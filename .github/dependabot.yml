@@ -1,0 +1,84 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    target-branch: "main"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Etc/UTC
+    # Limit kept low during alpha to avoid Dependabot fatigue while we
+    # iterate fast. Raise after API stabilizes.
+    open-pull-requests-limit: 5
+    # Title format: "chore(deps): bump zod from 4.1.0 to 4.2.0"
+    # `include: scope` was REMOVED — it appended a second scope after the
+    # one already in `prefix`, producing invalid "chore(deps)(deps): ..."
+    # titles that fail the Conventional Commits PR-title check.
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps)"
+    # Group only minor/patch into one PR. Major bumps get their own
+    # individual PRs so each potentially-breaking change is reviewed
+    # one at a time — important during alpha when the framework's
+    # external dependency surface is still moving.
+    groups:
+      all-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    # `drizzle-kit` is exact-pinned by policy — `scripts/check-drizzle-kit-pin.cjs`
+    # enforces it in CI. Telling Dependabot to skip it avoids weekly
+    # PRs that CI would just block.
+    ignore:
+      - dependency-name: "drizzle-kit"
+      # The repository compiles with TypeScript 7 only, pinned exactly and held
+      # by an override in pnpm-workspace.yaml, so a TypeScript 5 or 6 release
+      # is never an update for it.
+      - dependency-name: "typescript"
+        versions: ["< 7"]
+    reviewers:
+      - mobeenabdullah
+    labels:
+      - dependencies
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    target-branch: "main"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    # Title format: "chore(ci): bump the all-actions group with N updates"
+    # `include: scope` was REMOVED — it appended a second scope after the
+    # one already in `prefix`, producing invalid "chore(ci)(deps): ..."
+    # titles that fail the Conventional Commits PR-title check.
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      all-actions:
+        patterns:
+          - "*"
+    # Three actions move only by hand, because a bump alone breaks CI or the
+    # release; Dependabot proposing them inside the group would hold every
+    # other update back with it.
+    ignore:
+      # v2 refuses @changesets/cli v2 and renames its inputs and its
+      # `hasChangesets` output, so the release workflow moves with a CLI v3
+      # migration, not on its own.
+      - dependency-name: "changesets/action"
+        update-types: ["version-update:semver-major"]
+      # The action verifies binaries of the fallow CLI pinned in package.json
+      # (an npm dependency), so the action and the CLI move together.
+      - dependency-name: "fallow-rs/fallow"
+      # The review workflow runs an agent with repository grants, pinned to a
+      # revision scripts/review-bot-workflow.test.mjs holds; a new revision is
+      # reviewed before the pin and the test move.
+      - dependency-name: "anthropics/claude-code-action"
+    reviewers:
+      - mobeenabdullah
+    labels:
+      - dependencies
+      - github-actions

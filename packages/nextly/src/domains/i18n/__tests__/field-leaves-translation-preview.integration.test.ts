@@ -1,0 +1,461 @@
+/**
+ * The Schema Builder's preview says what a field leaving translation moves to the archive.
+ *
+ * Making a translated field shared archives every non-default language's value and keeps the
+ * default language's as the shared one. The preview the builder shows before Apply has to say
+ * so: how many values in which languages move, and how to bring them back. A field that cannot
+ * leave translation in one change is refused there, before Apply, rather than after it.
+ */
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+
+import { dispatchCollections } from "../../../dispatcher/handlers/collection-dispatcher";
+import { dispatchComponents } from "../../../dispatcher/handlers/component-dispatcher";
+import { dispatchSingles } from "../../../dispatcher/handlers/single-dispatcher";
+import { describeEachDialect } from "../../../plugins/__tests__/helpers/dialect-matrix";
+import {
+  createTestNextly,
+  type TestDialect,
+  type TestNextly,
+} from "../../../plugins/test-nextly";
+import type { ServiceContainer } from "../../../services";
+import type { SingleEntryService } from "../../singles/services/single-entry-service";
+
+const LOCALES = ["en", "es", "ar"];
+const TRANSLATED = [
+  { name: "heading", type: "text" },
+  { name: "views", type: "number" },
+];
+const SHARED = [
+  { name: "heading", type: "text", localized: false },
+  { name: "views", type: "number" },
+];
+/** `heading` with a width, as a Builder collection states one: a short text of 100. */
+const HEADING_WITH_WIDTH = {
+  name: "heading",
+  type: "text",
+  options: { variant: "short" },
+  validation: { maxLength: 100 },
+};
+
+/** What the preview reports for one field leaving translation. */
+interface LeavingTranslation {
+  name: string;
+  column: string;
+  byLocale: Record<string, number> | null;
+  total: number | null;
+  entriesWithoutDefault: number | null;
+  sharedFrom?: Record<string, number> | null;
+  defaultLocale: string;
+  restoreCommand: string;
+  refusal?: { reason: string; steps: string[] };
+}
+
+/** What the preview reports for one field becoming translated. */
+interface JoiningTranslation {
+  name: string;
+  column: string;
+  values: number | null;
+  defaultLocale: string;
+}
+
+interface Preview {
+  hasChanges: boolean;
+  leavingTranslation?: LeavingTranslation[];
+  joiningTranslation?: JoiningTranslation[];
+}
+
+interface Entries {
+  createEntry(
+    params: {
+      collectionName: string;
+      overrideAccess?: boolean;
+      locale?: string;
+    },
+    data: Record<string, unknown>
+  ): Promise<{ success: boolean; data: unknown }>;
+  updateEntry(
+    params: {
+      collectionName: string;
+      entryId: string;
+      overrideAccess?: boolean;
+      locale?: string;
+    },
+    data: Record<string, unknown>
+  ): Promise<{ success: boolean }>;
+}
+
+interface CollectionsHandler {
+  createCollection(data: Record<string, unknown>): Promise<{
+    success: boolean;
+    message?: string;
+  }>;
+  getEntryService(): Entries;
+}
+
+function quote(dialect: TestDialect, name: string): string {
+  return dialect === "mysql" ? `\`${name}\`` : `"${name}"`;
+}
+
+async function bodyOf(response: unknown): Promise<Preview> {
+  const data = (await (response as Response).json()) as Preview & {
+    data?: Preview;
+  };
+  return data.data ?? data;
+}
+
+describeEachDialect("the preview of a field leaving translation", dialect => {
+  let current: TestNextly;
+
+  beforeEach(async () => {
+    vi.stubEnv("NODE_ENV", "development");
+    current = await createTestNextly({
+      dialect,
+      collections: [],
+      localization: { locales: LOCALES, defaultLocale: "en" },
+    });
+  });
+
+  afterEach(async () => {
+    await current.destroy();
+    vi.unstubAllEnvs();
+  });
+
+  async function query<T>(sql: string): Promise<T[]> {
+    return (
+      current.adapter as unknown as {
+        executeQuery<R>(statement: string): Promise<R[]>;
+      }
+    ).executeQuery<T>(sql);
+  }
+
+  const handler = () =>
+    current.getService("collectionsHandler") as unknown as CollectionsHandler;
+
+  /** Two entries: both with Spanish, one with Arabic. */
+  async function seedCollection(
+    fields: Record<string, unknown>[] = TRANSLATED
+  ): Promise<void> {
+    const created = await handler().createCollection({
+      name: "flpposts",
+      label: "Post",
+      localized: true,
+      fields,
+    });
+    expect(created.success, JSON.stringify(created)).toBe(true);
+    const entries = handler().getEntryService();
+    for (const [title, translations] of [
+      ["One", { es: "Uno", ar: "واحد" }],
+      ["Two", { es: "Dos" }],
+    ] as const) {
+      const entry = await entries.createEntry(
+        { collectionName: "flpposts", overrideAccess: true, locale: "en" },
+        { heading: title, views: 1 }
+      );
+      expect(entry.success, JSON.stringify(entry)).toBe(true);
+      const id = String((entry.data as { id: unknown }).id);
+      for (const [locale, value] of Object.entries(translations)) {
+        const translated = await entries.updateEntry(
+          {
+            collectionName: "flpposts",
+            entryId: id,
+            overrideAccess: true,
+            locale,
+          },
+          { heading: value, _overwrite: true }
+        );
+        expect(translated.success, JSON.stringify(translated)).toBe(true);
+      }
+    }
+  }
+
+  it("counts a collection's values by language and names the restore", async () => {
+    await seedCollection();
+
+    const preview = await bodyOf(
+      await dispatchCollections(
+        {} as ServiceContainer,
+        "previewSchemaChanges",
+        { collectionName: "flpposts" },
+        { fields: SHARED, localized: true }
+      )
+    );
+
+    // A change, so the builder opens its dialog rather than saving straight away; which dialog
+    // is the admin's to choose, from the list below.
+    expect(preview.hasChanges).toBe(true);
+    expect(preview.leavingTranslation).toEqual([
+      {
+        name: "heading",
+        column: "heading",
+        byLocale: { ar: 1, es: 2 },
+        total: 3,
+        entriesWithoutDefault: 0,
+        // Every entry has an English value, so none takes its shared value from another language.
+        sharedFrom: {},
+        defaultLocale: "en",
+        restoreCommand:
+          "nextly i18n:restore --collection flpposts --field heading",
+      },
+    ]);
+  });
+
+  const previewShared = async (fields: Record<string, unknown>[] = SHARED) =>
+    bodyOf(
+      await dispatchCollections(
+        {} as ServiceContainer,
+        "previewSchemaChanges",
+        { collectionName: "flpposts" },
+        { fields, localized: true }
+      )
+    );
+
+  it("counts every field leaving translation in one go", async () => {
+    const both = [
+      { name: "heading", type: "text" },
+      { name: "summary", type: "text" },
+      { name: "views", type: "number" },
+    ];
+    await seedCollection(both);
+    const entries = handler().getEntryService();
+    const created = await entries.createEntry(
+      { collectionName: "flpposts", overrideAccess: true, locale: "en" },
+      { heading: "Three", summary: "Sub" }
+    );
+    const id = String((created.data as { id: unknown }).id);
+    await entries.updateEntry(
+      {
+        collectionName: "flpposts",
+        entryId: id,
+        overrideAccess: true,
+        locale: "es",
+      },
+      { summary: "Resumen", _overwrite: true }
+    );
+
+    const preview = await previewShared(
+      both.map(f => (f.type === "text" ? { ...f, localized: false } : f))
+    );
+
+    expect(
+      preview.leavingTranslation?.map(f => [f.name, f.column, f.byLocale])
+    ).toEqual([
+      ["heading", "heading", { ar: 1, es: 2 }],
+      ["summary", "summary", { es: 1 }],
+    ]);
+  });
+
+  it("says the values could not be counted rather than that there are none", async () => {
+    await seedCollection();
+    // A companion that has drifted from its registry: the count has nothing to read.
+    await query(
+      `ALTER TABLE ${quote(dialect, "dc_flpposts_locales")} DROP COLUMN ${quote(dialect, "heading")}`
+    );
+
+    const preview = await previewShared();
+
+    expect(preview.leavingTranslation?.[0]).toMatchObject({
+      name: "heading",
+      byLocale: null,
+      total: null,
+      entriesWithoutDefault: null,
+    });
+  });
+
+  it("counts the entries with no default-language value", async () => {
+    await seedCollection();
+    // One entry translated before it had an English row, as an older install may hold.
+    await query(
+      `DELETE FROM ${quote(dialect, "dc_flpposts_locales")} WHERE ${quote(dialect, "_locale")} = 'en' AND ${quote(dialect, "heading")} = 'Two'`
+    );
+
+    const preview = await previewShared();
+
+    expect(preview.leavingTranslation?.[0]?.entriesWithoutDefault).toBe(1);
+  });
+
+  // The summary names whose page changes: an entry with no default-language value takes its shared
+  // value from another language, which its default-language readers will now see, and that
+  // language's value is the shared one rather than one sent to the archive.
+  it("names the language an entry without a default-language value takes its shared value from", async () => {
+    await seedCollection();
+    await query(
+      `DELETE FROM ${quote(dialect, "dc_flpposts_locales")} WHERE ${quote(dialect, "_locale")} = 'en' AND ${quote(dialect, "heading")} = 'Two'`
+    );
+
+    const [leaving] = (await previewShared()).leavingTranslation ?? [];
+
+    expect(leaving?.sharedFrom).toEqual({ es: 1 });
+    // "Dos" becomes the shared value and is archived as Spanish's own too, so the language can
+    // be restored; "Uno" and "واحد" go to the archive as well.
+    expect(leaving?.byLocale).toEqual({ es: 2, ar: 1 });
+  });
+
+  // The other direction says what it does too: a shared field becoming translated keeps each
+  // entry's value as the default language's, and every other language falls back to it until
+  // translated. The summary says how many values that is.
+  it("counts the values a field becoming translated keeps as the default language's", async () => {
+    const made = await handler().createCollection({
+      name: "flpposts",
+      label: "Post",
+      localized: true,
+      fields: SHARED,
+    });
+    expect(made.success, JSON.stringify(made)).toBe(true);
+    for (const heading of ["One", "Two", null]) {
+      const entry = await handler()
+        .getEntryService()
+        .createEntry(
+          { collectionName: "flpposts", overrideAccess: true, locale: "en" },
+          { heading, views: 1 }
+        );
+      expect(entry.success, JSON.stringify(entry)).toBe(true);
+    }
+
+    const preview = await previewShared(TRANSLATED);
+
+    expect(preview.hasChanges).toBe(true);
+    expect(preview.joiningTranslation).toEqual([
+      { name: "heading", column: "heading", values: 2, defaultLocale: "en" },
+    ]);
+  });
+
+  it("names the refusal before Apply when the entries cannot take a Required field's setting", async () => {
+    await seedCollection([
+      { name: "heading", type: "text", required: true },
+      { name: "views", type: "number" },
+    ]);
+    const leaving = [
+      { name: "heading", type: "text", required: true, localized: false },
+      { name: "views", type: "number" },
+    ];
+
+    // Every entry has an English heading, so the field can be shared with the setting on.
+    expect(
+      (await previewShared(leaving)).leavingTranslation?.[0]?.refusal
+    ).toBe(undefined);
+
+    // One entry with no heading in any language, as an older install may hold: whichever
+    // language it keeps, it would be left without one.
+    const [two] = await query<{ parent: string }>(
+      `SELECT ${quote(dialect, "_parent")} AS parent FROM ${quote(dialect, "dc_flpposts_locales")} WHERE ${quote(dialect, "_locale")} = 'en' AND ${quote(dialect, "heading")} = 'Two'`
+    );
+    await query(
+      `UPDATE ${quote(dialect, "dc_flpposts_locales")} SET ${quote(dialect, "heading")} = NULL WHERE ${quote(dialect, "_parent")} = '${two.parent}'`
+    );
+
+    expect(
+      (await previewShared(leaving)).leavingTranslation?.[0]?.refusal
+    ).toEqual({
+      reason:
+        "1 entry would have no heading once it is shared: the value it keeps is empty.",
+      steps: [
+        "Give that entry a heading, or turn off Required, and save again.",
+      ],
+    });
+  });
+
+  // Five entries in two groups sharing an English heading, of two and of three: every entry in
+  // either is in the way, so the preview counts five, as Apply's refusal does. The field states
+  // a width in both shapes: shared on MySQL, a unique text field without one is refused before
+  // anything is counted (its column would be keyed whole), which
+  // `migrate-check-builder-columns.test.ts` pins.
+  it("counts the entries of every group that would share a value for a Unique field", async () => {
+    await seedCollection([
+      { ...HEADING_WITH_WIDTH },
+      { name: "views", type: "number" },
+    ]);
+    const entries = handler().getEntryService();
+    for (const heading of ["One", "Two", "Two"]) {
+      const entry = await entries.createEntry(
+        { collectionName: "flpposts", overrideAccess: true, locale: "en" },
+        { heading, views: 1 }
+      );
+      expect(entry.success, JSON.stringify(entry)).toBe(true);
+    }
+
+    const preview = await previewShared([
+      { ...HEADING_WITH_WIDTH, unique: true, localized: false },
+      { name: "views", type: "number" },
+    ]);
+
+    expect(preview.leavingTranslation?.[0]?.refusal?.reason).toMatch(
+      /^5 entries would share a value for heading, which must be unique/
+    );
+  });
+
+  it("counts a Single's values", async () => {
+    await dispatchSingles(
+      "createSingle",
+      {},
+      { slug: "hero", label: "Hero", localized: true, fields: TRANSLATED }
+    );
+    const singles: SingleEntryService =
+      current.getService("singleEntryService");
+    for (const [locale, value] of [
+      ["en", "Hello"],
+      ["es", "Hola"],
+    ]) {
+      const written = await singles.update(
+        "hero",
+        { heading: value, _overwrite: true },
+        { locale, overrideAccess: true }
+      );
+      expect(written.success, JSON.stringify(written)).toBe(true);
+    }
+
+    const preview = await bodyOf(
+      await dispatchSingles(
+        "previewSingleSchemaChanges",
+        { slug: "hero" },
+        { fields: SHARED, localized: true }
+      )
+    );
+
+    expect(preview.leavingTranslation).toEqual([
+      expect.objectContaining({
+        name: "heading",
+        byLocale: { es: 1 },
+        total: 1,
+        restoreCommand: "nextly i18n:restore --collection hero --field heading",
+      }),
+    ]);
+  });
+
+  it("counts a field group's values", async () => {
+    await dispatchComponents(
+      "createComponent",
+      {},
+      { slug: "promo", label: "Promo", localized: true, fields: TRANSLATED }
+    );
+    await query(
+      `INSERT INTO ${quote(dialect, "comp_promo")} (${["id", "_parent_id", "_parent_table", "_parent_field", "views"].map(c => quote(dialect, c)).join(", ")}) ` +
+        `VALUES ('promo-1', 'entry-1', 'dc_pages', 'promo', 7)`
+    );
+    for (const [locale, value] of [
+      ["en", "Hello"],
+      ["es", "Hola"],
+      ["ar", "مرحبا"],
+    ]) {
+      await query(
+        `INSERT INTO ${quote(dialect, "comp_promo_locales")} (${["_parent", "_locale", "heading"].map(c => quote(dialect, c)).join(", ")}) ` +
+          `VALUES ('promo-1', '${locale}', '${value}')`
+      );
+    }
+
+    const preview = await bodyOf(
+      await dispatchComponents(
+        "previewComponentSchemaChanges",
+        { slug: "promo" },
+        { fields: SHARED, localized: true }
+      )
+    );
+
+    expect(preview.leavingTranslation).toEqual([
+      expect.objectContaining({
+        name: "heading",
+        byLocale: { ar: 1, es: 1 },
+        total: 2,
+      }),
+    ]);
+  });
+});

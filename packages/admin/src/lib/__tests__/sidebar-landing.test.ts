@@ -1,0 +1,265 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  getSidebarCollectionsForLanding,
+  getSidebarSinglesForLanding,
+} from "../sidebar-landing";
+
+import type { AdminBranding } from "@admin/types/branding";
+import type { ApiCollection, ApiSingle } from "@admin/types/entities";
+import { buildCapabilities } from "@admin/hooks/useCurrentUserPermissions";
+import type { AdminCapabilities } from "@admin/types/permissions";
+
+// Tests run with a super-admin capabilities stub so the permission filter
+// never excludes anything — these tests are about ordering semantics.
+// Derived rather than hand-built, for the reason the webhook nav test gives:
+// a literal keeps passing after the deriver stops setting a flag it still sets
+// for itself. These tests are about ordering, so the permission filter is
+// deliberately made to exclude nothing.
+const superAdmin: AdminCapabilities = buildCapabilities([], true, {
+  isSuperAdmin: true,
+  validUntil: null,
+  entities: {},
+});
+
+const noBranding: AdminBranding = {};
+
+function makeCollection(
+  name: string,
+  overrides: Partial<ApiCollection["admin"]> & {
+    label?: string;
+    pluralLabel?: string;
+  } = {}
+): ApiCollection {
+  const { label, pluralLabel, ...adminOverrides } = overrides;
+  return {
+    id: `id-${name}`,
+    name,
+    label: label ?? name,
+    tableName: name,
+    schemaDefinition: { fields: [] },
+    createdAt: "2026-05-01T00:00:00Z",
+    updatedAt: "2026-05-01T00:00:00Z",
+    labels: pluralLabel ? { plural: pluralLabel } : undefined,
+    admin: { ...adminOverrides },
+  } as unknown as ApiCollection;
+}
+
+function makeSingle(
+  slug: string,
+  overrides: Partial<ApiSingle["admin"]> & { label?: string } = {}
+): ApiSingle {
+  const { label, ...adminOverrides } = overrides;
+  return {
+    id: `id-${slug}`,
+    slug,
+    label: label ?? slug,
+    tableName: slug,
+    fields: [],
+    createdAt: "2026-05-01T00:00:00Z",
+    updatedAt: "2026-05-01T00:00:00Z",
+    admin: { ...adminOverrides },
+  } as unknown as ApiSingle;
+}
+
+describe("getSidebarCollectionsForLanding", () => {
+  it("returns an empty array when items is empty", () => {
+    expect(
+      getSidebarCollectionsForLanding([], {
+        branding: noBranding,
+        capabilities: superAdmin,
+        pinnedCollections: new Set(),
+      })
+    ).toEqual([]);
+  });
+
+  it("places pinned items before everything regardless of order", () => {
+    const items = [
+      makeCollection("authors", { order: 1 }),
+      makeCollection("posts", { order: 50 }),
+    ];
+    const result = getSidebarCollectionsForLanding(items, {
+      branding: noBranding,
+      capabilities: superAdmin,
+      pinnedCollections: new Set(["posts"]),
+    });
+    expect(result.map(c => c.name)).toEqual(["posts", "authors"]);
+  });
+
+  it("orders by admin.order ascending before alphabetical", () => {
+    const items = [
+      makeCollection("zebras", { order: 1 }),
+      makeCollection("alligators", { order: 5 }),
+    ];
+    const result = getSidebarCollectionsForLanding(items, {
+      branding: noBranding,
+      capabilities: superAdmin,
+      pinnedCollections: new Set(),
+    });
+    expect(result.map(c => c.name)).toEqual(["zebras", "alligators"]);
+  });
+
+  it("falls back to alphabetical (by plural label) when orders tie", () => {
+    const items = [
+      makeCollection("zebras", { order: 100, pluralLabel: "Zebras" }),
+      makeCollection("alligators", { order: 100, pluralLabel: "Alligators" }),
+    ];
+    const result = getSidebarCollectionsForLanding(items, {
+      branding: noBranding,
+      capabilities: superAdmin,
+      pinnedCollections: new Set(),
+    });
+    expect(result.map(c => c.name)).toEqual(["alligators", "zebras"]);
+  });
+
+  it("treats missing admin.order as 100 (the documented default)", () => {
+    const items = [
+      makeCollection("explicit", { order: 50 }),
+      makeCollection("implicit"), // no order — defaults to 100
+    ];
+    const result = getSidebarCollectionsForLanding(items, {
+      branding: noBranding,
+      capabilities: superAdmin,
+      pinnedCollections: new Set(),
+    });
+    expect(result.map(c => c.name)).toEqual(["explicit", "implicit"]);
+  });
+
+  it("excludes hidden collections", () => {
+    const items = [
+      makeCollection("visible"),
+      makeCollection("hidden", { hidden: true }),
+    ];
+    const result = getSidebarCollectionsForLanding(items, {
+      branding: noBranding,
+      capabilities: superAdmin,
+      pinnedCollections: new Set(),
+    });
+    expect(result.map(c => c.name)).toEqual(["visible"]);
+  });
+
+  it("excludes plugin collections by default but includes them when plugin metadata sets placement to 'collections'", () => {
+    const items = [
+      makeCollection("posts"),
+      makeCollection("forms", { isPlugin: true }),
+    ];
+    // First: with no plugin metadata, the plugin collection is excluded.
+    const withoutMeta = getSidebarCollectionsForLanding(items, {
+      branding: { plugins: [] },
+      capabilities: superAdmin,
+      pinnedCollections: new Set(),
+    });
+    expect(withoutMeta.map(c => c.name)).toEqual(["posts"]);
+
+    // Then: metadata that places the plugin's collection in the
+    // "collections" section pulls it back in.
+    const withMeta = getSidebarCollectionsForLanding(items, {
+      branding: {
+        plugins: [
+          {
+            name: "form-builder",
+            collections: ["forms"],
+            placement: "collections",
+          },
+        ],
+      },
+      capabilities: superAdmin,
+      pinnedCollections: new Set(),
+    });
+    expect(withMeta.map(c => c.name).sort()).toEqual(["forms", "posts"]);
+  });
+});
+
+describe("getSidebarCollectionsForLanding with sidebar groups", () => {
+  const deps = (pinned: string[] = []) => ({
+    branding: noBranding,
+    capabilities: superAdmin,
+    pinnedCollections: new Set(pinned),
+  });
+
+  it("lists a collection naming a group of its own, before the ungrouped ones", () => {
+    const items = [
+      makeCollection("posts", { order: 1 }),
+      makeCollection("products", { sidebarGroup: "shop", order: 50 }),
+    ];
+    expect(
+      getSidebarCollectionsForLanding(items, deps()).map(c => c.name)
+    ).toEqual(["products", "posts"]);
+  });
+
+  it("puts each group where its first collection appears, its collections together", () => {
+    const items = [
+      makeCollection("newsletters", { sidebarGroup: "marketing", order: 30 }),
+      makeCollection("products", { sidebarGroup: "shop", order: 20 }),
+      makeCollection("case-studies", { sidebarGroup: "marketing", order: 10 }),
+      makeCollection("orders", { sidebarGroup: "shop", order: 40 }),
+    ];
+    expect(
+      getSidebarCollectionsForLanding(items, deps()).map(c => c.name)
+    ).toEqual(["case-studies", "newsletters", "products", "orders"]);
+  });
+
+  it("moves a pinned collection up its own group, not its group past others", () => {
+    const items = [
+      makeCollection("case-studies", { sidebarGroup: "marketing", order: 10 }),
+      makeCollection("products", { sidebarGroup: "shop", order: 20 }),
+      makeCollection("orders", { sidebarGroup: "shop", order: 40 }),
+    ];
+    expect(
+      getSidebarCollectionsForLanding(items, deps(["orders"])).map(c => c.name)
+    ).toEqual(["case-studies", "orders", "products"]);
+  });
+
+  it("reads the built-in section's name as no group", () => {
+    const items = [
+      makeCollection("pages", { sidebarGroup: "collections", order: 1 }),
+      makeCollection("products", { sidebarGroup: "shop", order: 50 }),
+    ];
+    expect(
+      getSidebarCollectionsForLanding(items, deps()).map(c => c.name)
+    ).toEqual(["products", "pages"]);
+  });
+});
+
+describe("getSidebarSinglesForLanding", () => {
+  it("uses the same pinned/order/name comparator as collections", () => {
+    const items = [
+      makeSingle("zebras", { order: 1 }),
+      makeSingle("alligators", { order: 5 }),
+      makeSingle("kittens", { order: 5 }),
+    ];
+    const result = getSidebarSinglesForLanding(items, {
+      capabilities: superAdmin,
+      pinnedSingles: new Set(["kittens"]),
+    });
+    expect(result.map(s => s.slug)).toEqual([
+      "kittens", // pinned wins
+      "zebras", // order=1 next
+      "alligators", // order=5 first alphabetically
+    ]);
+  });
+
+  it("lists a Single that names a sidebar group, where it would otherwise be listed nowhere", () => {
+    const items = [
+      makeSingle("banner", { sidebarGroup: "marketing", order: 1 }),
+      makeSingle("footer", { order: 5 }),
+    ];
+    const result = getSidebarSinglesForLanding(items, {
+      capabilities: superAdmin,
+      pinnedSingles: new Set(),
+    });
+    expect(result.map(s => s.slug)).toEqual(["banner", "footer"]);
+  });
+
+  it("excludes hidden singles", () => {
+    const items = [
+      makeSingle("visible"),
+      makeSingle("hidden", { hidden: true }),
+    ];
+    const result = getSidebarSinglesForLanding(items, {
+      capabilities: superAdmin,
+      pinnedSingles: new Set(),
+    });
+    expect(result.map(s => s.slug)).toEqual(["visible"]);
+  });
+});

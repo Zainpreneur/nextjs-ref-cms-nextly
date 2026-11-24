@@ -1,0 +1,25 @@
+---
+title: SCHEMA_SYNC_IN_PRODUCTION
+description: "`NODE_ENV` is `production`, where schema changes are applied by migrations and never synced automatically."
+---
+
+## Cause
+
+`NODE_ENV` is `production`, where schema changes are applied by migrations and never synced automatically.
+
+In production the schema changes only through migrations, which are reviewed and recorded. With `NODE_ENV=production`, `nextly db:sync` refuses in every mode (`--no-auto-sync`, `--promote` and `--demote` included) before it opens the database, so it creates no table and writes no registry row. `nextly db:sync --dry-run` still runs, and names this refusal.
+
+## Fix
+
+- Where you develop, create a migration for the changes: `nextly migrate:create --name="add-posts"`, and commit it.
+- Apply it to the production database with `nextly migrate`.
+- If this is not production, unset `NODE_ENV` or set it to `development`, then run the command again.
+
+## Example
+
+```text
+✗ db:sync does not run in production.
+  Why:  `NODE_ENV` is `production`, and db:sync changes the database directly, without a migration. Nothing was changed.
+  Next: Run `nextly migrate:create --name="<migration-name>"` where you develop, commit the migration, then run `nextly migrate` against this database.
+  Docs: https://nextlyhq.com/docs/cli/errors/schema-sync-in-production  (SCHEMA_SYNC_IN_PRODUCTION)
+```

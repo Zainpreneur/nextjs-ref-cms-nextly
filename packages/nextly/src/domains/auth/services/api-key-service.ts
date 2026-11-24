@@ -1,0 +1,1611 @@
+/**
+ * API Key Service
+ *
+ * Manages the full lifecycle of API keys — generation, hashing, CRUD,
+ * validation, and permission resolution. Keys use a three-tier token type
+ * model (Read-only / Full access / Role-based) backed by Nextly's RBAC
+ * system as the single source of truth for permissions.
+ *
+ * ## Security Invariants
+ *
+ * - Raw keys are NEVER stored. Only a SHA-256 hex digest (`keyHash`) is
+ *   persisted. The full key is returned exactly once on creation and must
+ *   be surfaced to the caller immediately.
+ * - Keys are cryptographically random (32 bytes = 256-bit entropy).
+ * - The `nx_live_` prefix allows instant identification in logs/configs.
+ * - Expiry is enforced at validation time; expired keys return `null` from
+ *   `authenticateApiKey()` and result in a `401` response.
+ * - A key whose creator is deactivated returns `null` the same way, until the
+ *   creator is reactivated. A new password for the creator does not stop it.
+ *
+ * ## Key Format
+ *
+ * ```
+ * nx_live_<id>_<base64url-32-bytes>
+ * └──────┘└──┘ └───────────────────┘
+ *  prefix  id   43-char base64url secret (256 bits)
+ *
+ * Full key example : nx_live_<id>_<random>...  (76 chars total)
+ * Id               : 24 hex chars the server verifies without a lookup
+ *                    (`domains/auth/lib/api-key-id`)
+ * Stored hash      : sha256(fullKey) as hex string (64 chars)
+ * Display prefix   : "nx_live_" + the id's first 8 chars, for masked UI display
+ * ```
+ *
+ * A key made before ids (`nx_live_<base64url-32-bytes>`, 51 chars) still
+ * authenticates; it only lacks the id, so its failed lookups from a source the
+ * server cannot resolve share one bound with every other such key.
+ *
+ * @module domains/auth/services/api-key-service
+ * @since 1.0.0
+ */
+
+import { createHash, randomBytes, randomUUID } from "crypto";
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import { and, desc, eq, inArray, isNull, lt, or } from "drizzle-orm";
+
+import {
+  keyCallerHoldsSuperAdmin,
+  type GrantedPermission,
+} from "../../../auth/authenticated-scope";
+import { accountIsActive } from "../../../auth/session/session-standing";
+import { loadedDialect } from "../../../database/dialect-tables";
+import { toDbError } from "../../../database/errors";
+import { NextlyError } from "../../../errors/nextly-error";
+import { permissionSlug } from "../../../schemas/_zod/rbac";
+import type { apiKeys as apiKeysMysql } from "../../../schemas/api-keys/mysql";
+import type { apiKeys as apiKeysPg } from "../../../schemas/api-keys/postgres";
+import type { apiKeys as apiKeysSqlite } from "../../../schemas/api-keys/sqlite";
+import type {
+  permissions as permissionsMysql,
+  rolePermissions as rolePermissionsMysql,
+  roles as rolesMysql,
+  userRoles as userRolesMysql,
+} from "../../../schemas/rbac/mysql";
+import type {
+  permissions as permissionsPg,
+  rolePermissions as rolePermissionsPg,
+  roles as rolesPg,
+  userRoles as userRolesPg,
+} from "../../../schemas/rbac/postgres";
+import type {
+  permissions as permissionsSqlite,
+  rolePermissions as rolePermissionsSqlite,
+  roles as rolesSqlite,
+  userRoles as userRolesSqlite,
+} from "../../../schemas/rbac/sqlite";
+import type { users as usersMysql } from "../../../schemas/users/mysql";
+import type { users as usersPg } from "../../../schemas/users/postgres";
+import type { users as usersSqlite } from "../../../schemas/users/sqlite";
+// PR 4 migration: switch from legacy ServiceError to NextlyError unified system.
+// ServiceError throw sites are replaced with NextlyError factory calls; identifying
+// info (key id, role id, exceeded permission) moves from public message to logContext
+// per spec §13.8 (no identifiers/values in publicMessage).
+import { BaseService } from "../../../services/base-service";
+import {
+  hasPermission,
+  isSuperAdmin,
+  listRoleSlugsForUserOrRefuse,
+  resolveUserRoles,
+} from "../../../services/lib/permissions";
+import { refreshEpoch, stampIsCurrent } from "../../../services/lib/rbac-epoch";
+import { userRoleAssignmentsInForce } from "../../../services/lib/role-assignments";
+import type { Logger } from "../../../services/shared";
+import { serializeOnSqlite } from "../../../shared/lib/run-adapter-transaction";
+import type { LastSuperAdminTx } from "../../users/services/last-super-admin";
+import { isPublishWithoutReview } from "../../workflows/permissions";
+import { mintApiKeyId } from "../lib/api-key-id";
+
+import { refuseLinkingPublicRole } from "./public-role";
+import { wholeSecondExpiry } from "./token-account-binding";
+
+/** The three token types that determine how permissions are resolved at request time. */
+export type ApiKeyTokenType = "read-only" | "full-access" | "role-based";
+
+/** Token duration options for key expiry. "unlimited" means the key never expires. */
+export type ExpiresIn = "7d" | "30d" | "90d" | "unlimited";
+
+/**
+ * Why a presented key does not authenticate: for the server's log, never the
+ * caller, who is told the same thing whichever it is.
+ */
+export type ApiKeyRefusalCause =
+  | "unknown"
+  | "revoked"
+  | "expired"
+  | "creator-inactive";
+
+/** The key value returned by generateApiKey(). fullKey is shown once and never stored. */
+export interface GeneratedApiKey {
+  /** The full raw key — e.g. "nx_live_<random>...". Show to the user once, then discard. */
+  fullKey: string;
+  /** SHA-256 hex digest of fullKey. Stored in the database for lookup. */
+  keyHash: string;
+  /** First 16 characters of fullKey — stored for masked display in the UI. */
+  keyPrefix: string;
+}
+
+/**
+ * Metadata returned by all API key endpoints.
+ * The raw key hash and secret are NEVER returned.
+ */
+export interface ApiKeyMeta {
+  id: string;
+  name: string;
+  description: string | null;
+  /** First 16 chars of the key (e.g. "nx_live_abcdefgh") — for masked UI display. */
+  keyPrefix: string;
+  tokenType: ApiKeyTokenType;
+  /** Populated only for role-based keys. Null if no role is set or role was deleted. */
+  role: { id: string; name: string; slug: string } | null;
+  /**
+   * The person who created the key, whose permissions a read-only or
+   * full-access key follows. Null when their account no longer exists, and
+   * for an API key reading keys without being allowed to read users.
+   *
+   * Always set by the service. Optional in the type, so a value built before
+   * the field existed (a test double, an adapter) still type-checks.
+   */
+  owner?: { id: string; name: string | null; email: string } | null;
+  /** ISO 8601 string, or null for unlimited keys. */
+  expiresAt: string | null;
+  /** ISO 8601 string of the last request that used this key, or null if never used. */
+  lastUsedAt: string | null;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Input for creating a new API key. */
+export interface CreateApiKeyInput {
+  /** Human-readable label, e.g. "Frontend App Key". 1–255 characters. */
+  name: string;
+  /** Optional documentation about this key's intended use. */
+  description?: string | null;
+  tokenType: ApiKeyTokenType;
+  /** Required when tokenType is "role-based". Must be absent for other token types. */
+  roleId?: string | null;
+  expiresIn: ExpiresIn;
+}
+
+/** Input for updating an existing API key. Only name and description can change. */
+export interface UpdateApiKeyInput {
+  name?: string;
+  description?: string | null;
+}
+
+/**
+ * The prefix every issued key carries.
+ *
+ * `scripts/check-docs-claims.mjs` reads this declaration and compares the
+ * documentation's bearer examples against it, so this is the one place the key
+ * format is stated and a second copy of it anywhere is a claim that can go
+ * stale. Nothing catches a wrong one at runtime: a key is looked up by hash, so
+ * a documented prefix that does not match this authenticates as an ordinary
+ * failure, with no hint that the format was the problem.
+ *
+ * Not exported. The guard reads the declaration rather than importing it,
+ * because it runs under plain Node before any TypeScript is built.
+ */
+const KEY_PREFIX = "nx_live_";
+
+/**
+ * Generate a new cryptographically-random API key.
+ *
+ * Returns the full raw key along with its SHA-256 hash and the 16-character
+ * display prefix. The full key must be shown to the user immediately — it is
+ * NOT stored and cannot be retrieved later.
+ *
+ * Key format: `nx_live_<id>_<base64url-32-bytes>`
+ * - `<id>`: 24 hex characters the server can verify without a lookup
+ *   (`mintApiKeyId`), so failed lookups from a source it cannot resolve are
+ *   bounded per key rather than shared with every invalid key
+ * - the secret: 32 random bytes as base64url = 43 characters (no padding),
+ *   256 bits of entropy
+ * - Total key length: 8 (prefix) + 24 (id) + 1 + 43 (secret) = 76 characters
+ *
+ * The display prefix is the `nx_live_` prefix and the id's first 8
+ * characters: it names the key in lists without holding any of its secret.
+ *
+ * @returns Object containing the raw key, its SHA-256 hash, and the display prefix
+ *
+ * @example
+ * ```typescript
+ * const { fullKey, keyHash, keyPrefix } = generateApiKey();
+ * // fullKey   → "nx_live_<id>_<random>..." (return to user, never store)
+ * // keyHash   → "a3f2c1..." (store in DB for lookup)
+ * // keyPrefix → "nx_live_3f9a2c1d" (store in DB for UI display)
+ * ```
+ */
+export function generateApiKey(): GeneratedApiKey {
+  const id = mintApiKeyId();
+  const secret = randomBytes(32).toString("base64url");
+  const fullKey = `${KEY_PREFIX}${id}_${secret}`;
+
+  return {
+    fullKey,
+    keyHash: hashApiKey(fullKey),
+    keyPrefix: `${KEY_PREFIX}${id.slice(0, 8)}`,
+  };
+}
+
+/**
+ * Compute the SHA-256 hex digest of a raw API key.
+ *
+ * This function is deterministic: the same input always produces the same
+ * output, enabling constant-time lookup by hash without storing the raw key.
+ *
+ * **Why SHA-256 instead of bcrypt?**
+ * API keys are high-entropy random strings (256 bits). bcrypt is designed for
+ * low-entropy passwords and its intentional slowness (100 ms+) would add
+ * latency to every authenticated API request. SHA-256 is fast (microseconds),
+ * sufficient for high-entropy secrets, and the approach used by GitHub and
+ * Stripe for their API key hashing.
+ *
+ * @param rawKey - The full API key string (e.g. "nx_live_<random>...")
+ * @returns 64-character lowercase hex string (SHA-256 digest)
+ *
+ * @example
+ * ```typescript
+ * const hash = hashApiKey("nx_live_<random>...");
+ * // → "a3f2c1d9e8b7..." (64 hex chars, deterministic)
+ *
+ * // Lookup by hash in the database:
+ * const key = await db.select().from(apiKeys).where(eq(apiKeys.keyHash, hash));
+ * ```
+ */
+export function hashApiKey(rawKey: string): string {
+  return createHash("sha256").update(rawKey).digest("hex");
+}
+
+/**
+ * Determine whether an API key has expired.
+ *
+ * A key with `expiresAt = null` is considered unlimited and never expires.
+ * A key with a past `expiresAt` is considered expired regardless of its
+ * `isActive` flag — expiry takes precedence and is checked first.
+ *
+ * @param expiresAt - The key's expiry timestamp, or `null` for unlimited
+ * @returns `true` if the key is expired, `false` if still valid or unlimited
+ *
+ * @example
+ * ```typescript
+ * isKeyExpired(null);                          // → false (unlimited)
+ * isKeyExpired(new Date("2099-01-01"));        // → false (future)
+ * isKeyExpired(new Date("2020-01-01"));        // → true  (past)
+ * isKeyExpired(new Date(Date.now() - 1000));   // → true  (1 second ago)
+ * ```
+ */
+export function isKeyExpired(expiresAt: Date | null): boolean {
+  if (expiresAt === null) {
+    return false;
+  }
+  return expiresAt.getTime() < Date.now();
+}
+
+/**
+ * How `caller` sees keys: each key's metadata as they may see it.
+ *
+ * Anyone who may read keys sees every key, but a key's owner is a person, so
+ * their name and address show only to a caller who may also read users. A
+ * person always sees themselves on their own keys. An API key is judged by its
+ * own scope: it is told an owner only when that scope may read users, as it
+ * must before any other user data reaches it.
+ *
+ * Asked once per caller, so a list costs one permission check, not one per row.
+ * Here, beside the metadata it narrows, so the REST routes and the Direct API
+ * answer one caller the same way.
+ */
+export async function apiKeyViewer(
+  caller: {
+    userId: string;
+    authMethod: string;
+    permissions: readonly string[];
+  } & Parameters<typeof keyCallerHoldsSuperAdmin>[0]
+): Promise<(key: ApiKeyMeta) => ApiKeyMeta> {
+  const byKey = caller.authMethod === "api-key";
+  // A key carrying its maker's super-admin authority holds every permission,
+  // as every other way in treats it, its grant list notwithstanding.
+  const readsUsers = byKey
+    ? keyCallerHoldsSuperAdmin(caller) ||
+      caller.permissions.includes(permissionSlug("read", "users"))
+    : await hasPermission(caller.userId, "read", "users");
+  return key =>
+    readsUsers || (!byKey && key.owner?.id === caller.userId)
+      ? key
+      : { ...key, owner: null };
+}
+
+/**
+ * ApiKeyService handles the full API key lifecycle.
+ *
+ * Responsibilities:
+ * - Key generation and SHA-256 hashing (via module-level helpers)
+ * - Key CRUD (create, list, get, update name/description, revoke)
+ * - Incoming key authentication (hash lookup + expiry + rate limiting)
+ * - Permission resolution per token type (read-only / full-access / role-based)
+ *
+ * Extends BaseService for multi-database adapter support (PostgreSQL, MySQL, SQLite).
+ *
+ * @example
+ * ```typescript
+ * const service = new ApiKeyService(adapter, logger);
+ *
+ * // Generate a new key
+ * const { meta, key } = await service.createApiKey(userId, {
+ *   name: "Frontend App Key",
+ *   tokenType: "read-only",
+ *   expiresIn: "30d",
+ * });
+ * // key is the raw "nx_live_..." — surface to user immediately, never stored
+ *
+ * // Validate an incoming request key
+ * const result = await service.authenticateApiKey(rawKeyFromHeader);
+ * if (!result) return Response.json({ error: "Unauthorized" }, { status: 401 });
+ * ```
+ */
+
+// Module-level (rather than per-instance) so that UserRoleService can invalidate
+// entries via invalidateApiKeyPermissionsCache() without holding a reference to
+// an ApiKeyService instance — same pattern as services/lib/permissions.ts.
+const _apiKeyPermissionsCache = new Map<
+  string,
+  {
+    grants: readonly GrantedPermission[];
+    cachedAt: number;
+    /**
+     * The RBAC revision these grants were resolved under.
+     *
+     * Time alone is not enough. These grants are DERIVED from the same role and
+     * permission rows the RBAC caches hold, and nothing evicted them when a
+     * ROLE changed: `UserRoleService` evicts on assigning or unassigning a role
+     * to a user, and the role services only call `invalidatePermissionCache`,
+     * which knows nothing about keys. So revoking a role's inherited
+     * `super-admin` left a key holding the whole catalogue for the rest of this
+     * TTL, and changing a role's permissions left a role-based key holding the
+     * old set, which the comment in `UserRoleService` said was handled
+     * elsewhere and was not.
+     */
+    revision: string;
+    /**
+     * When the owner's role assignments behind these grants next lapse (epoch
+     * ms), if any of them expires. An expiry reaches no invalidation, so the
+     * entry is not served past it: a key whose owner's role had just lapsed
+     * kept that role's grants for up to the rest of the TTL.
+     */
+    validUntil: number | undefined;
+  }
+>();
+const _PERMISSIONS_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/** One key's cached grants, as {@link _apiKeyPermissionsCache} holds them. */
+type KeyGrantsEntry = NonNullable<
+  ReturnType<(typeof _apiKeyPermissionsCache)["get"]>
+>;
+
+/**
+ * Whether a key's cached grants may still be served at `now`.
+ *
+ * The revision is asked through the shared predicate, not by comparing the
+ * stamp. A match means nothing while this process holds invalidations the
+ * shared row has not accepted: the value being matched against is then one no
+ * other instance has seen, so a revocation made here keeps answering from
+ * this copy for the whole window. The permission tiers ask the same question.
+ *
+ * Then the entry's age, and the owner's next role expiry, which ends it early
+ * because nothing else runs when a role lapses.
+ */
+function keyGrantsServable(entry: KeyGrantsEntry, now: number): boolean {
+  return (
+    stampIsCurrent(entry.revision) &&
+    now - entry.cachedAt < _PERMISSIONS_CACHE_TTL_MS &&
+    (entry.validUntil === undefined || now < entry.validUntil)
+  );
+}
+
+/**
+ * Distinct rows, keyed on the slug — the identity a grant is stored under.
+ *
+ * A key's grants are kept as rows, not slugs: the slug (`read-posts`) is what
+ * every check compares and what a rule is handed, and the row also names
+ * the `action` and `resource` it grants. A stored slug cannot be decomposed
+ * back into those parts — a deliberately custom one (`manage-api-keys`, on action `update`) is
+ * explicitly supported by `RolePermissionService`, so splitting on the hyphen
+ * would invent a resource that no row names.
+ */
+function dedupeGrants(rows: GrantedPermission[]): GrantedPermission[] {
+  const bySlug = new Map<string, GrantedPermission>();
+  for (const row of rows) if (!bySlug.has(row.slug)) bySlug.set(row.slug, row);
+  return Array.from(bySlug.values());
+}
+
+/**
+ * Evict a single API key's resolved permissions from the shared in-memory cache.
+ *
+ * Call this when:
+ * - The key creator's role assignments change (read-only / full-access keys) — via UserRoleService
+ * - The key's referenced role changes permissions (role-based keys) — via RolePermissionService
+ *
+ * @param keyId - The API key ID whose cache entry should be evicted
+ */
+export function invalidateApiKeyPermissionsCache(keyId: string): void {
+  _apiKeyPermissionsCache.delete(`apikey:${keyId}`);
+}
+
+interface ApiKeyRow {
+  id: string;
+  name: string;
+  description: string | null;
+  keyPrefix: string;
+  tokenType: string;
+  roleId: string | null;
+  roleName: string | null;
+  roleSlug: string | null;
+  ownerId: string | null;
+  ownerName: string | null;
+  ownerEmail: string | null;
+  expiresAt: Date | number | null;
+  lastUsedAt: Date | number | null;
+  isActive: boolean | number;
+  createdAt: Date | number | string;
+  updatedAt: Date | number | string;
+}
+
+/**
+ * How fresh a key's recorded last use is kept: one write per key per minute
+ * at most, which is finer than the list shows it ("just now", "2 minutes
+ * ago").
+ */
+const LAST_USE_RESOLUTION_MS = 60_000;
+
+/**
+ * Whether a key acts with super-admin authority for this request: only a
+ * full-access key, and only while the person who made it holds the
+ * super-admin role, directly or through an inherited one.
+ *
+ * Asked for each request, as the maker's own sessions ask it, so the key
+ * loses the authority when its maker does: a role removed or expired, or a
+ * changed role version, is seen within the bound their sessions follow, and
+ * a deactivated maker's key is refused before this is asked. Never read from
+ * the grants cached for the key, which may outlast the maker's role. A
+ * lookup that fails answers no.
+ *
+ * With the answer comes the soonest expiry among the maker's roles, which
+ * ends the authority on a scope kept past its request as it ends a session's
+ * token. Read BEFORE the role itself, as a session reads it: read after, a
+ * role lapsing between the two reads would leave the authority with no end.
+ */
+async function keyHoldsSuperAdmin(
+  tokenType: ApiKeyTokenType,
+  userId: string
+): Promise<{ holds: boolean; until?: number }> {
+  if (tokenType !== "full-access") return { holds: false };
+  let until: number | undefined;
+  try {
+    ({ validUntil: until } = await resolveUserRoles(userId));
+  } catch {
+    // An authority with no known end is not carried.
+    return { holds: false };
+  }
+  if (!(await isSuperAdmin(userId))) return { holds: false };
+  return until === undefined ? { holds: true } : { holds: true, until };
+}
+
+/** What a key authentication accepted is resolved to, for its request. */
+export interface ResolvedKeyCaller {
+  grants: readonly GrantedPermission[];
+  roles: string[];
+  keyHoldsSuperAdmin: boolean;
+  /** The soonest expiry among the maker's roles, where the authority ends. */
+  keyHoldsSuperAdminUntil?: number;
+  /** When authentication asked the maker's standing, passed on as it came. */
+  keyStandingAskedAt?: number;
+}
+
+/**
+ * The grants, roles and super-admin authority a key authentication accepted
+ * acts with for this request. The one resolution REST authentication and
+ * `checkApiKey` share, so a scope made from either is the same scope, judged
+ * the same at every way in.
+ */
+export async function resolveKeyCaller(
+  service: Pick<ApiKeyService, "resolveApiKeyGrants" | "resolveApiKeyRoles">,
+  key: {
+    id: string;
+    userId: string;
+    tokenType: ApiKeyTokenType;
+    roleId: string | null;
+    /** When authentication asked the maker's standing, where it says. */
+    standingAskedAt?: number;
+    /** When the key itself expires (epoch ms), where it does. */
+    expiresAt?: number | null;
+  }
+): Promise<ResolvedKeyCaller> {
+  const [grants, roles, superAdmin] = await Promise.all([
+    service.resolveApiKeyGrants(key.tokenType, key.roleId, key.userId, key.id),
+    service.resolveApiKeyRoles(key.tokenType, key.roleId, key.userId),
+    keyHoldsSuperAdmin(key.tokenType, key.userId),
+  ]);
+  // The authority ends at the first of the maker's role expiry and the key's
+  // own, so a kept scope never outlives a key fresh authentication refuses.
+  const ends = [superAdmin.until, key.expiresAt ?? undefined].filter(
+    (at): at is number => at !== undefined
+  );
+  const until = ends.length > 0 ? Math.min(...ends) : undefined;
+  return {
+    grants,
+    roles,
+    keyHoldsSuperAdmin: superAdmin.holds,
+    ...(!superAdmin.holds || until === undefined
+      ? {}
+      : { keyHoldsSuperAdminUntil: until }),
+    ...(key.standingAskedAt === undefined
+      ? {}
+      : { keyStandingAskedAt: key.standingAskedAt }),
+  };
+}
+
+export class ApiKeyService extends BaseService {
+  private apiKeysTable:
+    | typeof apiKeysPg
+    | typeof apiKeysMysql
+    | typeof apiKeysSqlite;
+  private rolesTable: typeof rolesPg | typeof rolesMysql | typeof rolesSqlite;
+  private userRolesTable:
+    | typeof userRolesPg
+    | typeof userRolesMysql
+    | typeof userRolesSqlite;
+  private rolePermissionsTable:
+    | typeof rolePermissionsPg
+    | typeof rolePermissionsMysql
+    | typeof rolePermissionsSqlite;
+  private permissionsTable:
+    | typeof permissionsPg
+    | typeof permissionsMysql
+    | typeof permissionsSqlite;
+  private usersTable: typeof usersPg | typeof usersMysql | typeof usersSqlite;
+
+  constructor(adapter: DrizzleAdapter, logger: Logger) {
+    super(adapter, logger);
+
+    switch (this.dialect) {
+      case "postgresql":
+      case "mysql":
+      case "sqlite": {
+        // The loaded dialect's own tables, so only that dialect's files are
+        // imported; `createAdapter` loads them.
+        const tables = loadedDialect(this.dialect).tables;
+        this.apiKeysTable = tables.apiKeys;
+        this.rolesTable = tables.roles;
+        this.userRolesTable = tables.userRoles;
+        this.rolePermissionsTable = tables.rolePermissions;
+        this.permissionsTable = tables.permissions;
+        this.usersTable = tables.users;
+        break;
+      }
+      default:
+        // `this.dialect` is narrowed to `never` here after the exhaustive switch;
+        // wrap in String() to satisfy @typescript-eslint/restrict-template-expressions.
+        throw new Error(`Unsupported dialect: ${String(this.dialect)}`);
+    }
+  }
+
+  /**
+   * Create a new API key for a user.
+   *
+   * The raw key is returned exactly once in the result. It is NOT stored and
+   * cannot be retrieved again — the caller must surface it to the user immediately.
+   *
+   * For role-based keys, validates that the target role's permissions are a
+   * subset of the creator's permissions (permission ceiling enforcement).
+   *
+   * @param userId - ID of the user creating the key
+   * @param input - Key creation parameters
+   * @returns Object containing the key metadata and the raw key string
+   *
+   * @throws NextlyError(VALIDATION_ERROR) if roleId is missing/extraneous for the token type
+   * @throws NextlyError(API_KEY_ROLE_ABOVE_CREATOR) if the role's permissions exceed the creator's
+   * @throws NextlyError via fromDatabaseError on DB constraint violations
+   */
+  async createApiKey(
+    userId: string,
+    input: CreateApiKeyInput
+  ): Promise<{ meta: ApiKeyMeta; key: string }> {
+    await this.assertCreatable(userId, input.tokenType, input.roleId ?? null);
+
+    const { fullKey, keyHash, keyPrefix } = generateApiKey();
+    const id = randomUUID();
+    const now = new Date();
+    const expiresAt = this.resolveExpiresAt(input.expiresIn);
+
+    try {
+      await this.db.insert(this.apiKeysTable).values({
+        id,
+        name: input.name,
+        description: input.description ?? null,
+        keyHash,
+        keyPrefix,
+        tokenType: input.tokenType,
+        roleId: input.roleId ?? null,
+        userId,
+        expiresAt,
+        lastUsedAt: null,
+        isActive: true,
+        createdAt: now,
+        updatedAt: now,
+      });
+    } catch (error) {
+      // Map any DB error (unique-violation on keyHash, etc.) to a generic
+      // NextlyError. Driver text never leaks to the wire. Normalise raw
+      // driver errors via toDbError(dialect) so unique/fk/etc. classify
+      // correctly instead of collapsing to INTERNAL_ERROR.
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, error));
+    }
+
+    const meta = await this.getApiKeyById(id, userId, { allUsers: true });
+    if (!meta) {
+      // This is an internal invariant violation: we just inserted the row
+      // but cannot read it back. Identifier (id, userId) goes to logContext.
+      throw NextlyError.internal({
+        logContext: {
+          message: "Failed to retrieve created API key",
+          keyId: id,
+          userId,
+        },
+      });
+    }
+
+    return { meta, key: fullKey };
+  }
+
+  /**
+   * List API keys for a user, ordered by creation date (newest first).
+   *
+   * @param userId - The requesting user's ID (used to filter keys when not allUsers)
+   * @param opts.allUsers - When true, returns keys for all users (for super-admin callers)
+   * @returns Array of key metadata (raw key and hash are never returned)
+   */
+  /**
+   * What a key created now by `userId`, with this type and role, would be
+   * able to do: the grants the form shows before creation.
+   *
+   * Refused exactly as creating that key would be (a role-based key with no
+   * role, a role for another type, a role above its creator), and answered
+   * by the same resolution a key's requests use, without caching, since no
+   * key exists yet. A read-only or full-access key follows its creator, so
+   * this is the answer for now: it changes as their permissions do.
+   *
+   * @experimental The key form's summary; may change while that screen does.
+   */
+  async previewApiKeyGrants(
+    userId: string,
+    input: { tokenType: ApiKeyTokenType; roleId?: string | null }
+  ): Promise<readonly GrantedPermission[]> {
+    const roleId = input.roleId ?? null;
+    await this.assertCreatable(userId, input.tokenType, roleId);
+    const { rows } = await this.resolveGrantRows(
+      input.tokenType,
+      roleId,
+      userId
+    );
+    return Object.freeze(dedupeGrants(rows).map(row => Object.freeze(row)));
+  }
+
+  /**
+   * Whether `userId` may create a key of this type and role: the checks a
+   * creation runs before it writes anything, and a summary runs before it
+   * answers.
+   */
+  private async assertCreatable(
+    userId: string,
+    tokenType: ApiKeyTokenType,
+    roleId: string | null
+  ): Promise<void> {
+    if (tokenType === "role-based" && !roleId) {
+      // §13.8: validation messages name the field, never the value. The bad
+      // tokenType context goes to logContext for operators to debug.
+      throw NextlyError.validation({
+        errors: [
+          {
+            path: "roleId",
+            code: "REQUIRED",
+            message: "roleId is required when tokenType is 'role-based'.",
+          },
+        ],
+        logContext: { tokenType: tokenType },
+      });
+    }
+    if (tokenType !== "role-based" && roleId) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path: "roleId",
+            code: "INVALID",
+            message:
+              "roleId must not be set when tokenType is not 'role-based'.",
+          },
+        ],
+        logContext: { tokenType: tokenType },
+      });
+    }
+
+    // A role that does not exist names nothing a key could act as. Refused
+    // here, before the ceiling (which lets a super-admin through without
+    // reading the role), so a summary and a creation refuse it alike.
+    if (tokenType === "role-based" && roleId) {
+      const found = await this.db
+        .select({ id: this.rolesTable.id })
+        .from(this.rolesTable)
+        .where(eq(this.rolesTable.id, roleId))
+        .limit(1);
+      if ((found as Array<{ id: string }>).length === 0) {
+        throw NextlyError.validation({
+          errors: [
+            {
+              path: "roleId",
+              code: "INVALID",
+              message: "roleId does not name a role.",
+            },
+          ],
+          logContext: { tokenType },
+        });
+      }
+      // The Public role is what visitors hold, never a key's.
+      await refuseLinkingPublicRole(
+        this.db as LastSuperAdminTx,
+        this.dialect,
+        [roleId],
+        "assign",
+        { userId }
+      );
+    }
+
+    await this.checkPermissionCeiling(userId, tokenType, roleId);
+  }
+
+  async listApiKeys(
+    userId: string,
+    opts?: { allUsers?: boolean }
+  ): Promise<ApiKeyMeta[]> {
+    let query = this.selectMeta();
+
+    if (!opts?.allUsers) {
+      query = query.where(eq(this.apiKeysTable.userId, userId));
+    }
+
+    const rows = await query.orderBy(desc(this.apiKeysTable.createdAt));
+    return (rows as ApiKeyRow[]).map(row => this.toMeta(row));
+  }
+
+  /**
+   * The key `id`, as `userId` may reach it: their own only, or any owner's
+   * with `allUsers`. One predicate for reading, updating and revoking, so the
+   * row a check found is the row the write changes.
+   */
+  private keyOwnedBy(
+    id: string,
+    userId: string,
+    opts?: { allUsers?: boolean }
+  ) {
+    return opts?.allUsers
+      ? eq(this.apiKeysTable.id, id)
+      : and(eq(this.apiKeysTable.id, id), eq(this.apiKeysTable.userId, userId));
+  }
+
+  /**
+   * Get a single API key by ID.
+   *
+   * @param id - The API key ID
+   * @param userId - The requesting user's ID
+   * @param opts.allUsers - When true, skips the ownership check
+   * @returns Key metadata, or null if not found (or not owned by userId)
+   */
+  async getApiKeyById(
+    id: string,
+    userId: string,
+    opts?: { allUsers?: boolean }
+  ): Promise<ApiKeyMeta | null> {
+    const rows = await this.selectMeta()
+      .where(this.keyOwnedBy(id, userId, opts))
+      .limit(1);
+
+    if ((rows as ApiKeyRow[]).length === 0) return null;
+    return this.toMeta((rows as ApiKeyRow[])[0]);
+  }
+
+  /**
+   * Update an API key's name and/or description.
+   *
+   * Token type, role, and duration cannot be changed after creation.
+   * To change those fields, revoke the key and create a new one.
+   *
+   * Only the key's owner can update it, unless `opts.allUsers` says the
+   * caller may change anyone's keys (the holder of the permission to update
+   * keys, or trusted server code).
+   *
+   * @param id - The API key ID
+   * @param userId - The requesting user's ID (the key owner, without `allUsers`)
+   * @param input - Fields to update (name, description)
+   * @param opts.allUsers - When true, skips the ownership check
+   * @returns Updated key metadata
+   *
+   * @throws NextlyError(NOT_FOUND) if key doesn't exist or is not owned by userId
+   */
+  async updateApiKey(
+    id: string,
+    userId: string,
+    input: UpdateApiKeyInput,
+    opts?: { allUsers?: boolean }
+  ): Promise<ApiKeyMeta> {
+    const existing = await this.getApiKeyById(id, userId, opts);
+    if (!existing) {
+      // §13.8: never leak entity identifiers in publicMessage. Generic "Not found."
+      // is provided by the factory; the id moves to logContext for operators.
+      throw NextlyError.notFound({ logContext: { keyId: id, userId } });
+    }
+
+    const now = new Date();
+    const updateData: Record<string, unknown> = { updatedAt: now };
+
+    if (input.name !== undefined) updateData.name = input.name;
+    if (input.description !== undefined)
+      updateData.description = input.description;
+
+    try {
+      await this.db
+        .update(this.apiKeysTable)
+        .set(updateData)
+        .where(this.keyOwnedBy(id, userId, opts));
+    } catch (error) {
+      // Normalise raw driver errors so DB error kind (unique violation, etc.)
+      // is preserved when mapping to NextlyError.
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, error));
+    }
+
+    const updated = await this.getApiKeyById(id, userId, opts);
+    if (!updated) {
+      // Internal invariant: row existed before update but reads back as null.
+      throw NextlyError.internal({
+        logContext: {
+          message: "Failed to retrieve updated API key",
+          keyId: id,
+          userId,
+        },
+      });
+    }
+    return updated;
+  }
+
+  /**
+   * Revoke an API key by setting isActive = false (soft delete).
+   *
+   * The row is preserved for audit trail purposes. Revoked keys are
+   * rejected at authentication time with a 401 response.
+   *
+   * Only the key's owner can revoke it, unless `opts.allUsers` says the
+   * caller may revoke anyone's keys (the holder of the permission to revoke
+   * keys, or trusted server code).
+   *
+   * @param id - The API key ID
+   * @param userId - The requesting user's ID (the key owner, without `allUsers`)
+   * @param opts.allUsers - When true, skips the ownership check
+   *
+   * @throws NextlyError(NOT_FOUND) if key doesn't exist or is not owned by userId
+   */
+  async revokeApiKey(
+    id: string,
+    userId: string,
+    opts?: { allUsers?: boolean }
+  ): Promise<void> {
+    const existing = await this.getApiKeyById(id, userId, opts);
+    if (!existing) {
+      // Identifier moves to logContext — generic "Not found." in publicMessage.
+      throw NextlyError.notFound({ logContext: { keyId: id, userId } });
+    }
+
+    const now = new Date();
+    try {
+      // Through the adapter on SQLite: a plain update made while another
+      // request's transaction is open runs inside it, and that transaction's
+      // rollback would make the revoked key authenticate again.
+      await serializeOnSqlite(this.adapter, () =>
+        this.db
+          .update(this.apiKeysTable)
+          .set({ isActive: false, updatedAt: now })
+          .where(this.keyOwnedBy(id, userId, opts))
+      );
+    } catch (error) {
+      // Normalise raw driver errors before mapping so the right NextlyError
+      // kind is produced (e.g. fk-violation → 400, not INTERNAL_ERROR).
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, error));
+    }
+  }
+
+  /**
+   * Resolve the effective permission slugs for an authenticated API key.
+   *
+   * Called by auth middleware immediately after {@link authenticateApiKey}
+   * to determine what actions the key is permitted to perform. Results are
+   * cached in-memory for {@link PERMISSIONS_CACHE_TTL_MS} (5 min) keyed by
+   * `"apikey:{keyId}"`. Call {@link invalidatePermissionsCache} to evict.
+   *
+   * Token type semantics:
+   * - **read-only** — creator's full permission set, filtered to `read-*` slugs only
+   * - **full-access** — creator's full permission set (all slugs)
+   * - **role-based** — the assigned role's permission set.
+   *   If the role has been deleted (`roleId === null`), returns `[]` and logs a warning.
+   *
+   * A super-admin creator's "full permission set" is the catalogue, every
+   * permission the install declares, because a super-admin's power is a bypass
+   * and the role's own rows are the ones that existed at setup. The key's kind
+   * still bounds it: read-only stays read-only.
+   *
+   * @param tokenType - The key's token type
+   * @param roleId - The assigned role ID (only relevant for "role-based" keys)
+   * @param userId - The key creator's user ID
+   * @param keyId - The API key's own ID (used for cache keying and log messages)
+   * @returns Array of permission slugs (e.g. `["read-posts", "read-users"]`)
+   *
+   * @example
+   * ```typescript
+   * const auth = await apiKeyService.authenticateApiKey(rawKey);
+   * if (!auth) return Response.json({ error: "Unauthorized" }, { status: 401 });
+   * const permissions = await apiKeyService.resolveApiKeyPermissions(
+   *   auth.tokenType, auth.roleId, auth.userId, auth.id
+   * );
+   * // permissions → ["read-posts", "read-users", ...]
+   * ```
+   */
+  async resolveApiKeyPermissions(
+    tokenType: ApiKeyTokenType,
+    roleId: string | null,
+    userId: string,
+    keyId: string
+  ): Promise<string[]> {
+    const grants = await this.resolveApiKeyGrants(
+      tokenType,
+      roleId,
+      userId,
+      keyId
+    );
+    return grants.map(grant => grant.slug);
+  }
+
+  /**
+   * The key's grants, as the rows they were resolved from.
+   *
+   * Rows rather than slugs, because a slug cannot be split back into the
+   * action and resource it grants, and the scope keeps both for whatever
+   * asks of the key. A rule judging the key is handed each grant's stored
+   * slug, the one its coarse permission check tests.
+   *
+   * Returns a COPY. The cached arrays are shared by every request this key
+   * makes for the TTL, and the scope built from them is handed to plugin route
+   * handlers — which `ctx.authenticatedScope` invites to narrow it. Handing out
+   * the cached array made such a narrowing edit the key's real grants until the
+   * entry expired, so a handler restricting one call could deny the key
+   * everything for five minutes.
+   */
+  async resolveApiKeyGrants(
+    tokenType: ApiKeyTokenType,
+    roleId: string | null,
+    userId: string,
+    keyId: string
+  ): Promise<readonly GrantedPermission[]> {
+    const cacheKey = `apikey:${keyId}`;
+    // Read BEFORE the queries below, never after. An invalidation that lands
+    // while they are in flight would otherwise be stamped onto the result they
+    // return: the rows were read under the old revision and would be filed
+    // under the new one, so the next request reuses grants the change was
+    // meant to retire, for the whole TTL. Captured here, that entry is already
+    // behind when it is written and the next read re-resolves.
+    //
+    // Refreshed rather than read, which is what makes the comparison below
+    // answer for the INSTALL rather than for this process. These grants are a
+    // copy of the catalogue held for five minutes, and a role revoked on
+    // another instance has to retire them here too.
+    const resolvedUnder = await refreshEpoch();
+
+    // Read AFTER the refresh, not before it. That refresh can wait — on a slow
+    // database, or behind another forced read it queued for — and an age taken
+    // beforehand is the age the entry had when the request started rather than
+    // when it is being served, so an entry that expired during the wait passes
+    // the window one more time.
+    const now = Date.now();
+
+    const cached = _apiKeyPermissionsCache.get(cacheKey);
+    if (cached && keyGrantsServable(cached, now)) {
+      return cached.grants;
+    }
+
+    // Guard: referenced role was deleted via onDelete: "set null"
+    if (tokenType === "role-based" && !roleId) {
+      this.logger.warn(
+        `API key ${keyId} is role-based but its role has been deleted — all requests will be denied`,
+        { keyId }
+      );
+      return Object.freeze([]);
+    }
+    const { rows, validUntil } = await this.resolveGrantRows(
+      tokenType,
+      roleId,
+      userId
+    );
+
+    // Frozen rather than copied per caller. The array and its rows are shared
+    // by every request this key makes for the TTL, and a caller narrowing its
+    // own scope used to edit the key's real grants through exactly this
+    // reference. `narrowScope` returns a new scope instead, so nothing needs to
+    // write here and nothing may.
+    const grants = Object.freeze(
+      dedupeGrants(rows).map(row => Object.freeze(row))
+    );
+    _apiKeyPermissionsCache.set(cacheKey, {
+      grants,
+      cachedAt: now,
+      revision: resolvedUnder,
+      validUntil,
+    });
+    return grants;
+  }
+
+  /**
+   * Evict a single API key's resolved permissions from the shared in-memory cache.
+   *
+   * Delegates to the module-level {@link invalidateApiKeyPermissionsCache} so that
+   * callers who hold a service reference (e.g. REST handlers) can use either form.
+   *
+   * @param keyId - The API key ID whose cache entry should be evicted
+   */
+  /**
+   * The permission rows a key of this type and role grants, uncached: the one
+   * resolution both a key's requests and the pre-creation summary use.
+   *
+   * A role-based key grants its role's rows, and one whose role is gone
+   * grants nothing. A read-only or full-access key grants its creator's live
+   * permissions, read-only keeping only the `read-*` ones; `validUntil` is
+   * when one of the creator's roles lapses, after which the answer must be
+   * read again.
+   */
+  private async resolveGrantRows(
+    tokenType: ApiKeyTokenType,
+    roleId: string | null,
+    userId: string
+  ): Promise<{ rows: GrantedPermission[]; validUntil?: number }> {
+    const resolved = await this.resolveGrantRowsOfKind(
+      tokenType,
+      roleId,
+      userId
+    );
+    // No key holds `publish-without-review-<slug>`, whatever its type, role or creator: publishing
+    // past a workflow is a person's act, and a key may act for an agent. Dropped here, where every
+    // key's grants and every summary of them are resolved, so no route that grants a role a
+    // permission, or gives its creator one, can put it within a key's reach.
+    return {
+      ...resolved,
+      rows: resolved.rows.filter(row => !isPublishWithoutReview(row)),
+    };
+  }
+
+  /** {@link resolveGrantRows} before the permissions no key holds are dropped. */
+  private async resolveGrantRowsOfKind(
+    tokenType: ApiKeyTokenType,
+    roleId: string | null,
+    userId: string
+  ): Promise<{ rows: GrantedPermission[]; validUntil?: number }> {
+    // A role-based key holds its role directly, not through an assignment that
+    // can lapse, so only a user-based key's answer has an end of this kind.
+    if (tokenType === "role-based") {
+      return {
+        rows: roleId ? await this.resolveRolePermissionRows(roleId) : [],
+      };
+    }
+    // A super-admin's power is a bypass, not a list. The role is granted
+    // every permission that exists when the install is set up and nothing
+    // grants it the ones a later collection adds, while the session never
+    // needs the rows. A key copies the rows, so a key of theirs held a stale
+    // subset at best and, on an install whose first user came before the
+    // grant, nothing: every request refused, and the first key an operator
+    // mints to try an integration with. The catalogue is what their key
+    // copies, bounded by the key's kind like anyone else's. Whether they are
+    // one is the session bypass's own question, asked of its own resolver:
+    // a role that inherits super-admin answers yes there, so it answers yes
+    // here, where a direct read of `user_roles` said no.
+    //
+    // The owner's next role expiry is read BEFORE the grants. Read after, a
+    // role lapsing between the two reads would leave its grants in the entry
+    // and its expiry out of it, and the entry would outlive the role.
+    const { validUntil } = await resolveUserRoles(userId);
+    const all = (await isSuperAdmin(userId))
+      ? await this.resolveCataloguePermissionRows()
+      : await this.resolveUserPermissionRows(userId);
+    // Still filtered on the STORED slug rather than on `action === "read"`.
+    // A deliberately custom slug is supported, so the two disagree — a row
+    // named `view-dashboard` on action `read` is excluded by the slug test
+    // and included by the action test, and widening what a read-only key
+    // holds is not this change's business.
+    const rows =
+      tokenType === "read-only"
+        ? all.filter(row => row.slug.startsWith("read-"))
+        : all;
+    return { rows, validUntil };
+  }
+
+  invalidatePermissionsCache(keyId: string): void {
+    invalidateApiKeyPermissionsCache(keyId);
+  }
+
+  /**
+   * Resolve the role slugs that apply to an authenticated API key.
+   *
+   * Called by auth middleware alongside {@link resolveApiKeyPermissions} to
+   * populate `AuthContext.roles` for API key requests. This ensures that
+   * code-defined access functions checking `ctx.roles.includes('editor')`
+   * work identically for both session and API key auth.
+   *
+   * Token type semantics:
+   * - **role-based** — `[selectedRole.slug]`. Single lookup by the assigned `roleId`.
+   *   If the role has been deleted (`roleId === null`), returns `[]`.
+   * - **full-access / read-only** — creator's full assigned role slugs, resolved
+   *   via `listRoleSlugsForUserOrRefuse()`. Same set the user would see in a
+   *   session context, and a lookup that could not run refuses instead of
+   *   answering with none.
+   *
+   * @param tokenType - The key's token type
+   * @param roleId - The assigned role ID (only relevant for "role-based" keys)
+   * @param userId - The key creator's user ID
+   * @returns Array of role slugs (e.g. `["editor"]` or `["super-admin", "editor"]`)
+   */
+  async resolveApiKeyRoles(
+    tokenType: ApiKeyTokenType,
+    roleId: string | null,
+    userId: string
+  ): Promise<string[]> {
+    if (tokenType === "role-based") {
+      if (!roleId) return [];
+
+      const rows = await this.db
+        .select({ slug: this.rolesTable.slug })
+        .from(this.rolesTable)
+        .where(eq(this.rolesTable.id, roleId))
+        .limit(1);
+      return rows.length > 0
+        ? [(rows[0] as Record<string, unknown>).slug as string]
+        : [];
+    }
+
+    // The refusing resolver, not the swallowing one. A key's roles populate
+    // `authenticatedScope.roles`, which every later role rule reads directly,
+    // so a failed lookup arriving as `[]` is indistinguishable from an owner
+    // who holds no roles — and a rule that WITHHOLDS on a role
+    // (`!roles.includes("suspended")`) then authorizes the request it exists
+    // to refuse. Failing the request is the correct direction: a decision taken
+    // on roles nobody could read is not a decision.
+    return listRoleSlugsForUserOrRefuse(userId);
+  }
+
+  private async resolveRolePermissionRows(
+    roleId: string
+  ): Promise<GrantedPermission[]> {
+    const rows = await this.db
+      .select({
+        slug: this.permissionsTable.slug,
+        action: this.permissionsTable.action,
+        resource: this.permissionsTable.resource,
+      })
+      .from(this.rolePermissionsTable)
+      .innerJoin(
+        this.permissionsTable,
+        eq(this.rolePermissionsTable.permissionId, this.permissionsTable.id)
+      )
+      .where(eq(this.rolePermissionsTable.roleId, roleId));
+
+    return rows as GrantedPermission[];
+  }
+
+  /**
+   * Every permission the install declares today, orphans left out.
+   *
+   * Read from the catalogue rather than from any role, because no role is
+   * kept complete: the super-admin role is granted the rows that exist at
+   * setup and never the ones a later collection adds. A permission a package
+   * stopped declaring stays in the table, marked, so a grant survives; a
+   * super-admin's key does not inherit it, since nothing else new can.
+   */
+  private async resolveCataloguePermissionRows(): Promise<GrantedPermission[]> {
+    const rows = await this.db
+      .select({
+        slug: this.permissionsTable.slug,
+        action: this.permissionsTable.action,
+        resource: this.permissionsTable.resource,
+      })
+      .from(this.permissionsTable)
+      .where(isNull(this.permissionsTable.orphanedAt));
+    return rows as GrantedPermission[];
+  }
+
+  private async resolveUserPermissionRows(
+    userId: string
+  ): Promise<GrantedPermission[]> {
+    const rows = await this.db
+      .select({
+        slug: this.permissionsTable.slug,
+        action: this.permissionsTable.action,
+        resource: this.permissionsTable.resource,
+      })
+      .from(this.userRolesTable)
+      .innerJoin(
+        this.rolePermissionsTable,
+        eq(this.userRolesTable.roleId, this.rolePermissionsTable.roleId)
+      )
+      .innerJoin(
+        this.permissionsTable,
+        eq(this.rolePermissionsTable.permissionId, this.permissionsTable.id)
+      )
+      // Only the owner's assignments in force: a lapsed role grants a key
+      // nothing, as it grants its owner nothing.
+      .where(
+        userRoleAssignmentsInForce(this.userRolesTable, userId, new Date())
+      );
+
+    return rows as GrantedPermission[];
+  }
+
+  /**
+   * Validate an incoming raw API key from a request header.
+   *
+   * Called by auth middleware on every request that presents a
+   * `Authorization: Bearer nx_live_...` header. Designed for the hot path:
+   * - Single SELECT of the key's own columns, no JOIN
+   * - Unique index hit on `keyHash` (O(1) lookup)
+   * - The creator's active flag from the per-process account-standing cache,
+   *   which reads the user row at most once per few seconds per person
+   * - A `lastUsedAt` write at most once a minute per key, made before the
+   *   request is answered
+   *
+   * Returns `null` for any failure case (not found, revoked, expired) so the
+   * middleware can respond with a uniform 401 without leaking the reason.
+   * Which one it was is told to `onRefused`, for the server's log.
+   *
+   * @param rawKey - The full raw key from the `Authorization: Bearer` header
+   * @param onRefused - Told why the key does not authenticate, when it does not
+   * @returns Auth tuple `{ id, userId, tokenType, roleId }` on success, or `null`
+   *
+   * @example
+   * ```typescript
+   * const result = await apiKeyService.authenticateApiKey(rawKey);
+   * if (!result) return Response.json({ error: "Unauthorized" }, { status: 401 });
+   * const permissions = await apiKeyService.resolveApiKeyPermissions(
+   *   result.tokenType, result.roleId, result.userId, result.id
+   * );
+   * ```
+   */
+  async authenticateApiKey(
+    rawKey: string,
+    onRefused?: (cause: ApiKeyRefusalCause) => void
+  ): Promise<{
+    id: string;
+    userId: string;
+    tokenType: ApiKeyTokenType;
+    roleId: string | null;
+    /**
+     * When the maker's standing was asked (`performance.now()`), taken just
+     * before the ask: the bound on any authority a scope made from this key
+     * carries counts from here, not from when the scope is made.
+     */
+    standingAskedAt: number;
+    /**
+     * When the key itself expires (epoch ms), or null where it does not: any
+     * authority a scope made from it carries ends there too.
+     */
+    expiresAt: number | null;
+  } | null> {
+    const keyHash = hashApiKey(rawKey);
+
+    const rows = await this.db
+      .select({
+        id: this.apiKeysTable.id,
+        userId: this.apiKeysTable.userId,
+        tokenType: this.apiKeysTable.tokenType,
+        roleId: this.apiKeysTable.roleId,
+        expiresAt: this.apiKeysTable.expiresAt,
+        lastUsedAt: this.apiKeysTable.lastUsedAt,
+        // Read rather than filtered on, so a revoked key is told from one
+        // that was never issued.
+        isActive: this.apiKeysTable.isActive,
+      })
+      .from(this.apiKeysTable)
+      .where(eq(this.apiKeysTable.keyHash, keyHash))
+      .limit(1);
+
+    type AuthRow = {
+      id: string;
+      userId: string;
+      tokenType: string;
+      roleId: string | null;
+      expiresAt: Date | number | null;
+      lastUsedAt: Date | number | null;
+      isActive: boolean | number;
+    };
+    const refused = (cause: ApiKeyRefusalCause): null => {
+      onRefused?.(cause);
+      return null;
+    };
+    if ((rows as AuthRow[]).length === 0) return refused("unknown");
+
+    const row = (rows as AuthRow[])[0];
+    if (!row.isActive) return refused("revoked");
+
+    // Normalise expiresAt — SQLite returns numeric timestamps, PG/MySQL return Date objects
+    const expiresAt: Date | null =
+      row.expiresAt instanceof Date
+        ? row.expiresAt
+        : row.expiresAt != null
+          ? new Date(row.expiresAt)
+          : null;
+
+    if (isKeyExpired(expiresAt)) return refused("expired");
+
+    // A key acts with its creator's authority, so it is refused while the
+    // creator is deactivated and works again once they are reactivated. Read
+    // through the account-standing cache sessions use, so a deactivation is
+    // refused at once on the instance that made it and within the cache's
+    // lifetime elsewhere. A failed read throws rather than admitting the key.
+    const standingAskedAt = performance.now();
+    if (!(await accountIsActive(row.userId))) {
+      return refused("creator-inactive");
+    }
+
+    await this.recordLastUse(row.id, row.lastUsedAt);
+
+    return {
+      id: row.id,
+      userId: row.userId,
+      tokenType: row.tokenType as ApiKeyTokenType,
+      roleId: row.roleId ?? null,
+      standingAskedAt,
+      expiresAt: expiresAt === null ? null : expiresAt.getTime(),
+    };
+  }
+
+  /**
+   * Record that the key was used now, when the record is more than
+   * {@link LAST_USE_RESOLUTION_MS} old.
+   *
+   * Awaited, so the write is made before the request it records is answered:
+   * a serverless runtime may freeze or end the invocation once the response
+   * is out, and a write still pending then is lost. Once per resolution
+   * rather than on every request, so a busy key costs one write a minute. A
+   * failed write is logged and never refuses the key it records.
+   */
+  private async recordLastUse(
+    keyId: string,
+    recorded: Date | number | null
+  ): Promise<void> {
+    const at = Date.now();
+    const last =
+      recorded instanceof Date
+        ? recorded.getTime()
+        : recorded != null
+          ? new Date(recorded).getTime()
+          : null;
+    if (last !== null && at - last < LAST_USE_RESOLUTION_MS) return;
+    try {
+      // The cutoff is in the write's own condition too: requests with one key
+      // at once each read the old record and pass the check above, and only
+      // the first to land writes. It also keeps the record moving forward,
+      // since an older request's time is never a minute past a newer one.
+      //
+      // On SQLite every request shares one connection, so a write issued
+      // while another request's transaction is open would run inside it and
+      // be undone by its rollback; queued behind it, it commits on its own.
+      await serializeOnSqlite(this.adapter, () =>
+        this.db
+          .update(this.apiKeysTable)
+          .set({ lastUsedAt: new Date(at) })
+          .where(
+            and(
+              eq(this.apiKeysTable.id, keyId),
+              or(
+                isNull(this.apiKeysTable.lastUsedAt),
+                lt(
+                  this.apiKeysTable.lastUsedAt,
+                  new Date(at - LAST_USE_RESOLUTION_MS)
+                )
+              )
+            )
+          )
+      );
+    } catch (error) {
+      this.logger.warn("API key last use could not be recorded", {
+        keyId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /**
+   * The columns every key's metadata is read with, and the joins that name its
+   * role and its owner. One selection for the list and for a single key, so
+   * the two can never describe the same key differently.
+   */
+  private selectMeta() {
+    return this.db
+      .select({
+        id: this.apiKeysTable.id,
+        name: this.apiKeysTable.name,
+        description: this.apiKeysTable.description,
+        keyPrefix: this.apiKeysTable.keyPrefix,
+        tokenType: this.apiKeysTable.tokenType,
+        roleId: this.apiKeysTable.roleId,
+        roleName: this.rolesTable.name,
+        roleSlug: this.rolesTable.slug,
+        ownerId: this.usersTable.id,
+        ownerName: this.usersTable.name,
+        ownerEmail: this.usersTable.email,
+        expiresAt: this.apiKeysTable.expiresAt,
+        lastUsedAt: this.apiKeysTable.lastUsedAt,
+        isActive: this.apiKeysTable.isActive,
+        createdAt: this.apiKeysTable.createdAt,
+        updatedAt: this.apiKeysTable.updatedAt,
+      })
+      .from(this.apiKeysTable)
+      .leftJoin(
+        this.rolesTable,
+        eq(this.apiKeysTable.roleId, this.rolesTable.id)
+      )
+      .leftJoin(
+        this.usersTable,
+        eq(this.apiKeysTable.userId, this.usersTable.id)
+      );
+  }
+
+  private toMeta(row: ApiKeyRow): ApiKeyMeta {
+    return {
+      id: row.id,
+      name: row.name,
+      description: row.description ?? null,
+      keyPrefix: row.keyPrefix,
+      tokenType: row.tokenType as ApiKeyTokenType,
+      role:
+        row.roleId != null && row.roleName != null
+          ? {
+              id: row.roleId,
+              name: row.roleName,
+              slug: row.roleSlug as string,
+            }
+          : null,
+      owner:
+        row.ownerId != null && row.ownerEmail != null
+          ? {
+              id: row.ownerId,
+              name: row.ownerName ?? null,
+              email: row.ownerEmail,
+            }
+          : null,
+      expiresAt:
+        row.expiresAt != null
+          ? row.expiresAt instanceof Date
+            ? row.expiresAt.toISOString()
+            : String(row.expiresAt)
+          : null,
+      lastUsedAt:
+        row.lastUsedAt != null
+          ? row.lastUsedAt instanceof Date
+            ? row.lastUsedAt.toISOString()
+            : String(row.lastUsedAt)
+          : null,
+      isActive: Boolean(row.isActive),
+      createdAt:
+        row.createdAt instanceof Date
+          ? row.createdAt.toISOString()
+          : String(row.createdAt),
+      updatedAt:
+        row.updatedAt instanceof Date
+          ? row.updatedAt.toISOString()
+          : String(row.updatedAt),
+    };
+  }
+
+  private resolveExpiresAt(expiresIn: ExpiresIn): Date | null {
+    if (expiresIn === "unlimited") return null;
+    const msPerDay = 24 * 60 * 60 * 1000;
+    const daysMap: Record<string, number> = {
+      "7d": 7,
+      "30d": 30,
+      "90d": 90,
+    };
+    const days = daysMap[expiresIn];
+    if (!days) return null;
+    // The whole second the instant falls in: a column that keeps whole
+    // seconds rounds milliseconds rather than cutting them, which would
+    // store the key as living longer than issued.
+    return wholeSecondExpiry(new Date(Date.now() + days * msPerDay));
+  }
+
+  private async checkPermissionCeiling(
+    creatorId: string,
+    tokenType: ApiKeyTokenType,
+    roleId: string | null
+  ): Promise<void> {
+    if (tokenType !== "role-based") return;
+    if (!roleId) return;
+
+    // Super-admin bypass: a super-admin can assign any role. Asked of the
+    // same resolver as the session bypass, so a role that INHERITS super-admin
+    // counts here exactly as it does there; a direct-row read of `user_roles`
+    // said no to such a creator while every other gate said yes.
+    if (await isSuperAdmin(creatorId)) return;
+
+    // The roles the creator holds now: a lapsed one sets no ceiling to mint
+    // a key under.
+    const creatorRoleRows = await this.db
+      .select({ roleId: this.userRolesTable.roleId })
+      .from(this.userRolesTable)
+      .where(
+        userRoleAssignmentsInForce(this.userRolesTable, creatorId, new Date())
+      );
+
+    const creatorRoleIds = (creatorRoleRows as Array<{ roleId: string }>).map(
+      r => r.roleId
+    );
+
+    const creatorPerms = new Set<string>();
+    if (creatorRoleIds.length > 0) {
+      const creatorPermRows = await this.db
+        .select({
+          action: this.permissionsTable.action,
+          resource: this.permissionsTable.resource,
+        })
+        .from(this.rolePermissionsTable)
+        .innerJoin(
+          this.permissionsTable,
+          eq(this.rolePermissionsTable.permissionId, this.permissionsTable.id)
+        )
+        .where(inArray(this.rolePermissionsTable.roleId, creatorRoleIds));
+
+      for (const row of creatorPermRows as Array<{
+        action: string;
+        resource: string;
+      }>) {
+        creatorPerms.add(`${row.resource}:${row.action}`);
+      }
+    }
+
+    const rolePermRows = await this.db
+      .select({
+        action: this.permissionsTable.action,
+        resource: this.permissionsTable.resource,
+      })
+      .from(this.rolePermissionsTable)
+      .innerJoin(
+        this.permissionsTable,
+        eq(this.rolePermissionsTable.permissionId, this.permissionsTable.id)
+      )
+      .where(eq(this.rolePermissionsTable.roleId, roleId));
+
+    for (const row of rolePermRows as Array<{
+      action: string;
+      resource: string;
+    }>) {
+      const slug = `${row.resource}:${row.action}`;
+      if (!creatorPerms.has(slug)) {
+        // §13.8: forbidden messages must not reveal *which* permission was
+        // missing — that would leak the policy. The sentence is FORBIDDEN's
+        // own; the offending slug and creator/role context move to
+        // logContext for operators. The code is this refusal's own, so the
+        // key form can tell "choose a smaller role" from "you may not create
+        // keys", which is plain FORBIDDEN.
+        throw NextlyError.apiKeyRoleAboveCreator({
+          logContext: {
+            reason: "permission-ceiling-exceeded",
+            exceededPermission: slug,
+            roleId,
+            creatorId,
+          },
+        });
+      }
+    }
+  }
+}

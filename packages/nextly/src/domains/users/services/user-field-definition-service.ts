@@ -1,0 +1,712 @@
+/**
+ * User Field Definition Service
+ *
+ * CRUD operations for managing user field definitions stored in the
+ * `user_field_definitions` table. Supports both UI-sourced fields
+ * (fully editable in admin) and code-sourced fields (synced from
+ * `defineConfig()`, read-only in admin).
+ *
+ * Write operations (`updateField`, `deleteField`) reject code-sourced
+ * fields with a business rule error — code fields should be modified
+ * in `defineConfig()` instead.
+ *
+ * @module services/users/user-field-definition-service
+ * @since 1.0.0
+ */
+
+import { randomUUID } from "crypto";
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import { eq, and, desc, asc, inArray } from "drizzle-orm";
+
+import { loadedDialect } from "../../../database/dialect-tables";
+import { toDbError } from "../../../database/errors";
+// PR 4 of unified-error-system migration: ServiceError → NextlyError.
+import { NextlyError } from "../../../errors";
+import type { userFieldDefinitionsMysql } from "../../../schemas/user-field-definitions/mysql";
+import type { userFieldDefinitionsPg } from "../../../schemas/user-field-definitions/postgres";
+import type { userFieldDefinitionsSqlite } from "../../../schemas/user-field-definitions/sqlite";
+import type {
+  UserFieldDefinitionInsert,
+  UserFieldDefinitionRecord,
+} from "../../../schemas/user-field-definitions/types";
+import { BaseService } from "../../../services/base-service";
+import type { Logger } from "../../../services/shared";
+import { isUniqueViolation } from "../../../shared/lib/unique-violation";
+import { carriedUserFieldOptions } from "../../../shared/lib/user-field-plugin-options";
+import type { UserFieldConfig } from "../../../users";
+import {
+  checkUserFieldName,
+  checkUserFieldType,
+  userFieldColumnName,
+} from "../../../users/config/validate-user-config";
+
+// ============================================================
+// Drizzle Transaction Type
+// ============================================================
+
+/**
+ * Minimal interface for the Drizzle transaction object returned by
+ * BaseService.withTransaction. The real type is dialect-specific
+ * (NodePgTransaction / MySql2Transaction / BetterSQLite3Database),
+ * but the fluent query API is identical across all three.
+ */
+interface DrizzleTransactionLike {
+  insert(table: unknown): { values(data: unknown): Promise<unknown> };
+  update(table: unknown): {
+    set(data: unknown): { where(condition: unknown): Promise<unknown> };
+  };
+  delete(table: unknown): { where(condition: unknown): Promise<unknown> };
+}
+
+// ============================================================
+// Input Types
+// ============================================================
+
+/**
+ * Input for creating a new user field definition.
+ * Extends UserFieldDefinitionInsert (all required + optional fields).
+ */
+export type CreateUserFieldDefinitionInput = UserFieldDefinitionInsert;
+
+/**
+ * Input for updating an existing user field definition.
+ * All fields are optional — only provided fields are updated.
+ * Note: `source` cannot be changed after creation.
+ */
+export interface UpdateUserFieldDefinitionInput {
+  name?: string;
+  label?: string;
+  type?: string;
+  required?: boolean;
+  defaultValue?: string | null;
+  options?: { label: string; value: string }[] | null;
+  /**
+   * Accepted only when echoed back unchanged — the flag decides the backing
+   * column's type, which cannot change after creation.
+   */
+  hasMany?: boolean | null;
+  minLength?: number | null;
+  maxLength?: number | null;
+  minValue?: number | null;
+  maxValue?: number | null;
+  placeholder?: string | null;
+  description?: string | null;
+  sortOrder?: number;
+  isActive?: boolean;
+}
+
+// ============================================================
+// User Field Definition Service
+// ============================================================
+
+/** Union of all dialect-specific user_field_definitions table types */
+type UserFieldDefinitionsTable =
+  | typeof userFieldDefinitionsPg
+  | typeof userFieldDefinitionsMysql
+  | typeof userFieldDefinitionsSqlite;
+
+export class UserFieldDefinitionService extends BaseService {
+  /** Dialect-specific Drizzle table for user_field_definitions (resolved at construction) */
+  private userFieldDefinitions: UserFieldDefinitionsTable;
+
+  constructor(adapter: DrizzleAdapter, logger: Logger) {
+    super(adapter, logger);
+
+    switch (this.dialect) {
+      case "postgresql":
+      case "mysql":
+      case "sqlite":
+        // The loaded dialect's own table, so only that dialect's file is
+        // imported; `createAdapter` loads it.
+        this.userFieldDefinitions = loadedDialect(
+          this.dialect
+        ).tables.userFieldDefinitions;
+        break;
+      default:
+        // Wrap `this.dialect` (typed as `never` in default branch) with
+        // String() so it is safe inside a template expression.
+        throw new Error(`Unsupported dialect: ${String(this.dialect)}`);
+    }
+  }
+
+  // ============================================================
+  // CRUD Methods
+  // ============================================================
+
+  /**
+   * Reject a name that cannot back a `user_ext` column.
+   *
+   * A custom field's name becomes both a column identifier and a key on the
+   * user object, where it is assigned over the built-ins — so a field named
+   * `email` or `id` displaces the real one rather than sitting beside it.
+   * `defineConfig()` applies the same check to code-defined fields.
+   */
+  private assertUsableName(name: unknown): void {
+    const rejection = checkUserFieldName(name);
+    if (!rejection) return;
+
+    throw NextlyError.validation({
+      errors: [
+        { path: "name", code: rejection.code, message: rejection.message },
+      ],
+      logContext: { name },
+    });
+  }
+
+  /**
+   * Reject a name stored in the `user_ext` column another field already uses
+   * (`foo_bar` beside `fooBar`). The same name again is left to the unique
+   * index, as before.
+   */
+  private async assertColumnFree(name: string): Promise<void> {
+    const column = userFieldColumnName(name);
+    const rows: Array<{ name: string }> = await this.db
+      .select({ name: this.userFieldDefinitions.name })
+      .from(this.userFieldDefinitions);
+    const holder = rows.find(
+      row => row.name !== name && userFieldColumnName(row.name) === column
+    );
+    if (!holder) return;
+
+    throw NextlyError.validation({
+      errors: [
+        {
+          path: "name",
+          code: "USER_FIELD_NAME_DUPLICATE",
+          message: `Field '${name}' would be stored in the column '${column}', which the field '${holder.name}' already uses`,
+        },
+      ],
+      logContext: { name, column, holder: holder.name },
+    });
+  }
+
+  /**
+   * Reject a type that has no `user_ext` column representation.
+   */
+  private assertUsableType(type: unknown): void {
+    const rejection = checkUserFieldType(type);
+    if (!rejection) return;
+
+    throw NextlyError.validation({
+      errors: [
+        { path: "type", code: rejection.code, message: rejection.message },
+      ],
+      logContext: { type },
+    });
+  }
+
+  /**
+   * Reject a change to an existing field's name or type.
+   *
+   * Both identify the backing `user_ext` column, and the schema reconciler
+   * only ever adds columns: a rename leaves the old column and its data
+   * stranded under the old name, and a type change leaves the column at its
+   * original type. Values echoed back unchanged are accepted so that clients
+   * can send a whole field back without special-casing these two keys.
+   */
+  private assertIdentityUnchanged(
+    existing: UserFieldDefinitionRecord,
+    data: UpdateUserFieldDefinitionInput
+  ): void {
+    if (data.name !== undefined && data.name !== existing.name) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path: "name",
+            code: "USER_FIELD_NAME_IMMUTABLE",
+            message:
+              "A field's name cannot be changed after it is created. Create a new field instead.",
+          },
+        ],
+        logContext: { id: existing.id, from: existing.name, to: data.name },
+      });
+    }
+
+    if (data.type !== undefined && data.type !== existing.type) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path: "type",
+            code: "USER_FIELD_TYPE_IMMUTABLE",
+            message:
+              "A field's type cannot be changed after it is created. Create a new field instead.",
+          },
+        ],
+        logContext: { id: existing.id, from: existing.type, to: data.type },
+      });
+    }
+
+    // hasMany picks between a scalar and a json column, so it is as
+    // immutable as the type itself. Absent and echoed-back values pass.
+    if (
+      data.hasMany !== undefined &&
+      (data.hasMany ?? false) !== (existing.hasMany ?? false)
+    ) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path: "hasMany",
+            code: "USER_FIELD_HAS_MANY_IMMUTABLE",
+            message:
+              "Whether a field stores multiple values cannot be changed after it is created. Create a new field instead.",
+          },
+        ],
+        logContext: {
+          id: existing.id,
+          from: existing.hasMany,
+          to: data.hasMany,
+        },
+      });
+    }
+  }
+
+  /**
+   * Create a new user field definition.
+   *
+   * If `sortOrder` is not provided, it defaults to one higher than
+   * the current maximum sort order (appending to the end).
+   *
+   * @throws NextlyError(VALIDATION) when the name or type cannot back a column
+   * @throws NextlyError(DUPLICATE) on unique constraint violation (duplicate name)
+   */
+  async createField(
+    data: CreateUserFieldDefinitionInput
+  ): Promise<UserFieldDefinitionRecord> {
+    this.assertUsableName(data.name);
+    this.assertUsableType(data.type);
+    await this.assertColumnFree(data.name);
+
+    const id = randomUUID();
+    const now = new Date();
+
+    // Auto-assign sortOrder if not provided
+    let sortOrder = data.sortOrder;
+    if (sortOrder === undefined || sortOrder === null) {
+      sortOrder = await this.getNextSortOrder();
+    }
+
+    const values = {
+      id,
+      name: data.name,
+      label: data.label,
+      type: data.type,
+      required: data.required ?? false,
+      defaultValue: data.defaultValue ?? null,
+      options: data.options ?? null,
+      hasMany: data.hasMany ?? null,
+      minLength: data.minLength ?? null,
+      maxLength: data.maxLength ?? null,
+      minValue: data.minValue ?? null,
+      maxValue: data.maxValue ?? null,
+      placeholder: data.placeholder ?? null,
+      description: data.description ?? null,
+      sortOrder,
+      source: data.source ?? "ui",
+      isActive: data.isActive ?? true,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    try {
+      await this.db.insert(this.userFieldDefinitions).values(values);
+    } catch (error) {
+      // Normalise raw driver errors so unique-violation / fk-violation are
+      // mapped to the right kind instead of collapsing to INTERNAL_ERROR.
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, error));
+    }
+
+    return this.getField(id);
+  }
+
+  /**
+   * Get a single user field definition by ID.
+   *
+   * §13.8: public message is generic; entity name + id flow through logContext.
+   *
+   * @throws NextlyError(NOT_FOUND) if field definition doesn't exist
+   */
+  async getField(id: string): Promise<UserFieldDefinitionRecord> {
+    const results = await this.db
+      .select()
+      .from(this.userFieldDefinitions)
+      .where(eq(this.userFieldDefinitions.id, id))
+      .limit(1);
+
+    if (results.length === 0) {
+      throw NextlyError.notFound({
+        logContext: { entity: "user_field_definition", id },
+      });
+    }
+
+    return results[0] as UserFieldDefinitionRecord;
+  }
+
+  /**
+   * List all user field definitions, ordered by sort order (ascending),
+   * then by creation date (ascending) as a tiebreaker.
+   */
+  async listFields(): Promise<UserFieldDefinitionRecord[]> {
+    const results = await this.db
+      .select()
+      .from(this.userFieldDefinitions)
+      .orderBy(
+        asc(this.userFieldDefinitions.sortOrder),
+        asc(this.userFieldDefinitions.createdAt)
+      );
+
+    return results as UserFieldDefinitionRecord[];
+  }
+
+  /**
+   * Update an existing user field definition.
+   *
+   * Only UI-sourced fields can be updated. Code-sourced fields
+   * must be modified in `defineConfig()`.
+   *
+   * Note: `source` cannot be changed after creation, but `name` can be updated.
+   *
+   * @throws NextlyError(NOT_FOUND) if field definition doesn't exist
+   * @throws NextlyError(BUSINESS_RULE_VIOLATION) if field is code-sourced
+   */
+  async updateField(
+    id: string,
+    data: UpdateUserFieldDefinitionInput
+  ): Promise<UserFieldDefinitionRecord> {
+    const existing = await this.getField(id);
+
+    if (existing.source === "code") {
+      // §13.8: public message is a complete sentence with no identifiers; the
+      // field id + name go to logContext.
+      throw new NextlyError({
+        code: "BUSINESS_RULE_VIOLATION",
+        publicMessage:
+          "Cannot update code-sourced field definitions. Modify defineConfig() instead.",
+        logContext: { id, name: existing.name },
+      });
+    }
+
+    this.assertIdentityUnchanged(existing, data);
+
+    const updateData: Record<string, unknown> = {
+      updatedAt: new Date(),
+    };
+
+    if (data.name !== undefined) updateData.name = data.name;
+    if (data.label !== undefined) updateData.label = data.label;
+    if (data.type !== undefined) updateData.type = data.type;
+    if (data.required !== undefined) updateData.required = data.required;
+    if (data.defaultValue !== undefined)
+      updateData.defaultValue = data.defaultValue;
+    if (data.options !== undefined) updateData.options = data.options;
+    if (data.minLength !== undefined) updateData.minLength = data.minLength;
+    if (data.maxLength !== undefined) updateData.maxLength = data.maxLength;
+    if (data.minValue !== undefined) updateData.minValue = data.minValue;
+    if (data.maxValue !== undefined) updateData.maxValue = data.maxValue;
+    if (data.placeholder !== undefined)
+      updateData.placeholder = data.placeholder;
+    if (data.description !== undefined)
+      updateData.description = data.description;
+    if (data.sortOrder !== undefined) updateData.sortOrder = data.sortOrder;
+    if (data.isActive !== undefined) updateData.isActive = data.isActive;
+
+    try {
+      await this.db
+        .update(this.userFieldDefinitions)
+        .set(updateData)
+        .where(eq(this.userFieldDefinitions.id, id));
+    } catch (error) {
+      // Normalise raw driver errors so the kind is preserved.
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, error));
+    }
+
+    return this.getField(id);
+  }
+
+  /**
+   * Delete a user field definition.
+   *
+   * Only UI-sourced fields can be deleted. Code-sourced fields
+   * must be removed from `defineConfig()`.
+   *
+   * @throws NextlyError(NOT_FOUND) if field definition doesn't exist
+   * @throws NextlyError(BUSINESS_RULE_VIOLATION) if field is code-sourced
+   */
+  async deleteField(id: string): Promise<void> {
+    const existing = await this.getField(id);
+
+    if (existing.source === "code") {
+      // §13.8: public message is a complete sentence with no identifiers; the
+      // field id + name go to logContext.
+      throw new NextlyError({
+        code: "BUSINESS_RULE_VIOLATION",
+        publicMessage:
+          "Cannot delete code-sourced field definitions. Remove from defineConfig() instead.",
+        logContext: { id, name: existing.name },
+      });
+    }
+
+    await this.db
+      .delete(this.userFieldDefinitions)
+      .where(eq(this.userFieldDefinitions.id, id));
+  }
+
+  /**
+   * Reorder field definitions by updating `sortOrder` based on
+   * the position of each field ID in the provided array.
+   *
+   * Field IDs not in the array keep their current sort order.
+   * Uses a transaction for atomicity.
+   *
+   * @param fieldIds - Array of field IDs in the desired order
+   * @returns Updated list of all field definitions
+   */
+  async reorderFields(
+    fieldIds: string[]
+  ): Promise<UserFieldDefinitionRecord[]> {
+    const now = new Date();
+
+    await this.withTransaction(async tx => {
+      // tx is unknown from BaseService.withTransaction — cast to access Drizzle fluent API
+      const txDb = tx as DrizzleTransactionLike;
+      for (let i = 0; i < fieldIds.length; i++) {
+        await txDb
+          .update(this.userFieldDefinitions)
+          .set({ sortOrder: i, updatedAt: now })
+          .where(eq(this.userFieldDefinitions.id, fieldIds[i]));
+      }
+    });
+
+    return this.listFields();
+  }
+
+  // ============================================================
+  // Code Field Sync (Subtask 5.10.2)
+  // ============================================================
+
+  /**
+   * Sync code-defined fields from `defineConfig()` into the
+   * `user_field_definitions` table.
+   *
+   * - Upserts code fields with `source = 'code'`
+   * - Deletes stale `source = 'code'` rows no longer in config
+   * - Code fields get `sortOrder` based on array index (0, 1, 2...)
+   * - Called on startup (dev-server boot / `nextly db:sync`)
+   * - Idempotent — safe to run on every startup
+   *
+   * @param codeFields - Fields from `defineConfig().users.fields`
+   */
+  async syncCodeFields(
+    codeFields: { name: string; [key: string]: unknown }[]
+  ): Promise<void> {
+    // A configuration declaring none goes through the same comparison: it
+    // removes the code fields stored, where there are any, rather than writing a
+    // delete on every sync whether or not anything is stored.
+    codeFields = codeFields ?? [];
+
+    // Processes starting at once each find a code field missing and insert
+    // it; one wins, and the rest roll back on its name, taking every other
+    // change they meant to write with them. So a sync that lost on a
+    // duplicate runs once more, from the rows now stored: the field that won
+    // is updated rather than inserted, and the rest of this config's changes
+    // are written. A name an admin's own field holds collides again, and
+    // that, like any other failure, is thrown.
+    try {
+      await this.writeCodeFields(codeFields);
+    } catch (error) {
+      if (!isUniqueViolation(error)) throw error;
+      this.logger.debug(
+        "Code-defined user fields were written by another process; syncing again from the stored rows"
+      );
+      await this.writeCodeFields(codeFields);
+    }
+  }
+
+  /**
+   * Bring the stored code fields into line with `codeFields`, in one
+   * transaction, from the rows as they are when it starts.
+   */
+  private async writeCodeFields(
+    codeFields: { name: string; [key: string]: unknown }[]
+  ): Promise<void> {
+    // Fetch all existing code-sourced field definitions
+    const existingCodeFields: UserFieldDefinitionRecord[] = await this.db
+      .select()
+      .from(this.userFieldDefinitions)
+      .where(eq(this.userFieldDefinitions.source, "code"));
+    // None declared and none stored: nothing to compare, and no transaction
+    // to open for it.
+    if (codeFields.length === 0 && existingCodeFields.length === 0) return;
+
+    const existingByName = new Map(existingCodeFields.map(f => [f.name, f]));
+    const incomingNames = new Set(codeFields.map(f => f.name));
+
+    await this.withTransaction(async tx => {
+      // tx is unknown from BaseService.withTransaction — cast to access Drizzle fluent API
+      const txDb = tx as DrizzleTransactionLike;
+      const now = new Date();
+
+      // Upsert each code field
+      for (let i = 0; i < codeFields.length; i++) {
+        const field = codeFields[i];
+        const name = field.name;
+        const label = (field.label as string) || name;
+        const type = (field.type as string) || "text";
+        const required = (field.required as boolean) ?? false;
+        const defaultValue = (field.defaultValue as string) ?? null;
+        const options =
+          (field.options as { label: string; value: string }[]) ?? null;
+        // Presentation options live under `admin` on field configs; the flat
+        // spelling is kept for older configs that carried them at top level.
+        const admin = (field.admin ?? {}) as {
+          placeholder?: string;
+          description?: string;
+        };
+        const placeholder =
+          (field.placeholder as string) ?? admin.placeholder ?? null;
+        const description =
+          (field.description as string) ?? admin.description ?? null;
+        // Persist the multi-value flag and the validation bounds: dropping
+        // them here made a code-declared maxLength silently inert, because
+        // the checker reads configs back from these rows, not from code.
+        const hasMany = (field.hasMany as boolean) ?? null;
+        const minLength = (field.minLength as number) ?? null;
+        const maxLength = (field.maxLength as number) ?? null;
+        const minValue = (field.min as number) ?? null;
+        const maxValue = (field.max as number) ?? null;
+        const sortOrder = i;
+        // Whatever the field declared beyond the modelled columns, folded the
+        // same way codegen folds it. A contributed type states what it needs to
+        // render — a rating's scale, a picker's source — and those keys have no
+        // column of their own, so without this the admin rebuilds the field
+        // from this row and hands the plugin's editor a stripped declaration.
+        const pluginOptions = carriedUserFieldOptions(
+          field as unknown as UserFieldConfig
+        );
+
+        const existing = existingByName.get(name);
+
+        if (existing) {
+          // Update if any property changed
+          const changed =
+            existing.label !== label ||
+            existing.type !== type ||
+            existing.required !== required ||
+            existing.defaultValue !== defaultValue ||
+            JSON.stringify(existing.options) !== JSON.stringify(options) ||
+            existing.placeholder !== placeholder ||
+            existing.description !== description ||
+            (existing.hasMany ?? null) !== hasMany ||
+            (existing.minLength ?? null) !== minLength ||
+            (existing.maxLength ?? null) !== maxLength ||
+            (existing.minValue ?? null) !== minValue ||
+            (existing.maxValue ?? null) !== maxValue ||
+            JSON.stringify(existing.pluginOptions ?? null) !==
+              JSON.stringify(pluginOptions) ||
+            existing.sortOrder !== sortOrder;
+
+          if (changed) {
+            await txDb
+              .update(this.userFieldDefinitions)
+              .set({
+                label,
+                type,
+                required,
+                defaultValue,
+                options,
+                placeholder,
+                description,
+                hasMany,
+                minLength,
+                maxLength,
+                minValue,
+                maxValue,
+                pluginOptions,
+                sortOrder,
+                updatedAt: now,
+              })
+              .where(eq(this.userFieldDefinitions.id, existing.id));
+          }
+        } else {
+          // Insert new code field
+          await txDb.insert(this.userFieldDefinitions).values({
+            id: randomUUID(),
+            name,
+            label,
+            type,
+            required,
+            defaultValue,
+            options,
+            placeholder,
+            description,
+            hasMany,
+            minLength,
+            maxLength,
+            minValue,
+            maxValue,
+            pluginOptions,
+            sortOrder,
+            source: "code",
+            isActive: true,
+            createdAt: now,
+            updatedAt: now,
+          });
+        }
+      }
+
+      // Delete stale code fields (in DB but not in config)
+      const staleIds = existingCodeFields
+        .filter(f => !incomingNames.has(f.name))
+        .map(f => f.id);
+
+      if (staleIds.length > 0) {
+        await txDb
+          .delete(this.userFieldDefinitions)
+          .where(
+            and(
+              eq(this.userFieldDefinitions.source, "code"),
+              inArray(this.userFieldDefinitions.id, staleIds)
+            )
+          );
+      }
+    });
+  }
+
+  /**
+   * Get merged field list (code + UI) for schema generation.
+   *
+   * Returns all active field definitions ordered by sort order,
+   * combining both code-synced and UI-created fields.
+   */
+  async getMergedFields(): Promise<UserFieldDefinitionRecord[]> {
+    const results = await this.db
+      .select()
+      .from(this.userFieldDefinitions)
+      .where(eq(this.userFieldDefinitions.isActive, true))
+      .orderBy(
+        asc(this.userFieldDefinitions.sortOrder),
+        asc(this.userFieldDefinitions.createdAt)
+      );
+
+    return results as UserFieldDefinitionRecord[];
+  }
+
+  // ============================================================
+  // Private Helpers
+  // ============================================================
+
+  /**
+   * Get the next available sort order value (max + 1).
+   * Returns 0 if no fields exist.
+   */
+  private async getNextSortOrder(): Promise<number> {
+    const results = await this.db
+      .select()
+      .from(this.userFieldDefinitions)
+      .orderBy(desc(this.userFieldDefinitions.sortOrder))
+      .limit(1);
+
+    if (results.length === 0) return 0;
+    return ((results[0] as UserFieldDefinitionRecord).sortOrder ?? 0) + 1;
+  }
+}

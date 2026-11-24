@@ -1,0 +1,1249 @@
+/**
+ * The style-property catalog: the closed-but-extensible set of keys legal
+ * inside a document's `StyleValues`, with each key's value shape, the CSS it
+ * emits, and the design-token kinds it accepts.
+ *
+ * Storage keys are logical-first: a value says "the edge where text starts",
+ * not "the left edge", so one document renders correctly in both writing
+ * directions with no per-locale style fork. Editors show physical labels
+ * ("Left", "Right") mapped by the canvas direction, so the logical vocabulary
+ * never reaches users. Sizing stays physical because width and height are
+ * direction-neutral.
+ *
+ * Adding a property here is backwards-compatible; removing one, or changing an
+ * existing one's meaning or value shape, is a document-format migration.
+ */
+import {
+  APPEAR_DELAY_PROPERTY,
+  APPEAR_DURATION_PROPERTY,
+  APPEAR_EFFECT_EXPANSIONS,
+  APPEAR_EFFECT_PROPERTY,
+  APPEAR_EFFECTS,
+  APPEAR_MAX_MILLISECONDS,
+  APPEAR_START_EXPANSIONS,
+  APPEAR_START_PROPERTY,
+  APPEAR_STARTS,
+} from "./appear";
+import type {
+  ColorLeaf,
+  CssValueLeaf,
+  DimensionLeaf,
+  KeywordLeaf,
+  LogicalCornersShape,
+  LogicalSidesShape,
+  NumberLeaf,
+  StyleGroup,
+  StyleProperty,
+  TokenKind,
+  UrlLeaf,
+} from "./catalog-types";
+import {
+  DISCLOSURE_ICON_EXPANSIONS,
+  DISCLOSURE_ICON_PROPERTY,
+  DISCLOSURE_ICONS,
+  DISCLOSURE_POSITION_EXPANSIONS,
+  DISCLOSURE_POSITION_PROPERTY,
+  DISCLOSURE_POSITIONS,
+} from "./disclosure";
+import { OVERLAY_COLOR, OVERLAY_STRENGTH } from "./overlay";
+
+// --- Leaf constructors ------------------------------------------------------
+// Terse to author, explicit once built: every leaf carries the literal CSS
+// property it emits, so emission is data the compiler walks rather than
+// branches the compiler holds.
+
+interface DimensionOptions {
+  keywords?: readonly string[];
+  maxParts?: number;
+  allowNegative?: boolean;
+  allowPercentage?: boolean;
+  functions?: readonly string[];
+  allowNumber?: boolean;
+}
+
+function dimension(
+  cssProperty: string,
+  options: DimensionOptions = {}
+): DimensionLeaf {
+  return {
+    kind: "dimension",
+    cssProperty,
+    tokenKinds: ["dimension"],
+    keywords: options.keywords ?? [],
+    maxParts: options.maxParts ?? 1,
+    allowNegative: options.allowNegative ?? false,
+    allowPercentage: options.allowPercentage ?? false,
+    functions: options.functions ?? [],
+    allowNumber: options.allowNumber ?? false,
+  };
+}
+
+/**
+ * The CSS Box Alignment vocabularies, built from the grammar rather than
+ * written out.
+ *
+ * `align-items` takes a SELF position, `justify-content` and `align-content`
+ * take a CONTENT position, and either may be preceded by an overflow-safety
+ * keyword. Spelling every combination by hand is where the gaps came from:
+ * each is a legal value with no other way to express it, and one missing entry
+ * is a declaration an author cannot store. Generating them means adding a
+ * position adds its safe and unsafe forms too.
+ *
+ * `left` and `right` are absent by policy rather than by oversight: the catalog
+ * stores logical values so one document serves both writing directions, and a
+ * test holds the whole catalog to it.
+ */
+const SELF_POSITIONS = [
+  "center",
+  "start",
+  "end",
+  "self-start",
+  "self-end",
+  "flex-start",
+  "flex-end",
+];
+
+const CONTENT_POSITIONS = ["center", "start", "end", "flex-start", "flex-end"];
+
+/** A position, and the same position with each overflow-safety keyword. */
+function withOverflowSafety(positions: readonly string[]): string[] {
+  return [
+    ...positions,
+    ...positions.map(position => `safe ${position}`),
+    ...positions.map(position => `unsafe ${position}`),
+  ];
+}
+
+/**
+ * Every legal ordering of a set of optional, unordered components.
+ *
+ * A grammar written with `||` accepts its parts in any order and any
+ * non-empty combination, which is more values than are sensible to write out:
+ * `text-transform` alone has thirty-seven. Generating them keeps the list
+ * exhaustive and keeps a component from being addable without its
+ * combinations.
+ */
+function unorderedCombinations(
+  groups: readonly (readonly string[])[]
+): string[] {
+  const results: string[] = [];
+  const build = (chosen: readonly string[], index: number): void => {
+    if (index === groups.length) {
+      if (chosen.length > 0) results.push(...orderings(chosen));
+      return;
+    }
+    build(chosen, index + 1);
+    for (const option of groups[index] ?? [])
+      build([...chosen, option], index + 1);
+  };
+  build([], 0);
+  return [...new Set(results)];
+}
+
+/** Every ordering of the chosen parts. */
+function orderings(parts: readonly string[]): string[] {
+  if (parts.length <= 1) return [parts.join(" ")];
+  const out: string[] = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    const rest = [...parts.slice(0, index), ...parts.slice(index + 1)];
+    for (const tail of orderings(rest)) out.push(`${parts[index]} ${tail}`);
+  }
+  return out;
+}
+
+/** Where a baseline may be taken from. */
+const BASELINE_POSITIONS = [
+  "baseline",
+  ...unorderedCombinations([["first", "last"], ["baseline"]]).filter(entry =>
+    entry.includes(" ")
+  ),
+];
+
+/** How leftover space is spread between items. */
+const CONTENT_DISTRIBUTION = [
+  "space-between",
+  "space-around",
+  "space-evenly",
+  "stretch",
+];
+
+/**
+ * Functions that produce a size rather than a length. Legal on the properties
+ * that take a size and discarded elsewhere, which is why they travel with the
+ * sizing keywords instead of being allowed wherever a measurement is.
+ */
+const SIZING_FUNCTIONS = ["fit-content", "calc-size"];
+
+/** Keyword sets shared by several length-valued properties. */
+const SIZING_KEYWORDS = [
+  "auto",
+  "min-content",
+  "max-content",
+  "fit-content",
+  "stretch",
+  // Fits the content while respecting the containing block, which neither
+  // `stretch` nor `fit-content` reproduces.
+  "contain",
+];
+const MAX_SIZING_KEYWORDS = [
+  "none",
+  "min-content",
+  "max-content",
+  "fit-content",
+  "stretch",
+  "contain",
+];
+const FONT_SIZE_KEYWORDS = [
+  // Scales with MathML script level; no absolute or relative size reproduces it.
+  "math",
+  "xx-small",
+  "x-small",
+  "small",
+  "medium",
+  "large",
+  "x-large",
+  "xx-large",
+  "xxx-large",
+  "smaller",
+  "larger",
+];
+
+function keyword(
+  cssProperty: string,
+  values: readonly string[],
+  maxParts = 1,
+  soloValues: readonly string[] = []
+): KeywordLeaf {
+  return {
+    kind: "keyword",
+    cssProperty,
+    tokenKinds: [],
+    values,
+    maxParts,
+    soloValues,
+  };
+}
+
+function color(cssProperty: string, descendant?: string): ColorLeaf {
+  return { kind: "color", cssProperty, tokenKinds: ["color"], descendant };
+}
+
+function cssValue(
+  cssProperty: string,
+  tokenKinds: readonly TokenKind[] = []
+): CssValueLeaf {
+  return { kind: "cssValue", cssProperty, tokenKinds };
+}
+
+function numberValue(
+  cssProperty: string,
+  bounds: { min?: number; max?: number; integer?: boolean } = {},
+  tokenKinds: readonly TokenKind[] = ["number"]
+): NumberLeaf {
+  return { kind: "number", cssProperty, tokenKinds, ...bounds };
+}
+
+function url(cssProperty: string, keywords: readonly string[] = []): UrlLeaf {
+  return { kind: "url", cssProperty, tokenKinds: [], keywords };
+}
+
+/**
+ * The four logical box sides of a CSS property family, e.g. `margin` yields
+ * `margin-block-start` … `margin-inline-end`, and `("border", "width")` yields
+ * `border-block-start-width` … `border-inline-end-width`.
+ */
+function logicalSides(
+  prefix: string,
+  suffix: string | undefined,
+  options: DimensionOptions = {}
+): LogicalSidesShape {
+  const name = (side: string): string =>
+    suffix ? `${prefix}-${side}-${suffix}` : `${prefix}-${side}`;
+  return {
+    kind: "logicalSides",
+    sides: {
+      blockStart: dimension(name("block-start"), options),
+      blockEnd: dimension(name("block-end"), options),
+      inlineStart: dimension(name("inline-start"), options),
+      inlineEnd: dimension(name("inline-end"), options),
+    },
+  };
+}
+
+/** The four logical corners of `border-radius`. */
+function logicalCorners(): LogicalCornersShape {
+  // Each corner property takes a horizontal and a vertical radius, which is how
+  // an elliptical corner is written; one value makes them equal.
+  const corner = (cssProperty: string) =>
+    dimension(cssProperty, { allowPercentage: true, maxParts: 2 });
+  return {
+    kind: "logicalCorners",
+    corners: {
+      startStart: corner("border-start-start-radius"),
+      startEnd: corner("border-start-end-radius"),
+      endStart: corner("border-end-start-radius"),
+      endEnd: corner("border-end-end-radius"),
+    },
+  };
+}
+
+// --- The catalog ------------------------------------------------------------
+
+/**
+ * Every legal style property, in group order. The `flag` field, where present,
+ * is the `supports` sub-flag that enables the property on its own: a block
+ * declaring `supports: { border: { radius: true } }` may set `borderRadius` and
+ * nothing else in the border group, while `supports: { border: true }` enables
+ * the whole group. Properties with no flag are only reachable through `true`.
+ */
+export const STYLE_CATALOG: readonly StyleProperty[] = [
+  // --- spacing
+  {
+    property: "margin",
+    group: "spacing",
+    appliesWhen: ["always"],
+    flag: "margin",
+    shape: logicalSides("margin", undefined, {
+      keywords: ["auto"],
+      allowNegative: true,
+      allowPercentage: true,
+    }),
+    summary: "Space outside the element, per logical side.",
+  },
+  {
+    property: "padding",
+    group: "spacing",
+    appliesWhen: ["always"],
+    flag: "padding",
+    shape: logicalSides("padding", undefined, { allowPercentage: true }),
+    summary: "Space inside the element, per logical side.",
+  },
+
+  // --- layout
+  {
+    property: "boxSizing",
+    group: "layout",
+    appliesWhen: ["always"],
+    shape: keyword("box-sizing", ["content-box", "border-box"]),
+    summary: "Whether a stated width includes padding and border.",
+  },
+  {
+    property: "display",
+    group: "layout",
+    appliesWhen: ["always"],
+    shape: keyword("display", [
+      "block",
+      "flex",
+      "grid",
+      "inline",
+      "inline-block",
+      "inline-flex",
+      "inline-grid",
+      "flow-root",
+      "contents",
+      "none",
+      // A marker box, and the table modes: native table layout has no other
+      // expression, and `display` has no free-form variant to fall back on.
+      // The multi-keyword forms generate a different OUTER display type, so an
+      // inline list item is not reachable through the legacy keyword.
+      ...unorderedCombinations([
+        ["inline", "block"],
+        ["flow", "flow-root"],
+        ["list-item"],
+      ]).filter(entry => entry.includes("list-item")),
+      "table",
+      "inline-table",
+      "table-row-group",
+      "table-header-group",
+      "table-footer-group",
+      "table-row",
+      "table-cell",
+      "table-column-group",
+      "table-column",
+      "table-caption",
+      // Ruby annotation roles, which no other display mode reproduces.
+      "ruby",
+      // A ruby box that participates in layout as a block; the legacy keyword
+      // is inline-level and cannot reproduce it.
+      "block ruby",
+      "ruby-base",
+      "ruby-text",
+      "ruby-base-container",
+      "ruby-text-container",
+    ]),
+    summary: "How the element generates boxes for its children.",
+  },
+  {
+    property: "flexDirection",
+    group: "layout",
+    appliesWhen: ["flex-container"],
+    shape: keyword("flex-direction", [
+      "row",
+      "row-reverse",
+      "column",
+      "column-reverse",
+    ]),
+    summary: "Main-axis direction of a flex container.",
+  },
+  {
+    property: "flexWrap",
+    group: "layout",
+    appliesWhen: ["flex-container"],
+    shape: keyword("flex-wrap", ["nowrap", "wrap", "wrap-reverse"]),
+    summary: "Whether flex children wrap onto more lines.",
+  },
+  {
+    property: "justifyContent",
+    group: "layout",
+    appliesWhen: ["flex-or-grid-container"],
+    shape: keyword("justify-content", [
+      "normal",
+      ...CONTENT_DISTRIBUTION,
+      // Flex-relative rather than physical: these resolve against
+      // `flex-direction` and flip with it, which `left` and `right` do not.
+      ...withOverflowSafety(CONTENT_POSITIONS),
+    ]),
+    summary: "Main-axis distribution. Logical by nature: start, never left.",
+  },
+  {
+    property: "alignItems",
+    group: "layout",
+    appliesWhen: ["flex-or-grid-container"],
+    shape: keyword("align-items", [
+      "normal",
+      "stretch",
+      ...BASELINE_POSITIONS,
+      // A standalone alternative in the grammar rather than a self position,
+      // so it takes no overflow-safety keyword: `safe anchor-center` is not a
+      // value. It aligns to the centre of the element's anchor, which no other
+      // position reproduces.
+      "anchor-center",
+      ...withOverflowSafety(SELF_POSITIONS),
+    ]),
+    summary: "Cross-axis alignment of children.",
+  },
+  {
+    property: "alignContent",
+    group: "layout",
+    // A block container's content moves too, wherever its height leaves room:
+    // a Stack with a set height centres with `align-content: center`.
+    appliesWhen: ["wrapping-flex-or-grid", "block-container"],
+    shape: keyword("align-content", [
+      "normal",
+      ...BASELINE_POSITIONS,
+      ...CONTENT_DISTRIBUTION,
+      ...withOverflowSafety(CONTENT_POSITIONS),
+    ]),
+    summary: "Cross-axis distribution of wrapped lines.",
+  },
+  {
+    property: "gap",
+    group: "layout",
+    appliesWhen: ["flex-or-grid-container"],
+    shape: dimension("gap", {
+      keywords: ["normal"],
+      maxParts: 2,
+      allowPercentage: true,
+    }),
+    summary: "Space between rows and columns.",
+  },
+  {
+    property: "rowGap",
+    group: "layout",
+    appliesWhen: ["flex-or-grid-container"],
+    shape: dimension("row-gap", {
+      keywords: ["normal"],
+      allowPercentage: true,
+    }),
+    summary: "Space between rows.",
+  },
+  {
+    property: "columnGap",
+    group: "layout",
+    appliesWhen: ["flex-or-grid-container"],
+    shape: dimension("column-gap", {
+      keywords: ["normal"],
+      allowPercentage: true,
+    }),
+    summary: "Space between columns.",
+  },
+  {
+    property: "gridTemplateColumns",
+    group: "layout",
+    appliesWhen: ["grid-container"],
+    shape: cssValue("grid-template-columns"),
+    summary: "Grid column track sizes.",
+  },
+  {
+    property: "gridTemplateRows",
+    group: "layout",
+    appliesWhen: ["grid-container"],
+    shape: cssValue("grid-template-rows"),
+    summary: "Grid row track sizes.",
+  },
+  {
+    property: "gridAutoFlow",
+    group: "layout",
+    appliesWhen: ["grid-container"],
+    shape: keyword("grid-auto-flow", [
+      "row",
+      "column",
+      "dense",
+      "row dense",
+      "column dense",
+      // The grammar is unordered, so a serialisation stricter than CSS would
+      // refuse a value the browser accepts.
+      "dense row",
+      "dense column",
+    ]),
+    summary: "How auto-placed grid items are inserted.",
+  },
+  {
+    property: "justifyItems",
+    group: "layout",
+    appliesWhen: ["grid-container"],
+    // Each grid item's place across its column. A flex line has no such
+    // thing: it places items along its main axis with `justify-content`.
+    // Positions only, as on `justify-self`: Baseline records no baseline,
+    // overflow-safety or `legacy` forms here as widely available.
+    shape: keyword("justify-items", ["normal", "stretch", ...SELF_POSITIONS]),
+    summary: "Where each grid item sits across its column.",
+  },
+
+  // --- dimensions (physical on purpose: size is direction-neutral)
+  {
+    property: "width",
+    group: "dimensions",
+    appliesWhen: ["always"],
+    shape: dimension("width", {
+      keywords: SIZING_KEYWORDS,
+      functions: SIZING_FUNCTIONS,
+      allowPercentage: true,
+    }),
+    summary: "Element width.",
+  },
+  {
+    property: "height",
+    group: "dimensions",
+    appliesWhen: ["always"],
+    shape: dimension("height", {
+      keywords: SIZING_KEYWORDS,
+      functions: SIZING_FUNCTIONS,
+      allowPercentage: true,
+    }),
+    summary: "Element height.",
+  },
+  {
+    property: "minWidth",
+    group: "dimensions",
+    appliesWhen: ["always"],
+    shape: dimension("min-width", {
+      keywords: SIZING_KEYWORDS,
+      functions: SIZING_FUNCTIONS,
+      allowPercentage: true,
+    }),
+    summary: "Lower bound on width.",
+  },
+  {
+    property: "minHeight",
+    group: "dimensions",
+    appliesWhen: ["always"],
+    shape: dimension("min-height", {
+      keywords: SIZING_KEYWORDS,
+      functions: SIZING_FUNCTIONS,
+      allowPercentage: true,
+    }),
+    summary: "Lower bound on height.",
+  },
+  {
+    property: "maxWidth",
+    group: "dimensions",
+    appliesWhen: ["always"],
+    shape: dimension("max-width", {
+      keywords: MAX_SIZING_KEYWORDS,
+      functions: SIZING_FUNCTIONS,
+      allowPercentage: true,
+    }),
+    summary: "Upper bound on width.",
+  },
+  {
+    property: "maxHeight",
+    group: "dimensions",
+    appliesWhen: ["always"],
+    shape: dimension("max-height", {
+      keywords: MAX_SIZING_KEYWORDS,
+      functions: SIZING_FUNCTIONS,
+      allowPercentage: true,
+    }),
+    summary: "Upper bound on height.",
+  },
+  {
+    property: "aspectRatio",
+    group: "dimensions",
+    appliesWhen: ["always"],
+    shape: cssValue("aspect-ratio"),
+    summary: "Preferred width-to-height ratio.",
+  },
+  {
+    property: "objectFit",
+    group: "dimensions",
+    appliesWhen: ["replaced"],
+    shape: keyword("object-fit", [
+      "fill",
+      "contain",
+      "cover",
+      "none",
+      "scale-down",
+    ]),
+    summary: "How replaced content fills its box.",
+  },
+  {
+    property: "objectPosition",
+    group: "dimensions",
+    appliesWhen: ["replaced"],
+    shape: cssValue("object-position"),
+    summary:
+      "Which part of replaced content stays in view when it is cropped, or where it sits in its box.",
+  },
+  {
+    property: "overflow",
+    group: "dimensions",
+    appliesWhen: ["always"],
+    shape: keyword(
+      "overflow",
+      ["visible", "hidden", "clip", "scroll", "auto"],
+      2
+    ),
+    summary: "How content exceeding the box is handled.",
+  },
+  // How a block takes space inside a Row or a Grid. In this group rather than
+  // a group of their own because every block with a size can sit in one, so a
+  // block offering `dimensions` offers these with nothing further to declare.
+  {
+    property: "flexGrow",
+    group: "dimensions",
+    appliesWhen: ["flex-child"],
+    shape: numberValue("flex-grow", { min: 0 }),
+    summary: "How much of a row's spare space the element takes.",
+  },
+  {
+    property: "flexShrink",
+    group: "dimensions",
+    appliesWhen: ["flex-child"],
+    shape: numberValue("flex-shrink", { min: 0 }),
+    summary: "How much the element gives up when a row is short of space.",
+  },
+  {
+    property: "flexBasis",
+    group: "dimensions",
+    appliesWhen: ["flex-child"],
+    shape: dimension("flex-basis", {
+      // `content` sizes the item by its content even where a width is set,
+      // which `auto` (use the width) does not. Only the keywords Baseline
+      // marks widely available on `flex-basis`: `stretch`, `contain` and the
+      // sizing functions a width takes are not, here.
+      keywords: [
+        "auto",
+        "content",
+        "min-content",
+        "max-content",
+        "fit-content",
+      ],
+      allowPercentage: true,
+    }),
+    summary: "The element's starting size along a row, before space is shared.",
+  },
+  {
+    property: "alignSelf",
+    group: "dimensions",
+    appliesWhen: ["flex-or-grid-child"],
+    // No overflow-safety forms: Baseline does not yet mark `safe` and
+    // `unsafe` widely available on `align-self`.
+    shape: keyword("align-self", [
+      "auto",
+      "normal",
+      "stretch",
+      ...BASELINE_POSITIONS,
+      ...SELF_POSITIONS,
+    ]),
+    summary: "The element's own cross-axis alignment, over its parent's.",
+  },
+  {
+    property: "justifySelf",
+    group: "dimensions",
+    appliesWhen: ["grid-child"],
+    // Positions only: Baseline records no baseline or overflow-safety forms
+    // of `justify-self` as widely available.
+    shape: keyword("justify-self", [
+      "auto",
+      "normal",
+      "stretch",
+      ...SELF_POSITIONS,
+    ]),
+    summary:
+      "Where the element sits across its grid column, over its parent's.",
+  },
+  {
+    property: "order",
+    group: "dimensions",
+    appliesWhen: ["flex-or-grid-child"],
+    // Visual order only: reading and tab order stay the document's.
+    shape: numberValue("order", { integer: true }),
+    summary: "Where the element is drawn among its siblings, lowest first.",
+  },
+
+  // --- typography
+  {
+    property: "fontFamily",
+    group: "typography",
+    appliesWhen: ["always"],
+    shape: cssValue("font-family", ["fontFamily"]),
+    summary: "Typeface stack. Token-first: reference a typography token.",
+  },
+  {
+    property: "fontSize",
+    group: "typography",
+    appliesWhen: ["always"],
+    shape: dimension("font-size", {
+      keywords: FONT_SIZE_KEYWORDS,
+      allowPercentage: true,
+    }),
+    summary: "Text size.",
+  },
+  {
+    property: "fontWeight",
+    group: "typography",
+    appliesWhen: ["always"],
+    shape: {
+      kind: "union",
+      of: [
+        keyword("font-weight", ["normal", "bold", "lighter", "bolder"]),
+        numberValue("font-weight", { min: 1, max: 1000 }, [
+          "fontWeight",
+          "number",
+        ]),
+      ],
+    },
+    summary: "Text weight, as a keyword or a numeric weight.",
+  },
+  {
+    property: "lineHeight",
+    group: "typography",
+    appliesWhen: ["always"],
+    shape: {
+      kind: "union",
+      of: [
+        numberValue("line-height", { min: 0 }),
+        dimension("line-height", {
+          keywords: ["normal"],
+          allowPercentage: true,
+          // The number leaf takes a stored number; a number written as an
+          // expression arrives as a string and reaches this leaf instead, and
+          // `line-height: calc(2)` is a value the browser honours.
+          allowNumber: true,
+        }),
+      ],
+    },
+    summary: "Line box height, unitless (preferred) or as a length.",
+  },
+  {
+    property: "letterSpacing",
+    group: "typography",
+    appliesWhen: ["always"],
+    shape: dimension("letter-spacing", {
+      keywords: ["normal"],
+      allowNegative: true,
+    }),
+    summary: "Space between characters.",
+  },
+  {
+    property: "wordSpacing",
+    group: "typography",
+    appliesWhen: ["always"],
+    shape: dimension("word-spacing", {
+      keywords: ["normal"],
+      allowNegative: true,
+      allowPercentage: true,
+    }),
+    summary: "Space between words.",
+  },
+  {
+    property: "textAlign",
+    group: "typography",
+    appliesWhen: ["always"],
+    shape: keyword("text-align", [
+      // Resolves against the PARENT's direction, which neither `start` nor
+      // `inherit` reproduces when parent and child directions differ.
+      "match-parent",
+      // Justifies the last line too, which `justify` leaves alone and no other
+      // property here can reach.
+      "justify-all",
+      "start",
+      "center",
+      "end",
+      "justify",
+    ]),
+    summary: "Inline alignment. Logical: start flips with writing direction.",
+  },
+  {
+    property: "textTransform",
+    group: "typography",
+    appliesWhen: ["always"],
+    // A case transform, a full-width transform and a kana transform compose in
+    // any order; only the case transforms are mutually exclusive, which falls
+    // out of each combination taking at most one of them.
+    shape: keyword("text-transform", [
+      "none",
+      // Its own value: MathML italicises single letters through it, and it
+      // combines with none of the case or width transforms.
+      "math-auto",
+      ...unorderedCombinations([
+        ["uppercase", "lowercase", "capitalize"],
+        ["full-width"],
+        ["full-size-kana"],
+      ]),
+    ]),
+    summary: "Letter-case transformation.",
+  },
+  {
+    property: "fontStyle",
+    group: "typography",
+    appliesWhen: ["always"],
+    // `oblique` takes an optional angle, which no closed keyword set can
+    // express; the vocabulary stays for an editor to offer, and the free-form
+    // variant is what makes `oblique 10deg` storable.
+    shape: {
+      kind: "union",
+      of: [
+        keyword("font-style", ["normal", "italic", "oblique"]),
+        cssValue("font-style"),
+      ],
+    },
+    summary: "Upright or slanted text, with an optional oblique angle.",
+  },
+  {
+    property: "listStyleType",
+    // Its OWN group, not typography. Group membership is what decides which
+    // blocks are offered a control, and `typography: true` grants every
+    // property in that group — so a heading and a button would both be offered
+    // a list-marker control that cannot change anything they render.
+    group: "list",
+    appliesWhen: ["always"],
+    // `revert` earns its place beside the concrete markers. A CSS reset that
+    // sets `list-style: none` on every list — Tailwind's Preflight does, and
+    // this library's own scaffold imports it — leaves an author no keyword that
+    // means "whatever this element would have shown", because the right answer
+    // differs between `ul` and `ol`. `revert` rolls back to the user-agent
+    // value per element, so one declaration restores discs to one and numerals
+    // to the other.
+    shape: keyword("list-style-type", [
+      "none",
+      "revert",
+      "disc",
+      "circle",
+      "square",
+      "decimal",
+      "decimal-leading-zero",
+      "lower-alpha",
+      "upper-alpha",
+      "lower-roman",
+      "upper-roman",
+    ]),
+    summary: "The marker drawn beside each list item.",
+  },
+  {
+    property: "disclosureIcon",
+    // Its own group, offered only by a block whose children are disclosures
+    // (an Accordion): each keyword writes its sections' title rows, so on any
+    // other block it would style nothing.
+    group: "disclosure",
+    appliesWhen: ["always"],
+    shape: {
+      ...keyword(DISCLOSURE_ICON_PROPERTY, DISCLOSURE_ICONS),
+      expands: DISCLOSURE_ICON_EXPANSIONS,
+    },
+    summary: "The icon each section shows beside its title.",
+  },
+  {
+    property: "disclosurePosition",
+    group: "disclosure",
+    appliesWhen: ["always"],
+    shape: {
+      ...keyword(DISCLOSURE_POSITION_PROPERTY, DISCLOSURE_POSITIONS),
+      expands: DISCLOSURE_POSITION_EXPANSIONS,
+    },
+    summary: "Whether the icon sits before or after each section's title.",
+  },
+  {
+    property: "textDecoration",
+    group: "typography",
+    appliesWhen: ["always"],
+    shape: cssValue("text-decoration"),
+    summary: "Underline, overline, or line-through decoration.",
+  },
+  {
+    property: "textShadow",
+    group: "typography",
+    appliesWhen: ["always"],
+    shape: cssValue("text-shadow", ["shadow"]),
+    summary: "Shadow cast by the text.",
+  },
+
+  // --- color
+  {
+    property: "color",
+    group: "color",
+    appliesWhen: ["always"],
+    flag: "text",
+    shape: color("color"),
+    summary: "Text color.",
+  },
+  {
+    property: "linkColor",
+    group: "color",
+    appliesWhen: ["always"],
+    flag: "link",
+    shape: color("color", "a"),
+    summary: "Color of links inside the element.",
+  },
+  {
+    property: "linkColorHover",
+    group: "color",
+    appliesWhen: ["always"],
+    flag: "link",
+    shape: color("color", "a:hover"),
+    summary: "Color of hovered links inside the element.",
+  },
+
+  // --- background
+  {
+    property: "backgroundColor",
+    group: "background",
+    appliesWhen: ["always"],
+    flag: "color",
+    shape: color("background-color"),
+    summary: "Background fill color.",
+  },
+  {
+    property: "background",
+    group: "background",
+    appliesWhen: ["always"],
+    flag: "image",
+    shape: {
+      kind: "object",
+      fields: {
+        // `none` is what clears an image set at an earlier state, and it has
+        // to be a keyword rather than a path or it emits `url("none")`. A file
+        // really named `none` is still reachable as `./none`.
+        url: { ...url("background-image", ["none"]), overlaid: true },
+        position: cssValue("background-position"),
+        size: cssValue("background-size"),
+        // `repeat-x` and `repeat-y` each name both axes already, so they are
+        // the whole value; the other four pair up as inline-then-block.
+        repeat: keyword(
+          "background-repeat",
+          ["repeat", "repeat-x", "repeat-y", "no-repeat", "space", "round"],
+          2,
+          ["repeat-x", "repeat-y"]
+        ),
+        attachment: keyword("background-attachment", [
+          "scroll",
+          "fixed",
+          "local",
+        ]),
+        // A colour laid over the image, and how strongly, in percent: each
+        // its own custom property, which the image's layer reads, so either
+        // may be set at a device the image is not.
+        overlay: color(OVERLAY_COLOR),
+        overlayStrength: numberValue(OVERLAY_STRENGTH, { min: 0, max: 100 }),
+      },
+    },
+    summary: "Background image and how it is placed.",
+  },
+  {
+    property: "backgroundGradient",
+    group: "background",
+    appliesWhen: ["always"],
+    flag: "gradient",
+    shape: { ...cssValue("background-image"), overlaid: true },
+    summary: "Gradient fill, as a CSS gradient value.",
+  },
+
+  // --- border
+  {
+    property: "border",
+    group: "border",
+    appliesWhen: ["always"],
+    flag: "line",
+    shape: {
+      kind: "object",
+      fields: {
+        width: logicalSides("border", "width", {
+          keywords: ["thin", "medium", "thick"],
+        }),
+        style: keyword("border-style", [
+          "none",
+          // Distinct from `none` where borders compete: under collapsed-table
+          // conflict resolution `hidden` suppresses the neighbouring border.
+          "hidden",
+          "solid",
+          "dashed",
+          "dotted",
+          "double",
+          "groove",
+          "ridge",
+          "inset",
+          "outset",
+        ]),
+        color: color("border-color"),
+      },
+    },
+    summary: "Border width per logical side, plus style and color.",
+  },
+  {
+    property: "borderRadius",
+    group: "border",
+    appliesWhen: ["always"],
+    flag: "radius",
+    shape: {
+      kind: "union",
+      of: [
+        dimension("border-radius", { allowPercentage: true }),
+        logicalCorners(),
+      ],
+    },
+    summary:
+      "Corner rounding: one radius for all corners, or per logical corner.",
+  },
+  {
+    property: "outline",
+    group: "border",
+    appliesWhen: ["always"],
+    flag: "outline",
+    // Drawn outside the border and taking no space, so setting one never
+    // moves the layout: what a focus ring needs. The offset moves it out, or
+    // in over the box's edge when negative.
+    shape: {
+      kind: "object",
+      fields: {
+        width: dimension("outline-width", {
+          keywords: ["thin", "medium", "thick"],
+        }),
+        style: keyword("outline-style", [
+          // The browser's own focus ring, in its colour and shape.
+          "auto",
+          "none",
+          "solid",
+          "dashed",
+          "dotted",
+          "double",
+          "groove",
+          "ridge",
+          "inset",
+          "outset",
+        ]),
+        color: color("outline-color"),
+        offset: dimension("outline-offset", { allowNegative: true }),
+      },
+    },
+    summary:
+      "A line drawn outside the border that takes no space, such as a focus ring.",
+  },
+
+  // --- shadow
+  {
+    property: "boxShadow",
+    group: "shadow",
+    appliesWhen: ["always"],
+    shape: cssValue("box-shadow", ["shadow"]),
+    summary: "Shadow cast by the element's box.",
+  },
+
+  // --- effects
+  {
+    property: "opacity",
+    group: "effects",
+    appliesWhen: ["always"],
+    shape: numberValue("opacity", { min: 0, max: 1 }),
+    summary: "Element opacity, 0 to 1.",
+  },
+  {
+    property: "filter",
+    group: "effects",
+    appliesWhen: ["always"],
+    shape: cssValue("filter"),
+    summary: "Graphical effects such as blur or brightness.",
+  },
+  {
+    property: "mixBlendMode",
+    group: "effects",
+    appliesWhen: ["always"],
+    shape: keyword("mix-blend-mode", [
+      "normal",
+      "multiply",
+      "screen",
+      "overlay",
+      "darken",
+      "lighten",
+      "color-dodge",
+      "color-burn",
+      "hard-light",
+      "soft-light",
+      "difference",
+      "exclusion",
+      "hue",
+      "saturation",
+      "color",
+      "luminosity",
+      "plus-darker",
+      "plus-lighter",
+    ]),
+    summary: "How the element blends with what is behind it.",
+  },
+  {
+    property: "transform",
+    group: "effects",
+    appliesWhen: ["always"],
+    shape: cssValue("transform"),
+    summary: "Geometric transforms such as translate, scale, or rotate.",
+  },
+  {
+    property: "transition",
+    group: "effects",
+    appliesWhen: ["always"],
+    shape: cssValue("transition", ["custom", "duration"]),
+    summary: "Explicit transitions. Nothing is smoothed automatically.",
+  },
+  {
+    property: "appear",
+    group: "effects",
+    appliesWhen: ["always"],
+    // Four parts, each its own custom property, so each is set per device on
+    // its own: see `appear.ts`. The two times are whole milliseconds.
+    shape: {
+      kind: "object",
+      fields: {
+        effect: {
+          ...keyword(APPEAR_EFFECT_PROPERTY, APPEAR_EFFECTS),
+          expands: APPEAR_EFFECT_EXPANSIONS,
+        },
+        duration: numberValue(
+          APPEAR_DURATION_PROPERTY,
+          { min: 0, max: APPEAR_MAX_MILLISECONDS, integer: true },
+          []
+        ),
+        delay: numberValue(
+          APPEAR_DELAY_PROPERTY,
+          { min: 0, max: APPEAR_MAX_MILLISECONDS, integer: true },
+          []
+        ),
+        start: {
+          ...keyword(APPEAR_START_PROPERTY, APPEAR_STARTS),
+          expands: APPEAR_START_EXPANSIONS,
+        },
+      },
+    },
+    summary:
+      "An animation as the block scrolls into view or the page loads, moving only its opacity and transform.",
+  },
+
+  // --- position
+  {
+    property: "position",
+    group: "position",
+    // The type always takes effect; the offsets only move a positioned block,
+    // and z-index also stacks a flex or grid item that is not positioned.
+    appliesWhen: ["always"],
+    fieldAppliesWhen: {
+      inset: ["positioned"],
+      zIndex: ["positioned", "flex-or-grid-child"],
+    },
+    shape: {
+      kind: "object",
+      fields: {
+        type: keyword("position", [
+          "static",
+          "relative",
+          "absolute",
+          "fixed",
+          "sticky",
+        ]),
+        inset: logicalSides("inset", undefined, {
+          keywords: ["auto"],
+          allowNegative: true,
+          allowPercentage: true,
+          functions: ["anchor"],
+        }),
+        zIndex: {
+          kind: "union",
+          of: [
+            numberValue("z-index", { integer: true }),
+            keyword("z-index", ["auto"]),
+          ],
+        },
+      },
+    },
+    summary: "Positioning scheme, logical offsets, and stacking order.",
+  },
+
+  // --- container
+  {
+    property: "containerType",
+    group: "container",
+    appliesWhen: ["always"],
+    // A scroll-state container answers a different kind of query from a size
+    // one, and the two combine in either order.
+    shape: keyword("container-type", [
+      "normal",
+      ...unorderedCombinations([["inline-size", "size"], ["scroll-state"]]),
+    ]),
+    summary: "Opt the element in as a query container for its descendants.",
+  },
+];
+
+// --- Lookups ----------------------------------------------------------------
+
+const CATALOG_BY_PROPERTY: ReadonlyMap<string, StyleProperty> = new Map(
+  STYLE_CATALOG.map(entry => [entry.property, entry])
+);
+
+/** The catalog row for a storage key, or `undefined` if it is not a style property. */
+export function getStyleProperty(property: string): StyleProperty | undefined {
+  return CATALOG_BY_PROPERTY.get(property);
+}
+
+/**
+ * Every catalog row, ordered by property name, computed once.
+ *
+ * What the emitter walks, instead of the keys of the map it is compiling. The two produce the
+ * same declarations in the same order, because a stored key this catalog does not define writes
+ * nothing either way — but one is bounded by the catalog and the other by whatever was persisted,
+ * and a named class is site settings, outside the document byte cap and read on every page
+ * render.
+ *
+ * Sorted rather than left in catalog order so that adding a property to the table cannot silently
+ * reorder the declarations an existing page emits.
+ */
+export const CATALOG_IN_EMISSION_ORDER: readonly StyleProperty[] = [
+  ...STYLE_CATALOG,
+].sort((a, b) =>
+  a.property < b.property ? -1 : a.property > b.property ? 1 : 0
+);
+
+/** Every catalog row in one group, in catalog order. */
+export function stylePropertiesInGroup(
+  group: StyleGroup
+): readonly StyleProperty[] {
+  return STYLE_CATALOG.filter(entry => entry.group === group);
+}
+
+/** The sub-flags a group defines, derived from the properties that declare them. */
+export function styleFlagsInGroup(group: StyleGroup): readonly string[] {
+  const flags: string[] = [];
+  for (const entry of stylePropertiesInGroup(group)) {
+    if (entry.flag !== undefined && !flags.includes(entry.flag)) {
+      flags.push(entry.flag);
+    }
+  }
+  return flags;
+}

@@ -1,0 +1,104 @@
+/**
+ * Color math for the token-contrast check.
+ *
+ * The genuinely hard, gamut-sensitive step (OKLCH -> sRGB) is delegated to
+ * culori, which implements CSS Color Module Level 4. Everything WCAG-specific
+ * (alpha compositing, relative luminance, contrast ratio) is done here in a few
+ * bounded, well-known formulas so it can be unit-tested directly and read at a
+ * glance. A test cross-checks this luminance against culori's own to guard
+ * against a formula typo.
+ */
+import { converter, parse } from "culori";
+
+import type { Rgba } from "../../lib/color/hex";
+
+const toRgb = converter("rgb");
+
+/**
+ * An sRGB color with gamma-encoded channels in [0, 1] and an alpha in [0, 1].
+ *
+ * Re-exported from `lib/color` rather than declared again. Two structurally
+ * identical definitions of one concept in one package is a drift waiting to
+ * happen, and the drift that matters would be silent: the two agree on
+ * channels in [0, 1] today, so a future edit moving either to 0-255 would
+ * typecheck, produce wrong ratios in every pairing, and leave this suite green
+ * because both sides of each comparison shift together.
+ *
+ * The direction is deliberate. `lib/color` is the published surface and this
+ * module is not, so importing from there consumes existing public API rather
+ * than creating any. The WCAG formula itself lives in `lib/color/wcag.ts`,
+ * which `@nextlyhq/ui/color` does not export, so the runtime adjustment of a
+ * brand's colours and this check read one formula while neither publishes it.
+ */
+export type Rgb = Rgba;
+
+const clamp01 = (n: number): number => Math.min(1, Math.max(0, n));
+
+/**
+ * Parse a resolved CSS color string (oklch, hex, ...) to gamma-encoded sRGB.
+ *
+ * Channels are clamped to [0, 1]: an OKLCH value can fall outside the sRGB
+ * gamut, and a browser can only display what fits, so the contrast a user
+ * actually sees is computed from the clamped color.
+ */
+export function toClampedRgb(color: string): Rgb {
+  const parsed = parse(color);
+  const rgb = parsed ? toRgb(parsed) : undefined;
+  if (!rgb) {
+    throw new Error(`could not parse color: ${JSON.stringify(color)}`);
+  }
+  return {
+    r: clamp01(rgb.r),
+    g: clamp01(rgb.g),
+    b: clamp01(rgb.b),
+    alpha: rgb.alpha ?? 1,
+  };
+}
+
+/**
+ * Composite a (possibly translucent) foreground over an opaque background with
+ * the standard source-over operator, in gamma-encoded sRGB.
+ *
+ * This is deliberately done in gamma space rather than linear light: it matches
+ * how a browser paints a translucent border over its surface, so the contrast
+ * asserted here is the contrast that renders. Compositing in linear light would
+ * be more colorimetrically pure but would not match the pixels on screen. This
+ * is the step the Primer color system got wrong at first: our borders are alpha
+ * (`oklch(0 0 0 / 0.13)`), and asserting on the raw translucent value is
+ * meaningless until it is blended onto the surface it sits on.
+ */
+export function compositeOver(fg: Rgb, bg: Rgb): Rgb {
+  const a = fg.alpha;
+  return {
+    r: fg.r * a + bg.r * (1 - a),
+    g: fg.g * a + bg.g * (1 - a),
+    b: fg.b * a + bg.b * (1 - a),
+    alpha: 1,
+  };
+}
+
+/**
+ * WCAG 2.x relative luminance and contrast ratio, the one implementation in
+ * this package. Any translucent color must be composited (see
+ * {@link compositeOver}) before its ratio is taken: the alpha is not consulted.
+ */
+export { contrastRatio, relativeLuminance } from "../../lib/color/wcag";
+
+/**
+ * Resolve a color token to an OPAQUE sRGB color, compositing over `base` when
+ * the token is itself translucent. Surfaces are expected to be opaque; the
+ * `base` fallback keeps the check correct if one ever gains an alpha.
+ */
+export function toOpaque(color: string, base: Rgb): Rgb {
+  const rgb = toClampedRgb(color);
+  return rgb.alpha < 1 ? compositeOver(rgb, base) : rgb;
+}
+
+/** `#rrggbb` for a color, for human-readable failure messages. */
+export function toHex(rgb: Rgb): string {
+  const channel = (c: number): string =>
+    Math.round(clamp01(c) * 255)
+      .toString(16)
+      .padStart(2, "0");
+  return `#${channel(rgb.r)}${channel(rgb.g)}${channel(rgb.b)}`;
+}

@@ -1,0 +1,635 @@
+"use client";
+
+/**
+ * Field Renderer Component
+ *
+ * Main field renderer that dynamically selects the appropriate input component
+ * based on field type. Handles field wrapping, error display, and conditional rendering.
+ *
+ * This component serves as the central dispatcher for all field types, enabling
+ * extensibility and consistent handling across the entry form system.
+ *
+ * @module components/entries/fields/FieldRenderer
+ * @since 1.0.0
+ */
+
+import type {
+  FieldConfig,
+  TextFieldConfig,
+  TextareaFieldConfig,
+  EmailFieldConfig,
+  PasswordFieldConfig,
+  CodeFieldConfig,
+  IconFieldConfig,
+  NumberFieldConfig,
+  CheckboxFieldConfig,
+  SelectFieldConfig,
+  RadioFieldConfig,
+  DateFieldConfig,
+  UploadFieldConfig,
+  RelationshipFieldConfig,
+  RepeaterFieldConfig,
+  GroupFieldConfig,
+  JSONFieldConfig,
+  RichTextFieldConfig,
+  ChipsFieldConfig,
+} from "nextly/config";
+import { isFieldGroupFieldType } from "nextly/field-group-type";
+import { lazy, Suspense, useState, useEffect } from "react";
+import type { JSX } from "react";
+import { useFormContext, useWatch } from "react-hook-form";
+
+import { PluginSlot } from "@admin/components/shared/plugin-slot";
+import { usePluginFieldType } from "@admin/lib/plugins/plugin-field-type";
+
+import { useWithheldFields } from "../../versions/withheld-fields-context";
+
+import {
+  conditionSourcePath,
+  effectiveFieldGate,
+  fieldAdminGates,
+} from "./field-admin-gates";
+import { FieldWrapper } from "./FieldWrapper";
+import { UploadInput } from "./media/UploadInput";
+import { NumberInput } from "./number/NumberInput";
+import { RelationshipInput } from "./relational/RelationshipInput";
+import { CheckboxInput } from "./selection/CheckboxInput";
+import { ChipsInput } from "./selection/ChipsInput";
+import { DateInput } from "./selection/DateInput";
+import { MultiSelectInput } from "./selection/MultiSelectInput";
+import { RadioInput } from "./selection/RadioInput";
+import { SelectInput } from "./selection/SelectInput";
+import { ComponentInput } from "./structured/ComponentInput";
+import { GroupInput } from "./structured/GroupInput";
+import { JsonInput } from "./structured/JsonInput";
+import { RepeaterInput } from "./structured/RepeaterInput";
+import { EmailInput } from "./text/EmailInput";
+import { PasswordInput } from "./text/PasswordInput";
+import { TextareaInput } from "./text/TextareaInput";
+import { TextInput } from "./text/TextInput";
+
+// RichTextInput uses Lexical which has PrismJS - must be lazy loaded for SSR
+const RichTextInput = lazy(() =>
+  import("./special/RichTextInput").then(mod => ({
+    default: mod.RichTextInput,
+  }))
+);
+// CodeInput uses CodeMirror which has PrismJS - must be lazy loaded for SSR
+const CodeInput = lazy(() =>
+  import("./text/CodeInput").then(mod => ({ default: mod.CodeInput }))
+);
+// IconInput names the icon set's dynamic import. Lazy, so that import sits in
+// a chunk of its own and the admin's main bundle never references the set.
+const IconInput = lazy(() =>
+  import("./special/IconInput").then(mod => ({ default: mod.IconInput }))
+);
+
+// Special inputs
+
+/**
+ * Loading skeleton for editor components during SSR/lazy loading
+ */
+function EditorSkeleton() {
+  return (
+    <div className="flex h-[200px] items-center justify-center rounded-lg  border border-border bg-primary/5 animate-pulse">
+      <span className="text-sm text-muted-foreground">Loading editor...</span>
+    </div>
+  );
+}
+
+/**
+ * Stands in for the icon field while its control loads: the field's own
+ * height, so the form does not shift when the control arrives.
+ */
+function IconFieldSkeleton() {
+  return <div className="h-10 rounded-md bg-muted" />;
+}
+
+/**
+ * Client-side only wrapper for components with browser dependencies
+ */
+function ClientOnly({
+  children,
+  fallback,
+}: {
+  children: React.ReactNode;
+  fallback?: React.ReactNode;
+}) {
+  const [isMounted, setIsMounted] = useState(false);
+
+  useEffect(() => {
+    setIsMounted(true);
+  }, []);
+
+  if (!isMounted) {
+    return fallback ? <>{fallback}</> : <EditorSkeleton />;
+  }
+
+  return <>{children}</>;
+}
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export interface FieldRendererProps {
+  /** Field configuration from collection schema */
+  field: FieldConfig;
+  /** Base path for nested fields (e.g., "metadata" or "items.0") */
+  basePath?: string;
+  /** Whether the field is disabled */
+  disabled?: boolean;
+  /** Whether the field is read-only */
+  readOnly?: boolean;
+  /** Form mode; write-only fields (password) adjust their affordances */
+  mode?: "create" | "edit";
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/**
+ * Retrieves nested error from React Hook Form errors object.
+ * Handles dot-notation paths like "metadata.title" or "items.0.name".
+ *
+ * @param errors - React Hook Form errors object
+ * @param path - Field path in dot notation
+ * @returns Error object if found, undefined otherwise
+ */
+function getNestedError(
+  errors: Record<string, unknown>,
+  path: string
+): { message?: string } | undefined {
+  const keys = path.split(".");
+  let current: unknown = errors;
+
+  for (const key of keys) {
+    if (current && typeof current === "object" && key in current) {
+      current = (current as Record<string, unknown>)[key];
+    } else {
+      return undefined;
+    }
+  }
+
+  // Check if current is an error object with message
+  if (
+    current &&
+    typeof current === "object" &&
+    "message" in current &&
+    typeof (current as { message?: string }).message === "string"
+  ) {
+    return current as { message?: string };
+  }
+
+  return undefined;
+}
+
+// ============================================================================
+// Component
+// ============================================================================
+
+/**
+ * FieldRenderer - Dynamically renders appropriate input component for a field
+ *
+ * Acts as a type dispatcher that:
+ * 1. Determines the correct input component based on field.type
+ * 2. Wraps the input in FieldWrapper for consistent styling and error handling
+ * 3. Passes through common props (disabled, readOnly, control)
+ * 4. Computes the full field path for nested fields
+ *
+ * ## Supported Field Types
+ *
+ * ### Text Fields
+ * - `text` - Single-line text input
+ * - `textarea` - Multi-line text area
+ * - `icon` - One icon, chosen from a search-first picker
+ *
+ * ### Number Fields
+ * - `number` - Number input with min/max/step
+ *
+ * ### Selection Fields
+ * - `checkbox` - Boolean checkbox
+ * - `select` - Dropdown select
+ * - `date` - Date picker
+ *
+ * ### Media Fields
+ * - `upload` - File upload with preview
+ *
+ * ### Relational Fields
+ * - `relationship` - Reference to other collection entries
+ *
+ * ### Structured Fields
+ * - `array` - Array field for multiple items
+ * - `repeater` - Repeater field for multiple items
+ * - `group` - Nested field group
+ *
+ * ### Special Fields
+ * - `richText` - Lexical-based rich text editor
+ *
+ * ## Usage in Forms
+ *
+ * @example Basic usage
+ * ```tsx
+ * <FieldRenderer
+ *   field={{
+ *     name: 'title',
+ *     type: 'text',
+ *     label: 'Title',
+ *     required: true
+ *   }}
+ * />
+ * ```
+ *
+ * @example Nested field in a group
+ * ```tsx
+ * <FieldRenderer
+ *   field={{ name: 'city', type: 'text', label: 'City' }}
+ *   basePath="address"
+ * />
+ * // Field path will be: "address.city"
+ * ```
+ *
+ * @example Nested field in array
+ * ```tsx
+ * <FieldRenderer
+ *   field={{ name: 'name', type: 'text', label: 'Name' }}
+ *   basePath="items.0"
+ * />
+ * // Field path will be: "items.0.name"
+ * ```
+ *
+ * @param props - FieldRenderer props
+ * @returns Rendered field component wrapped in FieldWrapper
+ */
+export function FieldRenderer({
+  field,
+  basePath = "",
+  disabled,
+  readOnly,
+  mode,
+}: FieldRendererProps): JSX.Element | null {
+  const {
+    formState: { errors },
+    control,
+  } = useFormContext();
+
+  /*
+   * The plugin list arrives from the SESSION-GATED half of admin-meta, so it is
+   * absent for a moment on every load — and a field whose type lives in a
+   * plugin is deciding what to render during exactly that moment.
+   *
+   * Read the request's state as well as its answer, because absence means two
+   * different things here: no plugin contributes this type, or the list that
+   * would say so has not come back. Only the first is a fact about the project;
+   * treating the second as one reports a correctly-configured field as broken.
+   */
+  const pluginFieldType = usePluginFieldType(field.type);
+
+  // A plugin-supplied editor for this one field (D24 — a component path),
+  // which replaces the type dispatch below.
+  const adminOptions = field.admin;
+
+  // The condition's source, relative to the current base path.
+  const conditionFieldPath = conditionSourcePath(
+    fieldAdminGates(field).condition,
+    basePath
+  );
+
+  // Watch the condition field value to enable reactive conditional rendering
+  const conditionFieldValue = useWatch({
+    control,
+    name: conditionFieldPath || "",
+    disabled: !conditionFieldPath,
+  });
+
+  // The form's one decision about this field — drawn at all, read-only,
+  // disabled — from what the parent passes down, the field's own gates and
+  // the value its condition reads. A document view folds the same function
+  // over a field's groups, so the two cannot disagree.
+  const gate = effectiveFieldGate(
+    field,
+    { shown: true, readOnly: Boolean(readOnly), disabled: Boolean(disabled) },
+    conditionFieldValue
+  );
+  // Read before the early return below, as every hook here must be.
+  const isWithheld = useWithheldFields();
+  if (!gate.shown) return null;
+  const isReadOnly = gate.readOnly;
+  const isDisabled = gate.disabled;
+
+  // =========================================
+  // Data Fields (With FieldWrapper)
+  // =========================================
+  // Compute full field path for nested fields
+  // Use empty string as fallback for fields without names (shouldn't happen for data fields)
+  const fieldName = "name" in field ? (field.name as string) : "";
+  const fieldPath = basePath ? `${basePath}.${fieldName}` : fieldName;
+
+  // Get error for this field (handles nested paths)
+  const error = fieldPath ? getNestedError(errors, fieldPath) : undefined;
+
+  // Common props passed to all input components
+  const commonProps = {
+    name: fieldPath,
+    disabled: isDisabled,
+    readOnly: isReadOnly,
+    control,
+  };
+
+  // Component fields bypass FieldWrapper — they own their own header/label
+  // rendering (accordion in sidebar, card in main content).
+  // Asked through the shared predicate: stored definitions rewritten by the
+  // storage migration carry `fieldGroup`, and a dispatch against one literal
+  // rendered the migrated field as an unknown type.
+  // A component a viewed version withheld from the reader takes the wrapper's
+  // path instead, which names it and says it is held back: drawn as a
+  // component it would read as one that holds nothing.
+  const fieldType = field.type as string;
+  if (isFieldGroupFieldType(fieldType) && !isWithheld(fieldPath)) {
+    return (
+      <ComponentInput
+        {...commonProps}
+        name={fieldPath}
+        field={field as Parameters<typeof ComponentInput>[0]["field"]}
+      />
+    );
+  }
+
+  // Determine if horizontal layout should be used
+  // Removed horizontal layout override for checkboxes based on user feedback
+  // to match the vertical layout of radio buttons.
+  const useHorizontalLayout = false;
+
+  // Whether the editor for this field comes from a plugin rather than from the
+  // built-in type dispatch — either a per-field `admin.component` override
+  // (D24) or a plugin-registered field type (C7/D16). Both render through
+  // `PluginSlot`, so nothing here can know whether the result exposes a single
+  // labelable control, and it must not claim one does.
+  //
+  // This is deliberately a STRUCTURAL question rather than a check against the
+  // field's type name: an override leaves the type untouched while replacing
+  // the component entirely, so no list of composite type names can see it.
+  //
+  // Derived from the one lookup above rather than scanning the plugin list a
+  // second time. Two scans of one list for one fact agree today and drift the
+  // first time either changes what it matches.
+  const hasPluginEditor =
+    Boolean(adminOptions?.component) ||
+    (pluginFieldType.status === "ready" &&
+      pluginFieldType.component !== undefined);
+
+  return (
+    <FieldWrapper
+      field={field}
+      error={error?.message}
+      fieldPath={fieldPath}
+      horizontal={useHorizontalLayout}
+      editorIsOpaque={hasPluginEditor}
+      writesHeld={isReadOnly || isDisabled}
+    >
+      {renderField()}
+    </FieldWrapper>
+  );
+
+  /**
+   * Renders the appropriate input component based on field type.
+   * Uses type narrowing to ensure type-safe prop passing.
+   */
+  function renderField() {
+    // D24 — a plugin/app can override the editor for a specific field via
+    // `admin.component` (a component path). Takes precedence over the built-in
+    // type dispatch; isolated by the plugin boundary inside PluginSlot (D53).
+    if (adminOptions?.component) {
+      return (
+        <PluginSlot
+          path={adminOptions.component}
+          props={{ ...commonProps, field }}
+        />
+      );
+    }
+
+    // Cast to string to allow legacy "string" type which isn't in the FieldConfig union
+    const fieldType = field.type as string;
+    switch (fieldType) {
+      // =========================================
+      // Text Types
+      // =========================================
+      case "text":
+        return <TextInput {...commonProps} field={field as TextFieldConfig} />;
+
+      case "textarea":
+        return (
+          <TextareaInput
+            {...commonProps}
+            field={field as TextareaFieldConfig}
+          />
+        );
+
+      case "email":
+        return (
+          <EmailInput {...commonProps} field={field as EmailFieldConfig} />
+        );
+
+      case "password":
+        return (
+          <PasswordInput
+            {...commonProps}
+            field={field as PasswordFieldConfig}
+            mode={mode}
+          />
+        );
+
+      case "code":
+        return (
+          <ClientOnly>
+            <Suspense fallback={<EditorSkeleton />}>
+              <CodeInput {...commonProps} field={field as CodeFieldConfig} />
+            </Suspense>
+          </ClientOnly>
+        );
+
+      case "icon":
+        return (
+          <ClientOnly fallback={<IconFieldSkeleton />}>
+            <Suspense fallback={<IconFieldSkeleton />}>
+              <IconInput {...commonProps} field={field as IconFieldConfig} />
+            </Suspense>
+          </ClientOnly>
+        );
+
+      // =========================================
+      // Number Types
+      // =========================================
+      case "number":
+        return (
+          <NumberInput {...commonProps} field={field as NumberFieldConfig} />
+        );
+
+      // =========================================
+      // Selection Types
+      // =========================================
+      case "checkbox":
+        return (
+          <CheckboxInput
+            {...commonProps}
+            field={field as CheckboxFieldConfig}
+          />
+        );
+
+      case "select":
+        // hasMany selects store an array; SelectInput is single-value only and
+        // would submit a scalar that fails the field's z.array() schema.
+        return (field as SelectFieldConfig).hasMany ? (
+          <MultiSelectInput
+            {...commonProps}
+            field={field as SelectFieldConfig}
+          />
+        ) : (
+          <SelectInput {...commonProps} field={field as SelectFieldConfig} />
+        );
+
+      case "radio":
+        return (
+          <RadioInput {...commonProps} field={field as RadioFieldConfig} />
+        );
+
+      case "chips":
+        return (
+          <ChipsInput {...commonProps} field={field as ChipsFieldConfig} />
+        );
+
+      case "date":
+        return <DateInput {...commonProps} field={field as DateFieldConfig} />;
+
+      // =========================================
+      // Media Types
+      // =========================================
+      case "upload":
+        return (
+          <UploadInput {...commonProps} field={field as UploadFieldConfig} />
+        );
+
+      // =========================================
+      // Relational Types
+      // =========================================
+      case "relationship":
+        return (
+          <RelationshipInput
+            {...commonProps}
+            field={field as RelationshipFieldConfig}
+          />
+        );
+
+      // =========================================
+      // Structured Types
+      // =========================================
+      case "repeater":
+        return (
+          <RepeaterInput
+            {...commonProps}
+            name={fieldPath}
+            field={field as RepeaterFieldConfig}
+            // Pass FieldRenderer recursively for nested fields
+            renderField={(subField, subBasePath, subControl, options) => (
+              <FieldRenderer
+                field={subField}
+                basePath={subBasePath}
+                disabled={options?.disabled}
+                readOnly={options?.readOnly}
+              />
+            )}
+          />
+        );
+
+      case "group":
+        return (
+          <GroupInput
+            {...commonProps}
+            field={field as GroupFieldConfig}
+            basePath={basePath}
+          />
+        );
+
+      case "component":
+        // Handled by early return above (bypasses FieldWrapper).
+        return null;
+
+      // =========================================
+      // Special Types
+      // =========================================
+      case "richText":
+        return (
+          <ClientOnly>
+            <Suspense fallback={<EditorSkeleton />}>
+              <RichTextInput
+                {...commonProps}
+                field={field as RichTextFieldConfig}
+              />
+            </Suspense>
+          </ClientOnly>
+        );
+
+      case "json":
+        return (
+          <JsonInput
+            {...commonProps}
+            name={fieldPath}
+            field={field as JSONFieldConfig}
+          />
+        );
+
+      // =========================================
+      // Unknown Type
+      // =========================================
+      default: {
+        /*
+         * C7/D16 — a plugin-registered custom field type renders via its
+         * contributed editor component (PluginSlot isolates it, D53).
+         *
+         * The lookup reports whether the plugin list can answer at all, so the
+         * "unknown type" sentence below is reachable only from a list that
+         * actually arrived. Reading `branding.plugins` here instead would make
+         * a failed request indistinguishable from a project with no plugins.
+         */
+        if (pluginFieldType.status === "loading") return <EditorSkeleton />;
+        if (pluginFieldType.status === "unavailable") {
+          /*
+           * A THIRD state, not a slower version of the skeleton above.
+           *
+           * A skeleton says something is coming. The request is issued with
+           * `retry: false`, so once it has failed nothing is coming and a
+           * skeleton would leave the field pretending to load for as long as
+           * the server stays unreachable. Falling through to "unknown field
+           * type" is worse still: it blames the field for a request that
+           * failed, so a correctly-installed plugin reads as a broken
+           * configuration.
+           */
+          return (
+            <div className="rounded-lg border border-border bg-muted/50 p-4 text-center">
+              <p className="text-sm text-muted-foreground">
+                This field could not be loaded because the list of installed
+                plugins is unavailable. Reload the page to try again.
+              </p>
+            </div>
+          );
+        }
+        if (pluginFieldType.component) {
+          return (
+            <PluginSlot
+              path={pluginFieldType.component}
+              props={{ ...commonProps, field }}
+            />
+          );
+        }
+        return (
+          <div className="rounded-lg  border border-danger-border bg-danger-surface p-4 text-center">
+            <p className="text-sm text-destructive">
+              Unknown field type: {(field as { type: string }).type}
+            </p>
+          </div>
+        );
+      }
+    }
+  }
+}

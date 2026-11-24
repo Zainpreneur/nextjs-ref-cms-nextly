@@ -1,0 +1,90 @@
+{
+  "extends": "@nextlyhq/tsconfig/react-library-bundler.json",
+  "compilerOptions": {
+    // The common directory of every input, as TypeScript infers it today:
+    // `paths` below map `nextly` to its source, so inputs sit in `../nextly`
+    // as well as here. TypeScript 7 defaults `rootDir` to this directory and
+    // would refuse them (TS6059).
+    "rootDir": "..",
+    "types": ["node"],
+    // A field declared without an initializer is a type, not an assignment.
+    // The bundler reads this, and the Lexical node classes rely on it: they
+    // declare `__buttons` and the like and set them in the constructor after
+    // `super()`, where define semantics would first reset them to `undefined`.
+    // It is what this package has always shipped, set by its old ES2020 target.
+    "useDefineForClassFields": false,
+    "emitDeclarationOnly": false,
+    "outDir": "dist",
+    "paths": {
+      "nextly": ["../nextly/src"],
+      // The gate the layout endpoint and the browser BOTH decide with. Mapped
+      // to source because a bare subpath resolves through the package exports
+      // to `dist`, which does not exist until something builds -- so static
+      // analysis reports it unresolved on a clean checkout even though tsc and
+      // the bundler are fine after a build. The bare `nextly` mapping above
+      // does not cover subpaths.
+      "nextly/widget-gate": ["../nextly/src/domains/widgets/gate.ts"],
+      // Same reason, and a second one: the root entry reaches the DI
+      // container and the auth middleware, whose `@nextly/*` aliases this
+      // project does not define, so importing it here reports a hundred
+      // errors about code the admin never touches.
+      "nextly/document-lock": [
+        "../nextly/src/domains/document-lock/contract.ts"
+      ],
+      // Same reason again: the wire shapes a widget query answers with, whose
+      // `types` and `import` conditions point at different built paths.
+      "nextly/widget-result": ["../nextly/src/domains/widgets/result.ts"],
+      // Same reason: the translation states the worklist asks the server for.
+      "nextly/translation-filter-states": [
+        "../nextly/src/domains/i18n/translation-filter-states.ts"
+      ],
+      // Same reason: the keys a linked filter keeps at its top level.
+      "nextly/reserved-filter-keys": [
+        "../nextly/src/domains/collections/query/reserved-filter-keys.ts"
+      ],
+      // Same reason: the one deprecation notice, said once per process.
+      "nextly/deprecation-notice": [
+        "../nextly/src/shared/lib/deprecation-notice.ts"
+      ],
+      // Same reason: the kinds and keys Needs attention's answer is written in.
+      "nextly/admin-root-exports": [
+        "../nextly/src/plugins/codegen/admin-root-exports.ts"
+      ],
+      "nextly/attention-keys": [
+        "../nextly/src/domains/widgets/attention-keys.ts"
+      ],
+      // Same reason: a card's body height and the rows it holds, the one
+      // formula the frame draws by and a widget's load counts by.
+      // Same reason: a comparison baseline's name grammar, which the
+      // registry refuses a name by and an address is read by.
+      "nextly/comparison-baseline-name": [
+        "../nextly/src/domains/versions/comparison-baseline-name.ts"
+      ],
+      "nextly/card-geometry": [
+        "../nextly/src/domains/widgets/card-geometry.ts"
+      ],
+      // Same reason: the one humaniser of a field's key, which the server's
+      // `describe` read names fields by too. Internal to core and the admin.
+      "nextly/field-label": ["../nextly/src/collections/fields/field-label.ts"],
+      // Same reason: where the admin may send a browser after sign-in, the
+      // rule the server holds a sign-in's destination to as well. Internal
+      // to core and the admin.
+      "nextly/admin-path": [
+        "../nextly/src/auth/redirect/sanitize-admin-path.ts"
+      ],
+      // Same reason: which kind of file a MIME type is, which the server's
+      // library query narrows by too. Internal to core and the admin.
+      "nextly/media-categories": [
+        "../nextly/src/domains/media/media-categories.ts"
+      ],
+      // Same reason: the data each of core's declared cards answers, typed at
+      // both ends. Internal to core and the admin.
+      "nextly/core-widget-data": [
+        "../nextly/src/domains/widgets/core-widgets/data.ts"
+      ],
+      "@admin/*": ["./src/*"]
+    }
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

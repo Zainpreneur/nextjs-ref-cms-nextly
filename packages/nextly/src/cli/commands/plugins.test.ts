@@ -1,0 +1,178 @@
+import { describe, expect, it, vi } from "vitest";
+
+import type { PluginInfo } from "../../plugins/plugin-introspection";
+import { installTarget, renderPluginInfo, renderPluginsList } from "./plugins";
+
+function info(overrides: Partial<PluginInfo> = {}): PluginInfo {
+  return {
+    name: "@nextlyhq/plugin-form-builder",
+    version: "2.0.0",
+    nextly: "^1.0.0",
+    enabled: true,
+    dependsOn: [],
+    optionalDependsOn: [],
+    collections: ["forms", "form-submissions"],
+    singles: [],
+    fieldGroups: [],
+    permissions: ["export-submissions"],
+    events: ["nextlyhq-plugin-form-builder.submitted"],
+    principalKinds: [],
+    routeCount: 1,
+    adminMenuCount: 1,
+    adminPageCount: 1,
+    hasSettings: true,
+    renamed: {},
+    manifest: {
+      outbound: [],
+      rawSql: false,
+      completesLogins: false,
+      secrets: [],
+      provides: [],
+      requires: {},
+    },
+    ...overrides,
+  };
+}
+
+describe("renderPluginsList (D48)", () => {
+  it("prints a table with one row per plugin", () => {
+    const logger = { header: vi.fn(), info: vi.fn(), table: vi.fn() };
+    renderPluginsList(
+      [info(), info({ name: "@acme/x", enabled: false })],
+      logger
+    );
+
+    expect(logger.table).toHaveBeenCalledTimes(1);
+    const [headers, rows] = logger.table.mock.calls[0];
+    expect(headers).toEqual([
+      "name",
+      "version",
+      "enabled",
+      "collections",
+      "routes",
+      "permissions",
+    ]);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toEqual([
+      "@nextlyhq/plugin-form-builder",
+      "2.0.0",
+      "yes",
+      2,
+      1,
+      1,
+    ]);
+    // Disabled plugin shows "no".
+    expect(rows[1][2]).toBe("no");
+  });
+
+  it("reports the empty case without a table", () => {
+    const logger = { header: vi.fn(), info: vi.fn(), table: vi.fn() };
+    renderPluginsList([], logger);
+    expect(logger.table).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith("No plugins registered.");
+  });
+});
+
+describe("renderPluginInfo (D48)", () => {
+  it("says a plugin declares no schemaVersion rather than leaving it out", () => {
+    const logger = {
+      header: vi.fn(),
+      keyValue: vi.fn(),
+      item: vi.fn(),
+      info: vi.fn(),
+    };
+    renderPluginInfo(info(), logger);
+
+    const kv = Object.fromEntries(logger.keyValue.mock.calls);
+    expect(kv.schemaVersion).toBe("not declared");
+  });
+
+  it("prints key/value details and itemized contributions", () => {
+    const logger = {
+      header: vi.fn(),
+      keyValue: vi.fn(),
+      item: vi.fn(),
+      info: vi.fn(),
+    };
+    renderPluginInfo(info({ renamed: { forms: "contact-forms" } }), logger);
+
+    expect(logger.header).toHaveBeenCalledWith("@nextlyhq/plugin-form-builder");
+    const kv = Object.fromEntries(logger.keyValue.mock.calls);
+    expect(kv.version).toBe("2.0.0");
+    expect(kv.enabled).toBe("yes");
+    expect(kv.renamed).toBe("forms→contact-forms");
+    expect(kv["settings page"]).toBe("yes");
+    // Permissions are itemized.
+    expect(logger.item).toHaveBeenCalledWith("export-submissions", 1);
+  });
+
+  it("lists the kinds of signed-in person a plugin registers", () => {
+    const logger = {
+      header: vi.fn(),
+      keyValue: vi.fn(),
+      item: vi.fn(),
+      info: vi.fn(),
+    };
+    renderPluginInfo(
+      info({ principalKinds: ["acme-accounts:account"] }),
+      logger
+    );
+
+    const kv = Object.fromEntries(logger.keyValue.mock.calls);
+    expect(kv["signed-in kinds"]).toBe("1");
+    expect(logger.item).toHaveBeenCalledWith("acme-accounts:account", 1);
+  });
+
+  it("prints the manifest an operator reviews before installing", () => {
+    const logger = {
+      header: vi.fn(),
+      keyValue: vi.fn(),
+      item: vi.fn(),
+      info: vi.fn(),
+    };
+    renderPluginInfo(
+      info({
+        manifest: {
+          outbound: ["api.stripe.com"],
+          rawSql: true,
+          completesLogins: true,
+          secrets: ["apiKey"],
+          provides: ["acme/payments"],
+          requires: { "acme/webhooks": ">=2.0.0" },
+          schemaVersion: 3,
+        },
+      }),
+      logger
+    );
+
+    const kv = Object.fromEntries(logger.keyValue.mock.calls);
+    expect(kv["raw SQL"]).toBe("declared");
+    expect(kv.schemaVersion).toBe("3");
+    expect(kv["finishes logins"]).toBe("declared");
+    const items = logger.item.mock.calls.map(call => call[0]);
+    expect(items).toEqual(
+      expect.arrayContaining([
+        "api.stripe.com",
+        "apiKey",
+        "acme/payments",
+        "acme/webhooks >=2.0.0",
+      ])
+    );
+  });
+});
+
+describe("installTarget", () => {
+  it("installs the named plugin", () => {
+    expect(installTarget("@acme/fx", false)).toEqual({ name: "@acme/fx" });
+  });
+
+  it("installs every configured plugin with --all", () => {
+    expect(installTarget(undefined, true)).toBe("all");
+  });
+
+  it("refuses both a name and --all, and neither", () => {
+    // Both: which one was meant would be the parser's guess.
+    expect(installTarget("@acme/fx", true)).toBeNull();
+    expect(installTarget(undefined, false)).toBeNull();
+  });
+});

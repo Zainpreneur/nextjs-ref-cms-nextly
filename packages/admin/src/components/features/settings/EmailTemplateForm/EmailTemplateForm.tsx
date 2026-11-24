@@ -1,0 +1,514 @@
+"use client";
+
+import type { EditorView } from "@codemirror/view";
+import { zodResolver } from "@hookform/resolvers/zod";
+import type { JSX } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useForm, type Resolver, type SubmitHandler } from "react-hook-form";
+
+import { toast } from "@admin/components/ui";
+import { Form } from "@admin/components/ui/form";
+import { ROUTES } from "@admin/constants/routes";
+import { useEmailProviders } from "@admin/hooks/queries/useEmailProviders";
+import { useEmailTemplates } from "@admin/hooks/queries/useEmailTemplates";
+import { generateSlug } from "@admin/lib/fields";
+import { navigateTo } from "@admin/lib/navigation";
+import type { EmailTemplateRecord } from "@admin/services/emailTemplateApi";
+
+import { BodyEditor } from "./BodyEditor";
+import { DataRail } from "./DataRail";
+import { DetailsPanel } from "./DetailsPanel";
+import { EnvelopeBar } from "./EnvelopeBar";
+import { InboxStrip, shownInboxLine } from "./InboxStrip";
+import { OwnershipNotices } from "./OwnershipNotices";
+import { regionsForRefusal } from "./refusal-routing";
+import { suppliedNamesFor } from "./sample-data";
+import {
+  DEFAULT_VALUES,
+  EMAIL_TEMPLATE_FORM_ID,
+  templateSchemaFor,
+  templateToFormValues,
+  testDraftOf,
+  type TemplateFormValues,
+} from "./schema";
+import { SendTestDialog } from "./SendTestDialog";
+import { PreviewPane } from "./TemplatePreview";
+import { useDerivedTemplateState } from "./useDerivedTemplateState";
+import { useOwnershipActs, type OwnershipActs } from "./useOwnershipActs";
+import { useTemplateVariables } from "./useTemplateVariables";
+import { useVariableInsertion } from "./useVariableInsertion";
+import { VariableChips } from "./VariablesRail";
+import { ownsContent } from "./workbench-model";
+import { WorkbenchDialogs } from "./WorkbenchDialogs";
+import { PhoneActions, WorkbenchHeader } from "./WorkbenchHeader";
+import {
+  WorkbenchLayout,
+  type RevealRequest,
+  type SheetPanel,
+} from "./WorkbenchLayout";
+import { LazyWrittenBody } from "./written/LazyWrittenBody";
+import type { InsertVariable } from "./written/WrittenBody";
+
+// ============================================================
+// EmailTemplateForm — the template workbench
+// ============================================================
+
+export interface EmailTemplateFormProps {
+  mode: "create" | "edit";
+  template?: EmailTemplateRecord;
+  initialValues?: TemplateFormValues;
+  isPending: boolean;
+  onSubmit: SubmitHandler<TemplateFormValues>;
+}
+
+type FormOf = ReturnType<typeof useForm<TemplateFormValues>>;
+
+/** The content column: whose email it is, the inbox line, envelope and body. */
+function ContentColumn({
+  form,
+  template,
+  owns,
+  keptOnOldEngine,
+  acts,
+  isPending,
+  isLayoutRow,
+  inbox,
+  editor,
+  writtenInsert,
+  sampleData,
+}: {
+  form: FormOf;
+  template?: EmailTemplateRecord;
+  owns: boolean;
+  keptOnOldEngine: boolean;
+  acts: OwnershipActs;
+  isPending: boolean;
+  isLayoutRow: boolean;
+  /** The inbox line as rendered from the draft, or null before the first render. */
+  inbox: { subject: string; preheader: string; from: string | null } | null;
+  editor: Omit<
+    React.ComponentProps<typeof BodyEditor>,
+    "control" | "isPending" | "readOnly" | "liquid"
+  >;
+  /** Where the Variables rail puts a chip in a written email. */
+  writtenInsert: React.MutableRefObject<InsertVariable | null>;
+  /** The test data, or null while the sample JSON is invalid. */
+  sampleData: Record<string, unknown> | null;
+}) {
+  const [subject, preheader, fromOverride, format, blocks, variables] =
+    form.watch([
+      "subject",
+      "preheader",
+      "fromOverride",
+      "format",
+      "blocks",
+      "variables",
+    ]);
+  const written = format === "written";
+  return (
+    // The column scrolls, so its cards keep their height (a shrunk card clips
+    // its own fields); only the body grows into what is left.
+    <div className="flex min-h-full flex-col gap-4 p-4 *:shrink-0 lg:p-6">
+      <OwnershipNotices
+        record={template}
+        ownsContent={owns}
+        keptOnOldEngine={keptOnOldEngine}
+        isDirty={form.formState.isDirty}
+        undo={acts.undoNote}
+        onOverride={() => acts.startAct("override")}
+        onReview={() => acts.startAct("review")}
+        onReset={() => acts.startAct("reset")}
+      />
+      {isLayoutRow ? null : (
+        <InboxStrip
+          {...shownInboxLine({ subject, preheader, from: fromOverride }, inbox)}
+        />
+      )}
+      <div
+        data-testid="workbench-envelope"
+        className="overflow-hidden rounded-lg border border-border"
+      >
+        <EnvelopeBar
+          control={form.control}
+          isPending={isPending}
+          isLayoutRow={isLayoutRow}
+          ownsContent={owns}
+          completion={editor.completion}
+          liquid={!keptOnOldEngine}
+        />
+      </div>
+      <div className="flex min-h-105 flex-1 flex-col overflow-hidden rounded-lg border border-border">
+        {written && blocks ? (
+          // A written email's body is its blocks, in place of the code editor.
+          <LazyWrittenBody
+            value={blocks}
+            readOnly={!owns || isPending}
+            variables={variables}
+            sampleData={sampleData}
+            insertRef={writtenInsert}
+            onChange={next =>
+              form.setValue("blocks", next, { shouldDirty: true })
+            }
+          />
+        ) : (
+          <BodyEditor
+            control={form.control}
+            isPending={isPending}
+            readOnly={!owns}
+            liquid={!keptOnOldEngine}
+            suppliedNames={suppliedNamesFor(isLayoutRow)}
+            {...editor}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+export function EmailTemplateForm({
+  mode,
+  template,
+  initialValues,
+  isPending,
+  onSubmit,
+}: EmailTemplateFormProps): JSX.Element {
+  const isEdit = mode === "edit";
+  const slugTouchedRef = useRef(false);
+  const bodyViewRef = useRef<EditorView | null>(null);
+
+  const [editorTab, setEditorTab] = useState<"html" | "text">("html");
+  const [sheet, setSheet] = useState<SheetPanel | null>(null);
+  const [revealRequest, setRevealRequest] = useState<RevealRequest>({
+    panel: "edit",
+    seq: 0,
+  });
+  const reveal = (panel: RevealRequest["panel"]) =>
+    setRevealRequest(previous => ({ panel, seq: previous.seq + 1 }));
+  const [sampleOverride, setSampleOverride] = useState<string | null>(null);
+  const [sendTestOpen, setSendTestOpen] = useState(false);
+
+  // The row being edited keeps its kind; layouts are wrappers, not bodies.
+  const currentKind = template?.kind ?? "template";
+  const isLayoutRow = currentKind === "layout";
+  // Emails are listed under Messages, and layouts and partials under Design;
+  // leaving the workbench returns to the tab that lists it.
+  const listedUnderDesign = currentKind !== "template";
+  const listHref = listedUnderDesign ? ROUTES.EMAIL_DESIGN : ROUTES.EMAIL;
+  const owns = ownsContent(template);
+
+  const form = useForm<TemplateFormValues>({
+    resolver: zodResolver(
+      templateSchemaFor(isLayoutRow)
+    ) as unknown as Resolver<TemplateFormValues>,
+    defaultValues:
+      initialValues ??
+      (template ? templateToFormValues(template) : DEFAULT_VALUES),
+  });
+
+  const { data: providersData } = useEmailProviders(
+    { page: 0, pageSize: 100, search: "" },
+    { staleTime: 60_000 }
+  );
+
+  const { data: allTemplates } = useEmailTemplates();
+  const layouts = useMemo(
+    () => (allTemplates ?? []).filter(t => t.kind === "layout"),
+    [allTemplates]
+  );
+  // Only the list says whether an email is kept on the previous engine.
+  const keptOnOldEngine = Boolean(
+    allTemplates?.find(t => t.id === template?.id)?.keptOnOldEngine
+  );
+
+  const acts = useOwnershipActs({
+    template,
+    isDirty: form.formState.isDirty,
+    listHref,
+  });
+
+  const [
+    htmlContent,
+    plainTextContent,
+    subject,
+    preheader,
+    useLayout,
+    isActive,
+    name,
+    variables,
+    layoutId,
+    fromOverride,
+    replyTo,
+    watchedFormat,
+    watchedBlocks,
+  ] = form.watch([
+    "htmlContent",
+    "plainTextContent",
+    "subject",
+    "preheader",
+    "useLayout",
+    "isActive",
+    "name",
+    "variables",
+    "layoutId",
+    "fromOverride",
+    "replyTo",
+    "format",
+    "blocks",
+  ]);
+
+  useEffect(() => {
+    if (initialValues) {
+      form.reset(initialValues);
+      slugTouchedRef.current = false;
+    } else if (template && isEdit) {
+      form.reset(templateToFormValues(template));
+    }
+  }, [initialValues, template, isEdit, form]);
+
+  const handleNameChange = useCallback(
+    (value: string, onChange: (v: string) => void) => {
+      onChange(value);
+      if (!isEdit && !slugTouchedRef.current) {
+        form.setValue("slug", generateSlug(value), { shouldValidate: true });
+      }
+    },
+    [isEdit, form]
+  );
+
+  // Insert a {{variable}} at the editor caret (falls back to append).
+  const insertCodedVariable = useVariableInsertion({
+    form,
+    editorTab,
+    bodyViewRef,
+  });
+  // A written email's variables are chips in its blocks, put where the person
+  // was last typing; the code editor's insertion would go into HTML a written
+  // email doesn't have.
+  const writtenInsert = useRef<InsertVariable | null>(null);
+  const insertVariable = useCallback(
+    (name: string) => {
+      if (form.getValues("format") !== "written") {
+        insertCodedVariable(name);
+        return;
+      }
+      if (!writtenInsert.current?.(name)) {
+        toast.info(
+          "Click into a heading, text, button label or alt text, then insert the variable."
+        );
+      }
+    },
+    [form, insertCodedVariable]
+  );
+
+  const derived = useDerivedTemplateState({
+    variables,
+    sampleOverride,
+    subject,
+    htmlContent,
+    plainTextContent,
+    preheader,
+    useLayout,
+    layoutId,
+    kind: currentKind,
+    fromOverride,
+    templateId: template?.id,
+    written: watchedFormat === "written" ? watchedBlocks : null,
+  });
+
+  // What the template uses but doesn't declare, and what would show blank.
+  const variableCheck = useTemplateVariables({
+    sources: [subject, preheader, htmlContent, plainTextContent],
+    // From address and Reply-To are always rendered by the Liquid engine,
+    // even when the body is kept on the previous one.
+    liquidSources: [fromOverride, replyTo],
+    declared: variables ?? [],
+    data: derived.sampleData,
+    isLayoutRow,
+    liquid: !keptOnOldEngine,
+  });
+  const declareVariable = useCallback(
+    (variableName: string) => {
+      form.setValue(
+        "variables",
+        [
+          ...(form.getValues("variables") ?? []),
+          { name: variableName, description: "", required: false },
+        ],
+        { shouldDirty: true }
+      );
+    },
+    [form]
+  );
+
+  // What the editors complete: the declared variables, and the test data's
+  // shape for their properties.
+  const completion = useMemo(
+    () => ({ declared: variables ?? [], sample: derived.sampleData }),
+    [variables, derived.sampleData]
+  );
+
+  const toggleSheet = (panel: SheetPanel) =>
+    setSheet(current => (current === panel ? null : panel));
+  const openSendTest = () => setSendTestOpen(true);
+  const openOverride = () => acts.startAct("override");
+
+  return (
+    <Form {...form}>
+      <form
+        id={EMAIL_TEMPLATE_FORM_ID}
+        onSubmit={e => {
+          /*
+           * The second argument is what stops a refusal being silent. The
+           * Details sheet opens on demand, so a field it owns can be invalid
+           * while the only message for it is unmounted: `handleSubmit` then
+           * declines and nothing appears, which reads as a Save button that
+           * does nothing.
+           */
+          void form.handleSubmit(onSubmit, errors => {
+            // The editor's own fields first: they're the content itself.
+            const regions = regionsForRefusal(Object.keys(errors));
+            if (regions.content) {
+              reveal("edit");
+            } else if (regions.details) {
+              setSheet("details");
+              reveal("details");
+            }
+          })(e);
+        }}
+        className="h-full min-h-0"
+        aria-busy={isPending}
+      >
+        <WorkbenchLayout
+          splitLabel="Editor and preview"
+          sheet={sheet}
+          onSheetChange={setSheet}
+          revealRequest={revealRequest}
+          header={tier => (
+            <WorkbenchHeader
+              tier={tier}
+              control={form.control}
+              onNameChange={handleNameChange}
+              record={template}
+              isEdit={isEdit}
+              isPending={isPending}
+              isDirty={form.formState.isDirty}
+              isActive={isActive}
+              ownsContent={owns}
+              hasData={!isLayoutRow}
+              sheet={sheet}
+              onToggleSheet={toggleSheet}
+              onExit={() => navigateTo(listHref)}
+              exitLabel={
+                listedUnderDesign ? "Back to Design" : "Back to Messages"
+              }
+              onSendTest={openSendTest}
+              onOverride={openOverride}
+              menu={acts.menu}
+            />
+          )}
+          content={
+            <ContentColumn
+              form={form}
+              template={template}
+              owns={owns}
+              keptOnOldEngine={keptOnOldEngine}
+              acts={acts}
+              isPending={isPending}
+              isLayoutRow={isLayoutRow}
+              writtenInsert={writtenInsert}
+              sampleData={derived.sampleError ? null : derived.sampleData}
+              inbox={
+                derived.hasPreview
+                  ? {
+                      subject: derived.previewSubject,
+                      preheader: derived.previewPreheader,
+                      from: derived.previewFrom,
+                    }
+                  : null
+              }
+              editor={{
+                editorTab,
+                onEditorTabChange: setEditorTab,
+                bodyViewRef,
+                completion,
+                chips: (
+                  <VariableChips
+                    declared={variables ?? []}
+                    onInsert={insertVariable}
+                  />
+                ),
+              }}
+            />
+          }
+          preview={
+            <PreviewPane
+              html={derived.previewHtml}
+              text={derived.previewText}
+              subject={derived.previewSubject}
+              format={editorTab}
+              isPending={derived.isPreviewPending}
+              error={derived.previewError}
+            />
+          }
+          data={
+            isLayoutRow ? null : (
+              <DataRail
+                sampleText={derived.sampleText}
+                onSampleChange={setSampleOverride}
+                onReset={() => setSampleOverride(null)}
+                sampleError={derived.sampleError}
+                check={variableCheck}
+                onDeclare={owns ? declareVariable : undefined}
+              />
+            )
+          }
+          details={
+            <DetailsPanel
+              control={form.control}
+              isEdit={isEdit}
+              isPending={isPending}
+              isLayoutRow={isLayoutRow}
+              providers={providersData?.data ?? []}
+              layouts={layouts}
+              declared={variables ?? []}
+              onInsert={insertVariable}
+              ownsContent={owns}
+              carriesSecret={template?.carriesSecret === true}
+              sentBy={template?.sentBy}
+              sendersIncomplete={template?.referencesComplete === false}
+            />
+          }
+          phoneBar={
+            <PhoneActions
+              isEdit={isEdit}
+              isPending={isPending}
+              ownsContent={owns}
+              onSendTest={openSendTest}
+              onOverride={openOverride}
+            />
+          }
+        />
+
+        {isEdit && (
+          <SendTestDialog
+            open={sendTestOpen}
+            onOpenChange={setSendTestOpen}
+            templateId={template?.id ?? ""}
+            templateName={name}
+            sampleData={derived.sampleData}
+            draftOf={() => testDraftOf(form.getValues())}
+          />
+        )}
+      </form>
+
+      {template ? (
+        <WorkbenchDialogs
+          template={template}
+          acts={acts}
+          source={derived.previewSource}
+          onDiscardEdits={() => form.reset(templateToFormValues(template))}
+        />
+      ) : null}
+    </Form>
+  );
+}

@@ -1,0 +1,370 @@
+/**
+ * The reserved filter keys that keep entries by where they stand in
+ * publishing, rather than by a value they hold.
+ *
+ * - `_pendingChange: true` keeps entries whose draft holds changes not yet
+ *   published.
+ * - `_strandedStage: true` keeps entries with a part in a stage their workflow
+ *   no longer has, which Needs attention lists.
+ * - `_inRelease: { scheduledBefore }` keeps entries a scheduled release will
+ *   publish after now and no later than `scheduledBefore`; `_inRelease: true`
+ *   drops the upper bound.
+ *
+ * They are what the dashboard's counts are counted with, so a count and the
+ * list it links to are one filter and cannot disagree. Like `_translated`, each
+ * is a condition on another table, so each is read only at the TOP level of a
+ * filter and refused anywhere else (`filter-shape`).
+ *
+ * This module decides what each key's value MEANS, once: the shape check
+ * refuses what these readers cannot read, and the query reads the keys with the
+ * same readers, so the two cannot come to accept different values.
+ *
+ * @module domains/collections/query/workflow-filter
+ * @experimental The keys and their forms may change until the dashboard's
+ *   Needs attention card is complete.
+ */
+
+import type { FilterProblem } from "./filter-shape";
+import {
+  ASSIGNED_TO_ME_KEY,
+  CHANGED_SINCE_APPROVED_KEY,
+  IN_RELEASE_KEY,
+  PENDING_CHANGE_KEY,
+  STAGE_KEY,
+  STRANDED_STAGE_KEY,
+  WAITING_FOR_ME_KEY,
+} from "./reserved-filter-keys";
+
+// Declared with the other reserved keys, so the admin reads the same names.
+export {
+  ASSIGNED_TO_ME_KEY,
+  CHANGED_SINCE_APPROVED_KEY,
+  IN_RELEASE_KEY,
+  PENDING_CHANGE_KEY,
+  STAGE_KEY,
+  STRANDED_STAGE_KEY,
+  WAITING_FOR_ME_KEY,
+};
+
+/**
+ * Which scheduled releases an entry must be in to be kept.
+ *
+ * @experimental
+ */
+export interface InReleaseFilter {
+  /**
+   * The latest instant a release may be scheduled for, inclusive, or `null`
+   * for no upper bound. The lower bound is always the read's own "now".
+   */
+  scheduledBefore: Date | null;
+}
+
+/**
+ * The workflow conditions a filter carried at its top level.
+ *
+ * @experimental
+ */
+export interface WorkflowFilter {
+  /** Keep only entries whose draft holds changes not yet published. */
+  pendingChange: boolean;
+  /** Keep only entries a scheduled release will publish, or `null` for no such condition. */
+  inRelease: InReleaseFilter | null;
+  /**
+   * Keep only entries with a part in a stage their workflow no longer has.
+   * Absent reads as false, so a filter built before the key existed keeps
+   * meaning what it meant.
+   */
+  strandedStage?: boolean;
+  /**
+   * Keep only entries with a part assigned to the reader or to one of their
+   * roles. Absent reads as false, as `strandedStage` does.
+   */
+  assignedToMe?: boolean;
+  /**
+   * Keep only entries with a part changed since its last approval. Absent
+   * reads as false, as `strandedStage` does.
+   */
+  changedSinceApproved?: boolean;
+  /**
+   * Keep only entries with a part in this stage of their workflow. Absent
+   * keeps every entry, as before the key existed.
+   */
+  stage?: string;
+  /**
+   * Keep only entries with a part waiting for the reader's review. Absent
+   * reads as false, as `strandedStage` does.
+   */
+  waitingForMe?: boolean;
+}
+
+/**
+ * An instant written with its zone: a date, a time and `Z` or an offset.
+ *
+ * The zone is required because the bound is an INSTANT. A bare date or a time
+ * without a zone would be read in the server's own zone, so one link would
+ * mean different moments on different servers.
+ */
+const ZONED_INSTANT =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,9})?)?(?:Z|[+-](\d{2}):(\d{2}))$/;
+
+/** Whether `value` is an integer from `min` to `max`, both included. */
+function within(value: string | undefined, min: number, max: number): boolean {
+  if (value === undefined) return true;
+  const n = Number(value);
+  return n >= min && n <= max;
+}
+
+/**
+ * Whether every part of a zoned instant names a real moment: a month of the
+ * year, a day of that month, an hour, a minute and a second, and an offset.
+ *
+ * Checked part by part because `Date` does not refuse an impossible one: it
+ * rolls `2026-02-30` over to March 2, and the filter would then answer for a
+ * bound the caller never wrote.
+ */
+function realParts(match: RegExpExecArray): boolean {
+  const [, year, month, day, hour, minute, second, offsetHour, offsetMinute] =
+    match;
+  if (!within(month, 1, 12)) return false;
+  // Day 0 of the next month is the last day of this one.
+  const daysInMonth = new Date(
+    Date.UTC(Number(year), Number(month), 0)
+  ).getUTCDate();
+  return (
+    within(day, 1, daysInMonth) &&
+    within(hour, 0, 23) &&
+    within(minute, 0, 59) &&
+    within(second, 0, 59) &&
+    within(offsetHour, 0, 23) &&
+    within(offsetMinute, 0, 59)
+  );
+}
+
+/** A valid instant from a `Date` or a zoned ISO 8601 string, or `undefined`. */
+function readInstant(value: unknown): Date | undefined {
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value : undefined;
+  }
+  if (typeof value !== "string") return undefined;
+  const match = ZONED_INSTANT.exec(value);
+  if (match === null || !realParts(match)) return undefined;
+  const parsed = new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed : undefined;
+}
+
+/**
+ * `_pendingChange`'s value, read: `true` is its only form.
+ *
+ * `false` is refused rather than read as "no condition": a caller who wrote it
+ * meant "entries WITHOUT pending changes", and answering every entry instead
+ * would be a wider answer than the one asked.
+ */
+function readPendingChange(value: unknown): true | undefined {
+  return value === true ? true : undefined;
+}
+
+/**
+ * `_strandedStage`'s value, read: `true` is its only form, for the reason
+ * `_pendingChange` takes no `false`.
+ */
+function readStrandedStage(value: unknown): true | undefined {
+  return value === true ? true : undefined;
+}
+
+/**
+ * `_assignedToMe`'s value, read: `true` is its only form, as `_strandedStage`'s.
+ */
+function readAssignedToMe(value: unknown): true | undefined {
+  return value === true ? true : undefined;
+}
+
+/**
+ * `_changedSinceApproved`'s value, read: `true` is its only form, as `_strandedStage`'s.
+ */
+function readChangedSinceApproved(value: unknown): true | undefined {
+  return value === true ? true : undefined;
+}
+
+/**
+ * `_waitingForMe`'s value, read: `true` is its only form, as `_strandedStage`'s.
+ */
+function readWaitingForMe(value: unknown): true | undefined {
+  return value === true ? true : undefined;
+}
+
+/**
+ * `_stage`'s value, read: a stage's name, which is never empty.
+ */
+function readStage(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * `_inRelease`'s value, read: `true`, or an object holding exactly one
+ * `scheduledBefore` instant.
+ *
+ * An empty object is refused rather than read as the open form, because the
+ * bracket form of a query string cannot carry an empty object and the two
+ * spellings of one filter would then differ by transport.
+ */
+function readInRelease(value: unknown): InReleaseFilter | undefined {
+  if (value === true) return { scheduledBefore: null };
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    value instanceof Date
+  ) {
+    return undefined;
+  }
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || keys[0] !== "scheduledBefore") return undefined;
+  const scheduledBefore = readInstant(
+    (value as Record<string, unknown>).scheduledBefore
+  );
+  return scheduledBefore === undefined ? undefined : { scheduledBefore };
+}
+
+/** Each workflow key, how it is read, and how it is written when refused. */
+const WORKFLOW_KEYS = {
+  [PENDING_CHANGE_KEY]: {
+    read: readPendingChange,
+    form: `true`,
+  },
+  [IN_RELEASE_KEY]: {
+    read: readInRelease,
+    form: `true, or { "scheduledBefore": "<date and time with a zone, such as 2026-10-28T09:00:00Z>" }`,
+  },
+  [STRANDED_STAGE_KEY]: {
+    read: readStrandedStage,
+    form: `true`,
+  },
+  [ASSIGNED_TO_ME_KEY]: {
+    read: readAssignedToMe,
+    form: `true`,
+  },
+  [CHANGED_SINCE_APPROVED_KEY]: {
+    read: readChangedSinceApproved,
+    form: `true`,
+  },
+  [WAITING_FOR_ME_KEY]: {
+    read: readWaitingForMe,
+    form: `true`,
+  },
+  [STAGE_KEY]: {
+    read: readStage,
+    form: `"<the name of a stage of the collection's workflow, such as review>"`,
+  },
+} as const;
+
+type WorkflowKey = keyof typeof WORKFLOW_KEYS;
+
+/** Whether a filter key is one of the workflow keys. */
+export function isWorkflowKey(key: string): key is WorkflowKey {
+  return Object.prototype.hasOwnProperty.call(WORKFLOW_KEYS, key);
+}
+
+/**
+ * What is wrong with a workflow key's value at the top level of a filter, or
+ * `undefined` when it can be read.
+ */
+export function workflowKeyProblem(
+  key: WorkflowKey,
+  value: unknown
+): FilterProblem | undefined {
+  if (WORKFLOW_KEYS[key].read(value) !== undefined) return undefined;
+  return {
+    path: `where.${key}`,
+    code: "FILTER_INVALID_OPERAND",
+    message: `"${key}" needs ${WORKFLOW_KEYS[key].form}.`,
+  };
+}
+
+/** How a workflow key's refusal says what it does, when it is given below the top level. */
+export const WORKFLOW_KEY_PURPOSE: Readonly<Record<WorkflowKey, string>> = {
+  [PENDING_CHANGE_KEY]: "keeps entries with unpublished changes",
+  [IN_RELEASE_KEY]: "keeps entries a scheduled release will publish",
+  [STRANDED_STAGE_KEY]:
+    "keeps entries with a part in a stage their workflow no longer has",
+  [ASSIGNED_TO_ME_KEY]:
+    "keeps entries with a part assigned to you or to one of your roles",
+  [CHANGED_SINCE_APPROVED_KEY]:
+    "keeps entries with a part changed since its last approval",
+  [STAGE_KEY]: "keeps entries with a part in a stage of their workflow",
+  [WAITING_FOR_ME_KEY]: "keeps entries with a part waiting for your review",
+};
+
+/** How a workflow key is written, for the refusal of one given below the top level. */
+export function workflowKeyForm(key: WorkflowKey): string {
+  return `{ "${key}": ${WORKFLOW_KEYS[key].form} }`;
+}
+
+/** Whether `where` is a filter object with a workflow key at its top level. */
+function carriesWorkflowKey(where: unknown): where is object {
+  return (
+    typeof where === "object" &&
+    where !== null &&
+    !Array.isArray(where) &&
+    Object.keys(where).some(isWorkflowKey)
+  );
+}
+
+/** Sets the condition one readable workflow key carries on `filter`. */
+function applyWorkflowKey(
+  filter: WorkflowFilter,
+  key: WorkflowKey,
+  value: unknown
+): void {
+  if (key === PENDING_CHANGE_KEY) filter.pendingChange = true;
+  else if (key === STRANDED_STAGE_KEY) filter.strandedStage = true;
+  else if (key === ASSIGNED_TO_ME_KEY) filter.assignedToMe = true;
+  else if (key === CHANGED_SINCE_APPROVED_KEY) {
+    filter.changedSinceApproved = true;
+  } else if (key === STAGE_KEY) filter.stage = readStage(value);
+  else if (key === WAITING_FOR_ME_KEY) filter.waitingForMe = true;
+  else filter.inRelease = readInRelease(value) ?? null;
+}
+
+/**
+ * Take the workflow keys out of a filter's top level.
+ *
+ * Returns the conditions they carried and the filter without them, which is
+ * `undefined` when nothing else remains. A value these readers cannot read is
+ * returned as a problem rather than dropped: dropping it would run the read
+ * under a wider filter than the caller wrote.
+ */
+export function extractWorkflowFilter(where: unknown): {
+  filter: WorkflowFilter | null;
+  cleanedWhere: unknown;
+  problems: FilterProblem[];
+} {
+  if (!carriesWorkflowKey(where)) {
+    return { filter: null, cleanedWhere: where, problems: [] };
+  }
+  const rest: Record<string, unknown> = {};
+  const problems: FilterProblem[] = [];
+  const filter: WorkflowFilter = { pendingChange: false, inRelease: null };
+  for (const [key, value] of Object.entries(where)) {
+    if (isWorkflowKey(key)) {
+      const problem = workflowKeyProblem(key, value);
+      if (problem !== undefined) problems.push(problem);
+      // Read by the same reader the problem was judged with, so a value is
+      // never both accepted there and dropped here.
+      else applyWorkflowKey(filter, key, value);
+    } else {
+      // Defined, not assigned, so a `__proto__` key stays a key for the
+      // condition builder to refuse.
+      Object.defineProperty(rest, key, {
+        value,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+  }
+  return {
+    filter,
+    cleanedWhere: Object.keys(rest).length > 0 ? rest : undefined,
+    problems,
+  };
+}

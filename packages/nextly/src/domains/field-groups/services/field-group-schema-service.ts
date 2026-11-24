@@ -1,0 +1,1294 @@
+/**
+ * FieldGroupSchemaService generates database schemas for component data tables (`comp_{slug}`).
+ * Supports PostgreSQL, MySQL, and SQLite dialects.
+ */
+
+import { sql } from "drizzle-orm";
+import {
+  mysqlTable,
+  text as mysqlText,
+  int as mysqlInt,
+  boolean as mysqlBoolean,
+  timestamp as mysqlTimestamp,
+  datetime as mysqlDatetime,
+  json as mysqlJson,
+  varchar as mysqlVarchar,
+  double as mysqlDouble,
+  decimal as mysqlDecimal,
+  index as mysqlIndex,
+} from "drizzle-orm/mysql-core";
+import {
+  pgTable,
+  text as pgText,
+  integer as pgInteger,
+  boolean as pgBoolean,
+  timestamp as pgTimestamp,
+  jsonb as pgJsonb,
+  varchar as pgVarchar,
+  doublePrecision as pgDoublePrecision,
+  numeric as pgNumeric,
+  index as pgIndex,
+} from "drizzle-orm/pg-core";
+import {
+  sqliteTable,
+  text as sqliteText,
+  integer as sqliteInteger,
+  real as sqliteReal,
+  numeric as sqliteNumeric,
+  index as sqliteIndex,
+  primaryKey as sqlitePrimaryKey,
+} from "drizzle-orm/sqlite-core";
+
+import {
+  isTextField,
+  isTextareaField,
+  isRichTextField,
+  isEmailField,
+  isIconField,
+  isPasswordField,
+  isCodeField,
+  isNumberField,
+  isCheckboxField,
+  isDateField,
+  isSelectField,
+  isRadioField,
+  isUploadField,
+  isRelationshipField,
+  isRepeaterField,
+  isGroupField,
+  isJSONField,
+  isDataField,
+} from "../../../collections/fields/guards";
+import type {
+  FieldConfig,
+  DataFieldConfig,
+  NumberFieldConfig,
+} from "../../../collections/fields/types";
+import { NextlyError } from "../../../errors";
+import { env } from "../../../lib/env";
+import { sqliteTimestamp } from "../../../schemas/_internal/sqlite-timestamp";
+import { STORAGE_FORMAT } from "../../../schemas/storage-format";
+import { resolveLocalizedFieldNames } from "../../i18n/classify-fields";
+import type { ColumnOverride } from "../../schema/extension/draft";
+import type { ExtensionColumn } from "../../schema/extension/types";
+import { columnIndexSql } from "../../schema/pipeline/sql-templates/create-index";
+import {
+  DEFAULT_DECIMAL_PRECISION,
+  DEFAULT_DECIMAL_SCALE,
+  componentRelationIsSingleReference,
+  componentRelationshipHoldsReferenceList,
+  componentRelationshipStoresJson,
+  fieldsStoredOnRow,
+  getComponentRowColumnDescriptor,
+  usesJunctionTable,
+  type ColumnDescriptor,
+  type ColumnOrigin,
+} from "../../schema/services/field-column-descriptor";
+import {
+  MAX_INDEX_NAME_LENGTH,
+  columnTypeIsIndexable,
+  indexNameForColumn,
+  refuseUniqueOnList,
+  uniquenessCanBeAnIndex,
+} from "../../schema/services/index-name";
+import {
+  isPluginDataField,
+  pluginStorageFieldType,
+} from "../../schema/services/plugin-codegen";
+import {
+  addContributedDrizzleColumns,
+  buildUserDrizzleColumn,
+  contributedColumnsFor,
+  contributedSqliteChecks,
+  overriddenColumnsFor,
+  withColumnOverride,
+} from "../../schema/services/runtime-schema-generator";
+import { typeColumnForNewTable } from "../storage/resolve-storage-names";
+
+import { componentFieldHasColumn } from "./field-group-utils";
+
+export type SupportedDialect = "postgresql" | "mysql" | "sqlite";
+
+/**
+ * The type words of a field group's SYSTEM columns, which belong to no field and so are not the
+ * column descriptor's to answer. A user field's column type is the descriptor's (`columnTypeFor`).
+ */
+const STRUCTURAL_COLUMN_TYPES: Record<
+  SupportedDialect,
+  { varchar: (length: number) => string; integer: string; timestamp: string }
+> = {
+  postgresql: {
+    varchar: (length: number) => `VARCHAR(${length})`,
+    integer: "INTEGER",
+    timestamp: "TIMESTAMP",
+  },
+  mysql: {
+    varchar: (length: number) => `VARCHAR(${length})`,
+    integer: "INT",
+    timestamp: "DATETIME",
+  },
+  sqlite: {
+    varchar: () => "TEXT",
+    integer: "INTEGER",
+    timestamp: "INTEGER",
+  },
+};
+
+const QUOTE_CHAR: Record<SupportedDialect, string> = {
+  postgresql: '"',
+  mysql: "`",
+  sqlite: '"',
+};
+
+const TIMESTAMP_DEFAULT: Record<SupportedDialect, string> = {
+  postgresql: "DEFAULT NOW()",
+  mysql: "DEFAULT CURRENT_TIMESTAMP",
+  sqlite: "DEFAULT (strftime('%s', 'now'))",
+};
+
+/**
+ * The timestamp DEFAULT's value without its keyword, as a comparison and a
+ * Drizzle `.default()` need it. The CREATE below and the SQLite runtime table
+ * both read it here, so the default a table is created with and the one
+ * drizzle-kit is told about cannot differ.
+ */
+function timestampDefaultValue(dialect: SupportedDialect): string {
+  return TIMESTAMP_DEFAULT[dialect].replace(/^DEFAULT\s+/, "");
+}
+
+/**
+ * The DEFAULT expression each SYSTEM column of a field group's table is created with, by column
+ * name: `structuralColumnDefaults` below, as a function of the dialect alone, so the desired schema
+ * a save and `migrate:create` plan from declares the defaults the table is created with.
+ */
+export function fieldGroupStructuralDefaults(
+  dialect: SupportedDialect
+): ReadonlyMap<string, string> {
+  // The timestamp keyword carries its own `DEFAULT ` prefix in the DDL table; the VALUE is what a
+  // comparison needs, so the prefix is stripped once, in `timestampDefaultValue`.
+  const timestamp = timestampDefaultValue(dialect);
+  return new Map([
+    [STORAGE_FORMAT.columns.order, "0"],
+    ["created_at", timestamp],
+    ["updated_at", timestamp],
+  ]);
+}
+
+/** The name of the index on a field group's `created_at`, as the desired schema names it. */
+function createdAtIndexName(tableName: string): string {
+  return indexNameForColumn(tableName, "created_at");
+}
+
+/**
+ * What `generateRuntimeSchema` needs beyond the fields.
+ *
+ * `typeColumn` is required rather than defaulted. The storage migration renames
+ * the discriminator, so the right physical name is a property of the database in
+ * front of us, and a default would let a call site that never learned to resolve
+ * it compile and then silently project a column that is not there. Required
+ * makes the type checker the completeness proof. Callers supply either the
+ * resolved name from the catalog or, for a table this process just created,
+ * `typeColumnForNewTable(tableName)` — the same column the DDL just wrote.
+ */
+export interface RuntimeSchemaOptions {
+  localized?: boolean;
+  typeColumn: string;
+  /**
+   * The columns the live table holds, where the caller read them (`resolveTableColumns`).
+   *
+   * A field inside a group with no name is stored on the row, and field groups made before that
+   * was so have no column for it until their next save or `nextly migrate` adds one. Given this, the
+   * runtime table leaves out such a field whose column the table does not hold yet, so the field
+   * group's reads and writes keep working, without that field, as they did before, instead of
+   * naming a column the table lacks. A field beside the group is never left out: a definition
+   * ahead of its table there is answered as not migrated, as everywhere else. Omitted, every
+   * column the fields declare is included, which is right for a table just created or altered.
+   */
+  heldColumns?: readonly string[];
+}
+
+/**
+ * A field as the runtime column mappers read it.
+ *
+ * They switch on `field.type`, which for a plugin-contributed type matches no case. Substituting
+ * the storage primitive's built-in type makes them emit the column that type persists as.
+ * Exported so the record of this creator's earlier column types (`pre-builder-save-column-type`)
+ * reads a plugin field as the creator did.
+ */
+export function asStorageMappedField(field: DataFieldConfig): DataFieldConfig {
+  const storageType = pluginStorageFieldType(field);
+  if (storageType === undefined) return field;
+  const mapped: Record<string, unknown> = {
+    ...(field as unknown as Record<string, unknown>),
+    type: storageType,
+  };
+  // The keys below are how a BUILT-IN field states its physical shape, and
+  // the mappers read them straight off the field. A plugin type's options are
+  // its own and core does not interpret them, so one that happens to be named
+  // `dbType` or `maxLength` would otherwise reshape the column here while the
+  // canonical descriptor — which never sees them — kept mapping the primitive
+  // as declared. The same field would then be one type in a component and
+  // another in a collection.
+  for (const physical of [
+    "dbType",
+    "precision",
+    "scale",
+    "maxLength",
+    "options",
+  ]) {
+    delete mapped[physical];
+  }
+  return mapped as unknown as DataFieldConfig;
+}
+
+export class FieldGroupSchemaService {
+  private readonly dialect: SupportedDialect;
+  private readonly q: string;
+
+  /**
+   * @param builtBy The column rule of whoever owns the field group's table: the Schema Builder's
+   *   (`fieldGroup`, the default) or the code's (`codeFirst`), as `builtByFor` names them. A text
+   *   field states no width the same way to both: unbounded for a Builder field group, 255 for a
+   *   code-first one, so a table described with the other rule reads as needing a change it does
+   *   not, or hides one it does.
+   */
+  constructor(
+    dialect?: SupportedDialect,
+    private readonly builtBy: ColumnOrigin = "fieldGroup"
+  ) {
+    this.dialect = dialect || env.DB_DIALECT || "postgresql";
+    this.q = QUOTE_CHAR[this.dialect];
+  }
+
+  /**
+   * Generate SQL migration for creating a new component data table.
+   */
+  generateMigrationSQL(
+    tableName: string,
+    fields: FieldConfig[],
+    options: { localized?: boolean } = {}
+  ): string {
+    // A list marked unique is refused as declared, nested and translated ones included, before the
+    // translated fields are set aside for the companion and before any SQL is made.
+    refuseUniqueOnList(tableName, fields, this.dialect);
+    const types = STRUCTURAL_COLUMN_TYPES[this.dialect];
+    const structuralDefaults = this.structuralColumnDefaults();
+    // i18n: a localized component omits its translatable columns from the main comp_ CREATE
+    // (they live in the companion `comp_<slug>_locales` table, provisioned out-of-band).
+    const localizedNames = options.localized
+      ? new Set(
+          resolveLocalizedFieldNames(
+            fields as unknown as Parameters<
+              typeof resolveLocalizedFieldNames
+            >[0],
+            true
+          )
+        )
+      : new Set<string>();
+
+    const lines: string[] = [];
+    lines.push(`-- Create component data table: ${tableName}`);
+    lines.push(`CREATE TABLE IF NOT EXISTS ${this.q}${tableName}${this.q} (`);
+
+    if (this.dialect === "mysql") {
+      lines.push(`  ${this.q}id${this.q} varchar(36) PRIMARY KEY NOT NULL,`);
+    } else {
+      lines.push(`  ${this.q}id${this.q} text PRIMARY KEY NOT NULL,`);
+    }
+
+    if (this.dialect === "mysql") {
+      lines.push(
+        `  ${this.q}${STORAGE_FORMAT.columns.parentId}${this.q} varchar(36) NOT NULL,`
+      );
+    } else {
+      lines.push(
+        `  ${this.q}${STORAGE_FORMAT.columns.parentId}${this.q} text NOT NULL,`
+      );
+    }
+    lines.push(
+      `  ${this.q}${STORAGE_FORMAT.columns.parentTable}${this.q} ${types.varchar(255)} NOT NULL,`
+    );
+    lines.push(
+      `  ${this.q}${STORAGE_FORMAT.columns.parentField}${this.q} ${types.varchar(255)} NOT NULL,`
+    );
+    lines.push(
+      `  ${this.q}${STORAGE_FORMAT.columns.order}${this.q} ${types.integer} DEFAULT ${structuralDefaults.get(STORAGE_FORMAT.columns.order)},`
+    );
+    // The discriminator a table created under this name carries: the migrated column for a table
+    // created under the current names, the legacy one otherwise (`typeColumnForNewTable`), so the
+    // DDL, the pipeline and the runtime binding agree on it.
+    lines.push(
+      `  ${this.q}${typeColumnForNewTable(tableName)}${this.q} ${types.varchar(255)},`
+    );
+
+    // Only fields that own a column on this row (`columnFields`): a nested
+    // component keeps its data in its own table and a virtual field stores
+    // nothing, and this DDL, the runtime tables and the ALTER plan share the
+    // one list so they cannot give the table different columns.
+    for (const field of this.columnFields(fields)) {
+      // i18n: translatable columns live in the companion, not the main comp_ table.
+      if (localizedNames.has(field.name)) continue;
+
+      const columnSQL = this.generateColumnSQL(field);
+      if (columnSQL) {
+        lines.push(`  ${columnSQL},`);
+      }
+    }
+
+    lines.push(
+      `  ${this.q}created_at${this.q} ${types.timestamp} NOT NULL DEFAULT ${structuralDefaults.get("created_at")},`
+    );
+    lines.push(
+      `  ${this.q}updated_at${this.q} ${types.timestamp} NOT NULL DEFAULT ${structuralDefaults.get("updated_at")}`
+    );
+
+    lines.push(");");
+
+    let sql = lines.join("\n");
+
+    const indexStatements: string[] = [];
+
+    const parentIndexName = `${STORAGE_FORMAT.indexPrefix}${tableName}_parent`;
+    // From the shared constant rather than listed here, so the index this CREATES and any check
+    // asking whether a live table still has it cannot disagree about which columns or what order.
+    const parentColumns = STORAGE_FORMAT.parentIndexColumns
+      .map(column => `${this.q}${column}${this.q}`)
+      .join(", ");
+
+    if (this.dialect === "mysql") {
+      indexStatements.push(
+        `CREATE INDEX ${this.q}${parentIndexName}${this.q} ON ${this.q}${tableName}${this.q}(${parentColumns});`
+      );
+    } else {
+      indexStatements.push(
+        `CREATE INDEX IF NOT EXISTS ${this.q}${parentIndexName}${this.q} ON ${this.q}${tableName}${this.q}(${parentColumns});`
+      );
+    }
+
+    // The index the desired schema has always declared on `created_at`, which a save and
+    // `migrate:create` plan from. Left out here, every table this made read as missing it, and its
+    // first save added it.
+    indexStatements.push(
+      this.createIndexSql(
+        createdAtIndexName(tableName),
+        tableName,
+        "created_at",
+        types.timestamp
+      )
+    );
+
+    // A plain index on every column that references one entry, then on every
+    // other column a field asks to index — one per column either way, by the
+    // per-field rule the desired schema applies (`collectionIndexSpecs`), so
+    // the two agree on every user column's index. Localized fields live in the
+    // companion, not the main comp_ table, so they get no main index.
+    //
+    // A unique column the dialect can key carries its uniqueness as `uq_`
+    // below and gets no plain index besides. A relation holding a list of
+    // references gets none even when it asks
+    // (`componentRelationshipHoldsReferenceList` says why); a single
+    // polymorphic reference is one object and keeps one it asks for.
+    // Otherwise a plain index goes only where the dialect can index the
+    // column: MySQL cannot index a JSON column, and the index statement would
+    // fail after the table was already created.
+    const indexed = (field: DataFieldConfig, wanted: boolean): boolean => {
+      if (!wanted || componentRelationshipHoldsReferenceList(field)) {
+        return false;
+      }
+      const columnType = this.columnTypeFor(field) ?? "";
+      if (
+        "unique" in field &&
+        field.unique &&
+        uniquenessCanBeAnIndex(columnType, this.dialect)
+      ) {
+        return false;
+      }
+      return columnTypeIsIndexable(columnType, this.dialect);
+    };
+    const mainColumns = this.columnFields(fields).filter(
+      field => !localizedNames.has(field.name)
+    );
+    const referencing = mainColumns.filter(field =>
+      indexed(field, componentRelationIsSingleReference(field))
+    );
+    const declaredIndexed = mainColumns.filter(field =>
+      indexed(
+        field,
+        !componentRelationIsSingleReference(field) &&
+          "index" in field &&
+          field.index === true
+      )
+    );
+    for (const field of [...referencing, ...declaredIndexed]) {
+      const columnName = this.toSnakeCase(field.name);
+      const indexName = `idx_${tableName}_${columnName}`;
+
+      indexStatements.push(
+        this.createIndexSql(
+          indexName,
+          tableName,
+          columnName,
+          this.columnTypeFor(field) ?? ""
+        )
+      );
+    }
+
+    for (const field of this.columnFields(fields)) {
+      // Localized fields live in the companion, not the main comp_ table — no main index.
+      if (localizedNames.has(field.name)) continue;
+      if (!("unique" in field && field.unique)) continue;
+
+      const columnName = this.toSnakeCase(field.name);
+      const indexName = `uq_${tableName}_${columnName}`;
+
+      // Asked through the same rule the collection generators and the desired schema use. A
+      // dialect that cannot key the column cannot carry the uniqueness as an index, and emitting
+      // one anyway installs the table and then fails on a statement it has already committed
+      // past — leaving a component without the guarantee it declared.
+      this.assertUniquenessEnforceable(field, tableName);
+
+      if (this.dialect === "mysql") {
+        indexStatements.push(
+          `CREATE UNIQUE INDEX ${this.q}${indexName}${this.q} ON ${this.q}${tableName}${this.q}(${this.q}${columnName}${this.q});`
+        );
+      } else {
+        indexStatements.push(
+          `CREATE UNIQUE INDEX IF NOT EXISTS ${this.q}${indexName}${this.q} ON ${this.q}${tableName}${this.q}(${this.q}${columnName}${this.q});`
+        );
+      }
+    }
+
+    if (indexStatements.length > 0) {
+      sql += "\n--> statement-breakpoint\n";
+      sql += indexStatements.join("\n--> statement-breakpoint\n");
+    }
+
+    return sql;
+  }
+
+  /**
+   * Generate DROP TABLE migration for a component data table.
+   */
+  generateDropTableMigration(tableName: string): {
+    migrationSQL: string;
+    migrationFileName: string;
+  } {
+    const dropStatement =
+      this.dialect === "sqlite"
+        ? `DROP TABLE IF EXISTS ${this.q}${tableName}${this.q};`
+        : `DROP TABLE IF EXISTS ${this.q}${tableName}${this.q} CASCADE;`;
+
+    const componentSlug = tableName.startsWith(STORAGE_FORMAT.tablePrefix)
+      ? tableName.slice(STORAGE_FORMAT.tablePrefix.length)
+      : tableName;
+    const migrationSQL = `-- Drop component data table: ${tableName}\n${dropStatement}`;
+
+    return {
+      migrationSQL,
+      migrationFileName: `${Date.now()}_drop_${STORAGE_FORMAT.tablePrefix}${componentSlug}.sql`,
+    };
+  }
+
+  /**
+   * Generate a Drizzle table object at runtime for querying component data.
+   */
+  // Returns an opaque Drizzle table object (PgTable | MySqlTable | SQLiteTable).
+  // Typed as `unknown` because the column shape is dynamic at compile time;
+  // callers cast at the use site.
+  generateRuntimeSchema(
+    tableName: string,
+    fields: FieldConfig[],
+    options: RuntimeSchemaOptions
+  ): unknown {
+    // i18n: when the component is localized, its translatable fields live in the
+    // companion `comp_<slug>_locales` table and are omitted from the main runtime
+    // table — kept in lockstep with buildDesiredTableFromComponentFields' `localized`
+    // option so the diff and the DDL agree.
+    const localizedNames = options.localized
+      ? new Set(
+          resolveLocalizedFieldNames(
+            fields as unknown as Parameters<
+              typeof resolveLocalizedFieldNames
+            >[0],
+            true
+          )
+        )
+      : new Set<string>();
+    const mainFields = this.heldRowFields(
+      fields.filter(f => {
+        const name = "name" in f ? (f as { name?: string }).name : undefined;
+        return !name || !localizedNames.has(name);
+      }),
+      options.heldColumns
+    );
+    const typeColumn = options.typeColumn;
+    // Columns a schema hook contributed to this table, read the way every
+    // entity runtime table reads them. This table is what drizzle-kit is
+    // handed for a field group, so without them the push creates the table
+    // without the column the desired spec asks for.
+    const contributed = contributedColumnsFor(tableName, this.dialect);
+    // The app's overrides of its field columns' storage, read the same way:
+    // built with the field's own storage, the push would change them back.
+    const overrides = overriddenColumnsFor(tableName, this.dialect);
+    switch (this.dialect) {
+      case "postgresql":
+        return this.generatePostgresSchema(
+          tableName,
+          mainFields,
+          typeColumn,
+          contributed,
+          overrides
+        );
+      case "mysql":
+        return this.generateMySQLSchema(
+          tableName,
+          mainFields,
+          typeColumn,
+          contributed,
+          overrides
+        );
+      case "sqlite":
+        return this.generateSQLiteSchema(
+          tableName,
+          mainFields,
+          typeColumn,
+          contributed,
+          overrides
+        );
+      default:
+        throw new Error(`Unsupported dialect: ${String(this.dialect)}`);
+    }
+  }
+
+  private generatePostgresSchema(
+    tableName: string,
+    fields: FieldConfig[],
+    typeColumn: string,
+    contributed: readonly ExtensionColumn[],
+    overrides: readonly ColumnOverride[] = []
+  ): unknown {
+    // Required by Drizzle: pgTable() expects a `Record<string, PgColumnBuilderBase>`
+    // but the column builders returned by helpers (pgText, pgInteger, ...) have
+    // deeply nested generic types. Using `unknown` here keeps the call site clean
+    // and doesn't leak Drizzle internals into the public API.
+    const columns: Record<string, unknown> = {
+      id: pgText("id").primaryKey(),
+      _parent_id: pgText(STORAGE_FORMAT.columns.parentId).notNull(),
+      _parent_table: pgVarchar(STORAGE_FORMAT.columns.parentTable, {
+        length: 255,
+      }).notNull(),
+      _parent_field: pgVarchar(STORAGE_FORMAT.columns.parentField, {
+        length: 255,
+      }).notNull(),
+      _order: pgInteger(STORAGE_FORMAT.columns.order).default(0),
+      // 🔴 The Drizzle property key stays `STORAGE_FORMAT.columns.type` while the
+      // physical name is resolved. The adapter addresses columns by property key
+      // everywhere — rows come back keyed by it, `buildDrizzleWhere` and
+      // `orderBy` look columns up by it — so every consumer downstream reads the
+      // same key whichever spelling the storage carries, and keeps reading it
+      // when the constant itself moves.
+      [STORAGE_FORMAT.columns.type]: pgVarchar(typeColumn, { length: 255 }),
+      created_at: pgTimestamp("created_at").defaultNow().notNull(),
+      updated_at: pgTimestamp("updated_at").defaultNow().notNull(),
+    };
+
+    this.addFieldColumns(columns, fields, contributed, overrides);
+
+    // Required by Drizzle: pgTable() is generic over the column shape, and
+    // our columns map is dynamic (Record<string, unknown>). The index
+    // callback's `table` arg would normally be inferred from that shape;
+    // we cast to a typed indexer so Drizzle's fluent API still works.
+    return pgTable(
+      tableName,
+      columns as Record<string, never>,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Drizzle table column accessor is dialect-typed
+      (table: any) => ({
+        parentIdx: pgIndex(
+          `${STORAGE_FORMAT.indexPrefix}${tableName}_parent`
+        ).on(table._parent_id, table._parent_table, table._parent_field),
+      })
+    );
+  }
+
+  private generateMySQLSchema(
+    tableName: string,
+    fields: FieldConfig[],
+    typeColumn: string,
+    contributed: readonly ExtensionColumn[],
+    overrides: readonly ColumnOverride[] = []
+  ): unknown {
+    const columns: Record<string, unknown> = {
+      id: mysqlVarchar("id", { length: 36 }).primaryKey(),
+      _parent_id: mysqlVarchar(STORAGE_FORMAT.columns.parentId, {
+        length: 36,
+      }).notNull(),
+      _parent_table: mysqlVarchar(STORAGE_FORMAT.columns.parentTable, {
+        length: 255,
+      }).notNull(),
+      _parent_field: mysqlVarchar(STORAGE_FORMAT.columns.parentField, {
+        length: 255,
+      }).notNull(),
+      _order: mysqlInt(STORAGE_FORMAT.columns.order).default(0),
+      [STORAGE_FORMAT.columns.type]: mysqlVarchar(typeColumn, {
+        length: 255,
+      }),
+      // DATETIME, as the CREATE makes them and the desired schema declares them. Declared as
+      // TIMESTAMP here, any save that reached drizzle-kit converted both columns, taking on
+      // TIMESTAMP's 2038 limit and its time-zone conversion.
+      created_at: mysqlDatetime("created_at")
+        .default(sql.raw(timestampDefaultValue("mysql")))
+        .notNull(),
+      updated_at: mysqlDatetime("updated_at")
+        .default(sql.raw(timestampDefaultValue("mysql")))
+        .notNull(),
+    };
+
+    this.addFieldColumns(columns, fields, contributed, overrides);
+
+    return mysqlTable(
+      tableName,
+      columns as Record<string, never>,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Drizzle table column accessor is dialect-typed
+      (table: any) => ({
+        parentIdx: mysqlIndex(
+          `${STORAGE_FORMAT.indexPrefix}${tableName}_parent`
+        ).on(table._parent_id, table._parent_table, table._parent_field),
+      })
+    );
+  }
+
+  private generateSQLiteSchema(
+    tableName: string,
+    fields: FieldConfig[],
+    typeColumn: string,
+    contributed: readonly ExtensionColumn[],
+    overrides: readonly ColumnOverride[] = []
+  ): unknown {
+    const columns: Record<string, unknown> = {
+      // NOT NULL, with the key declared on the table below rather than on the
+      // column. On SQLite a primary key that is not an INTEGER takes NULL
+      // unless it says NOT NULL, as the CREATE above does, and drizzle-kit
+      // drops NOT NULL from a column-level key: a push that rebuilt this
+      // table wrote an id that takes NULL. A table-level key keeps it.
+      id: sqliteText("id").notNull(),
+      _parent_id: sqliteText(STORAGE_FORMAT.columns.parentId).notNull(),
+      _parent_table: sqliteText(STORAGE_FORMAT.columns.parentTable).notNull(),
+      _parent_field: sqliteText(STORAGE_FORMAT.columns.parentField).notNull(),
+      _order: sqliteInteger(STORAGE_FORMAT.columns.order).default(0),
+      [STORAGE_FORMAT.columns.type]: sqliteText(typeColumn),
+      // Stamped by the application as every SQLite timestamp is, and declared
+      // with the DEFAULT the CREATE above writes. Without it drizzle-kit,
+      // comparing this table with the live one, saw a default to add and
+      // rebuilt every field-group table on a push that never touched them.
+      created_at: sqliteTimestamp("created_at").default(
+        sql.raw(timestampDefaultValue("sqlite"))
+      ),
+      updated_at: sqliteTimestamp("updated_at").default(
+        sql.raw(timestampDefaultValue("sqlite"))
+      ),
+    };
+
+    this.addFieldColumns(columns, fields, contributed, overrides);
+
+    return sqliteTable(
+      tableName,
+      columns as Record<string, never>,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Drizzle table column accessor is dialect-typed
+      (table: any) => ({
+        // Unnamed, so drizzle-kit names it as it reads the live table's key.
+        pk: sqlitePrimaryKey({ columns: [table.id] }),
+        parentIdx: sqliteIndex(
+          `${STORAGE_FORMAT.indexPrefix}${tableName}_parent`
+        ).on(table._parent_id, table._parent_table, table._parent_field),
+        // The contributed enum checks, keyed by their names: SQLite creates
+        // a check only with the table, so the definition a rebuild uses
+        // must carry them — as an entity table's does.
+        ...Object.fromEntries(
+          contributedSqliteChecks(tableName, contributed).map(built => [
+            built.name,
+            built,
+          ])
+        ),
+      })
+    );
+  }
+
+  /**
+   * Refuse a `unique` field the dialect cannot enforce, before any DDL is generated for it.
+   *
+   * Asks the shared rule rather than restating it, so a component, a collection and the desired
+   * schema cannot hold different opinions about the same column. MySQL refuses to key an
+   * unbounded TEXT/BLOB in either spelling and cannot index JSON at all, and because it commits
+   * each DDL statement separately there is no way to attempt the constraint without risking a
+   * table that exists WITHOUT it. A bare column is also exactly what the desired schema declares
+   * for an unkeyable type, so a half-applied add would read as converged and the guarantee would
+   * disappear silently.
+   */
+  private assertUniquenessEnforceable(
+    field: DataFieldConfig,
+    tableName: string
+  ): void {
+    const columnType = this.columnTypeFor(field);
+    if (columnType === null) return;
+    if (uniquenessCanBeAnIndex(columnType, this.dialect)) return;
+
+    const name = "name" in field && field.name ? String(field.name) : "";
+    const type = "type" in field ? String(field.type) : "unknown";
+    throw NextlyError.validation({
+      errors: [
+        {
+          path: `fields.${name}`,
+          code: "UNIQUE_NOT_ENFORCEABLE_ON_DIALECT",
+          message:
+            `"${name}" is marked unique, but ${this.dialect} cannot enforce uniqueness on a ` +
+            `${type} column. Store the value in a short-variant text field, which becomes a ` +
+            `bounded VARCHAR the server can key, or remove the unique flag.`,
+        },
+      ],
+      logContext: { tableName, field: name, type, dialect: this.dialect },
+    });
+  }
+
+  /**
+   * The column type this dialect gives `field`, spelled exactly as the CREATE TABLE spells it.
+   *
+   * The same value `generateColumnSQL` puts into its column definition, exposed so a caller that
+   * needs only the type can ask for it instead of recovering it from rendered SQL. Recovering it
+   * that way loses information the moment a type is more than one word — `DOUBLE PRECISION` reads
+   * back as `DOUBLE` — and no amount of parsing makes a printed statement a reliable channel for a
+   * value the function already returns.
+   *
+   * `null` where this service would emit no column at all, which is the same condition that makes
+   * `generateColumnSQL` skip a field.
+   *
+   * The column descriptor's answer for a field on a component's row, read for every field type:
+   * the type a Builder save's migration and the desired schema give the same field, so a table this
+   * creates and one a save creates are the same table. Before 0.0.2-alpha.77 this creator kept a
+   * type map of its own and spelled some columns differently; that spelling is kept, for
+   * recognising tables built with it and never for building one, in `pre-builder-save-column-type`.
+   */
+  columnTypeFor(field: DataFieldConfig): string | null {
+    return (
+      getComponentRowColumnDescriptor(
+        field as unknown as Parameters<
+          typeof getComponentRowColumnDescriptor
+        >[0],
+        this.dialect,
+        this.builtBy
+      )?.dialectType ?? null
+    );
+  }
+
+  /**
+   * The DEFAULT expression each SYSTEM column is created with, by column name.
+   *
+   * These belong to no field, so nothing derived from the field list can describe them — and they
+   * are not decoration: the generated runtime schema declares `_order` and the timestamps as
+   * DATABASE defaults, so Drizzle OMITS those columns from an INSERT and the database supplies the
+   * value. A dropped default therefore fails a NOT NULL insert outright, or silently stores NULL
+   * where a zero was intended.
+   *
+   * Rendered into the CREATE TABLE below rather than restated there, so the defaults a caller can
+   * ask about and the ones the table actually gets are one expression.
+   */
+  structuralColumnDefaults(): ReadonlyMap<string, string> {
+    return fieldGroupStructuralDefaults(this.dialect);
+  }
+
+  /**
+   * The DEFAULT expression this dialect gives `field`, or `null` where it writes none.
+   *
+   * The companion of {@link columnTypeFor}, and exposed for the same reason: a caller comparing a
+   * live column against what this service would have created needs the value, and the only other
+   * way to obtain it is to render a statement and read it back out. `null` is a real answer here —
+   * most field types carry no default — which is why it is distinct from the "could not decide"
+   * a caller may need to represent separately.
+   */
+  columnDefaultFor(field: DataFieldConfig): string | null {
+    const mappable = asStorageMappedField(field);
+    if (!isCheckboxField(mappable) || mappable.defaultValue === undefined) {
+      return null;
+    }
+    // SQLite has no boolean literal, so the same declaration is stored as 1/0 there.
+    const value =
+      this.dialect === "sqlite"
+        ? mappable.defaultValue
+          ? 1
+          : 0
+        : mappable.defaultValue;
+    return String(value);
+  }
+
+  private generateColumnSQL(field: DataFieldConfig): string | null {
+    if (!("name" in field) || !field.name) return null;
+
+    const columnName = this.toSnakeCase(field.name);
+    // Through the public accessor, so the type a caller can ask for and the type that reaches the
+    // table are the same expression rather than two that agree until one is edited.
+    const columnType = this.columnTypeFor(field);
+    if (!columnType) return null;
+
+    const parts = [`${this.q}${columnName}${this.q}`, columnType];
+
+    if (this.writesNotNull(field)) {
+      parts.push("NOT NULL");
+    }
+
+    // Same accessor rule as the type above: one expression decides the default a caller can ask
+    // about and the default the table actually gets.
+    const columnDefault = this.columnDefaultFor(field);
+    if (columnDefault !== null) {
+      parts.push(`DEFAULT ${columnDefault}`);
+    }
+
+    return parts.join(" ");
+  }
+
+  /**
+   * Whether the creating SQL writes `field`'s column NOT NULL: a required field, except a
+   * many-to-many. That column is nullable on every route, as the desired schema records it, with
+   * `required` enforced when the entry is saved; a NOT NULL here would make the next preview plan
+   * to drop a constraint the runtime table never had.
+   */
+  private writesNotNull(field: FieldConfig): boolean {
+    return (
+      Boolean("required" in field && field.required) &&
+      !usesJunctionTable(field)
+    );
+  }
+
+  // Classifies a number field's storage the same way collections and
+  // migrate:create do (via the shared column descriptor): exact decimal for
+  // `dbType: "decimal"`, floating point for a UI field's `options.format ===
+  // "float"`, integer otherwise. Keeps a component's number column matching the
+  // type the rest of the schema pipeline emits for the identical field.
+  private numberColumnKind(
+    field: NumberFieldConfig
+  ): "integer" | "decimal" | "double" {
+    if (field.dbType === "decimal") return "decimal";
+    const format = (field as { options?: { format?: string } }).options?.format;
+    return format === "float" ? "double" : "integer";
+  }
+
+  private decimalDimensions(field: NumberFieldConfig): {
+    precision: number;
+    scale: number;
+  } {
+    return {
+      precision: field.precision ?? DEFAULT_DECIMAL_PRECISION,
+      scale: field.scale ?? DEFAULT_DECIMAL_SCALE,
+    };
+  }
+
+  /**
+   * The canonical descriptor's column for a field the runtime table binds from it, or null for one
+   * the dialect mappers below still bind.
+   *
+   * An icon's and a text field's columns are read from the descriptor for the SQL and the Drizzle
+   * table alike, so they are the columns the desired schema and the diff compare against on every
+   * dialect. An icon is `text` on PostgreSQL and SQLite and `varchar(255)` on MySQL; a text field is
+   * bounded by its own `maxLength`, and without one by the rule of whoever owns the table (`builtBy`).
+   * Mapped here a second time, the Drizzle table once declared a MySQL text field `varchar(255)`,
+   * and a save that reached drizzle-kit narrowed the TEXT column the CREATE had made.
+   *
+   * So is every field the descriptor stores as JSON. The CREATE takes its type from the descriptor
+   * (`columnTypeFor`), and the mappers below bind a `hasMany` number as a scalar and a chips field
+   * as text, so the runtime table would describe a column the table does not have, and drizzle-kit,
+   * handed that table, would convert the JSON list back to a scalar. The other kinds stay with the
+   * mappers: they bind the column the CREATE makes, and the descriptor's builders read some of them
+   * back differently (a decimal as a number rather than a string).
+   */
+  private canonicalColumn(
+    field: DataFieldConfig,
+    mapped: DataFieldConfig
+  ): ColumnDescriptor | null {
+    if (!field.name) return null;
+    // Asked of the field as declared, exactly as `columnTypeFor` asks for the CREATE, so the runtime
+    // column and the created one are one answer. The storage-mapped field keeps options its plugin
+    // type does not interpret (a `hasMany` on a contributed number type) and would be described as
+    // a different column; it only says which fields the mappers below cannot bind.
+    const descriptor = getComponentRowColumnDescriptor(
+      field as unknown as Parameters<typeof getComponentRowColumnDescriptor>[0],
+      this.dialect,
+      this.builtBy
+    );
+    if (descriptor === null) return null;
+    return isIconField(mapped) ||
+      isTextField(mapped) ||
+      descriptor.kind === "json"
+      ? descriptor
+      : null;
+  }
+
+  /**
+   * Adds each field's runtime column to a table's columns, keyed by the field's name, and then the
+   * columns a schema hook contributed, the same way for every dialect.
+   */
+  private addFieldColumns(
+    columns: Record<string, unknown>,
+    fields: FieldConfig[],
+    contributed: readonly ExtensionColumn[],
+    overrides: readonly ColumnOverride[] = []
+  ): void {
+    for (const field of this.columnFields(fields)) {
+      const column = this.drizzleColumnFor(field, overrides);
+      if (column) {
+        columns[field.name] = column;
+      }
+    }
+    addContributedDrizzleColumns(columns, contributed, this.dialect);
+  }
+
+  /**
+   * A field's runtime Drizzle column: built from the descriptor where it names the column, and by
+   * this dialect's own mapper otherwise, so the runtime table and the CREATE read one answer.
+   */
+  private drizzleColumnFor(
+    field: DataFieldConfig,
+    overrides: readonly ColumnOverride[] = []
+  ): unknown {
+    const mappable = asStorageMappedField(field);
+    const overridden = this.overriddenColumn(mappable, overrides);
+    if (overridden) return buildUserDrizzleColumn(overridden, this.dialect);
+    const canonical = this.canonicalColumn(field, mappable);
+    if (canonical) return buildUserDrizzleColumn(canonical, this.dialect);
+    switch (this.dialect) {
+      case "postgresql":
+        return this.mapFieldToPostgresColumn(mappable);
+      case "mysql":
+        return this.mapFieldToMySQLColumn(mappable);
+      case "sqlite":
+        return this.mapFieldToSQLiteColumn(mappable);
+    }
+  }
+
+  /**
+   * The field's column with the storage the app's override gives it, from the descriptor every
+   * entity's runtime column reads, or null when no override names it.
+   */
+  private overriddenColumn(
+    field: DataFieldConfig,
+    overrides: readonly ColumnOverride[]
+  ): ColumnDescriptor | null {
+    if (overrides.length === 0 || !field.name) return null;
+    // Any data field: the descriptor maps every type, where the guards in
+    // `canonicalColumn` narrow to the two this service hands it otherwise.
+    const descriptor = getComponentRowColumnDescriptor(
+      field as unknown as Parameters<typeof getComponentRowColumnDescriptor>[0],
+      this.dialect,
+      this.builtBy
+    );
+    if (!descriptor || !overrides.some(o => o.column === descriptor.name)) {
+      return null;
+    }
+    return withColumnOverride(descriptor, overrides, this.dialect);
+  }
+
+  // Returns a Drizzle column builder — typed as `unknown` to avoid
+  // depending on Drizzle's internal column builder types from the public API.
+  /** A field's column name and whether it is required, as every dialect's mapper reads them. */
+  private columnNaming(
+    field: DataFieldConfig
+  ): { colName: string; isRequired: boolean } | null {
+    if (!("name" in field) || !field.name) return null;
+    return {
+      colName: this.toSnakeCase(field.name),
+      isRequired: "required" in field && field.required === true,
+    };
+  }
+
+  private mapFieldToPostgresColumn(field: DataFieldConfig): unknown {
+    const named = this.columnNaming(field);
+    if (named === null) return null;
+    const { colName, isRequired } = named;
+
+    // A text field's column is the descriptor's (`canonicalColumn`).
+    if (isEmailField(field) || isPasswordField(field)) {
+      return isRequired ? pgText(colName).notNull() : pgText(colName);
+    }
+    if (
+      isTextareaField(field) ||
+      isRichTextField(field) ||
+      isCodeField(field)
+    ) {
+      return isRequired ? pgText(colName).notNull() : pgText(colName);
+    }
+    if (isNumberField(field)) {
+      const kind = this.numberColumnKind(field);
+      const column =
+        kind === "integer"
+          ? pgInteger(colName)
+          : kind === "decimal"
+            ? pgNumeric(colName, this.decimalDimensions(field))
+            : pgDoublePrecision(colName);
+      return isRequired ? column.notNull() : column;
+    }
+    if (isCheckboxField(field)) {
+      return isRequired ? pgBoolean(colName).notNull() : pgBoolean(colName);
+    }
+    if (isDateField(field)) {
+      return isRequired ? pgTimestamp(colName).notNull() : pgTimestamp(colName);
+    }
+    if (isSelectField(field) || isRadioField(field)) {
+      return isRequired ? pgText(colName).notNull() : pgText(colName);
+    }
+    if (isRelationshipField(field) || isUploadField(field)) {
+      // A list of references is JSON, as the creating SQL and the desired schema store it.
+      return componentRelationshipStoresJson(field)
+        ? pgJsonb(colName)
+        : pgText(colName);
+    }
+    if (isRepeaterField(field) || isGroupField(field) || isJSONField(field)) {
+      return isRequired ? pgJsonb(colName).notNull() : pgJsonb(colName);
+    }
+
+    return pgText(colName);
+  }
+
+  private mapFieldToMySQLColumn(field: DataFieldConfig): unknown {
+    const named = this.columnNaming(field);
+    if (named === null) return null;
+    const { colName, isRequired } = named;
+
+    // A text field's column is the descriptor's (`canonicalColumn`).
+    if (isEmailField(field) || isPasswordField(field)) {
+      return isRequired
+        ? mysqlVarchar(colName, { length: 255 }).notNull()
+        : mysqlVarchar(colName, { length: 255 });
+    }
+    if (
+      isTextareaField(field) ||
+      isRichTextField(field) ||
+      isCodeField(field)
+    ) {
+      return isRequired ? mysqlText(colName).notNull() : mysqlText(colName);
+    }
+    if (isNumberField(field)) {
+      const kind = this.numberColumnKind(field);
+      const column =
+        kind === "integer"
+          ? mysqlInt(colName)
+          : kind === "decimal"
+            ? mysqlDecimal(colName, this.decimalDimensions(field))
+            : mysqlDouble(colName);
+      return isRequired ? column.notNull() : column;
+    }
+    if (isCheckboxField(field)) {
+      return isRequired
+        ? mysqlBoolean(colName).notNull()
+        : mysqlBoolean(colName);
+    }
+    if (isDateField(field)) {
+      return isRequired
+        ? mysqlTimestamp(colName).notNull()
+        : mysqlTimestamp(colName);
+    }
+    if (isSelectField(field) || isRadioField(field)) {
+      return isRequired
+        ? mysqlVarchar(colName, { length: 255 }).notNull()
+        : mysqlVarchar(colName, { length: 255 });
+    }
+    if (isRelationshipField(field) || isUploadField(field)) {
+      // A list of references is JSON, as the creating SQL and the desired schema store it.
+      return componentRelationshipStoresJson(field)
+        ? mysqlJson(colName)
+        : mysqlVarchar(colName, { length: 36 });
+    }
+    if (isRepeaterField(field) || isGroupField(field) || isJSONField(field)) {
+      return isRequired ? mysqlJson(colName).notNull() : mysqlJson(colName);
+    }
+
+    return mysqlVarchar(colName, { length: 255 });
+  }
+
+  private mapFieldToSQLiteColumn(field: DataFieldConfig): unknown {
+    const named = this.columnNaming(field);
+    if (named === null) return null;
+    const { colName, isRequired } = named;
+
+    // A text field's column is the descriptor's (`canonicalColumn`).
+    if (
+      isEmailField(field) ||
+      isPasswordField(field) ||
+      isTextareaField(field) ||
+      isRichTextField(field) ||
+      isCodeField(field) ||
+      isSelectField(field) ||
+      isRadioField(field)
+    ) {
+      return isRequired ? sqliteText(colName).notNull() : sqliteText(colName);
+    }
+    if (isNumberField(field)) {
+      const kind = this.numberColumnKind(field);
+      const column =
+        kind === "integer"
+          ? sqliteInteger(colName)
+          : kind === "decimal"
+            ? sqliteNumeric(colName)
+            : sqliteReal(colName);
+      return isRequired ? column.notNull() : column;
+    }
+    if (isCheckboxField(field)) {
+      return isRequired
+        ? sqliteInteger(colName, { mode: "boolean" }).notNull()
+        : sqliteInteger(colName, { mode: "boolean" });
+    }
+    if (isDateField(field)) {
+      return isRequired
+        ? sqliteInteger(colName, { mode: "timestamp" }).notNull()
+        : sqliteInteger(colName, { mode: "timestamp" });
+    }
+    if (isRelationshipField(field) || isUploadField(field)) {
+      return sqliteText(colName);
+    }
+    if (isRepeaterField(field) || isGroupField(field) || isJSONField(field)) {
+      return isRequired ? sqliteText(colName).notNull() : sqliteText(colName);
+    }
+
+    return sqliteText(colName);
+  }
+
+  /**
+   * The identifiers a rendered migration would put in front of the database, with their lengths.
+   *
+   * 🔴 Read out of the SQL rather than re-derived from the field list, and the difference is not
+   * stylistic. An enumeration that walks the fields again is a SECOND transcription of the rules
+   * this renderer applies — which index names it emits, which fields it skips because they are
+   * localized and live in the companion, which get a `uq_` rather than an `idx_`, and that a column
+   * name is itself an identifier. A first attempt at that missed unique indexes and plain column
+   * names, and wrongly rejected localized fields for an index the renderer never emits. Three ways
+   * to be wrong, in rules that had already been written down once.
+   *
+   * Scanning what was actually rendered cannot drift, because it IS the output. Every identifier
+   * this service emits is quoted with `this.q`, and no dialect uses that character for string
+   * literals — PostgreSQL and SQLite quote strings with `'`, MySQL identifiers are backticked — so
+   * the quoted tokens are identifiers and nothing else.
+   */
+  identifiersIn(sql: string): string[] {
+    const pattern = this.q === "`" ? /`([^`]+)`/g : /"([^"]+)"/g;
+    const found = new Set<string>();
+    for (const match of sql.matchAll(pattern)) {
+      if (match[1]) found.add(match[1]);
+    }
+    return [...found];
+  }
+
+  /**
+   * `fields` without each field inside a group with no name whose column `heldColumns` does not
+   * list; see `RuntimeSchemaOptions.heldColumns`. Flattened through `fieldsStoredOnRow`, which
+   * `columnFields` reads again unchanged, so the runtime table still lists the row's fields once.
+   */
+  private heldRowFields(
+    fields: FieldConfig[],
+    heldColumns: readonly string[] | undefined
+  ): FieldConfig[] {
+    if (heldColumns === undefined) return fields;
+    const held = new Set(heldColumns.map(column => column.toLowerCase()));
+    const topLevel = new Set<FieldConfig>(fields);
+    return fieldsStoredOnRow(fields).filter(field => {
+      if (topLevel.has(field)) return true;
+      const name = (field as { name?: unknown }).name;
+      return (
+        typeof name === "string" &&
+        held.has(this.toSnakeCase(name).toLowerCase())
+      );
+    });
+  }
+
+  /**
+   * The fields that own a column on the component's row: named data fields,
+   * less those `componentFieldHasColumn` rules out. Every loop that builds the
+   * CREATE, the indexes, the runtime tables or the ALTER plan reads this list,
+   * so they cannot disagree about which fields are columns.
+   *
+   * Read through `fieldsStoredOnRow`: a group with no name only lays fields
+   * out, and the data fields inside it are stored on this row as the ones
+   * beside it are, so each gets its column here.
+   */
+  private columnFields(
+    fields: FieldConfig[]
+  ): Array<DataFieldConfig & { name: string }> {
+    return fieldsStoredOnRow(fields).filter(
+      (field): field is DataFieldConfig & { name: string } =>
+        (isDataField(field) || isPluginDataField(field)) &&
+        componentFieldHasColumn(field) &&
+        "name" in field &&
+        typeof field.name === "string" &&
+        field.name.length > 0
+    );
+  }
+
+  /**
+   * A plain index on one column, in this dialect's spelling. Rendered by the schema pipeline's own
+   * rule, so a MySQL TEXT/BLOB column, which MySQL refuses to index whole, is keyed by the same
+   * prefix a collection's column is.
+   */
+  private createIndexSql(
+    indexName: string,
+    tableName: string,
+    columnName: string,
+    columnType: string
+  ): string {
+    const sql = columnIndexSql(
+      tableName,
+      indexName,
+      columnName,
+      columnType,
+      this.dialect,
+      name => `${this.q}${name}${this.q}`
+    );
+    return `${sql};`;
+  }
+
+  private toSnakeCase(name: string): string {
+    return name
+      .replace(/([A-Z])/g, "_$1")
+      .toLowerCase()
+      .replace(/^_/, "");
+  }
+
+  private toPascalCase(str: string): string {
+    return str
+      .split(/[-_]/)
+      .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+      .join("");
+  }
+}
+
+/**
+ * The longest slug this generator can turn into a legal identifier on every dialect.
+ *
+ * Derived rather than chosen. A slug is not the identifier: it is prefixed into a table name and
+ * that table name is prefixed AND suffixed into an index name, so the longest thing the database
+ * actually sees is
+ *
+ *   `idx_` + `comp_` + <slug> + `_parent`
+ *
+ * which is sixteen characters longer than the slug the caller typed. Bounding the slug at the
+ * product's usual 50 therefore still produces a 66-character index name, and MySQL rejects any
+ * identifier past 64 — the table is created, the index creation fails, and the field group is left
+ * recorded as failed with an unbound table.
+ *
+ * The budget is PostgreSQL's 63 rather than MySQL's 64 because it is the tighter of the two, and
+ * because its failure is the worse one: PostgreSQL does not reject an over-long identifier, it
+ * silently TRUNCATES it, so the index it creates carries a name nothing else can address.
+ *
+ * Computed from the same constants the names are built from, so a change to either prefix or to the
+ * suffix moves this bound with it instead of leaving a number behind that used to be right.
+ */
+/**
+ * The longest identifier every supported dialect stores intact, in UTF-8 bytes.
+ *
+ * PostgreSQL's 63 rather than MySQL's 64 because it is the tighter budget AND its failure is the
+ * worse one: PostgreSQL does not reject an over-long identifier, it silently TRUNCATES it, leaving
+ * an object under a name nothing else can address. Its limit is in bytes, so a name is measured
+ * with `identifierBytes`. The schema's own bound, rather than a second 63, so field groups and
+ * every other derived name are held to one limit.
+ */
+export const MAX_IDENTIFIER_LENGTH = MAX_INDEX_NAME_LENGTH;
+
+export const MAX_FIELD_GROUP_SLUG_LENGTH =
+  MAX_IDENTIFIER_LENGTH -
+  STORAGE_FORMAT.indexPrefix.length -
+  STORAGE_FORMAT.tablePrefix.length -
+  "_parent".length;

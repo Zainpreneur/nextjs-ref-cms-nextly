@@ -1,0 +1,274 @@
+/**
+ * Database adapter configuration type definitions.
+ *
+ * @packageDocumentation
+ */
+
+import type { SqlParam } from "./core";
+
+/**
+ * Logger interface for adapter operations.
+ *
+ * @remarks
+ * Adapters use this interface to log queries, errors, and performance metrics.
+ *
+ * @public
+ */
+export interface AdapterLogger {
+  /**
+   * Log a query execution.
+   *
+   * @param sql - SQL statement
+   * @param params - Query parameters
+   * @param durationMs - Query execution time in milliseconds
+   */
+  query?: (sql: string, params?: SqlParam[], durationMs?: number) => void;
+
+  /**
+   * Log an error.
+   *
+   * @param error - Error object
+   * @param context - Additional context about the error
+   */
+  error?: (error: Error, context?: Record<string, unknown>) => void;
+
+  /**
+   * Log a debug message.
+   *
+   * @param message - Debug message
+   * @param context - Additional context
+   */
+  debug?: (message: string, context?: Record<string, unknown>) => void;
+
+  /**
+   * Log a warning.
+   *
+   * @param message - Warning message
+   * @param context - Additional context
+   */
+  warn?: (message: string, context?: Record<string, unknown>) => void;
+
+  /**
+   * Log an info message.
+   *
+   * @param message - Info message
+   * @param context - Additional context
+   */
+  info?: (message: string, context?: Record<string, unknown>) => void;
+}
+
+/**
+ * Connection pool configuration.
+ *
+ * @remarks
+ * Controls connection pooling behavior. SQLite adapters ignore these
+ * settings as SQLite uses a single connection, except
+ * `connectionTimeoutMs`, which bounds the wait for that one connection.
+ *
+ * @public
+ */
+export interface PoolConfig {
+  /** Minimum number of connections in the pool */
+  min?: number;
+
+  /** Maximum number of connections in the pool */
+  max?: number;
+
+  /** Time (ms) before an idle connection is closed */
+  idleTimeoutMs?: number;
+
+  /**
+   * Time (ms) a request waits for a connection before it fails as
+   * "database busy" (code `NEXTLY_POOL_WAIT_TIMEOUT` from the adapter,
+   * `DATABASE_BUSY` from Nextly), the same on every dialect. On PostgreSQL
+   * and MySQL it is the wait for a connection already in the pool; it is also
+   * the time a new one gets to open, and one that cannot open in time is a
+   * connection error rather than busy. On SQLite, the wait for the one
+   * connection behind the transactions ahead. `0` waits without limit.
+   *
+   * @default 15000 (a PostgreSQL provider may set its own: Neon's is 20000)
+   */
+  connectionTimeoutMs?: number;
+
+  /** Time (ms) before considering an unused connection stale */
+  maxLifetimeMs?: number;
+}
+
+/**
+ * SSL/TLS configuration for database connections.
+ *
+ * @remarks
+ * Relevant for PostgreSQL and MySQL. SQLite doesn't use network connections.
+ *
+ * @public
+ */
+export interface SslConfig {
+  /** Reject unauthorized certificates (default: true for production) */
+  rejectUnauthorized?: boolean;
+
+  /** Path to CA certificate file */
+  ca?: string;
+
+  /** Path to client certificate file */
+  cert?: string;
+
+  /** Path to client private key file */
+  key?: string;
+}
+
+/**
+ * Base adapter configuration.
+ *
+ * @remarks
+ * Common configuration options for all database adapters. Dialect-specific
+ * adapters may extend this interface with additional options.
+ *
+ * @public
+ */
+export interface BaseAdapterConfig {
+  /**
+   * Database connection URL.
+   *
+   * @remarks
+   * Examples:
+   * - PostgreSQL: `postgres://user:pass@localhost:5432/dbname`
+   * - MySQL: `mysql://user:pass@localhost:3306/dbname`
+   * - SQLite: `file:./data/app.db` or `file::memory:`
+   */
+  url?: string;
+
+  /** Database host (alternative to URL) */
+  host?: string;
+
+  /** Database port (alternative to URL) */
+  port?: number;
+
+  /** Database name (alternative to URL) */
+  database?: string;
+
+  /** Database user (alternative to URL) */
+  user?: string;
+
+  /** Database password (alternative to URL) */
+  password?: string;
+
+  /** Connection pool configuration */
+  pool?: PoolConfig;
+
+  /** Logger instance for queries and errors */
+  logger?: AdapterLogger;
+
+  /**
+   * Schema name (PostgreSQL only).
+   *
+   * Applied as `search_path` in the pool's startup options, which is the
+   * pooled-safe way to set it: a `SET search_path` issued as a query belongs
+   * to whichever pooled connection happened to run it, so the next checkout
+   * would see the default again.
+   *
+   * The adapter creates the schema if it is missing, because `search_path`
+   * naming a schema that does not exist does not fail — it falls through, and
+   * the tables land somewhere else.
+   *
+   * Declared here since the first release and read by nothing until now, which
+   * is why setting it appeared to work and changed nothing.
+   */
+  schema?: string;
+
+  /** SSL/TLS configuration */
+  ssl?: SslConfig | boolean;
+
+  /**
+   * Default query timeout in milliseconds.
+   *
+   * @remarks
+   * Queries exceeding this limit will be aborted and throw a DatabaseError
+   * with kind 'timeout'. This prevents runaway queries from blocking the
+   * system indefinitely.
+   *
+   * Can be overridden per-transaction via TransactionOptions.timeoutMs.
+   *
+   * Set to 0 or undefined to disable timeout (not recommended for production).
+   *
+   * @default 15000 (15 seconds)
+   *
+   * @example
+   * ```typescript
+   * const adapter = createPostgresAdapter({
+   *   url: 'postgres://localhost/mydb',
+   *   queryTimeoutMs: 30000, // 30 seconds
+   * });
+   * ```
+   */
+  queryTimeoutMs?: number;
+
+  /** Additional connection options (driver-specific) */
+  options?: Record<string, unknown>;
+}
+
+/**
+ * PostgreSQL-specific adapter configuration.
+ *
+ * @public
+ */
+export interface PostgresAdapterConfig extends BaseAdapterConfig {
+  /** Application name for connection tracking */
+  applicationName?: string;
+
+  /** Statement timeout in milliseconds */
+  statementTimeout?: number;
+
+  /** Query timeout in milliseconds */
+  queryTimeout?: number;
+
+  /** Enable prepared statements (default: true) */
+  preparedStatements?: boolean;
+
+  /**
+   * Connect without creating anything: a configured `schema` that does not
+   * exist fails the connect with code `3F000` (invalid schema name) instead of
+   * being created. For a run that must change nothing, such as a dry run.
+   */
+  readOnly?: boolean;
+}
+
+/**
+ * MySQL-specific adapter configuration.
+ *
+ * @public
+ */
+export interface MySqlAdapterConfig extends BaseAdapterConfig {
+  /** Character set (default: utf8mb4) */
+  charset?: string;
+
+  /** Timezone (default: 'local') */
+  timezone?: string;
+
+  /** Enable multiple statements per query (default: false, security risk) */
+  multipleStatements?: boolean;
+
+  /** Date strings instead of Date objects (default: false) */
+  dateStrings?: boolean;
+}
+
+/**
+ * SQLite-specific adapter configuration.
+ *
+ * @public
+ */
+export interface SqliteAdapterConfig extends BaseAdapterConfig {
+  /** Enable WAL mode (default: true) */
+  wal?: boolean;
+
+  /** Busy timeout in milliseconds (default: 5000) */
+  busyTimeout?: number;
+
+  /** Enable foreign keys (default: true) */
+  foreignKeys?: boolean;
+
+  /** Memory-only database (overrides url) */
+  memory?: boolean;
+
+  /** Read-only mode (default: false) */
+  readonly?: boolean;
+}

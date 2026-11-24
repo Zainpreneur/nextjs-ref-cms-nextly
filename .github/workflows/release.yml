@@ -1,0 +1,356 @@
+name: Release
+
+# When this runs, and so when the Version Packages pull request changes.
+#
+# A push to `main` runs the job only when it is that pull request's own merge
+# ("chore: version packages", "(alpha)" in pre mode): that is the moment to
+# publish. Every other push leaves the job skipped, before a runner is taken.
+# Refreshing the Version Packages pull request after every merge restarted its
+# whole pipeline each time (132 times in one week, 7% of all runs, and 45-60
+# minutes per reset inside a release window) for a pull request that only
+# matters when someone decides to release.
+#
+# So that pull request is created or refreshed on demand, from the Actions tab
+# ("Run workflow" on `main`): with changesets pending the run versions them
+# into that pull request, and with none pending it publishes, which is also the
+# way to publish if that merge's message was ever edited away from the title.
+#
+# The merge's own push publishes what that merge versioned even when other
+# changesets reached `main` after that pull request was last refreshed: they
+# wait for the next release. Left to `changesets/action`, those changesets
+# would send the run down its versioning path, and the merged version would
+# never publish.
+#
+# A dispatch with "publish" ticked skips the action and publishes the current
+# manifests directly, changesets pending or not. That is the recovery path
+# after a partial publish whose fix needed a commit: a plain dispatch would
+# send the action down its versioning path whenever any changeset is pending,
+# and the failed version would never finish.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the current manifests now, even with changesets pending (recovery after a partial publish)"
+        type: boolean
+        default: false
+
+# No workflow-level `concurrency`: every run enters a workflow-level group,
+# including each ordinary push to `main` whose job then skips, and entering it
+# replaces whatever run is pending there. The release job holds its own group
+# below, which a job skipped by its `if:` never enters.
+
+jobs:
+  release:
+    name: Version & Publish
+    runs-on: ubuntu-latest
+    # Sized around `release:verify`, which waits up to thirty minutes for the
+    # largest package to become readable after the publish (SETTLE_BUDGET_MS in
+    # scripts/release/lib.mjs), plus the install and a build that may miss the
+    # cache before it.
+    timeout-minutes: 60
+
+    # Block publishing from forks, and run on a push only for the Version
+    # Packages merge (see `on:` above).
+    # Only from `main`: "Run workflow" offers every branch and tag, and the
+    # job versions or publishes whatever ref it checks out, so a dispatch from
+    # any other ref would release that ref's packages. A push reaches here
+    # only from `main` already (`on.push.branches`); the ref test holds for
+    # both events.
+    # A block scalar, since the title's ": " would end a plain YAML value.
+    if: >-
+      github.repository == 'nextlyhq/nextly' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+      startsWith(github.event.head_commit.message, 'chore: version packages')))
+
+    # One release at a time, and never cancel a running publish. On the job
+    # rather than the workflow, so only runs that release ever wait here: an
+    # ordinary push to `main` skips the job and never enters the group.
+    # `queue: max` keeps every waiting release, up to 100, in order, where the
+    # default keeps one pending and cancels it for the next: a dispatch would
+    # otherwise replace a Version Packages merge waiting to publish, and that
+    # merge's publish would be lost.
+    concurrency:
+      group: release-${{ github.workflow }}
+      cancel-in-progress: false
+      queue: max
+
+    # Reads RELEASE_BOT_TOKEN from the Production environment. Also enables
+    # environment protection rules (required reviewers, wait timers).
+    # The environment name "Production" MUST match the "Environment name"
+    # configured on every package's Trusted Publisher entry at npmjs.com.
+    environment: Production
+
+    permissions:
+      contents: write # create git tags + GitHub Releases
+      pull-requests: write # open "Version Packages" PR
+      id-token: write # OIDC token for npm Trusted Publishing (also covers provenance)
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          # Use bot token so the Version PR it opens can trigger CI
+          # GITHUB_TOKEN cannot trigger workflow runs on PR creation
+          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # .nvmrc pins the Node release this job runs, and the npm bundled
+          # with it is whatever that release ships. Nothing in this
+          # job upgrades npm any more, and re-adding such a step would be cargo
+          # cult: `pnpm publish` has been implemented natively since pnpm 11 and
+          # no longer delegates to the npm CLI, so the npm on PATH is not what
+          # writes to the registry. `changeset publish` detects the pnpm lockfile
+          # and spawns `pnpm publish`, which performs the OIDC token exchange
+          # itself. The version that has to satisfy trusted publishing is
+          # therefore the pnpm in `packageManager`, not npm.
+          #
+          # The predecessor of this comment pinned `npm install -g npm@11.18.0`
+          # because pnpm 9 DID shell out to npm, and Node 22.14's bundled npm
+          # 10.9 could not exchange an OIDC token (the registry answered 404).
+          # Both halves of that reasoning are now obsolete.
+          node-version-file: .nvmrc
+          # Writes ~/.npmrc with the registry URL for publishing
+          registry-url: https://registry.npmjs.org
+
+      - name: Restore pnpm store
+        uses: ./.github/actions/pnpm-store
+
+      # Scoped to the JOB, which is the part that matters. Six jobs across four
+      # workflows cache `.turbo`, they run concurrently on the same commit, and
+      # they build different filter sets — this one builds every package and app,
+      # `preview` builds only packages, `integration` builds five of them. Keyed on
+      # the commit alone they all wrote one entry, so whichever finished first
+      # decided what every later reader got.
+      #
+      # A reader then restores a `.turbo` shaped by someone else's build, reports
+      # `cache hit, replaying logs`, and lays down a `dist/` that does not contain
+      # what its own tests import. The symptom is `Cannot find module
+      # '.../dist/chunk-<hash>.mjs'` in a package the pull request never touched.
+      # Re-running cannot clear it: the key is the commit, so a second attempt
+      # scores an exact hit on the same foreign entry.
+      #
+      # `github.job` gives each job its own lineage. Nothing is lost — a job's own
+      # previous runs are what its cache was ever useful for, and turbo entries are
+      # content-addressed, so a narrower cache is a slower run and never a wrong
+      # one.
+      #
+      # The `v2-` prefix retires every entry written under the shared scheme in one
+      # step. Cache keys are immutable and `restore-keys` prefers the newest match,
+      # so the entries already written would otherwise keep being selected.
+      - name: Restore Turbo cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .turbo
+          key: turbo-v2-${{ runner.os }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            turbo-v2-${{ runner.os }}-${{ github.job }}-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Save pnpm store
+        if: github.event_name == 'push'
+        uses: ./.github/actions/pnpm-store
+        with:
+          save: "true"
+
+      # A dispatch: the action versions pending changesets into the Version
+      # Packages pull request, or publishes when none are pending, which is
+      # the path for publishing a version whose merge push did not. A dispatch
+      # with "publish" ticked takes the direct publish below instead.
+      - name: Create Release PR or Publish
+        id: changesets
+        if: github.event_name == 'workflow_dispatch' && !inputs.publish
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
+        with:
+          # Run when no changesets are pending. Builds then publishes.
+          publish: pnpm release:publish
+          # Run when changesets exist. Creates the Version PR.
+          version: pnpm release:version
+          commit: "chore: version packages"
+          title: "chore: version packages"
+          # Disabled: per-package GitHub Releases (one for every published
+          # package in the train) made the Releases sidebar noisy and put
+          # whichever package timestamped last as "Latest". The consolidated
+          # release step below creates ONE `vX.Y.Z` release per cycle that
+          # matches our `fixed[]` lockstep model and Payload's release style.
+          createGithubReleases: false
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          TURBO_CACHE_DIR: .turbo
+
+      # The Version Packages merge's push: publish what it versioned. Not the
+      # action, which counts changesets first and versions instead whenever
+      # any are pending, and a changeset can reach `main` between the Version
+      # Packages pull request's last refresh and its merge.
+      #
+      # This is everything the action's publish path does with the inputs
+      # above: it runs the `publish` command with GITHUB_TOKEN set to the
+      # token it was given, and fails the step when the command fails. With
+      # `createGithubReleases: false` it pushes no tag and creates no release,
+      # so per-package tags only ever existed on the runner. The git identity
+      # it configures is set here too, so the per-package tags
+      # `changeset publish` creates locally are made the same way. The
+      # registry login is the setup-node .npmrc and the job's OIDC token, as
+      # for the action. The action's `published` outputs are not read
+      # anywhere in this job.
+      #
+      # A dispatch with "publish" ticked runs this step too, for the same
+      # reason: it publishes what the manifests on `main` declare, whatever
+      # changesets are pending. `inputs` is empty on a push, so there the
+      # event alone decides.
+      - name: Publish the current manifests
+        id: publish
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          TURBO_CACHE_DIR: .turbo
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          pnpm release:publish
+
+      # Whether this run took a publish path: the merge's push published, or a
+      # dispatch found nothing pending and the action published. A dispatch
+      # that versioned took neither. The two steps below read this one
+      # output, so both publish paths are verified and finalized alike.
+      - name: Record whether this run published
+        id: path
+        env:
+          PUBLISHED: ${{ steps.publish.outcome == 'success' || steps.changesets.outputs.hasChangesets == 'false' }}
+        run: echo "publish=$PUBLISHED" >> "$GITHUB_OUTPUT"
+
+      # `changeset publish` pushes packages one at a time and reports success
+      # even when some of them failed, so the only way to know a release is
+      # whole is to ask the registry afterwards. Failing here stops the tag and
+      # the GitHub Release from being created, which is what keeps npm, git and
+      # the Releases page describing the same release.
+      #
+      # Gated on `steps.path.outputs.publish` (this run took a publish path)
+      # rather than on the action's `published == 'true'` (this run published
+      # something new). The two differ during recovery: publishing is
+      # resumable, so a re-run after a partial release skips the versions npm
+      # already has and reports nothing newly published. Keying off `published`
+      # would then skip both verification and finalization forever, leaving a
+      # complete npm release with no tag and no GitHub Release. Both steps below
+      # are idempotent, so running them on an already-finalized release is a
+      # no-op.
+      - name: Verify every package reached the registry
+        if: steps.path.outputs.publish == 'true'
+        run: pnpm release:verify
+
+      - name: Create consolidated GitHub Release
+        if: steps.path.outputs.publish == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Build the notes from the workspace manifest, not from the publish
+          # step's output. On a recovery run that output lists only the
+          # stragglers it just published, which would produce a release claiming
+          # three packages shipped and omit the rest of the train's changelogs.
+          # Verification above has already confirmed the whole manifest is live.
+          MANIFEST=$(node scripts/release/manifest.mjs)
+
+          # Every publishable package shares a version via `fixed[]`, so the
+          # first entry's version is the canonical monorepo version.
+          VERSION=$(echo "$MANIFEST" | jq -r '.[0].version')
+          TAG="v${VERSION}"
+
+          # Build the release notes from the same manifest. Every package in
+          # the train shares a version, so each changeset is written verbatim
+          # into all of their changelogs; the builder prints each entry once,
+          # drops the generated "Updated dependencies" blocks, and caps the
+          # body below GitHub's 125,000-character release limit. Concatenating
+          # the raw sections instead produced a 349k body that the API rejected
+          # with a 422 after the packages were already live on npm.
+          NOTES_FILE=$(mktemp)
+          node scripts/release/release-notes.mjs > "$NOTES_FILE"
+
+          # Configure git for the bot so we can push the unified tag
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # SemVer pre-release versions contain a hyphen (e.g. 0.0.1-alpha.0,
+          # 0.0.1-beta.2, 0.0.1-rc.1). Stable versions do not (0.0.1, 0.1.0,
+          # 1.0.0). GitHub uses --prerelease to mark a release as pre-release
+          # and --latest to flip the "Latest" badge to it. Pre-releases must
+          # NEVER be the Latest, so we route on the version string.
+          if [[ "$VERSION" == *-* ]]; then
+            RELEASE_FLAG="--prerelease"
+          else
+            RELEASE_FLAG="--latest"
+          fi
+
+          # Idempotent: skip if the release already exists. This step also runs
+          # on a dispatch or a re-run after a release is finalized, so "already
+          # done" is a normal outcome rather than a sign something went wrong.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; nothing to finalize"
+          else
+            # The tag has to point at the commit whose packages were published.
+            # `gh release create` creates a missing tag from the default branch,
+            # so if `main` moved while this ran, letting it fall back would tag a
+            # commit that was never released. Push the tag first and require it.
+            HEAD_SHA=$(git rev-parse HEAD)
+            # Peeled ref first so an annotated tag resolves to its commit.
+            REMOTE_TAG_SHA=$(git ls-remote origin "refs/tags/${TAG}^{}" | awk '{print $1}')
+            if [[ -z "$REMOTE_TAG_SHA" ]]; then
+              REMOTE_TAG_SHA=$(git ls-remote origin "refs/tags/${TAG}" | awk '{print $1}')
+            fi
+
+            if [[ -n "$REMOTE_TAG_SHA" && "$REMOTE_TAG_SHA" != "$HEAD_SHA" ]]; then
+              echo "::error::${TAG} already exists on origin at ${REMOTE_TAG_SHA}," \
+                "but this release was built from ${HEAD_SHA}."
+              exit 1
+            fi
+
+            if [[ -z "$REMOTE_TAG_SHA" ]]; then
+              # A previous run can have created the tag locally without pushing.
+              if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+                git tag "$TAG"
+              fi
+              # No `|| true` here: pushing a tag that already matches the remote
+              # exits zero on its own, so a failure is a real failure (auth, tag
+              # protection, network) and must stop the release.
+              git push origin "refs/tags/${TAG}"
+            fi
+
+            gh release create "$TAG" \
+              --verify-tag \
+              --title "$TAG" \
+              --notes-file "$NOTES_FILE" \
+              $RELEASE_FLAG
+          fi
+
+          # Mirror the notes into the workflow run summary for visibility
+          echo "## Released $TAG" >> $GITHUB_STEP_SUMMARY
+          echo "$MANIFEST" \
+            | jq -r '.[] | "- **\(.name)** @ `\(.version)`"' \
+            >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat "$NOTES_FILE" >> $GITHUB_STEP_SUMMARY
+
+      # Only a job that finished its work publishes what it learned. A cancelled or
+      # failed run leaves the cache as it found it — `actions/cache` saves in a post
+      # step that runs however the job ended, and splitting restore from save is the
+      # supported way to make that conditional (`save-always` was deprecated for it).
+      - name: Save Turbo cache
+        if: success()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .turbo
+          key: turbo-v2-${{ runner.os }}-${{ github.job }}-${{ github.sha }}

@@ -1,0 +1,273 @@
+/**
+ * Folding registry-only collections into a config-derived desired schema.
+ *
+ * Collections reach the database two ways: written in `nextly.config.ts`, or
+ * created through the Schema Builder. Only the first kind is visible to code
+ * that reads the config file. The second kind lives solely in the registry
+ * table.
+ *
+ * That asymmetry matters because SQLite and MySQL ignore `tablesFilter` and
+ * introspect the whole database, so a managed table absent from the desired
+ * schema is not merely skipped — it is diffed as an orphan and emitted as a
+ * DROP. A desired schema built from the config alone therefore proposes
+ * deleting every Schema-Builder collection in the project.
+ *
+ * @module domains/schema/pipeline/registered-collections
+ */
+
+import { pluginCollectionSources } from "../migrate/plugin/plugin-collection-sources";
+import type { ColumnOrigin } from "../services/field-column-descriptor";
+
+import { DEMOTED_FROM_CODE } from "./demoted-from-code";
+import type { DesiredCollection } from "./types";
+
+/**
+ * Fields every registry-backed entity contributes to its desired entry.
+ *
+ * Built by the merge itself rather than by each caller's mapper: these parts
+ * are identical across collections, singles and components, and a hand-written
+ * mapper that omits one produces silent drift rather than a type error.
+ */
+export interface RegisteredEntityBase {
+  slug: string;
+  tableName: string;
+  fields: DesiredCollection["fields"];
+  localized: boolean;
+  builderOwned: boolean;
+}
+
+/**
+ * A registry row, kept structurally loose because callers reach the registry
+ * through different surfaces (DI resolution, a CLI-constructed service, or a
+ * partial fake in tests) and not all of them share a nominal type.
+ */
+export interface RegisteredCollectionRow {
+  slug?: string;
+  tableName?: string;
+  fields?: unknown[];
+  status?: boolean;
+  localized?: boolean;
+  /** Set for a row owned by code-first config or a plugin. */
+  locked?: boolean;
+  /** `code`, `plugin:<name>`, or the UI source. Read only to corroborate `locked`. */
+  source?: string;
+  /**
+   * The configuration file a code row came from, or {@link DEMOTED_FROM_CODE} on a row a demote
+   * handed to the Schema Builder (`isHandedToBuilder`).
+   */
+  configPath?: string | null;
+}
+
+/**
+ * Whether a registry row is a collection `nextly db:sync --demote` handed to the Schema Builder:
+ * the Builder's by its source, with the demote's mark. A collection made in the Builder carries no
+ * mark, so a code entry that later takes its address is applied to it as before.
+ *
+ * The one answer to this question, for the registry's own sync and `nextly migrate`'s registry
+ * write as much as for the roads that build a desired schema (`withoutHandedToBuilder`).
+ */
+export function isHandedToBuilder(
+  row: Pick<RegisteredCollectionRow, "source" | "configPath">
+): boolean {
+  return row.source === "ui" && row.configPath === DEMOTED_FROM_CODE;
+}
+
+/**
+ * The configuration's collections without those a demote handed to the Schema Builder, so a road
+ * that builds a desired schema from code takes the Builder's row for that address instead
+ * (`mergeRegisteredCollections` adds it as any registry-only collection).
+ *
+ * Until its entry is removed from `nextly.config.ts`, that entry would otherwise win the merge: a
+ * field the Builder added would read as unwanted, and an edit to the entry would still change the
+ * table. A plugin's collection (`pluginSlugs`) is never left out: a plugin registers its own again
+ * at every start, so no demote hands it over.
+ */
+export function withoutHandedToBuilder<T>(
+  configured: readonly T[],
+  registered: readonly RegisteredCollectionRow[],
+  pluginSlugs: Pick<ReadonlySet<string>, "has">
+): T[] {
+  const handedOver = new Set(
+    registered.filter(isHandedToBuilder).map(row => row.slug)
+  );
+  return configured.filter(entry => {
+    const slug = slugOf(entry);
+    return slug === undefined || !handedOver.has(slug) || pluginSlugs.has(slug);
+  });
+}
+
+/**
+ * A configured entry's slug, or undefined for one without a string slug. Read from an entry of any
+ * shape, since some configurations type their collections loosely (`readonly unknown[]`).
+ */
+function slugOf(entry: unknown): string | undefined {
+  return typeof entry === "object" &&
+    entry !== null &&
+    "slug" in entry &&
+    typeof entry.slug === "string"
+    ? entry.slug
+    : undefined;
+}
+
+/**
+ * `config` as code still owns it: its collections without those a demote handed to the Schema
+ * Builder (`withoutHandedToBuilder`), with a plugin's kept by the rule a start gives a collection
+ * its origin by (`pluginCollectionSources`), and every other part as it is.
+ *
+ * For the passes that read the configuration's entities themselves: the translations-table passes
+ * and the checks of new addresses and sibling fields. Each then ignores such an entry as the schema
+ * roads do, as if it had been removed: its `localized` setting provisions or restores no
+ * translations table the Builder's collection keeps, and a pair of fields added to it refuses
+ * nothing.
+ *
+ * Not for building a desired schema: there the configuration still has to name the collection, or
+ * the Builder's row merged in for its address would read as one removed from code. Those roads
+ * filter the collections themselves (`withoutHandedToBuilder`).
+ */
+export function configTheCodeOwns<
+  C extends {
+    collections?: readonly unknown[];
+    plugins?: Parameters<typeof pluginCollectionSources>[0];
+  },
+>(config: C, registered: readonly RegisteredCollectionRow[]): C {
+  if (config.collections === undefined) return config;
+  const collections = withoutHandedToBuilder(
+    config.collections,
+    registered,
+    pluginCollectionSources(config.plugins ?? [])
+  );
+  // A copy with the collections replaced, typed as the configuration it was given (`C & ...`).
+  return collections.length === config.collections.length
+    ? config
+    : Object.assign({}, config, { collections });
+}
+
+/**
+ * Whether a registry row belongs to code-first config or a plugin rather than the Schema Builder.
+ *
+ * `locked` is the persisted answer; `source` corroborates it for a row written before the flag was
+ * populated. Either one being set is enough, because misreading code as Builder-authored is the
+ * direction that rewrites a table nobody asked to change.
+ */
+export function isCodeOwned(row: RegisteredCollectionRow): boolean {
+  if (row.locked === true) return true;
+  const source = row.source;
+  return source === "code" || (!!source && source.startsWith("plugin:"));
+}
+
+/**
+ * Which builder made an entity's table, from the ownership the registry recorded.
+ *
+ * The Schema Builder's two creators disagree with each other about a text field that states no
+ * width, so the entity kind matters as much as the ownership: a collection and a single come from
+ * one creator, a field group from another. An entity the Builder does not own was built by the
+ * pipeline, whichever kind it is.
+ */
+export function builtByFor(
+  kind: "collection" | "single" | "fieldGroup",
+  builderOwned: boolean | undefined
+): ColumnOrigin {
+  if (builderOwned !== true) return "codeFirst";
+  return kind === "fieldGroup" ? "fieldGroup" : "collection";
+}
+
+/** Logger slice used to report a registry that could not be read. */
+interface WarnLogger {
+  warn(message: string): void;
+}
+
+/**
+ * Add registry-only entities to a config-derived desired schema.
+ *
+ * Config entries win: an entity defined in code is authoritative over the
+ * registry row that mirrors it, so a field removed from the config is seen as
+ * a removal rather than being resurrected from the registry.
+ *
+ * Generic over the desired shape because collections, singles and components
+ * all face the same orphan-drop problem and differ only in which fields their
+ * desired entry carries.
+ */
+export function mergeRegisteredEntities<T>(
+  fromConfig: Record<string, T>,
+  registered: readonly RegisteredCollectionRow[],
+  extend: (row: RegisteredCollectionRow, base: RegisteredEntityBase) => T
+): Record<string, T> {
+  const merged: Record<string, T> = { ...fromConfig };
+
+  for (const row of registered) {
+    if (!row?.slug || !row?.tableName) continue;
+    if (merged[row.slug]) continue;
+    merged[row.slug] = extend(row, {
+      slug: row.slug,
+      tableName: row.tableName,
+      fields: (row.fields ?? []) as RegisteredEntityBase["fields"],
+      // Carried for every entity kind rather than left to each caller:
+      // collections, singles and components all keep translatable columns in
+      // a companion `_locales` table, and an entity whose flag is dropped has
+      // those columns re-added to its main table by the very next diff.
+      localized: row.localized === true,
+      // Registry-only is NOT the same as Builder-authored. A code-first or plugin collection
+      // dropped from the current config keeps its row on purpose — `findOrphanedCollections`
+      // retains exactly those — so it reaches this merge while still being owned by code. Calling
+      // it the Builder's would rewrite its columns on the next sync against a table that orphan
+      // retention exists to leave alone. The row says which it is, so the row is asked.
+      builderOwned: !isCodeOwned(row),
+    });
+  }
+
+  return merged;
+}
+
+/** Collection-shaped merge: carries status and the i18n flag. */
+export function mergeRegisteredCollections(
+  fromConfig: Record<string, DesiredCollection>,
+  registered: readonly RegisteredCollectionRow[]
+): Record<string, DesiredCollection> {
+  return mergeRegisteredEntities(fromConfig, registered, (row, base) => ({
+    ...base,
+    status: row.status === true,
+  }));
+}
+
+/**
+ * Load registry rows and merge them, treating an unreadable registry as
+ * non-fatal.
+ *
+ * The failure policy is deliberate and is the reason this wraps the merge
+ * rather than leaving callers to do it. If the registry cannot be read we
+ * proceed with the config-only schema, because refusing to sync at all would
+ * be a worse outcome than syncing a subset. The caller is warned explicitly
+ * that Schema-Builder collections may be flagged for drop on this pass, since
+ * that is the consequence and it is not otherwise obvious from the output.
+ */
+export async function mergeRegisteredSafely<T>(
+  fromConfig: Record<string, T>,
+  loadRegistered: () => Promise<readonly RegisteredCollectionRow[]>,
+  extend: (row: RegisteredCollectionRow, base: RegisteredEntityBase) => T,
+  logger?: WarnLogger
+): Promise<Record<string, T>> {
+  try {
+    return mergeRegisteredEntities(fromConfig, await loadRegistered(), extend);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger?.warn(
+      `Could not load registered entities (${message}). Entities created in ` +
+        `the Schema Builder may be flagged for drop this pass.`
+    );
+    return { ...fromConfig };
+  }
+}
+
+/** Collection-shaped {@link mergeRegisteredSafely}. */
+export async function mergeRegisteredCollectionsSafely(
+  fromConfig: Record<string, DesiredCollection>,
+  loadRegistered: () => Promise<readonly RegisteredCollectionRow[]>,
+  logger?: WarnLogger
+): Promise<Record<string, DesiredCollection>> {
+  return mergeRegisteredSafely(
+    fromConfig,
+    loadRegistered,
+    (row, base) => ({ ...base, status: row.status === true }),
+    logger
+  );
+}

@@ -1,0 +1,82 @@
+/**
+ * User identity tables — MySQL.
+ *
+ * Tables: users.
+ * Moved verbatim from packages/nextly/src/database/schema/mysql.ts as part of
+ * Plan A schemas consolidation. No behavior change.
+ *
+ * Cross-table relations live in `../_dialect-bundles/mysql.relations.ts` and are re-exported
+ * at the bottom of this file. See `./postgres.ts` for the rationale.
+ *
+ * @module schemas/users/mysql
+ * @since v0.0.3-alpha (Plan A — schemas consolidation)
+ */
+
+import type { BuildColumns } from "drizzle-orm";
+import {
+  mysqlTable,
+  int,
+  varchar,
+  datetime,
+  boolean,
+  timestamp,
+} from "drizzle-orm/mysql-core";
+
+import { USERS_INDEXES, mysqlIndexes } from "../_internal/core-indexes";
+
+/** `users` columns, a fresh builder record per call (see `core-table-contributions`). */
+export function usersColumns() {
+  return {
+    // Auth.js adapters expect string ids; use varchar to ensure compatibility
+    id: varchar("id", { length: 191 }).primaryKey(),
+    name: varchar("name", { length: 255 }),
+    email: varchar("email", { length: 255 }).notNull(),
+    emailVerified: datetime("email_verified"),
+    // How the address came to be verified (see `EmailVerifiedVia`): written in
+    // the same statement as email_verified and cleared with it. Nullable, so
+    // adding it to an existing table rewrites no row; `nextly migrate` then
+    // marks addresses verified before it existed as "legacy".
+    emailVerifiedVia: varchar("email_verified_via", { length: 16 }),
+    passwordUpdatedAt: datetime("password_updated_at"),
+    image: varchar("image", { length: 255 }),
+    // The interface language this person chose for the admin, as a language
+    // tag (`fr`, `pt-BR`); null follows the browser, then English. Kept apart
+    // from any content language. Nullable, so adding it to an existing table
+    // rewrites no row and every existing person keeps today's behaviour.
+    // Sized to the longest tag kept (`shared/lib/language-tag`).
+    interfaceLanguage: varchar("interface_language", { length: 35 }),
+    passwordHash: varchar("password_hash", { length: 255 }),
+    isActive: boolean("is_active").notNull().default(false),
+    // When an administrator deactivated the account; null when none has. Kept
+    // apart from is_active because that flag is also false for an account
+    // still waiting on its verification link or invite, and only this says
+    // whether following one may switch the account on. Nullable, so adding it
+    // to an existing table rewrites no row.
+    deactivatedAt: datetime("deactivated_at"),
+    // Set when an admin creates the account with a password they chose: the
+    // person must replace it on first sign-in (ASVS 6.4.1). Nullable so the
+    // column can be added to an existing table without a data-losing default;
+    // null and false both mean "no forced change".
+    mustChangePassword: boolean("must_change_password"),
+    // Raised whenever the account's sessions are ended: a deactivation, or a
+    // password set. Every access token carries the value it was signed at, and
+    // one signed at an older value is refused (auth/session/session-standing).
+    // Nullable, so adding it to an existing table rewrites no row; null reads
+    // as zero, the value an account starts at.
+    sessionEpoch: int("session_epoch"),
+    // Brute-force protection: tracks failed login attempts and account lockout
+    failedLoginAttempts: int("failed_login_attempts").notNull().default(0),
+    lockedUntil: datetime("locked_until"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+    updatedAt: timestamp("updated_at").defaultNow().notNull(),
+  };
+}
+
+/** `users` indexes, from `USERS_INDEXES`. */
+export function usersExtraConfig(
+  t: BuildColumns<"users", ReturnType<typeof usersColumns>, "mysql">
+) {
+  return mysqlIndexes(USERS_INDEXES, t);
+}
+
+export const users = mysqlTable("users", usersColumns(), usersExtraConfig);

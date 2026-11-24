@@ -1,0 +1,56 @@
+/**
+ * The identifiers of the `system:` sources core ships, declared ONCE.
+ *
+ * 🔴 A card's `query.source` and the registration that answers it are two halves
+ * of one name, and nothing checks that they agree: a definition naming an
+ * unregistered source is a legal definition, refused only at query time and only
+ * for the reader unlucky enough to hold the card. Renaming a source with the
+ * literal repeated in `core-widgets/` therefore leaves both cards querying an
+ * id nothing serves while the source and every one of its own tests still pass.
+ *
+ * Its own module rather than an export of each source, because `core-widgets/`
+ * would otherwise import the registration modules for their constants alone --
+ * pulling a domain's service wiring into the definition list, and making the
+ * widget domain depend on every domain that publishes a source.
+ *
+ * @module domains/widgets/system-source-ids
+ */
+
+/** What ships next: the releases the caller may see. */
+export const RELEASES_SOURCE_ID = "system:releases";
+
+/** The documents carrying edits that are not live. */
+export const VERSIONS_SOURCE_ID = "system:versions";
+
+/** Who changed what, most recent first: the activity this caller may see. */
+export const ACTIVITY_SOURCE_ID = "system:activity";
+
+/** What is waiting for someone: pending changes, releases due soon and overdue. */
+export const ATTENTION_SOURCE_ID = "system:attention";
+
+/**
+ * The team's figures, for a reader the Team card is offered to: the number of
+ * people, and of roles for a reader who may see them.
+ */
+export const TEAM_SOURCE_ID = "system:team";
+
+/**
+ * The Team card's people: name, email, role and last active, most recently
+ * active first, optionally only those holding one role.
+ */
+export const TEAM_PEOPLE_SOURCE_ID = "system:team-people";
+
+/** The Content card's collections, each with its entries and how many are drafts. */
+export const CONTENT_SOURCE_ID = "system:content";
+
+/**
+ * Continue where you left off: the reader's pins and their own latest saves,
+ * or other people's latest saves, one row per document this caller may read.
+ */
+export const CONTINUE_SOURCE_ID = "system:continue";
+
+/**
+ * How many people have an account, and when they joined, for a reader who may
+ * read users: what a Count card set to Users reads.
+ */
+export const USERS_SOURCE_ID = "system:users";

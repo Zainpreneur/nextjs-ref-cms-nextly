@@ -1,0 +1,1005 @@
+/**
+ * Entry API Client
+ *
+ * Provides CRUD operations for collection entries.
+ * This module handles all entry-related API calls for dynamic collections.
+ *
+ * @example
+ * ```typescript
+ * import { entryApi, entryKeys } from '@admin/services/entryApi';
+ *
+ * // Use query keys for caching
+ * const queryKey = entryKeys.list('posts', { page: 1, limit: 10 });
+ *
+ * // Fetch entries (canonical ListResponse shape per spec §5.1)
+ * const result = await entryApi.find('posts', { page: 1, limit: 10 });
+ * console.log(result.items);          // Entry[]
+ * console.log(result.meta.total);     // Total count
+ * console.log(result.meta.hasNext);   // boolean
+ * ```
+ */
+
+import { fetcher } from "../lib/api/fetcher";
+import { protectedApi } from "../lib/api/protectedApi";
+import type { BulkResponse, ListResponse } from "../lib/api/response-types";
+import {
+  DOCUMENT_REVS_KEY,
+  everyLanguageBody,
+  type EveryLanguageVersion,
+} from "../lib/document-version";
+import type { HookWarning, MutationResult } from "../lib/mutation-warnings";
+import type { Entry, EntryValue, FieldDefinition } from "../types/collection";
+
+import type {
+  PublishAllLanguageOutcome,
+  PublishAllPreview,
+} from "./publishAllPreview";
+import {
+  publishPartsBody,
+  type PublishPartsChoice,
+  type PublishPartsDirection,
+  type PublishPartsResult,
+} from "./publishParts";
+
+/** The canonical mutation envelope, exactly as the server sends it. */
+interface MutationResponse<T> {
+  message: string;
+  item: T;
+  warnings?: HookWarning[];
+}
+
+/**
+ * Parameters for find operation
+ */
+export interface FindParams {
+  /** Page number (1-indexed, default: 1) */
+  page?: number;
+  /** Number of documents per page (default: 10) */
+  limit?: number;
+  /** Sort field and direction (e.g., '-createdAt' for desc, 'title' for asc) */
+  sort?: string;
+  /** Search query string */
+  search?: string;
+  /** Query filters using Nextly where syntax */
+  where?: Record<string, unknown>;
+  /**
+   * Status filter (`?status=`). The REST default is published-only, so the
+   * management list must pass `"all"` explicitly to include drafts. Omitted →
+   * the server's published-only default.
+   */
+  status?: "all" | "draft" | "published";
+  /** Depth for relationship population (0-10) */
+  depth?: number;
+  /** Fields to select (reduces response size) */
+  select?: Record<string, boolean>;
+  /** Fields to populate for relationships */
+  populate?: Record<string, boolean> | string[];
+  /** Whether to include draft documents */
+  draft?: boolean;
+  /** Locale for localized fields */
+  locale?: string;
+  /** Fallback locale when translation is missing */
+  fallbackLocale?: string;
+  /**
+   * Request the per-locale `_translations` overview map on each row (which languages
+   * are translated + each one's draft/published status). Sent as `?translation-status=1`.
+   */
+  translationStatus?: boolean;
+  /**
+   * Request each row's review state under `_review` (`?reviewState=true`): each part where it
+   * stands in the collection's workflow, as the Review column and the bulk moves read it.
+   */
+  reviewState?: boolean;
+  /**
+   * Count the total no further than the server's cap (`?count=capped`), so a
+   * very large list says "1000+" instead of counting every row.
+   */
+  cappedCount?: boolean;
+}
+
+/**
+ * Parameters for count operation
+ */
+export interface CountParams {
+  /** Query filters using Nextly where syntax */
+  where?: Record<string, unknown>;
+  /**
+   * Content locale. Keeps the count in parity with a locale-scoped list — a
+   * localized where/search filters within this language, so the total must match the rows.
+   */
+  locale?: string;
+  /** Fallback locale when a translation is missing (`false`/`"none"` disables fallback). */
+  fallbackLocale?: string;
+}
+
+/**
+ * Result of count operation
+ */
+export interface CountResult {
+  totalDocs: number;
+}
+
+/**
+ * Entry filter configuration for query keys
+ */
+export interface EntryFilters {
+  page?: number;
+  limit?: number;
+  sort?: string;
+  search?: string;
+  where?: Record<string, unknown>;
+  depth?: number;
+}
+
+/**
+ * Extended entry type with field definitions for rendering
+ * Note: This is a wrapper type that includes schema alongside entry data
+ */
+export interface EntryWithSchema {
+  entry: Entry;
+  schema?: {
+    fields: FieldDefinition[];
+  };
+}
+
+/**
+ * Create entry payload
+ */
+export type CreateEntryPayload = Record<string, EntryValue>;
+
+/**
+ * Update entry payload (partial)
+ */
+export type UpdateEntryPayload = Record<string, EntryValue>;
+
+// ============================================================================
+// Query Keys (TanStack Query v5 Pattern)
+// ============================================================================
+
+/**
+ * Query key factory for entries
+ *
+ * Follows TanStack Query v5 best practices with hierarchical key structure.
+ * Keys are organized from general to specific to enable precise cache invalidation.
+ *
+ * @example
+ * ```typescript
+ * // Invalidate all entries
+ * queryClient.invalidateQueries({ queryKey: entryKeys.all });
+ *
+ * // Invalidate all lists for a collection
+ * queryClient.invalidateQueries({ queryKey: entryKeys.lists('posts') });
+ *
+ * // Invalidate specific list with filters
+ * queryClient.invalidateQueries({ queryKey: entryKeys.list('posts', { page: 1 }) });
+ *
+ * // Invalidate single entry
+ * queryClient.invalidateQueries({ queryKey: entryKeys.detail('posts', 'entry-123') });
+ *
+ * // Invalidate count queries
+ * queryClient.invalidateQueries({ queryKey: entryKeys.count('posts') });
+ * ```
+ */
+export const entryKeys = {
+  /** Base key for all entry queries */
+  all: ["entries"] as const,
+
+  /** Key for all list queries */
+  lists: (): readonly ["entries", "list"] =>
+    [...entryKeys.all, "list"] as const,
+
+  /** Key for lists of a specific collection */
+  listsByCollection: (
+    collectionSlug: string
+  ): readonly ["entries", "list", string] =>
+    [...entryKeys.lists(), collectionSlug] as const,
+
+  /** Key for a specific list query with filters */
+  list: (
+    collectionSlug: string,
+    filters?: EntryFilters
+  ): readonly ["entries", "list", string, EntryFilters] =>
+    [...entryKeys.listsByCollection(collectionSlug), filters ?? {}] as const,
+
+  /** Key for all detail queries */
+  details: (): readonly ["entries", "detail"] =>
+    [...entryKeys.all, "detail"] as const,
+
+  /** Key for details of a specific collection */
+  detailsByCollection: (
+    collectionSlug: string
+  ): readonly ["entries", "detail", string] =>
+    [...entryKeys.details(), collectionSlug] as const,
+
+  /** Key for a specific entry detail */
+  detail: (
+    collectionSlug: string,
+    id: string
+  ): readonly ["entries", "detail", string, string] =>
+    [...entryKeys.detailsByCollection(collectionSlug), id] as const,
+
+  /**
+   * The FULL detail cache identity, including the per-view read dimensions that
+   * change which document the server returns: content locale, fallback locale,
+   * the translation-status overview flag, and draft mode (the working-draft
+   * overlay). The read hook (useEntry) and the mutation hook (useUpdateEntry)
+   * MUST build the key through this one function — React Query hashes the object,
+   * so any divergence makes the optimistic write, rollback, and cancelQueries
+   * silently target a query the editor is not reading. Values are null/false
+   * normalised here so callers cannot drift on `undefined` vs `null`.
+   */
+  detailScoped: (
+    collectionSlug: string,
+    id: string,
+    params: {
+      locale?: string | null;
+      fallbackLocale?: string | null;
+      translationStatus?: boolean;
+      draft?: boolean;
+    }
+  ): readonly [
+    "entries",
+    "detail",
+    string,
+    string,
+    {
+      readonly locale: string | null;
+      readonly fallbackLocale: string | null;
+      readonly translationStatus: boolean;
+      readonly draft: boolean;
+    },
+  ] =>
+    [
+      ...entryKeys.detail(collectionSlug, id),
+      {
+        locale: params.locale ?? null,
+        fallbackLocale: params.fallbackLocale ?? null,
+        translationStatus: params.translationStatus ?? false,
+        draft: params.draft ?? false,
+      },
+    ] as const,
+
+  /** Key for count queries */
+  counts: (): readonly ["entries", "count"] =>
+    [...entryKeys.all, "count"] as const,
+
+  /** Key for count of a specific collection */
+  count: (
+    collectionSlug: string,
+    where?: Record<string, unknown>
+  ): readonly ["entries", "count", string, Record<string, unknown>] =>
+    [...entryKeys.counts(), collectionSlug, where ?? {}] as const,
+} as const;
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/**
+ * Synthesize a canonical PaginationMeta when the upstream call did not
+ * carry one (Singles fallback below, edge cases). Mirrors the math in
+ * nextly's `respondList` helper so admin and server agree on the shape.
+ */
+function buildListMeta(options: {
+  total: number;
+  page: number;
+  limit: number;
+}): {
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+  hasNext: boolean;
+  hasPrev: boolean;
+} {
+  const { total, page, limit } = options;
+  const totalPages = limit > 0 ? Math.ceil(total / limit) : 0;
+  return {
+    total,
+    page,
+    limit,
+    totalPages,
+    hasNext: page < totalPages,
+    hasPrev: page > 1,
+  };
+}
+
+/**
+ * Parse sort parameter into field and direction
+ * Uses '-fieldName' for descending, 'fieldName' for ascending
+ */
+function parseSort(
+  sort?: string
+): { field: string; direction: "asc" | "desc" } | undefined {
+  if (!sort) return undefined;
+
+  if (sort.startsWith("-")) {
+    return { field: sort.slice(1), direction: "desc" };
+  }
+  return { field: sort, direction: "asc" };
+}
+
+/**
+ * Build query string for entry find requests
+ */
+export const buildFindQuery = (params: FindParams): string => {
+  const query = new URLSearchParams();
+
+  // Pagination (convert to backend format).
+  if (params.page !== undefined) {
+    query.set("page", String(params.page));
+  }
+  if (params.limit !== undefined) {
+    query.set("limit", String(params.limit));
+  }
+
+  // Search
+  if (params.search) {
+    query.set("search", params.search);
+  }
+
+  // Sorting (-field for desc, field for asc)
+  const sortInfo = parseSort(params.sort);
+  if (sortInfo) {
+    query.set("sortBy", sortInfo.field);
+    query.set("sortOrder", sortInfo.direction);
+  }
+
+  // Depth for relationship population
+  if (params.depth !== undefined) {
+    query.set("depth", String(params.depth));
+  }
+
+  // Status filter. The REST default is published-only; the management list
+  // sends `all` so editors still see drafts (the status dropdown narrows via
+  // `where` on top of this).
+  if (params.status !== undefined) {
+    query.set("status", params.status);
+  }
+
+  // Where clause (Nextly query syntax)
+  if (params.where && Object.keys(params.where).length > 0) {
+    query.set("where", JSON.stringify(params.where));
+  }
+
+  // Select fields
+  if (params.select && Object.keys(params.select).length > 0) {
+    query.set("select", JSON.stringify(params.select));
+  }
+
+  // Populate fields
+  if (params.populate) {
+    if (Array.isArray(params.populate)) {
+      query.set("populate", JSON.stringify(params.populate));
+    } else if (Object.keys(params.populate).length > 0) {
+      query.set("populate", JSON.stringify(params.populate));
+    }
+  }
+
+  // Draft mode
+  if (params.draft !== undefined) {
+    query.set("draft", String(params.draft));
+  }
+
+  // Locale
+  if (params.locale) {
+    query.set("locale", params.locale);
+  }
+  if (params.fallbackLocale) {
+    // The dispatcher reads the kebab-case `fallback-locale` query key; sending
+    // `fallbackLocale` would be ignored, so `fallbackLocale: "none"` would still
+    // fall back to the default language.
+    query.set("fallback-locale", params.fallbackLocale);
+  }
+  // Opt into the per-locale translation-status overview map.
+  if (params.translationStatus) {
+    query.set("translation-status", "1");
+  }
+  if (params.cappedCount) {
+    query.set("count", "capped");
+  }
+  // Opt into each row's review state, for a collection a workflow holds.
+  if (params.reviewState) {
+    query.set("reviewState", "true");
+  }
+
+  return query.toString();
+};
+
+/**
+ * What a caller knows about the slug it reads as a collection.
+ *
+ * The server answers 404 for a missing entry and, the same way, for one the
+ * caller may not read. Reading `/singles/<slug>` after such a 404 is right only
+ * for a slug that is a Single, so the read is made again there only when the
+ * caller says it knows the slug is one; otherwise the server's own 404 stands.
+ */
+interface CollectionReadOptions {
+  knownSingle?: boolean;
+}
+
+/** Whether a failed collection read is made again as `/singles/<slug>`. */
+function readsAsSingle(
+  error: unknown,
+  collectionSlug: string,
+  knownSingle: boolean
+): boolean {
+  // `users` is a system collection, never a Single.
+  const status = (error as Record<string, unknown> | undefined)?.status;
+  return status === 404 && knownSingle && collectionSlug !== "users";
+}
+
+// ============================================================================
+// API Functions
+// ============================================================================
+
+/**
+ * Entry API client
+ *
+ * @example
+ * ```typescript
+ * // Find entries with pagination
+ * const result = await entryApi.find('posts', {
+ *   page: 1,
+ *   limit: 10,
+ *   sort: '-createdAt',
+ *   where: { status: { equals: 'published' } },
+ * });
+ *
+ * // Find single entry by ID
+ * const post = await entryApi.findByID('posts', 'abc123');
+ *
+ * // Create entry
+ * const newPost = await entryApi.create('posts', { title: 'Hello' });
+ *
+ * // Update entry
+ * const updated = await entryApi.update('posts', 'abc123', { title: 'Updated' });
+ *
+ * // Delete entry
+ * await entryApi.delete('posts', 'abc123');
+ *
+ * // Count entries
+ * const count = await entryApi.count('posts', { where: { status: { equals: 'published' } } });
+ * ```
+ */
+export const entryApi = {
+  /**
+   * Find entries with pagination and filtering
+   *
+   * @param collectionSlug - The collection identifier
+   * @param params - Query parameters
+   * @returns Paginated response with docs and metadata
+   *
+   * @example
+   * ```typescript
+   * const result = await entryApi.find('posts', {
+   *   page: 1,
+   *   limit: 10,
+   *   sort: '-createdAt',
+   *   where: { status: { equals: 'published' } },
+   *   depth: 2,
+   * });
+   *
+   * console.log(result.items);          // Entry[]
+   * console.log(result.meta.total);     // 42
+   * console.log(result.meta.hasNext);   // true
+   * ```
+   */
+  find: async (
+    collectionSlug: string,
+    params: FindParams = {},
+    { knownSingle = false }: CollectionReadOptions = {}
+  ): Promise<ListResponse<Entry>> => {
+    // Why: admin context is trusted (the route is gated by
+    // requireCollectionAccess). Inject `status=all` so the server's
+    // published-only default doesn't hide drafts from the admin list /
+    // count views. `findByID` carries the same injection for the same
+    // reason: every query that omits status falls through to the public
+    // default, so each caller has to opt out of it explicitly.
+    // Public REST callers omit the param and continue to get the safe
+    // published-only default. The status-filter dropdown in the entry
+    // table layers a `where: {status: {equals: ...}}` clause on top of
+    // this; that still narrows correctly because where-filtering happens
+    // after the default-bypass.
+    const search = new URLSearchParams(buildFindQuery(params));
+    if (!search.has("status")) search.set("status", "all");
+    const query = search.toString();
+    let url = `/collections/${collectionSlug}/entries${query ? `?${query}` : ""}`;
+
+    // Special handling for system 'users' collection
+    if (collectionSlug === "users") {
+      url = `/users${query ? `?${query}` : ""}`;
+    }
+
+    try {
+      // Server returns canonical ListResponse<Entry> via respondList.
+      const result = await fetcher<ListResponse<Entry>>(url, {}, true);
+
+      if (result.meta) {
+        return result;
+      }
+
+      // Fallback when meta is missing (defensive: dispatchers always emit
+      // it post-Phase-4, but synthesize one if a custom handler skipped it).
+      const page = params.page ?? 1;
+      const limit = params.limit ?? 10;
+      return {
+        items: result.items,
+        meta: buildListMeta({ total: result.items.length, page, limit }),
+      };
+    } catch (error: unknown) {
+      // A slug the caller knows is a Single answers 404 as a collection, so
+      // it is read from the Singles API and its bare doc projected into a
+      // single-item list. Any other 404 is the server's answer and stands.
+      if (readsAsSingle(error, collectionSlug, knownSingle)) {
+        try {
+          const singleUrl = `/singles/${collectionSlug}`;
+          const singleResult = await fetcher<Entry>(singleUrl, {}, true);
+
+          if (singleResult) {
+            return {
+              items: [singleResult],
+              meta: buildListMeta({
+                total: 1,
+                page: 1,
+                limit: params.limit ?? 10,
+              }),
+            };
+          }
+        } catch (singleError) {
+          // If both fail, throw the original error (Collection not found)
+          console.warn(
+            "Failed to fetch as single after collection failure",
+            singleError
+          );
+        }
+      }
+      throw error;
+    }
+  },
+
+  /**
+   * Find a single entry by ID
+   *
+   * @param collectionSlug - The collection identifier
+   * @param id - The entry ID
+   * @param options - Optional parameters (depth, locale, etc.)
+   * @returns The entry data
+   *
+   * @example
+   * ```typescript
+   * const post = await entryApi.findByID('posts', 'abc123', { depth: 2 });
+   * ```
+   */
+  findByID: async (
+    collectionSlug: string,
+    id: string,
+    options?: Pick<
+      FindParams,
+      "depth" | "locale" | "fallbackLocale" | "draft" | "translationStatus"
+    > & {
+      /**
+       * Also answer with the entry as stored, as a depth-0 read in the same
+       * language and view gives it, under `_stored`. A collection entry's
+       * read only; the users read ignores it.
+       */
+      stored?: boolean;
+    },
+    { knownSingle = false }: CollectionReadOptions = {}
+  ): Promise<Entry> => {
+    const query = new URLSearchParams();
+    if (options?.depth !== undefined) query.set("depth", String(options.depth));
+    if (options?.locale) query.set("locale", options.locale);
+    // Kebab-case `fallback-locale` is the query key the dispatcher reads; the
+    // camelCase form is silently ignored (so `fallbackLocale: "none"` would not
+    // actually disable fallback).
+    if (options?.fallbackLocale)
+      query.set("fallback-locale", options.fallbackLocale);
+    if (options?.draft !== undefined) query.set("draft", String(options.draft));
+    // Opt into the per-locale translation-status overview map.
+    if (options?.translationStatus) query.set("translation-status", "1");
+    if (options?.stored && collectionSlug !== "users") query.set("stored", "1");
+    // Why: admin context is trusted (the route is gated by
+    // requireCollectionAccess). Pass `status=all` so the server's default
+    // published-only filter doesn't 404 the admin out of its own draft
+    // demotes a published entry and immediately re-renders the page.
+    // Public REST callers omit this param and continue to get the safe
+    // published-only default.
+    query.set("status", "all");
+
+    const queryString = query.toString();
+
+    // Special handling for system 'users' collection
+    let url;
+    if (collectionSlug === "users") {
+      url = `/users/${id}${queryString ? `?${queryString}` : ""}`;
+    } else {
+      url = `/collections/${collectionSlug}/entries/${id}${queryString ? `?${queryString}` : ""}`;
+    }
+
+    try {
+      return await protectedApi.get<Entry>(url);
+    } catch (error: unknown) {
+      // A slug the caller knows is a Single is read from the Singles API;
+      // any other 404 is the server's answer and stands.
+      if (readsAsSingle(error, collectionSlug, knownSingle)) {
+        try {
+          // Try fetching as a Single (id is ignored/redundant as slug defines it)
+          const singleUrl = `/singles/${collectionSlug}`;
+          return await protectedApi.get<Entry>(singleUrl);
+        } catch (_singleError) {
+          // Ignore
+        }
+      }
+      throw error;
+    }
+  },
+
+  /**
+   * Count entries matching criteria
+   *
+   * @param collectionSlug - The collection identifier
+   * @param params - Count parameters with optional where clause
+   * @returns Count result
+   *
+   * @example
+   * ```typescript
+   * const result = await entryApi.count('posts', {
+   *   where: { status: { equals: 'published' } },
+   * });
+   * console.log(result.totalDocs); // 42
+   * ```
+   */
+  count: async (
+    collectionSlug: string,
+    params: CountParams = {}
+  ): Promise<CountResult> => {
+    const query = new URLSearchParams();
+    if (params.where && Object.keys(params.where).length > 0) {
+      query.set("where", JSON.stringify(params.where));
+    }
+    // Forward the content locale so a locale-scoped count matches the list.
+    if (params.locale) {
+      query.set("locale", params.locale);
+    }
+    if (params.fallbackLocale) {
+      query.set("fallback-locale", params.fallbackLocale);
+    }
+    // Why: admin counts include drafts by default — same rationale as
+    // `find` above. Without this, /entries/count returns the published-
+    // only total, which would mismatch the list view's row count and
+    // confuse pagination.
+    query.set("status", "all");
+
+    const queryString = query.toString();
+    const url = `/collections/${collectionSlug}/entries/count${queryString ? `?${queryString}` : ""}`;
+
+    // Server emits `{ total }`; the public CountResult type still
+    // uses `totalDocs`, so map the field without renaming callers.
+    const result = await protectedApi.get<{ total: number }>(url);
+    return { totalDocs: result.total };
+  },
+
+  /**
+   * Create a new entry
+   *
+   * @param collectionSlug - The collection identifier
+   * @param data - The entry data
+   * @returns The created entry
+   *
+   * @example
+   * ```typescript
+   * const newPost = await entryApi.create('posts', {
+   *   title: 'Hello World',
+   *   content: 'This is my first post',
+   *   status: 'draft',
+   * });
+   * ```
+   */
+  create: async (
+    collectionSlug: string,
+    data: CreateEntryPayload
+  ): Promise<MutationResult<Entry>> => {
+    // The whole envelope, not just `item`. `warnings` reports side effects that
+    // failed AFTER the row committed, and returning only the row is what made
+    // a save whose webhook never fired indistinguishable from a clean one.
+    const result = await protectedApi.post<MutationResponse<Entry>>(
+      `/collections/${collectionSlug}/entries`,
+      data
+    );
+    return { item: result.item, warnings: result.warnings };
+  },
+
+  /**
+   * Update an entry by ID
+   *
+   * @param collectionSlug - The collection identifier
+   * @param id - The entry ID
+   * @param data - The partial entry data to update
+   * @returns The updated entry
+   *
+   * @example
+   * ```typescript
+   * const updated = await entryApi.update('posts', 'abc123', {
+   *   title: 'Updated Title',
+   *   status: 'published',
+   * });
+   * ```
+   */
+  update: async (
+    collectionSlug: string,
+    id: string,
+    data: UpdateEntryPayload,
+    options?: Pick<FindParams, "locale" | "fallbackLocale">
+  ): Promise<MutationResult<Entry>> => {
+    // `?locale=de` updates only the German translatable values for this entry.
+    const query = new URLSearchParams();
+    if (options?.locale) query.set("locale", options.locale);
+    if (options?.fallbackLocale)
+      query.set("fallback-locale", options.fallbackLocale);
+    const qs = query.toString();
+    const result = await protectedApi.patch<MutationResponse<Entry>>(
+      `/collections/${collectionSlug}/entries/${id}${qs ? `?${qs}` : ""}`,
+      data
+    );
+    return { item: result.item, warnings: result.warnings };
+  },
+
+  /**
+   * Bulk update entries matching a where clause.
+   *
+   * Hits `PATCH /api/collections/{slug}/entries` (server `bulkUpdateByQuery`).
+   * Single round-trip; server runs per-row updates concurrently with full
+   * hook + access-control pipeline; partial failures returned in `errors[]`.
+   *
+   * @param collectionSlug - The collection identifier
+   * @param params - Where clause + data to update
+   * @returns BulkResponse<Entry> with successful records in `items` and
+   *          structured `errors[]` (each `{ id, code, message }`)
+   *
+   * @example
+   * ```typescript
+   * const result = await entryApi.updateMany('posts', {
+   *   where: { status: { equals: 'draft' } },
+   *   data: { status: 'archived' },
+   * });
+   * toast(result.message);
+   * console.log(result.items.length, 'updated');
+   * console.log(result.errors.length, 'failed');
+   * ```
+   */
+  updateMany: async (
+    collectionSlug: string,
+    params: {
+      where: Record<string, unknown>;
+      data: UpdateEntryPayload;
+    }
+  ): Promise<BulkResponse<Entry>> => {
+    return protectedApi.patch<BulkResponse<Entry>>(
+      `/collections/${collectionSlug}/entries`,
+      params
+    );
+  },
+
+  /**
+   * Bulk update entries by id list.
+   *
+   * Hits `POST /api/collections/{slug}/entries/bulk-update` (server
+   * `bulkUpdateEntries`). Same shape as updateMany; preferred when the
+   * caller already has a list of ids (e.g. multi-select in admin tables).
+   *
+   * @param collectionSlug - The collection identifier
+   * @param params - Array of ids + data to update on each
+   * @returns BulkResponse<Entry>
+   *
+   * @example
+   * ```typescript
+   * const result = await entryApi.updateByIDs('posts', {
+   *   ids: ['id1', 'id2'],
+   *   data: { status: 'published' },
+   * });
+   * ```
+   */
+  updateByIDs: async (
+    collectionSlug: string,
+    params: {
+      ids: string[];
+      data: UpdateEntryPayload;
+      /** Each document's version by id; see `BulkUpdateVariables`. */
+      revs?: Record<string, string>;
+    }
+  ): Promise<BulkResponse<Entry>> => {
+    const { revs, ...rest } = params;
+    return protectedApi.post<BulkResponse<Entry>>(
+      `/collections/${collectionSlug}/entries/bulk-update`,
+      revs ? { ...rest, [DOCUMENT_REVS_KEY]: revs } : rest
+    );
+  },
+
+  /**
+   * Delete an entry by ID
+   *
+   * @param collectionSlug - The collection identifier
+   * @param id - The entry ID
+   * @returns The deleted entry
+   *
+   * @example
+   * ```typescript
+   * const deleted = await entryApi.delete('posts', 'abc123');
+   * ```
+   */
+  delete: async (
+    collectionSlug: string,
+    id: string
+  ): Promise<MutationResult<Entry>> => {
+    const result = await protectedApi.delete<MutationResponse<Entry>>(
+      `/collections/${collectionSlug}/entries/${id}`
+    );
+    return { item: result.item, warnings: result.warnings };
+  },
+
+  /**
+   * Bulk delete entries by id list.
+   *
+   * Hits `POST /api/collections/{slug}/entries/bulk-delete` (server
+   * `bulkDeleteEntries`). Single round-trip; server runs per-row deletes
+   * concurrently with full hook + access-control pipeline; partial
+   * failures returned in `errors[]`.
+   *
+   * `items` contains `[{id}, ...]` for the successfully deleted ids
+   * (no full record, since the entries are gone).
+   *
+   * @param collectionSlug - The collection identifier
+   * @param ids - Array of entry IDs to delete
+   * @returns BulkResponse<{ id: string }>
+   *
+   * @example
+   * ```typescript
+   * const result = await entryApi.deleteByIDs('posts', ['id1', 'id2']);
+   * toast(result.message);
+   * if (result.errors.length > 0) {
+   *   // Surface per-item failures; each has { id, code, message }.
+   * }
+   * ```
+   */
+  deleteByIDs: async (
+    collectionSlug: string,
+    ids: string[]
+  ): Promise<BulkResponse<{ id: string }>> => {
+    return protectedApi.post<BulkResponse<{ id: string }>>(
+      `/collections/${collectionSlug}/entries/bulk-delete`,
+      { ids }
+    );
+  },
+
+  /**
+   * Duplicate an existing entry (creates a copy)
+   *
+   * Creates a new entry with the same field values as the source entry.
+   * System fields (id, createdAt, updatedAt) and unique fields (slug) are
+   * automatically handled by the backend. Title/name fields get " (Copy)" appended.
+   *
+   * @param collectionSlug - The collection identifier
+   * @param id - The ID of the entry to duplicate
+   * @param overrides - Optional field overrides for the duplicated entry
+   * @returns The newly created duplicate entry
+   *
+   * @example
+   * ```typescript
+   * // Simple duplication
+   * const duplicate = await entryApi.duplicate('posts', 'abc123');
+   *
+   * // With field overrides
+   * const duplicate = await entryApi.duplicate('posts', 'abc123', {
+   *   title: 'Custom Title',
+   *   status: 'draft',
+   * });
+   * ```
+   */
+  duplicate: async (
+    collectionSlug: string,
+    id: string,
+    overrides?: Record<string, unknown>
+  ): Promise<Entry> => {
+    const result = await protectedApi.post<{ message: string; item: Entry }>(
+      `/collections/${collectionSlug}/entries/${id}/duplicate`,
+      overrides ? { overrides } : {}
+    );
+    return result.item;
+  },
+
+  /**
+   * Publish every language of an entry at once.
+   * Hits `POST /api/collections/{slug}/entries/{id}/publish-all`.
+   */
+  publishAllLocales: async (
+    collectionSlug: string,
+    id: string,
+    /**
+     * The version of every language, as a read of every language gives it: a
+     * publish of every language is refused when any of them changed since.
+     * Or the overwrite choice, from a caller refused that read.
+     */
+    version?: EveryLanguageVersion
+  ): Promise<{
+    id: string;
+    status?: string;
+    languages?: PublishAllLanguageOutcome[];
+  }> => {
+    // The publish reports each language's outcome beside the entry, which
+    // the result message names language by language.
+    const result = await protectedApi.post<{
+      message: string;
+      item: {
+        id: string;
+        status?: string;
+        languages?: PublishAllLanguageOutcome[];
+      };
+    }>(
+      `/collections/${collectionSlug}/entries/${id}/publish-all`,
+      everyLanguageBody(version)
+    );
+    return result.item;
+  },
+
+  /**
+   * What publishing every language of an entry would do, language by
+   * language, without doing it: asked as the publish is, and writing nothing.
+   * Hits `GET /api/collections/{slug}/entries/{id}/publish-all`.
+   */
+  previewPublishAllLocales: async (
+    collectionSlug: string,
+    id: string
+  ): Promise<PublishAllPreview> =>
+    protectedApi.get<PublishAllPreview>(
+      `/collections/${collectionSlug}/entries/${id}/publish-all`
+    ),
+
+  /**
+   * Publish or unpublish the parts of an entry a person chose: some of its languages, and
+   * separately its shared fields. With `describe`, say what that would do and change nothing.
+   * Hits `POST /api/collections/{slug}/entries/{id}/publish` (or `/unpublish`).
+   *
+   * @experimental Until publishing per language is complete.
+   */
+  publishParts: async (
+    collectionSlug: string,
+    id: string,
+    direction: PublishPartsDirection,
+    choice: PublishPartsChoice
+  ): Promise<PublishPartsResult> => {
+    const result = await protectedApi.post<{
+      message: string;
+      item: PublishPartsResult;
+    }>(
+      `/collections/${collectionSlug}/entries/${id}/${direction}`,
+      publishPartsBody(choice)
+    );
+    return result.item;
+  },
+
+  // ===========================================================================
+  // Legacy Methods (for backwards compatibility with internal table components)
+  // ===========================================================================
+
+  /**
+   * List all entries (non-paginated)
+   *
+   * @deprecated Use `find` with high limit instead
+   * @internal
+   */
+  list: async (collectionSlug: string): Promise<Entry[]> => {
+    const result = await entryApi.find(collectionSlug, { limit: 1000 });
+    return result.items;
+  },
+
+  /**
+   * Get single entry by ID
+   *
+   * @deprecated Use `findByID` instead
+   * @internal
+   */
+  get: async (collectionSlug: string, entryId: string): Promise<Entry> => {
+    return entryApi.findByID(collectionSlug, entryId);
+  },
+} as const;

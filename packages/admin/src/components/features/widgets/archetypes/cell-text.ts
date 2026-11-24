@@ -1,0 +1,263 @@
+/**
+ * Turning one value from a widget row into text a card can print.
+ *
+ * Shared by every archetype that draws rows, because "what does this cell say"
+ * is one question and two answers would drift the first time either was
+ * corrected. `list` learned this reading first; `table` needs exactly the same
+ * one.
+ *
+ * @module components/features/widgets/archetypes/cell-text
+ */
+
+import { answerHasNothing } from "nextly/widget-result";
+
+import {
+  formatGlobalDateTime,
+  getGlobalDateTimeConfig,
+  isValidTimezone,
+  resolveLocalTimezone,
+} from "@admin/lib/dates/format";
+import type {
+  WidgetResult,
+  WidgetResultField,
+} from "@admin/types/dashboard/widgets";
+
+import type { ArchetypeOutcome } from "./types";
+
+/** What a cell needs to know about its column to present a value: its kind and its value labels. */
+export type CellColumn = Pick<WidgetResultField, "type" | "choices">;
+
+/**
+ * What a person calls a stored choice value, or `undefined` when the column names none.
+ *
+ * One lookup for every place a stored value is shown -- a row, a table cell, a chart group -- so a
+ * status reads "Published" in all of them or in none. A value the column does not list (an option
+ * removed since the row was written) falls back to the stored value, which is still the truth.
+ */
+export function choiceLabel(
+  value: string,
+  choices: CellColumn["choices"]
+): string | undefined {
+  return choices?.find(choice => choice.value === value)?.label;
+}
+
+/**
+ * One cell as text, or `undefined` when it is not something to print.
+ *
+ * Objects and arrays are DROPPED rather than stringified. `String({})` is
+ * "[object Object]", which is not a defect a reader can act on — it looks like
+ * data. A relationship, a repeater or a rich-text value all arrive here as
+ * objects, and no row-drawing archetype can render any of them; saying nothing
+ * is better than saying that, as a title that came back as an object showed.
+ *
+ * `null` and `undefined` are absent values, not text. `0` and `false` ARE text:
+ * a count of zero is a real answer and dropping it would make the row lie.
+ */
+export function asText(value: unknown): string | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === "string") return value.trim() === "" ? undefined : value;
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return undefined;
+}
+
+/**
+ * One cell as text, PRESENTED according to the kind the source declared it.
+ *
+ * 🔴 The layer `asText` deliberately is not. `asText` answers "can this value be
+ * printed at all", which is a question about the value; this answers "how should
+ * a reader see it", which is a question about the value AND its declared type.
+ * Keeping them apart is what lets a source with no declaration still render.
+ *
+ * A `date` is the case that forced this. Every source declares its date fields
+ * as such, the value crosses the wire as an ISO 8601 string, and printing it
+ * verbatim put `2026-09-01T07:00:00.000Z` in front of a reader on a card whose
+ * whole subject is when something happens. Selecting a different field is not a
+ * remedy — it just moves which column is unreadable.
+ *
+ * 🔴 Formatted through `formatGlobalDateTime`, the same path every other admin
+ * date goes through, NOT a bare `toLocaleString`. General Settings carries a
+ * timezone, `GeneralSettingsSync` publishes it to that formatter at the
+ * root of the admin, and a cell reading the browser's own zone instead would
+ * make these cards disagree with every date beside them whenever an
+ * administrator has configured one. The formatter falls back to the local zone
+ * when nothing is configured, so the browser zone remains the default rather
+ * than the rule.
+ *
+ * It is imported from `lib/dates/format` rather than through
+ * `useAdminDateFormatter`: this module is a plain function called from a render
+ * body, not a hook, and the underlying formatter reads a module-level config
+ * that the provider has already set.
+ *
+ * What it still cannot show is the zone a value was AUTHORED against -- a
+ * release scheduled for 09:00 Berlin is stored with that zone, and the widget
+ * query contract carries a value and its declared type rather than a value and
+ * its zone. This renders in the ADMIN's zone, which is the right answer for a
+ * dashboard summary and the wrong one for a scheduling screen, where
+ * `formatScheduledAt` already serves the authored zone from the full release.
+ *
+ * An UNPARSEABLE date falls back to the raw text rather than dropping the cell.
+ * The value is still evidence — a reader can see something is wrong with it —
+ * and an em dash would report a working row as missing data.
+ */
+export function asPresentedText(
+  value: unknown,
+  column: CellColumn | undefined,
+  now: number = Date.now()
+): string | undefined {
+  // A choice column shows the value's label, never the stored value ("Published", not
+  // `published`); the stored value is kept when the column names no label for it. Asked
+  // before the value is judged printable, so an option that stores "" under a label ("None")
+  // reads as that label, as it does on a bar, rather than as an empty cell.
+  const named =
+    typeof value === "string" && column?.choices
+      ? choiceLabel(value, column.choices)
+      : undefined;
+  if (named !== undefined) return named;
+  const text = asText(value);
+  if (text === undefined) return undefined;
+  if (column?.type !== "date") return text;
+
+  // The raw text is the FALLBACK, so an unparseable value still reaches the
+  // reader as evidence rather than as an em dash claiming the row has nothing.
+  return presentedDate(text, now)?.short ?? text;
+}
+
+/** The admin's zone, locale and clock, as every admin date reads them. */
+function adminClock(): {
+  timeZone: string | undefined;
+  locale: string;
+  hour12: boolean | undefined;
+} {
+  const config = getGlobalDateTimeConfig();
+  return {
+    timeZone: isValidTimezone(config.timezone)
+      ? config.timezone
+      : resolveLocalTimezone(),
+    locale: config.locale ?? "en-US",
+    hour12:
+      config.timeFormat === "12h"
+        ? true
+        : config.timeFormat === "24h"
+          ? false
+          : undefined,
+  };
+}
+
+/** The calendar day `date` falls on in `timeZone`, as "YYYY-MM-DD". */
+function dayIn(date: Date, timeZone: string | undefined): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+/** The day before a "YYYY-MM-DD" day, by the calendar alone. */
+function dayBefore(day: string): string {
+  const noon = new Date(`${day}T12:00:00Z`);
+  noon.setUTCDate(noon.getUTCDate() - 1);
+  return noon.toISOString().slice(0, 10);
+}
+
+/**
+ * A date as a cell shows it, short enough for a meta line, and in full for its
+ * tooltip: "Today, 9:40 PM" and "Yesterday, 9:40 PM" for the two days a reader
+ * names that way, "Oct 24, 9:40 PM" within this year, and the year only when
+ * it is another. Every form is read in the admin's zone, locale and clock, so
+ * the day a cell names is the day every other admin date names; the full form
+ * is the admin's own formatted date, in the site's configured date format.
+ * `undefined` for a value that is not a date.
+ */
+export function presentedDate(
+  text: string,
+  now: number = Date.now()
+): { short: string; full: string } | undefined {
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) return undefined;
+  const { timeZone, locale, hour12 } = adminClock();
+  const full = formatGlobalDateTime(text, {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const day = dayIn(date, timeZone);
+  const today = dayIn(new Date(now), timeZone);
+  const time = new Intl.DateTimeFormat(locale, {
+    timeZone,
+    hour: "numeric",
+    minute: "2-digit",
+    hour12,
+  }).format(date);
+  if (day === today) return { short: `Today, ${time}`, full };
+  if (day === dayBefore(today)) return { short: `Yesterday, ${time}`, full };
+  const short = new Intl.DateTimeFormat(locale, {
+    timeZone,
+    month: "short",
+    day: "numeric",
+    ...(day.slice(0, 4) === today.slice(0, 4) ? {} : { year: "numeric" }),
+    hour: "numeric",
+    minute: "2-digit",
+    hour12,
+  }).format(date);
+  return { short, full };
+}
+
+/**
+ * The fields a widget's answer is drawn by: the answer's own `fields` when it
+ * describes them, else the first row's own keys, in their order. Every card is
+ * answered on the server from its declaration, with no query of its own to
+ * select them.
+ *
+ * 🔴 The first row's keys only: a key a later row carries and the first does
+ * not is not drawn. The rows are what the widget's own data function answered,
+ * through reads already bound to this reader, so its first row is its own
+ * description of them, not a guess at fields the reader may not see.
+ */
+export function declaredAnswerFields(result: {
+  items: readonly Record<string, unknown>[];
+  fields?: readonly WidgetResultField[];
+}): WidgetResultField[] {
+  if (result.fields !== undefined && result.fields.length > 0) {
+    return [...result.fields];
+  }
+  return Object.keys(result.items[0] ?? {}).map(name => ({ name }));
+}
+
+/**
+ * A row display's answer as its list of rows, or what it draws instead: a
+ * refusal when the answer is not a list, and its one empty state, worded for
+ * what it lists, when there are no rows. Asked before any field is read, since
+ * an answer that describes no fields is drawn by its first row's: with
+ * no rows it is empty, not undrawable. One reading for every row display, so
+ * a list and a table cannot come to disagree about either.
+ */
+export function rowsOrInstead(
+  result: WidgetResult,
+  title: string,
+  words: { expected: string; rows: string }
+): Extract<WidgetResult, { op: "list" }> | ArchetypeOutcome {
+  if (result.op !== "list") {
+    return {
+      ok: false,
+      message: `"${title}" expected ${words.expected}, but the query returned a ${result.op}.`,
+    };
+  }
+  if (answerHasNothing(result)) {
+    // The frame's one empty state, worded for what the display lists. Source-neutral: the card
+    // may read any collection's, system's or plugin's data, so it names no kind of row it
+    // cannot know.
+    return {
+      ok: true,
+      empty: {
+        title: "Nothing here yet",
+        detail: `${words.rows} appear here once something matches this card.`,
+      },
+    };
+  }
+  return result;
+}

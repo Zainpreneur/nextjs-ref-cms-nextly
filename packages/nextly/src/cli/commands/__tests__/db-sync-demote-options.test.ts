@@ -1,0 +1,424 @@
+/**
+ * A demoted collection is written to the Schema Builder's registry with every option the
+ * code-first sync stores for it: its names, description, table and admin options, and every
+ * collection-level option that changes how it behaves, its Draft/Published lifecycle first. So the
+ * record is the one the collection had while code owned it, and promoting it again prints the same
+ * collection. What a record cannot hold is named before the write.
+ *
+ * The schema lock is stood in for: what is asserted is the record handed to the registry.
+ */
+import { describe, expect, it, vi } from "vitest";
+
+import { defineCollection } from "../../../collections/config/define-collection";
+import { toCodeFirstCollectionConfig } from "../../../domains/collections/services/collection-sync-service";
+import { serializeCollection } from "../../../domains/schema/services/code-generator";
+import { calculateSchemaHash } from "../../../domains/schema/services/schema-hash";
+import { resolveVersionsConfig } from "../../../domains/versions/resolve-config";
+import type {
+  DynamicCollectionInsert,
+  DynamicCollectionRecord,
+} from "../../../schemas/dynamic-collections";
+import type { CollectionRegistryService } from "../../../services/collections/collection-registry-service";
+import { createLogger } from "../../utils/logger";
+import {
+  demoteCollection,
+  demotedCollectionIn,
+  type DemotedCollection,
+} from "../db-sync-demote";
+import { promotedCollection } from "../db-sync-promote-collection";
+
+vi.mock("../db-sync-registry", async importOriginal => ({
+  ...(await importOriginal<typeof import("../db-sync-registry")>()),
+  withCollectionRegistryWrite: (_args: unknown, work: () => Promise<unknown>) =>
+    work(),
+}));
+
+/** What a demote of `collection` writes, with `existing` the record already registered. */
+async function demoted(
+  collection: DemotedCollection,
+  existing: DynamicCollectionRecord | null = null,
+  /** The dialect of the database the demote runs on, as its adapter states it. */
+  dialect?: "postgresql" | "mysql" | "sqlite"
+) {
+  const registered: DynamicCollectionInsert[] = [];
+  const updated: Partial<DynamicCollectionInsert>[] = [];
+  const updateOptions: unknown[] = [];
+  let shown = "";
+  const registry = {
+    getCollectionBySlug: async () => existing,
+    registerCollection: async (data: DynamicCollectionInsert) => {
+      registered.push(data);
+      return data;
+    },
+    updateCollection: async (
+      _slug: string,
+      data: Partial<DynamicCollectionInsert>,
+      options?: unknown
+    ) => {
+      updated.push(data);
+      updateOptions.push(options);
+      return data;
+    },
+  } as unknown as CollectionRegistryService;
+  const outcome = await demoteCollection({
+    collection,
+    logger: createLogger({ quiet: true }),
+    registry,
+    adapter: (dialect === undefined ? {} : { dialect }) as never,
+    confirm: async code => {
+      shown = code;
+      return true;
+    },
+  });
+  expect(outcome).toBe("demoted");
+  return { registered, updated, updateOptions, shown };
+}
+
+/** The one record a demote with nothing registered writes. */
+async function registeredFor(
+  collection: DemotedCollection
+): Promise<DynamicCollectionInsert> {
+  const { registered, updated } = await demoted(collection);
+  expect(updated).toEqual([]);
+  expect(registered).toHaveLength(1);
+  return registered[0];
+}
+
+const FIELDS = [{ name: "body", type: "text" as const }];
+
+/** A collection as the config defines it. */
+function coded(options: Record<string, unknown> = {}): DemotedCollection {
+  // Options of every shape, from one table of cases, so the call is not narrowed to one of them.
+  return defineCollection({
+    slug: "articles",
+    fields: FIELDS,
+    ...options,
+  } as Parameters<typeof defineCollection>[0]) as DemotedCollection;
+}
+
+/** The registered record, as the registry reads it back and a promote then prints it. */
+function asRecord(insert: DynamicCollectionInsert): DynamicCollectionRecord {
+  return {
+    id: "record-id",
+    schemaVersion: 1,
+    migrationStatus: "pending",
+    locked: false,
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+    timestamps: true,
+    status: false,
+    localized: false,
+    ...insert,
+  } as DynamicCollectionRecord;
+}
+
+/** The printed code of a promote of `record`, evaluated: an object literal of plain values. */
+function promotedFrom(record: DynamicCollectionRecord) {
+  const code = serializeCollection(promotedCollection(record));
+  return new Function(`return (${code});`)() as Parameters<
+    typeof toCodeFirstCollectionConfig
+  >[0];
+}
+
+describe("a demoted collection's record", () => {
+  it("keeps the Draft/Published lifecycle", async () => {
+    const record = await registeredFor(coded({ status: true }));
+    expect(record.status).toBe(true);
+    expect(record.versions).toEqual(resolveVersionsConfig(undefined, true));
+  });
+
+  it("hands a record the code-first sync made to the Schema Builder: its source and lock in the one update", async () => {
+    const synced = {
+      ...asRecord({
+        slug: "articles",
+        labels: { singular: "Article", plural: "Articles" },
+        tableName: "dc_articles",
+        fields: [],
+        source: "code",
+        schemaHash: "older",
+      }),
+      locked: true,
+    };
+    const { registered, updated, updateOptions } = await demoted(
+      coded(),
+      synced
+    );
+    expect(registered).toEqual([]);
+    expect(updated).toHaveLength(1);
+    expect(updated[0]).toMatchObject({
+      source: "ui",
+      locked: false,
+      // As a newly registered demote records it, and the hash the sync compares fields by.
+      configPath: "demoted-from-code",
+      schemaHash: calculateSchemaHash(updated[0].fields as never),
+    });
+    // Asked of the registry as a hand-over, which is what lets a locked record be written.
+    expect(updateOptions).toEqual([{ handOver: "builder" }]);
+  });
+
+  it("keeps the table a record already names, whatever table the configuration now asks for", async () => {
+    // The configuration's `dbName` changed since the record was written: the entries are still
+    // in the table the record names, and a demote moves no table.
+    const synced = {
+      ...asRecord({
+        slug: "articles",
+        labels: { singular: "Article", plural: "Articles" },
+        tableName: "dc_articles",
+        fields: [],
+        source: "code",
+        schemaHash: "older",
+      }),
+      locked: true,
+    };
+    const { updated } = await demoted(coded({ dbName: "dc_renamed" }), synced);
+    expect(updated).toHaveLength(1);
+    expect(updated[0].tableName).toBe("dc_articles");
+    // A collection the registry does not hold yet takes the table its configuration names.
+    expect(
+      (await registeredFor(coded({ dbName: "dc_renamed" }))).tableName
+    ).toBe("dc_renamed");
+  });
+
+  it("keeps the timestamps setting a record already holds, whatever the configuration now says", async () => {
+    // The configuration turned timestamps on since the record was written: the table was built
+    // without the timestamp columns, and a demote adds no column.
+    const synced = {
+      ...asRecord({
+        slug: "articles",
+        labels: { singular: "Article", plural: "Articles" },
+        tableName: "dc_articles",
+        fields: [],
+        source: "code",
+        schemaHash: "older",
+      }),
+      locked: true,
+      timestamps: false,
+    };
+    const { updated } = await demoted(coded({ timestamps: true }), synced);
+    expect(updated).toHaveLength(1);
+    expect(updated[0].timestamps).toBe(false);
+    // A collection the registry does not hold yet takes the setting its configuration states.
+    expect((await registeredFor(coded({ timestamps: false }))).timestamps).toBe(
+      false
+    );
+    expect((await registeredFor(coded({ timestamps: true }))).timestamps).toBe(
+      true
+    );
+  });
+
+  it("keeps the lifecycle when it replaces a record already registered", async () => {
+    const existing = asRecord({
+      slug: "articles",
+      labels: { singular: "Article", plural: "Articles" },
+      tableName: "dc_articles",
+      fields: [],
+      source: "ui",
+      schemaHash: "older",
+    });
+    const { registered, updated } = await demoted(
+      coded({ status: true }),
+      existing
+    );
+    expect(registered).toEqual([]);
+    expect(updated).toHaveLength(1);
+    expect(updated[0]).toMatchObject({
+      status: true,
+      versions: resolveVersionsConfig(undefined, true),
+      source: "ui",
+    });
+  });
+
+  it.each([
+    ["the lifecycle", { status: true }],
+    [
+      "drafts kept beside the live row",
+      { status: true, versions: { drafts: { autosave: false }, maxPerDoc: 5 } },
+    ],
+    ["history alone", { versions: true }],
+    ["translations", { localized: true }],
+    ["no timestamps", { timestamps: false }],
+    ["the cache opt-out", { revalidate: { disable: true } }],
+    ["the webhook opt-out", { webhooks: { record: false } }],
+    ["a table of its own", { dbName: "legacy_articles" }],
+    [
+      "names, a description and admin options",
+      {
+        labels: { singular: "Story", plural: "Stories" },
+        description: "News and features.",
+        admin: {
+          group: "Content",
+          icon: "FileText",
+          useAsTitle: "slug",
+          defaultColumns: ["title", "slug"],
+          order: 3,
+        },
+      },
+    ],
+    ["no options", {}],
+  ])(
+    "promotes back to the collection it came from: %s",
+    async (_what, options) => {
+      const collection = coded(options);
+      const record = asRecord(await registeredFor(collection));
+      expect(toCodeFirstCollectionConfig(promotedFrom(record))).toEqual(
+        toCodeFirstCollectionConfig(collection)
+      );
+    }
+  );
+
+  it("is registered with the hash the registry compares fields by, as an update writes it", async () => {
+    // A different hash for the same fields reads as a schema change at the Builder's first save.
+    const record = await registeredFor(coded());
+    expect(record.schemaHash).toBe(calculateSchemaHash(record.fields as never));
+  });
+
+  it("writes its fields, names and table", async () => {
+    const collection = coded();
+    const record = await registeredFor(collection);
+    expect(record).toMatchObject({
+      slug: "articles",
+      labels: collection.labels,
+      tableName: "dc_articles",
+      source: "ui",
+    });
+    expect(record.fields.map(field => field.name)).toEqual([
+      "title",
+      "slug",
+      "body",
+    ]);
+  });
+});
+
+describe("a demoted collection's code-only options", () => {
+  it("are named before the write, since a record cannot hold them", async () => {
+    const { shown } = await demoted(
+      coded({
+        hooks: { beforeCreate: [() => undefined] },
+        indexes: [{ fields: ["body"], unique: true }],
+      })
+    );
+    expect(shown).toContain("hooks.");
+  });
+
+  it("say its compound indexes go at the next schema sync, not when its code entry is removed", async () => {
+    // Once demoted, the code entry is ignored by every schema sync, so the indexes it declares are
+    // not in the schema the next sync applies, whether or not the entry is still there.
+    const { shown } = await demoted(
+      coded({
+        hooks: { beforeCreate: [() => undefined] },
+        indexes: [{ fields: ["body"], unique: true }],
+      })
+    );
+    expect(shown).toContain(
+      "Its compound indexes are dropped at the next schema sync"
+    );
+    expect(shown).not.toContain("indexes.");
+  });
+
+  it("are not mentioned for a collection without any", async () => {
+    const { shown } = await demoted(coded());
+    expect(shown).not.toContain("Schema Builder cannot hold");
+    expect(shown).not.toContain("compound indexes");
+    // Nor for one that declares an empty list of them.
+    expect((await demoted(coded({ indexes: [] }))).shown).not.toContain(
+      "compound indexes"
+    );
+  });
+});
+
+describe("a demoted collection's columns", () => {
+  it("are named where the Schema Builder's column rules describe them differently, on the database's dialect", async () => {
+    // A shared text field stating no width is VARCHAR(255) on a code-first MySQL table and TEXT on
+    // a Schema Builder one. From the next sync the table is the Builder's, so the column widens.
+    // Translated, so its translatable fields are kept per language whatever the site's layout.
+    const { shown } = await demoted(
+      coded({
+        localized: true,
+        fields: [
+          { name: "code", type: "text", localized: false },
+          { name: "body", type: "text" },
+        ],
+      }),
+      null,
+      "mysql"
+    );
+    expect(shown).toContain(
+      "From the next schema sync its table follows the Schema Builder's column rules"
+    );
+    expect(shown).toMatch(/code \(varchar\(255\) to text\)/);
+    // `slug` keeps its column: both builders bound it, since it is indexed.
+    expect(shown).not.toMatch(/\bslug \(/);
+    // A translatable field's column is in the translations table, not the table the note names.
+    expect(shown).not.toMatch(/\bbody \(/);
+  });
+
+  it("include the fields a group with no name keeps on the collection's own row", async () => {
+    // A presentational group stores its fields as columns of the collection's table, so the next
+    // sync changes them as it changes a top-level field.
+    const { shown } = await demoted(
+      coded({
+        localized: true,
+        fields: [
+          {
+            type: "group",
+            fields: [
+              { name: "sku", type: "text", localized: false },
+              { name: "caption", type: "text" },
+            ],
+          },
+        ],
+      }),
+      null,
+      "mysql"
+    );
+    expect(shown).toMatch(/sku \(varchar\(255\) to text\)/);
+    // Its translatable field is kept per language, like a top-level one.
+    expect(shown).not.toMatch(/\bcaption \(/);
+  });
+
+  it("are not mentioned where both rules describe every column the same way", async () => {
+    // SQLite stores every text field as TEXT, whoever built the table.
+    const { shown } = await demoted(coded(), null, "sqlite");
+    expect(shown).not.toContain("column rules");
+  });
+});
+
+describe("which collection a demote may move", () => {
+  const plugin = {
+    name: "@acme/forms",
+    contributes: { collections: [{ slug: "articles" }] },
+  };
+
+  it("is the app's own collection the configuration defines", () => {
+    const collection = coded();
+    expect(demotedCollectionIn("articles", { collections: [collection] })).toBe(
+      collection
+    );
+  });
+
+  it("is never a plugin's, even under an address the configuration also lists", () => {
+    // A plugin registers its collection again at every start, so a hand-over to the Builder would
+    // be taken back by the next one; under a Builder record's address it would mark that record as
+    // handed over from code.
+    const refused = demotedCollectionIn("articles", {
+      collections: [coded()],
+      plugins: [plugin],
+    });
+    expect(refused).toMatchObject({ code: "DEMOTE_PLUGIN_COLLECTION" });
+    expect((refused as { what: string }).what).toContain("@acme/forms");
+  });
+
+  it("is refused as not defined when the configuration has none under the address", () => {
+    expect(
+      demotedCollectionIn("articles", {
+        collections: [],
+        plugins: [
+          {
+            name: "@acme/pages",
+            contributes: { collections: [{ slug: "pages" }] },
+          },
+        ],
+      })
+    ).toMatchObject({ code: "DEMOTE_COLLECTION_NOT_FOUND" });
+  });
+});

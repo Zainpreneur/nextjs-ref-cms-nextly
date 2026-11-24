@@ -1,0 +1,341 @@
+/**
+ * Tests for Nextly initialization API
+ */
+
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  vi,
+  expectTypeOf,
+} from "vitest";
+
+import { defineConfig } from "../collections/config/define-config";
+import { registerServices } from "../di/register";
+import { isServicesRegistered } from "../di/service-access";
+import { buildServiceConfig } from "../init/build-service-config";
+import {
+  getCachedNextly,
+  getNextly,
+  shutdownNextly,
+  type Nextly,
+} from "../init";
+
+// Mock console.info to avoid noise in tests: Nextly reports through
+// consoleLogger, whose info level writes there.
+const originalLog = console.info;
+beforeEach(() => {
+  console.info = vi.fn();
+});
+afterEach(() => {
+  console.info = originalLog;
+});
+
+function testOptions(): Parameters<typeof getNextly>[0] {
+  return {
+    config: defineConfig({}),
+  };
+}
+
+describe("init - Nextly API", () => {
+  // Clean up after each test
+  afterEach(async () => {
+    await shutdownNextly();
+  });
+
+  describe("getNextly()", () => {
+    it("should return a Nextly instance with all services", async () => {
+      const nextly = await getNextly(testOptions());
+
+      // Verify structure
+      expect(nextly).toBeDefined();
+      expect(nextly.collections).toBeDefined();
+      expect(nextly.users).toBeDefined();
+      expect(nextly.media).toBeDefined();
+      expect(nextly.adapter).toBeDefined();
+      expect(nextly.shutdown).toBeDefined();
+      expect(typeof nextly.shutdown).toBe("function");
+    });
+
+    it("carries every method the lazy Direct API offers", async () => {
+      // DERIVED from the lazy object's OWN surface. A hand-written list of
+      // expected names would share the omission it is meant to catch: a method
+      // added to the Direct API and forgotten on the instance would normally be
+      // forgotten in the list too, and the test would stay green -- which is
+      // exactly how `group` stayed missing from `getNextly({ config })` from
+      // the day it shipped, with a hand-written `PUBLIC_MEMBERS` list beside it
+      // that omitted it as well.
+      //
+      // Both were callable through the lazy `nextly` object and `undefined`
+      // through `getNextly({ config })`, so the recommended spelling was the
+      // broken one.
+      const instance = await getNextly(testOptions());
+      const { nextly: lazy } = await import("../direct-api/nextly");
+
+      const offered = Object.entries(lazy as Record<string, unknown>)
+        .filter(([, value]) => typeof value === "function")
+        .map(([name]) => name);
+
+      // The derivation has to have found something, or an empty list would make
+      // every assertion below vacuous.
+      expect(offered.length).toBeGreaterThan(5);
+      expect(offered).toContain("group");
+      expect(offered).toContain("timeseries");
+
+      const missing = offered.filter(
+        name =>
+          typeof (instance as unknown as Record<string, unknown>)[name] !==
+          "function"
+      );
+      expect(
+        missing,
+        "methods the lazy API offers that getNextly() lacks"
+      ).toEqual([]);
+    });
+
+    it("carries every namespace the lazy Direct API offers", async () => {
+      // The same derivation for namespaces, which are objects rather than
+      // functions and so pass the method check above unseen: a namespace
+      // added to the Direct API and not forwarded is `undefined` through
+      // `getNextly({ config })` while the lazy object answers.
+      const instance = await getNextly(testOptions());
+      const { nextly: lazy } = await import("../direct-api/nextly");
+
+      const offered = Object.entries(lazy as Record<string, unknown>)
+        .filter(([, value]) => typeof value === "object" && value !== null)
+        .map(([name]) => name);
+
+      expect(offered).toContain("releases");
+      expect(offered).toContain("apiKeys");
+
+      const missing = offered.filter(name => {
+        const value = (instance as unknown as Record<string, unknown>)[name];
+        return typeof value !== "object" || value === null;
+      });
+      expect(
+        missing,
+        "namespaces the lazy API offers that getNextly() lacks"
+      ).toEqual([]);
+    });
+
+    it("should return the same instance on subsequent calls (singleton)", async () => {
+      const nextly1 = await getNextly(testOptions());
+      const nextly2 = await getNextly(testOptions());
+
+      // Should be the exact same instance
+      expect(nextly1).toBe(nextly2);
+      expect(nextly1.adapter).toBe(nextly2.adapter);
+    });
+
+    it("should log database capabilities on first initialization", async () => {
+      const mockLog = vi.fn();
+      console.info = mockLog;
+
+      await getNextly(testOptions());
+
+      // Should have logged initialization message
+      expect(mockLog).toHaveBeenCalledWith(
+        expect.stringContaining("Nextly initialized")
+      );
+      expect(mockLog).toHaveBeenCalledWith(
+        expect.stringContaining("JSONB support")
+      );
+    });
+
+    it("should not log on subsequent calls (cached)", async () => {
+      // First call
+      await getNextly(testOptions());
+
+      // Clear mock
+      const mockLog = vi.fn();
+      console.info = mockLog;
+
+      // Second call - should not log
+      await getNextly(testOptions());
+
+      expect(mockLog).not.toHaveBeenCalled();
+    });
+
+    it("starts again when the services of the instance it kept were shut down without it", async () => {
+      await getNextly(testOptions());
+      const { shutdownServices } = await import("../di/register");
+      await shutdownServices();
+      expect(isServicesRegistered()).toBe(false);
+
+      // Not the kept instance with nothing registered behind it.
+      await getNextly(testOptions());
+
+      expect(isServicesRegistered()).toBe(true);
+    });
+  });
+
+  describe("shutdownNextly()", () => {
+    it("should shutdown the instance and clear cache", async () => {
+      const nextly1 = await getNextly(testOptions());
+      await shutdownNextly();
+
+      // After shutdown, new call should create new instance
+      const nextly2 = await getNextly(testOptions());
+
+      // Should be different instances
+      expect(nextly1).not.toBe(nextly2);
+    });
+
+    it("should log shutdown message", async () => {
+      await getNextly(testOptions());
+
+      const mockLog = vi.fn();
+      console.info = mockLog;
+
+      await shutdownNextly();
+
+      expect(mockLog).toHaveBeenCalledWith(
+        expect.stringContaining("Nextly shutdown complete")
+      );
+    });
+
+    it("should handle being called when no instance exists", async () => {
+      // Should not throw
+      await expect(shutdownNextly()).resolves.toBeUndefined();
+    });
+  });
+
+  describe("Nextly instance methods", () => {
+    it("should allow shutdown via instance method", async () => {
+      const nextly = await getNextly(testOptions());
+
+      const mockLog = vi.fn();
+      console.info = mockLog;
+
+      await nextly.shutdown();
+
+      expect(mockLog).toHaveBeenCalledWith(
+        expect.stringContaining("Nextly shutdown complete")
+      );
+    });
+  });
+
+  describe("Type exports", () => {
+    it("should export Nextly type", () => {
+      expectTypeOf<Nextly>().toBeObject();
+    });
+  });
+
+  describe("getCachedNextly() — fallback path", () => {
+    // The full public surface, pinned by name so a member dropped from the
+    // instance construction fails HERE with the member it is missing,
+    // rather than as a shape diff against whatever the code still builds.
+    // The compiler enforces the same list on the annotated literal; this
+    // pins it on the object the process actually hands out.
+    // A hand-written list, and therefore NOT what catches a missing method:
+    // `group` was absent from the instance and from this list at the same time,
+    // so both sides agreed and the omission shipped. What discriminates is the
+    // test above, which compares the instance against the Direct API's own
+    // surface rather than against a second copy of the same belief. This list
+    // still earns its place for the FALLBACK comparison, where the question is
+    // whether two constructions match.
+    const PUBLIC_MEMBERS = [
+      "access",
+      "adapter",
+      "apiKeys",
+      "bulkDelete",
+      "changePassword",
+      "collections",
+      "contentEvents",
+      "count",
+      "create",
+      "createFromSource",
+      "delete",
+      "duplicate",
+      "email",
+      "emailDeliveries",
+      "emailProviders",
+      "emailTemplates",
+      "fieldGroups",
+      "files",
+      "find",
+      "findByID",
+      "findSingle",
+      "findSingles",
+      "forgotPassword",
+      "forms",
+      "group",
+      "jobs",
+      "login",
+      "logout",
+      "me",
+      "media",
+      "mediaService",
+      "meta",
+      "notices",
+      "permissions",
+      "plugins",
+      "principals",
+      "publicSiteSettings",
+      "publish",
+      "register",
+      "releases",
+      "resetPassword",
+      "rewriteField",
+      "roles",
+      "shutdown",
+      "storage",
+      "timeseries",
+      "unpublish",
+      "update",
+      "updateMe",
+      "updateSingle",
+      "userFields",
+      "userService",
+      "users",
+      "verifyEmail",
+      "workflows",
+    ];
+
+    function shapeOf(instance: Nextly): Record<string, string> {
+      const shape: Record<string, string> = {};
+      for (const key of Object.keys(instance).sort()) {
+        shape[key] = typeof instance[key];
+      }
+      return shape;
+    }
+
+    it("builds the same instance the public factory builds", async () => {
+      const normal = await getNextly(testOptions());
+      // The factory-path instance carries the full surface — the control
+      // that separates "fallback is incomplete" from "everything is".
+      expect(Object.keys(shapeOf(normal))).toEqual(PUBLIC_MEMBERS);
+
+      await shutdownNextly();
+      expect(isServicesRegistered()).toBe(false);
+
+      // The request-path boot: services registered directly, without the
+      // public factory ever running — the state route-handler's
+      // ensureServicesInitialized leaves the process in.
+      await registerServices(buildServiceConfig(testOptions()));
+
+      const fallback = await getCachedNextly();
+      expect(Object.keys(shapeOf(fallback))).toEqual(PUBLIC_MEMBERS);
+      expect(shapeOf(fallback)).toEqual(shapeOf(normal));
+    });
+
+    it("caches the fallback instance and shuts it down cleanly", async () => {
+      await registerServices(buildServiceConfig(testOptions()));
+
+      const first = await getCachedNextly();
+      const second = await getCachedNextly();
+      expect(second).toBe(first);
+
+      const mockLog = vi.fn();
+      console.info = mockLog;
+      await first.shutdown();
+      expect(isServicesRegistered()).toBe(false);
+      // Both construction paths share one shutdown, so the fallback logs
+      // the completion line the factory path always has. Pins the unified
+      // behavior.
+      expect(mockLog).toHaveBeenCalledWith("[INFO] Nextly shutdown complete");
+    });
+  });
+});

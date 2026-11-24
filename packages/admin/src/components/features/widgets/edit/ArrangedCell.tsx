@@ -1,0 +1,691 @@
+"use client";
+
+/**
+ * One cell of the grid: its size, its spacing, its customise controls and the
+ * widget inside it.
+ *
+ * Its own component because the split is by SUBJECT: everything here is about
+ * one card, and everything left in the grid is about the set.
+ *
+ * @module components/features/widgets/edit/ArrangedCell
+ */
+
+import type { GridSize } from "nextly/config";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentProps,
+  type CSSProperties,
+  type ReactElement,
+  type ReactNode,
+  type RefObject,
+  type JSX,
+} from "react";
+
+import { useBranding } from "@admin/context/providers/BrandingProvider";
+import { cn } from "@admin/lib/utils";
+import type {
+  DashboardWidget,
+  WidgetSlot,
+} from "@admin/types/dashboard/widgets";
+
+import { heldCellStyle, useHeldCardHeight } from "../frame/held-height";
+import type { AnswerSize } from "../frame/tier";
+import { CardHiddenReportContext } from "../hidden-while-empty";
+import type { MoveDirection } from "../layout-editor";
+import type { PlacementReport } from "../reported-placements";
+import { cardSpanClass, drawnSize } from "../sizes";
+import { settingsAsAsked, titleAsAsked } from "../widget-as-asked";
+import { WidgetRenderer } from "../WidgetRenderer";
+
+import { CardActionsMenu, CardSizeLabel } from "./CardActionsMenu";
+import { CardMenu, removeLabelFor } from "./CardMenu";
+import {
+  CardControlsOverlay,
+  CardControlsSpace,
+  CardHandleSpace,
+  CustomizingFence,
+} from "./CustomizingFence";
+import {
+  DraggableWidgetCell,
+  type CellDrag,
+  type CellResize,
+  type DraggableWidgetCellProps,
+} from "./DraggableWidgetCell";
+import { LazyWidgetSettingsSheet } from "./LazyWidgetSettingsSheet";
+import { requestSettingsPanel } from "./settings-panel-registry";
+import type { SettingsPanelProps } from "./SettingsPanel";
+import {
+  useCardQuickSetting,
+  type CellSettingsWrite,
+} from "./useCardQuickSetting";
+import type { ArrangedWidget } from "./useDashboardArrangement";
+
+export interface ArrangedCellProps {
+  row: ArrangedWidget;
+  /**
+   * The columns the cell spans in place of its card's own width, where the grid draws it wider
+   * (the lone card of the pair). The cell's span ALONE: the card, its size controls, every write
+   * and Undo keep the stored size, so a change to its height saves its own width.
+   */
+  drawnW?: number;
+  isEditing: boolean;
+  /** The card just placed: moved, resized, added or put back. */
+  highlighted?: boolean;
+  /** Its handle's drag, while dragging is on; absent at one column. */
+  drag?: CellDrag;
+  /** Its right edge, where its width can be dragged; absent where it cannot. */
+  resize?: CellResize;
+  /**
+   * Where the grid places it among the cards while one is dragged (CSS `order`), so the grid
+   * lays the cards out in the order the drag has reached without moving any on the page;
+   * absent otherwise.
+   */
+  order?: number;
+  /**
+   * Whether a layout write is in flight anywhere on this dashboard.
+   *
+   * Dashboard-wide rather than per-card, because every write is a whole-layout
+   * snapshot guarded by one cached version: two in flight at once carry the
+   * same guard, so the server honours one and refuses the other as a conflict
+   * the reader never caused.
+   */
+  isWriting: boolean;
+  /**
+   * Why a single-card write is unavailable right now, or absent when it is
+   * available. Present while the stored layout is unreadable.
+   */
+  singleCardWriteBlocked?: string;
+  /** Which of the four moves would move this card. */
+  can: Record<MoveDirection, boolean>;
+  /**
+   * What the batch answered for this card, or its absence.
+   *
+   * One group because it is one answer: the renderer takes them together,
+   * and `updatedAt`/`isFetching` are `null`/`false` for a card that took no
+   * part in the batch rather than being separately meaningful.
+   */
+  data: {
+    slot: WidgetSlot | undefined;
+    /** When this card's own answer arrived; `null` when this card took no part in the batch. */
+    updatedAt: Date | null;
+    isFetching: boolean;
+    /**
+     * The size the answer in `slot` was fetched at, which a card that grew draws that answer by
+     * until its new size's answer arrives; see `WidgetRenderer`'s own.
+     */
+    answerSize?: AnswerSize | undefined;
+    /** Reload this card's data on its own, offered in its error state. */
+    onRetry?: () => void;
+  };
+  /**
+   * How this card's settings are saved at once, outside customise mode: its header's quick
+   * setting and its settings drawer's Save. ABSENT while customising, where a change waits for the dashboard's Save, and before an
+   * arrangement has been read, when there is no stored placement to write into.
+   */
+  settingsWrite?: CellSettingsWrite | undefined;
+  /**
+   * Where the card reports whether it is off the dashboard, as it decides it (`WidgetCard`), by
+   * this card's placement: what the grid counts the cards on show from. Absent, nothing is told.
+   */
+  reportHidden?: PlacementReport;
+  /** Registers the card's controls, so focus can be sent back to them. */
+  refs: {
+    menu: (element: HTMLElement | null) => void;
+    dismiss: (element: HTMLElement | null) => void;
+  };
+  /**
+   * What acting on this card does, each already bound to this placement by
+   * the caller: the writes are keyed by placement, and the cell should not
+   * have to know how the editor addresses one.
+   */
+  on: {
+    move: (direction: MoveDirection) => void;
+    setSize: (size: GridSize) => void;
+    remove: () => void;
+    /**
+     * Send this card away from the card itself, outside customise mode: the menu's Remove, the
+     * reader's own dismissal of it, whatever its widget declares.
+     *
+     * 🔴 ABSENT rather than present-and-inert before an arrangement has been
+     * read: the rows drawn then carry no stored placement to remove, so a
+     * control drawn then would answer a click by doing nothing at all.
+     */
+    dismiss?: () => void;
+    /** Records what a reader chose for THIS card: its settings, and its own title where set. */
+    saveSettings: (config: Record<string, unknown>, ownTitle?: string) => void;
+  };
+  /**
+   * Present for a card the add panel just added as one the reader already has
+   * (`useProvisionalCard`): its settings open at once, Save keeps it only once it is told apart
+   * from the card it matches, and closing them unsaved takes it back off.
+   */
+  provisional?: {
+    refusal: (
+      config: Record<string, unknown>,
+      ownTitle: string | undefined
+    ) => string | undefined;
+    keep: () => void;
+    closed: () => void;
+  };
+}
+
+/** A card's width and its one menu, side by side, while customising. */
+function CardEditActions(props: {
+  row: ArrangedCellProps["row"];
+  /** The size the card is drawn at. */
+  size: GridSize;
+  can: ArrangedCellProps["can"];
+  isWriting: boolean;
+  /** Registers the menu button, so focus can be sent back to it. */
+  menuRef: (element: HTMLElement | null) => void;
+  on: ArrangedCellProps["on"];
+  openSettings: () => void;
+  /** Ask again for this card's data alone, where it asks for any. */
+  refresh: (() => void) | undefined;
+}) {
+  const { row, size, can, isWriting, menuRef, on, openSettings } = props;
+  return (
+    <span className="flex items-center gap-1" data-testid="card-edit-actions">
+      <CardSizeLabel size={size} />
+      <CardActionsMenu
+        title={row.widget.title}
+        can={can}
+        disabled={isWriting}
+        triggerRef={menuRef}
+        removeLabel={removeLabelFor(row.widget.id)}
+        on={{
+          move: on.move,
+          remove: on.remove,
+          openSettings,
+          refresh: props.refresh,
+        }}
+      />
+    </span>
+  );
+}
+
+/** The widget itself, at rest or while customising. */
+function CardBody(props: {
+  widget: DashboardWidget;
+  /** The widget's own name under the title, when the title names the card's subject. */
+  subtitle: string | undefined;
+  placement: ComponentProps<typeof WidgetRenderer>["placement"];
+  headerAction: ReactNode;
+  /** Before the title: the room the drag handle is drawn over, while customising. */
+  leading: ReactNode;
+  /** The card's quick setting, at rest; the frame decides when to draw it. */
+  quick: ReactNode;
+  data: ArrangedCellProps["data"];
+  isEditing: boolean;
+  /** Opens this card's settings from its empty state, where the reader can change them. */
+  onOpenSettings: (() => void) | undefined;
+}) {
+  const { widget, placement, headerAction, quick, data, isEditing } = props;
+  const { subtitle, leading } = props;
+  if (isEditing) {
+    // While customising: drawn, and out of reach. A different element from
+    // the resting cell's, so entering and leaving customise mode mounts the
+    // widget afresh.
+    return (
+      <CustomizingFence>
+        <WidgetRenderer
+          definition={widget}
+          placement={placement}
+          headerAction={headerAction}
+          leading={leading}
+          customizing
+          subtitle={subtitle}
+          {...data}
+        />
+      </CustomizingFence>
+    );
+  }
+  return (
+    <WidgetRenderer
+      definition={widget}
+      placement={placement}
+      headerAction={headerAction}
+      quick={quick}
+      subtitle={subtitle}
+      {...(props.onOpenSettings
+        ? { onOpenSettings: props.onOpenSettings }
+        : {})}
+      {...data}
+    />
+  );
+}
+
+/**
+ * A card's controls: its header's quick setting, its menus' Settings…, its menu in its header at
+ * rest, and where its drawer's Save goes.
+ */
+function useCardControls(
+  props: ArrangedCellProps,
+  widget: DashboardWidget,
+  size: GridSize,
+  setSettingsOpen: (open: boolean) => void
+) {
+  // From the DECLARED widget, so the change is judged against the reader's stored settings.
+  const quick = useCardQuickSetting({
+    placementId: props.row.placementId,
+    widget: props.row.widget,
+    title: widget.title,
+    config: props.row.config,
+    isEditing: props.isEditing,
+    isFetching: props.data.isFetching,
+    updatedAt: props.data.updatedAt,
+    settingsWrite: props.settingsWrite,
+  });
+  const menus = useMenuButtons(props);
+  // Every card offers Settings…, since every card has a title and a width its reader can set.
+  const openSettings = () => setSettingsOpen(true);
+  return {
+    quick,
+    openSettings,
+    // Where focus goes back to as the drawer closes: the menu the reader opened it from. Read
+    // as the drawer closes, not as it opened: the drawer outlives customise mode, whose menu is
+    // gone once it ends, so a button no longer on the page gives way to the one the card draws
+    // now.
+    panelReturnFocusTo: () => onPage(menus.button.current),
+    customiseMenuRef: menus.customise,
+    // The menu is the one control a card's header holds at rest: its Remove is the dismissal.
+    header: restingMenuFor(props, widget, {
+      openSettings,
+      menuRef: menus.rest,
+    }),
+    done: doneFor(props),
+  };
+}
+
+/**
+ * The card's menu buttons, registered for focus: the customise menu's as the card's menu, and
+ * the one at rest as its dismiss control, which focus returns to after Undo of a removal made
+ * from it: its Remove is the card's dismissal.
+ */
+function useMenuButtons(props: ArrangedCellProps) {
+  const button = useRef<HTMLElement | null>(null);
+  const { menu, dismiss } = props.refs;
+  const rest = useCallback(
+    (element: HTMLElement | null) => {
+      button.current = element;
+      dismiss(element);
+    },
+    [dismiss]
+  );
+  const customise = useCallback(
+    (element: HTMLElement | null) => {
+      button.current = element;
+      menu(element);
+    },
+    [menu]
+  );
+  return { button, rest, customise };
+}
+
+/** `element` while it is still on the page, else `null`: focus on a removed node is lost. */
+function onPage(element: HTMLElement | null): HTMLElement | null {
+  return element?.isConnected === true ? element : null;
+}
+
+/** Whether a card's settings cannot be saved at rest right now: a write is in flight, or none is possible. */
+function settingsBlocked(write: CellSettingsWrite | undefined): boolean {
+  return (
+    write !== undefined && (write.isWriting || write.unavailable !== undefined)
+  );
+}
+
+/**
+ * The card's menu at rest, in the same place on every card: Settings…, Refresh and Remove, each
+ * where the card has it (`CardMenu`). Nothing while customising, where the customise menu stands
+ * in its place, nor for a card that would offer nothing in it. Settings… is offered once an
+ * arrangement has been read, as Remove is: before it there is no stored card to save into.
+ */
+function restingMenuFor(
+  props: ArrangedCellProps,
+  widget: DashboardWidget,
+  controls: {
+    openSettings: () => void;
+    menuRef: (element: HTMLElement | null) => void;
+  }
+): ReactNode | undefined {
+  if (props.isEditing) return undefined;
+  const write = props.settingsWrite;
+  const items = {
+    onOpenSettings: write ? controls.openSettings : undefined,
+    onRefresh: props.data.onRetry,
+    onRemove: props.on.dismiss,
+  };
+  if (Object.values(items).every(item => item === undefined)) return undefined;
+  return (
+    <CardMenu
+      title={widget.title}
+      triggerRef={controls.menuRef}
+      removeLabel={removeLabelFor(widget.id)}
+      settingsDisabled={settingsBlocked(write)}
+      removeDisabled={props.isWriting}
+      {...(props.singleCardWriteBlocked === undefined
+        ? {}
+        : { removeUnavailable: props.singleCardWriteBlocked })}
+      {...items}
+    />
+  );
+}
+
+/**
+ * Where the drawer's Save goes, decided by where the reader is when they press it, since the
+ * drawer stays open across a change of mode. While customising it is staged in the draft, kept
+ * with the dashboard's other unsaved changes until the customise bar's Save, and the drawer
+ * closes. Outside it, the settings, title and width are saved at once in one write, the same
+ * write as the header's quick setting, and the drawer hears how that ended: it closes when the
+ * save lands and says why in place when it does not. A size is sent only when the reader chose
+ * another width (`PanelKept`'s `resize`).
+ */
+function doneFor(props: ArrangedCellProps): {
+  done: SettingsPanelProps["onDone"];
+  blocked: string | undefined;
+} {
+  const write = props.settingsWrite;
+  if (props.isEditing || !write) {
+    const { provisional } = props;
+    return {
+      done: (kept, settled) => {
+        const refused = provisional?.refusal(kept.config, kept.ownTitle);
+        if (refused !== undefined) {
+          settled.failed(refused);
+          return;
+        }
+        provisional?.keep();
+        props.on.saveSettings(kept.config, kept.ownTitle);
+        if (kept.resize) props.on.setSize(kept.resize.size);
+        settled.saved();
+      },
+      blocked: undefined,
+    };
+  }
+  return {
+    done: (kept, settled) =>
+      write.write(
+        kept.config,
+        {
+          onLanded: settled.saved,
+          onFailed: settled.failed,
+          showsFailure: true,
+        },
+        kept.ownTitle,
+        kept.resize?.size
+      ),
+    blocked: write.unavailable,
+  };
+}
+
+/**
+ * The cell's classes: its columns (`span`, the card's drawn width or the width the grid draws it
+ * at in its place), its leaving the grid while hidden, and the ring that marks it while its
+ * settings drawer is open (`editing`), so the reader sees which card they change.
+ */
+function cellClassName(span: number, editing: boolean): string {
+  return cn(
+    // `relative` so the drag handle, which is absolutely positioned, lands
+    // on this cell rather than on the grid. Nothing clips or scrolls: the
+    // cell is as tall as its card's content, or its row's tallest card.
+    "relative min-w-0",
+    // 🔴 The PLACEMENT's size, drawn at the nearest size its widget's bounds
+    // allow. The stored size IS the reader's arrangement, so it is never
+    // replaced by the declaration's default here.
+    cardSpanClass(span),
+    // A card whose widget hides when empty leaves the grid while its answer is: the frame marks
+    // it (`data-hidden-empty`) only outside customise mode, so the cell needs no state of its own.
+    "has-[[data-hidden-empty]]:hidden",
+    editing &&
+      "rounded-lg ring-2 ring-foreground ring-offset-2 ring-offset-background"
+  );
+}
+
+/**
+ * The card's width and menu while customising, or nothing at rest: drawn over its own header's
+ * right end, outside the fence that puts the card's own content out of reach.
+ */
+function editActionsOf(
+  props: ArrangedCellProps,
+  size: GridSize,
+  controls: ReturnType<typeof useCardControls>
+): ReactElement | null {
+  if (!props.isEditing) return null;
+  const { row, can, isWriting, on } = props;
+  return (
+    <CardEditActions
+      {...{ row, size, can, isWriting, on }}
+      menuRef={controls.customiseMenuRef}
+      openSettings={controls.openSettings}
+      refresh={props.data.onRetry}
+    />
+  );
+}
+
+/** The card's size and menu while customising, drawn over its header's right end. */
+function CellEditActions({ actions }: { actions: ReactNode }) {
+  if (!actions) return null;
+  return <CardControlsOverlay>{actions}</CardControlsOverlay>;
+}
+
+/**
+ * The card's settings sheet: whether it is open, whether it opens on its first field, and the
+ * empty state's way into it.
+ *
+ * Open state lives with the CELL rather than with the grid: the sheet belongs to one card, and
+ * hoisting it would make the grid track which of many is open for no benefit to either. The
+ * first-field flag is set only by the empty state's action, which opens the sheet to ask for what
+ * the card is missing, and is reset when the sheet closes, so the menu's Settings opens it as
+ * before. That action is offered at rest, and only where the menu's Settings could save the
+ * settings now, so it never opens a sheet whose Done cannot keep anything.
+ */
+function useSettingsSheet(props: ArrangedCellProps, hasSettings: boolean) {
+  const [settingsOpen, setOpenNow] = useState(false);
+  // Whether the panel has opened yet: until it has, its module is not loaded at all.
+  const [everOpened, setEverOpened] = useState(false);
+  useEffect(() => {
+    if (settingsOpen) setEverOpened(true);
+  }, [settingsOpen]);
+  const [focusFirstField, setFocusFirstField] = useState(false);
+  const { placementId } = props.row;
+  // Every way into the panel asks through `requestSettingsPanel`, so it never opens over another
+  // card's panel holding a change: that one asks first, and this one opens once it is answered.
+  const setSettingsOpen = useCallback(
+    (open: boolean) => {
+      if (!open) {
+        setOpenNow(false);
+        return;
+      }
+      requestSettingsPanel(
+        placementId,
+        () => setOpenNow(true),
+        () => setOpenNow(false)
+      );
+    },
+    [placementId]
+  );
+  const changeSettingsOpen = (open: boolean) => {
+    setSettingsOpen(open);
+    if (!open) setFocusFirstField(false);
+    if (!open) props.provisional?.closed();
+  };
+  // A card added as one the reader already has opens its settings as it is drawn, once.
+  const opensAtOnce = props.provisional !== undefined;
+  useEffect(() => {
+    if (opensAtOnce) setSettingsOpen(true);
+  }, [opensAtOnce, setSettingsOpen]);
+  const offersFromEmpty =
+    !props.isEditing &&
+    props.settingsWrite !== undefined &&
+    hasSettings &&
+    !settingsBlocked(props.settingsWrite);
+  const openFromEmpty = offersFromEmpty
+    ? () =>
+        requestSettingsPanel(
+          placementId,
+          () => {
+            setFocusFirstField(true);
+            setOpenNow(true);
+          },
+          () => setOpenNow(false)
+        )
+    : undefined;
+  return {
+    settingsOpen,
+    everOpened: everOpened || settingsOpen,
+    setSettingsOpen,
+    focusFirstField,
+    changeSettingsOpen,
+    openFromEmpty,
+  };
+}
+
+/**
+ * The cell's element, and its style: while the card's answer has not arrived (`loading`), the
+ * height the card was last drawn at (`frame/held-height`), so the cards below it stay where they
+ * were; nothing otherwise.
+ */
+function useHeldCellStyle(
+  placementId: string,
+  loading: boolean,
+  order: number | undefined
+): {
+  cellRef: RefObject<HTMLDivElement | null>;
+  style: CSSProperties | undefined;
+} {
+  const cellRef = useRef<HTMLDivElement>(null);
+  const heldPx = useHeldCardHeight(placementId, loading, cellRef);
+  const held = heldCellStyle(heldPx);
+  return {
+    cellRef,
+    style: order === undefined ? held : { ...held, order },
+  };
+}
+
+/**
+ * What the card's header holds at each end. While customising it keeps the room its controls are
+ * drawn over, and, wherever a handle is drawn, room before the title for it; at rest it holds the
+ * menu.
+ */
+function headerRoom(
+  props: ArrangedCellProps,
+  restingControls: ReactNode
+): { headerAction: ReactNode; leading: ReactNode } {
+  if (!props.isEditing)
+    return { headerAction: restingControls, leading: undefined };
+  return {
+    headerAction: <CardControlsSpace />,
+    leading: props.drag === undefined ? undefined : <CardHandleSpace />,
+  };
+}
+
+/** The cell's handle drag and edge resize, each only where it is offered. */
+function cellGestures(
+  props: ArrangedCellProps
+): Pick<DraggableWidgetCellProps, "drag" | "resize"> {
+  const gestures: Pick<DraggableWidgetCellProps, "drag" | "resize"> = {};
+  if (props.drag !== undefined) gestures.drag = props.drag;
+  if (props.resize !== undefined) gestures.resize = props.resize;
+  return gestures;
+}
+
+export function ArrangedCell(props: ArrangedCellProps): JSX.Element {
+  const { row, isEditing, data } = props;
+  const hasSettings = (row.widget.settings?.length ?? 0) > 0;
+  const sheet = useSettingsSheet(props, hasSettings);
+  const { setSettingsOpen } = sheet;
+  // The reader's collections, which the card's title and its settings are read against.
+  const sources = useBranding().widgetSources;
+  const heading = useMemo(
+    () => titleAsAsked(row.widget, row.config, sources, row.ownTitle),
+    [row.widget, row.config, sources, row.ownTitle]
+  );
+  // The widget under the title the card is drawn with: its own, or one its settings or its
+  // reader gave it.
+  const widget = useMemo(
+    () =>
+      heading.title === row.widget.title
+        ? row.widget
+        : { ...row.widget, title: heading.title },
+    [row.widget, heading.title]
+  );
+  // The size the card is drawn at: its stored size, held to its widget's
+  // current bounds. One reading for its span, its menu and the size
+  // a declared component is handed.
+  const size = useMemo(
+    () => drawnSize(row.size, row.widget.size),
+    [row.size, row.widget.size]
+  );
+  const held = useHeldCellStyle(
+    row.placementId,
+    data.slot === undefined,
+    props.order
+  );
+  // The card's report, bound to this placement. Only the card drawn in the cell is told it: the
+  // settings sheet's preview of the same placement is drawn outside it and reports nothing.
+  const { reportHidden } = props;
+  const reportCardHidden = useCallback(
+    (hidden: boolean) => reportHidden?.(row.placementId, hidden),
+    [reportHidden, row.placementId]
+  );
+  /*
+   * Resolved HERE, the one place a card's declaration and its reader's stored
+   * config are both in scope. Only DECLARED names are returned, so a component
+   * cannot act on a key its widget never offered, and each as the card's
+   * `load` read it, so a link the component builds matches its answer.
+   */
+  const placement = useMemo(
+    () => ({
+      id: row.placementId,
+      settings: settingsAsAsked(row.widget, row.config, sources),
+      size,
+    }),
+    [row.placementId, row.widget, row.config, size, sources]
+  );
+  const controls = useCardControls(props, widget, size, setSettingsOpen);
+  const { quick, header: restingControls, done } = controls;
+  const editActions = editActionsOf(props, size, controls);
+  const { headerAction, leading } = headerRoom(props, restingControls);
+
+  return (
+    <DraggableWidgetCell
+      id={row.placementId}
+      isEditing={isEditing}
+      highlighted={props.highlighted}
+      {...cellGestures(props)}
+      data-testid={`widget-cell-${widget.id}`}
+      className={cellClassName(props.drawnW ?? size.w, sheet.settingsOpen)}
+      cellRef={held.cellRef}
+      style={held.style}
+    >
+      <CellEditActions actions={editActions} />
+      {/* On every card, since every card has its own title to set, once its reader first opens
+          it: the panel's module is fetched then, or as a pointer or focus heads for a control
+          that opens it (`settings-sheet-code`), not with the dashboard. Kept mounted after, not
+          only while customising, which is what lets the panel outlive customise mode rather
+          than being torn out from under a reader still filling it in. */}
+      {sheet.everOpened ? (
+        <LazyWidgetSettingsSheet
+          {...{ row, widget, data, done, size, isEditing }}
+          isWriting={props.isWriting}
+          open={sheet.settingsOpen}
+          onOpenChange={sheet.changeSettingsOpen}
+          focusFirstField={sheet.focusFirstField}
+          returnFocusTo={controls.panelReturnFocusTo}
+        />
+      ) : null}
+      <CardHiddenReportContext.Provider value={reportCardHidden}>
+        <CardBody
+          {...{ widget, placement, headerAction, leading, data, isEditing }}
+          subtitle={heading.subtitle}
+          quick={quick.inline}
+          onOpenSettings={sheet.openFromEmpty}
+        />
+      </CardHiddenReportContext.Provider>
+    </DraggableWidgetCell>
+  );
+}

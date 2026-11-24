@@ -1,0 +1,1383 @@
+/**
+ * Field-level function registry: the bridge that makes code-first
+ * field `validate` / `access` / `hooks` actually execute.
+ *
+ * The DB-backed collection registry serializes field definitions, which
+ * drops functions — so the write/read services can never find them on the
+ * field defs they load. This registry captures the function-bearing field
+ * configs from the LIVE `defineConfig` object during service registration
+ * and hands them back to the services by collection slug.
+ *
+ * globalThis-backed so dev-mode HMR re-execution reuses one store (the
+ * same pattern as init/schema-snapshot-cache); re-registration replaces a
+ * slug's entry wholesale, so a config reload never leaves stale functions.
+ *
+ * Semantics implemented here (matching the types' documented contracts):
+ * - `access.create/update`: a `false` result strips the field from the
+ *   write silently (the caller keeps working with the fields they may
+ *   touch); `overrideAccess` bypasses.
+ * - `access.read`: a `false` result strips the field from serialized
+ *   responses.
+ * - `hooks.beforeValidate` / `hooks.beforeChange`: transform the incoming
+ *   field value (return value replaces it; `undefined` keeps it).
+ * - `hooks.afterChange` / `hooks.afterRead`: observe/transform the stored
+ *   value on the way out.
+ *
+ * @module shared/lib/field-level-registry
+ */
+
+import type { VisitorActor } from "../../auth/access/actor";
+import { actorForVisitor } from "../../auth/access/resolve-actor";
+import {
+  buildRuleContext,
+  type HeldPermission,
+} from "../../auth/access/rule-context";
+import {
+  type AuthenticatedScope,
+  scopeGrants,
+} from "../../auth/authenticated-scope";
+import { effectiveCallerScope } from "../../auth/caller-scope";
+import {
+  currentPrincipal,
+  withCurrentPrincipal,
+} from "../../auth/principal-scope";
+import type { RequestContext } from "../../collections/fields/types/base";
+import { NextlyError } from "../../errors/nextly-error";
+import {
+  ruleCouldNotRun,
+  waitedOutPoolBound,
+} from "../../errors/rule-could-not-run";
+import { withHookLanguage } from "../../hooks/hook-language";
+import { normalizeHookError } from "../../hooks/normalize-hook-error";
+import { singleHookNamespace } from "../../hooks/register-single-hooks";
+import { recordSideEffectWarning } from "../../hooks/side-effect-warnings";
+import type { FieldHookHandler } from "../../hooks/types";
+import { immutableSystemColumnNames } from "../../lib/system-columns";
+import {
+  listEffectiveGrants,
+  listRoleSlugsForUser,
+} from "../../services/lib/permissions";
+import { addressableFields } from "../addressable-fields";
+import { FIELD_ACCESS_KEYS } from "../base-validator";
+import { consoleLogger } from "../types";
+import type { AccessRuleContext, AccessRuleTarget } from "../types/access";
+
+import { detachData } from "./detach";
+import type { ValidatableField } from "./entry-validation";
+
+type MaybePromise<T> = T | Promise<T>;
+
+/** A field rule, handed the one context every access rule is handed. */
+type FieldAccessFn = (args: AccessRuleContext) => MaybePromise<boolean>;
+
+/**
+ * The caller's grants, as the rows they were resolved from.
+ *
+ * A field rule and a collection rule are written by the same person, minutes
+ * apart, and a permission that reads one way in one and another way in the
+ * other is a rule that silently denies. So both are handed their list by the
+ * one rule-context builder, from these rows; a key whose scope carried slugs
+ * alone holds those.
+ */
+export interface CallerGrants {
+  permissions: readonly HeldPermission[];
+  roles: string[];
+}
+
+/**
+ * Where a visitor's Public grants are read, handed the executor the caller's
+ * own lookups read on (a transaction's, or none for the pool).
+ *
+ * Absent, they are read through the global container, the process's cached
+ * copy. A service holding a database of its own with no access-control
+ * service passes one reading that database, as its collection gate does, so
+ * a field rule and the gate above it are handed one Public role: the
+ * container may be missing in such a setup, or filled for another instance.
+ */
+export type VisitorGrantsLoader = (executor?: unknown) => Promise<VisitorActor>;
+
+/** The process's Public role: the default {@link VisitorGrantsLoader}. */
+const processVisitor: VisitorGrantsLoader = executor =>
+  actorForVisitor({ executor });
+
+/**
+ * Resolve the caller's grants once, on the first rule that actually runs.
+ *
+ * Field access is evaluated on every authenticated write and read, and most
+ * entities declare no rule at all — so resolving eagerly would put a role and
+ * permission lookup on paths that never ask a question. Memoizing the PROMISE
+ * rather than the value also collapses the concurrent case: the rules at one
+ * level run in sequence but a nested container recurses first, and two levels
+ * asking at once must not become two lookups.
+ */
+function grantsResolver(
+  userId: string | undefined,
+  scope?: AuthenticatedScope,
+  executor?: unknown,
+  visitor: VisitorGrantsLoader = processVisitor
+): () => Promise<CallerGrants> {
+  let pending: Promise<CallerGrants> | undefined;
+  // A lookup that rejects is forgotten once it settles, so the next rule asks
+  // again rather than being handed the failure: a lookup that waited out the
+  // bound for a database connection ends its request, and a retry is judged
+  // afresh. Only the rules already awaiting it share the rejection.
+  const remembered = (lookup: Promise<CallerGrants>) => {
+    pending = lookup;
+    lookup.catch(() => {
+      if (pending === lookup) pending = undefined;
+    });
+    return lookup;
+  };
+  return () => {
+    if (pending) return pending;
+    // A scoped API key is judged on the grants stamped on the KEY. `userId`
+    // names the key's OWNER, so resolving from it reads the owner's roles and
+    // permissions — which let a viewer-scoped key minted by a super-admin read
+    // a field gated on `roles.includes("super-admin")`. The collection gate
+    // already prefers the scope; this is the same question one level down.
+    //
+    // The scope is taken from the request when the caller did not name one.
+    // Eighteen call sites reach this function, each rebuilding its arguments by
+    // hand, and an argument a call site has to remember is one a nineteenth
+    // will not — the same shape that dropped the scope at the collection gate
+    // and a hook context before it. Explicit still wins, so a caller may narrow.
+    //
+    // No database read at all in this branch: the key's grants were resolved at
+    // authentication and travel with the request.
+    const effective = effectiveCallerScope(scope);
+    if (effective?.actorType === "apiKey") {
+      pending = Promise.resolve({
+        permissions: scopeGrants(effective) ?? [...effective.permissions],
+        roles: [...(effective.roles ?? [])],
+      });
+      return pending;
+    }
+    if (!userId) {
+      // A plugin's person holds no role and no permission. A visitor (no
+      // user, no person) holds what the Public role grants, read through the
+      // same actor the collection and Single rules are handed, so a field
+      // rule and the rule above it answer a visitor alike, from the database
+      // `visitor` reads. A read of Public that fails rejects, and the rule is
+      // denied as a user's would be.
+      return remembered(
+        currentPrincipal() !== null
+          ? Promise.resolve({ permissions: [], roles: [] })
+          : visitor(executor).then(actor => ({
+              permissions: actor.permissions,
+              roles: [],
+            }))
+      );
+    }
+    return remembered(
+      Promise.all([
+        listEffectiveGrants(userId, executor),
+        listRoleSlugsForUser(userId, executor),
+      ])
+        // A lookup that fails rejects, and every rule awaiting it is denied
+        // by its own guard (`runFieldRule`). Not an empty grant set: that
+        // denies a rule asking for a role or a permission, and allows one
+        // asking for the absence of one.
+        .then(([permissions, roles]) => ({ permissions, roles }))
+    );
+  };
+}
+
+// The registry stores exactly what a field hook is declared as, so the shape
+// lives in one place rather than being restated here.
+type FieldHookFn = FieldHookHandler;
+
+export interface FieldFunctions {
+  validate?: ValidatableField["validate"];
+  /**
+   * A `defaultValue` declared as a function. Only the function form lives
+   * here: a constant default survives the stored definition and is read from
+   * it, while a function does not survive storage at all.
+   */
+  defaultValue?: (data: Record<string, unknown>) => unknown;
+  access?: {
+    create?: FieldAccessFn;
+    read?: FieldAccessFn;
+    update?: FieldAccessFn;
+  };
+  hooks?: {
+    beforeValidate?: FieldHookFn[];
+    beforeChange?: FieldHookFn[];
+    afterChange?: FieldHookFn[];
+    afterRead?: FieldHookFn[];
+  };
+  /** Nested function-bearing fields (repeater/group containers). */
+  fields?: Record<string, FieldFunctions>;
+}
+
+/**
+ * What a registration is keyed by.
+ *
+ * A field group joins the two entity kinds because it has the same problem and
+ * only the registry solves it: its fields are read from a stored definition on
+ * every write, and a function does not survive being stored. What is CONSUMED
+ * from a field group's entry today is the `defaultValue` alone. Its `access`
+ * rules and hooks are captured by the same walk but nothing reads them for a
+ * field group, so registering one does not mean they are enforced.
+ */
+type EntityKind = "collection" | "single" | "fieldGroup";
+type Store = Map<string, Record<string, FieldFunctions>>;
+
+const GLOBAL_KEY = "__nextlyFieldFunctionRegistry";
+
+function store(): Store {
+  const g = globalThis as Record<string, unknown>;
+  if (!g[GLOBAL_KEY]) g[GLOBAL_KEY] = new Map();
+  return g[GLOBAL_KEY] as Store;
+}
+
+function key(kind: EntityKind, slug: string): string {
+  return `${kind}:${slug}`;
+}
+
+/**
+ * The answer of each rule written as `true` or `false`, keyed by the function
+ * that stands for it, so a rule run can answer one without resolving the
+ * caller's grants: a literal asks nothing of the caller.
+ */
+const literalRules = new WeakMap<FieldAccessFn, boolean>();
+
+/** A function standing for a literal rule, answering it. */
+function literalRule(answer: boolean): FieldAccessFn {
+  const rule: FieldAccessFn = () => answer;
+  literalRules.set(rule, answer);
+  return rule;
+}
+
+/**
+ * A field's access rules as the registry runs them: each a function.
+ *
+ * A rule written as `true` or `false` becomes a function answering itself,
+ * so every read and write that redacts asks it the way it asks a function;
+ * kept as a boolean, it would not be called, and `read: false` would withhold
+ * nothing. Undefined when the field declares no rule.
+ */
+function fieldRules(access: unknown): FieldFunctions["access"] | undefined {
+  if (!access || typeof access !== "object") return undefined;
+  const rules: NonNullable<FieldFunctions["access"]> = {};
+  for (const operation of FIELD_ACCESS_KEYS) {
+    const rule = (access as Record<string, unknown>)[operation];
+    if (typeof rule === "function") rules[operation] = rule as FieldAccessFn;
+    else if (typeof rule === "boolean") rules[operation] = literalRule(rule);
+  }
+  return Object.keys(rules).length > 0 ? rules : undefined;
+}
+
+/** Extract the function-bearing subset of one field config. */
+function extractFieldFunctions(
+  field: Record<string, unknown>
+): FieldFunctions | undefined {
+  const out: FieldFunctions = {};
+  let hasAny = false;
+
+  if (typeof field.defaultValue === "function") {
+    out.defaultValue = field.defaultValue as FieldFunctions["defaultValue"];
+    hasAny = true;
+  }
+  if (typeof field.validate === "function") {
+    out.validate = field.validate as FieldFunctions["validate"];
+    hasAny = true;
+  }
+  const access = fieldRules(field.access);
+  if (access) {
+    out.access = access;
+    hasAny = true;
+  }
+  const hooks = field.hooks as FieldFunctions["hooks"] | undefined;
+  if (
+    hooks &&
+    (hooks.beforeValidate?.length ||
+      hooks.beforeChange?.length ||
+      hooks.afterChange?.length ||
+      hooks.afterRead?.length)
+  ) {
+    out.hooks = hooks;
+    hasAny = true;
+  }
+
+  const nested = field.fields;
+  if (Array.isArray(nested)) {
+    const nestedMap = collectFieldFunctions(nested);
+    if (nestedMap) {
+      out.fields = nestedMap;
+      hasAny = true;
+    }
+  }
+
+  return hasAny ? out : undefined;
+}
+
+/**
+ * An unnamed GROUP is layout: its children are stored at the level the group
+ * sits in, which is the level this map is keyed by. An unnamed REPEATER is not:
+ * its children are stored PER ROW, so flattening them here would file a row's
+ * field under the parent's name and hand its rules the wrong object.
+ *
+ * The same distinction `collection-sources` draws, and it has to be made DURING
+ * the walk: the walk emits the children themselves, so by the time a predicate
+ * could read the result, a field reached through an unnamed repeater is
+ * indistinguishable from one reached through an unnamed group.
+ */
+export function storedAtThisLevel(container: { type?: unknown }): boolean {
+  return container.type === "group";
+}
+
+/**
+ * The function-bearing fields at one level, keyed by name.
+ *
+ * Flattened through the shared `addressableFields` walk rather than a loop over
+ * the array, because an unnamed presentational container stores its children at
+ * the level it sits in. A loop over named entries drops every rule declared
+ * inside one: not just a `defaultValue`, but the `access` rule deciding whether
+ * a caller may read or write that field, and the hooks that shape it. The data
+ * side already flattens these containers, so the two now agree.
+ *
+ * `defineCollection` refuses a field with no name, so the documented code-first
+ * path cannot build this shape. A plugin contributing raw config can:
+ * `assertPluginFieldDeclarations` checks each field's TYPE and not its name, so
+ * an unnamed `group` reaches the live config and this map. Silently dropping
+ * the access rules inside it is the failure worth spending a walk to avoid.
+ */
+function collectFieldFunctions(
+  fields: unknown[]
+): Record<string, FieldFunctions> | undefined {
+  const map: Record<string, FieldFunctions> = {};
+  let hasAny = false;
+  for (const raw of addressableFields(fields, {
+    descendInto: storedAtThisLevel,
+  })) {
+    const field = raw as unknown as Record<string, unknown>;
+    if (typeof field.name !== "string" || !field.name) continue;
+    const fns = extractFieldFunctions(field);
+    if (fns) {
+      map[field.name] = fns;
+      hasAny = true;
+    }
+  }
+  return hasAny ? map : undefined;
+}
+
+/**
+ * Capture function-bearing field configs for one entity from the live
+ * config object. Replaces any previous registration for the slug.
+ */
+export function registerFieldFunctions(
+  kind: EntityKind,
+  slug: string,
+  fields: unknown[]
+): void {
+  const map = collectFieldFunctions(fields);
+  if (map) {
+    store().set(key(kind, slug), map);
+  } else {
+    store().delete(key(kind, slug));
+  }
+}
+
+/** One entity's live config, for a wholesale registry replacement. */
+export interface FieldFunctionSource {
+  kind: EntityKind;
+  slug: string;
+  fields: unknown[];
+}
+
+/**
+ * Rebuild the whole registry from the config that is now in force.
+ *
+ * Replacing rather than adding, because a reload can REMOVE an entity: a
+ * collection dropped from `nextly.config.ts` keeps its registry row and its
+ * table so an orphan sweep can find them later, so it stays addressable, and
+ * an entry left behind here would keep deciding its access, running its hooks
+ * and filling its defaults from a config that no longer declares it.
+ *
+ * Called at the reload's commit point, not when the new config is read. A
+ * reload that is refused after its DDL has run still parsed a valid config,
+ * and installing these early would leave a rule the process explicitly
+ * rejected deciding writes while every other service still ran the previous
+ * one.
+ */
+export function replaceFieldFunctions(
+  sources: readonly FieldFunctionSource[]
+): void {
+  const next: Store = new Map();
+  for (const source of sources) {
+    if (!source.slug || !Array.isArray(source.fields)) continue;
+    const map = collectFieldFunctions(source.fields);
+    if (map) next.set(key(source.kind, source.slug), map);
+  }
+  const current = store();
+  current.clear();
+  for (const [k, v] of next) current.set(k, v);
+}
+
+export function getFieldFunctions(
+  kind: EntityKind,
+  slug: string
+): Record<string, FieldFunctions> | undefined {
+  return store().get(key(kind, slug));
+}
+
+/** Test seam. */
+export function clearFieldFunctions(): void {
+  store().clear();
+}
+
+/**
+ * Attach registered custom `validate` functions onto the (serialized)
+ * field definitions so the entry validator can run them. Returns the
+ * original array when the entity registered no functions.
+ */
+export function attachFieldValidators(
+  kind: EntityKind,
+  slug: string,
+  fields: ValidatableField[]
+): ValidatableField[] {
+  const fns = getFieldFunctions(kind, slug);
+  if (!fns) return fields;
+  return attachValidators(fields, fns);
+}
+
+function attachValidators(
+  fields: ValidatableField[],
+  fns: Record<string, FieldFunctions>
+): ValidatableField[] {
+  return fields.map(field => {
+    // An unnamed container holds no entry of its own, and its children are
+    // registered at THIS level because that is where their values are stored.
+    // Descending with the same map is what makes the two agree; returning it
+    // untouched left a validator captured at registration unattached, so a
+    // value it should have rejected was accepted.
+    if (!field.name) {
+      if (!field.fields || !storedAtThisLevel(field)) return field;
+      return { ...field, fields: attachValidators(field.fields, fns) };
+    }
+    const entry = fns[field.name];
+    if (!entry) return field;
+    const next: ValidatableField = { ...field };
+    if (entry.validate) next.validate = entry.validate;
+    if (entry.fields && field.fields) {
+      next.fields = attachValidators(field.fields, entry.fields);
+    }
+    return next;
+  });
+}
+
+/**
+ * The container rows a nested field set applies to: a `group` value is one
+ * object, a `repeater` value is its array of row objects. Non-object rows
+ * are skipped (they carry no nested fields to process).
+ */
+function nestedRows(value: unknown): Record<string, unknown>[] {
+  if (Array.isArray(value)) {
+    return value.filter(
+      (row): row is Record<string, unknown> =>
+        row !== null && typeof row === "object" && !Array.isArray(row)
+    );
+  }
+  if (value !== null && typeof value === "object") {
+    return [value as Record<string, unknown>];
+  }
+  return [];
+}
+
+/**
+ * Open a container value for in-place editing, parsing a JSON string first.
+ *
+ * SQLite stores `group` / `repeater` values as JSON strings, so a caller that
+ * hands over a row straight from the database has containers that
+ * {@link nestedRows} cannot descend — the nested fields inside would keep
+ * whatever the rules should have removed. `serialize()` writes the (mutated)
+ * container back in the shape it arrived in, so a string column stays a string.
+ * Returns null when there is nothing to descend into.
+ */
+export function openNestedContainer(
+  value: unknown
+): { rows: Record<string, unknown>[]; serialize: () => unknown } | null {
+  if (typeof value !== "string") {
+    const rows = nestedRows(value);
+    return rows.length > 0 ? { rows, serialize: () => value } : null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  const rows = nestedRows(parsed);
+  if (rows.length === 0) return null;
+  return { rows, serialize: () => JSON.stringify(parsed) };
+}
+
+/**
+ * Whether any field at this level has an access callback for the operation.
+ *
+ * Decides whether a snapshot is worth taking at all: a level with no callbacks
+ * never shows its data to app code, so copying it would be pure cost on every
+ * row of every list read.
+ */
+/**
+ * Whether any field of this entity declares an access rule for one operation,
+ * at any depth.
+ *
+ * Answers the question a caller asks before paying to resolve the caller's
+ * grants: the pass consults them only for a field carrying `access[operation]`,
+ * so an entity whose registered functions are all validators, defaults, hooks
+ * or READ rules never reaches a grants lookup, and resolving them for it is
+ * pure cost on every write.
+ */
+export function hasFieldAccessRule(
+  kind: EntityKind,
+  slug: string,
+  operation: "create" | "update" | "read"
+): boolean {
+  const fns = getFieldFunctions(kind, slug);
+  return fns ? nestedHasAccessCallback(fns, operation) : false;
+}
+
+/**
+ * Whether any field of this entity declares a hook for one phase, at any
+ * depth.
+ *
+ * Asked by a read deciding whether it may take fewer columns than the whole
+ * row: a field hook is handed the row its field sits in, so it may read a
+ * sibling the caller did not select, and such a read has to take every value
+ * a hook could look at.
+ */
+export function hasFieldHook(
+  kind: EntityKind,
+  slug: string,
+  phase: keyof NonNullable<FieldFunctions["hooks"]>
+): boolean {
+  const fns = getFieldFunctions(kind, slug);
+  return fns ? nestedHasHook(fns, phase) : false;
+}
+
+function nestedHasHook(
+  fns: Record<string, FieldFunctions>,
+  phase: keyof NonNullable<FieldFunctions["hooks"]>
+): boolean {
+  for (const entry of Object.values(fns)) {
+    if ((entry.hooks?.[phase]?.length ?? 0) > 0) return true;
+    if (entry.fields && nestedHasHook(entry.fields, phase)) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether any field group declares an access rule for one operation, at any
+ * depth.
+ *
+ * The question a read asks before paying to resolve the field groups its
+ * fields reach: their rules live in their own registrations, so an
+ * application whose field groups declare none has nothing to judge inside
+ * them, and the schema lookups would be pure cost on every read.
+ */
+export function anyFieldGroupHasAccessRule(
+  operation: "create" | "update" | "read"
+): boolean {
+  const prefix = key("fieldGroup", "");
+  for (const [registered, fns] of store()) {
+    if (
+      registered.startsWith(prefix) &&
+      nestedHasAccessCallback(fns, operation)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function nestedHasAccessCallback(
+  fns: Record<string, FieldFunctions>,
+  operation: "create" | "update" | "read"
+): boolean {
+  for (const entry of Object.values(fns)) {
+    if (typeof entry.access?.[operation] === "function") return true;
+    if (entry.fields && nestedHasAccessCallback(entry.fields, operation)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function levelHasAccessCallback(
+  fns: Record<string, FieldFunctions>,
+  operation: "create" | "update" | "read"
+): boolean {
+  for (const entry of Object.values(fns)) {
+    if (typeof entry.access?.[operation] === "function") return true;
+  }
+  return false;
+}
+
+/** What a field rule is told about the caller, the row and its entity. */
+export interface FieldRuleCaller {
+  user?: Record<string, unknown>;
+  id?: string;
+  grants: () => Promise<CallerGrants>;
+  /** The collection, Single or component the field is declared on. */
+  target: AccessRuleTarget;
+}
+
+/** The target a field rule judges, for the entity kind it is registered under. */
+export function fieldRuleTarget(
+  kind: EntityKind,
+  slug: string
+): AccessRuleTarget {
+  return { kind: kind === "fieldGroup" ? "component" : kind, slug };
+}
+
+/**
+ * Run one field's access rule. The read and the write ask it identically, so
+ * one function asks: a rule told different things on the two paths is how
+ * one field ends up readable by a caller who may not write it, or the
+ * reverse, for no reason anyone chose.
+ */
+async function fieldRuleAllows(
+  fn: FieldAccessFn,
+  operation: FieldRuleOperation,
+  ctx: FieldRuleCaller,
+  snapshot: Record<string, unknown> | undefined,
+  field: string
+): Promise<boolean> {
+  return runFieldRule(
+    fn,
+    operation,
+    ctx,
+    { id: ctx.id, data: snapshot },
+    field
+  );
+}
+
+/** What a field rule may be asked: the field operations alone. */
+type FieldRuleOperation = "create" | "read" | "update";
+
+/**
+ * Call a field rule with the caller's grants and the entry fields given, and
+ * read its answer; a rule that throws denies (fail-secure), except one that
+ * could not reach the database, which ends the request (`ruleCouldNotRun`).
+ *
+ * `entry` is spread into the arguments, so a caller may pass accessors in
+ * place of values and observe whether the rule reads them.
+ */
+async function runFieldRule(
+  fn: FieldAccessFn,
+  operation: FieldRuleOperation,
+  ctx: Omit<FieldRuleCaller, "id">,
+  entry: Pick<AccessRuleContext, "id" | "data">,
+  /** The field the rule guards, where the caller knows it, to name it. */
+  field?: string
+): Promise<boolean> {
+  // A literal answers before the grants are resolved: it reads neither them
+  // nor the entry, so resolving them would be a lookup with no question.
+  const literal = literalRules.get(fn);
+  if (literal !== undefined) return literal;
+  try {
+    const { permissions, roles } = await ctx.grants();
+    const userId = ctx.user?.id;
+    const email = ctx.user?.email;
+    const args = buildRuleContext(
+      {
+        user:
+          typeof userId === "string"
+            ? { id: userId, ...(typeof email === "string" ? { email } : {}) }
+            : null,
+        // The request's own user object, as a field rule has always read it.
+        requestUser: ctx.user as RequestContext["user"],
+        roles,
+        permissions,
+        // The person the operation is made as, from the same frame the
+        // collection gate reads, so a field rule and the gate above it agree
+        // on who is asking.
+        principal: currentPrincipal(),
+      },
+      { operation, target: ctx.target },
+      entry
+    );
+    return await fn(args);
+  } catch (error) {
+    // A rule whose own query, or the caller's grants it reads, waited out the
+    // bound for a database connection never answered: the field is neither
+    // shown nor hidden, and the whole request ends naming the rule, rather
+    // than returning the document with the field silently withheld.
+    if (waitedOutPoolBound(error)) {
+      throw ruleCouldNotRun({
+        subject: ctx.target.slug,
+        ...(field !== undefined ? { field } : {}),
+        rule: `the field ${operation} rule`,
+        cause: error,
+      });
+    }
+    // Fail-secure: an access rule that throws denies the field.
+    return false;
+  }
+}
+
+/**
+ * Whether one read rule allows the caller without reading the entry at all.
+ *
+ * A rule that reads `id` or `data` depends on the entry, and with none its
+ * answer is an accident of comparing absent values: the documented ownership
+ * rule `data?.owner === req.user?.id` reads `undefined === undefined` for an
+ * anonymous caller and answers true. So reading either refuses, whatever the
+ * rule then returns. A rule that never touches them is judged by its answer.
+ */
+async function ruleAllowsWithoutEntry(
+  rule: FieldAccessFn,
+  caller: Omit<FieldRuleCaller, "id">
+): Promise<boolean> {
+  let readsEntry = false;
+  const entry = {
+    get id(): string | undefined {
+      readsEntry = true;
+      return undefined;
+    },
+    get data(): Record<string, unknown> | undefined {
+      readsEntry = true;
+      return undefined;
+    },
+  };
+  const allowed = await runFieldRule(rule, "read", caller, entry);
+  return allowed === true && !readsEntry;
+}
+
+/**
+ * Whether every read rule on this field, and on anything nested in it, lets
+ * the caller read it when no entry is given.
+ *
+ * The question a query asks before it filters, sorts, groups or searches on a
+ * field. There is no row yet, so a rule that needs one — reading `data` or
+ * `id` — cannot allow, and the field is unreadable for the query: that is what
+ * keeps a predicate, an ordering or a match from revealing the value on the
+ * entries where the rule hides it. A rule that allows the caller outright
+ * (by role, permission or identity) allows here too. A nested child is judged
+ * because a container is stored as one value, so matching the container
+ * probes the child. Asked through the same rule runner as a read, so a rule
+ * that throws denies here as it does there.
+ */
+export async function readableWithoutEntry(
+  fns: FieldFunctions,
+  caller: Omit<FieldRuleCaller, "id">
+): Promise<boolean> {
+  const rule = fns.access?.read;
+  if (rule && !(await ruleAllowsWithoutEntry(rule, caller))) return false;
+  for (const nested of Object.values(fns.fields ?? {})) {
+    if (!(await readableWithoutEntry(nested, caller))) return false;
+  }
+  return true;
+}
+
+/**
+ * Recursive worker for write access. Every rule at one level is evaluated
+ * against the SAME immutable snapshot of that level's data, so a rule that
+ * reads a sibling field's value can't flip from deny to allow purely
+ * because an earlier-registered field was already deleted (registration
+ * order must not change the outcome). Denied fields are removed only after
+ * all rules at the level have run. Nested containers recurse first.
+ */
+async function applyWriteAccessRec(
+  data: Record<string, unknown>,
+  fns: Record<string, FieldFunctions>,
+  operation: "create" | "update",
+  ctx: FieldRuleCaller,
+  asStored?: (snapshot: Record<string, unknown>) => Record<string, unknown>
+): Promise<void> {
+  // Taken BEFORE the recursion below, which rewrites nested containers in
+  // place as it redacts them: a rule at this level that reads into a nested
+  // value must see what the level held when it was entered, not what an
+  // earlier-registered field's recursion left behind. Skipped entirely when no
+  // rule at this level will run.
+  const detached = levelHasAccessCallback(fns, operation)
+    ? detachData(data)
+    : undefined;
+  const snapshot = detached && asStored ? asStored(detached) : detached;
+  const denied: string[] = [];
+  for (const [name, entry] of Object.entries(fns)) {
+    if (!(name in data)) continue;
+    if (entry.fields) {
+      for (const row of nestedRows(data[name])) {
+        await applyWriteAccessRec(row, entry.fields, operation, ctx);
+      }
+    }
+    const fn = entry.access?.[operation];
+    if (!fn) continue;
+    const allowed = await fieldRuleAllows(fn, operation, ctx, snapshot, name);
+    if (!allowed) denied.push(name);
+  }
+  for (const name of denied) delete data[name];
+}
+
+/**
+ * Enforce field-level write access: fields the caller may not create or
+ * update are stripped from the payload (silent, Payload-parity), never an
+ * error. Applies at every depth (group/repeater nesting). `overrideAccess`
+ * (trusted server context) bypasses entirely.
+ */
+export async function applyFieldWriteAccess(opts: {
+  kind: EntityKind;
+  slug: string;
+  data: Record<string, unknown>;
+  operation: "create" | "update";
+  user?: Record<string, unknown>;
+  /** The caller's own grants when they arrived on an API key; see {@link grantsResolver}. */
+  authenticatedScope?: AuthenticatedScope;
+  overrideAccess?: boolean;
+  /**
+   * The id the entry is stored under, which a rule is told as `id` and finds
+   * as `data.id`: the stored row's on an update, never the one the request
+   * named, which a database matching ids loosely may have found it by.
+   */
+  id?: string;
+  /**
+   * A resolver shared with another pass over the same write, so the caller's
+   * roles and permissions are read once and both passes judge with one
+   * authority. Build it with {@link callerAccessGrants}. Omitted, this pass
+   * builds its own, which is right for a write judged only once.
+   */
+  grants?: () => Promise<CallerGrants>;
+  /**
+   * Where a visitor's Public grants are read when this pass builds its own
+   * resolver; see {@link VisitorGrantsLoader}.
+   */
+  visitor?: VisitorGrantsLoader;
+}): Promise<void> {
+  // Bypass for a caller that has SAID it is trusted, and only that. The read
+  // side gates on the same single condition, and the two must agree: a rule
+  // that strips a field from an authenticated writer but not from an
+  // unauthenticated one would make less authentication buy more authority.
+  //
+  // Absence of a user is not trust. `collection-access-service` does read
+  // `overrideAccess || !user`, but only where it resolves a stored OWNER
+  // predicate — with nobody to compare against, that predicate is unanswerable
+  // rather than failing. A field rule is a different question: it asks whether
+  // THIS writer may set this field, and "nobody" is a perfectly good answer.
+  // Its main gate uses `overrideAccess` alone, which is the one this matches.
+  //
+  // An internal writer that needs to set a protected field says so with
+  // `overrideAccess: true`; that is a deliberate line in the caller rather
+  // than a property of having no session.
+  if (opts.overrideAccess) return;
+  const fns = getFieldFunctions(opts.kind, opts.slug);
+  if (!fns) return;
+  await applyWriteAccessRec(
+    opts.data,
+    fns,
+    opts.operation,
+    {
+      user: opts.user,
+      id: opts.id,
+      target: fieldRuleTarget(opts.kind, opts.slug),
+      // An anonymous writer holds what the Public role grants, and no role
+      // (see `grantsResolver`), so a rule written as
+      // `({ permissions }) => permissions.includes(...)` answers it as the
+      // collection rule does, and refuses it what Public does not grant.
+      grants:
+        opts.grants ??
+        grantsResolver(
+          typeof opts.user?.id === "string" ? opts.user.id : undefined,
+          opts.authenticatedScope,
+          undefined,
+          opts.visitor
+        ),
+    },
+    asStoredFor(opts.kind, opts.id)
+  );
+}
+
+/**
+ * The entry a write rule reads as `data`, made the stored one's where the
+ * caller could make it differ: the system columns only the service decides
+ * are not there, and `id` is the id the entry is stored under. A body may
+ * carry any of them, and none of them is what is stored. A field group's
+ * instances are told their own stored id by the write that saves them.
+ */
+function asStoredFor(
+  kind: EntityKind,
+  id: string | undefined
+):
+  | ((snapshot: Record<string, unknown>) => Record<string, unknown>)
+  | undefined {
+  if (kind === "fieldGroup") return undefined;
+  const closed = immutableSystemColumnNames(kind);
+  return snapshot => {
+    for (const name of closed) delete snapshot[name];
+    if (id !== undefined) snapshot.id = id;
+    return snapshot;
+  };
+}
+
+/**
+ * The values each read-access pass removed from a row, keyed by the row OBJECT,
+ * so a later pass over the same row can restore them as EVIDENCE before it
+ * re-judges the row.
+ *
+ * The nested-read pipeline applies access to a related row BEFORE its parent's
+ * hooks (so a hook cannot read a denied child field to copy it), then AGAIN
+ * after all hooks (a hook may have written a denied field back, mutated a row in
+ * place, or added, replaced, or reordered rows). The second pass MUST re-run the
+ * rules against the post-hook content — a cached verdict cannot be trusted once a
+ * hook may have changed what the rule reads. Re-running alone would flip a
+ * verdict, though: the first pass already removed the denied values a rule reads
+ * as evidence, so a field kept only while such a value was present would be
+ * wrongly dropped. Restoring each row's removed values first (unless a hook has
+ * since set them) gives the rules the same evidence the first pass — and a direct
+ * read — judged against, while the current values of everything a hook touched
+ * are seen and re-judged.
+ *
+ * A restored value is EVIDENCE only, never response data: it is one the caller
+ * was denied and the post-hook row did not itself supply, so it is removed again
+ * once every snapshot that needed it has been taken. Otherwise a hook that flips
+ * a field's CONDITION from deny to allow (say, a sibling `tier`) without
+ * reintroducing the value would resurrect the value the first pass removed.
+ *
+ * The restore runs over the WHOLE subtree before any level's snapshot is taken,
+ * because the evidence a rule reads is not always a sibling: an outer field's
+ * rule can depend on a value inside a nested group or repeater the first pass
+ * already redacted. Snapshotting a level before descending to restore its nested
+ * rows would judge that outer rule against a stripped subtree and drop it, unlike
+ * a direct read which judges once with the subtree intact.
+ *
+ * Keyed by the row object, never by an `id`: two rows may carry the same `id`,
+ * and a replacement row is a genuinely new object that must be judged on its own
+ * content. Row objects survive between the passes because the nested walk decodes
+ * container values to arrays before hooks run.
+ */
+export type ReadAccessRedactions = WeakMap<
+  Record<string, unknown>,
+  Record<string, unknown>
+>;
+
+/** One value a pass put back purely as evidence: the row it was written onto and
+ *  the key, so it can be removed again once the snapshots that needed it are
+ *  taken. */
+interface RestoredEvidence {
+  row: Record<string, unknown>;
+  name: string;
+}
+
+/**
+ * The field names a pass RESTORED onto each row purely as evidence, keyed by the
+ * row object. The recorder consults it to tell a value the post-hook row
+ * genuinely supplies — which clears its stale redaction — from one present only
+ * because this pass restored it, which must be remembered as still-removed.
+ */
+type RestoredByRow = WeakMap<Record<string, unknown>, Set<string>>;
+
+/**
+ * Restore, throughout the subtree rooted at `entry`, the values a prior pass
+ * removed from each row — unless a hook has since set the key, so a hook's own
+ * value stands. Runs once before any snapshot is taken, so a rule at any level is
+ * judged against the evidence a single direct read would see. Every value it puts
+ * back is recorded in `restored`, because it is EVIDENCE, not response data: the
+ * caller was denied it and the post-hook row did not supply it, so it must be
+ * removed again once the snapshots are taken (see {@link applyFieldReadAccess}).
+ *
+ * The restore has to span the whole subtree, not just the current row: an outer
+ * field's rule can read a value that lives in a nested group or repeater a prior
+ * pass already redacted. Restoring per row on the way down would take the outer
+ * level's snapshot before descending to restore that nested value, and the rule
+ * would judge against the stripped subtree and wrongly drop the outer field.
+ */
+function restoreReadAccessEvidence(
+  entry: Record<string, unknown>,
+  fns: Record<string, FieldFunctions>,
+  redactions: ReadAccessRedactions,
+  restored: RestoredEvidence[],
+  restoredByRow: RestoredByRow
+): void {
+  const priorlyRemoved = redactions.get(entry);
+  if (priorlyRemoved) {
+    for (const [name, value] of Object.entries(priorlyRemoved)) {
+      if (!(name in entry)) {
+        entry[name] = value;
+        restored.push({ row: entry, name });
+        // Recorded so the judge can distinguish this evidence-only value, which
+        // stays removed, from one the post-hook row genuinely supplied.
+        let names = restoredByRow.get(entry);
+        if (!names) {
+          names = new Set();
+          restoredByRow.set(entry, names);
+        }
+        names.add(name);
+      }
+    }
+  }
+  for (const [name, fieldFns] of Object.entries(fns)) {
+    if (!fieldFns.fields || !(name in entry)) continue;
+    const container = openNestedContainer(entry[name]);
+    if (!container) continue;
+    for (const row of container.rows) {
+      restoreReadAccessEvidence(
+        row,
+        fieldFns.fields,
+        redactions,
+        restored,
+        restoredByRow
+      );
+    }
+    entry[name] = container.serialize();
+  }
+}
+
+/** Recursive worker for read access — same snapshot + recurse contract. Prior
+ *  passes' removed values are restored across the whole subtree by
+ *  {@link restoreReadAccessEvidence} before this runs, so the snapshot reflects
+ *  the content a single direct read would judge; the rules always run against the
+ *  current content, and what this pass removes is recorded for the next. */
+async function applyReadAccessRec(
+  entry: Record<string, unknown>,
+  fns: Record<string, FieldFunctions>,
+  ctx: FieldRuleCaller,
+  redactions: ReadAccessRedactions,
+  restoredByRow: RestoredByRow
+): Promise<void> {
+  // Taken BEFORE the recursion below replaces nested containers with their
+  // redacted serialization: a parent-level rule reading a protected nested
+  // value would otherwise find it already removed, and the outcome would turn
+  // on field registration order.
+  const snapshot = levelHasAccessCallback(fns, "read")
+    ? detachData(entry)
+    : undefined;
+  const denied: string[] = [];
+  for (const [name, fieldFns] of Object.entries(fns)) {
+    if (!(name in entry)) continue;
+    if (fieldFns.fields) {
+      const container = openNestedContainer(entry[name]);
+      if (container) {
+        for (const row of container.rows) {
+          await applyReadAccessRec(
+            row,
+            fieldFns.fields,
+            ctx,
+            redactions,
+            restoredByRow
+          );
+        }
+        entry[name] = container.serialize();
+      }
+    }
+    const fn = fieldFns.access?.read;
+    if (!fn) continue;
+    const allowed = await fieldRuleAllows(fn, "read", ctx, snapshot, name);
+    if (!allowed) denied.push(name);
+  }
+  // Record what stays removed for the next pass to restore as evidence. A prior
+  // pass's removed value is carried forward only while the row still lacks the
+  // key, or holds it solely because THIS pass restored it as evidence (about to
+  // be stripped again). A field the post-hook row genuinely supplies and that was
+  // allowed clears its stale evidence, so a later rule keyed on the old value is
+  // not judged against a value the row no longer carries.
+  const priorlyRemoved = redactions.get(entry);
+  const restoredHere = restoredByRow.get(entry);
+  const removed: Record<string, unknown> = {};
+  if (priorlyRemoved) {
+    for (const [name, value] of Object.entries(priorlyRemoved)) {
+      if (!(name in entry) || restoredHere?.has(name)) {
+        removed[name] = value;
+      }
+    }
+  }
+  for (const name of denied) {
+    removed[name] = entry[name];
+    delete entry[name];
+  }
+  if (Object.keys(removed).length > 0) {
+    redactions.set(entry, removed);
+  } else {
+    // Nothing stays removed: drop any stale entry so a later pass does not
+    // restore a value this row now legitimately carries or no longer hides.
+    redactions.delete(entry);
+  }
+}
+
+/**
+ * The caller's grants, RESOLVED, wrapped as the resolver a field-access pass
+ * takes.
+ *
+ * `callerAccessGrants` builds a lazy resolver: nothing is looked up until the
+ * first pass asks, and a pass that first asks from inside a write transaction
+ * issues its queries on the pooled connection that transaction is holding. On
+ * a one-connection pool the query waits for a connection it can never get, and
+ * the write hangs rather than fails. A caller about to open a transaction
+ * awaits this instead, so the lookups are already done and the resolver it
+ * hands in only returns them.
+ */
+export async function resolvedCallerGrants(
+  user: Record<string, unknown> | undefined,
+  authenticatedScope?: AuthenticatedScope,
+  /** Where a visitor's Public grants are read; see {@link VisitorGrantsLoader}. */
+  visitor?: VisitorGrantsLoader
+): Promise<() => Promise<CallerGrants>> {
+  const grants = await callerAccessGrants(
+    user,
+    authenticatedScope,
+    undefined,
+    visitor
+  )();
+  return () => Promise.resolve(grants);
+}
+
+/**
+ * The caller's grants resolver, to hand to every field-access pass over one
+ * document or record so roles and permissions are read once.
+ *
+ * One function for reads and writes, because they ask the same question of the
+ * same authority. Two constructors of it drifted apart the moment either was
+ * changed: a fix to how an anonymous caller or an API key resolves would land
+ * on one side and leave the other judging by different rules, which is the
+ * shape of an access bug nobody sees until it is exploited.
+ */
+export function callerAccessGrants(
+  user: Record<string, unknown> | undefined,
+  authenticatedScope?: AuthenticatedScope,
+  /**
+   * The transaction-bound executor, for a pass that runs while a write holds
+   * its connection: the lookups then read on it, rather than waiting on the
+   * pool for the connection the transaction itself is holding.
+   */
+  executor?: unknown,
+  /**
+   * Where a visitor's Public grants are read, handed `executor`; see
+   * {@link VisitorGrantsLoader}.
+   */
+  visitor?: VisitorGrantsLoader
+): () => Promise<CallerGrants> {
+  return grantsResolver(
+    typeof user?.id === "string" ? user.id : undefined,
+    authenticatedScope,
+    executor,
+    visitor
+  );
+}
+
+/**
+ * Enforce field-level read access on a serialized entry: fields whose
+ * `access.read` denies are removed from the response, at every depth.
+ *
+ * Pass a shared {@link ReadAccessRedactions} to run access more than once over
+ * rows a hook may have mutated in between (the nested-read pipeline's
+ * before-hooks and after-hooks passes): each pass restores the values a prior
+ * pass removed from a row as evidence, then re-judges the row against its current
+ * content — so a denied field a hook reintroduced or a row it changed is caught,
+ * while a field kept only because of a now-removed sibling keeps its verdict.
+ */
+export async function applyFieldReadAccess(
+  opts: {
+    kind: EntityKind;
+    slug: string;
+    entry: Record<string, unknown>;
+    user?: Record<string, unknown>;
+    /** The caller's own grants when they arrived on an API key; see {@link grantsResolver}. */
+    authenticatedScope?: AuthenticatedScope;
+    overrideAccess?: boolean;
+    /**
+     * A resolver shared with another pass over the same document, so the two
+     * passes read the caller's roles and permissions once and judge with one
+     * authority; see {@link callerAccessGrants}.
+     */
+    grants?: () => Promise<CallerGrants>;
+    /**
+     * Where a visitor's Public grants are read when this pass builds its own
+     * resolver; see {@link VisitorGrantsLoader}.
+     */
+    visitor?: VisitorGrantsLoader;
+  },
+  redactions?: ReadAccessRedactions
+): Promise<void> {
+  if (opts.overrideAccess) return;
+  const fns = getFieldFunctions(opts.kind, opts.slug);
+  if (!fns) return;
+  const store = redactions ?? new WeakMap();
+  // Restore the whole subtree's prior-pass evidence before any level's snapshot,
+  // so an outer rule reading a value nested in a group or repeater is judged
+  // against the same content a single direct read would (a no-op on the first
+  // pass, whose store is empty). The judge below re-removes what stays denied.
+  // The restored keys are tracked so the judge can tell them from values the row
+  // genuinely supplies when it decides what stays recorded as removed.
+  const restored: RestoredEvidence[] = [];
+  const restoredByRow: RestoredByRow = new WeakMap();
+  restoreReadAccessEvidence(opts.entry, fns, store, restored, restoredByRow);
+  await applyReadAccessRec(
+    opts.entry,
+    fns,
+    {
+      user: opts.user,
+      id: typeof opts.entry.id === "string" ? opts.entry.id : undefined,
+      target: fieldRuleTarget(opts.kind, opts.slug),
+      // An unauthenticated read still runs the rules — this path, unlike the
+      // write one, does not bail without a user — so the resolver is handed the
+      // same absent id and answers with what the Public role grants.
+      grants:
+        opts.grants ??
+        grantsResolver(
+          typeof opts.user?.id === "string" ? opts.user.id : undefined,
+          opts.authenticatedScope,
+          undefined,
+          opts.visitor
+        ),
+    },
+    store,
+    restoredByRow
+  );
+  // A restored value existed only to feed the snapshots above. The caller was
+  // denied it and the post-hook row did not supply it, so it must not appear in
+  // the response even when the current pass judged it allowed — a hook that
+  // flipped the field's CONDITION from deny to allow (say, a sibling `tier`)
+  // without reintroducing the value must not resurrect the value the first pass
+  // removed. Removed after every snapshot is taken, so re-judging still saw it.
+  for (const { row, name } of restored) delete row[name];
+}
+
+/** Recursive worker for hooks. Transforms values in registration order. */
+async function runFieldHooksRec(
+  data: Record<string, unknown>,
+  fns: Record<string, FieldFunctions>,
+  phase: "beforeValidate" | "beforeChange" | "afterChange" | "afterRead",
+  ctx: {
+    slug: string;
+    kind: EntityKind;
+    operation: "create" | "read" | "update" | "delete";
+    user?: Record<string, unknown>;
+  },
+  /** Top level only; a nested row's names are its own. See {@link runFieldHooks}. */
+  only?: ReadonlySet<string>
+): Promise<void> {
+  for (const [name, entry] of Object.entries(fns)) {
+    if (!(name in data)) continue;
+    if (only && !only.has(name)) continue;
+    if (entry.fields) {
+      for (const row of nestedRows(data[name])) {
+        await runFieldHooksRec(row, entry.fields, phase, ctx);
+      }
+    }
+    const handlers = entry.hooks?.[phase];
+    if (!handlers?.length) continue;
+    let value = data[name];
+    for (const handler of handlers) {
+      // `afterChange` runs once the row is durable, so a handler throwing
+      // there cannot un-save it. Letting it propagate failed the whole write
+      // -- and in a bulk operation classified a committed row as failed,
+      // which is the retry-duplicates-the-write hazard the collection-level
+      // phases already avoid. Field-level handlers get the same treatment:
+      // normalize, report, and keep going, so one broken handler does not
+      // silently skip the ones after it.
+      //
+      // Every other phase runs BEFORE the write and keeps failing fast: there
+      // the throw is the handler rejecting the input, and the operation has
+      // not happened yet.
+      if (phase === "afterChange") {
+        try {
+          const result = await handler(
+            withCurrentPrincipal(
+              withHookLanguage({
+                collection: ctx.slug,
+                operation: ctx.operation,
+                fieldName: name,
+                value,
+                data,
+                user: ctx.user,
+              })
+            )
+          );
+          if (result !== undefined) value = result;
+        } catch (error) {
+          // The registry has no `afterChange` phase: it maps onto
+          // `afterCreate` / `afterUpdate`, and the operation says which. A
+          // warning naming a phase the registry does not have would not match
+          // what a collection-level handler on the same write reports.
+          const committedPhase =
+            ctx.operation === "create" ? "afterCreate" : "afterUpdate";
+          // The key the hook registry stores a Single under, so a warning
+          // from a field-level handler and one from an entity-level handler
+          // on the same write name the same entity. A bare slug would also
+          // collide with a collection sharing it.
+          const registryKey =
+            ctx.kind === "single" ? singleHookNamespace(ctx.slug) : ctx.slug;
+          const normalized = normalizeHookError(
+            error,
+            committedPhase,
+            registryKey,
+            { fieldName: name }
+          );
+          consoleLogger.error(
+            `Field hook "afterChange" failed for "${registryKey}.${name}" after the write committed`,
+            { normalized }
+          );
+          recordSideEffectWarning({
+            phase: committedPhase,
+            collection: registryKey,
+            error: NextlyError.is(normalized)
+              ? normalized
+              : NextlyError.internal({
+                  logContext: { collection: registryKey, fieldName: name },
+                }),
+          });
+        }
+        continue;
+      }
+      const result = await handler(
+        withCurrentPrincipal(
+          withHookLanguage({
+            collection: ctx.slug,
+            operation: ctx.operation,
+            fieldName: name,
+            value,
+            data,
+            user: ctx.user,
+          })
+        )
+      );
+      if (result !== undefined) value = result;
+    }
+    data[name] = value;
+  }
+}
+
+/**
+ * Run one field-hook phase over the provided values, at every depth. A
+ * hook's non-undefined return replaces the field value; hooks run in
+ * registration order.
+ */
+export async function runFieldHooks(opts: {
+  kind: EntityKind;
+  slug: string;
+  phase: "beforeValidate" | "beforeChange" | "afterChange" | "afterRead";
+  data: Record<string, unknown>;
+  operation: "create" | "read" | "update" | "delete";
+  user?: Record<string, unknown>;
+  /**
+   * Restrict WHICH fields' handlers run, without restricting what they SEE.
+   *
+   * Presence in `data` normally decides both, and for most callers that is the
+   * same question. It stops being the same question when the row carries more
+   * than the write touched: a localized update assembles the whole translation
+   * for its snapshot, and firing `afterChange` for a sibling nobody edited
+   * sends mail for an unchanged value. Withholding those keys from `data`
+   * instead would answer that at the cost of the other half — a handler that
+   * does run could no longer read its siblings, which is what a search-index
+   * or derived-value hook is for.
+   *
+   * Names at the TOP level only. A nested row's fields are its own, and the
+   * parent's gate has already decided whether its subtree runs at all.
+   */
+  only?: ReadonlySet<string>;
+}): Promise<void> {
+  const fns = getFieldFunctions(opts.kind, opts.slug);
+  if (!fns) return;
+  await runFieldHooksRec(
+    opts.data,
+    fns,
+    opts.phase,
+    {
+      slug: opts.slug,
+      kind: opts.kind,
+      operation: opts.operation,
+      user: opts.user,
+    },
+    opts.only
+  );
+}

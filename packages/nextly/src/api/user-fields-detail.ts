@@ -1,0 +1,181 @@
+/**
+ * User Field Definitions Detail API Route Handlers for Next.js
+ *
+ * These route handlers can be re-exported in your Next.js application to provide
+ * individual user field definition management endpoints at /api/user-fields/[id].
+ *
+ * Services are auto-initialized on first request using environment variables:
+ * - DB_DIALECT: Database dialect ("postgresql" | "mysql" | "sqlite")
+ * - DATABASE_URL: Database connection string
+ *
+ * @example
+ * ```typescript
+ * // In your Next.js app: app/api/user-fields/[id]/route.ts
+ * export { GET, PATCH, DELETE } from 'nextly/api/user-fields-detail';
+ * ```
+ *
+ * @module api/user-fields-detail
+ */
+
+import { container, getService } from "../di";
+import {
+  SYSTEM_READ_POLICY,
+  SYSTEM_WRITE_POLICY,
+} from "../domains/auth/system-write-policy";
+import { withSchemaChangeExcluded } from "../domains/schema/services/schema-change-exclusion";
+import { getCachedNextly } from "../init";
+import type { UserFieldDefinitionService } from "../services/users/user-field-definition-service";
+
+import { readJsonBody } from "./read-json-body";
+import { respondAction, respondDoc, respondMutation } from "./response-shapes";
+import { requireRouteAnyPermission } from "./route-auth";
+import { withErrorHandler } from "./with-error-handler";
+
+interface RouteContext {
+  params: Promise<{ id: string }>;
+}
+
+async function getUserFieldDefinitionService(): Promise<UserFieldDefinitionService> {
+  await getCachedNextly();
+  return container.get<UserFieldDefinitionService>(
+    "userFieldDefinitionService"
+  );
+}
+
+/**
+ * GET handler for retrieving a single user field definition by ID.
+ *
+ * Requires authentication. Returns the field definition including its
+ * source (code or ui).
+ *
+ * Response Codes:
+ * - 200 OK: Field definition retrieved successfully
+ * - 401 Unauthorized: Authentication required
+ * - 404 Not Found: Field definition with ID does not exist
+ * - 500 Internal Server Error: Failed to fetch field definition
+ *
+ * Response: `{ "data": UserFieldDefinition }`
+ */
+export const GET = withErrorHandler(
+  async (request: Request, context: RouteContext): Promise<Response> => {
+    await requireRouteAnyPermission(request, [
+      ...SYSTEM_READ_POLICY.settings.read.anyOf,
+    ]);
+
+    const { id } = await context.params;
+    const service = await getUserFieldDefinitionService();
+    const field = await service.getField(id);
+
+    return respondDoc(field);
+  }
+);
+
+/**
+ * PATCH handler for updating a user field definition.
+ *
+ * Requires authentication. Only UI-sourced fields can be updated.
+ * Code-sourced fields (from `defineConfig()`) return 422 Business Rule Violation.
+ * The `source` property cannot be changed after creation.
+ *
+ * Request Body (all fields optional):
+ * - name, label, type, required, defaultValue, options, placeholder,
+ *   description, sortOrder, isActive.
+ *
+ * Response Codes:
+ * - 200 OK: Field definition updated successfully
+ * - 400 Bad Request: Invalid JSON body
+ * - 401 Unauthorized: Authentication required
+ * - 404 Not Found: Field definition with ID does not exist
+ * - 422 Unprocessable Entity: Cannot modify code-sourced field
+ * - 500 Internal Server Error: Update failed
+ *
+ * Response: `{ "data": UserFieldDefinition }`
+ */
+export const PATCH = withErrorHandler(
+  async (request: Request, context: RouteContext): Promise<Response> => {
+    await requireRouteAnyPermission(request, [
+      ...SYSTEM_WRITE_POLICY.userFields.update.anyOf,
+    ]);
+
+    const { id } = await context.params;
+    const body = await readJsonBody<Record<string, unknown>>(request);
+
+    // Selective copy: only forward fields the legacy handler accepted, so
+    // unknown keys are silently ignored (matches the pre-migration contract).
+    const updateData: Record<string, unknown> = {};
+    if (body.name !== undefined) updateData.name = body.name;
+    if (body.label !== undefined) updateData.label = body.label;
+    if (body.type !== undefined) updateData.type = body.type;
+    if (body.required !== undefined) updateData.required = body.required;
+    if (body.defaultValue !== undefined)
+      updateData.defaultValue = body.defaultValue;
+    if (body.options !== undefined) updateData.options = body.options;
+    if (body.placeholder !== undefined)
+      updateData.placeholder = body.placeholder;
+    if (body.description !== undefined)
+      updateData.description = body.description;
+    if (body.sortOrder !== undefined) updateData.sortOrder = body.sortOrder;
+    if (body.isActive !== undefined) updateData.isActive = body.isActive;
+
+    const service = await getUserFieldDefinitionService();
+    // The service's read of the stored definition and its row write hold the schema lock together,
+    // refused at once while a migration holds it. This route writes the definition row alone, so
+    // it issues no DDL and must not create the lock table on a role without DDL rights.
+    const field = await withSchemaChangeExcluded(
+      {
+        adapter: getService("adapter"),
+        logger: getService("logger"),
+        label: `update user field "${id}"`,
+        issuesDdl: false,
+      },
+      () => service.updateField(id, updateData)
+    );
+
+    return respondMutation("User field updated.", field);
+  }
+);
+
+/**
+ * DELETE handler for removing a user field definition.
+ *
+ * Requires authentication. Only UI-sourced fields can be deleted.
+ * Code-sourced fields (from `defineConfig()`) return 422 Business Rule Violation.
+ * To remove a code-sourced field, remove it from `defineConfig()`.
+ *
+ * Response Codes:
+ * - 200 OK: Field definition deleted successfully
+ * - 401 Unauthorized: Authentication required
+ * - 404 Not Found: Field definition with ID does not exist
+ * - 422 Unprocessable Entity: Cannot delete code-sourced field
+ * - 500 Internal Server Error: Deletion failed
+ *
+ * Response: `{ "data": { "success": true } }`
+ */
+export const DELETE = withErrorHandler(
+  async (request: Request, context: RouteContext): Promise<Response> => {
+    await requireRouteAnyPermission(request, [
+      ...SYSTEM_WRITE_POLICY.userFields.delete.anyOf,
+    ]);
+
+    const { id } = await context.params;
+    const service = await getUserFieldDefinitionService();
+
+    // The service's read of the stored definition and its removal hold the schema lock together,
+    // refused at once while a migration holds it. It issues no DDL, so it must not create the lock
+    // table on a role without DDL rights.
+    await withSchemaChangeExcluded(
+      {
+        adapter: getService("adapter"),
+        logger: getService("logger"),
+        label: `delete user field "${id}"`,
+        issuesDdl: false,
+      },
+      () => service.deleteField(id)
+    );
+
+    // Service returns void. Echo the deleted id (named `fieldId` to
+    // match the dispatcher route's wire shape) so the admin can prune
+    // its local list without a follow-up fetch.
+    return respondAction("User field deleted.", { fieldId: id });
+  }
+);

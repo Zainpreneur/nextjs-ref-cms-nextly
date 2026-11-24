@@ -1,0 +1,170 @@
+/**
+ * Auth extensibility contracts (D71/D57).
+ *
+ * The plugin-facing surface for extending authentication: pluggable strategies
+ * ("who is this user"), an auth-flow hook pipeline (modify / abort / challenge),
+ * and a first-class multi-step challenge protocol. Re-exported `@experimental`
+ * from `@nextlyhq/plugin-sdk` (see that package's STABILITY.md).
+ *
+ * @experimental
+ */
+import type { PluginContext } from "../../plugins/plugin-context";
+import type { AuthUser } from "../../types/auth";
+
+/**
+ * @experimental What an auth strategy receives. `body` is the parsed JSON
+ * request body; `strategyName` is the strategy currently being attempted.
+ */
+export interface AuthInput {
+  request: Request;
+  body: Record<string, unknown>;
+  strategyName: string;
+}
+
+/**
+ * @experimental A pending second factor / step. `id` is the challenge
+ * definition id; `userId` is the candidate user this challenge gates (never
+ * surfaced to the client raw — only via the signed pending-auth token).
+ */
+export interface Challenge {
+  id: string;
+  userId: string;
+  /** Opaque hint the UI uses to pick/parameterize the challenge view. */
+  uiHint?: Record<string, unknown>;
+}
+
+/**
+ * @experimental The result of a strategy attempt:
+ * - `authenticated` → core issues a session
+ * - `challenge` → pause the flow pending a second step
+ * - `fail` → deny (generic public message; no user enumeration)
+ * - `pass` → "not my credential", try the next strategy
+ */
+export type AuthOutcome =
+  | { type: "authenticated"; user: AuthUser }
+  | { type: "challenge"; challenge: Challenge }
+  | { type: "fail"; reason?: string }
+  | { type: "pass" };
+
+/**
+ * @experimental What a strategy tells the sign-in rate limit about a request,
+ * before any strategy authenticates it:
+ * - `{ handles: false }` → not this strategy's request; the next is asked
+ * - `{ handles: true, key }` → this strategy's; the request is limited under
+ *   `key`, or against the budget shared by requests naming no account when
+ *   `key` is `null` or empty
+ */
+export type AuthLimitAnswer =
+  | { handles: false }
+  | { handles: true; key: string | null };
+
+/** @experimental A pluggable authentication strategy (app opt-in). */
+export interface AuthStrategy {
+  name: string;
+  authenticate(input: AuthInput, ctx: PluginContext): Promise<AuthOutcome>;
+  /**
+   * @experimental Name the identity a sign-in targets, so the auth rate limit
+   * keys a request whose client address cannot be read on what this strategy
+   * reads rather than on any `email` the body carries.
+   *
+   * Asked in chain order, before any strategy authenticates; the first that
+   * handles a request decides its key, whatever later strategies would say.
+   * The key comes from the request alone, never from whether an account
+   * matches it, and is normalised as this strategy's own lookup normalises
+   * it: a known and an unknown identity are then limited alike, and spellings
+   * the lookup treats as one share one budget. For a credential that names no
+   * identity before it is looked up, such as an OAuth code, name the
+   * credential itself. An answer that throws or rejects counts the request
+   * against the budget shared by requests naming no account.
+   *
+   * A strategy without it leaves the limiter unable to tell which strategy
+   * will handle a request, so the chain is keyed on the request's `email`,
+   * and the server names the strategy at startup.
+   */
+  limitKey?(input: {
+    request: Request;
+    body: Record<string, unknown>;
+  }): AuthLimitAnswer | Promise<AuthLimitAnswer>;
+}
+
+/** @experimental Resolves a challenge given the client's response (e.g. a TOTP code). */
+export interface ChallengeDefinition {
+  id: string;
+  resolve(
+    args: { userId: string; response: Record<string, unknown> },
+    ctx: PluginContext
+  ): Promise<{ ok: true } | { ok: false; reason?: string }>;
+}
+
+/** @experimental The names of the auth-flow hook phases. */
+export type AuthHookName =
+  | "beforeLogin"
+  | "afterAuthenticate"
+  | "afterLogin"
+  | "beforeRegister"
+  | "afterRegister"
+  | "beforeLogout"
+  | "afterLogout"
+  | "determineUser"
+  | "customizeClaims";
+
+/**
+ * @experimental Auth-flow hooks (normal contribution). Each hook may modify
+ * (return a new value), abort (throw: a `NextlyError` keeps its own code,
+ * anything else becomes a generic error), or — for `afterAuthenticate` —
+ * return a `{ challenge }` to require a second step.
+ */
+export interface AuthHooks {
+  /** Runs before any strategy. Throw to abort. */
+  beforeLogin?: (input: AuthInput, ctx: PluginContext) => Promise<void> | void;
+  /**
+   * After a user is identified. Return a `{ challenge }` to require a second
+   * step, the (possibly modified) user to continue, or throw to abort. The
+   * user returned, and a challenge's `userId`, must be the account that
+   * authenticated: a different id fails the login.
+   */
+  afterAuthenticate?: (
+    user: AuthUser,
+    ctx: PluginContext
+  ) =>
+    | Promise<AuthUser | { challenge: Challenge }>
+    | AuthUser
+    | { challenge: Challenge };
+  /** Observe-only side effects after the session is issued. */
+  afterLogin?: (user: AuthUser, ctx: PluginContext) => Promise<void> | void;
+  /** Modify registration data before the user is created. */
+  beforeRegister?: (
+    data: Record<string, unknown>,
+    ctx: PluginContext
+  ) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  /** Observe-only side effects after a user registers. */
+  afterRegister?: (user: AuthUser, ctx: PluginContext) => Promise<void> | void;
+  /** Runs before logout. */
+  beforeLogout?: (
+    user: AuthUser | null,
+    ctx: PluginContext
+  ) => Promise<void> | void;
+  /** Runs after logout. */
+  afterLogout?: (ctx: PluginContext) => Promise<void> | void;
+  /**
+   * Custom current-user resolution for `GET /auth/session` only. Return
+   * `null` to fall through to core cookie/JWT resolution.
+   */
+  determineUser?: (
+    request: Request,
+    ctx: PluginContext
+  ) => Promise<AuthUser | null> | AuthUser | null;
+  /**
+   * Add JWT claims. Receives the core claims and returns the final ones.
+   * Every claim core built — `sub`, `email`, `name`, `image`, `roleIds`, the
+   * claims from the user's custom fields, and `iat`, `exp`, `jti` — is
+   * restored as core built it, and the reserved `nbf`, `aud`, `iss` and `typ`
+   * cannot be added, so a hook can add a claim of its own but never change
+   * who the session belongs to or what it may do.
+   */
+  customizeClaims?: (
+    claims: Record<string, unknown>,
+    user: AuthUser,
+    ctx: PluginContext
+  ) => Promise<Record<string, unknown>> | Record<string, unknown>;
+}

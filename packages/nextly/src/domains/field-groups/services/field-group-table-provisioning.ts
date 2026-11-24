@@ -1,0 +1,328 @@
+// Runtime registration and companion provisioning for a field group's table.
+//
+// Both were private to the components dispatcher, which is why the two other create transports
+// could not reuse the schema half and shipped a registry row describing a table that did not
+// exist. Moved here unchanged so one service can own the table change and the registry write
+// together; the bodies are byte-identical to the versions the dispatcher carried.
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import { getColumns, is, Table } from "drizzle-orm";
+
+import type { FieldConfig } from "../../../collections/fields/types";
+import { getSchemaRegistryFromDI } from "../../../dispatcher/helpers/di";
+import type { FieldDefinition } from "../../../schemas/dynamic-collections";
+import { FieldGroupSchemaService } from "../../../services/field-groups/field-group-schema-service";
+import { consoleLogger } from "../../../shared/types";
+import {
+  appLanguageOrder,
+  appLocalization,
+} from "../../i18n/configured-locales";
+import { refuseTranslatedUniqueThatCannotHold } from "../../i18n/migration/archive-preflight";
+import { applyCompanionTransition } from "../../i18n/migration/held-leaving-drops";
+import {
+  buildCompanionTransitionStatements,
+  type FieldRename,
+} from "../../i18n/migration/reconcile-companion";
+import { liveCompanionShape } from "../../i18n/runtime/companion-io";
+import { buildCompanionRuntimeTable } from "../../i18n/runtime/companion-registration";
+import type { BusyTableWait } from "../../schema/services/apply-migration-statements";
+
+/**
+ * Whether the in-memory schema was actually refreshed, and why not when it was not.
+ *
+ * Reported rather than thrown because this step runs AFTER the durable write on every caller: the
+ * schema change is already committed, so raising here would describe a repair that landed as one
+ * that failed. Returning the outcome lets a caller that must not overstate its result — a repair
+ * telling an operator the group is usable again — say what is still stale, while the callers that
+ * treat registration as best-effort carry on ignoring it exactly as before.
+ */
+export interface RuntimeSchemaRegistration {
+  registered: boolean;
+  /** Present only when `registered` is false; safe to show an operator. */
+  reason?: string;
+}
+
+/**
+ * The column names of the runtime table registered for `tableName`, lowercased, or `undefined`
+ * where no table is registered for it.
+ *
+ * The runtime table is what this process addresses the field group's table as. A start leaves out
+ * of it a field inside a group with no name whose column the table does not hold yet
+ * (`RuntimeSchemaOptions.heldColumns`), and the instance write asks this so it leaves out that
+ * field's value too, rather than naming a column the table lacks.
+ */
+export function registeredComponentColumns(
+  adapter: DrizzleAdapter,
+  tableName: string
+): ReadonlySet<string> | undefined {
+  const registry = getSchemaRegistryFromDI();
+  // The same two places registration writes to, read in the same order.
+  const table = registry
+    ? registry.getTable(tableName)
+    : (
+        adapter as unknown as {
+          tableResolver?: { getTable?: (name: string) => unknown };
+        }
+      ).tableResolver?.getTable?.(tableName);
+  if (!is(table, Table)) return undefined;
+  return new Set(
+    Object.values(getColumns(table)).map(column => column.name.toLowerCase())
+  );
+}
+
+export function registerComponentRuntimeSchema(
+  adapter: DrizzleAdapter,
+  dialect: string,
+  tableName: string,
+  fields: FieldConfig[],
+  typeColumn: string,
+  // i18n: when localized, the main comp_ runtime table omits translatable columns and the
+  // companion comp_<slug>_locales runtime table is registered for per-language reads/writes.
+  localized = false,
+  // The columns the live table holds, where the caller read them; see
+  // `RuntimeSchemaOptions.heldColumns`. Omitted after a create or a save, which leave every column.
+  heldColumns?: readonly string[]
+): RuntimeSchemaRegistration {
+  try {
+    const fieldGroupSchemaService = new FieldGroupSchemaService(
+      dialect as ConstructorParameters<typeof FieldGroupSchemaService>[0]
+    );
+    const runtimeTable = fieldGroupSchemaService.generateRuntimeSchema(
+      tableName,
+      fields,
+      { localized, typeColumn, heldColumns }
+    );
+    const companion = localized
+      ? buildCompanionRuntimeTable({
+          slug: tableName,
+          tableName,
+          fields: fields as { name: string; type: string }[],
+          dialect: dialect as Parameters<
+            typeof buildCompanionRuntimeTable
+          >[0]["dialect"],
+          localized: true,
+          status: false,
+        })
+      : null;
+
+    /**
+     * Register the pair through whichever sink is available.
+     *
+     * 🔴 Both tables, always. A localized field group's reads and writes go through the COMPANION,
+     * so registering only the main table leaves the half that actually serves translated values
+     * stale — and a caller that reports this as a completed refresh then tells an operator the
+     * group is usable when the localized half is not. Written once and applied to both sinks
+     * because the two branches answer the same question, and the fallback previously answered it
+     * differently while returning the same verdict.
+     */
+    const registerBoth = (
+      register: (name: string, table: unknown) => void
+    ): void => {
+      register(tableName, runtimeTable);
+      if (companion) {
+        register(companion.companionTableName, companion.table);
+      }
+    };
+
+    const registry = getSchemaRegistryFromDI();
+    if (registry) {
+      registerBoth((name, table) =>
+        registry.registerDynamicSchema(name, table)
+      );
+      return { registered: true };
+    }
+
+    // Fallback for paths where DI isn't wired (tests, CLI).
+    const resolver = (
+      adapter as unknown as {
+        tableResolver?: {
+          registerDynamicSchema?: (name: string, table: unknown) => void;
+        };
+      }
+    ).tableResolver;
+    const fallbackRegister = resolver?.registerDynamicSchema;
+    if (typeof fallbackRegister === "function") {
+      registerBoth((name, table) =>
+        fallbackRegister.call(resolver, name, table)
+      );
+      return { registered: true };
+    }
+
+    consoleLogger.warn(
+      `[registerComponentRuntimeSchema] No SchemaRegistry available for ` +
+        `'${tableName}'. Component queries may reference old column names ` +
+        `until next server restart.`
+    );
+    return {
+      registered: false,
+      reason: "no schema registry is available in this process",
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    consoleLogger.warn(
+      `[registerComponentRuntimeSchema] In-memory schema refresh failed for ` +
+        `'${tableName}': ${msg}. Component queries may reference old ` +
+        `column names until next server restart.`
+    );
+    return { registered: false, reason: msg };
+  }
+}
+
+/**
+ * Provision (create / ADD-DROP columns) the component's companion `comp_<slug>_locales` table
+ * out-of-band after a schema change, then register its runtime table. The push pipeline excludes
+ * companions, so every component create/update/apply path that changes the localized field set
+ * goes through here. No-op when the component isn't localized. Mirrors reconcileSingleCompanion.
+ * DDL throws on failure; runtime registration is best-effort. Does not move existing main-table
+ * rows into the companion — that is the `nextly migrate` enable/disable path.
+ */
+export async function reconcileComponentCompanion(args: {
+  slug: string;
+  tableName: string;
+  oldFields: FieldDefinition[];
+  newFields: FieldDefinition[];
+  /** Localization state AFTER this save (requested). */
+  localized: boolean;
+  /** Localization state BEFORE this save (persisted). Drives enable/disable detection. */
+  wasLocalized: boolean;
+  adapter: DrizzleAdapter;
+  /**
+   * Fields becoming translated whose companion columns the caller already added, with their
+   * values, before the main table changed (`moveValuesOfFieldsJoiningTranslation`).
+   */
+  joinedBefore?: readonly string[];
+  /** A translated field this change renames, by field name; its companion column is renamed. */
+  renamed?: FieldRename;
+  /**
+   * Applies the Required and Unique settings of fields leaving translation, once their values are
+   * copied onto main and before their companion columns are dropped (`settleThenDropLeavingFields`),
+   * throwing when they are refused. Left out, each column is dropped right after its copy.
+   */
+  settleLeaving?: () => Promise<void>;
+  /** A Schema Builder save's wait for a busy table (`applyCompanionTransition`). */
+  busyTable?: BusyTableWait;
+  // Whether any DDL actually ran. The caller cannot derive this from the request: a field-set
+  // change on a group that was and remains non-localized reaches here and moves nothing, and a
+  // caller that inferred "the tables changed" from the request shape would report a physical
+  // transition that never happened.
+}): Promise<boolean> {
+  const { slug, tableName, oldFields, newFields, localized, adapter } = args;
+  const wasLocalized = args.wasLocalized;
+  // Nothing to do when the component was and remains non-localized.
+  if (!wasLocalized && !localized) return false;
+
+  const dialect = adapter.dialect;
+  const defaultLocale = appLocalization()?.defaultLocale ?? "en";
+
+  // A translated field made unique is refused before any DDL where the rule cannot hold: on a
+  // server that cannot key its index, or where a language already holds a value twice. Asked here,
+  // where every field-group path that changes the companion arrives, so the service's own update
+  // is refused as the schema dialog's is, before a statement runs (MySQL commits each one).
+  await refuseTranslatedUniqueThatCannotHold({
+    adapter,
+    entity: slug,
+    tableName,
+    builtBy: "fieldGroup",
+    oldFields,
+    newFields,
+    wasLocalized,
+    isLocalized: localized,
+  });
+
+  const companionExists = await adapter.tableExists(`${tableName}_locales`);
+  const plan = buildCompanionTransitionStatements({
+    // The companion mirrors the main table, and a field group's builder reads a width from a different key.
+    builtBy: "fieldGroup" as const,
+    slug,
+    kind: "fieldGroup",
+    tableName,
+    dialect,
+    defaultLocale,
+    languageOrder: appLanguageOrder(),
+    // Components are never Draft/Published — companion has no `_status`.
+    status: false,
+    // And never had one, so the disable restore has no status to carry back.
+    wasStatus: false,
+    wasLocalized,
+    isLocalized: localized,
+    oldFields,
+    newFields,
+    companionExists,
+    joinedBefore: args.joinedBefore,
+    renamed: args.renamed,
+    holdLeavingDrops: args.settleLeaving !== undefined,
+    // What this database holds now, so a re-save after a part-applied one finishes it.
+    ...(await liveCompanionShape(adapter, {
+      tableName,
+      oldFields,
+      newFields,
+      builtBy: "fieldGroup",
+      companionExists,
+    })),
+  });
+
+  await applyCompanionTransition({
+    adapter,
+    plan,
+    settleLeaving: args.settleLeaving,
+    ...(args.busyTable === undefined ? {} : { busyTable: args.busyTable }),
+    kind: "fieldGroup",
+    slug,
+    tableName,
+  });
+
+  // Runtime registration of the companion is handled by registerComponentRuntimeSchema(localized)
+  // in the calling handlers, so no separate registration is needed here.
+
+  // The archive DDL is excluded on purpose: it provisions a shared framework table and is
+  // idempotent, so it says nothing about whether THIS field group's storage moved.
+  return plan.statements.length > 0;
+}
+
+/**
+ * Which discriminator column a field group's table actually carries.
+ *
+ * PROBED rather than assumed, because the storage migration renames these tables and their
+ * columns: which spelling a given database uses is a fact about that database, not something a
+ * release can infer from its own version. The constant is the fallback for a table the probe
+ * cannot see, which is the shape a fresh install has.
+ *
+ * Here rather than private to a transport for the reason the rest of this module exists: the
+ * dispatcher held it, so every other transport that rebinds a runtime schema either reimplemented
+ * it or skipped it.
+ *
+ * 🔴 Call it BEFORE the DDL, never from inside `registerComponentRuntimeSchema`. That function's
+ * `catch` is a cache-refresh failsafe — it suppresses so a refresh problem cannot fail a request
+ * whose schema change already committed — and a catalog probe placed inside it inherits that
+ * policy, letting a caller report success while leaving the runtime table unregistered or holding
+ * obsolete columns. Resolving first is equivalent and safer: a schema change only ever alters user
+ * columns, so the discriminator is the same either side of it, and a probe that cannot answer
+ * fails the request before anything is committed.
+ */
+export async function resolveComponentTypeColumn(
+  adapter: DrizzleAdapter,
+  tableName: string
+): Promise<string> {
+  // Derived from the fuller answer, read by the same one catalog listing.
+  return (await resolveComponentTableColumns(adapter, tableName)).typeColumn;
+}
+
+/**
+ * {@link resolveComponentTypeColumn} with the columns the table holds, for a caller that registers
+ * the runtime table over a table it does not alter: a field inside a group with no name whose
+ * column the table lacks yet is then left out of it (`RuntimeSchemaOptions.heldColumns`).
+ */
+export async function resolveComponentTableColumns(
+  adapter: DrizzleAdapter,
+  tableName: string
+): Promise<{ typeColumn: string; columns: readonly string[] | undefined }> {
+  const { resolveTableColumns } = await import(
+    "../storage/resolve-storage-names"
+  );
+  const { STORAGE_FORMAT } = await import("../../../schemas/storage-format");
+  const held = (await resolveTableColumns(adapter, [tableName])).get(tableName);
+  return {
+    typeColumn: held?.typeColumn ?? STORAGE_FORMAT.columns.type,
+    columns: held?.columns,
+  };
+}

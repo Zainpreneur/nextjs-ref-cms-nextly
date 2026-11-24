@@ -1,0 +1,172 @@
+---
+name: release-and-changesets
+description: Use when adding a changeset to a PR, deciding whether a PR needs one, cutting or debugging a release, or when the Version PR / npm publish flow looks wrong.
+metadata:
+  internal: true
+---
+
+# Changesets and releases in the Nextly monorepo
+
+## The changeset rules (non-negotiable)
+
+- **ONE changeset per PR**, not per commit.
+- It must list **ALL published packages** (they are a `fixed` lockstep group
+  in `.changeset/config.json`; the repo is in pre-release `alpha` mode via
+  `.changeset/pre.json`).
+- Always **`patch`** while in alpha.
+- The description is the USER-facing impact, one or two lines, not an
+  implementation note.
+- **No changeset** for PRs that touch only tests, CI/workflows, repo docs,
+  or other non-published files. When in doubt: does the change alter what a
+  user installs from npm? No -> no changeset.
+
+Create one with `pnpm changeset` (select all packages, patch) or write the
+file by hand under `.changeset/` following an existing one.
+
+## How releasing actually works (CI-only)
+
+1. PRs with changesets merge into `dev`, and reach `main` with the daily
+   promotion (a pull request from `dev` that lands only when `dev` is green).
+   Releases are cut from `main` alone; `.changeset/config.json`'s
+   `baseBranch` is `dev` because only `changeset status` and `changeset add`
+   read it, to compare a branch with where it merges.
+2. When a release is wanted, a maintainer runs the Release workflow from the
+   Actions tab ("Run workflow" on `main`; the job runs from no other branch or
+   tag). With changesets pending it opens or refreshes the Version PR
+   ("chore: version packages (alpha)"), which bumps every package in lockstep
+   and updates changelogs. A push to `main` does not refresh it: only that
+   PR's own merge runs the Release job on a push.
+3. **Merging the Version PR publishes**: the release workflow builds and
+   publishes all packages to npm via trusted publishing (OIDC) in the
+   protected environment. It publishes the version that merge carries even
+   when other changesets reached `main` after the PR was last refreshed; those
+   wait for the next run of the workflow. A public package added after that
+   refresh is the exception: it would stay on the old version, so CI's
+   "Release versions in lockstep" step fails the PR (and the queue's run of
+   it) until the workflow is run again to refresh it. Every real version is published this way; never run
+   `changeset publish` or `npm publish` yourself. The one exception is the
+   `0.0.0` placeholder that claims a brand-new package name: a maintainer with
+   publish rights on npm runs `scripts/release/bootstrap-package.mjs` once,
+   locally, and the helper refuses to publish when `CI` is set. See
+   "Bootstrapping a brand-new package" below.
+4. Tags (`vX.Y.Z-alpha.N`) and a consolidated GitHub Release are created by
+   the workflow.
+5. After the release, merge `main` back into `dev`, so `dev` carries the
+   version bump, the changelogs and `.changeset/pre.json`, and the next
+   promotion brings only new commits.
+
+## Known gotchas (learned the hard way)
+
+- The release workflow no longer upgrades npm, on purpose. `pnpm publish`
+  performs the OIDC token exchange itself, so the version trusted publishing
+  depends on is the pnpm in `packageManager`, not the npm on `PATH`. Do not add
+  an npm upgrade step back; the comment on the Node setup step in
+  `.github/workflows/release.yml` says why the old pin is obsolete.
+- Old branches can restore already-published changeset files on merge; if
+  the Version PR suddenly lists ancient entries, check for resurrected
+  `.changeset/*.md` files and delete them in a cleanup PR.
+- The npm `latest` dist-tag for the unscoped packages is managed manually
+  after publishes; a publish alone does not move it. Only move it once a
+  release is verified complete: promoting a partial train points a bare
+  `npm install` at a version whose siblings never shipped.
+- If the Version PR looks wrong, fix the inputs (changeset files on main);
+  never edit the Version PR's generated diff by hand.
+
+## A publish is not atomic
+
+`changeset publish` pushes packages one at a time. When one fails, the rest
+are already live and cannot be unpublished, so a release can end up split
+across versions. Two guards exist:
+
+- `pnpm release:preflight` runs first inside `release:publish`. It refuses to
+  start when a package has incomplete publish metadata, when the versions are
+  not in lockstep, or when a package name has never been published (see
+  bootstrapping below). It costs one registry lookup per package and saves a
+  ten-minute build that could only end in a half-release.
+- `pnpm release:verify` runs after publishing and compares the registry to the
+  workspace. The consolidated tag and GitHub Release are created only when it
+  passes, so git and npm cannot disagree about what shipped.
+
+Run either by hand at any time; both are read-only.
+
+## Recovering a partial release
+
+Publishing is resumable: `changeset publish` skips versions the registry
+already has, so a re-run only attempts the missing packages.
+
+1. `pnpm release:verify` to list exactly which packages are missing and why.
+2. Fix the cause per package (metadata, npm access, trusted publisher).
+3. Retry the publish. When the fix is outside the repository (npm access, a
+   trusted publisher), re-run the Release run that failed
+   (`gh run rerun <id> --failed`). A re-run uses the same commit, and a re-run
+   of the Version PR merge's push publishes that commit's version whatever is
+   pending on `main`. When the fix is a commit, land it on
+   `main` with no new changeset, then run the Release workflow from the
+   Actions tab on `main`. In prerelease mode the `.changeset/*.md` files stay
+   on disk after versioning, but the ones already recorded in
+   `pre.json.changesets` do not count as pending, so with nothing else pending
+   the run takes the publish path and retries the current version. With any
+   changeset pending, it versions instead: it opens a Version PR and moves the
+   train to the next version.
+4. Do not bump the version to "get a clean run": that abandons the partial
+   version permanently, leaving a hole where some packages exist at a version
+   and their siblings never do.
+
+Finalization (the consolidated tag and GitHub Release) is gated on the registry
+being complete, not on whether a particular run published something, so a
+recovery run still creates the tag for a release whose packages were published
+earlier.
+
+## Bootstrapping a brand-new package
+
+A trusted publisher is configured per package on npmjs.com, and it can only be
+attached to a package that exists. A new package therefore cannot publish
+through the normal OIDC flow on its first release, which surfaces as a `404
+… could not be found or you do not have permission to access it`.
+
+For each new package name, in order:
+
+1. Confirm the manifest carries `license`, `repository.directory`,
+   `engines.node`, and `publishConfig.access: "public"`. A scoped package
+   without `access: "public"` is published as restricted and fails.
+2. Claim the name with a placeholder that contains no code:
+
+   ```sh
+   npm login
+   node scripts/release/bootstrap-package.mjs @nextlyhq/<name>            # shows the plan
+   node scripts/release/bootstrap-package.mjs @nextlyhq/<name> --publish  # claims 0.0.0
+   ```
+
+   The helper refuses to run against a name that already exists, and publishes
+   only a `package.json` and a README. Real versions are always published by
+   CI. (`nextly` itself was claimed this way with a `0.0.1` stub.)
+
+3. Add the package's Trusted Publisher entry at
+   `https://www.npmjs.com/package/<name>/access`: repository `nextlyhq/nextly`,
+   workflow `release.yml`, environment `Production`. The environment name must
+   match the release workflow's `environment:` exactly, or publishing fails
+   with the same 404.
+4. Add the package name to `packages` in
+   `scripts/release/first-publish-acknowledged.json`, in the same pull request
+   that adds the package (or, when that has already merged, in one of its
+   own), and only after step 3. Preflight reads that file. It refuses to start
+   a release while a package's only npm version is the `0.0.0` placeholder and
+   its name is not listed, because nothing on the registry shows whether step 3
+   was done. Once the package has published a real version, preflight says the
+   entry is no longer needed; remove it then.
+5. If a release was already blocked on this package, re-run it so the package
+   rejoins the train. Preflight reads the list from the commit being released,
+   so the entry has to be on `main` first. Re-running the blocked workflow run
+   reuses its old commit and is refused again; land the change on `main` with
+   no new changeset instead, then run the Release workflow from the Actions
+   tab, as in "Recovering a partial release" above.
+
+There is no CI-only path for step 2, and no override for it: OIDC cannot perform
+a package's first publish, and giving CI a long-lived npm token just to claim a
+name would replace short-lived trusted publishing with a standing credential.
+The helper refuses to publish when `CI` is set for that reason. Preflight blocks
+the whole release until the name exists, which is deliberate: the alternative is
+publishing the rest of the train and stranding this package.
+
+Adding a package to the `fixed[]` group without completing the steps above is
+what makes the _next_ release fail.

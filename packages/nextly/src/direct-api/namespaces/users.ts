@@ -1,0 +1,354 @@
+/**
+ * Direct API Users Namespace
+ *
+ * Factory for the `nextly.users.*` sub-namespace. Provides CRUD operations
+ * on the users collection via the dedicated `UserService` (not the generic
+ * collection handler).
+ *
+ * @packageDocumentation
+ */
+
+import type { ListedExternalIdentity } from "../../domains/auth/services/identity-service";
+import {
+  SYSTEM_READ_POLICY,
+  SYSTEM_WRITE_POLICY,
+} from "../../domains/auth/system-write-policy";
+import { NextlyError } from "../../errors/nextly-error";
+import type { User } from "../../services/users/user-service";
+import { assertNoHiddenFieldQueried } from "../../shared/lib/filterable-fields";
+import type {
+  CreateUserArgs,
+  DeleteUserArgs,
+  DirectAPIConfig,
+  FindOneUserArgs,
+  FindUserByIDArgs,
+  FindUsersArgs,
+  ListResult,
+  ListUserIdentitiesArgs,
+  MutationResult,
+  UnlinkIdentityArgs,
+  UpdateUserArgs,
+} from "../types/index";
+
+import type { NextlyContext } from "./context";
+import {
+  authorizeChecked,
+  checkRead,
+  checkedCaller,
+  checkedRoleChange,
+  createRequestContext,
+  isNotFoundError,
+  mergeConfig,
+  toListResult,
+  type RouteGrant,
+} from "./helpers";
+import { hiddenUserFieldPaths, withoutHiddenPaths } from "./hidden-fields";
+
+/**
+ * The check an identities method runs first, as REST's two doors ask it: a
+ * person acting on their own account needs only to be named, as the
+ * signed-in caller of `/api/me/identities` needs only a session; another
+ * account's identities take the user-management `grant`, and so does every
+ * call made under an API key, its maker's own account included, as REST
+ * asks of a key at either door. A trusted call is server code, and runs
+ * unchecked as every other trusted call does.
+ */
+async function checkIdentityAccess(
+  ctx: NextlyContext,
+  args: DirectAPIConfig,
+  userId: string,
+  grant: RouteGrant
+): Promise<void> {
+  const caller = checkedCaller(ctx.defaultConfig, args);
+  if (!caller) return;
+  const ownSession =
+    caller.authMethod === "session" && caller.userId === userId;
+  if (!ownSession) await authorizeChecked(caller, grant);
+}
+
+/**
+ * Users namespace API, bound to a Nextly context.
+ *
+ * `ListResult<T>` / `MutationResult<T>` envelopes so the Direct API and
+ * the wire API speak the same shape.
+ */
+export interface UsersNamespace {
+  find(args?: FindUsersArgs): Promise<ListResult<User>>;
+  findOne(args?: FindOneUserArgs): Promise<User | null>;
+  findByID(args: FindUserByIDArgs): Promise<User | null>;
+  create(args: CreateUserArgs): Promise<MutationResult<User>>;
+  update(args: UpdateUserArgs): Promise<MutationResult<User>>;
+  delete(args: DeleteUserArgs): Promise<MutationResult<{ id: string }>>;
+  /** The account's linked sign-in identities, oldest link first, as one page. */
+  listIdentities(
+    args: ListUserIdentitiesArgs
+  ): Promise<ListResult<ListedExternalIdentity>>;
+  /** Remove one linked identity from the account, and nothing else. */
+  unlinkIdentity(
+    args: UnlinkIdentityArgs
+  ): Promise<MutationResult<{ id: string }>>;
+}
+
+/**
+ * Build the `users` namespace for a `Nextly` instance.
+ */
+export function createUsersNamespace(ctx: NextlyContext): UsersNamespace {
+  /**
+   * The custom user fields this read leaves out, judged by the fields the
+   * user services read and write; none unless it passes
+   * `showHiddenFields: false`.
+   */
+  const hiddenUserFields = (args: DirectAPIConfig): ReadonlySet<string> =>
+    hiddenUserFieldPaths(mergeConfig(ctx.defaultConfig, args), () =>
+      ctx.userService.customFieldConfigs()
+    );
+
+  /** The search option for a read leaving `hidden` out: none when it keeps them. */
+  const unsearched = (
+    hidden: ReadonlySet<string>
+  ): { unsearchedFields?: ReadonlySet<string> } =>
+    hidden.size === 0 ? {} : { unsearchedFields: hidden };
+
+  return {
+    async find(args: FindUsersArgs = {}): Promise<ListResult<User>> {
+      // Checked as REST's user list is, before anything is read.
+      await checkRead(ctx.defaultConfig, args, SYSTEM_READ_POLICY.users.read);
+      const limit = args.limit ?? 10;
+      const page = args.page ?? 1;
+      // Past the read check: a sort by a field this read leaves out is
+      // refused, since the order would reveal the value, and the search does
+      // not match one, since which users match would.
+      const hidden = hiddenUserFields(args);
+      assertNoHiddenFieldQueried(
+        {
+          sort: args.sortBy === undefined ? [] : [args.sortBy],
+          // Reported under the argument the caller sorted with.
+          labels: { sort: "sortBy" },
+        },
+        hidden
+      );
+
+      const result = await ctx.userService.listUsers(
+        {
+          pagination: { limit, page },
+          search: args.search,
+          ...unsearched(hidden),
+          emailVerified: args.emailVerified,
+          hasPassword: args.hasPassword,
+          sortBy: args.sortBy,
+          sortOrder: args.sortOrder,
+        },
+        createRequestContext(args)
+      );
+
+      // The limit the service ACTUALLY paginated by, not the one requested. It bounds the page
+      // size it will honour, and deriving `totalPages` from the request instead would report a
+      // page count for a page size that was never used.
+      return toListResult(
+        {
+          ...result,
+          data: result.data.map(user => withoutHiddenPaths(user, hidden)),
+        },
+        result.pagination.limit,
+        page
+      );
+    },
+
+    async findOne(args: FindOneUserArgs = {}): Promise<User | null> {
+      // A search of the list, so it asks what the list asks.
+      await checkRead(ctx.defaultConfig, args, SYSTEM_READ_POLICY.users.read);
+      const hidden = hiddenUserFields(args);
+      const result = await ctx.userService.listUsers(
+        {
+          pagination: { limit: 1, page: 1 },
+          search: args.search,
+          ...unsearched(hidden),
+          emailVerified: args.emailVerified,
+          hasPassword: args.hasPassword,
+        },
+        createRequestContext(args)
+      );
+
+      const user = result.data[0];
+      return user === undefined ? null : withoutHiddenPaths(user, hidden);
+    },
+
+    async findByID(args: FindUserByIDArgs): Promise<User | null> {
+      // Refused before the lookup, so `disableErrors` answers a refusal as a
+      // refusal, never as a missing user.
+      await checkRead(ctx.defaultConfig, args, SYSTEM_READ_POLICY.users.read);
+      const config = mergeConfig(ctx.defaultConfig, args);
+
+      try {
+        const user = await ctx.userService.findById(
+          args.id,
+          createRequestContext(args)
+        );
+        return withoutHiddenPaths(user, hiddenUserFields(args));
+      } catch (error) {
+        if (config.disableErrors && isNotFoundError(error)) {
+          return null;
+        }
+        throw error;
+      }
+    },
+
+    async create(args: CreateUserArgs): Promise<MutationResult<User>> {
+      const data = args.data ?? {};
+      const { name, image, roles, isActive, ...customFields } = data;
+      const user = await checkedRoleChange(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.users.create,
+        () =>
+          ctx.userService.create(
+            {
+              email: args.email,
+              name: (name as string) ?? "",
+              password: args.password,
+              image: image as string | undefined,
+              roles: roles as string[] | undefined,
+              isActive: isActive as boolean | undefined,
+              ...customFields,
+            },
+            createRequestContext(args)
+          )
+      );
+      // matching the wire API. Hardcoded noun ("User") since this is the
+      // users-specific namespace.
+      return {
+        message: "User created.",
+        item: user,
+      };
+    },
+
+    async update(args: UpdateUserArgs): Promise<MutationResult<User>> {
+      if (!args.id) {
+        throw new NextlyError({
+          code: "INVALID_INPUT",
+          publicMessage: "'id' is required for users.update()",
+          statusCode: 400,
+        });
+      }
+
+      const data = args.data ?? {};
+      const { email, name, image, emailVerified, isActive, ...customFields } =
+        data;
+      const id = args.id;
+      const user = await checkedRoleChange(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.users.update,
+        () =>
+          ctx.userService.update(
+            id,
+            {
+              email: email as string | undefined,
+              name: name as string | undefined,
+              image: image as string | undefined,
+              emailVerified: emailVerified as Date | null | undefined,
+              isActive: isActive as boolean | undefined,
+              ...customFields,
+            },
+            createRequestContext(args)
+          )
+      );
+      return {
+        message: "User updated.",
+        item: user,
+      };
+    },
+
+    async delete(
+      args: DeleteUserArgs
+    ): Promise<MutationResult<{ id: string }>> {
+      if (!args.id) {
+        throw new NextlyError({
+          code: "INVALID_INPUT",
+          publicMessage: "'id' is required for users.delete()",
+          statusCode: 400,
+        });
+      }
+
+      const id = args.id;
+      await checkedRoleChange(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.users.delete,
+        () => ctx.userService.delete(id, createRequestContext(args))
+      );
+      // For deletes the `item` is just the deleted id so callers can still
+      // chain on something concrete (matches the wire API's `{ id }` shape
+      // returned by delete handlers under `respondMutation`).
+      return {
+        message: "User deleted.",
+        item: { id: args.id },
+      };
+    },
+
+    async listIdentities(
+      args: ListUserIdentitiesArgs
+    ): Promise<ListResult<ListedExternalIdentity>> {
+      if (!args.userId) {
+        throw new NextlyError({
+          code: "INVALID_INPUT",
+          publicMessage: "'userId' is required for users.listIdentities()",
+          statusCode: 400,
+        });
+      }
+
+      // Checked as REST checks the listing — another account's with the
+      // user read `findByID` asks, the caller's own as `/api/me/identities`
+      // serves it — before anything is read.
+      await checkIdentityAccess(
+        ctx,
+        args,
+        args.userId,
+        SYSTEM_READ_POLICY.users.read
+      );
+      const identities = await ctx.identityService.listExternalIdentities(
+        args.userId
+      );
+      // Every identity in one page: an account holds a handful, and the
+      // listing is not paginated at either door.
+      return toListResult(
+        { data: identities, pagination: { total: identities.length } },
+        Math.max(identities.length, 1),
+        1
+      );
+    },
+
+    async unlinkIdentity(
+      args: UnlinkIdentityArgs
+    ): Promise<MutationResult<{ id: string }>> {
+      if (!args.userId || !args.identityId) {
+        throw new NextlyError({
+          code: "INVALID_INPUT",
+          publicMessage:
+            "'userId' and 'identityId' are required for users.unlinkIdentity()",
+          statusCode: 400,
+        });
+      }
+
+      // Checked as REST checks the unlink — another account's with the
+      // user update the role assignments take, the caller's own as
+      // `/api/me/identities` serves it — before anything is written.
+      await checkIdentityAccess(
+        ctx,
+        args,
+        args.userId,
+        SYSTEM_WRITE_POLICY.users.update
+      );
+      await ctx.identityService.unlinkExternalIdentity(
+        args.userId,
+        args.identityId
+      );
+      // The unlinked identity's own id, as the delete's `item` carries the
+      // deleted user's: something concrete to chain on.
+      return {
+        message: "Identity unlinked.",
+        item: { id: args.identityId },
+      };
+    },
+  };
+}

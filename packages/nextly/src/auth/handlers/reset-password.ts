@@ -1,0 +1,144 @@
+/**
+ * POST /auth/reset-password
+ *
+ * Resets password using a valid reset token. Per spec §13.4, all token-related
+ * failure modes (expired, unknown, used) collapse into a single response:
+ * 400 INVALID_INPUT / "This reset link is invalid or has expired." Internal
+ * details (which leg actually failed) live only in logContext.
+ *
+ * The reset's password write ends every session the account holds, in the
+ * same transaction (force re-login on all devices).
+ */
+// CSRF double-submit cookie + origin check. The URL token is already an
+// unguessable secret, but CSRF still prevents cross-origin abuse of the
+// authenticated password-reset form. See docs/auth/csrf.md.
+import { readOrGenerateRequestId } from "../../api/request-id";
+import { respondAction } from "../../api/response-shapes";
+import { NextlyError } from "../../errors/nextly-error";
+import { retryAfterHeader } from "../../errors/retry-after";
+import { readCsrfCookie, readCsrfFromRequest } from "../csrf/csrf-cookie";
+import { validateCsrf } from "../csrf/validate";
+
+import { csrfFailure, jsonResponse } from "./handler-utils";
+
+export interface ResetPasswordHandlerDeps {
+  allowedOrigins: string[];
+  /**
+   * Throws NextlyError on failure (any token-related failure, including
+   * expired / unknown / used, must be normalised by the caller into the
+   * INVALID_INPUT shape). Ends every session the account holds on success.
+   */
+  resetPasswordWithToken: (
+    token: string,
+    newPassword: string
+  ) => Promise<{ email: string }>;
+}
+
+function buildResetErrorResponse(
+  err: NextlyError,
+  requestId: string
+): Response {
+  return new Response(
+    JSON.stringify({ error: err.toResponseJSON(requestId) }),
+    {
+      status: err.statusCode,
+      headers: {
+        "content-type": "application/problem+json",
+        "x-request-id": requestId,
+        ...retryAfterHeader(err),
+      },
+    }
+  );
+}
+
+/**
+ * Collapse all token-related failures (expired, unknown, used) into the
+ * spec §13.4 unified response. Anything else (DB outage, etc.) propagates.
+ */
+function normaliseTokenFailure(err: unknown): NextlyError {
+  if (NextlyError.is(err)) {
+    if (
+      err.code === "NOT_FOUND" ||
+      err.code === "INVALID_INPUT" ||
+      err.code === "TOKEN_EXPIRED" ||
+      err.code === "VALIDATION_ERROR"
+    ) {
+      return new NextlyError({
+        code: "INVALID_INPUT",
+        publicMessage: "This reset link is invalid or has expired.",
+        logContext: {
+          ...(err.logContext ?? {}),
+          originalCode: err.code,
+        },
+      });
+    }
+  }
+  // Not a token-related failure — caller handles (typically rethrow).
+  throw err;
+}
+
+export async function handleResetPassword(
+  request: Request,
+  deps: ResetPasswordHandlerDeps
+): Promise<Response> {
+  const requestId = readOrGenerateRequestId(request);
+
+  try {
+    const body = await request.json();
+
+    const csrfCookie = readCsrfCookie(request);
+    const csrfToken = readCsrfFromRequest(body, request);
+    const csrfResult = validateCsrf(
+      request,
+      csrfCookie,
+      csrfToken,
+      deps.allowedOrigins
+    );
+    if (!csrfResult.valid) {
+      return jsonResponse(
+        403,
+        { error: csrfFailure(request, csrfResult) },
+        { "x-request-id": requestId }
+      );
+    }
+
+    const { token, newPassword } = body;
+    if (!token || !newPassword) {
+      throw NextlyError.validation({
+        errors: [
+          ...(!token
+            ? [{ path: "token", code: "REQUIRED", message: "Required." }]
+            : []),
+          ...(!newPassword
+            ? [{ path: "newPassword", code: "REQUIRED", message: "Required." }]
+            : []),
+        ],
+      });
+    }
+
+    try {
+      await deps.resetPasswordWithToken(token, newPassword);
+    } catch (err) {
+      // normaliseTokenFailure either returns the unified INVALID_INPUT error
+      // or re-throws (for non-token failures). The thrown re-throw is caught
+      // by the outer catch.
+      throw normaliseTokenFailure(err);
+    }
+
+    // Success body is just `{ message: "Password reset." }` per spec §7.6.
+    return respondAction(
+      "Password reset.",
+      {},
+      { status: 200, headers: { "x-request-id": requestId } }
+    );
+  } catch (err) {
+    if (NextlyError.is(err)) {
+      return buildResetErrorResponse(err, requestId);
+    }
+    return buildResetErrorResponse(
+      // Internal, unless the database was only busy.
+      NextlyError.fromUnexpected(err),
+      requestId
+    );
+  }
+}

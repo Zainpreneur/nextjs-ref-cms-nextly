@@ -1,0 +1,347 @@
+/**
+ * Collection Schema API Route Handlers for Next.js
+ *
+ * These route handlers can be re-exported in your Next.js application to provide
+ * collection schema management endpoints at /api/collections/schema.
+ *
+ * Services are auto-initialized on first request using environment variables:
+ * - DB_DIALECT: Database dialect ("postgresql" | "mysql" | "sqlite")
+ * - DATABASE_URL: Database connection string
+ *
+ * @example
+ * ```typescript
+ * // In your Next.js app: app/api/collections/schema/route.ts
+ * export { GET, POST } from 'nextly/api/collections-schema';
+ * ```
+ *
+ * @module api/collections-schema
+ */
+
+import { z } from "zod";
+
+import { schemaListed } from "../auth/access/route-gate-adapters";
+import { getRBACService } from "../auth/code-access";
+import { COLLECTION_DEFINITION_PERMISSIONS } from "../auth/collection-definition-policy";
+import { getService } from "../di";
+import { withSchemaChangeExcluded } from "../domains/schema/services/schema-change-exclusion";
+import { calculateSchemaHash } from "../domains/schema/services/schema-hash";
+import { assertNoNewSiblingClashes } from "../domains/schema/sibling-fields";
+import { resolveBuilderVersions } from "../domains/versions/builder-versions";
+import { resolveBuilderWebhooks } from "../domains/webhooks/builder-webhooks";
+import { getFilterRegistry, FilterSeams } from "../filters";
+import { getCachedNextly } from "../init";
+import { resolveBuilderRevalidate } from "../revalidation/builder-revalidate";
+import type { CollectionRegistryService } from "../services/collections/collection-registry-service";
+import { assertGlobalResourceSlugAvailable } from "../services/lib/resource-slug-guard";
+import { addressSchema } from "../shared/address-rule";
+import { requireBuilderEnabled } from "../shared/builder-access";
+import { simplePluralize } from "../shared/lib/pluralization";
+
+import { assertValidFieldsPayload } from "./fields-payload";
+import { respondList, respondMutation } from "./response-shapes";
+import {
+  requireRouteAllPermissions,
+  requireRouteAuthentication,
+} from "./route-auth";
+import { withErrorHandler } from "./with-error-handler";
+import { nextlyValidationFromZod } from "./zod-to-nextly-error";
+
+/**
+ * @experimental D63 `admin.nav` filter seam. Lets plugins transform the
+ * collection list that feeds the admin sidebar (hide/reorder/relabel).
+ */
+export async function applyAdminNavFilter<T extends { slug: string }>(
+  items: T[],
+  userId: string
+): Promise<T[]> {
+  return getFilterRegistry().applyFilters(FilterSeams.AdminNav, items, {
+    userId,
+  });
+}
+
+async function getCollectionRegistry(): Promise<CollectionRegistryService> {
+  await getCachedNextly();
+  return getService("collectionRegistryService");
+}
+
+const createCollectionSchema = z.object({
+  // The one address rule every road shares, so this manifest-shaped create
+  // refuses exactly what the Builder's create and configuration refuse.
+  slug: addressSchema("collection"),
+  labels: z.object({
+    singular: z.string().trim().min(1, "Singular label is required"),
+    plural: z.string().trim().min(1, "Plural label is required").optional(),
+  }),
+  description: z.string().optional(),
+  // Validated against the shared manifest field rules after parse (see
+  // api/fields-payload); kept unknown here so passthrough keys survive.
+  fields: z.array(z.unknown()),
+  timestamps: z.boolean().default(true),
+  // Draft/Published opt-in. Default false keeps the existing public API
+  // contract — collections without the flag continue to ship a single
+  // Save/Create button.
+  status: z.boolean().optional(),
+  // i18n opt-in. Default false keeps non-localized behavior. Enabling adds the
+  // companion `_locales` table on the next migrate (migration-gated).
+  localized: z.boolean().optional(),
+  // Version history opt-in. Default off: capture adds a row to nextly_versions
+  // on every save, which no existing caller has asked for.
+  versions: z.boolean().optional(),
+  // Retention: durable versions kept per document. `false` = unlimited, a
+  // non-negative integer = keep that many, absent = the default (50). Only
+  // meaningful when `versions` is on.
+  versionsMaxPerDoc: z
+    .union([z.number().int().nonnegative(), z.literal(false)])
+    .optional(),
+  // Cache-revalidation opt-out. Default on (absent): writes bust the standard
+  // nextly:* tags; false persists the disable config so this collection busts
+  // nothing.
+  revalidate: z.boolean().optional(),
+  // Webhook recording opt-out. Default on (absent): writes are recorded to the
+  // outbox and delivered to subscribed endpoints; false persists the opt-out so
+  // this collection's content never leaves the app.
+  webhooks: z.boolean().optional(),
+  admin: z
+    .object({
+      group: z.string().optional(),
+      icon: z.string().optional(),
+      hidden: z.boolean().optional(),
+      useAsTitle: z.string().optional(),
+      isPlugin: z.boolean().optional(),
+      order: z.number().optional(),
+      sidebarGroup: z.string().optional(),
+    })
+    .optional(),
+  hooks: z.array(z.any()).optional(),
+});
+
+/**
+ * GET handler for listing collections with pagination and filters.
+ *
+ * Returns only collections the caller has read permission for; super-admins
+ * see everything. Anonymous callers get 401.
+ *
+ * Query Parameters:
+ * - source: Filter by source type ("code" | "ui" | "built-in")
+ * - search: Search query for slug and labels
+ * - limit: Maximum results (default: 50)
+ * - offset: Number of results to skip (default: 0)
+ *
+ * Response Codes:
+ * - 200 OK: Collections list retrieved successfully
+ * - 401 Unauthorized: Authentication required
+ * - 500 Internal Server Error: Failed to fetch collections
+ *
+ * @example
+ * ```bash
+ * curl "http://localhost:3000/api/collections/schema?source=ui&limit=10"
+ * # => {"items":[...],"meta":{"total":5,"page":1,"limit":10,"totalPages":1,"hasNext":false,"hasPrev":false}}
+ * ```
+ */
+export const GET = withErrorHandler(async (request: Request) => {
+  const auth = await requireRouteAuthentication(request);
+
+  const registry = await getCollectionRegistry();
+  const { searchParams } = new URL(request.url);
+
+  const source = searchParams.get("source") as
+    | "code"
+    | "ui"
+    | "built-in"
+    | null;
+  const search = searchParams.get("search") || undefined;
+  const limit = searchParams.get("limit")
+    ? parseInt(searchParams.get("limit")!, 10)
+    : 50;
+  const offset = searchParams.get("offset")
+    ? parseInt(searchParams.get("offset")!, 10)
+    : 0;
+
+  // Every matching collection, in the registry's stable order: the page is
+  // cut only after the list is narrowed to what the caller may see, so every
+  // page but the last is full and `total` counts the whole visible list. A
+  // page cut first, then filtered, comes back short and its total stops at it.
+  const result = await registry.listCollections({
+    source: source || undefined,
+    search,
+  });
+
+  // Narrowed to the collections the caller may read, judged on how it
+  // authenticated: a key on its own scope, never its owner's grants, so a
+  // restricted key lists nothing outside it. The caller's access is read once
+  // for the whole list.
+  const filteredCollections = await schemaListed(
+    auth,
+    result.data,
+    getRBACService()
+  );
+
+  // D63 seam: let plugins transform the admin nav collection list.
+  const navItems = await applyAdminNavFilter(filteredCollections, auth.userId);
+
+  const { items, meta } = pageOf(navItems, limit, offset);
+  return respondList(items, meta);
+});
+
+/**
+ * One page of the list the caller is shown, and the canonical page/limit meta
+ * for it: `total` is everything the caller can page through.
+ *
+ * A limit or offset that is not a number takes its default: the page is cut
+ * here, and a `NaN` limit would return an empty one.
+ */
+function pageOf<T>(all: T[], limit: number, offset: number) {
+  const safeLimit = Number.isFinite(limit) ? Math.max(1, limit) : 50;
+  const safeOffset = Number.isFinite(offset) ? Math.max(0, offset) : 0;
+  const total = all.length;
+  const items = all.slice(safeOffset, safeOffset + safeLimit);
+  return {
+    items,
+    meta: {
+      total,
+      page: Math.floor(safeOffset / safeLimit) + 1,
+      limit: safeLimit,
+      totalPages: Math.ceil(total / safeLimit),
+      // From the offset asked, not a page number: an offset that is not a
+      // multiple of the limit still says truly whether anything follows it or
+      // comes before it.
+      hasNext: safeOffset + items.length < total,
+      hasPrev: safeOffset > 0,
+    },
+  };
+}
+
+/**
+ * POST handler for creating a new UI collection.
+ *
+ * Requires super-admin, or create, update and delete on settings. Creates a
+ * new collection with `source="ui"` and `locked=false`.
+ *
+ * Response Codes:
+ * - 201 Created: Collection created successfully
+ * - 400 Bad Request: Invalid input
+ * - 401 Unauthorized: Authentication required
+ * - 403 Forbidden: Caller lacks permission to create collections
+ * - 409 Conflict: Collection with slug already exists
+ * - 500 Internal Server Error: Creation failed
+ */
+export const POST = withErrorHandler(async (request: Request) => {
+  // Creating a collection is DDL. Refuse before auth so a disabled builder
+  // reads the same to every caller, super-admin or not.
+  requireBuilderEnabled("create-collection");
+
+  // Initialize services (required for permission check via RBAC tables).
+  const registry = await getCollectionRegistry();
+
+  // Authorise: a super-admin, or a caller holding every permission a
+  // collection definition change asks (create, update and delete settings).
+  await requireRouteAllPermissions(request, COLLECTION_DEFINITION_PERMISSIONS);
+
+  const body = await request.json();
+
+  const parseResult = createCollectionSchema.safeParse(body);
+  if (!parseResult.success) {
+    throw nextlyValidationFromZod(parseResult.error);
+  }
+  const validated = parseResult.data;
+
+  // Same rules as the ui-schema.json mirror (see api/fields-payload).
+  assertValidFieldsPayload(validated.fields, { kind: "collection" });
+  // A new collection holds no pair of sibling fields yet, so every pair it is created with is
+  // new. Asked here because this route writes the registry row itself, through the create the
+  // code-first sync also uses after the start has judged it.
+  assertNoNewSiblingClashes(
+    { kind: "collection", slug: validated.slug },
+    validated.fields,
+    null
+  );
+
+  const tableName = validated.slug
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+  // Validated by assertValidFieldsPayload above; cast through `unknown`
+  // to the registry's config type while keeping the payload unstripped.
+  const fields = validated.fields as unknown as Parameters<
+    typeof registry.registerCollection
+  >[0]["fields"];
+
+  // Calculate schema hash for change detection.
+  const schemaHash = calculateSchemaHash(fields);
+
+  const normalizedLabels = {
+    singular: validated.labels.singular.trim(),
+    plural:
+      validated.labels.plural?.trim() ||
+      simplePluralize(validated.labels.singular),
+  };
+
+  // The address check and the row write hold the schema lock together, refused at once while a
+  // migration holds it: the row describes storage a migration could be moving, and the address is
+  // judged against the collections and Singles as they stand while it is held. Everything above
+  // reads the request alone and is decided before the lock is taken.
+  const adapter = getService("adapter");
+  const collection = await withSchemaChangeExcluded(
+    {
+      adapter,
+      logger: getService("logger"),
+      label: `create collection "${validated.slug}"`,
+      // This route writes the registry row alone; the table comes from the next migrate. It issues
+      // no DDL, so it must not create the lock table on a role without DDL rights.
+      issuesDdl: false,
+    },
+    async () => {
+      // A new address beside another collection's or Single's of the same snake_case form is
+      // refused here, before the row is written: the registry's own guard leaves that check to
+      // the road.
+      await assertGlobalResourceSlugAvailable(adapter, validated.slug, {
+        addressKind: "collection",
+      });
+
+      return registry.registerCollection({
+        slug: validated.slug,
+        labels: normalizedLabels,
+        tableName,
+        description: validated.description,
+        fields,
+        timestamps: validated.timestamps,
+        admin: validated.admin,
+        source: "ui",
+        locked: false,
+        // Forward Draft/Published flag so the schema-level POST honours the
+        // user's status opt-in just like the dispatcher path does.
+        status: validated.status === true,
+        // i18n: forward the localization opt-in so the registry stores it (companion
+        // table is provisioned on the next migrate).
+        localized: validated.localized === true,
+        // Version history opt-in, normalized to the resolved config the column
+        // holds and every runtime reader tests. Retention rides with the switch.
+        versions: resolveBuilderVersions(
+          validated.versions,
+          validated.versionsMaxPerDoc
+        ),
+        // Cache-revalidation opt-out, normalized to the resolved config the write
+        // path reads (null = standard tags, { disable: true } = off).
+        revalidate: resolveBuilderRevalidate(validated.revalidate),
+        // Persist the recording opt-out alongside the other policy columns so it
+        // survives a restart, not just this process.
+        webhooks: resolveBuilderWebhooks(validated.webhooks),
+        schemaHash,
+        hooks: validated.hooks,
+      });
+    }
+  );
+
+  // POST is a create; canonical mutation envelope ships a toast message
+  // alongside the new collection so the admin can confirm success.
+  return respondMutation("Collection created.", collection, { status: 201 });
+});
+
+// NOTE: previewSchemaChanges and applySchemaChanges live in the
+// dispatcher (collection-dispatcher.ts). Wire-routes:
+//   POST /api/collections/schema/{slug}/preview -> dispatcher.previewSchemaChanges()
+//     -> pipeline/preview.ts (diff + classify)
+//     -> legacy-preview/translate.ts (legacy SchemaPreviewResult shape)
+//   POST /api/collections/schema/{slug}/apply -> dispatcher.applySchemaChanges()
+//     -> applyDesiredSchema (full pipeline including pre-cleanup + pushSchema)

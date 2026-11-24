@@ -1,0 +1,413 @@
+// @vitest-environment jsdom
+
+/**
+ * The interaction state reaching the canvas and the panel as ONE value.
+ *
+ * `state-switcher.test.tsx` asserts the control, and `inspector-panel.test.tsx`
+ * asserts that the panel offers and withholds it. What is only true HERE is the
+ * wiring: that the state the panel edits and the state the canvas forces are
+ * the same value, and that it is suppressed when the control that explains it
+ * is not on screen.
+ *
+ * The failure this guards is silent in the worst direction. Every derivation
+ * can be right while the two props disagree — the panel reports hover values,
+ * the canvas draws the base appearance, and nothing says so.
+ *
+ * The builder shell is replaced with recorders rather than rendered, as
+ * `BlocksField.breakpoints.test` does and for its reason: what is under test is
+ * which props this component passes.
+ *
+ * @module admin/BlocksField.styleState.test
+ */
+import { cleanup, render } from "@testing-library/react";
+import * as React from "react";
+import { useForm, type FieldValues } from "react-hook-form";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+
+import { clearBlocks, registerBlocks } from "@nextlyhq/blocks-engine";
+import { closedDocumentSession } from "../__tests__/closed-document-session";
+
+/*
+ * REAL nodes, and one of them of a type the registry does not know.
+ *
+ * An empty document was the first shape here and it made the wiring cases green
+ * about a selection that did not exist: nothing was inspectable, so a
+ * derivation counting ids could not tell the difference. The unregistered node
+ * is the case a count cannot see at all — it reads as one ordinary selection
+ * while the panel shows no tabs for it.
+ */
+const DOCUMENT = {
+  formatVersion: 1,
+  kind: "page",
+  nodes: [
+    { id: "a", type: "acme/leaf", version: 1, props: {} },
+    { id: "b", type: "acme/leaf", version: 1, props: {} },
+    { id: "unknown", type: "acme/not-registered", version: 1, props: {} },
+  ],
+};
+
+const seen: {
+  inspector: Record<string, unknown> | undefined;
+  canvas: Record<string, unknown> | undefined;
+} = { inspector: undefined, canvas: undefined };
+
+/**
+ * The selection the editor reports, which each case sets.
+ *
+ * A module-level box rather than a mock factory argument, because the mock is
+ * hoisted above every binding in this file — reading it at call time is what
+ * lets a case change the selection between renders.
+ */
+let selectionIds: string[] = ["a"];
+
+// The editor asks the session's grants for shared styles; this file is not
+// about them, so the author holds the right to change the site's design.
+vi.mock("@nextlyhq/plugin-sdk/client", () => ({
+  useCan: (permission: string) => permission === "update-site-style",
+}));
+
+vi.mock("@nextlyhq/builder/shell", async importOriginal => {
+  const real = await importOriginal<Record<string, unknown>>();
+  const record =
+    (key: "inspector" | "canvas") =>
+    (props: Record<string, unknown>): React.JSX.Element => {
+      seen[key] = props;
+      return <div data-recorder={key} />;
+    };
+  const nothing = (): null => null;
+  const passthrough = ({
+    children,
+  }: {
+    children?: React.ReactNode;
+  }): React.JSX.Element => <>{children}</>;
+  return {
+    ...real,
+    BuilderShell: ({
+      inspector,
+      topBar,
+      topBarCenter,
+      topBarEnd,
+      children,
+    }: {
+      inspector: React.ReactNode;
+      topBar?: React.ReactNode;
+      topBarCenter?: React.ReactNode;
+      topBarEnd?: React.ReactNode;
+      children?: React.ReactNode;
+    }): React.JSX.Element => (
+      <div>
+        {topBar}
+        {topBarCenter}
+        {topBarEnd}
+        {inspector}
+        {children}
+      </div>
+    ),
+    BreakpointManager: nothing,
+    BreakpointSwitcher: nothing,
+    InspectorPanel: record("inspector"),
+    Canvas: record("canvas"),
+    // Passed through: the canvas renders inside its frame, which jsdom never
+    // loads a page into.
+    CanvasFrame: ({
+      children,
+    }: {
+      children?: React.ReactNode;
+    }): React.JSX.Element => <>{children}</>,
+    BlockKeyboardActions: passthrough,
+    BlockContextMenu: passthrough,
+    BlockToolbar: nothing,
+    EditorCommandPalette: nothing,
+    DropIndicator: nothing,
+    InsertPanel: nothing,
+    RepairNotice: nothing,
+    LayersPanel: nothing,
+    OnboardingChecklist: nothing,
+    SelectionBreadcrumb: nothing,
+    SpacingOverlay: nothing,
+    useBuilderChecklist: () => ({
+      visible: false,
+      steps: [],
+      dismiss: () => {},
+    }),
+    useCanvasDrag: () => ({
+      handlers: {},
+      target: null,
+      draggingId: null,
+      draggingBlockName: null,
+    }),
+    useEditorState: () => ({
+      document: DOCUMENT,
+      selectedId: selectionIds[0] ?? null,
+      selection: { ids: selectionIds, primary: selectionIds[0] ?? null },
+      apply: () => null,
+      applyAll: () => null,
+      select: () => {},
+      undo: () => {},
+      redo: () => {},
+      canUndo: false,
+      canRedo: false,
+      undoDepth: 0,
+    }),
+    useInlineText: () => ({ onDoubleClick: () => {} }),
+  };
+});
+
+/** Asking the stored style again, as the editor does after a save. */
+const refetchStoredStyle = async () => ({ isError: false });
+// The stored site style arrives through the editor's one read, the plugin's
+// route; that read's request is asserted in `site-style-read.test`.
+vi.mock("./site-style-read", () => ({
+  useStoredSiteStyle: () => ({
+    data: undefined,
+    isPending: false,
+    error: null,
+    refetch: refetchStoredStyle,
+  }),
+}));
+
+vi.mock("@nextlyhq/plugin-sdk/admin", async () => ({
+  // Where the page opens and the pin's id, which the top bar reads; no
+  // collection is named here, so the exit goes to the form.
+  useDocumentOpensIn: () => null,
+  PIN_TO_DASHBOARD_ACTION: "pin-to-dashboard",
+  // The canvas's media read, answering nothing: these cases draw no image.
+  // One function for every call, as the admin's own hook keeps it.
+  useMediaResolver: (
+    read => () =>
+      read
+  )(() => Promise.resolve(null)),
+  // The Fallback picker's library search, finding nothing: no case here
+  // opens it. One function for every call, as the admin's own hook keeps it.
+  useMediaSearcher: (
+    search => () =>
+      search
+  )(() => Promise.resolve([])),
+  // The host's font table, which the real entry re-exports from core.
+  WEB_FONT_FORMATS: (await import("nextly/config")).WEB_FONT_FORMATS,
+  // The editor mount asks for the variant-use writer; no case here opens a
+  // component, so it is never called.
+  usePluginRouteMutation: () => ({
+    write: async () => undefined,
+    pending: false,
+    error: null,
+  }),
+  // The media library, drawn as nothing: these cases never open it.
+  MediaPickerDialog: () => null,
+  loadInlineRichTextEditor: () => new Promise<never>(() => {}),
+  usePluginClientConfig: () => undefined,
+  // No document around the field: the state every case here was written
+  // against, and the one that offers every component.
+  useDocumentIdentity: () => null,
+  navigateTo: vi.fn(),
+  // Nor a language the field could know: the component read asks for the
+  // app default.
+  useDocumentLocale: () => null,
+  /*
+   * The library read. Absent here rather than stubbed with patterns, because
+   * these cases are about other surfaces and an offered pattern would change
+   * what the palette contains. `pending: false` says the read ANSWERED with
+   * nothing, which is the site with an empty library — the state every one of
+   * these cases was written against.
+   */
+  usePluginRoute: () => ({
+    data: undefined,
+    pending: false,
+    error: null,
+    refetch: () => {},
+  }),
+  useDocumentCheckpoint: () => ({ schedule: () => {} }),
+  useEntryFieldsPanel: () => null,
+  useReportUnsavedWork: () => {},
+  useSuppressAdminChrome: () => {},
+  // The form's storing gate, which site style writes are tracked with.
+  useTrackedWrite: () => () => {},
+  useBeforeDocumentAction: () => {},
+  // The session a header edited in place opens; none is opened here.
+  useDocumentSession: () => closedDocumentSession(),
+  // The header's controls the bar places; drawn by the admin, not here.
+  DocumentSaveAndPublish: () => null,
+  useDocumentLifeStage: () => null,
+  useDocumentActions: () => null,
+  // No preview here: the top bar's Preview draws nothing.
+  useDocumentPreview: () => null,
+  // No one signed in: the editor keeps no preferences.
+  useCurrentUserId: () => null,
+  useDocumentStatus: () => null,
+  // The editor registers its restore; nothing here offers one.
+  useDocumentRestore: () => undefined,
+  useUpdateSingleDocument: () => ({
+    mutateAsync: async () => ({ success: true }),
+    isPending: false,
+  }),
+}));
+
+const { PageBuilderView } = await import("./editor/PageBuilderView");
+
+/**
+ * The blocks field's declaration, as the admin hands it to the view. Typed at
+ * the boundary because `FieldConfig` is the closed union of the built-in
+ * shapes, and a contributed type such as `blocks` has no arm in it.
+ */
+const BODY_FIELD = { name: "body", type: "blocks" } as never;
+
+/** The builder's document view, open on the form's `body` field. */
+function Host(): React.JSX.Element {
+  const { control } = useForm<FieldValues>({
+    defaultValues: { body: undefined },
+  });
+  return (
+    <PageBuilderView
+      control={control}
+      field={BODY_FIELD}
+      readOnly={false}
+      exit={() => {}}
+    />
+  );
+}
+
+function openEditor(): { rerender: () => void } {
+  const view = render(<Host />);
+  return {
+    rerender: () => {
+      React.act(() => {
+        view.rerender(<Host />);
+      });
+    },
+  };
+}
+
+/** The state the panel was told to edit. */
+const panelState = (): unknown =>
+  (seen.inspector?.styleState as { state?: unknown } | undefined)?.state;
+
+/** The state the canvas was told to draw. */
+const canvasState = (): unknown => seen.canvas?.forcedState;
+
+/** Choose a state through the binding the panel was handed. */
+function chooseState(next: string): void {
+  const binding = seen.inspector?.styleState as
+    | { onChange?: (state: string) => void }
+    | undefined;
+  React.act(() => {
+    binding?.onChange?.(next);
+  });
+}
+
+beforeAll(() => {
+  clearBlocks();
+  registerBlocks(
+    [
+      {
+        name: "acme/leaf",
+        version: 1,
+        description: "A block.",
+        example: { props: {} },
+        render: () => null,
+      },
+    ] as never,
+    { source: "blocksfield-state-test" }
+  );
+});
+afterAll(clearBlocks);
+
+beforeEach(() => {
+  selectionIds = ["a"];
+  seen.inspector = undefined;
+  seen.canvas = undefined;
+});
+afterEach(cleanup);
+
+describe("the interaction state reaching both surfaces", () => {
+  it("starts at base on both", () => {
+    openEditor();
+
+    expect(panelState()).toBe("base");
+    expect(canvasState()).toBe("base");
+  });
+
+  it("carries a chosen state to the panel AND the canvas", () => {
+    /*
+     * The whole wiring. The panel states no `liveStates`, so its provenance
+     * falls back to the edited state plus base — correct exactly while the
+     * canvas is simulating the state being edited, and wrong the moment it is
+     * not. Asserted on both props in one case, because a version that moved
+     * only one of them is the defect.
+     */
+    openEditor();
+
+    chooseState("hover");
+
+    expect(panelState()).toBe("hover");
+    expect(canvasState()).toBe("hover");
+  });
+
+  it("suppresses the state while SEVERAL blocks are selected", () => {
+    /*
+     * The inspector replaces its whole tab strip with a multi-selection
+     * summary, so the state control goes with it — and the panel's own tab
+     * handler cannot catch this, because the stored tab value is still `style`
+     * and no tab change happens. A forced state that outlives its control is a
+     * canvas drawn mid-hover with nothing on screen explaining why.
+     */
+    const view = openEditor();
+    chooseState("hover");
+    expect(canvasState()).toBe("hover");
+
+    selectionIds = ["a", "b"];
+    view.rerender();
+
+    expect(canvasState()).toBe("base");
+    expect(panelState()).toBe("base");
+  });
+
+  it("suppresses the state for a block the inspector cannot show", () => {
+    /*
+     * `inspectSelection` returns null for an unregistered block type, so the
+     * panel replaces its whole tab strip and the switcher goes with it — while
+     * the selection is a perfectly ordinary single id. A derivation counting
+     * ids therefore keeps forwarding the state, and the placeholder is drawn
+     * mid-hover with nothing on screen explaining why.
+     *
+     * The control is the SAME state on a registered block, immediately before,
+     * so this cannot pass by the state never reaching the canvas at all.
+     */
+    const view = openEditor();
+    chooseState("hover");
+    expect(canvasState()).toBe("hover");
+
+    selectionIds = ["unknown"];
+    view.rerender();
+
+    expect(canvasState()).toBe("base");
+  });
+
+  it("RESTORES the chosen state when the selection narrows again", () => {
+    /*
+     * Suppressed, not reset. Writing `base` into the state instead would
+     * silently discard what the author was editing, so shift-clicking a second
+     * block and clicking back would lose their place.
+     */
+    const view = openEditor();
+    chooseState("hover");
+
+    selectionIds = ["a", "b"];
+    view.rerender();
+    expect(canvasState()).toBe("base");
+
+    selectionIds = ["a"];
+    view.rerender();
+
+    expect(canvasState()).toBe("hover");
+    expect(panelState()).toBe("hover");
+  });
+});

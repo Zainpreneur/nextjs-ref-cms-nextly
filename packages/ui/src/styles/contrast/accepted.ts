@@ -1,0 +1,326 @@
+/**
+ * Pairings that render BELOW their WCAG minimum as a deliberate product
+ * decision, each recorded with the ratio it actually measures.
+ *
+ * This is not {@link EXCLUSIONS}, and the difference is the whole point of the
+ * file existing. An exclusion says "1.4.11 does not scope this pairing", and
+ * every entry there carries a reason drawn from the standard: a decorative
+ * separator, a container edge on a control identified by its own label. Those
+ * pairings are not failing; they were never in scope. The entries HERE are in
+ * scope and are failing. Filing them as exclusions would have been the easy
+ * move and would have quietly corrupted the one list a reviewer reads to learn
+ * where coverage genuinely ends.
+ *
+ * So the accepted set is kept separate, and it is kept honest three ways. The
+ * suites assert each entry still measures what is recorded, so a token cannot
+ * drift further under cover of an existing entry. They assert each entry is
+ * still below its threshold, so one that gets fixed has to be deleted rather
+ * than lingering as a false confession. And they assert every entry still
+ * matches something real, so a renamed or removed pairing cannot leave a
+ * permanent blanket here.
+ *
+ * **Identity is the ROLE PAIR, not a label.** Two different suites consult this
+ * list — the token pairings and the scan over ink utilities in real component
+ * source — and they name the same colours differently: one has
+ * `--color-destructive-foreground` on `--color-destructive-solid`, the other has
+ * `text-destructive-foreground` on `bg-destructive-solid`. Keying on either
+ * spelling would have forced a second list for the other suite, and two lists
+ * of accepted failures drift apart silently, each looking complete on its own.
+ * Reducing both to the role pair gives one identity that both can ask for.
+ */
+
+/**
+ * Faded UTILITIES shipped below their threshold, keyed by the utility itself.
+ *
+ * The sibling of {@link ACCEPTED_REGRESSIONS}, and keyed differently on purpose.
+ * That list identifies a pairing by its ROLE PAIR because two suites reach the
+ * same colours through different names. A faded utility is a third naming, and
+ * reducing it to a role pair loses three things the scan measured — each of
+ * which turns an acceptance into a suppression it was never agreed for:
+ *
+ * - the KIND, and so the threshold. `border-x/50` and `text-x/50` reduce to one
+ *   identity while being held to 3:1 and 4.5:1, so accepting a decorative
+ *   boundary would silently accept body text at the same ratio.
+ * - the VARIANT. `dark:border-success-900/50` is scanned as
+ *   `border-success-900/50`, so a light-mode acceptance would vouch for a
+ *   utility that only ever renders in dark.
+ * - the PRECISION. `border-input/[33.3%]` parses to `0.33299999999999996`,
+ *   which is not the `0.333` anyone would write.
+ *
+ * The utility string loses none of them, so that is the key. It lives in this
+ * file rather than beside the scan because this is where a reviewer comes to
+ * learn what the palette knowingly ships below its minimum, and two files
+ * answering that question is how the ledger comes to understate what renders.
+ *
+ * These do not duplicate {@link ACCEPTED_REGRESSIONS}: a faded utility and the
+ * opaque pairing of the same roles are different colours and measure different
+ * ratios, so an entry here is never the same fact recorded twice.
+ */
+export interface AcceptedAlphaUtility {
+  /**
+   * What the utility measures, to 2dp, in each mode that FAILS.
+   *
+   * A mode that already clears its threshold carries no number, and recording
+   * one for it is refused. Many utilities fail in one theme only — measured,
+   * `border-input/90` is about 1.14:1 in light and 3.58:1 in dark — so an entry
+   * required to record both could never be written for the commonest case.
+   */
+  light?: number;
+  dark?: number;
+  /** Why the shortfall is shipped rather than corrected. */
+  reason: string;
+}
+
+/**
+ * Empty, and that is the honest state: no faded utility is currently shipped
+ * in scope and failing. The suite that consults this holds every entry to
+ * being still used, still failing, and still measuring what it records.
+ */
+export const ACCEPTED_ALPHA_UTILITIES: Record<string, AcceptedAlphaUtility> =
+  Object.create(null) as Record<string, AcceptedAlphaUtility>;
+
+/** A pairing knowingly shipped below its threshold. */
+export interface AcceptedRegression {
+  /** Foreground role: the token name with its `--nx-` / `--color-` prefix cut. */
+  fg: string;
+  /** Surface role, named the same way. */
+  bg: string;
+  mode: "light" | "dark";
+  /** The ratio this pair measures at the tokens as shipped, to 2dp. */
+  ratio: number;
+  /** Why the palette keeps the failing value rather than correcting it. */
+  reason: string;
+  /**
+   * Alpha and underlying surface, when the pair needs them to be identified.
+   *
+   * The role pair alone is not always unique: `bg-primary/10 over card` and
+   * `bg-primary/10 over page` are both `primary` on `primary`, and they measure
+   * different ratios. Omitted means "the opaque pair", which is what every
+   * current entry is; an entry that omits them does NOT match a tinted variant.
+   */
+  fgAlpha?: number;
+  bgAlpha?: number;
+  bgOver?: string;
+}
+
+/** The parts of a pairing beyond its role pair that change what it measures. */
+export interface PairDetail {
+  fgAlpha?: number;
+  bgAlpha?: number;
+  bgOver?: string;
+}
+
+/**
+ * The role a token plays, independent of which namespace spells it. `--nx-input`
+ * and `--color-input` are one role; so are the `text-`/`bg-` utility forms the
+ * component scan sees.
+ */
+export function roleOf(token: string): string {
+  // The two strips are mutually exclusive, and conflating them is a live bug
+  // rather than a tidiness point: `--nx-border-strong` is a custom property
+  // whose role is `border-strong`, but a blanket utility strip turns it into
+  // `strong` and it then matches nothing. A leading `--` says which kind of
+  // name this is, so branch on it instead of applying both.
+  const named = token.startsWith("--")
+    ? token.replace(/^--(?:nx|color)-/, "")
+    : token.replace(/^(?:text|bg|border|ring)-/, "");
+
+  // The 500 step of a status scale is not a shade of the role, it IS the role:
+  // theme.css declares `--color-destructive-500: var(--nx-destructive)`, the
+  // same token under a second name. Components use both spellings, so without
+  // this the two would need separate accepted entries for one colour -- which
+  // is the duplication this whole identity exists to avoid. Only 500 is folded
+  // in; every other step is a genuine `color-mix()` and measures differently.
+  return named.replace(/-500$/, "");
+}
+
+/**
+ * Every entry here traces to one decision: take the reference palette's border
+ * weight and its red rather than darken either to pass. The tokens involved are
+ * `--nx-input`, `--nx-border-strong`, `--nx-sidebar-border`, `--nx-destructive`
+ * and `--nx-destructive-solid`, all in light mode. Dark mode clears its
+ * thresholds unchanged and nothing here applies to it.
+ *
+ * The boundary entries and the text entries are not equivalent trades, and the
+ * difference is worth keeping in view. A faint border leaves a control whose
+ * label, value and focus ring still identify it; a text ratio below minimum
+ * means the words themselves are harder to read. `destructive-foreground` on
+ * `destructive-solid` is the sharpest case, being the label of a confirm button.
+ */
+export const ACCEPTED_REGRESSIONS: AcceptedRegression[] = [
+  // --nx-input: the reference field border. The 3:1 boundary minimum wants
+  // roughly oklch(0.63), a noticeably heavier input than the palette is drawn
+  // around.
+  {
+    fg: "input",
+    bg: "page-background",
+    mode: "light",
+    ratio: 1.09,
+    reason:
+      "Field border against the page container, the weakest instance and the one to buy back first.",
+  },
+  {
+    fg: "input",
+    bg: "muted",
+    mode: "light",
+    ratio: 1.09,
+    reason: "Field border against a muted surface.",
+  },
+  {
+    fg: "input",
+    bg: "background",
+    mode: "light",
+    ratio: 1.16,
+    reason: "Field border against the page background.",
+  },
+  {
+    fg: "input",
+    bg: "popover",
+    mode: "light",
+    ratio: 1.16,
+    reason: "Field border inside a popover.",
+  },
+  {
+    fg: "input",
+    bg: "card",
+    mode: "light",
+    ratio: 1.19,
+    reason: "Field border on a card, the strongest instance of this token.",
+  },
+
+  // --nx-sidebar-border: matching the border weight used elsewhere.
+  {
+    fg: "sidebar-border",
+    bg: "sidebar-background",
+    mode: "light",
+    ratio: 1.16,
+    reason:
+      "Sidebar edge against its own surface, held to the same weight as the rest of the palette's borders.",
+  },
+
+  // --nx-border-strong: mixed from the border token rather than set darker, so
+  // "strong" stays a step up from --nx-border without leaving the palette.
+  {
+    fg: "border-strong",
+    bg: "page-background",
+    mode: "light",
+    ratio: 2.1,
+    reason: "Emphasised boundary against the page container.",
+  },
+  {
+    fg: "border-strong",
+    bg: "background",
+    mode: "light",
+    ratio: 2.22,
+    reason: "Emphasised boundary against the page background.",
+  },
+
+  // --nx-destructive / --nx-destructive-solid: the reference red. Darkening it
+  // to clear 4.5:1 produces a visibly different colour, and the status scale is
+  // mixed from this token, so every destructive shade moves with it.
+  {
+    fg: "destructive",
+    bg: "background",
+    mode: "light",
+    ratio: 3.73,
+    reason: "Destructive label on the page background.",
+  },
+  {
+    fg: "destructive",
+    bg: "popover",
+    mode: "light",
+    ratio: 3.73,
+    reason: "Destructive label inside a popover.",
+  },
+  {
+    fg: "destructive",
+    bg: "card",
+    mode: "light",
+    ratio: 3.84,
+    reason: "Destructive label on a card.",
+  },
+  {
+    fg: "destructive",
+    bg: "page-background",
+    mode: "light",
+    ratio: 3.52,
+    reason:
+      "Destructive label on the page container, which is what .admin-page-container paints and is a separate token from the page background.",
+  },
+  {
+    fg: "destructive",
+    bg: "muted",
+    mode: "light",
+    ratio: 3.52,
+    reason:
+      "Destructive label on the muted surface of a dashboard widget or stat tile. The tightest of the text pairs, muted being the darkest of the surfaces this ink lands on.",
+  },
+  {
+    fg: "destructive",
+    bg: "sidebar-background",
+    mode: "light",
+    ratio: 3.73,
+    reason: "Destructive label on the sidebar surface, in quick-link rows.",
+  },
+  {
+    fg: "destructive-foreground",
+    bg: "destructive-solid",
+    mode: "light",
+    ratio: 3.84,
+    reason:
+      "White label on the solid destructive fill: the Delete / Discard / Unpublish confirm buttons. The most consequential entry in this file.",
+  },
+  {
+    fg: "destructive-600",
+    bg: "muted",
+    mode: "light",
+    ratio: 4.23,
+    reason:
+      "The 600 shade painted directly on the muted surface, in the entry meta strip.",
+  },
+  {
+    fg: "destructive-600",
+    bg: "background",
+    mode: "light",
+    ratio: 4.48,
+    reason:
+      "The same meta-strip ink against the page. Two hundredths short, and the closest entries in this file to passing.",
+  },
+  {
+    fg: "destructive-600",
+    bg: "destructive-50",
+    mode: "light",
+    ratio: 4.33,
+    reason:
+      "Derived chip shade, mixed from the base token rather than chosen, so it moved with it. The closest of these to passing.",
+  },
+];
+
+/**
+ * The accepted entry for a foreground/surface pair, in a given mode.
+ *
+ * Alpha and underlying surface must match exactly, including both being absent.
+ * A tinted variant of an accepted opaque pair measures a different ratio and is
+ * a different decision, so it does not inherit the acceptance.
+ */
+export function acceptedFor(
+  fg: string,
+  bg: string,
+  mode: "light" | "dark",
+  detail: PairDetail = {}
+): AcceptedRegression | undefined {
+  const fgRole = roleOf(fg);
+  const bgRole = roleOf(bg);
+  const over = detail.bgOver === undefined ? undefined : roleOf(detail.bgOver);
+  return ACCEPTED_REGRESSIONS.find(
+    entry =>
+      entry.mode === mode &&
+      entry.fg === fgRole &&
+      entry.bg === bgRole &&
+      entry.fgAlpha === detail.fgAlpha &&
+      entry.bgAlpha === detail.bgAlpha &&
+      (entry.bgOver === undefined
+        ? over === undefined
+        : roleOf(entry.bgOver) === over)
+  );
+}

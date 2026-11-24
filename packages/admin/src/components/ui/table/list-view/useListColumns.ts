@@ -1,0 +1,132 @@
+"use client";
+
+/**
+ * A list's column choice, remembered.
+ *
+ * `useColumnVisibility` has persisted this since it was written, and exactly one
+ * surface used it. Every other list held its hidden columns in a bare `useState`
+ * that a reload threw away — so a reader who narrowed a wide table to the four
+ * columns they care about got the full set back on their next visit, and had no
+ * reason to think the control was doing anything durable.
+ *
+ * This adapts that hook to the shape `ListView` already asks for, so adopting it
+ * is a one-line change at a call site rather than a re-implementation of
+ * storage. It DERIVES from the hook rather than duplicating it: there is one
+ * answer to "which columns has this reader hidden", and one place it is stored.
+ *
+ * @module components/ui/table/list-view/useListColumns
+ */
+
+import { useCallback, useMemo } from "react";
+
+import { useColumnVisibility } from "@admin/hooks/useColumnVisibility";
+
+import type { NextlyColumn } from "../data-table";
+
+import type { ListColumnsControl } from "./types";
+
+export interface UseListColumnsOptions<Row extends object> {
+  /**
+   * Identifies the list whose choice is being stored, and it is part of the
+   * storage key — so it must be stable across renders and unique to the
+   * surface. Two lists sharing one key share one column choice.
+   */
+  storageKey: string;
+  /** The toggleable columns, in the order the control should offer them. */
+  columns: NextlyColumn<Row>[];
+  /**
+   * Which columns are visible for a reader who has never chosen. Defaults to
+   * all of them.
+   *
+   * Changing this invalidates a stored choice made against the previous set,
+   * which is the hook's own staleness rule rather than something added here: a
+   * preference recorded against columns that no longer exist would otherwise
+   * hide a new column from everyone who had ever touched the control.
+   */
+  defaultVisible?: string[];
+}
+
+/**
+ * Returns the object `ListView` takes as `columnsControl`, backed by storage.
+ */
+export function useListColumns<Row extends object>({
+  storageKey,
+  columns,
+  defaultVisible,
+}: UseListColumnsOptions<Row>): ListColumnsControl<Row> {
+  /*
+   * Both lists are stabilised BY VALUE, not by identity.
+   *
+   * The hook underneath re-reads storage in an effect keyed on these arrays, so
+   * an array rebuilt on each render re-runs that effect, which sets state,
+   * which renders again. `defaultVisible: ["name"]` written inline at a call
+   * site — the obvious way to write it — is a new array every render and spins
+   * forever. Keying on the joined contents makes identity follow meaning, so a
+   * caller cannot hang the page by not memoising.
+   */
+  const columnKey = columns.map(column => column.name).join("\u0000");
+  const availableColumns = useMemo(
+    () => (columnKey ? columnKey.split("\u0000") : []),
+    [columnKey]
+  );
+
+  const defaultKey = defaultVisible?.join("\u0000");
+  const stableDefaults = useMemo(
+    () => (defaultKey === undefined ? undefined : defaultKey.split("\u0000")),
+    [defaultKey]
+  );
+
+  const {
+    isColumnVisible: isManagedColumnVisible,
+    toggleColumn,
+    resetToDefault,
+  } = useColumnVisibility({
+    collectionSlug: storageKey,
+    availableColumns,
+    defaultVisible: stableDefaults,
+  });
+
+  const managedColumns = useMemo(
+    () => new Set(availableColumns),
+    [availableColumns]
+  );
+
+  /*
+   * A column this control was never given is not a column it hides.
+   *
+   * The hook underneath answers from a list of VISIBLE columns, so a name it
+   * has never seen is simply absent from that list and comes back "not
+   * visible". Callers pass only the TOGGLEABLE columns — every list surface
+   * withholds its primary identifying column, because a reader must not be able
+   * to hide the one cell that says which row this is — and then asks about
+   * every column when computing `hidden`. Those two reasonable decisions meet
+   * here, and the answer was to hide the row's name on every list in the admin.
+   *
+   * Answered at this boundary rather than at the ten call sites: the caller
+   * would have to remember to exempt its own always-visible set each time, and
+   * the eleventh list would get it wrong the same way.
+   */
+  const isColumnVisible = useCallback(
+    (columnId: string) =>
+      managedColumns.has(columnId) ? isManagedColumnVisible(columnId) : true,
+    [managedColumns, isManagedColumnVisible]
+  );
+
+  /*
+   * The reset affordance is offered only when a default was declared. With no
+   * default every column is visible, so "reset" would restore the state the
+   * reader is already looking at whenever they have hidden nothing — a control
+   * that sometimes does nothing and never says which time it is.
+   */
+  const onReset = useCallback(() => resetToDefault(), [resetToDefault]);
+
+  return useMemo(
+    () => ({
+      columns,
+      isColumnVisible,
+      onToggleColumn: toggleColumn,
+      onReset: stableDefaults ? onReset : undefined,
+    }),
+    [columns, isColumnVisible, toggleColumn, stableDefaults, onReset]
+  );
+}

@@ -1,0 +1,57 @@
+/**
+ * Binds core's dashboard components to the `core#` paths its widgets name.
+ *
+ * Core's widget definitions live in `nextly` and can only name a component as a
+ * STRING; the components themselves are React and live here. This is the one
+ * place the two meet, and it is why `core#` is reserved in the component
+ * registry -- the definition names the path, so anything else able to claim it
+ * could replace the body drawn for a card the registry still attributes to
+ * core.
+ *
+ * Called at MODULE scope by `WidgetGrid`, not from an effect. `PluginSlot`
+ * resolves a path during render, so a registration that ran in `useEffect`
+ * would arrive after the first paint and every core card would draw its
+ * unresolved fallback once before appearing. A static import runs before any
+ * render of the grid, and `Map.set` makes repeat calls harmless.
+ *
+ * @module components/features/widgets/core-components
+ */
+
+import { BreakdownCard } from "@admin/components/features/dashboard/BreakdownCard";
+import { ContentTable } from "@admin/components/features/dashboard/ContentTable";
+import { ContinueCard } from "@admin/components/features/dashboard/ContinueCard";
+import { CountCard } from "@admin/components/features/dashboard/CountCard";
+import { NeedsAttention } from "@admin/components/features/dashboard/NeedsAttention";
+import { NoteCard } from "@admin/components/features/dashboard/NoteCard";
+import { OverTimeCard } from "@admin/components/features/dashboard/OverTimeCard";
+import { RecentEntriesCard } from "@admin/components/features/dashboard/RecentEntriesCard";
+import { SetupCard } from "@admin/components/features/dashboard/SetupCard";
+import { SystemHealthCard } from "@admin/components/features/dashboard/SystemHealthCard";
+import { TeamActivityCard } from "@admin/components/features/dashboard/TeamActivity";
+import { TeamSummary } from "@admin/components/features/dashboard/TeamSummary";
+import { UpcomingReleasesCard } from "@admin/components/features/dashboard/UpcomingReleases";
+import { registerCoreComponent } from "@admin/lib/plugins/component-registry-internal";
+
+/**
+ * Every `core#` path core's widget definitions name, bound to its component.
+ *
+ * Keyed by the exact path so the two sides are comparable by eye. A card whose
+ * definition names a path missing here draws the unresolved fallback rather
+ * than crashing, which is `PluginSlot`'s existing behaviour and the right one:
+ * one card reports itself and the dashboard stands.
+ */
+export function registerCoreWidgetComponents(): void {
+  registerCoreComponent("core#Setup", SetupCard);
+  registerCoreComponent("core#ContentTable", ContentTable);
+  registerCoreComponent("core#TeamSummary", TeamSummary);
+  registerCoreComponent("core#NeedsAttention", NeedsAttention);
+  registerCoreComponent("core#TeamActivity", TeamActivityCard);
+  registerCoreComponent("core#ContinueCard", ContinueCard);
+  registerCoreComponent("core#UpcomingReleases", UpcomingReleasesCard);
+  registerCoreComponent("core#Count", CountCard);
+  registerCoreComponent("core#Breakdown", BreakdownCard);
+  registerCoreComponent("core#Note", NoteCard);
+  registerCoreComponent("core#RecentEntries", RecentEntriesCard);
+  registerCoreComponent("core#OverTime", OverTimeCard);
+  registerCoreComponent("core#SystemHealth", SystemHealthCard);
+}

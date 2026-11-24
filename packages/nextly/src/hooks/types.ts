@@ -1,0 +1,819 @@
+/**
+ * Database Lifecycle Hooks System - Type Definitions
+ *
+ * This module provides TypeScript type definitions for Nextly's hook system,
+ * enabling developers to run custom logic before/after database operations.
+ *
+ * Inspired by modern CMS lifecycle hook patterns, adapted for Next.js 16
+ * and designed as an NPM package consumable API.
+ *
+ * @example
+ * ```typescript
+ * import { registerHook } from 'nextly';
+ *
+ * // Hash password before creating user
+ * registerHook('beforeCreate', 'users', async (context) => {
+ *   if (context.data?.password) {
+ *     context.data.password = await bcrypt.hash(context.data.password, 10);
+ *   }
+ *   return context.data;
+ * });
+ *
+ * // Send welcome email after user creation
+ * registerHook('afterCreate', 'users', async (context) => {
+ *   await sendWelcomeEmail(context.data.email);
+ * });
+ * ```
+ *
+ * @module hooks/types
+ * @since 1.0.0
+ */
+
+import type { TransactionContext } from "@nextlyhq/adapter-drizzle/types";
+
+import type { Nextly } from "../direct-api/nextly";
+import type { Principal } from "../plugins/principals/types";
+
+/**
+ * Available hook types for database lifecycle events.
+ *
+ * Hook execution order for a create operation:
+ * 1. beforeOperation - Run before any operation (can modify args)
+ * 2. beforeCreate - Run before validation and database insert
+ * 3. beforeChange - Run after validation, on the data about to be written
+ * 4. afterCreate - Run after database insert completes
+ *
+ * Hook execution order for an update operation:
+ * 1. beforeOperation - Run before any operation (can modify args)
+ * 2. beforeUpdate - Run before validation and database update
+ * 3. beforeChange - Run after validation, on the data about to be written
+ * 4. afterUpdate - Run after database update completes
+ *
+ * Hook execution order for a delete operation:
+ * 1. beforeOperation - Run before any operation (can modify args)
+ * 2. beforeDelete - Run before database delete
+ * 3. afterDelete - Run after database delete completes
+ *
+ * Hook execution order for a read operation:
+ * 1. beforeOperation - Run before any operation (can modify args)
+ * 2. beforeRead - Run before database query
+ * 3. afterRead - Run after database query completes
+ *
+ * `beforeCreate`/`beforeUpdate` and `beforeChange` are both pre-write, and the
+ * difference between them is the validation gate. A `beforeCreate` handler can
+ * supply or repair a value and have the rules applied to what it produced; a
+ * `beforeChange` handler receives data that has already passed them, which is
+ * what makes it the phase for deriving a stored value -- and also means what it
+ * returns is written without being re-checked.
+ */
+export const HOOK_TYPES = [
+  "beforeOperation",
+  "beforeCreate",
+  "afterCreate",
+  "beforeUpdate",
+  "afterUpdate",
+  "beforeChange",
+  "beforeDelete",
+  "afterDelete",
+  "beforeRead",
+  "afterRead",
+] as const;
+
+/**
+ * Derived from {@link HOOK_TYPES} rather than declared separately, so anything
+ * that has to visit every phase -- clearing a collection's handlers, for one --
+ * can iterate the same list the type is built from. A hand-maintained array
+ * annotated `HookType[]` type-checks perfectly while missing a phase, which is
+ * how a newly added one went on being registered but never cleared.
+ */
+export type HookType = (typeof HOOK_TYPES)[number];
+
+/**
+ * The phases whose handlers take a {@link HookContext}, which is every phase
+ * except `beforeOperation`.
+ *
+ * `beforeOperation` handlers take a {@link BeforeOperationContext} instead and
+ * reshape the operation's `args` rather than its `data`. Naming the rest as a
+ * type keeps the two signatures from being registered through one another.
+ */
+export type HookContextPhase = Exclude<HookType, "beforeOperation">;
+
+/**
+ * Who registered a handler, which is really the question "what will put this
+ * back if it is removed?".
+ *
+ * - `"code"` -- a declaration in the config. `registerCollectionHooks` and
+ *   `registerSingleHooks` rebuild these from the config on boot AND on every
+ *   config reload, so a reload may remove them freely. Those two registrars are
+ *   the only callers entitled to claim it, and they pass it explicitly.
+ * - `"app"` -- an imperative registration, whether through `registerHook()` or
+ *   straight into the registry the public API hands out. Nothing re-runs it:
+ *   the module holding the call is evaluated once and a config reload never
+ *   revisits it, so removing one is permanent.
+ * - `"plugin:<name>"` -- registered through `ctx.hooks.on` during a plugin's
+ *   `init`, which re-runs only on a full service registration and not on a
+ *   config reload.
+ *
+ * `"app"` is the DEFAULT, so an unannotated registration survives a reload. The
+ * two failure modes are not symmetric: defaulting to `"code"` costs a handler
+ * that silently disappears for good, while defaulting to `"app"` costs at worst
+ * a stale handler that a restart clears.
+ *
+ * `"code"` and `"plugin:<name>"` follow the vocabulary the webhook recording
+ * provenance already uses, so one concept does not get two spellings.
+ */
+export type HookOwner = "code" | "app" | `plugin:${string}`;
+
+/**
+ * Facts about the HTTP request behind an operation, resolved by the core.
+ *
+ * Handed to hooks as {@link HookContext.req}`.http`. Its presence answers the
+ * question a request-scoped rule has to ask first: was there a request at all?
+ */
+export interface HookHttpFacts {
+  /**
+   * The client address, resolved under the deployment's proxy-trust settings
+   * (`security.trustProxy` and `TRUSTED_PROXY_IPS`).
+   *
+   * `null` when no address can be trusted -- proxy headers are off, or every
+   * hop in the chain is a proxy this deployment already trusts. Null is not a
+   * bucket: keying a rate limit on it would put every unidentifiable client in
+   * one, so a rule that cannot identify a client should decide what to do about
+   * that rather than treat them all as the same one.
+   */
+  readonly ip: string | null;
+
+  /** The request method, uppercased by the platform (`POST`, `PATCH`). */
+  readonly method: string;
+}
+
+/**
+ * What a hook is told about languages, beside its own context: the language
+ * its operation is for, every language it involves, and whether it moves the
+ * shared part (the fields kept the same in every language). Filled where the
+ * hook is called, from the languages the operation's rules are told.
+ *
+ * @experimental
+ */
+export interface HookLanguageContext {
+  /**
+   * The language the operation is for: the one a write stores or a read
+   * reads. Absent for an operation of every language (a delete, a publish of
+   * every language) and on a site without languages.
+   */
+  locale?: string;
+  /**
+   * Every language the operation involves: the one written, a read's
+   * fallback chain, or every configured language. Empty on a site without
+   * languages.
+   */
+  locales?: readonly string[];
+  /**
+   * Whether the operation moves the shared part: a write that sets a shared
+   * field, a create or delete, or a publish that moves the shared part.
+   * Absent for a read, which moves nothing.
+   */
+  shared?: boolean;
+}
+
+/**
+ * Context object passed to hook handlers containing operation metadata.
+ *
+ * The context provides all information needed for hooks to make decisions:
+ * - Which collection is being operated on
+ * - What operation is being performed
+ * - The data being created/updated/deleted/read
+ * - The user performing the operation (if authenticated)
+ * - A shared context object for passing data between hooks
+ *
+ * @template T - Type of the data being operated on
+ *
+ * @example
+ * ```typescript
+ * // beforeCreate hook modifying data
+ * const beforeCreateHook: HookHandler<User> = async (context) => {
+ *   console.log(`Creating ${context.collection}`);
+ *   console.log(`User: ${context.user?.id}`);
+ *
+ *   // Add auto-generated slug
+ *   const modifiedData = {
+ *     ...context.data,
+ *     slug: slugify(context.data.title)
+ *   };
+ *
+ *   // Store in shared context for afterCreate hook
+ *   context.context.generatedSlug = true;
+ *
+ *   return modifiedData;
+ * };
+ *
+ * // afterCreate hook reading shared context
+ * const afterCreateHook: HookHandler<User> = async (context) => {
+ *   if (context.context.generatedSlug) {
+ *     console.log('Slug was auto-generated');
+ *   }
+ * };
+ * ```
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- generic default requires `any` for type-erased hook registry
+export interface HookContext<T = any> extends HookLanguageContext {
+  /**
+   * Collection name (e.g., "posts", "users", "products")
+   *
+   * This is the slug/name of the collection being operated on.
+   */
+  collection: string;
+
+  /**
+   * Operation type being performed
+   *
+   * Determines which CRUD operation triggered this hook.
+   */
+  operation: "create" | "read" | "update" | "delete";
+
+  /**
+   * Data being created, updated, or read
+   *
+   * For `before*` hooks, modifying this data will affect what gets saved to the database.
+   * For `after*` hooks, this contains the final data that was saved/retrieved.
+   *
+   * **Hook Behavior:**
+   * - `beforeCreate`: Incoming data before validation (can be modified)
+   * - `afterCreate`: Created record from database (read-only, for side effects)
+   * - `beforeUpdate`: Incoming changes before validation (can be modified)
+   * - `afterUpdate`: Updated record from database (read-only)
+   * - `beforeDelete`: Record about to be deleted (read-only)
+   * - `afterDelete`: Deleted record data (read-only)
+   * - `beforeRead`: Query parameters (can be modified to filter)
+   * - `afterRead`: Fetched records (can be modified for transformation)
+   */
+  data?: T;
+
+  /**
+   * Original data before changes (only for update operations)
+   *
+   * This allows update hooks to compare the old vs new state.
+   *
+   * @example
+   * ```typescript
+   * registerHook('afterUpdate', 'products', async (context) => {
+   *   if (context.originalData.price !== context.data.price) {
+   *     await logPriceChange(context.originalData.price, context.data.price);
+   *   }
+   * });
+   * ```
+   */
+  originalData?: T;
+
+  /**
+   * The status an update is classified against, where core reads it apart
+   * from `originalData`: on a collection that keeps its status per language,
+   * the status stored in the language the write names (its companion row's,
+   * or the main row's where that language has none), and for a write to every
+   * language, `"published"` when any language is. Absent where the write's
+   * status is the main row's, so `originalData.status` is the one to read.
+   *
+   * @experimental
+   */
+  storedStatus?: string | null;
+
+  /**
+   * User performing the operation (if authenticated)
+   *
+   * Contains user ID and any additional user data passed from the request.
+   * This is `undefined` if the operation is performed without authentication.
+   */
+  user?: {
+    id: string;
+    email?: string;
+    [key: string]: unknown;
+  };
+
+  /**
+   * @experimental The plugin-defined signed-in person the operation is made
+   * as. Present only for a call made as one, and then `user` is absent: a
+   * person is never a staff user.
+   */
+  principal?: Principal;
+
+  /**
+   * Shared context object for passing data between hooks
+   *
+   * This allows `before*` hooks to communicate with `after*` hooks
+   * within the same request lifecycle.
+   *
+   * @example
+   * ```typescript
+   * // beforeCreate sets flag
+   * registerHook('beforeCreate', 'posts', async (context) => {
+   *   context.context.sendNotification = true;
+   *   return context.data;
+   * });
+   *
+   * // afterCreate reads flag
+   * registerHook('afterCreate', 'posts', async (context) => {
+   *   if (context.context.sendNotification) {
+   *     await sendNewPostNotification(context.data);
+   *   }
+   * });
+   * ```
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- shared context is a general-purpose key-value store
+  context: Record<string, any>;
+
+  /**
+   * Request metadata and API access (optional)
+   *
+   * Contains HTTP request information if available (headers, query params)
+   * and the Nextly Direct API instance for performing database operations
+   * within hooks.
+   *
+   * **`req.nextly`** provides the same Direct API available via `requireNextly()`,
+   * allowing hooks to perform CRUD operations on other collections.
+   * This allows hooks to perform CRUD operations on other collections.
+   *
+   * @example
+   * ```typescript
+   * registerHook('afterCreate', 'posts', async (context) => {
+   *   // Access Direct API via req.nextly
+   *   await context.req?.nextly?.create({
+   *     collection: 'activity-logs',
+   *     data: {
+   *       action: 'post_created',
+   *       postId: context.data.id,
+   *     },
+   *   });
+   * });
+   * ```
+   */
+  req?: {
+    /** HTTP request headers */
+    headers?: Record<string, string>;
+    /** HTTP query parameters */
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- query params have arbitrary shapes
+    query?: Record<string, any>;
+    /**
+     * What the core resolved about the HTTP request behind this operation.
+     *
+     * Absent when no request produced it: a seed script, a scheduled job, an
+     * import. That absence is the point. A rule scoped to a visitor -- a rate
+     * limit, a honeypot, a captcha -- reads it to tell a browser from a trusted
+     * server, and applies only when this is here. A server importing ten
+     * thousand rows is not rate-limited by its own importer.
+     *
+     * Resolved rather than raw, because `x-forwarded-for` is forgeable by
+     * whoever sends it. See {@link HookHttpFacts.ip}.
+     */
+    http?: HookHttpFacts;
+    /**
+     * Nextly Direct API instance.
+     *
+     * Provides access to all Direct API operations (`find`, `create`, `update`,
+     * `delete`, etc.) for performing database operations within hooks.
+     *
+     * Allows hooks to call the full Nextly API for cross-collection operations.
+     */
+    nextly?: Nextly;
+  };
+
+  /**
+   * Transaction-bound Drizzle executor for the write this hook participates in.
+   *
+   * Present only when the hook runs inside a caller-owned transaction (the
+   * transactional bulk / entry write paths). A hook that reads the database (for
+   * example the built-in sanitization hook, which loads field metadata) must use
+   * it so the read runs on the transaction's own connection instead of taking a
+   * second pooled one, which can stall against a small pool while the caller's
+   * transaction holds the only connection. Undefined outside a transaction, where
+   * the pooled connection is correct.
+   */
+  executor?: unknown;
+  /**
+   * @experimental Run `effect` once the write this hook belongs to is durable.
+   *
+   * Inside a transaction (a caller-owned one, or a plugin's `ctx.db.transaction`)
+   * the effect is held until the OUTERMOST transaction commits, and dropped if
+   * it rolls back; it runs after the commit, before that transaction's call
+   * resolves, and a failure then is logged rather than thrown, since the write
+   * has committed. Outside a transaction it runs at once. For what a rollback
+   * cannot take back, such as sending an email: done from an after-hook
+   * directly, it would happen for a write that never landed.
+   *
+   * Offered only to the hooks that run after the write: `afterCreate`,
+   * `afterUpdate` and `afterDelete`. A before-hook (`beforeCreate`,
+   * `beforeUpdate`, `beforeChange`, `beforeDelete`) runs before the write opens
+   * its transaction and is not given one, since an effect handed over there
+   * would run at once, for a write that may still be refused. Absent too on a
+   * context a hook test builds by hand. `cloneContext` keeps it.
+   */
+  afterCommit?: (effect: () => unknown) => Promise<void>;
+}
+
+/**
+ * Hook handler function signature
+ *
+ * Hook handlers can be synchronous or asynchronous (Promise-based).
+ * They receive a `HookContext` and can optionally return modified data.
+ *
+ * **Return Value Behavior:**
+ * - For `before*` hooks: Return value replaces `context.data` for next hook
+ * - For `after*` hooks: Return value is ignored (use for side effects only)
+ *
+ * **Error Handling:**
+ * - Throwing an error will abort the operation and rollback the transaction
+ * - The error message will be returned to the client
+ *
+ * @template T - Type of the data being operated on
+ *
+ * @param context - Hook context with operation metadata
+ * @returns Modified data (for before hooks) or void (for after hooks)
+ *
+ * @example
+ * ```typescript
+ * // Synchronous hook (beforeCreate)
+ * const addTimestamp: HookHandler<Post> = (context) => {
+ *   return {
+ *     ...context.data,
+ *     publishedAt: new Date()
+ *   };
+ * };
+ *
+ * // Asynchronous hook (afterCreate)
+ * const notifyWebhook: HookHandler<Post> = async (context) => {
+ *   await fetch('https://webhook.example.com', {
+ *     method: 'POST',
+ *     body: JSON.stringify(context.data)
+ *   });
+ *   // No return value needed for after hooks
+ * };
+ *
+ * // Rejecting input (beforeCreate). Throw a NextlyError, not a plain Error:
+ * // a plain one is indistinguishable from a crash, so its message is replaced
+ * // with a generic server-fault message before the caller sees it.
+ * const validatePrice: HookHandler<Product> = (context) => {
+ *   if (context.data.price < 0) {
+ *     throw NextlyError.validation({
+ *       errors: [
+ *         { path: 'price', code: 'INVALID', message: 'Price cannot be negative.' },
+ *       ],
+ *     });
+ *   }
+ *   return context.data;
+ * };
+ * ```
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- generic default requires `any` for type-erased hook registry
+export type HookHandler<T = any> = (
+  context: HookContext<T>
+) => Promise<T | void> | T | void;
+
+/**
+ * What a FIELD-level hook is handed.
+ *
+ * A field hook is scoped to one field, so it is given that field's value and
+ * name alongside the row it belongs to. This is deliberately NOT
+ * {@link HookContext}: a collection-level hook receives the whole document as
+ * `data` and has no single field in view, while a field hook is called once per
+ * field and returns that field's replacement value.
+ */
+export interface FieldHookContext<T = unknown> extends HookLanguageContext {
+  /** Collection or single the field belongs to. */
+  collection: string;
+
+  /** Operation that triggered the hook. */
+  operation: "create" | "read" | "update" | "delete";
+
+  /** Name of the field this call is for. */
+  fieldName: string;
+
+  /** The field's current value. */
+  value: T;
+
+  /** The row the field belongs to, so a hook can read its siblings. */
+  data: Record<string, unknown>;
+
+  /** The authenticated caller, when there is one. */
+  user?: Record<string, unknown>;
+
+  /** @experimental As {@link HookContext.principal}. */
+  principal?: Principal;
+}
+
+/**
+ * A field-level hook. Returning a value replaces the field's value; returning
+ * nothing leaves it as it was.
+ */
+export type FieldHookHandler<T = unknown> = (
+  context: FieldHookContext<T>
+) => Promise<T | void> | T | void;
+
+/**
+ * Hook registration options (for future extensibility)
+ *
+ * Reserved for future features like:
+ * - Hook priority/ordering
+ * - Conditional execution
+ * - Hook middleware
+ */
+export interface HookOptions {
+  /**
+   * Hook priority (higher runs first)
+   * @default 0
+   * @future Reserved for future implementation
+   */
+  priority?: number;
+
+  /**
+   * Condition function to determine if hook should run
+   * @future Reserved for future implementation
+   */
+  condition?: (context: HookContext) => boolean;
+}
+
+/**
+ * Operation types supported by beforeOperation hook
+ *
+ * These map to the CRUD operations that can trigger hooks.
+ */
+export type OperationType = "create" | "read" | "update" | "delete";
+
+/**
+ * Arguments object for beforeOperation hook
+ *
+ * Contains the operation arguments that can be modified by the hook.
+ * Different operations use different argument properties:
+ *
+ * - **create**: Uses `data` (the document to create)
+ * - **read**: Uses `id` (single read) or `where` (query)
+ * - **update**: Uses `id` and `data` (the document changes)
+ * - **delete**: Uses `id` (the document to delete)
+ *
+ * @template T - Type of the data being operated on
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- generic default requires `any` for type-erased hook registry
+export interface BeforeOperationArgs<T = any> {
+  /**
+   * Data being created or updated
+   *
+   * For create: The full document to create
+   * For update: The partial document with changes
+   */
+  data?: T;
+
+  /**
+   * ID of the document being operated on
+   *
+   * For read (single): The document ID to fetch
+   * For update: The document ID to update
+   * For delete: The document ID to delete
+   */
+  id?: string;
+
+  /**
+   * Query filter for read operations
+   *
+   * Used for listing/querying multiple documents.
+   * Format follows Nextly Where query syntax.
+   */
+  where?: Record<string, unknown>;
+}
+
+/**
+ * Context object passed to beforeOperation hooks
+ *
+ * The beforeOperation hook runs BEFORE any operation-specific hooks,
+ * allowing you to modify operation arguments or execute side-effects
+ * that run before an operation begins.
+ *
+ * **Use Cases:**
+ * - Global logging/auditing of all operations
+ * - Rate limiting across all operations
+ * - Global validation or normalization
+ * - Modifying operation arguments before they reach specific hooks
+ *
+ * **Execution Order:**
+ * 1. beforeOperation (this hook)
+ * 2. beforeCreate/beforeRead/beforeUpdate/beforeDelete
+ * 3. Database operation
+ * 4. afterCreate/afterRead/afterUpdate/afterDelete
+ *
+ * @template T - Type of the data being operated on
+ *
+ * @example
+ * ```typescript
+ * import { registerBeforeOperationHook } from 'nextly';
+ *
+ * // Global logging for all operations
+ * registerBeforeOperationHook('*', async (context) => {
+ *   console.log(`[${context.operation}] ${context.collection}`, context.args);
+ * });
+ *
+ * // Modify operation arguments
+ * registerBeforeOperationHook('posts', async (context) => {
+ *   if (context.operation === 'create' && context.args.data) {
+ *     return {
+ *       ...context.args,
+ *       data: { ...context.args.data, source: 'api' }
+ *     };
+ *   }
+ *   return context.args;
+ * });
+ * ```
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- generic default requires `any` for type-erased hook registry
+export interface BeforeOperationContext<T = any> extends HookLanguageContext {
+  /**
+   * Collection name (e.g., "posts", "users", "products")
+   *
+   * This is the slug/name of the collection being operated on.
+   */
+  collection: string;
+
+  /**
+   * Operation type being performed
+   *
+   * Determines which CRUD operation is about to run.
+   */
+  operation: OperationType;
+
+  /**
+   * Operation arguments that can be modified
+   *
+   * Contains the data, id, or where clause depending on the operation.
+   * Returning modified args from the handler will affect the operation.
+   */
+  args: BeforeOperationArgs<T>;
+
+  /**
+   * User performing the operation (if authenticated)
+   *
+   * Contains user ID and any additional user data passed from the request.
+   * This is `undefined` if the operation is performed without authentication.
+   */
+  user?: HookContext["user"];
+
+  /** @experimental As {@link HookContext.principal}. */
+  principal?: HookContext["principal"];
+
+  /**
+   * Request metadata and API access (optional)
+   *
+   * Contains HTTP request information and the Nextly Direct API instance.
+   * See {@link HookContext.req} for details.
+   */
+  req?: HookContext["req"];
+
+  /**
+   * Shared context object for passing data between hooks
+   *
+   * This allows beforeOperation to pass data to operation-specific hooks.
+   */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- shared context is a general-purpose key-value store
+  context: Record<string, any>;
+
+  /**
+   * Transaction-bound Drizzle executor for the write this hook participates in.
+   *
+   * Present only when the operation runs inside a caller-owned transaction; a
+   * `beforeOperation` hook that reads the database must use it so the read stays
+   * on the transaction's own connection instead of taking a second pooled one.
+   * See {@link HookContext.executor}. Undefined outside a transaction.
+   */
+  executor?: unknown;
+}
+
+/**
+ * Handler function for beforeOperation hooks
+ *
+ * The beforeOperation handler can:
+ * 1. Execute side-effects (logging, validation) and return void
+ * 2. Modify operation arguments by returning modified args
+ * 3. Throw an error to abort the operation
+ *
+ * **Return Value Behavior:**
+ * - Return `void` or `undefined`: No modification, continue with original args
+ * - Return modified `args`: Use the returned args for the operation
+ * - Throw an error: Abort the operation
+ *
+ * @template T - Type of the data being operated on
+ *
+ * @param context - beforeOperation context with operation metadata and args
+ * @returns Modified args object, or void for side effects only
+ *
+ * @example
+ * ```typescript
+ * // Side effect only (logging)
+ * const logOperation: BeforeOperationHandler = async (context) => {
+ *   console.log(`Operation: ${context.operation} on ${context.collection}`);
+ *   // No return = original args unchanged
+ * };
+ *
+ * // Modify args (add field to data)
+ * const addTimestamp: BeforeOperationHandler<Post> = async (context) => {
+ *   if (context.operation === 'create' && context.args.data) {
+ *     return {
+ *       ...context.args,
+ *       data: { ...context.args.data, operationTimestamp: new Date() }
+ *     };
+ *   }
+ *   return context.args;
+ * };
+ *
+ * // Abort the operation. A NextlyError, not a plain one: a plain Error is
+ * // indistinguishable from a crash, so its message and status are replaced
+ * // with a generic server fault before the caller sees them.
+ * const rateLimit: BeforeOperationHandler = async (context) => {
+ *   if (await isRateLimited(context.user?.id)) {
+ *     throw NextlyError.rateLimited({});
+ *   }
+ * };
+ * ```
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- generic default requires `any` for type-erased hook registry
+export type BeforeOperationHandler<T = any> = (
+  context: BeforeOperationContext<T>
+) =>
+  | void
+  | Promise<void>
+  | BeforeOperationArgs<T>
+  | Promise<BeforeOperationArgs<T>>;
+
+/**
+ * @experimental One write, as the in-transaction phase describes it to a
+ * handler.
+ *
+ * The phase runs last inside the write's own transaction, after the entry, its
+ * field groups, its version and its outbox event are written and before the
+ * commit. Unlike every other phase it is not one of {@link HOOK_TYPES}: a member
+ * added to that published list would break an exhaustive `switch` over
+ * {@link HookType} downstream, and stored and config hooks have no meaning for
+ * it. It is stored apart, as `beforeOperation` is.
+ *
+ * The transaction may be retried after a version conflict, and each attempt
+ * runs the phase again, so whatever a handler does here must be undone by a
+ * rollback: writes on the transaction it is handed, nothing outside it.
+ */
+export interface InTransactionWrite<T = Record<string, unknown>>
+  extends HookLanguageContext {
+  /** The collection written to, or `single:<slug>` for a Single. */
+  collection: string;
+  /** What the write did. A Single is only ever updated. */
+  operation: "create" | "update" | "delete";
+  /** The written entry's id. */
+  id: string;
+  /**
+   * The document as this write leaves it, in the shape a read returns. For a
+   * delete, the document as it was just before it was removed. For an edit
+   * held as a working draft, the pending draft, marked `_isWorkingDraft`.
+   */
+  data: T | undefined;
+  /** For an update, the document before this write. */
+  originalData?: T;
+  /** The staff user the write is made as, when there is one. */
+  user?: HookContext["user"];
+  /**
+   * A detached, deeply frozen copy of the operation's shared hook context, made
+   * afresh for each attempt, so a handler cannot carry state from a discarded
+   * attempt into the one that commits, nor change what later hooks see. Only
+   * plain data is copied (primitives, arrays and plain objects, at any depth);
+   * any other value, such as a class instance, a function, a `Date` or a
+   * `Map`, is left out: its key is absent, and an array slot holding one
+   * reads `undefined`.
+   */
+  context: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * How the registry holds an in-transaction handler: a function of the write's
+ * transaction and the write. A plugin's handler is wrapped into one with its
+ * database bound to that transaction (`ctx.hooks.onInTransaction`).
+ *
+ * @internal
+ */
+export type InTransactionRunner = (
+  tx: TransactionContext,
+  write: InTransactionWrite
+) => Promise<void>;
+
+/**
+ * @experimental One thing deleting a collection takes with it besides its own
+ * entries, as a plugin names it for the delete dialog: what it is called
+ * (`label`) and what sort of thing it is (`kind`, such as `"template"`).
+ */
+export interface CollectionDeleteImpactItem {
+  readonly label: string;
+  readonly kind: string;
+}
+
+/**
+ * How the registry holds one plugin's collection-delete handlers: what
+ * deleting a collection takes with it, and the work that removes it inside
+ * the delete's transaction. A plugin's handlers are wrapped into one with a
+ * transaction token of their own (`ctx.hooks.onCollectionDelete`).
+ *
+ * @internal
+ */
+export interface CollectionDeleteRunner {
+  impact?: (slug: string) => Promise<readonly CollectionDeleteImpactItem[]>;
+  inTransaction?: (slug: string, tx: TransactionContext) => Promise<void>;
+}

@@ -1,0 +1,1536 @@
+import { beforeEach, describe, expect, it } from "vitest";
+
+import { NextlyError } from "../../../errors/nextly-error";
+import { intervalWindow } from "../../collections/query/timeseries-interval";
+import {
+  MAX_WIDGET_LIMIT,
+  relativeSpanStart,
+  validateWidgetQuery,
+} from "../query";
+import { clearSources, registerSource } from "../sources";
+
+/** The one message every source/op refusal answers with. */
+const SOURCE_OR_OP_REFUSAL =
+  "Invalid widget query: unavailable source or unsupported op";
+
+/**
+ * Runs `fn`, requiring it to throw a `NextlyError`, and hands the error back
+ * so a test can read `logContext` -- the only place the source/op detail
+ * survives now that the public message is shared.
+ */
+function caught(fn: () => unknown): NextlyError {
+  try {
+    fn();
+  } catch (err) {
+    expect(err).toBeInstanceOf(NextlyError);
+    return err as NextlyError;
+  }
+  throw new Error("expected the call to throw, and it returned");
+}
+
+beforeEach(() => {
+  clearSources();
+  registerSource({
+    id: "collection:posts",
+    label: "Posts",
+    kind: "collection",
+    supports: ["count", "list"],
+    // Declared, because the queries below select lifecycle states. The `status`
+    // FIELD beside it does not imply the capability -- a collection with the
+    // lifecycle off may declare an ordinary user field of that name, and the
+    // two are indistinguishable in `fields`.
+    lifecycleStatus: true,
+    fields: [
+      { name: "title", type: "string" },
+      { name: "status", type: "string" },
+      { name: "updatedAt", type: "date" },
+    ],
+  });
+});
+
+describe("validateWidgetQuery", () => {
+  it("accepts a query naming a registered source and declared fields, and returns every field unchanged", () => {
+    // I5(a): assert the WHOLE returned object, not just `limit` -- a version
+    // that silently dropped `select` or collapsed `sort`'s leading `-`
+    // (reversing sort direction) would still pass a `limit`-only assertion.
+    const input = {
+      source: "collection:posts",
+      op: "list",
+      select: ["title"],
+      sort: "-updatedAt",
+      where: { status: { equals: "draft" } },
+      limit: 5,
+    };
+    const q = validateWidgetQuery(input);
+    expect(q).toEqual({
+      source: "collection:posts",
+      op: "list",
+      select: ["title"],
+      sort: "-updatedAt",
+      where: { status: { equals: "draft" } },
+      limit: 5,
+    });
+  });
+
+  it("accepts a bare scalar under a field name as an implicit equality shorthand", () => {
+    const q = validateWidgetQuery({
+      source: "collection:posts",
+      op: "count",
+      where: { status: "draft" },
+    });
+    expect(q.where).toEqual({ status: "draft" });
+  });
+
+  it("refuses an unregistered source", () => {
+    // The source id is resolved against the registry, so no caller-invented
+    // table name can ever reach the compiler. Anchored to `logContext` rather
+    // than to the message, because the message is deliberately identical for
+    // every source/op refusal (an enumeration oracle otherwise) -- a catch-all
+    // that refused everything would satisfy a match on the shared message and
+    // could not produce this detail.
+    const err = caught(() =>
+      validateWidgetQuery({ source: "collection:secrets", op: "count" })
+    );
+    expect(err.publicMessage).toBe(SOURCE_OR_OP_REFUSAL);
+    expect(err.logContext?.widgetQuery).toMatch(
+      /unknown source "collection:secrets"/
+    );
+  });
+
+  it("refuses an op the source does not support", () => {
+    const err = caught(() =>
+      validateWidgetQuery({ source: "collection:posts", op: "timeseries" })
+    );
+    expect(err.publicMessage).toBe(SOURCE_OR_OP_REFUSAL);
+    expect(err.logContext?.widgetQuery).toMatch(
+      /does not support op "timeseries"/
+    );
+  });
+
+  it("refuses a query asking for core's own data result, which is an answer and never a question", () => {
+    // `data` is the result core's runner makes for a declared widget drawn by its own component.
+    // A raw query naming it would ask a source for something no source answers.
+    const err = caught(() =>
+      validateWidgetQuery({ source: "collection:posts", op: "data" })
+    );
+    expect(err.publicMessage).toBe(SOURCE_OR_OP_REFUSAL);
+  });
+
+  it("gives an unknown source and an unsupported op the SAME public message", () => {
+    // The oracle, stated directly: a caller who can tell the two apart can
+    // walk collection names and learn which exist.
+    const unknownSource = caught(() =>
+      validateWidgetQuery({ source: "collection:secrets", op: "count" })
+    );
+    const unsupportedOp = caught(() =>
+      validateWidgetQuery({ source: "collection:posts", op: "timeseries" })
+    );
+    expect(unknownSource.publicMessage).toBe(unsupportedOp.publicMessage);
+  });
+
+  it("refuses a where clause naming an undeclared field", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:posts",
+        op: "count",
+        where: { secretScore: { equals: 1 } },
+      })
+    ).toThrow(/where references undeclared field "secretScore"/);
+  });
+
+  it("refuses an explicitly empty select, which reads as the opposite of what it does", () => {
+    // "Select nothing" is not a projection the read path can express: the
+    // Direct API applies a selection only when it has keys, so an empty one
+    // falls through to an UNSELECTED read and the widget receives the whole
+    // document -- the widest possible answer from the narrowest possible
+    // request. Refused for the same reason `where: { and: [] }` and an empty
+    // condition object are refused: an accepted query that silently widens is
+    // exactly what this validator exists to prevent. A widget that wants no
+    // fields asks for `op: "count"`.
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:posts",
+        op: "list",
+        select: [],
+      })
+    ).toThrow(/select is empty/);
+  });
+
+  it("still accepts a select naming one declared field", () => {
+    // The control: without it the refusal above is satisfied by a validator
+    // that refuses every `select`.
+    const q = validateWidgetQuery({
+      source: "collection:posts",
+      op: "list",
+      select: ["title"],
+    });
+    expect(q.select).toEqual(["title"]);
+  });
+
+  it("refuses a select naming an undeclared field", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:posts",
+        op: "list",
+        select: ["title", "secretScore"],
+      })
+    ).toThrow(/select references undeclared field "secretScore"/);
+  });
+
+  it("refuses a sort naming an undeclared field, with or without the minus", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:posts",
+        op: "list",
+        sort: "-secretScore",
+      })
+    ).toThrow(/sort references undeclared field "secretScore"/);
+  });
+
+  describe("a lifecycle selector against a source that has no lifecycle", () => {
+    /**
+     * A collection with the lifecycle OFF that declares an ordinary user field
+     * called `status`. The pair is the whole point: `fields` cannot tell this
+     * apart from a lifecycle collection, so a validator reading the field list
+     * would admit the selector this source cannot answer.
+     */
+    beforeEach(() => {
+      registerSource({
+        id: "collection:notes",
+        label: "Notes",
+        kind: "collection",
+        supports: ["count", "list"],
+        fields: [
+          { name: "title", type: "string" },
+          { name: "status", type: "string" },
+        ],
+      });
+    });
+
+    it.each(["draft", "published"] as const)(
+      "refuses %s, which nothing downstream could have applied",
+      status => {
+        expect(() =>
+          validateWidgetQuery({
+            source: "collection:notes",
+            op: "count",
+            status,
+          })
+        ).toThrow(/collection:notes has no draft\/published lifecycle/);
+      }
+    );
+
+    it('accepts "all", which claims no lifecycle and is what the generated cards send', () => {
+      const q = validateWidgetQuery({
+        source: "collection:notes",
+        op: "count",
+        status: "all",
+      });
+      expect(q.status).toBe("all");
+    });
+
+    it("refuses it for a single too, and still admits one that has the lifecycle", () => {
+      // Both kinds reach the same read plumbing, so the refusal is the
+      // source's capability rather than a rule per kind.
+      registerSource({
+        id: "single:site-settings",
+        label: "Site settings",
+        kind: "single",
+        supports: ["list"],
+        fields: [{ name: "siteName", type: "string" }],
+      });
+      registerSource({
+        id: "single:homepage",
+        label: "Homepage",
+        kind: "single",
+        supports: ["list"],
+        lifecycleStatus: true,
+        fields: [{ name: "headline", type: "string" }],
+      });
+
+      expect(() =>
+        validateWidgetQuery({
+          source: "single:site-settings",
+          op: "list",
+          status: "draft",
+        })
+      ).toThrow(/single:site-settings has no draft\/published lifecycle/);
+
+      expect(
+        validateWidgetQuery({
+          source: "single:homepage",
+          op: "list",
+          status: "draft",
+        }).status
+      ).toBe("draft");
+    });
+  });
+
+  it("clamps the limit rather than trusting it", () => {
+    const q = validateWidgetQuery({
+      source: "collection:posts",
+      op: "list",
+      limit: 100000,
+    });
+    expect(q.limit).toBe(MAX_WIDGET_LIMIT);
+  });
+
+  it("refuses a where clause nested past the depth cap", () => {
+    // Unbounded nesting is a cheap way to make validation itself the
+    // expensive operation.
+    let deep: Record<string, unknown> = { status: { equals: "draft" } };
+    for (let i = 0; i < 12; i++) deep = { and: [deep] };
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:posts",
+        op: "count",
+        where: deep,
+      })
+    ).toThrow(/nested too deeply/);
+  });
+
+  // ---------------------------------------------------------------------
+  // C1: a non-array `and`/`or` value must not silently drop its subtree
+  // from the field walk. Each shape below names the undeclared field
+  // "secretScore" but through a combinator value the old code coerced to
+  // `[]` (zero branches) via `Array.isArray(value) ? value : []` -- which
+  // walked nothing, refused nothing, and let the query through.
+  // ---------------------------------------------------------------------
+  describe("C1: non-array and/or combinators fail closed", () => {
+    it("refuses a non-array `and` value instead of treating it as zero branches", () => {
+      expect(() =>
+        validateWidgetQuery({
+          source: "collection:posts",
+          op: "count",
+          where: { and: { secretScore: { equals: 1 } } },
+        })
+      ).toThrow(/where "and" must be an array/);
+    });
+
+    it("refuses a non-array `and` value even alongside a valid sibling condition", () => {
+      expect(() =>
+        validateWidgetQuery({
+          source: "collection:posts",
+          op: "count",
+          where: {
+            status: { equals: "draft" },
+            and: { secretScore: { equals: 1 } },
+          },
+        })
+      ).toThrow(/where "and" must be an array/);
+    });
+
+    it("refuses an EMPTY `and` array, which matches every row", () => {
+      // The same reason `null` and `{}` are refused under a field name: zero
+      // branches compile to no condition at all, so an accepted query the
+      // author wrote as filtered returns every row instead. Accepting `[]`
+      // while refusing `null` and `{}` for that identical reason was the
+      // inconsistency.
+      expect(() =>
+        validateWidgetQuery({
+          source: "collection:posts",
+          op: "count",
+          where: { and: [] },
+        })
+      ).toThrow(/where "and" is empty, which matches every row/);
+    });
+
+    it("refuses an EMPTY `or` array too", () => {
+      expect(() =>
+        validateWidgetQuery({
+          source: "collection:posts",
+          op: "count",
+          where: { or: [] },
+        })
+      ).toThrow(/where "or" is empty, which matches every row/);
+    });
+
+    it("still accepts a combinator with branches", () => {
+      // The negative control: refusing every combinator would pass both tests
+      // above and break every non-trivial widget.
+      const q = validateWidgetQuery({
+        source: "collection:posts",
+        op: "count",
+        where: { or: [{ status: { equals: "draft" } }] },
+      });
+      expect(q.where).toEqual({ or: [{ status: { equals: "draft" } }] });
+    });
+
+    it("refuses a non-object branch inside an `and` array", () => {
+      expect(() =>
+        validateWidgetQuery({
+          source: "collection:posts",
+          op: "count",
+          where: { and: ["secretScore"] },
+        })
+      ).toThrow(/where "and" branch must be an object/);
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // I2: the returned query must be independent of the input, `where`
+  // included -- not merely a fresh top-level envelope wrapped around a
+  // shared `where` reference.
+  // ---------------------------------------------------------------------
+  it("returns a `where` independent of the input -- mutating the input afterward does not touch it", () => {
+    const input: {
+      source: string;
+      op: string;
+      where: Record<string, unknown>;
+    } = {
+      source: "collection:posts",
+      op: "count",
+      where: { status: { equals: "draft" } },
+    };
+    const q = validateWidgetQuery(input);
+    expect(q.where).not.toBe(input.where);
+
+    // Mutate the ORIGINAL input's `where` after validation returned. If the
+    // returned query shares the reference, this mutation would smuggle an
+    // undeclared field into an object that already passed the gate and that
+    // a caller now treats as safe to compile.
+    (input.where as Record<string, unknown>).secretScore = { equals: 1 };
+
+    expect(q.where).toEqual({ status: { equals: "draft" } });
+  });
+
+  // ---------------------------------------------------------------------
+  // I3: `limit` must clamp even when it is not a well-formed finite number.
+  // ---------------------------------------------------------------------
+  describe("I3: limit clamping survives non-finite and non-integer input", () => {
+    it("falls back to a finite, in-range limit when the requested limit is NaN", () => {
+      const q = validateWidgetQuery({
+        source: "collection:posts",
+        op: "list",
+        limit: Number.NaN,
+      });
+      expect(Number.isFinite(q.limit)).toBe(true);
+      expect(q.limit).toBeGreaterThanOrEqual(1);
+      expect(q.limit).toBeLessThanOrEqual(MAX_WIDGET_LIMIT);
+    });
+
+    it("truncates a non-integer limit to a whole number", () => {
+      const q = validateWidgetQuery({
+        source: "collection:posts",
+        op: "list",
+        limit: 5.7,
+      });
+      expect(Number.isInteger(q.limit)).toBe(true);
+      expect(q.limit).toBe(5);
+    });
+
+    it("still clamps a negative limit up to 1", () => {
+      const q = validateWidgetQuery({
+        source: "collection:posts",
+        op: "list",
+        limit: -1,
+      });
+      expect(q.limit).toBe(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // I4: operator keys inside a field condition must be checked against the
+  // known operator vocabulary -- the field-name check alone lets an
+  // arbitrary operator key (and anything nested under it) through.
+  // ---------------------------------------------------------------------
+  describe("I4: where operators are checked against the known vocabulary", () => {
+    it("refuses a where clause using an operator outside the known vocabulary", () => {
+      expect(() =>
+        validateWidgetQuery({
+          source: "collection:posts",
+          op: "count",
+          where: { status: { $ne: null, notAnOperator: "x", $where: "1=1" } },
+        })
+      ).toThrow(/unknown operator "\$ne" on field "status"/);
+    });
+
+    it("refuses an unrecognised operator key even when it hides a nested condition", () => {
+      expect(() =>
+        validateWidgetQuery({
+          source: "collection:posts",
+          op: "count",
+          where: { status: { some: { secretScore: { equals: 1 } } } },
+        })
+      ).toThrow(/unknown operator "some" on field "status"/);
+    });
+
+    it("refuses a nested object value under a recognised operator", () => {
+      // "equals" IS a known operator; its VALUE should never be a plain
+      // object (every real operator takes a scalar or an array), so this
+      // is refused rather than walked -- see query.ts for why.
+      expect(() =>
+        validateWidgetQuery({
+          source: "collection:posts",
+          op: "count",
+          where: { status: { equals: { secretScore: 1 } } },
+        })
+      ).toThrow(
+        /operator "equals" on field "status" may not take a nested object/
+      );
+    });
+
+    it("refuses a bare array as a field's condition", () => {
+      expect(() =>
+        validateWidgetQuery({
+          source: "collection:posts",
+          op: "count",
+          where: { status: ["draft"] },
+        })
+      ).toThrow(/where condition for "status" must be an operator object/);
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // R2-1: `where` must be read exactly once. Cloning AFTER the walk let a
+  // getter/Proxy answer benignly to the walker's read and hostilely to a
+  // second, later read (structuredClone) -- a TOCTOU. Cloning FIRST and
+  // validating (and returning) that clone means only one read ever happens,
+  // so there is no second read left for a hostile answer to arrive on.
+  // ---------------------------------------------------------------------
+  describe("R2-1: where is read exactly once (clone-first closes the clone-after-walk TOCTOU)", () => {
+    it("a getter on `and` cannot answer differently to the walk than to the returned value", () => {
+      let reads = 0;
+      const where = {
+        get and() {
+          reads++;
+          // First (and, after the fix, ONLY) read is benign. A getter-based
+          // TOCTOU relies on a second read landing after the first read was
+          // approved -- that second read must never happen. The benign value
+          // carries a real branch because an empty combinator is now refused
+          // in its own right, which would end the test before the property
+          // under test is reached.
+          return reads === 1
+            ? [{ status: { equals: "draft" } }]
+            : [{ secretScore: { equals: 1 } }];
+        },
+      };
+      const q = validateWidgetQuery({
+        source: "collection:posts",
+        op: "count",
+        where,
+      });
+      expect(reads).toBe(1);
+      expect(q.where).toEqual({ and: [{ status: { equals: "draft" } }] });
+    });
+
+    it("a getter on a declared field's condition cannot answer differently to the walk than to the returned value", () => {
+      let reads = 0;
+      const where = {
+        get status() {
+          reads++;
+          return reads === 1 ? { equals: "draft" } : { $where: "1=1 OR 1=1" };
+        },
+      };
+      const q = validateWidgetQuery({
+        source: "collection:posts",
+        op: "count",
+        where,
+      });
+      expect(reads).toBe(1);
+      expect(q.where).toEqual({ status: { equals: "draft" } });
+    });
+
+    it("wraps an uncloneable where value in NextlyError rather than a raw DOMException", () => {
+      let caught: unknown;
+      try {
+        validateWidgetQuery({
+          source: "collection:posts",
+          op: "count",
+          where: { status: () => "not clonable" },
+        });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(NextlyError);
+      expect((caught as Error).message).toMatch(
+        /where contains a value that cannot be cloned/
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // R2-2: an accepted query must mean what it says. `null` and `{}` under a
+  // field name both compile to NO condition downstream (buildWhereClause
+  // skips `null`; `{}` has no operator keys), so accepting them would let a
+  // query the author wrote as filtered silently return every row instead.
+  // ---------------------------------------------------------------------
+  describe("R2-2: a condition that compiles to nothing is refused, not silently accepted", () => {
+    it("refuses `null` as a field's condition", () => {
+      expect(() =>
+        validateWidgetQuery({
+          source: "collection:posts",
+          op: "count",
+          where: { status: null },
+        })
+      ).toThrow(
+        /where condition for "status" is null, which matches every row/
+      );
+    });
+
+    it("refuses an empty object as a field's condition", () => {
+      expect(() =>
+        validateWidgetQuery({
+          source: "collection:posts",
+          op: "count",
+          where: { status: {} },
+        })
+      ).toThrow(
+        /where condition for "status" is empty, which matches every row/
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // The read-once invariant covers the WHOLE query, not just `where`.
+  // `validateWidgetQuery` is public API, so the caller's object may be a
+  // Proxy or carry accessors. An earlier commit closed this for `where` and
+  // left its four family members open: a `sort` getter answering "title" to
+  // the guard and "-secretScore" to the return spread yields a certified
+  // query whose sort was never checked.
+  // ---------------------------------------------------------------------
+  describe("every field is read exactly once, not just `where`", () => {
+    /** Counts reads per property and hands back a different value after the first. */
+    function hostile(benign: Record<string, unknown>, hostileValue: unknown) {
+      const reads: Record<string, number> = {};
+      const target: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(benign)) {
+        reads[key] = 0;
+        Object.defineProperty(target, key, {
+          enumerable: true,
+          get() {
+            reads[key] += 1;
+            return reads[key] === 1 ? value : hostileValue;
+          },
+        });
+      }
+      return { target, reads };
+    }
+
+    it("reads every property of the caller's object exactly once", () => {
+      const { target, reads } = hostile(
+        {
+          source: "collection:posts",
+          op: "count",
+          where: { status: { equals: "draft" } },
+          status: "draft",
+          select: ["title"],
+          sort: "-updatedAt",
+          limit: 5,
+        },
+        "-secretScore"
+      );
+
+      validateWidgetQuery(target);
+
+      expect(reads).toEqual({
+        source: 1,
+        op: 1,
+        where: 1,
+        status: 1,
+        select: 1,
+        sort: 1,
+        limit: 1,
+      });
+    });
+
+    it("returns the `sort` it validated, never a later answer from the same getter", () => {
+      let reads = 0;
+      const query = {
+        source: "collection:posts",
+        op: "count",
+        get sort() {
+          reads += 1;
+          return reads === 1 ? "title" : "-secretScore";
+        },
+      };
+
+      // Either outcome is acceptable SECURITY: refusing is fine. What is not
+      // acceptable is certifying `title` and returning `-secretScore`.
+      const q = validateWidgetQuery(query);
+      expect(q.sort).toBe("title");
+    });
+
+    it("returns the `select` it validated, never a later answer from the same getter", () => {
+      let reads = 0;
+      const query = {
+        source: "collection:posts",
+        op: "list",
+        get select() {
+          reads += 1;
+          return reads === 1 ? ["title"] : ["secretScore"];
+        },
+      };
+
+      const q = validateWidgetQuery(query);
+      expect(q.select).toEqual(["title"]);
+    });
+
+    it("returns the `status` it validated, never a later answer from the same getter", () => {
+      let reads = 0;
+      const query = {
+        source: "collection:posts",
+        op: "count",
+        get status() {
+          reads += 1;
+          return reads === 1 ? "draft" : "everything";
+        },
+      };
+
+      const q = validateWidgetQuery(query);
+      expect(q.status).toBe("draft");
+    });
+
+    it("returns the `op` it validated, never a later answer from the same getter", () => {
+      let reads = 0;
+      const query = {
+        source: "collection:posts",
+        get op() {
+          reads += 1;
+          return reads === 1 ? "count" : "timeseries";
+        },
+      };
+
+      const q = validateWidgetQuery(query);
+      expect(q.op).toBe("count");
+    });
+
+    it("copies `select` so a later mutation of the caller's array cannot reach it", () => {
+      // The array ELEMENTS are read once too: validating the caller's array
+      // and returning a spread of it is two reads of each index.
+      const select = ["title"];
+      const q = validateWidgetQuery({
+        source: "collection:posts",
+        op: "list",
+        select,
+      });
+      select[0] = "secretScore";
+      expect(q.select).toEqual(["title"]);
+    });
+  });
+});
+
+describe("a geo filter means what it says or is refused", () => {
+  // `near` and `within` were recognised as operators and their values only
+  // shape-checked, so `"not-a-location"` passed. Downstream `extractGeoFilters`
+  // parses the string, adds NO filter when parsing fails, and leaves nothing in
+  // `cleanedWhere` either -- so an accepted query ran with no condition at all
+  // and both `list` and `count` answered over the WHOLE collection. Validated
+  // here with the canonical parsers the executor itself uses.
+  beforeEach(() => {
+    registerSource({
+      id: "collection:places",
+      label: "Places",
+      kind: "collection",
+      supports: ["count", "list"],
+      fields: [{ name: "location", type: "string" }],
+    });
+  });
+
+  const near = (value: unknown) => () =>
+    validateWidgetQuery({
+      source: "collection:places",
+      op: "list",
+      where: { location: { near: value } },
+    });
+
+  it("accepts a well-formed near value", () => {
+    const query = near("-74.006,40.7128,10000")();
+    expect(query.where).toEqual({
+      location: { near: "-74.006,40.7128,10000" },
+    });
+  });
+
+  it("accepts a well-formed near value carrying a unit", () => {
+    expect(near("-74.006,40.7128,10,km")).not.toThrow();
+  });
+
+  it("accepts a well-formed within value", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:places",
+        op: "list",
+        where: { location: { within: "-74.006,40.7128,5000" } },
+      })
+    ).not.toThrow();
+  });
+
+  it("refuses an unparseable near value", () => {
+    expect(near("not-a-location")).toThrow(
+      /where operator "near" on field "location" is not a valid near filter/
+    );
+  });
+
+  it("refuses coordinates outside the world", () => {
+    // The parser's own bounds, rather than a second opinion about latitude.
+    expect(near("-999,40.7128,10000")).toThrow(/is not a valid near filter/);
+  });
+
+  it("refuses a near value missing its distance", () => {
+    expect(near("-74.006,40.7128")).toThrow(/is not a valid near filter/);
+  });
+
+  it("refuses an unparseable within value", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:places",
+        op: "list",
+        where: { location: { within: "-74.006,40.7128,0" } },
+      })
+    ).toThrow(/is not a valid within filter/);
+  });
+
+  it("refuses a non-string geo value", () => {
+    // `extractGeoFilters` only looks at a geo operator whose value is a string,
+    // so a number is dropped exactly as an unparseable string is.
+    expect(near(10000)).toThrow(/is not a valid near filter/);
+  });
+
+  it("refuses a geo filter nested inside a combinator", () => {
+    // The walk reaches every depth, so the guard has to as well.
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:places",
+        op: "list",
+        where: { and: [{ location: { near: "not-a-location" } }] },
+      })
+    ).toThrow(/is not a valid near filter/);
+  });
+});
+
+describe("a geo filter cannot be counted", () => {
+  // `countEntries` refuses a geo predicate unconditionally: it evaluates them in
+  // memory over rows a count never fetches, and `buildWhereClause` emits no SQL
+  // for them, so a total that ignored one would describe every candidate the
+  // filter was meant to exclude. A VALID geo value therefore used to pass this
+  // validator and fail its batch slot at execution -- the contract's promise is
+  // that an accepted query is one the executor will run, so the refusal belongs
+  // here.
+  beforeEach(() => {
+    registerSource({
+      id: "collection:places",
+      label: "Places",
+      kind: "collection",
+      supports: ["count", "list"],
+      fields: [{ name: "location", type: "string" }],
+    });
+  });
+
+  const counting = (where: unknown) => () =>
+    validateWidgetQuery({
+      source: "collection:places",
+      op: "count",
+      where,
+    });
+
+  it("refuses a valid near filter under count", () => {
+    expect(counting({ location: { near: "-74.006,40.7128,10000" } })).toThrow(
+      /where operator "near" on field "location" cannot be counted/
+    );
+  });
+
+  it("refuses a valid within filter under count", () => {
+    expect(counting({ location: { within: "-74.006,40.7128,5000" } })).toThrow(
+      /where operator "within" on field "location" cannot be counted/
+    );
+  });
+
+  it("refuses a geo filter a combinator hides under count", () => {
+    expect(
+      counting({ and: [{ location: { near: "-74.006,40.7128,10000" } }] })
+    ).toThrow(/cannot be counted/);
+  });
+
+  // The controls. Without them the refusals above are satisfied by a validator
+  // that refuses every geo operator, or every `count`.
+  it("still accepts the same geo filter under list", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:places",
+        op: "list",
+        where: { location: { near: "-74.006,40.7128,10000" } },
+      })
+    ).not.toThrow();
+  });
+
+  it("still accepts a non-geo filter under count", () => {
+    expect(counting({ location: { equals: "here" } })).not.toThrow();
+  });
+});
+
+describe("validateWidgetQuery, group key", () => {
+  beforeEach(() => {
+    registerSource({
+      id: "collection:grouped",
+      label: "Grouped",
+      kind: "collection",
+      supports: ["count", "list", "groupBy"],
+      fields: [
+        { name: "title", type: "string" },
+        { name: "status", type: "string" },
+      ],
+    });
+  });
+
+  it("carries a declared group key through onto the returned query", () => {
+    // Asserts the WHOLE object: a version that validated the key and then
+    // dropped it on the way out would satisfy any assertion that only read
+    // `groupBy` back off the input.
+    expect(
+      validateWidgetQuery({
+        source: "collection:grouped",
+        op: "groupBy",
+        groupBy: "status",
+      })
+    ).toEqual({
+      source: "collection:grouped",
+      op: "groupBy",
+      groupBy: "status",
+      limit: 5,
+    });
+  });
+
+  it("refuses a group key carried by an op that would ignore it", () => {
+    // The case worth refusing rather than dropping: accepted and ignored, a
+    // `count` reads back as a grouped count that was never computed.
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:grouped",
+        op: "count",
+        groupBy: "status",
+      })
+    ).toThrow(/groupBy is not valid for op "count"/);
+  });
+
+  it("refuses a groupBy op carrying no key", () => {
+    expect(() =>
+      validateWidgetQuery({ source: "collection:grouped", op: "groupBy" })
+    ).toThrow(/op "groupBy" requires a groupBy field/);
+  });
+
+  it("refuses a group key that is not a string", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:grouped",
+        op: "groupBy",
+        groupBy: ["status"],
+      })
+    ).toThrow(/groupBy must be a string/);
+  });
+
+  it("refuses a group key naming a field the source never declared", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:grouped",
+        op: "groupBy",
+        groupBy: "secretScore",
+      })
+    ).toThrow(/groupBy references undeclared field "secretScore"/);
+  });
+
+  it("refuses a select beside a grouped query, which returns no rows to select from", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:grouped",
+        op: "groupBy",
+        groupBy: "status",
+        select: ["title"],
+      })
+    ).toThrow(/select is not valid for op "groupBy"/);
+  });
+
+  it("refuses a sort beside a grouped query, which is ordered by bucket size", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:grouped",
+        op: "groupBy",
+        groupBy: "status",
+        sort: "-title",
+      })
+    ).toThrow(/sort is not valid for op "groupBy"/);
+  });
+
+  it("reads the group key exactly once, so an accessor cannot swap it past the check", () => {
+    // The invariant the whole module is built on: a property read twice is a
+    // seam where the value that was checked and the value that ships differ.
+    let reads = 0;
+    const q = validateWidgetQuery({
+      source: "collection:grouped",
+      op: "groupBy",
+      get groupBy() {
+        reads += 1;
+        return reads === 1 ? "status" : "secretScore";
+      },
+    });
+
+    expect(reads).toBe(1);
+    expect(q.groupBy).toBe("status");
+  });
+});
+
+describe("validateWidgetQuery, timeline keys", () => {
+  beforeEach(() => {
+    registerSource({
+      id: "collection:timed",
+      label: "Timed",
+      kind: "collection",
+      supports: ["count", "list", "timeseries"],
+      fields: [
+        { name: "title", type: "string" },
+        { name: "createdAt", type: "date" },
+      ],
+    });
+  });
+
+  it("carries both timeline keys through onto the returned query", () => {
+    // Asserts the WHOLE object: a version that validated the keys and dropped
+    // them on the way out would satisfy any assertion that only read them back
+    // off the input.
+    expect(
+      validateWidgetQuery({
+        source: "collection:timed",
+        op: "timeseries",
+        dateField: "createdAt",
+        interval: "day",
+      })
+    ).toEqual({
+      source: "collection:timed",
+      op: "timeseries",
+      dateField: "createdAt",
+      interval: "day",
+      limit: 5,
+    });
+  });
+
+  it("refuses a date field carried by an op that would ignore it", () => {
+    // Accepted and ignored, a `count` reads back as a timeline that was never
+    // computed.
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:timed",
+        op: "count",
+        dateField: "createdAt",
+      })
+    ).toThrow(/dateField is not valid for op "count"/);
+  });
+
+  it("refuses an interval carried by an op that would ignore it", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:timed",
+        op: "count",
+        interval: "day",
+      })
+    ).toThrow(/interval is not valid for op "count"/);
+  });
+
+  it("refuses a timeseries op carrying no date field", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:timed",
+        op: "timeseries",
+        interval: "day",
+      })
+    ).toThrow(/op "timeseries" requires a dateField/);
+  });
+
+  it("refuses a timeseries op carrying no interval", () => {
+    // Not defaulted: a width nobody chose answers a question nobody asked.
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:timed",
+        op: "timeseries",
+        dateField: "createdAt",
+      })
+    ).toThrow(/op "timeseries" requires an interval/);
+  });
+
+  it("refuses a date field the source never declared", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:timed",
+        op: "timeseries",
+        dateField: "secretAt",
+        interval: "day",
+      })
+    ).toThrow(/dateField references undeclared field "secretAt"/);
+  });
+
+  it("refuses a date field that is not a string", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:timed",
+        op: "timeseries",
+        dateField: ["createdAt"],
+        interval: "day",
+      })
+    ).toThrow(/dateField must be a string/);
+  });
+
+  it("refuses an interval it has no expression for", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:timed",
+        op: "timeseries",
+        dateField: "createdAt",
+        interval: "fortnight",
+      })
+    ).toThrow(/interval must be one of/);
+  });
+
+  it("refuses an inherited name offered as an interval", () => {
+    // The vocabulary is checked by membership rather than by indexing an
+    // object, so a prototype name is not an interval.
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:timed",
+        op: "timeseries",
+        dateField: "createdAt",
+        interval: "toString",
+      })
+    ).toThrow(/interval must be one of/);
+  });
+
+  it("refuses select and sort, which describe rows rather than points", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:timed",
+        op: "timeseries",
+        dateField: "createdAt",
+        interval: "day",
+        select: ["title"],
+      })
+    ).toThrow(/select is not valid for op "timeseries"/);
+
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:timed",
+        op: "timeseries",
+        dateField: "createdAt",
+        interval: "day",
+        sort: "createdAt",
+      })
+    ).toThrow(/sort is not valid for op "timeseries"/);
+  });
+});
+
+describe("validateWidgetQuery, a timeline key must name a date", () => {
+  beforeEach(() => {
+    registerSource({
+      id: "collection:mixed",
+      label: "Mixed",
+      kind: "collection",
+      supports: ["count", "timeseries"],
+      fields: [
+        { name: "title", type: "string" },
+        { name: "views", type: "number" },
+        { name: "createdAt", type: "date" },
+      ],
+    });
+  });
+
+  it("refuses a date field the source declares as something else", () => {
+    // The source already states each field's type, so this is refusable here.
+    // Accepted, it would reach the read, be refused there for storing no date,
+    // and arrive as a failed widget slot -- a runtime answer to a question the
+    // declaration already answers.
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:mixed",
+        op: "timeseries",
+        dateField: "title",
+        interval: "day",
+      })
+    ).toThrow(/is a string field; a timeseries needs a date/);
+  });
+
+  it("refuses a numeric field just as firmly", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:mixed",
+        op: "timeseries",
+        dateField: "views",
+        interval: "day",
+      })
+    ).toThrow(/is a number field; a timeseries needs a date/);
+  });
+
+  it("accepts the field the source declares as a date", () => {
+    // The control. Without it a guard that refused every key would satisfy both
+    // assertions above while making the op unusable.
+    expect(
+      validateWidgetQuery({
+        source: "collection:mixed",
+        op: "timeseries",
+        dateField: "createdAt",
+        interval: "day",
+      })
+    ).toEqual({
+      source: "collection:mixed",
+      op: "timeseries",
+      dateField: "createdAt",
+      interval: "day",
+      limit: 5,
+    });
+  });
+});
+
+describe("validateWidgetQuery, a localized date key", () => {
+  beforeEach(() => {
+    registerSource({
+      id: "collection:i18n",
+      label: "Localized",
+      kind: "collection",
+      supports: ["count", "timeseries"],
+      fields: [
+        { name: "publishedAt", type: "date" },
+        // Its values live in the `_locales` companion, so the read cannot
+        // bucket them. The coarse type says "date" either way.
+        { name: "translatedAt", type: "date", localized: true },
+      ],
+    });
+  });
+
+  it("refuses a localized date, which the coarse type cannot express", () => {
+    // Approved here, it would register a widget that the read refuses on every
+    // load, with nothing pointing at the declaration that caused it.
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:i18n",
+        op: "timeseries",
+        dateField: "translatedAt",
+        interval: "day",
+      })
+    ).toThrow(/is localized, so its values are stored per locale/);
+  });
+
+  it("still accepts a date that is not localized", () => {
+    // The control: a guard that refused every date field would satisfy the
+    // assertion above while making the op unusable.
+    expect(
+      validateWidgetQuery({
+        source: "collection:i18n",
+        op: "timeseries",
+        dateField: "publishedAt",
+        interval: "day",
+      })
+    ).toEqual({
+      source: "collection:i18n",
+      op: "timeseries",
+      dateField: "publishedAt",
+      interval: "day",
+      limit: 5,
+    });
+  });
+});
+
+describe("a read's window", () => {
+  beforeEach(() => {
+    registerSource({
+      id: "collection:dated",
+      label: "Dated",
+      kind: "collection",
+      supports: ["count", "list", "timeseries"],
+      fields: [
+        { name: "title", type: "string" },
+        { name: "createdAt", type: "date" },
+      ],
+    });
+  });
+
+  it("carries since and until on a count, from the closed list", () => {
+    expect(
+      validateWidgetQuery({
+        source: "collection:dated",
+        op: "count",
+        since: "60d",
+        until: "30d",
+      })
+    ).toMatchObject({ since: "60d", until: "30d" });
+  });
+
+  it.each([
+    [
+      { op: "count", since: "45d" },
+      /since must be one of 7d, 30d, 60d, 90d, 12m/,
+    ],
+    [{ op: "count", until: "30d" }, /since must be one of/],
+    [
+      { op: "count", since: "30d", until: "60d" },
+      /must end the window after since/,
+    ],
+    [
+      { op: "count", since: "30d", until: "30d" },
+      /must end the window after since/,
+    ],
+    [{ op: "list", since: "30d" }, /bound a count or a timeseries, not a list/],
+  ])("refuses %j", (query, reason) => {
+    expect(() =>
+      validateWidgetQuery({ source: "collection:dated", ...query })
+    ).toThrow(reason);
+  });
+
+  it("refuses a window on a count whose source declares no createdAt", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:posts",
+        op: "count",
+        since: "7d",
+      })
+    ).toThrow(/does not declare/);
+  });
+});
+
+describe("a timeseries' range", () => {
+  beforeEach(() => {
+    registerSource({
+      id: "collection:dated",
+      label: "Dated",
+      kind: "collection",
+      supports: ["count", "list", "timeseries"],
+      fields: [
+        { name: "title", type: "string" },
+        { name: "createdAt", type: "date" },
+      ],
+    });
+  });
+
+  it("carries the range alone, with no interval: the range sets it", () => {
+    const asked = validateWidgetQuery({
+      source: "collection:dated",
+      op: "timeseries",
+      dateField: "createdAt",
+      range: "90d",
+    });
+    expect(asked).toMatchObject({ dateField: "createdAt", range: "90d" });
+    expect(asked).not.toHaveProperty("interval");
+  });
+
+  it.each([
+    // 🔴 Two windows in one query: resolved by precedence, one of them would
+    // be silently ignored.
+    [
+      { range: "30d", since: "30d" },
+      /range and since or until each name a window/,
+    ],
+    [
+      { range: "30d", until: "30d" },
+      /range and since or until each name a window/,
+    ],
+    [{ range: "30d", interval: "day" }, /range sets the interval/],
+    // 🔴 The range sets the points drawn, so a limit beside it would be accepted and ignored.
+    [{ range: "30d", limit: 1 }, /range sets how many points are drawn/],
+    [{ range: "60d" }, /range must be one of 7d, 30d, 90d, 12m/],
+  ])("refuses %j on a timeseries", (keys, reason) => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:dated",
+        op: "timeseries",
+        dateField: "createdAt",
+        ...keys,
+      })
+    ).toThrow(reason);
+  });
+
+  it("carries no limit on a ranged query, so what it returns validates again unchanged", () => {
+    // 🔴 A limit added by default would be refused the next time the query is checked.
+    const once = validateWidgetQuery({
+      source: "collection:dated",
+      op: "timeseries",
+      dateField: "createdAt",
+      range: "30d",
+    });
+    expect(once).not.toHaveProperty("limit");
+    expect(validateWidgetQuery(once)).toEqual(once);
+  });
+
+  it("refuses a range on any op but a timeseries", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:dated",
+        op: "count",
+        range: "7d",
+      })
+    ).toThrow(/range draws a timeseries, not a count/);
+  });
+});
+
+describe("relativeSpanStart", () => {
+  const now = new Date("2026-03-31T10:20:30.400Z");
+
+  it("starts at the first of the whole UTC days the span names, today included", () => {
+    // Thirty days ending with today, the 31st: from the 2nd at midnight.
+    expect(relativeSpanStart("30d", now).toISOString()).toBe(
+      "2026-03-02T00:00:00.000Z"
+    );
+    expect(relativeSpanStart("7d", now).toISOString()).toBe(
+      "2026-03-25T00:00:00.000Z"
+    );
+    expect(relativeSpanStart("60d", now).toISOString()).toBe(
+      "2026-01-31T00:00:00.000Z"
+    );
+  });
+
+  it("starts at the first of the whole UTC months the span names, this one included", () => {
+    expect(relativeSpanStart("12m", now).toISOString()).toBe(
+      "2025-04-01T00:00:00.000Z"
+    );
+    // From a leap day: the month boundary, so no day needs clamping.
+    expect(
+      relativeSpanStart(
+        "12m",
+        new Date("2028-02-29T23:59:59.999Z")
+      ).toISOString()
+    ).toBe("2027-03-01T00:00:00.000Z");
+  });
+
+  it("is the first bucket of a timeseries over the same span, so a window and its chart agree", () => {
+    expect(relativeSpanStart("30d", now)).toEqual(
+      intervalWindow(now, "day", 30)[0]
+    );
+    expect(relativeSpanStart("12m", now)).toEqual(
+      intervalWindow(now, "month", 12)[0]
+    );
+  });
+});
+
+describe("a collection's workflow conditions", () => {
+  it("admits the entry list's workflow conditions at the top level, in the forms the list reads", () => {
+    for (const where of [
+      { _inRelease: true },
+      { _inRelease: { scheduledBefore: "2026-10-28T09:00:00Z" } },
+      { _pendingChange: true, title: { contains: "news" } },
+    ]) {
+      expect(
+        validateWidgetQuery({ source: "collection:posts", op: "count", where })
+          .where
+      ).toEqual(where);
+    }
+  });
+
+  it("refuses one below the top level, where the list would not read it", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:posts",
+        op: "count",
+        where: { and: [{ _inRelease: true }] },
+      })
+    ).toThrow(
+      /"_inRelease" keeps entries a scheduled release will publish, and is read only at the top level/
+    );
+  });
+
+  it("refuses a form the list does not read", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:posts",
+        op: "count",
+        where: { _inRelease: false },
+      })
+    ).toThrow(/"_inRelease" needs true/);
+  });
+
+  it("is a collection's alone: on another source it is a field like any other", () => {
+    registerSource({
+      id: "plugin:shop",
+      label: "Shop",
+      kind: "plugin",
+      supports: ["count"],
+      fields: [{ name: "total", type: "number" }],
+    });
+    expect(() =>
+      validateWidgetQuery({
+        source: "plugin:shop",
+        op: "count",
+        where: { _inRelease: true },
+      })
+    ).toThrow(/undeclared field "_inRelease"/);
+  });
+});
+
+describe("validateWidgetQuery, a source's declared filters", () => {
+  beforeEach(() => {
+    registerSource({
+      id: "system:edits",
+      label: "Edits",
+      kind: "system",
+      supports: ["list"],
+      fields: [
+        { name: "entryTitle", type: "string" },
+        { name: "collection", type: "string" },
+      ],
+      filters: ["collection", "onlyMine"],
+    });
+  });
+
+  it("admits a filter the source declares, in the value it takes", () => {
+    const q = validateWidgetQuery({
+      source: "system:edits",
+      op: "list",
+      where: { collection: "posts", onlyMine: true },
+    });
+    expect(q.where).toEqual({ collection: "posts", onlyMine: true });
+  });
+
+  it("admits Role as a role's slug, and refuses any other value", () => {
+    registerSource({
+      id: "system:people",
+      label: "People",
+      kind: "system",
+      supports: ["list"],
+      fields: [{ name: "name", type: "string" }],
+      filters: ["role"],
+    });
+    const q = validateWidgetQuery({
+      source: "system:people",
+      op: "list",
+      where: { role: "editor" },
+    });
+    expect(q.where).toEqual({ role: "editor" });
+    for (const role of ["", 3, { equals: "editor" }]) {
+      expect(() =>
+        validateWidgetQuery({
+          source: "system:people",
+          op: "list",
+          where: { role },
+        })
+      ).toThrow(/where filter "role" on "system:people" must be a role's slug/);
+    }
+  });
+
+  it("refuses a filter in a value it does not take, and one the source does not declare", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "system:edits",
+        op: "list",
+        where: { onlyMine: "yes" },
+      })
+    ).toThrow(NextlyError);
+    expect(() =>
+      validateWidgetQuery({
+        source: "system:edits",
+        op: "list",
+        where: { collection: { equals: "posts" } },
+      })
+    ).toThrow(NextlyError);
+    // 🔴 A source that declares no filters gets none: `onlyMine` is no field of
+    // a collection, so it is refused as any undeclared name is.
+    expect(() =>
+      validateWidgetQuery({
+        source: "collection:posts",
+        op: "list",
+        where: { onlyMine: true },
+      })
+    ).toThrow(NextlyError);
+  });
+
+  it("never admits a filter inside a combinator, where it would be a field condition", () => {
+    expect(() =>
+      validateWidgetQuery({
+        source: "system:edits",
+        op: "list",
+        where: { or: [{ onlyMine: true }, { collection: "posts" }] },
+      })
+    ).toThrow(NextlyError);
+  });
+});

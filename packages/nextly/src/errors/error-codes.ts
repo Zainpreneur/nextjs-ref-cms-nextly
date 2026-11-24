@@ -1,0 +1,455 @@
+/**
+ * Canonical NextlyError codes and their HTTP status mappings.
+ *
+ * Plugin codes outside this enum must always pass an explicit `statusCode`
+ * to the NextlyError constructor (no enum lookup happens for unknown codes).
+ */
+export const NEXTLY_ERROR_STATUS = {
+  VALIDATION_ERROR: 400,
+  INVALID_INPUT: 400,
+  AUTH_REQUIRED: 401,
+  AUTH_INVALID_CREDENTIALS: 401,
+  TOKEN_EXPIRED: 401,
+  FORBIDDEN: 403,
+  // The password was right and the address is unverified. Distinct from
+  // AUTH_INVALID_CREDENTIALS so the login page can offer to resend the link;
+  // only a caller who proved the password ever receives it.
+  EMAIL_NOT_VERIFIED: 403,
+  // The schema builder is off in this environment (production by default).
+  // Separate from FORBIDDEN: the caller's permissions are not the problem.
+  BUILDER_DISABLED: 403,
+  // A cookie-authenticated write whose origin or CSRF token did not check
+  // out. Separate from FORBIDDEN for the same reason: the caller may hold
+  // every permission, and a client can recover by reloading, not by asking
+  // an administrator for access.
+  CSRF_FAILED: 403,
+  // First-administrator setup in production without the setup token that
+  // opens it: missing, wrong, expired, or a configured one too weak to accept.
+  SETUP_TOKEN_REQUIRED: 403,
+  // An API key's role allows more than the person creating it may do.
+  // Separate from FORBIDDEN, which a person who may not create keys at all
+  // receives, so the key form can say which: choose a smaller role, or ask
+  // for access. The sentence stays FORBIDDEN's and names no permission.
+  API_KEY_ROLE_ABOVE_CREATOR: 403,
+  // A plugin's declared action asked of a row its visibility rule hides,
+  // judged on the row as the caller reads it. Separate from FORBIDDEN, which
+  // the action's permission refuses with: the caller may hold every
+  // permission, and the row is what is wrong. Generic: it never says which
+  // rule, or which field.
+  ACTION_NOT_AVAILABLE: 403,
+  NOT_FOUND: 404,
+  // A write to a collection or Single removed from code: its registry row
+  // says the app's code defines it, and the running configuration no longer
+  // declares it. 409 like the other states the database and the configuration
+  // disagree about: the caller's permissions are not the problem, retrying
+  // cannot change it, and declaring it again or retiring it does.
+  ENTITY_REMOVED_FROM_CODE: 409,
+  // A read or write of a collection or Single the database has not been
+  // migrated for: a declared field's column or the entity's table is missing,
+  // or this running instance never registered the entity. 409 for the reason
+  // ENTITY_REMOVED_FROM_CODE gives: retrying cannot change it, and
+  // `nextly migrate` does.
+  ENTITY_NOT_MIGRATED: 409,
+  // The path exists and this verb is not one it serves. Distinct from NOT_FOUND, which would
+  // tell the caller the address is wrong when only the method is; the response carries `Allow`.
+  METHOD_NOT_ALLOWED: 405,
+  // A `Range` naming bytes past the end of the file asked for. Distinct from
+  // NOT_FOUND: the file is there, and the response's `Content-Range` gives its
+  // size so the client can ask again for a span that exists.
+  RANGE_NOT_SATISFIABLE: 416,
+  CONFLICT: 409,
+  // An update made from a version of the document that is no longer its
+  // current one: someone else's save came in between. Its own code rather
+  // than CONFLICT, which the edit lock's claim and content history's version
+  // allocation already answer and which a retry keys on: this one must never
+  // be retried, since the same version stays out of date.
+  STALE_VERSION: 409,
+  // A write or a schema change that waited the hold's 30 seconds for another change of the same
+  // collection (a collection delete, a Builder save deleting a field's values) and was refused
+  // before anything changed. Its own code beside CONFLICT so a caller, a release run among them,
+  // can tell the refusal is safe to try again once the other change ends.
+  COLLECTION_BEING_CHANGED: 409,
+  // An update that must say which version of a document it was made from, or
+  // that it overwrites whatever is stored, and said neither: 428, Precondition
+  // Required. Its own code beside STALE_VERSION: nothing is out of date, the
+  // request is missing the condition it is judged by.
+  VERSION_REQUIRED: 428,
+  DUPLICATE: 409,
+  RATE_LIMITED: 429,
+  PAYLOAD_TOO_LARGE: 413,
+  UNSUPPORTED_MEDIA_TYPE: 415,
+  // 422: understood, well-formed, and refused on a rule the caller can act on.
+  // Deliberately NOT added to CANONICAL_CODE_FOR_STATUS -- that list drives the
+  // status -> code direction, where 422 stays mapped to INVALID_INPUT.
+  BUSINESS_RULE_VIOLATION: 422,
+  // A submit for review naming a step that is not a submit (an approval, a request for changes
+  // or a move). 400: the call names the wrong step, whatever the document's state.
+  WORKFLOW_STEP_NOT_SUBMIT: 400,
+  // A submit for review naming no step, of a part whose stage no submit step leaves. 409 like a
+  // stale write: the part's state stands in the way, not the call, and it may change.
+  WORKFLOW_NO_SUBMIT_STEP: 409,
+  INTERNAL_ERROR: 500,
+  DATABASE_ERROR: 500,
+  // A request waited `pool.connectionTimeoutMs` for a database connection and
+  // was given none, or found a SQLite file held past `busyTimeout`. 503, not
+  // 500 or 409: the statement or transaction that waited never ran, nothing is
+  // wrong with the request, and retrying shortly is the remedy, which
+  // `retryAfterSeconds` and Retry-After say.
+  DATABASE_BUSY: 503,
+  // An access or field rule the request needs could not run: its own database
+  // query waited out `pool.connectionTimeoutMs`. 503, not 403: the rule never
+  // answered, so nothing was refused, and retrying shortly is the remedy.
+  RULE_COULD_NOT_RUN: 503,
+  EXTERNAL_SERVICE_ERROR: 502,
+  SERVICE_UNAVAILABLE: 503,
+  // The app nextly runs in is set up so nextly cannot work: its config, or the
+  // Next.js and React it installs. 500: nothing about the request is wrong,
+  // and only the operator can change it.
+  CONFIGURATION_ERROR: 500,
+  // Outbound-fetch safety (utils/validate-external-url): a URL refused for SSRF
+  // safety, and a fetch that timed out / exceeded the size cap / failed to decode.
+  EXTERNAL_URL_BLOCKED: 400,
+  EXTERNAL_REQUEST_FAILED: 502,
+  FILENAME_INVALID: 400,
+  EXTENSION_BLOCKED: 400,
+  MIME_BLOCKED: 415,
+  MIME_NOT_ALLOWED: 415,
+  SIZE_EXCEEDED: 413,
+  // A stored object exceeded the cap a READ was given, which is a different
+  // question from SIZE_EXCEEDED above: that one refuses an upload the caller
+  // is sending, this one refuses to buffer an object already stored. Kept
+  // apart so a caller discriminating on the code cannot match both.
+  STORAGE_READ_TOO_LARGE: 413,
+  // A stored object did not answer within the deadline the read was given. 504
+  // rather than 500 because the failure is the BACKEND not answering, and a
+  // caller can act on that difference: a gateway timeout is worth retrying, an
+  // internal error is not.
+  STORAGE_READ_TIMEOUT: 504,
+  // The store answered, and answered badly. 502 rather than 500 because the
+  // fault is UPSTREAM of this process: a caller can retry it, and an operator
+  // reading the log needs to look at the bucket rather than at this service.
+  // Distinct from the timeout above, which never got an answer at all.
+  STORAGE_READ_UNREACHABLE: 502,
+  MAGIC_BYTE_MISMATCH: 400,
+  SVG_SANITIZATION_FAILED: 400,
+  UNSUPPORTED_FOR_BACKEND: 415,
+  // Plan B — schema bookkeeping consolidation.
+  NEXTLY_LEGACY_BOOKKEEPING_DETECTED: 409,
+  NEXTLY_UPGRADE_TABLE_NAME_COLLISION: 409,
+  NEXTLY_UPGRADE_IN_PROGRESS: 409,
+  // Plan C2 — nextly migrate phases.
+  NEXTLY_MIGRATE_LOCK_BUSY: 409,
+  // A schema change waited for a table another database session holds, past
+  // its bounds, and stopped. 409 like the schema lock's refusal: another
+  // session holds what the change needs, and it can run once that ends.
+  NEXTLY_TABLE_BUSY: 409,
+  // A write made inside a schema change's own SQLite transaction, on another
+  // connection to the same database, waited for the write lock that
+  // transaction holds. 500, not 409: this process holds the lock, no other
+  // session does, so nothing can end that a retry would wait for.
+  NEXTLY_LOCK_HELD_BY_THIS_PROCESS: 500,
+  NEXTLY_BASELINE_LOCK_NOT_HELD: 409,
+  NEXTLY_RESOLVE_LOCK_NOT_HELD: 409,
+  // Boot refused to serve: the migrate lock stayed held past the wait deadline,
+  // so this process never established whether the schema matches the code. 503
+  // rather than 409 — a load balancer should take the instance out of rotation
+  // and retry it, which is exactly the recovery this refusal wants.
+  NEXTLY_BOOT_MIGRATIONS_NOT_RUN: 503,
+  // Still running rather than refused. 503 for the same reason: retry shortly.
+  NEXTLY_BOOT_MIGRATIONS_PENDING: 503,
+  // A production start refused a database `nextly migrate` has not set up: it
+  // holds none of Nextly's tables, and the start creates none. 503 for the
+  // same reason as the two above: the instance serves once the deploy migrates.
+  NEXTLY_DATABASE_NOT_SET_UP: 503,
+  // A database with no Nextly tables, where the step that refuses sets up
+  // nothing. 503 like the two above: the instance cannot serve until the
+  // database is migrated, and running `nextly migrate` is the recovery.
+  NEXTLY_DATABASE_NOT_MIGRATED: 503,
+  NEXTLY_CORE_DESTRUCTIVE_REFUSED: 409,
+  // A core upgrade drizzle-kit cannot plan from this database, refused
+  // before any statement: the database is as it was, and an earlier release
+  // takes it the first step.
+  NEXTLY_CORE_UPGRADE_UNSUPPORTED: 409,
+  // A core upgrade that ran and still left a declared column or table out.
+  NEXTLY_CORE_UPGRADE_INCOMPLETE: 500,
+  NEXTLY_MIGRATION_DRIFT: 409,
+  NEXTLY_MIGRATION_APPLY_FAILED: 500,
+  // A SQLite migration unit would leave a row referencing a row that does
+  // not exist, or could not switch foreign-key enforcement off to run.
+  NEXTLY_MIGRATION_FOREIGN_KEY_VIOLATION: 409,
+  // A migration unit marked to run outside a transaction failed part-way;
+  // the statements before the failing one stayed applied.
+  NEXTLY_MIGRATION_PARTIALLY_APPLIED: 500,
+  // A pending app migration the database already stands at the end of, whose snapshot does not
+  // prove all it does, refused rather than recorded applied without running.
+  NEXTLY_MIGRATION_NOT_PROVEN: 409,
+  // Another run recorded the same migration applied, or rolled back, while
+  // this one was running it: this run's ledger write lost, and its work is
+  // rolled back wherever the transaction can undo it.
+  NEXTLY_MIGRATION_CONCURRENT_RUN: 409,
+  // `nextly migrate:resolve`, the recovery command.
+  NEXTLY_MIGRATION_FILE_MISSING: 404,
+  NEXTLY_MIGRATION_SNAPSHOT_MISSING: 404,
+  NEXTLY_MIGRATION_RESOLVE_DRIFT: 409,
+  NEXTLY_MIGRATION_RESOLVE_PRECONDITION: 409,
+  // A Schema Builder save refused by the migration history checks `nextly
+  // migrate` runs first (an applied file edited or missing, an unfinished
+  // attempt): nothing is written until the history is settled.
+  NEXTLY_MIGRATION_HISTORY_REFUSED: 409,
+  // A Schema Builder save that would also convert a column an earlier version
+  // made to the one field-to-column mapping, which the person did not confirm
+  // in the save's review: the Builder changes only what it said it would.
+  NEXTLY_SCHEMA_CONVERSION_UNCONFIRMED: 409,
+  // The Builder's UI schema.
+  NEXTLY_UI_SCHEMA_INVALID: 400,
+  NEXTLY_SCHEMA_SLUG_COLLISION: 409,
+  NEXTLY_SCHEMA_RELATION_TARGET_MISSING: 400,
+  // A declared table's relation names a table or column the registry does
+  // not have once every table is registered.
+  NEXTLY_SCHEMA_RELATION_UNRESOLVED: 400,
+  // Plugin schema: `contributes.extend` and relations.
+  NEXTLY_SCHEMA_EXTEND_TARGET_UNKNOWN: 400,
+  NEXTLY_SCHEMA_EXTEND_FIELD_DUPLICATE: 409,
+  NEXTLY_SCHEMA_CROSS_PLUGIN_RELATION: 409,
+  // Plugin schema: the framework remap (`.rename()`).
+  NEXTLY_SCHEMA_RENAME_UNKNOWN_TARGET: 400,
+  // Plugin platform — a declared admin.clientConfig that cannot be delivered
+  // to the browser, refused at boot rather than serialized mangled.
+  NEXTLY_PLUGIN_CLIENT_CONFIG_INVALID: 500,
+  // Plugin platform — a contributed admin widget that cannot be delivered to
+  // the browser. Refused at boot because it is serialized into the ONE
+  // `/api/admin-meta/workspace` payload: a value `JSON.stringify` throws on
+  // fails that request for every admin, not just the widget's own card.
+  NEXTLY_PLUGIN_ADMIN_WIDGET_INVALID: 500,
+  // Plugin platform — a plugin that adds widgets or widget data sources through
+  // `contributes.admin.widgets` or `contributes.widgetSources`, keys Nextly no
+  // longer reads: a plugin declares its widgets with `defineWidget` under
+  // `contributes.dashboard`. Refused at boot, naming the plugin and the key.
+  NEXTLY_PLUGIN_REMOVED_WIDGET_CHANNEL: 500,
+  // A plugin's document view cannot be routed: a malformed or reserved path,
+  // or one two declarations claim on the same document. Refused at boot.
+  NEXTLY_PLUGIN_DOCUMENT_VIEW_INVALID: 500,
+  // A plugin's override of a document action, or a section it adds to the
+  // document panel, cannot be drawn: an unknown action, nothing to draw, or
+  // one action two plugins override on one collection. Refused at boot.
+  NEXTLY_PLUGIN_DOCUMENT_SURFACE_INVALID: 500,
+  // Plugin platform (P0) — boot-time plugin dependency/version resolution.
+  PLUGIN_RESOLUTION_ERROR: 500,
+  // Plugin schema lifecycle. All 409: each is a state
+  // the database and the config disagree about, which retrying cannot change
+  // and an operator command resolves.
+  PLUGIN_DEPENDENCY_NOT_INSTALLED: 409,
+  PLUGIN_HAS_DEPENDENTS: 409,
+  PLUGIN_UNINSTALL_WOULD_DROP_OTHERS: 409,
+  PLUGIN_UNINSTALL_IRREVERSIBLE: 409,
+  // A full uninstall that would drop tables, run without `--yes`.
+  PLUGIN_UNINSTALL_UNCONFIRMED: 409,
+  PLUGIN_SCHEMA_BEHIND: 409,
+  PLUGIN_SCHEMA_UNINSTALLED: 409,
+  // A configured plugin `nextly plugins install` has not recorded as
+  // installed, refused at a production boot.
+  PLUGIN_NOT_INSTALLED: 409,
+  PLUGIN_DISABLED: 409,
+  // An uninstall that began and did not finish: refused at boot, and when
+  // run again the other way (with or without `--keep-data`).
+  PLUGIN_UNINSTALL_UNFINISHED: 409,
+  PLUGIN_SCHEMA_VERSION_NOT_ADVANCED: 409,
+  // A generated plugin migration that would drop a table or column the
+  // plugin's earlier modules created: a rename comes out as a drop and an add.
+  PLUGIN_MIGRATION_DROPS_CREATED_SCHEMA: 409,
+  // A generated plugin migration that would add a NOT NULL column with no
+  // default to a table its earlier modules created: existing rows have no
+  // value for it.
+  PLUGIN_MIGRATION_ADDS_UNFILLABLE_COLUMN: 409,
+  // A plugin migration that changes the schema on a dialect with no
+  // statements for it: its author's SQL was never written.
+  PLUGIN_MIGRATION_SQL_MISSING: 409,
+  PLUGIN_MIGRATIONS_UNAVAILABLE: 409,
+  // A migration would drop or rename a table or column another owner holds
+  // (or, for a plugin, a table no owner row claims), or names a drop target
+  // the guard cannot read — refused for the same reason.
+  DROP_OF_FOREIGN_TABLE: 409,
+  // A plugin migration module whose content no longer matches its checksum.
+  MIGRATION_CHECKSUM_MISMATCH: 409,
+  // A plugin lists its migration modules in an order other than their names'.
+  PLUGIN_MIGRATIONS_OUT_OF_ORDER: 409,
+  // A plugin's list no longer holds a module the ledger records applied, or
+  // holds a pending module ordered before an applied one.
+  PLUGIN_MIGRATION_HISTORY_CHANGED: 409,
+  // Plugin platform (P4) — contributes.routes collection (D25).
+  NEXTLY_ROUTE_COLLISION: 409,
+  NEXTLY_ROUTE_INVALID_PATH: 400,
+  // A root-mounted route declared where the request pipeline never reaches the
+  // root pass. 400 like an invalid path and not 409: nothing else claims the
+  // address, the declaration simply cannot be served from there.
+  NEXTLY_ROUTE_UNREACHABLE_ROOT: 400,
+  // A `mount` outside the declared union, which only an untyped caller can
+  // produce. 400 for the same reason: the declaration itself is unserveable.
+  NEXTLY_ROUTE_INVALID_MOUNT: 400,
+  // An email transport whose library is an optional peer dependency the host
+  // has not installed. 503 rather than 500: the request is not malformed and
+  // nothing is broken, the install simply cannot carry it out yet, and the
+  // remedy is one command on the server rather than a change by the caller.
+  NEXTLY_EMAIL_TRANSPORT_UNAVAILABLE: 503,
+  // The tooling that compiles `nextly.config.ts` is an optional peer the host
+  // has not installed. 503 rather than 500 for the same reason as the mail
+  // transport above: nothing is broken and the request is not malformed, the
+  // install simply cannot carry it out until one command is run.
+  NEXTLY_CONFIG_TOOLING_UNAVAILABLE: 503,
+  // `db.postgres.schema` names one schema and the adapter the application
+  // supplied writes to another. 500 like the other boot-time configuration
+  // refusals: no request caused it, and the fix is a change to the server's
+  // own configuration.
+  NEXTLY_POSTGRES_SCHEMA_MISMATCH: 500,
+  // A reloaded config turns `experimental.perLanguageStorage` on or off while the site runs. 500
+  // like the refusals beside it: no request caused it, and the remedy is restarting the site.
+  NEXTLY_PER_LANGUAGE_STORAGE_CHANGED: 500,
+  // `experimental.perLanguageStorage` is on over a database whose main tables still hold
+  // translatable values. 500 for the same reason: the remedy is the server's configuration or data.
+  NEXTLY_PER_LANGUAGE_STORAGE_MIXED: 500,
+  // `experimental.perLanguageStorage` is on, the site declares no languages, so it would serve the
+  // implicit English alone, and its translations in other languages would read as gone. 500 for the
+  // same reason: the remedy is the server's configuration.
+  NEXTLY_PER_LANGUAGE_STORAGE_LANGUAGES_UNDECLARED: 500,
+  // `nextly upgrade` found two configured language codes that become one code once in their
+  // standard form (`pt_BR` beside `pt-BR`): it changes nothing until the developer keeps one. 500
+  // for the same reason: the remedy is the site's configuration.
+  NEXTLY_LANGUAGE_CODES_COLLIDE: 500,
+  // The configuration writes a language code the earlier way (`pt_BR`) and the database still
+  // stores rows under it: the start refuses until `nextly upgrade` has moved them to the standard
+  // code they are read as. 500: the remedy is a command the developer runs.
+  NEXTLY_LANGUAGE_CODES_NOT_UPGRADED: 500,
+  // `nextly upgrade` found a translated entity whose values are both on its main table and in its
+  // translations table, with no record saying the copy across finished: which copy is current
+  // cannot be told, so it changes nothing until `nextly migrate --repair-localization` has run.
+  NEXTLY_UPGRADE_LOCALISATION_UNRESOLVED: 500,
+  // `db.postgres.schema` names a schema holding no installation while another
+  // schema of the database holds one: the setting moved on an existing site.
+  // 500 for the same reason as the mismatch above: a boot-time refusal of the
+  // server's own configuration.
+  NEXTLY_POSTGRES_SCHEMA_MOVED: 500,
+} as const;
+
+export type NextlyErrorCode = keyof typeof NEXTLY_ERROR_STATUS;
+
+/**
+ * The codes that REPRESENT their status, when a failure names none.
+ *
+ * A service that returns `{ success: false, statusCode }` without a code leaves
+ * every boundary to infer one, and three boundaries inferring separately is how
+ * the same 401 became `AUTH_REQUIRED` through the Direct API and
+ * `INTERNAL_ERROR` through the REST dispatcher. This list is the ONE inference,
+ * so they cannot disagree.
+ *
+ * Listed as CODES, not as status numbers: the number for each comes from
+ * {@link NEXTLY_ERROR_STATUS} below, so a code whose canonical status changes
+ * carries its inference with it instead of leaving a stale literal here.
+ *
+ * Several codes share a status -- 409 is both `CONFLICT` and `DUPLICATE`, 400
+ * is both `VALIDATION_ERROR` and `INVALID_INPUT` -- so this is a choice, not a
+ * mechanical inversion. Each entry is the reading that is still safe if the
+ * other was meant: `CONFLICT` says "reload", which is unhelpful for a name
+ * clash, while `DUPLICATE` would say "already exists", which is WRONG for a
+ * stale write. A producer that knows which it means sets `code` and is
+ * believed, and this list is never consulted for it.
+ */
+const CANONICAL_CODE_FOR_STATUS = [
+  "VALIDATION_ERROR",
+  "AUTH_REQUIRED",
+  "FORBIDDEN",
+  "NOT_FOUND",
+  "CONFLICT",
+  "VERSION_REQUIRED",
+  "PAYLOAD_TOO_LARGE",
+  "UNSUPPORTED_MEDIA_TYPE",
+  "RATE_LIMITED",
+  "EXTERNAL_SERVICE_ERROR",
+  "SERVICE_UNAVAILABLE",
+] as const satisfies readonly NextlyErrorCode[];
+
+/**
+ * 422, which no canonical code claims.
+ *
+ * `INVALID_INPUT` answers 400 in this system, so it cannot supply this key the
+ * way the codes above supply theirs. Legacy envelopes nonetheless use 422 for
+ * "understood but unprocessable", and reading it as an internal error would
+ * report the caller's own mistake as a server fault. Named rather than inlined
+ * so it is visibly the one entry that is NOT derived.
+ */
+const LEGACY_UNPROCESSABLE_STATUS = 422;
+
+const STATUS_TO_CODE: Readonly<Record<number, NextlyErrorCode>> = {
+  ...Object.fromEntries(
+    CANONICAL_CODE_FOR_STATUS.map(code => [NEXTLY_ERROR_STATUS[code], code])
+  ),
+  [LEGACY_UNPROCESSABLE_STATUS]: "INVALID_INPUT",
+};
+
+/**
+ * The canonical code for a status, for a failure that named none.
+ *
+ * Anything outside the table is an internal error: an unrecognised status from
+ * a legacy envelope says nothing a caller can act on, and inventing a specific
+ * code for it would assert a meaning no producer expressed.
+ */
+export function statusToErrorCode(statusCode: number): NextlyErrorCode {
+  return STATUS_TO_CODE[statusCode] ?? "INTERNAL_ERROR";
+}
+
+/**
+ * The sentence a caller reads for a code, when the failure supplied none.
+ *
+ * Kept beside the status table because they answer the same question together:
+ * a code-less envelope's own `message` is NOT usable here. Those envelopes come
+ * from legacy converters that store a raw exception's text, so promoting it
+ * would put driver output, table names and internal paths on the wire -- the
+ * disclosure the public error shape exists to prevent (spec 13.8).
+ *
+ * Every entry is generic by design. The specific detail stays in `logContext`
+ * for the operator, against the same request id.
+ */
+const GENERIC_PUBLIC_MESSAGE: Readonly<
+  Partial<Record<NextlyErrorCode, string>>
+> = {
+  VALIDATION_ERROR: "Validation failed.",
+  INVALID_INPUT: "The request could not be processed.",
+  AUTH_REQUIRED: "Authentication required.",
+  FORBIDDEN: "You don't have permission to perform this action.",
+  ACTION_NOT_AVAILABLE: "This action isn't available for this entry.",
+  NOT_FOUND: "Not found.",
+  METHOD_NOT_ALLOWED: "That method is not allowed on this address.",
+  RANGE_NOT_SATISFIABLE: "The requested range is outside the file.",
+  CONFLICT:
+    "The resource has changed since you last loaded it. Please refresh and try again.",
+  DUPLICATE: "Resource already exists.",
+  PAYLOAD_TOO_LARGE: "The request is too large.",
+  UNSUPPORTED_MEDIA_TYPE: "That file type is not supported.",
+  RATE_LIMITED: "Too many requests. Please try again later.",
+  EXTERNAL_SERVICE_ERROR: "An upstream service failed.",
+  SERVICE_UNAVAILABLE: "The service is temporarily unavailable.",
+  DATABASE_BUSY: "The database is busy. Please try again shortly.",
+  RULE_COULD_NOT_RUN:
+    "A check this request needs could not run. Please try again shortly.",
+  INTERNAL_ERROR: "An unexpected error occurred.",
+};
+
+/** The generic sentence for a code; the internal one for anything unlisted. */
+export function genericPublicMessage(code: string): string {
+  return (
+    GENERIC_PUBLIC_MESSAGE[code as NextlyErrorCode] ??
+    GENERIC_PUBLIC_MESSAGE.INTERNAL_ERROR!
+  );
+}
+
+/**
+ * The canonical error code a service names when it knows which one it means.
+ *
+ * A status is coarser than a code -- 409 covers both a name clash and a stale
+ * write, and they need opposite advice -- so a failure that knows the
+ * difference says so, and the boundary believes it instead of inferring the
+ * safer reading from the number alone.
+ *
+ * Widened to `string` rather than `NextlyErrorCode`: a plugin declares codes
+ * outside the canonical set, and the converter already carries those through.
+ */
+export type ServiceErrorCode = string;

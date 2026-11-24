@@ -1,0 +1,387 @@
+/**
+ * The admin's client for `/api/releases`.
+ *
+ * Thin over `fetcher`, like every other service here. The route enforces the
+ * three release permissions and refuses generically — `NextlyError.forbidden`
+ * ships one fixed sentence so a response cannot leak the shape of the authority
+ * model — so this layer does not try to interpret a refusal. The screens above
+ * it decide what to OFFER, which is the better answer anyway: not showing an
+ * action somebody cannot take beats explaining the refusal afterwards.
+ *
+ * @module services/releaseApi
+ */
+
+import { fetcher } from "../lib/api/fetcher";
+import type {
+  AddedReleaseMember,
+  AddReleaseMembersPayload,
+  CreateReleasePayload,
+  HiddenReleaseMembers,
+  Release,
+  ReleaseBlocker,
+  ReleaseCalendarParams,
+  ReleaseCalendarRead,
+  ReleaseListParams,
+  ReleaseMember,
+  ReleaseMemberAction,
+  ReleaseReadiness,
+  ReleaseReadinessEntry,
+  ScheduleDocumentPayload,
+  ScheduleReleasePayload,
+  UpdateReleasePayload,
+} from "../types/releases";
+
+import type { DocumentEvent } from "./versionApi";
+
+/**
+ * The canonical list envelope this API returns.
+ *
+ * `total` is every release the query matches, not the rows on this page, so a
+ * pager built on it reaches every page. The paging fields are optional because
+ * a `containing` read is answered by the same envelope and a caller of that one
+ * reads only `total` and `hasNext`.
+ */
+export interface ReleaseListResponse {
+  items: Release[];
+  meta: {
+    total: number;
+    hasNext: boolean;
+    page?: number;
+    limit?: number;
+    totalPages?: number;
+    hasPrev?: boolean;
+  };
+}
+
+export interface MemberListResponse {
+  items: ReleaseMember[];
+  /** `hidden`: the documents the reader may not read, counted by collection. */
+  meta: { total: number; hasNext: boolean; hidden?: HiddenReleaseMembers[] };
+}
+
+/** The blockers standing between one release and its instant. */
+export interface BlockerListResponse {
+  items: ReleaseBlocker[];
+  /** `hidden`: blocked documents the reader may not read, by collection. */
+  meta: { total: number; hasNext: boolean; hidden?: HiddenReleaseMembers[] };
+}
+
+/** The canonical mutation envelope. */
+export interface ReleaseMutationResponse {
+  /** The server's sentence for what happened, where it says more than "done". */
+  message?: string;
+  item: Release;
+}
+
+export interface MemberMutationResponse {
+  item: ReleaseMember;
+}
+
+/**
+ * The list parameters that travel as they are, under their own names.
+ *
+ * Only what was asked for is sent. An empty value would reach the route as a
+ * filter it must then refuse — the state parser rejects an unrecognised state
+ * rather than widening the query, which is the behaviour we want and not one
+ * to trigger by accident.
+ */
+const PLAIN_LIST_PARAMS = [
+  "state",
+  "scheduledAfter",
+  "scheduledBefore",
+  "limit",
+  "page",
+  "tab",
+  "reason",
+  "kind",
+] as const satisfies ReadonlyArray<keyof ReleaseListParams>;
+
+function query(params: ReleaseListParams): string {
+  const search = new URLSearchParams();
+  for (const key of PLAIN_LIST_PARAMS) {
+    const value = params[key];
+    if (value !== undefined && value !== "") search.set(key, String(value));
+  }
+  // Trimmed here only to decide whether to send it: an all-space search is no
+  // search, and sending it would match every title that has a space in it.
+  // The server trims and bounds what it is sent, so the text goes as typed.
+  if (params.search?.trim()) search.set("search", params.search);
+  // All three or none. The route refuses a partial reference, so sending one
+  // part would turn a document question into a 400 rather than into an answer
+  // about every release.
+  if (params.containing) {
+    search.set("containingScopeKind", params.containing.scopeKind);
+    search.set("containingScopeSlug", params.containing.scopeSlug);
+    search.set("containingEntryId", params.containing.entryId);
+  }
+  // Both or neither, for the same reason: the route refuses half a day, since
+  // a date with no zone names no instants.
+  if (params.day) {
+    search.set("day", params.day.date);
+    search.set("timezone", params.day.timezone);
+  }
+  const q = search.toString();
+  return q ? `?${q}` : "";
+}
+
+export const fetchReleases = (
+  params: ReleaseListParams = {}
+): Promise<ReleaseListResponse> =>
+  fetcher<ReleaseListResponse>(`/releases${query(params)}`, {}, true);
+
+/**
+ * The calendar of a window of days in a zone: every day, with its complete
+ * count by state and its first releases.
+ *
+ * The server places each release on its day, so the browser never buckets
+ * releases itself and never reads a capped page of them: a busy month is
+ * counted in full, and a release published late is on the day it went out.
+ */
+export const fetchReleaseCalendar = (
+  params: ReleaseCalendarParams
+): Promise<ReleaseCalendarRead> => {
+  const search = new URLSearchParams({
+    from: params.from,
+    to: params.to,
+    timezone: params.timezone,
+  });
+  return fetcher<ReleaseCalendarRead>(
+    `/releases/calendar?${search.toString()}`,
+    {},
+    true
+  );
+};
+
+export const fetchRelease = (id: string): Promise<Release> =>
+  fetcher<Release>(`/releases/${id}`, {}, true);
+
+export const fetchReleaseMembers = (
+  releaseId: string
+): Promise<MemberListResponse> =>
+  fetcher<MemberListResponse>(`/releases/${releaseId}/members`, {}, true);
+
+/**
+ * What stands between a release and its instant, asked before committing.
+ *
+ * Its own request rather than a field on the detail read: answering it costs an
+ * identity lookup over every member, which the detail must not pay to tell the
+ * overwhelming majority of callers that nothing is wrong.
+ */
+export const fetchReleaseBlockers = (
+  releaseId: string
+): Promise<BlockerListResponse> =>
+  fetcher<BlockerListResponse>(`/releases/${releaseId}/blockers`, {}, true);
+
+/** The batch readiness read's envelope. */
+export interface ReleaseReadinessListResponse {
+  items: ReleaseReadinessEntry[];
+  meta: { total: number };
+}
+
+/**
+ * What the checks say about each of a page of releases, in one request.
+ *
+ * The server checks every document of each release named, so this is asked
+ * only for the releases a screen is showing, and never for more than a page.
+ */
+export const fetchReleasesReadiness = (
+  releaseIds: readonly string[]
+): Promise<ReleaseReadinessListResponse> =>
+  fetcher<ReleaseReadinessListResponse>(
+    `/releases/readiness?ids=${releaseIds.map(encodeURIComponent).join(",")}`,
+    {},
+    true
+  );
+
+export const createRelease = (
+  payload: CreateReleasePayload
+): Promise<ReleaseMutationResponse> =>
+  fetcher<ReleaseMutationResponse>(
+    "/releases",
+    { method: "POST", body: JSON.stringify(payload) },
+    true
+  );
+
+/** What adding several documents answers: the release and its new members. */
+export interface MembersMutationResponse {
+  message?: string;
+  item: {
+    release: Release;
+    members: AddedReleaseMember[];
+  };
+}
+
+/**
+ * Put several documents into a release in one request, each with its action.
+ * The server adds all of them or none, and answers each new member with the
+ * documents it links to that will not be live at the release's moment.
+ */
+export const addReleaseMembers = (
+  releaseId: string,
+  payload: AddReleaseMembersPayload
+): Promise<MembersMutationResponse> =>
+  fetcher<MembersMutationResponse>(
+    `/releases/${releaseId}/members/batch`,
+    { method: "POST", body: JSON.stringify(payload) },
+    true
+  );
+
+/**
+ * Remove one document from a release.
+ *
+ * The release id travels in the PATH and is not decoration: the server refuses
+ * a member that belongs to a different release, so a stale link cannot quietly
+ * edit a release the editor never opened.
+ */
+export const removeReleaseMember = (
+  releaseId: string,
+  memberId: string
+): Promise<ReleaseMemberRemovalResponse> =>
+  fetcher<ReleaseMemberRemovalResponse>(
+    `/releases/${releaseId}/members/${memberId}`,
+    { method: "DELETE" },
+    true
+  );
+
+/**
+ * What taking a document out answers. Taking the only document out of a
+ * single-document release that has not run cancels the release and keeps the
+ * document, and `releaseCancelled` says when that is what happened.
+ */
+export type ReleaseMemberRemovalResponse = {
+  message: string;
+  releaseCancelled: boolean;
+};
+
+export const scheduleRelease = (
+  id: string,
+  payload: ScheduleReleasePayload
+): Promise<{ message: string }> =>
+  fetcher<{ message: string }>(
+    `/releases/${id}/schedule`,
+    { method: "POST", body: JSON.stringify(payload) },
+    true
+  );
+
+/** What scheduling a document answers: the release it went into. */
+export interface ScheduleDocumentResponse {
+  message?: string;
+  item: {
+    release: Pick<Release, "id" | "title" | "scheduledAt" | "timezone">;
+  };
+}
+
+/**
+ * Schedule one document to go live on its own, in one request. The release,
+ * its one document and its time land together or not at all, so a refusal
+ * leaves no empty release behind.
+ */
+export const scheduleDocument = (
+  payload: ScheduleDocumentPayload
+): Promise<ScheduleDocumentResponse> =>
+  fetcher<ScheduleDocumentResponse>(
+    "/releases/schedule-document",
+    { method: "POST", body: JSON.stringify(payload) },
+    true
+  );
+
+export const cancelRelease = (id: string): Promise<{ message: string }> =>
+  fetcher<{ message: string }>(
+    `/releases/${id}/cancel`,
+    { method: "POST", body: JSON.stringify({}) },
+    true
+  );
+
+/**
+ * Run a release now, rather than at its instant.
+ *
+ * Its own operation on the server, not a schedule for a past instant: the
+ * answer says how the run went, which a schedule cannot.
+ */
+export const publishReleaseNow = (
+  id: string
+): Promise<ReleaseMutationResponse> =>
+  fetcher<ReleaseMutationResponse>(
+    `/releases/${id}/publish`,
+    { method: "POST", body: JSON.stringify({}) },
+    true
+  );
+
+/**
+ * Delete a draft, or a cancelled release that was never scheduled.
+ *
+ * The server decides which releases may go, and answers with the release as it
+ * was, so the screen can name what it removed.
+ */
+export const deleteRelease = (id: string): Promise<ReleaseMutationResponse> =>
+  fetcher<ReleaseMutationResponse>(
+    `/releases/${id}`,
+    { method: "DELETE" },
+    true
+  );
+
+/**
+ * What the checks say about one release's documents right now: the hard
+ * problems that stop it, the soft ones that are notes, and those of documents
+ * the reader may not read, counted by collection.
+ *
+ * Every member is checked, however many the release holds, so a release made
+ * before the member limit is judged whole here rather than left unchecked.
+ */
+export const fetchReleaseReadiness = (id: string): Promise<ReleaseReadiness> =>
+  fetcher<ReleaseReadiness>(`/releases/${id}/readiness`, {}, true);
+
+/**
+ * Rename a release, change its description, or both. The answer is the
+ * release as it now stands, with what the reader may do to it.
+ */
+export const updateRelease = (
+  id: string,
+  payload: UpdateReleasePayload
+): Promise<ReleaseMutationResponse> =>
+  fetcher<ReleaseMutationResponse>(
+    `/releases/${id}`,
+    { method: "PATCH", body: JSON.stringify(payload) },
+    true
+  );
+
+/**
+ * Switch one document between going live and coming down. Bound to the
+ * release in the path, as a removal is, so a stale view cannot switch a
+ * document in a release it never opened.
+ */
+export const changeReleaseMemberAction = (
+  releaseId: string,
+  memberId: string,
+  action: ReleaseMemberAction
+): Promise<MemberMutationResponse> =>
+  fetcher<MemberMutationResponse>(
+    `/releases/${releaseId}/members/${memberId}`,
+    { method: "PATCH", body: JSON.stringify({ action }) },
+    true
+  );
+
+/**
+ * A page of a release's history, newest first, from the record of content
+ * events: one shape for every subject, so a release's events read as a
+ * document's do. The next page passes the last event's id as `before`.
+ */
+export interface ReleaseHistoryResponse {
+  items: DocumentEvent[];
+  meta: { total: number; hasNext: boolean };
+}
+
+export const fetchReleaseHistory = (
+  id: string,
+  params: { limit?: number; before?: string; kind?: string } = {}
+): Promise<ReleaseHistoryResponse> => {
+  const search = new URLSearchParams({ subject: "release", id });
+  if (params.limit !== undefined) search.set("limit", String(params.limit));
+  if (params.before !== undefined) search.set("before", params.before);
+  if (params.kind !== undefined) search.set("kind", params.kind);
+  return fetcher<ReleaseHistoryResponse>(
+    `/content-events?${search.toString()}`,
+    {},
+    true
+  );
+};

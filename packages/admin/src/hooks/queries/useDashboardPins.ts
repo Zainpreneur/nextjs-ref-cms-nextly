@@ -1,0 +1,172 @@
+/**
+ * The signed-in reader's dashboard pins: the entries and Singles they keep to
+ * come back to, read from and written to the server so they follow the reader
+ * across devices.
+ *
+ * The server decides what a reader is shown (a pin they may no longer read is
+ * left out of the titled list and only counted, never named) and refuses a
+ * pin past the limit; this hook only reads that answer and writes
+ * the reader's choices, then reads the answer again.
+ */
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type UseMutationResult,
+} from "@tanstack/react-query";
+import { useCallback } from "react";
+
+import { protectedApi } from "@admin/lib/api/protectedApi";
+
+import { WIDGET_QUERIES_KEY } from "./widget-queries-key";
+
+/** The one query key this feature owns, so a pin can invalidate exactly it. */
+const DASHBOARD_PINS_KEY = ["dashboard", "pins"] as const;
+
+const PINS_PATH = "/dashboard/pins";
+
+/** What a pin names: an entry of a collection, or a Single. */
+export type PinTarget =
+  | { targetType: "collection"; targetSlug: string; entryId: string }
+  | { targetType: "single"; targetSlug: string };
+
+/** One pin as the reader is shown it. */
+export interface ShownPin {
+  targetType: "collection" | "single";
+  targetSlug: string;
+  /** The pinned entry's id; "" for a Single. */
+  entryId: string;
+  title: string;
+  /** Its collection's or Single's icon, where it names one. */
+  icon?: string;
+  pinnedAt: string;
+}
+
+/** The reader's pins: those they may read, and how many they no longer may. */
+interface ReaderPins {
+  /** Newest first, titled. */
+  shown: ShownPin[];
+  /**
+   * How many of their pins name documents they may no longer read. A count
+   * alone: the server names none of them, and removes them itself
+   * ({@link useRemoveUnreadablePins}).
+   */
+  unreadableCount: number;
+}
+
+/** What a shown pin names, as a pin or an unpin sends it. */
+export function targetOfPin(pin: ShownPin): PinTarget {
+  return pin.targetType === "single"
+    ? { targetType: "single", targetSlug: pin.targetSlug }
+    : {
+        targetType: "collection",
+        targetSlug: pin.targetSlug,
+        entryId: pin.entryId,
+      };
+}
+
+/** Whether a shown pin names `target`. */
+function pinNames(pin: ShownPin, target: PinTarget): boolean {
+  return (
+    pin.targetType === target.targetType &&
+    pin.targetSlug === target.targetSlug &&
+    pin.entryId === (target.targetType === "collection" ? target.entryId : "")
+  );
+}
+
+/**
+ * The reader's pins they may read, newest first, and how many they may no
+ * longer read. An answer without `unreadableCount` (a server before it)
+ * counts none.
+ */
+export function useDashboardPins() {
+  return useQuery({
+    queryKey: DASHBOARD_PINS_KEY,
+    queryFn: async (): Promise<ReaderPins> => {
+      const answer = await protectedApi.get<{
+        items: ShownPin[];
+        unreadableCount?: number;
+      }>(PINS_PATH);
+      return {
+        shown: answer.items,
+        unreadableCount: answer.unreadableCount ?? 0,
+      };
+    },
+  });
+}
+
+/** Read the reader's pins and the dashboard's cards again, after a write. */
+function invalidatePins(queryClient: ReturnType<typeof useQueryClient>) {
+  return Promise.all([
+    queryClient.invalidateQueries({ queryKey: DASHBOARD_PINS_KEY }),
+    queryClient.invalidateQueries({ queryKey: WIDGET_QUERIES_KEY }),
+  ]);
+}
+
+/**
+ * Pin or unpin a target, then read the reader's pins again, and ask the
+ * dashboard's cards again: a card listing pins (Continue where you left off)
+ * draws them from its own answer, which a pin changes.
+ */
+export function useSetPinned(): UseMutationResult<
+  unknown,
+  Error,
+  { target: PinTarget; pinned: boolean }
+> {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ target, pinned }) =>
+      pinned
+        ? protectedApi.post(PINS_PATH, target)
+        : protectedApi.delete(PINS_PATH, target),
+    onSettled: () => invalidatePins(queryClient),
+  });
+}
+
+/**
+ * Remove every pin the reader may no longer open, in one request that names
+ * none of them: the server finds them, asking again per pin whether the
+ * reader may read it, and removes the reader's own alone. Once it has
+ * answered, either way, the pins are read again; a failure is the caller's
+ * to say.
+ */
+export function useRemoveUnreadablePins(): UseMutationResult<
+  unknown,
+  Error,
+  void
+> {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => protectedApi.delete(`${PINS_PATH}?unreadable=1`),
+    onSettled: () => invalidatePins(queryClient),
+  });
+}
+
+/**
+ * Whether `target` is pinned, as the reader is shown it, and a way to set it.
+ * `null` while the pins are still being read, so a control can wait rather
+ * than offer the wrong verb. `set` takes the state wanted rather than
+ * flipping the current one, so an undo restores what was there before the
+ * choice, whatever the pins read since.
+ */
+export function usePinned(target: PinTarget | null): {
+  pinned: boolean | null;
+  set: (pinned: boolean) => Promise<unknown>;
+  pending: boolean;
+} {
+  const pins = useDashboardPins();
+  const setPinned = useSetPinned();
+  const pinned =
+    target === null || pins.data === undefined
+      ? null
+      : pins.data.shown.some(pin => pinNames(pin, target));
+  const { mutateAsync } = setPinned;
+  const set = useCallback(
+    (wanted: boolean) =>
+      target === null
+        ? Promise.resolve()
+        : mutateAsync({ target, pinned: wanted }),
+    [mutateAsync, target]
+  );
+  return { pinned, set, pending: setPinned.isPending };
+}

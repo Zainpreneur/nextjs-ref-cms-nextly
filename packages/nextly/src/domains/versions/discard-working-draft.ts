@@ -1,0 +1,246 @@
+/**
+ * Discarding a document's pending working draft.
+ *
+ * The draft/published split stores a status-less edit of a published document
+ * as a working-draft sidecar in `nextly_versions`. Discarding removes that
+ * sidecar and hands back the live published row, so the editor resets to what
+ * is public. Durable history is never touched — this reverts unpublished edits,
+ * it does not rewrite a version.
+ *
+ * A localized document holds one pending change per language, so discarding is
+ * one language's concern: the request names the language it is discarding, and
+ * the other languages' pending changes are left alone.
+ *
+ * Collections and Singles share this one implementation. Only the services
+ * differ — which one reads the live document and which one owns the delete. The
+ * ordering below is the part worth having once: reading before deleting is what
+ * makes the discard effectively atomic, and a second copy of it would be a
+ * second place for that to be got wrong.
+ *
+ * Authorization is the caller's concern: the dispatcher handler establishes
+ * read and update on the document before calling in here, so this module only
+ * performs the removal and the re-read.
+ *
+ * @module domains/versions/discard-working-draft
+ */
+
+import type { AuthenticatedScope } from "../../auth/authenticated-scope";
+import type { RequestActor } from "../../auth/request-actor";
+import { getService } from "../../di";
+import { errorFromServiceEnvelope } from "../../errors/from-service-envelope";
+import { NextlyError } from "../../errors/nextly-error";
+import type { VersionScopeKind } from "../../schemas/versions/types";
+import { refuseHistoryWriteIfRemovedFromCode } from "../dynamic-collections/services/removed-from-code-writes";
+import type { UserContext } from "../singles/types";
+
+import { DOCUMENT_VERSION_KEY, withDocumentVersion } from "./document-revision";
+
+/**
+ * The document kinds a discard is implemented for.
+ *
+ * Narrower than `VersionScopeKind`, which also admits `"page"`. The branch below
+ * routes anything that is not a Single to the collection services, so accepting
+ * the wider type would let a page request read and delete a COLLECTION's working
+ * draft whenever the slug and id happened to match. Naming the two supported
+ * kinds makes that unrepresentable, and makes a future page discard declare
+ * itself rather than inherit collection behaviour by falling through.
+ */
+export type DiscardScopeKind = Extract<
+  VersionScopeKind,
+  "collection" | "single"
+>;
+
+export interface DiscardWorkingDraftArgs {
+  /** Which kind of document owns the pending change. */
+  scopeKind: DiscardScopeKind;
+  /** Collection or Single slug. */
+  slug: string;
+  /**
+   * The live document's id. A Single's URL carries none — there is only ever one
+   * document — so its caller resolves the id from the live row rather than
+   * letting a client name it.
+   */
+  entryId: string;
+  user: UserContext;
+  /**
+   * Which language's pending change to discard, and which language's live
+   * values to hand back. Absent means the request named none, which for a
+   * localized document is the default language — the admin omits `?locale=`
+   * when editing it. Ignored for an unlocalized document, which has one
+   * pending change rather than one per language.
+   */
+  locale?: string | null;
+  /**
+   * The caller's authenticated scope, forwarded to the re-read so a scoped API
+   * key is judged on its OWN read grant rather than the key owner's roles.
+   */
+  authenticatedScope?: AuthenticatedScope;
+  /** Who discarded it, for the document's history. */
+  actor?: RequestActor;
+  /** The request and context the caller's own read carries, for read hooks. */
+  request?: Request;
+  context?: Record<string, unknown>;
+  /**
+   * The version the pending change was read at (`_rev`) and the overwrite
+   * choice (`_overwrite`): a discard is judged as a save of the change is.
+   */
+  version?: Readonly<Record<string, unknown>>;
+  /**
+   * Discard the shared part's pending change alone, leaving each language's. Collections only,
+   * where the shared part keeps a draft of its own.
+   *
+   * @experimental
+   */
+  shared?: boolean;
+}
+
+/**
+ * Remove the working-draft sidecar for a published document and return the live
+ * published document as a plain read would shape it. A no-op that still returns
+ * the live row when no working draft exists.
+ */
+/** What a discard leaves: the live document, and how many drafts it removed. */
+export interface DiscardedWorkingDraft {
+  document: unknown;
+  /** Counted by the delete made under the document's lock. */
+  removed: number;
+}
+
+export async function discardWorkingDraft(
+  args: DiscardWorkingDraftArgs
+): Promise<DiscardedWorkingDraft> {
+  // Refused first when the collection or Single is removed from code, before
+  // the live document is read for the editor to reset to.
+  await refuseHistoryWriteIfRemovedFromCode({
+    scopeKind: args.scopeKind,
+    scopeSlug: args.slug,
+  });
+  // Read the live published row FIRST, through the full read pipeline (hooks,
+  // redaction, field-level access) and WITHOUT the working-draft overlay, so it
+  // is the live document the editor resets to. The delete below never touches
+  // the live row — it only clears the sidecar — so this pre-read is the same
+  // document a post-delete read would return. Reading first is what makes the
+  // discard effectively atomic: a read failure surfaces before anything is
+  // removed, leaving the pending draft intact rather than deleting it and then
+  // reporting a failure the admin treats as a no-op (which would keep the stale
+  // draft on screen and let a later Publish push its values straight to live).
+  //
+  // Neither read is attested by the route (`routeAuthorized: false`): the
+  // caller established read and update of the document, but the values handed
+  // back are the document in the language being discarded, so the read rule is
+  // asked in that language here, before anything is removed. A route's allow
+  // judged the request's language at most, and attesting it admitted a
+  // language the read rule refuses this caller. The
+  // language being discarded is named, so the values handed back are the ones the
+  // editor resets to: reading another language's would reset the form to text
+  // belonging to a language the author is not looking at.
+  //
+  // `overrideAccess: false` is stated rather than left off. Omitting it enforces
+  // access here too, but only because undefined is falsy — so the call site reads
+  // as though it might be trusted, and this is the document a caller receives.
+  // The live-document read gate beside this one states it for the same reason.
+  // A Single's shared part keeps no draft of its own to discard alone yet: refused, rather than
+  // read as a discard of a language's pending change.
+  if (args.shared === true && args.scopeKind === "single") {
+    throw NextlyError.validation({
+      errors: [
+        {
+          path: "part",
+          code: "NO_SHARED_DRAFT",
+          message:
+            "A Single's shared part keeps no draft of its own: discard a language's pending change instead.",
+        },
+      ],
+    });
+  }
+  const locale = args.locale ? { locale: args.locale } : {};
+  // The live-document read runs the read hooks, so they see what the caller's
+  // own read would.
+  const hookInputs = {
+    ...(args.request === undefined ? {} : { request: args.request }),
+    ...(args.context === undefined ? {} : { context: args.context }),
+  };
+  const result =
+    args.scopeKind === "single"
+      ? await getService("singleEntryService").get(args.slug, {
+          user: args.user,
+          overrideAccess: false,
+          routeAuthorized: false,
+          authenticatedScope: args.authenticatedScope,
+          status: "all",
+          ...locale,
+          ...hookInputs,
+        })
+      : await getService("collectionsHandler").getEntry({
+          collectionName: args.slug,
+          entryId: args.entryId,
+          user: args.user,
+          overrideAccess: false,
+          routeAuthorized: false,
+          authenticatedScope: args.authenticatedScope,
+          status: "all",
+          ...locale,
+          ...hookInputs,
+        });
+
+  // A failed read (a concurrent delete, or an after-read hook or database error)
+  // is propagated as the error it carries rather than returned as a successful
+  // discard of an empty document — and because nothing has been deleted yet, the
+  // draft is left intact for a retry.
+  if (!result.success) {
+    // The result object itself rather than a field-by-field copy of it. The
+    // read attached the thrown error to this object, and copying only the
+    // fields named here left that behind — so a driver failure underneath a
+    // discard reached the caller with nothing naming it.
+    throw errorFromServiceEnvelope(result);
+  }
+
+  // Now remove the sidecar through the collections handler, which deletes it
+  // under the same parent-row lock a draft save takes: a save committing between
+  // this request's authorization checks and the delete would otherwise have its
+  // brand-new draft removed with both requests reporting success. Deleting when
+  // none exists is a no-op, not an error.
+  //
+  // The version the discard left the document at, read on its own
+  // transaction: the live document read above carries the one from before the
+  // discard moved it.
+  let discardedVersion: string | undefined;
+  const onVersion = (version: string | undefined) => {
+    discardedVersion = version;
+  };
+  const removed =
+    args.scopeKind === "single"
+      ? await getService("singleEntryService").discardWorkingDraftCounted({
+          slug: args.slug,
+          // The document every check above was made against.
+          entryId: args.entryId,
+          locale: args.locale ?? null,
+          actor: args.actor,
+          user: args.user,
+          version: args.version,
+          onVersion,
+        })
+      : await getService("collectionsHandler").discardWorkingDraftCounted({
+          collectionName: args.slug,
+          entryId: args.entryId,
+          locale: args.locale ?? null,
+          ...(args.shared === true ? { shared: true } : {}),
+          actor: args.actor,
+          user: args.user,
+          // The update this discard was authorized for, asked again under the
+          // lock the delete holds.
+          updateUnderLock: { authenticatedScope: args.authenticatedScope },
+          version: args.version,
+          onVersion,
+        });
+
+  if (removed > 0 && typeof result.data === "object" && result.data !== null) {
+    const document = { ...(result.data as Record<string, unknown>) };
+    delete document[DOCUMENT_VERSION_KEY];
+    return {
+      document: withDocumentVersion(document, discardedVersion),
+      removed,
+    };
+  }
+  return { document: result.data, removed };
+}

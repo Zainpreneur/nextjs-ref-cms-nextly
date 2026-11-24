@@ -1,0 +1,249 @@
+/**
+ * Version history URLs nest under the document they belong to, and the two
+ * scopes address that document differently — a Single carries no entry id,
+ * because the server resolves it from the live row rather than trusting one
+ * sent by the client.
+ */
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const { getSpy, delSpy, putSpy } = vi.hoisted(() => ({
+  getSpy: vi.fn(),
+  delSpy: vi.fn(),
+  putSpy: vi.fn(),
+}));
+
+vi.mock("@admin/lib/api/protectedApi", () => ({
+  protectedApi: { get: getSpy, delete: delSpy, put: putSpy },
+}));
+
+import { versionApi } from "../versionApi";
+
+const collection = {
+  kind: "collection" as const,
+  slug: "posts",
+  entryId: "e1",
+};
+const single = {
+  kind: "single" as const,
+  slug: "settings",
+  documentId: "s1",
+};
+
+describe("versionApi.list", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getSpy.mockResolvedValue({ items: [], meta: {} });
+  });
+
+  it("nests a collection entry's history under the entry", async () => {
+    await versionApi.list(collection);
+
+    expect(getSpy).toHaveBeenCalledWith(
+      "/collections/posts/entries/e1/versions"
+    );
+  });
+
+  it("addresses a Single's history without an entry id", async () => {
+    // The document id is carried for cache identity only; sending it would let
+    // a client name which document's history to read.
+    await versionApi.list(single);
+
+    expect(getSpy).toHaveBeenCalledWith("/singles/settings/versions");
+  });
+
+  it("sends the limit and cursor when paging", async () => {
+    await versionApi.list(collection, { limit: 25, cursor: 12 });
+
+    expect(getSpy).toHaveBeenCalledWith(
+      "/collections/posts/entries/e1/versions?limit=25&cursor=12"
+    );
+  });
+
+  it("omits an absent cursor rather than sending it empty", async () => {
+    // The server rejects a cursor that is not a positive integer, so an unset
+    // one must not reach it as the string "undefined".
+    await versionApi.list(collection, { limit: 10 });
+
+    expect(getSpy).toHaveBeenCalledWith(
+      "/collections/posts/entries/e1/versions?limit=10"
+    );
+  });
+});
+
+describe("versionApi.get", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getSpy.mockResolvedValue({ id: "v1" });
+  });
+
+  it("addresses one version of a collection entry", async () => {
+    await versionApi.get(collection, 3);
+
+    expect(getSpy).toHaveBeenCalledWith(
+      "/collections/posts/entries/e1/versions/3"
+    );
+  });
+
+  it("addresses one version of a Single", async () => {
+    await versionApi.get(single, 2);
+
+    expect(getSpy).toHaveBeenCalledWith("/singles/settings/versions/2");
+  });
+});
+
+describe("versionApi.discardWorkingDraft", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    delSpy.mockResolvedValue({ message: "Working draft discarded.", item: {} });
+  });
+
+  it("DELETEs the working-draft sidecar under the collection entry", async () => {
+    await versionApi.discardWorkingDraft(collection);
+
+    expect(delSpy).toHaveBeenCalledWith(
+      "/collections/posts/entries/e1/versions/working-draft"
+    );
+  });
+
+  it("names the language in the query string when one is given", async () => {
+    // A localized document holds one pending change per language, so the
+    // request has to say which one it is throwing away.
+    await versionApi.discardWorkingDraft(collection, "es");
+
+    expect(delSpy).toHaveBeenCalledWith(
+      "/collections/posts/entries/e1/versions/working-draft?locale=es"
+    );
+  });
+
+  it("omits the query string when no language is named", async () => {
+    // An unlocalized collection, and the default language the editor addresses
+    // without naming it, both reach the server with no locale — which it
+    // resolves to the default rather than refusing.
+    await versionApi.discardWorkingDraft(collection, null);
+
+    expect(delSpy).toHaveBeenCalledWith(
+      "/collections/posts/entries/e1/versions/working-draft"
+    );
+  });
+});
+
+/**
+ * The rolling recovery point. Its URL is a named sub-resource rather than a
+ * version number, and its verb is PUT rather than POST, because the row is
+ * rewritten in place: sending the same snapshot twice must leave one recovery
+ * point rather than two.
+ */
+describe("versionApi autosave", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    putSpy.mockResolvedValue({ updatedAt: "2026-08-17T07:00:00.000Z" });
+    getSpy.mockResolvedValue(null);
+  });
+
+  it("writes a collection entry's recovery point with PUT", async () => {
+    await versionApi.saveAutosave(collection, { title: "draft" }, "en");
+
+    // The verb is asserted by WHICH spy was called: a POST would leave the
+    // server's PUT-only route unmatched, and the request would 404 rather than
+    // failing anywhere a type could catch.
+    expect(putSpy).toHaveBeenCalledTimes(1);
+    // The BODY IS THE SNAPSHOT, not an envelope containing one, and the locale
+    // rides in the query string. This pins the SERVER's contract: the
+    // dispatcher stores the body itself, so an envelope here would be stored as
+    // the snapshot and every field would sit one level too deep.
+    expect(putSpy).toHaveBeenCalledWith(
+      "/collections/posts/entries/e1/versions/autosave?locale=en",
+      { title: "draft" }
+    );
+  });
+
+  it("addresses a Single's recovery point without an entry id", async () => {
+    await versionApi.saveAutosave(single, { siteName: "x" });
+
+    expect(putSpy).toHaveBeenCalledWith("/singles/settings/versions/autosave", {
+      siteName: "x",
+    });
+  });
+
+  /**
+   * An unlocalized document sends an explicit null rather than omitting the
+   * key. Absent and null mean the same thing to this endpoint, and sending the
+   * key keeps the body one shape for every document.
+   */
+  /**
+   * An unlocalized document sends no locale at all rather than an empty one.
+   * The server reads it from the request params, so an empty value would be a
+   * locale named "" rather than the absence of one.
+   */
+  it("omits the locale entirely when the document has none", async () => {
+    await versionApi.saveAutosave(collection, { title: "draft" });
+
+    expect(putSpy).toHaveBeenCalledWith(
+      "/collections/posts/entries/e1/versions/autosave",
+      { title: "draft" }
+    );
+  });
+
+  it("reads the caller's own recovery point from the same path", async () => {
+    await versionApi.getAutosave(collection);
+
+    expect(getSpy).toHaveBeenCalledWith(
+      "/collections/posts/entries/e1/versions/autosave"
+    );
+  });
+
+  /**
+   * Having no recovery point is an ordinary answer, not a failure. The read
+   * must surface it as null so a caller can tell "nothing stored" apart from a
+   * request that did not complete.
+   */
+  it("returns null when the author has no recovery point", async () => {
+    getSpy.mockResolvedValue(null);
+
+    await expect(versionApi.getAutosave(single)).resolves.toBeNull();
+  });
+});
+
+describe("versionApi.diffFromBaseline", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getSpy.mockResolvedValue({});
+  });
+
+  /** The comparison request's query, as sent. */
+  const sentQuery = () =>
+    Object.fromEntries(
+      new URL(String(getSpy.mock.calls.at(-1)?.[0]), "http://admin.test")
+        .searchParams
+    );
+
+  it("names the language when no version is named, so the server compares that part", async () => {
+    await versionApi.diffFromBaseline(collection, "published", {
+      locale: "fr",
+    });
+
+    expect(sentQuery()).toEqual({ baseline: "published", locale: "fr" });
+  });
+
+  it("names the version and the baseline, and no language it was not given", async () => {
+    await versionApi.diffFromBaseline(collection, "draft", { to: 7 });
+
+    expect(sentQuery()).toEqual({ baseline: "draft", to: "7" });
+  });
+  it("names the shared part, which compares the shared fields across languages", async () => {
+    await versionApi.diffFromBaseline(collection, "since-approved", {
+      to: 11,
+      part: "shared",
+    });
+
+    expect(sentQuery()).toEqual({
+      baseline: "since-approved",
+      to: "11",
+      part: "shared",
+    });
+
+    await versionApi.diff(collection, 7, 11, { part: "shared" });
+
+    expect(sentQuery()).toEqual({ from: "7", to: "11", part: "shared" });
+  });
+});

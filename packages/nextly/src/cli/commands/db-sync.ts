@@ -1,0 +1,765 @@
+/**
+ * db:sync Command
+ *
+ * Implements the `nextly db:sync` command (aliased as `nextly sync`).
+ * Loads configuration, syncs collections, and generates schema/type files.
+ *
+ * and handles schema change prompts. This one-shot utility handles:
+ *
+ * - First-time setup (permissions seeded automatically; demo content via admin UI)
+ * - Config-file watching (`--watch` re-syncs on nextly.config.ts changes)
+ * - Type generation (`--types` writes the generated types file)
+ *
+ * ## Auto-Sync Mode (Development Only)
+ *
+ * Outside production (NODE_ENV !== 'production'), this command automatically
+ * syncs schema changes to the database without creating migration files.
+ * Dev databases are treated as sandboxes where schema changes are
+ * auto-applied without migration files. In production it refuses, in every mode,
+ * before it opens the database: `migrate:create` and `nextly migrate` change a
+ * production schema.
+ *
+ * **WARNING:** Auto-sync may cause data loss when tables are recreated.
+ * Use `--no-auto-sync` to disable this behavior and use migrations instead.
+ *
+ * This entry module owns command registration and the top-level `runDbSync`
+ * orchestration. The underlying sync, schema push, display, and watch
+ * implementations live in sibling modules:
+ *
+ * - `dev-server.ts` - core table bootstrapping, schema push, auto-sync
+ * - `dev-build.ts` - config-driven registry sync, permission/user seeding
+ * - `dev-display.ts` - user-facing output formatting
+ * - `dev-watcher.ts` - debounced watch-mode re-sync
+ *
+ * @module cli/commands/db-sync
+ * @since 1.0.0
+ *
+ * @example
+ * ```bash
+ * # Basic usage - sync once with auto-sync
+ * nextly db:sync
+ *
+ * # Short alias
+ * nextly sync
+ *
+ * # Watch for config changes with auto-sync
+ * nextly db:sync --watch
+ *
+ * # Skip type generation
+ * nextly db:sync --no-types
+ *
+ * # Disable auto-sync (use migrations)
+ * nextly db:sync --no-auto-sync
+ *
+ * # Consent to dropping columns, every one or only those named
+ * nextly db:sync --accept-data-loss
+ * nextly db:sync --accept-data-loss=dc_posts.summary
+ *
+ * # Custom config path
+ * nextly db:sync --config ./custom/nextly.config.ts
+ * ```
+ */
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import type { Command } from "commander";
+
+import { getDialectTables } from "../../database/index";
+import { SchemaRegistry } from "../../database/schema-registry";
+import { loadBuilderEntities } from "../../di/load-dynamic-tables";
+import {
+  assertNoMigrationInFlight,
+  withMigrationExcluded,
+} from "../../domains/field-groups/migration/sync-guard";
+import { registerComponentSchemas } from "../../domains/field-groups/services/register-field-group-schemas";
+import { getFieldGroupRegistryAliases } from "../../domains/field-groups/storage/registry-schemas";
+import {
+  busyTableBounds,
+  type BusyTableFlags,
+} from "../../domains/schema/busy-table/bounds";
+import { runWithFieldTypes } from "../../domains/schema/field-types/field-type-scope";
+import {
+  ACCEPT_DATA_LOSS_ENV,
+  resolveDataLossConsent,
+} from "../../domains/schema/migrate/data-loss-consent";
+import { configTheCodeOwns } from "../../domains/schema/pipeline/registered-collections";
+import { assertConfiguredSiblingFields } from "../../domains/schema/sibling-fields";
+import { assertConfiguredAddresses } from "../../shared/address-rule";
+import { assertPluginFieldDeclarations } from "../../shared/lib/assert-plugin-field-declarations";
+import { reportDryRun } from "../dry-run";
+import { exitWithError } from "../errors";
+import { CliError } from "../errors/cli-error";
+import {
+  createContext,
+  type CommandContext,
+  type GlobalOptions,
+} from "../program";
+import {
+  createCliAdapter,
+  getDialectDisplayName,
+  type CLIDatabaseAdapter,
+} from "../utils/adapter";
+import {
+  requireDatabaseEnv,
+  loadConfigOrExit,
+  openOrConnect,
+  type ValidDatabaseEnv,
+} from "../utils/command-prerequisites";
+import {
+  watchConfig,
+  clearConfigCache,
+  type LoadConfigResult,
+} from "../utils/config-loader";
+import { hasSchemaToSync } from "../utils/has-schema";
+import { formatDuration } from "../utils/logger";
+
+import {
+  judgeOrphanRemoval,
+  performPermissionSeeding,
+  syncUserFields,
+} from "./dev-build";
+import { ensureCoreTables, productionSyncRefusal } from "./dev-server";
+import { createDebouncedSync } from "./dev-watcher";
+import { planWithStoredData, storedDataOfRun } from "./stored-data-of-run";
+import { syncSchemaInOrder } from "./sync-schema";
+import { upgradeSiteOf } from "./upgrade-steps/localisation-site";
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/**
+ * Options specific to the dev command
+ */
+export interface DbSyncCommandOptions {
+  /**
+   * Watch for config file changes
+   * @default false
+   */
+  watch?: boolean;
+
+  /**
+   * Generate TypeScript types (to `typescript.outputFile`)
+   * @default false (types are not generated unless explicitly requested)
+   */
+  types?: boolean;
+
+  /**
+   * Generate Zod validation schema files to src/db/schemas/zod/.
+   * Drizzle `.ts` schema generation was removed (orphan output, unused by the
+   * runtime), so this flag no longer writes Drizzle schemas.
+   * @default false (schemas are not generated unless explicitly requested)
+   */
+  schemas?: boolean;
+
+  /**
+   * Enable auto-sync of schema changes to database
+   * In development mode, this is enabled by default.
+   * Use --no-auto-sync to disable and require migrations.
+   * @default true (in development mode)
+   */
+  autoSync?: boolean;
+
+  /**
+   * The retired `-f/--force`, which had no effect: given, the run is refused
+   * before it starts.
+   * @default false
+   */
+  force?: boolean;
+
+  /**
+   * Run database seeders after sync
+   * Seeds permissions and super admin user
+   * @default false
+   */
+  seed?: boolean;
+
+  /**
+   * Remove orphaned code-first entities from the database.
+   * Entities that exist in the DB with source='code' but are no longer
+   * defined in the config will be deleted (registry entry + data table).
+   * @default false
+   */
+  removeOrphaned?: boolean;
+
+  /**
+   * `--accept-data-loss [targets]`: the data-loss consent, for the push's
+   * column drops (handed on as NEXTLY_ACCEPT_DATA_LOSS) and for what
+   * `--remove-orphaned` deletes. `true` alone, the list when one is given.
+   */
+  acceptDataLoss?: string | boolean;
+
+  /**
+   * `--dry-run`: report what the sync would change, read over a read-only connection, with no
+   * lock taken and nothing asked or written.
+   */
+  dryRun?: boolean;
+
+  /**
+   * `--backup-confirmed`: the operator's statement that the database is backed up. Read only
+   * where an earlier release stored data the run brings up to date once it has synced.
+   */
+  backupConfirmed?: boolean;
+
+  /**
+   * `--lock-timeout <seconds>`: how long one try of the sync's schema change waits for a table
+   * another database session is using; handed on as `NEXTLY_LOCK_TIMEOUT`.
+   */
+  lockTimeout?: string;
+
+  /**
+   * `--lock-timeout-total <seconds>`: how long every try together waits; handed on as
+   * `NEXTLY_LOCK_TIMEOUT_TOTAL`.
+   */
+  lockTimeoutTotal?: string;
+}
+
+/**
+ * Combined options (global + dev-specific)
+ *
+ * Exported so sibling modules (dev-server, dev-build, dev-watcher, dev-display)
+ * can type function signatures consistently.
+ */
+export interface ResolvedDevOptions extends DbSyncCommandOptions {
+  config?: string;
+  verbose?: boolean;
+  quiet?: boolean;
+  cwd?: string;
+}
+
+// ============================================================================
+// Dev Command Implementation
+// ============================================================================
+
+/**
+ * Stops a run in production, in every mode, before anything is read, locked or written: no
+ * database is opened, so no table is created and no registry row is written. True when the run
+ * is over; a real run does not return, it exits with the refusal.
+ *
+ * A dry run reports the same refusal as what a real run would do and ends without a failure,
+ * since it changes nothing wherever it runs.
+ */
+function stoppedInProduction(
+  dryRun: boolean,
+  logger: CommandContext["logger"]
+): boolean {
+  const refusal = productionSyncRefusal();
+  if (refusal === undefined) return false;
+  if (!dryRun) exitWithError(logger, refusal);
+  reportDryRun(logger, {
+    changes: [],
+    refusals: [`${refusal.what} ${refusal.why}`],
+    notes: [
+      "NODE_ENV is production: a real run refuses before it reads or changes anything (use nextly migrate:create and nextly migrate).",
+    ],
+  });
+  return true;
+}
+
+/**
+ * Execute the dev command
+ *
+ * @param options - Combined global and command options
+ * @param context - Command context with logger
+ */
+export async function runDbSync(
+  options: ResolvedDevOptions,
+  context: CommandContext
+): Promise<void> {
+  const { logger } = context;
+  const startTime = Date.now();
+
+  // Before the database is opened or the configuration read. The command's action asks this
+  // first; asked here too, so a caller of this function gets the same refusal.
+  if (stoppedInProduction(options.dryRun === true, logger)) return;
+
+  logger.header("Nextly Dev");
+
+  // Step 1: Validate database environment
+  logger.debug("Validating database environment...");
+  const dbValidation = requireDatabaseEnv(logger);
+
+  logger.debug(`Database dialect: ${dbValidation.dialect}`);
+
+  // Step 2: Load configuration
+  logger.info("Loading configuration...");
+
+  const configResult = await loadConfigOrExit(
+    {
+      configPath: options.config,
+      cwd: options.cwd,
+      watch: options.watch,
+      debug: options.verbose,
+    },
+    logger
+  );
+
+  if (configResult.configPath) {
+    logger.success(`Loaded config from ${configResult.configPath}`);
+  } else {
+    logger.warn("No config file found, using defaults");
+  }
+
+  const collectionCount = configResult.config.collections.length;
+  const singleCount = configResult.config.singles.length;
+  const componentCount = configResult.config.fieldGroups.length;
+  const userFieldCount = configResult.config.users?.fields?.length ?? 0;
+  logger.keyValue("Collections", collectionCount);
+  logger.keyValue("Singles", singleCount);
+  logger.keyValue("Field groups", componentCount);
+  logger.keyValue("User Fields (code)", userFieldCount);
+
+  // Step 3: Connect to database (needed for seeding even without collections)
+  logger.newline();
+  logger.info(
+    `Connecting to ${getDialectDisplayName(dbValidation.dialect)}...`
+  );
+
+  // A dry run reads the database read-only and reports, changing nothing.
+  if (options.dryRun === true) {
+    await reportSyncDryRun(configResult, dbValidation, options, context);
+    return;
+  }
+
+  let adapter: CLIDatabaseAdapter;
+  // Held beyond the connect block so component schemas can be added once the core tables
+  // are known to exist — `dynamic_components` has to be readable before it can be listed.
+  let schemaRegistry: SchemaRegistry;
+  try {
+    adapter = await createCliAdapter({
+      dialect: dbValidation.dialect,
+      databaseUrl: dbValidation.databaseUrl,
+      logger: options.verbose ? logger : undefined,
+    });
+    logger.success("Database connected");
+
+    // Immediately set up SchemaRegistry with static system tables so that
+    // queries to system tables (users, dynamic_collections, etc.) work via
+    // the Drizzle query API path. This MUST happen before any sync or seed
+    // operations that query these tables.
+    schemaRegistry = installStaticSchemaRegistry(adapter);
+    logger.debug("Schema registry initialized with static tables");
+  } catch (error) {
+    exitWithError(logger, error);
+  }
+
+  // What the run does with data an earlier release stored: the steps `nextly
+  // migrate` takes once its migrations have applied, taken here once the
+  // sync is done, for a database that has no migrations to apply.
+  const storedData = storedDataOfRun({
+    adapter: adapter as unknown as DrizzleAdapter,
+    command: "nextly db:sync",
+    // The site the data steps bring an earlier release's content in step with.
+    site: upgradeSiteOf(configResult.config),
+    // The sync goes on registering tables in the registry it installed.
+    restoreResolver: () =>
+      (adapter as unknown as DrizzleAdapter).setTableResolver(schemaRegistry),
+    // The steps take the schema lock once the sync has let it go, and a
+    // field-group storage migration may have taken it between the two and
+    // stopped part-way. Its marker is read under the steps' lock, as the
+    // sync reads it under its own, so no step reads half-renamed tables.
+    underLock: () =>
+      assertNoMigrationInFlight({
+        adapter: adapter as unknown as DrizzleAdapter,
+        logger,
+        action: "db:sync's steps over data an earlier release stored",
+      }),
+    logger,
+    backupConfirmed: options.backupConfirmed === true,
+    lockTtlSeconds: configResult.config.db.migrateLockTtlSeconds,
+  });
+
+  const takesDataSteps = options.autoSync !== false;
+
+  try {
+    // Step 3.4: Work of that kind whose backup nobody confirmed is refused
+    // here, before the core tables or the sync change anything. Counted with
+    // the field types this configuration registered, as every step below is.
+    // Not under `--no-auto-sync`, which leaves the tables as they are: the
+    // steps read them in the shape the configuration gives them.
+    if (takesDataSteps) {
+      await runWithFieldTypes(configResult.fieldTypes, () =>
+        storedData.confirmBeforeSchemaChanges()
+      );
+    }
+
+    // Step 3.5: Ensure core tables exist.
+    // For fresh databases, the system tables (users, roles, permissions,
+    // dynamic_collections, etc.) must exist before any sync or query.
+    // Uses drizzle-kit pushSchema() to create ALL tables from the Drizzle
+    // schema definitions, guaranteeing they match 100%.
+    await ensureCoreTables(adapter, options, context);
+
+    // Step 3.55: Refuse while a field group storage migration is in flight.
+    //
+    // Mid-run the database is in a shape neither the old config nor the new one
+    // describes: some tables carry pre-rename names, some post-rename, and the
+    // registry pointers move one step at a time. Everything below reconciles the
+    // config against that, and `--remove-orphaned` deletes what it cannot
+    // account for. Placed after the core tables so the marker's own table is
+    // guaranteed to exist, and before anything that reads or changes schema.
+    // Held across the sync rather than sampled before it. A migration starting
+    // just after a point-in-time check renames tables underneath work that has
+    // already decided what exists, and `--remove-orphaned` deletes what it
+    // cannot account for. Watch mode is deliberately outside: it never returns,
+    // and each debounced re-sync takes the exclusion for itself.
+
+    // Step 4-5.5: Sync collections, singles and components.
+    //
+    // These run even when the config declares none of that entity type: removing the LAST
+    // collection/single/component is what strands its table, so a zero count is exactly when
+    // the orphan scan has something to report.
+    // The config validators do not run on this path — `loadConfig` registers
+    // plugin field types but nothing afterwards checks the declarations that
+    // use them, and the syncs below serialize those fields and materialize
+    // their columns. Only the field types' own rules run, so this cannot newly
+    // refuse a schema that syncs fine today.
+    // Pinned to the types this config registered, like every re-sync. In watch
+    // mode `loadConfig` starts the file watcher before returning, so a save
+    // during connection, core-table setup, or this first sync would rebuild the
+    // live registry while these calls are still materializing the config they
+    // started from. Component registration is inside the scope because it
+    // builds the `comp_` runtime tables from the same storage mappings: left
+    // outside, it would shape them from a newer config than the sync that then
+    // addresses them.
+    await withMigrationExcluded(
+      {
+        adapter: adapter as unknown as DrizzleAdapter,
+        logger,
+        label: "db:sync",
+        // A command-line run: a held schema lock is waited for, about a minute, and then
+        // the run stops naming its holder.
+        whenHeld: "wait",
+        mayCreateLock: options.autoSync !== false,
+        // A sync is idempotent and was never mutually exclusive with another sync, so dropping the
+        // claim on an interrupt costs nothing a rerun does not fix.
+        releaseOnInterrupt: true,
+      },
+      async () =>
+        await runWithFieldTypes(configResult.fieldTypes, async () => {
+          // The configuration's new addresses, judged by the one address rule as a start judges
+          // them, before this sync reads or writes any schema.
+          // Its sibling fields too: a pair the registry row does not hold is new and refused.
+          // A collection a demote handed to the Schema Builder is judged by its record, not by the
+          // code entry still in the configuration, which this sync ignores (`configTheCodeOwns`).
+          const liveAdapter = adapter as unknown as DrizzleAdapter;
+          const registered = await loadBuilderEntities(liveAdapter);
+          const owned = configTheCodeOwns(
+            configResult.config,
+            registered.collections
+          );
+          await assertConfiguredAddresses(owned, registered, table =>
+            liveAdapter.tableExists(table)
+          );
+          await assertConfiguredSiblingFields(owned, registered, table =>
+            liveAdapter.tableExists(table)
+          );
+          // A Builder save left part-way refuses the sync before it reads or writes any schema,
+          // asked under the schema lock so a save that started while the sync waited is seen: the
+          // sync's push would change the tables the save's record is judged against. Another
+          // host's save made outside development changed no table, and is named only.
+          const { refuseWhileSaveInProgress } = await import(
+            "../../domains/schema/builder-save/save-in-progress"
+          );
+          await refuseWhileSaveInProgress(liveAdapter, {
+            notice: line => logger.warn(line),
+          });
+
+          // Step 3.6: Register the runtime schema of every component in the database. The registry
+          // built above holds STATIC system tables only, so `comp_` tables are unaddressable by
+          // the ORM until this runs — and the orphan cleanup below has to delete rows from them.
+          // Reads from `dynamic_components` rather than the config so components already removed
+          // from code are still reachable.
+          await registerComponentSchemas({
+            adapter: adapter as unknown as DrizzleAdapter,
+            registry: schemaRegistry,
+            dialect: (adapter as unknown as DrizzleAdapter).getCapabilities()
+              .dialect,
+            logger,
+          });
+
+          assertPluginFieldDeclarations(configResult.config);
+
+          // Every orphan `--remove-orphaned` would delete, judged with the
+          // data-loss consent before anything below changes the database: a
+          // no, or a consent leaving one out, ends the run with none deleted.
+          await judgeOrphanRemoval(configResult, adapter, options, context);
+
+          // The registry read, the companion passes, the pushes and the move of fields a translated
+          // entity makes shared, in one order (`syncSchemaInOrder`).
+          await syncSchemaInOrder(configResult, adapter, options, context);
+
+          if (collectionCount === 0) {
+            logger.warn("No collections defined in config");
+            logger.info(
+              "Add collections to your nextly.config.ts to get started."
+            );
+          }
+
+          // Step 5.6: Sync user_ext table (always — handles both code and UI fields)
+          await syncUserFields(configResult, adapter, options, context);
+
+          // Step 5.7: Seed permissions for collections and singles (always, idempotent).
+          // demo content seeding moved to a Payload-style admin-triggered POST
+          // route in the project itself (src/app/admin/api/seed/route.ts).
+          await performPermissionSeeding(adapter, options, context);
+        })
+    );
+
+    // Step 6: Data an earlier release stored, brought up to date under the
+    // schema lock, which the sync above has let go: once in a run, a watched
+    // one included. A backup refusal made only now, for work the check before
+    // the sync could not see, ends the run with the sync applied.
+    if (takesDataSteps) {
+      await runWithFieldTypes(configResult.fieldTypes, () =>
+        storedData.takeAfterSchemaChanges()
+      );
+    }
+    const storedDataRefused = storedData.refusal();
+    if (storedDataRefused !== null) throw storedDataRefused;
+
+    // Step 7: Watch mode. Gated on any entity kind this command syncs, not just
+    // collections and singles: `loadConfig({ watch: true })` has already opened
+    // the file watcher, so a user-fields-only project stayed alive with no
+    // callback registered and never re-synced `user_ext` on a later edit.
+    if (options.watch && hasSchemaToSync(configResult.config)) {
+      logger.newline();
+      logger.divider();
+      logger.info("Watching for config changes... (press Ctrl+C to stop)");
+      logger.newline();
+
+      // Create debounced sync function to handle rapid file changes
+      const debouncedSync = createDebouncedSync(adapter, options, context);
+
+      // Register watch callback. Synchronous on purpose - debouncedSync
+      // schedules its own async work; the callback itself has nothing to
+      // await, so flagging it async triggered
+      // @typescript-eslint/require-await + no-misused-promises.
+      watchConfig(newConfigResult => {
+        debouncedSync(newConfigResult);
+      });
+
+      // Keep process alive
+      await new Promise(() => {
+        // This promise never resolves - keeps the process running
+        // User must press Ctrl+C to exit
+      });
+    } else {
+      // One-time sync complete
+      const duration = Date.now() - startTime;
+      logger.newline();
+      logger.divider();
+      logger.success(`Dev sync completed in ${formatDuration(duration)}`);
+    }
+  } finally {
+    // Cleanup on exit (only for non-watch mode)
+    if (!options.watch) {
+      await adapter.disconnect();
+      clearConfigCache();
+    }
+  }
+}
+
+/**
+ * A schema registry holding the static system tables, installed as `adapter`'s table resolver, so
+ * the system tables are addressable through the Drizzle query API. Both spellings of the
+ * field-group registry: the schema registry keys a table by the physical name its Drizzle object
+ * carries, so a database whose storage migration has run has no handle for its registry otherwise.
+ */
+function installStaticSchemaRegistry(
+  adapter: CLIDatabaseAdapter
+): SchemaRegistry {
+  const drizzleAdapter = adapter as unknown as DrizzleAdapter;
+  const dialect = drizzleAdapter.getCapabilities().dialect;
+  const schemaRegistry = new SchemaRegistry(dialect);
+  schemaRegistry.registerStaticSchemas({
+    ...getDialectTables(dialect),
+    ...getFieldGroupRegistryAliases(dialect),
+  });
+  drizzleAdapter.setTableResolver(schemaRegistry);
+  return schemaRegistry;
+}
+
+/**
+ * The dry run of a sync: the database opened read-only (one that is not there has been said, and
+ * ends the run), the schema registry set up in memory as a real run sets it up, and the plan
+ * reported. Nothing is locked, asked or written.
+ */
+async function reportSyncDryRun(
+  configResult: LoadConfigResult,
+  dbValidation: ValidDatabaseEnv,
+  options: ResolvedDevOptions,
+  context: CommandContext
+): Promise<void> {
+  const { logger } = context;
+  const adapter = await openOrConnect(
+    {
+      dialect: dbValidation.dialect,
+      databaseUrl: dbValidation.databaseUrl,
+      logger: options.verbose ? logger : undefined,
+    },
+    true,
+    logger
+  );
+  if (adapter === undefined) return;
+  try {
+    installStaticSchemaRegistry(adapter);
+    // Loaded only for a dry run, so a real sync loads none of the preview's modules.
+    const { planDbSync } = await import("./db-sync-dry-run");
+    const plan = await planDbSync(configResult, adapter, options, context);
+    // The data steps a real run takes after its sync, counted read-only on
+    // the database as it stands and listed after the sync's own changes.
+    const stored = await runWithFieldTypes(configResult.fieldTypes, () =>
+      storedDataOfRun({
+        adapter: adapter as unknown as DrizzleAdapter,
+        command: "nextly db:sync",
+        site: upgradeSiteOf(configResult.config),
+        logger,
+        backupConfirmed: options.backupConfirmed === true,
+        lockTtlSeconds: undefined,
+      }).plan()
+    );
+    reportDryRun(
+      logger,
+      // `--no-auto-sync` takes no data step.
+      planWithStoredData(plan, stored, {
+        takesSteps: options.autoSync !== false,
+      })
+    );
+  } finally {
+    await adapter.disconnect();
+    clearConfigCache();
+  }
+}
+
+// ============================================================================
+// Command Action
+// ============================================================================
+
+/**
+ * Hands `--accept-data-loss` to the push as `NEXTLY_ACCEPT_DATA_LOSS`, the
+ * spelling the schema prompt reads, for the rest of the run: `true` as the
+ * consent without targets, a list as itself. The flag replaces whatever the
+ * variable held, so the run is covered by what was typed for it. A list is
+ * read first, so a malformed one is refused before the sync starts rather
+ * than at the first drop. Absent, the variable is left as it is.
+ */
+export function exportDataLossConsent(
+  flag: string | boolean | undefined,
+  env: Record<string, string | undefined> = process.env
+): void {
+  if (flag === undefined || flag === false) return;
+  resolveDataLossConsent({ flag, env: {} });
+  env[ACCEPT_DATA_LOSS_ENV] = flag === true ? "1" : flag;
+}
+
+/**
+ * Hands `--lock-timeout` and `--lock-timeout-total` to the schema pipeline as
+ * `NEXTLY_LOCK_TIMEOUT` and `NEXTLY_LOCK_TIMEOUT_TOTAL`, the spelling it reads its busy-table
+ * bounds from when its caller passes none, for the rest of the run. Both are checked first, with
+ * the environment's, as the pipeline will read them (`busyTableBounds`), so a value outside its
+ * range is refused before the sync starts. A flag replaces its variable; one not given leaves its
+ * variable as it is.
+ */
+export function exportBusyTableBounds(
+  flags: BusyTableFlags,
+  env: NodeJS.ProcessEnv = process.env
+): void {
+  busyTableBounds({ flags, env });
+  if (flags.lockTimeout !== undefined) {
+    env.NEXTLY_LOCK_TIMEOUT = flags.lockTimeout;
+  }
+  if (flags.lockTimeoutTotal !== undefined) {
+    env.NEXTLY_LOCK_TIMEOUT_TOTAL = flags.lockTimeoutTotal;
+  }
+}
+
+/** The refusal of `db:sync -f/--force`, which had no effect and is retired. */
+function retiredForce(): CliError {
+  return new CliError("INPUT_REFUSED", {
+    what: "db:sync's --force is retired: it had no effect, and is no longer accepted.",
+    why: "Nothing was changed. A sync asks at a terminal before a destructive change; --force never skipped that.",
+    next: "Run it again without -f/--force. Where nobody can be asked, consent to the drops with --accept-data-loss (or NEXTLY_ACCEPT_DATA_LOSS).",
+    context: { reason: "retired-flag" },
+  });
+}
+
+/** The action of `nextly db:sync`, loaded when it runs. */
+export async function dbSyncAction(
+  cmdOptions: DbSyncCommandOptions & {
+    promote?: string;
+    demote?: string;
+  },
+  cmd: Command
+) {
+  const globalOpts = cmd.optsWithGlobals<GlobalOptions>();
+  const context = createContext(globalOpts);
+
+  // `-f/--force` never changed what a sync does, so it is refused rather than
+  // honoured, before anything is read or changed, naming the consent a run
+  // that cannot be asked gives instead.
+  if (cmdOptions.force) {
+    exitWithError(context.logger, retiredForce());
+  }
+
+  // Production refuses every mode of the command, promote and demote included, before anything
+  // is read or changed; their dry runs name that refusal.
+  if (stoppedInProduction(cmdOptions.dryRun === true, context.logger)) return;
+
+  // Surface the flag as an env var so downstream modules (the
+  // schema-change prompt, the auto-sync path) pick it up without
+  // needing to thread the option through every function call.
+  // The busy-table bounds likewise, checked here so a value outside its range is refused before
+  // anything is read or changed.
+  try {
+    exportDataLossConsent(cmdOptions.acceptDataLoss);
+    exportBusyTableBounds(cmdOptions);
+  } catch (error) {
+    exitWithError(context.logger, error);
+  }
+
+  // Promote / demote short-circuit the full db:sync flow because
+  // they operate on a single slug and do not need the normal
+  // multi-collection sync pipeline.
+  // A dry run of either asks no confirmation, takes no lock and writes nothing.
+  const dryRun = cmdOptions.dryRun === true;
+  if (cmdOptions.promote) {
+    try {
+      const { runPromote, runPromoteDryRun } = await import(
+        "./db-sync-promote"
+      );
+      await (dryRun ? runPromoteDryRun : runPromote)(
+        cmdOptions.promote,
+        context
+      );
+      return;
+    } catch (error) {
+      exitWithError(context.logger, error);
+    }
+  }
+
+  if (cmdOptions.demote) {
+    try {
+      const { runDemote, runDemoteDryRun } = await import("./db-sync-demote");
+      await (dryRun ? runDemoteDryRun : runDemote)(cmdOptions.demote, context);
+      return;
+    } catch (error) {
+      exitWithError(context.logger, error);
+    }
+  }
+
+  const resolvedOptions: ResolvedDevOptions = {
+    ...cmdOptions,
+    config: globalOpts.config,
+    verbose: globalOpts.verbose,
+    quiet: globalOpts.quiet,
+    cwd: globalOpts.cwd,
+  };
+
+  try {
+    await runDbSync(resolvedOptions, context);
+  } catch (error) {
+    exitWithError(context.logger, error);
+  }
+}
+
+export { registerDbSyncCommand } from "./db-sync.command";

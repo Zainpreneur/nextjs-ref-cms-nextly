@@ -1,0 +1,378 @@
+/**
+ * Background job DI registrations.
+ *
+ * Two singletons, and the reason there are two is the whole shape of the
+ * domain: `jobsRepository` is where jobs are WRITTEN — anything that wants work
+ * done later enqueues through it — and `jobRegistry` is where the code that
+ * performs them is looked up. A trigger needs both, and it must find the same
+ * two every pass: a registry built per request would answer for whatever job
+ * types that request happened to import, so a job queued by one route could be
+ * unrunnable from another.
+ *
+ * This is also the site that turns a job DEFINITION into a registered one.
+ * `defineJob` produces a value; until something puts it in a registry the
+ * runner cannot see it, and a queued row for its slug is deferred forever while
+ * looking exactly like an empty queue. Every built-in job type is registered
+ * here, so "which jobs can this installation run" has one answer that a reader
+ * can check.
+ *
+ * @module di/registrations/register-jobs
+ */
+
+import { nextly } from "../../direct-api/nextly";
+import {
+  createDocumentLockSweepJob,
+  type DocumentLockService,
+} from "../../domains/document-lock";
+import {
+  createQueuedEmailJob,
+  createQueuedEmailPruneJob,
+} from "../../domains/email/queued-send";
+import { scopedSender } from "../../domains/email/send-claims";
+import type { EmailService } from "../../domains/email/services/email-service";
+import { createDeleteObjectsJob } from "../../domains/files/delete-stored-file";
+import { createUploadSweepJob } from "../../domains/files/sweep-abandoned-uploads";
+import { createGrantsContentExpiryJob } from "../../domains/grants-content-expiry-job";
+import { JobRegistry } from "../../domains/jobs/job-registry";
+import { JobsRepository } from "../../domains/jobs/jobs-repository";
+import { databaseRunAs } from "../../domains/jobs/jobs-runner";
+import { createMediaFinalizeDeletesJob } from "../../domains/media/finalize-deletes-job";
+import type { DispatchAdapter } from "../../domains/plugin-events/dispatch";
+import { createDurableEventsDispatchJob } from "../../domains/plugin-events/dispatch-job";
+import { getDurableSubscribers } from "../../domains/plugin-events/subscribers";
+import { pluginSettingsSecrets } from "../../domains/plugins/settings-service";
+import type { ApplyDueReleasesResult } from "../../domains/releases/apply-due-releases";
+import { createReleaseNoticeEmailJob } from "../../domains/releases/release-notice-email";
+import { createReleasesDrainJob } from "../../domains/releases/releases-drain-job";
+import { collectSchedules } from "../../domains/schedules/collect-schedules";
+import { scheduleWindows } from "../../domains/schedules/schedule-windows";
+import {
+  IN_PASS_DRAIN_BOUNDS,
+  type RunWebhookDrainOptions,
+  type WebhookDrainDatabase,
+} from "../../domains/webhooks/drain-runner";
+import type { WebhookEndpointRegistry } from "../../domains/webhooks/endpoint-registry";
+import type { RunDrainResult } from "../../domains/webhooks/run-drain";
+import { createWebhookDrainJob } from "../../domains/webhooks/webhook-drain-job";
+import { createWorkflowNoticeEmailJob } from "../../domains/workflows/workflow-notices";
+import { env } from "../../lib/env";
+import { collectJobs } from "../../plugins/jobs/collect-jobs";
+import type { CollectionsHandler } from "../../services/collections-handler";
+import type { Logger } from "../../services/shared";
+import { container } from "../container";
+import type { NextlyServiceConfig } from "../register";
+
+import { wiredReleasesRepository } from "./register-releases";
+import type { RegistrationContext } from "./types";
+
+/**
+ * Report what a releases pass did, and say so loudly when a member failed.
+ *
+ * `createReleasesDrainJob` requires this rather than defaulting it, and the
+ * requirement is the point: a pass can fail individual members while the job
+ * row completes successfully — a deleted author, a refused write, a release
+ * cancelled mid-pass. Those releases stay `scheduled` and are retried on every
+ * later sweep, so without a report the only trace of a release that will never
+ * publish is a returned object nobody read.
+ *
+ * Failures are logged per member, not as a count. "3 failed" tells an operator
+ * that something is wrong; the document and the reason are what let them fix
+ * it, and a release stuck on one deactivated author is indistinguishable from
+ * three unrelated problems until you can see which is which.
+ *
+ * Exported so that contract is testable. It is the reason `onOutcome` is a
+ * required parameter rather than an optional one, and a reporter whose only
+ * guard is a comment is a guarantee nobody can prove still holds.
+ */
+
+export function reportReleasesOutcome(
+  logger: Logger,
+  result: ApplyDueReleasesResult
+): void {
+  if (result.due === 0) return;
+
+  logger.info("Content releases pass completed", {
+    due: result.due,
+    published: result.published,
+    applied: result.applied,
+    failed: result.failed,
+    // Without this a bounded pass logs EXACTLY like an ordinary one: same
+    // counts, no sign that scheduled work was left behind. Reporting the field
+    // from `applyDueReleases` and then dropping it here would defeat the whole
+    // reason it exists — an operator watching a backlog stall would see a run
+    // of clean completions.
+    deferred: result.deferred,
+    // Distinct from `deferred`: a truncated pass over empty releases omits no
+    // ACTION, so `deferred` is zero while releases stay scheduled. Without this
+    // the one case the finalization bound handles is the one it cannot report.
+    undischarged: result.undischarged,
+    // The transitions this pass made that nothing else reports. One failed
+    // member can stop an entire overlapping component, so the error logged
+    // below names ONE release while several were moved to `blocked` — and
+    // without this the operator reading the log has no way to learn that.
+    blocked: result.blocked,
+  });
+
+  for (const outcome of result.outcomes) {
+    if (outcome.failure === null) continue;
+    logger.error("A release member could not be materialised", {
+      releaseId: outcome.releaseId,
+      memberId: outcome.memberId,
+      scopeKind: outcome.ref.scopeKind,
+      scopeSlug: outcome.ref.scopeSlug,
+      entryId: outcome.ref.entryId,
+      locale: outcome.ref.locale,
+      effect: outcome.effect,
+      failure: outcome.failure,
+      detail: outcome.detail,
+    });
+  }
+}
+
+/**
+ * Report what a webhook drain pass did, and say so when deliveries failed.
+ *
+ * Same requirement, same reason as the releases reporter: the job row completes
+ * while individual deliveries fail, so without this the only trace of an
+ * endpoint that has stopped receiving anything is a returned object nobody read.
+ *
+ * Reported per pass rather than per delivery, unlike releases. A delivery
+ * already has its own durable row in the delivery log with its own error, so a
+ * line per failure would duplicate what an operator can already page through;
+ * what the log cannot show is that a whole pass finished with failures in it.
+ */
+export function reportWebhookDrainOutcome(
+  logger: Logger,
+  result: RunDrainResult
+): void {
+  if (result.eventsProcessed === 0 && result.attempted === 0) return;
+
+  logger.info("Webhook drain pass completed", {
+    rounds: result.rounds,
+    eventsProcessed: result.eventsProcessed,
+    deliveriesCreated: result.deliveriesCreated,
+    attempted: result.attempted,
+    delivered: result.delivered,
+    retried: result.retried,
+    failed: result.failed,
+    abandoned: result.abandoned,
+  });
+
+  if (result.failed > 0) {
+    logger.error("A webhook drain pass ended with failed deliveries", {
+      failed: result.failed,
+      retried: result.retried,
+      attempted: result.attempted,
+    });
+  }
+}
+
+export function registerJobServices(ctx: RegistrationContext): void {
+  const { adapter, logger } = ctx;
+
+  // Collected EAGERLY, here, rather than inside the registry factory below.
+  // `registerSingleton` stores a factory and runs it on first `get`, and the
+  // production callers of `get("jobRegistry")` all run after boot — a drain,
+  // and the releases service when it is first built — so a duplicate slug or
+  // a reserved namespace would let boot and every enqueue succeed, and then
+  // fail every drain, instead of refusing to start. A collision is a
+  // configuration error, and a configuration error should stop the boot that
+  // introduced it.
+  const declaredJobs = collectJobs(ctx.config, ctx.config.plugins ?? []);
+  // Collected eagerly for the same reason: a schedule that cannot run (an
+  // invalid cron or time zone, or a job its plugin does not declare) stops the
+  // start that introduced it, naming the plugin. One in the earlier shape is
+  // mapped with a deprecation notice, or left unexecuted with a notice, and
+  // its handler, when mapped, runs as a job given the plugin's started context.
+  const { schedules: declaredSchedules, jobs: earlierScheduleJobs } =
+    collectSchedules(ctx.config.plugins ?? [], declaredJobs, {
+      notice: message => logger.warn(message),
+      contextOf: async plugin => {
+        // Imported when a handler runs: the registration imports this module.
+        const { getInitializedPluginContext } = await import("../register");
+        return getInitializedPluginContext(plugin);
+      },
+    });
+
+  container.registerSingleton<JobsRepository>(
+    "jobsRepository",
+    () => new JobsRepository(adapter)
+  );
+
+  container.registerSingleton<JobRegistry>("jobRegistry", () => {
+    const registry = new JobRegistry();
+
+    // Content releases, consumer #1 of the runner. Constructed here rather than
+    // in the releases domain because a job type is only real once something
+    // registers it, and the registry is the thing that decides which jobs an
+    // installation can run.
+    //
+    // `runAs` is the means to RESOLVE an identity, never a principal: the pass
+    // resolves each member's own author, so one release carrying members by
+    // different people fails only the member whose author is gone. Passing a
+    // principal here instead would turn "schedule this" into a privilege
+    // escalation with a delay on it.
+    // Built with this registration, as the rest of the registry is, so a pass started under one
+    // install never flushes through another's revalidator after a re-registration.
+    const releasesRepository = wiredReleasesRepository(adapter);
+    registry.register(
+      createReleasesDrainJob({
+        db: adapter,
+        // The Direct API facade, whose operations survive extraction; the
+        // handler binds each call to the member's own resolved identity.
+        contentApi: nextly,
+        runAs: databaseRunAs(adapter),
+        onOutcome: result => reportReleasesOutcome(logger, result),
+        // The install's repository, whose flush reaches the pages readers are served.
+        repository: () => releasesRepository,
+      })
+    );
+    // What a notice's email job reads and sends through, resolved on each run so
+    // the send service is the one registered when it runs.
+    const noticeEmailDeps = () => ({
+      db: adapter,
+      email: container.has("emailService")
+        ? container.get<EmailService>("emailService")
+        : null,
+    });
+    // A release notice's email: handed on in the notice's own transaction, and
+    // queued through core's queued send once that has committed.
+    registry.register(createReleaseNoticeEmailJob(noticeEmailDeps));
+    // A workflow notice's email, the same shared notice email under the workflows' own slug:
+    // queued in the step's or assignment's transaction where the site sends email and the
+    // trigger's switch is on, and sent once that has committed.
+    registry.register(createWorkflowNoticeEmailJob(noticeEmailDeps));
+
+    // Advisory document locks. A lapsed row is already ignored by every
+    // reader, so this buys space rather than correctness: without it the table
+    // keeps a row per document ever opened and never shrinks. It rides the same
+    // `/api/jobs/run` entry as everything else here, so it needs no schedule of
+    // its own.
+    registry.register(
+      createDocumentLockSweepJob({
+        service: container.get<DocumentLockService>("documentLockService"),
+      })
+    );
+
+    // A deleted private file's bytes storage refused at first, retried.
+    registry.register(createDeleteObjectsJob());
+
+    // Uploads of private files never confirmed: kept queued like the lock
+    // sweep, so every pass of the job runner rejects those past their wait.
+    registry.register(
+      createUploadSweepJob({
+        collections: () =>
+          container.get<NextlyServiceConfig>("config").collections ?? [],
+        entries: () => container.get<CollectionsHandler>("collectionsHandler"),
+      })
+    );
+
+    // Webhook delivery, consumer #1 of the runner and the workload the jobs
+    // domain was extracted FROM. `/api/webhooks/drain` still exists and still
+    // works; this means an installation scheduling `/api/jobs/run` gets its
+    // webhooks drained too, so a new deployment needs one cron entry rather than
+    // one per subsystem.
+    //
+    // Resolved lazily inside the factory: the webhook registrations run before
+    // this one, but resolving at registry-construction time rather than at
+    // module load keeps the order a fact about the container rather than about
+    // import graphs.
+    registry.register(
+      createWebhookDrainJob(
+        container.get<WebhookDrainDatabase>("adapter"),
+        container.get<WebhookEndpointRegistry>("webhookEndpointRegistry"),
+        {
+          // Sized to fit INSIDE the jobs pass that runs it, not the webhook
+          // route's own tick. `runJobs` checks its budget before starting a
+          // handler and cannot interrupt one, so a handler that begins with a
+          // wider budget than the pass can outlive the invocation and be killed
+          // before it finalizes. Derived from the pass budget rather than
+          // restated, so raising one raises the other.
+          ...IN_PASS_DRAIN_BOUNDS,
+          retention: container.get<RunWebhookDrainOptions["retention"]>(
+            "webhookRetentionDeps"
+          ),
+        },
+        result => reportWebhookDrainOutcome(logger, result)
+      )
+    );
+    // Durable plugin events: fanned out to the subscribers registered in this
+    // process and delivered until each succeeds, on every jobs run, apart
+    // from the webhook outbox. The subscribers are read per run, as plugins
+    // register them at init.
+    registry.register(
+      createDurableEventsDispatchJob({
+        adapter: () => container.get<DispatchAdapter>("adapter"),
+        subscribers: getDurableSubscribers,
+        logger,
+      })
+    );
+    // Queued email: one attempt per run of a queued email's job, which carries
+    // only the email's id. The send service is resolved per run, as the
+    // queued email's own scope sends through it, so its key is claimed where
+    // the caller's would be.
+    registry.register(
+      createQueuedEmailJob(() => ({
+        adapter,
+        sender: scope =>
+          scopedSender(container.get<EmailService>("emailService"), scope),
+        secrets: pluginSettingsSecrets(env),
+      }))
+    );
+    // Settled queued emails, removed on every jobs run whatever the delivery
+    // records' retention, so a held message is gone seven days after it
+    // settles.
+    registry.register(createQueuedEmailPruneJob(() => adapter));
+    // A media delete's finish once its Undo window ends: queued with the
+    // delete's marks, so it completes on the next jobs run even when the
+    // worker that took the delete is gone. The marks are assembled per run,
+    // judged at the run's own instant, and loaded only when one runs.
+    registry.register(
+      createMediaFinalizeDeletesJob(async now => {
+        const { bootedPendingDeletes } = await import(
+          "../../domains/media/booted-pending-deletes"
+        );
+        return bootedPendingDeletes(() => now);
+      })
+    );
+
+    // The content expiry a change to grants owes: queued before the expiry is
+    // tried and withdrawn once it lands, so a row left is one whose process
+    // failed or is gone, and the next jobs run expires the pages it left. A
+    // row near the end of its attempts queues a successor through the queue.
+    registry.register(
+      createGrantsContentExpiryJob({
+        jobs: () => container.get<JobsRepository>("jobsRepository"),
+      })
+    );
+
+    // Job types the application and its plugins declared. Registered AFTER the
+    // built-ins so a plugin cannot shadow one: `collectJobs` already refuses a
+    // reserved namespace, and `JobRegistry.register` refuses a duplicate slug
+    // outright rather than replacing the incumbent — which would make the
+    // winner depend on load order and leave the loser silently unrun.
+    // With the plugin that declared each, so the registry answers which
+    // sweeps a plugin may run as its own.
+    for (const { definition, plugin } of [
+      ...declaredJobs,
+      ...earlierScheduleJobs,
+    ]) {
+      registry.register(definition, { plugin });
+    }
+    // The plugins' schedules, swept by every jobs pass, and pruned even when
+    // none is declared any more, so a removed schedule's windows still go.
+    // A schedule whose window cannot be recorded is said out loud, and the
+    // others still run.
+    registry.useSchedules(
+      scheduleWindows(adapter, declaredSchedules, {
+        onError: (error, scheduleKey) =>
+          logger.error("A plugin schedule could not be swept", {
+            scheduleKey,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+      })
+    );
+
+    return registry;
+  });
+}

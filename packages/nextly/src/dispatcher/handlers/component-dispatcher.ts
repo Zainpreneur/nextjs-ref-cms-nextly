@@ -1,0 +1,1388 @@
+/**
+ * Components (reusable field group) dispatch handlers.
+ *
+ * Routes 5 operations against `FieldGroupRegistryService`:
+ * list / create / get / update / delete. The create/update flows run
+ * `comp_*` table migrations directly against the DI-registered adapter
+ * so UI-edited components have a usable backing table immediately.
+ *
+ * Every handler returns a Response built via the respondX helpers in
+ * `../../api/response-shapes.ts`. The dispatcher passes the Response
+ * through unchanged. See spec §5.1 for the canonical shape contract.
+ */
+
+import {
+  assertBuilderFieldNames,
+  assertValidFieldsPayload,
+  assertValidPluginFieldOptions,
+} from "../../api/fields-payload";
+import {
+  respondAction,
+  respondData,
+  respondDoc,
+  respondList,
+  respondMutation,
+} from "../../api/response-shapes";
+import type { FieldConfig } from "../../collections/fields/types";
+import { container } from "../../di/container";
+import type { FieldOwner } from "../../domains/collections/services/collection-dependents";
+import { assertSaveLeavesNoFieldGroupCycle } from "../../domains/field-groups/field-group-cycles";
+import { assertNotDiverged } from "../../domains/field-groups/services/assert-not-diverged";
+import {
+  registerComponentRuntimeSchema,
+  resolveComponentTypeColumn,
+} from "../../domains/field-groups/services/field-group-table-provisioning";
+import { resolveFieldGroupRegistryName } from "../../domains/field-groups/storage/resolve-storage-names";
+import { assertLocalizationConfigured } from "../../domains/i18n/config/require-app-config";
+import {
+  appLanguageOrder,
+  appLocalization,
+} from "../../domains/i18n/configured-locales";
+import {
+  archiveFieldsLeavingTranslation,
+  fieldsAsFirstPushed,
+  fieldsWithLeavingSettingsDeferred,
+} from "../../domains/i18n/migration/archive-preflight";
+import { resolveCompanionRename } from "../../domains/i18n/migration/companion-rename";
+import { storesPerLanguage } from "../../domains/i18n/per-language-storage";
+import {
+  FirstQuestionWatch,
+  landingPush,
+} from "../../domains/schema/builder-save/landing-push";
+import { pushCarriesValues } from "../../domains/schema/builder-save/push-carries-values";
+import {
+  renamedFieldsOf,
+  type SchemaChangeAnswers,
+} from "../../domains/schema/builder-save/schema-change-save";
+import { entityRelations } from "../../domains/schema/builder-save/single-relations";
+import { fieldGroupEntity } from "../../domains/schema/builder-save/stored-entity";
+import { refuseMovesOffTheFile } from "../../domains/schema/field-moves/moves-road";
+import { refuseCompanionRenameSwitch } from "../../domains/schema/pipeline/companion-shape-switches";
+import { extractDatabaseNameFromUrl } from "../../domains/schema/pipeline/database-url";
+import { introspectLiveSnapshot } from "../../domains/schema/pipeline/diff/introspect-live";
+import type { BrowserRenameResolution } from "../../domains/schema/pipeline/prompt-dispatcher/browser";
+import type { Resolution } from "../../domains/schema/pipeline/resolution/types";
+import type { DesiredFieldGroup } from "../../domains/schema/pipeline/types";
+import { refuseRenamedFieldOntoTakenColumn } from "../../domains/schema/rename-target";
+import { recordedFieldsOf } from "../../domains/schema/services/collection-schema-apply";
+import { getComponentRowColumnDescriptor } from "../../domains/schema/services/field-column-descriptor";
+import { withSchemaChangeExcluded } from "../../domains/schema/services/schema-change-exclusion";
+import type { FieldResolution } from "../../domains/schema/services/schema-change-types";
+import { calculateSchemaHash } from "../../domains/schema/services/schema-hash";
+import { assertNoNewSiblingClashes } from "../../domains/schema/sibling-fields";
+import { NextlyError } from "../../errors";
+import type { FieldDefinition } from "../../schemas/dynamic-collections";
+// From the types module, not the barrel, which loads every dialect's tables.
+import {
+  FIELD_GROUP_MIGRATION_STATUSES,
+  type FieldGroupMigrationStatus,
+} from "../../schemas/dynamic-field-groups/types";
+import type { FieldGroupRegistryService } from "../../services/field-groups/field-group-registry-service";
+import { readableSlugsOfKind } from "../../services/lib/readable-slug-allowlist";
+import { assertAddressAllowed } from "../../shared/address-rule";
+import type { Logger } from "../../shared/types";
+import {
+  registryInFileTransaction,
+  writeAppliedFieldsRow,
+} from "../helpers/applied-fields-row";
+import { readAuthenticatedUser } from "../helpers/authenticated-user";
+import {
+  builderSaveDeps,
+  checkBuilderSaveHistory,
+  entityDialogQuestions,
+  entityPushReason,
+  reviewBuilderSchemaChange,
+  writeBuilderSchemaChange,
+} from "../helpers/builder-save-change";
+import { builderSchemaPreviewBody } from "../helpers/builder-schema-preview";
+import {
+  builderSchemaPush,
+  leavingSettingsStep,
+  pushAndReconcileCompanion,
+  reconcileBuilderCompanion,
+  type BuilderCompanionReconcile,
+} from "../helpers/builder-schema-push";
+import { refuseChangeDefinedInCode } from "../helpers/defined-in-code";
+import { buildFullDesiredSchema } from "../helpers/desired-schema";
+import {
+  getAdapterFromDI,
+  getComponentRegistryFromDI,
+  getFieldGroupMetadataServiceFromDI,
+  getLoggerFromDI,
+} from "../helpers/di";
+import { readRequestLocalized } from "../helpers/request-localized";
+import { readRequestedMoves } from "../helpers/request-moves";
+import { requireParam, toNumber } from "../helpers/validation";
+import type { MethodHandler, Params } from "../types";
+
+import { respondAddressCheck } from "./address-check-route";
+import { readListOffset } from "./list-offset";
+import { readListOwner, slugListsForOwner } from "./list-owner";
+import { readAccessCallerForDispatch } from "./read-access-caller";
+import { assertSchemaVersionMatch } from "./schema-version-guard";
+
+interface ComponentsServices {
+  registry: FieldGroupRegistryService;
+}
+
+// ============================================================
+// Pagination helper
+// ============================================================
+
+/**
+ * Translate the registry's `limit/offset/total` triple into the canonical
+ * `PaginationMeta` shape that `respondList` expects. Mirrors the helper
+ * in `single-dispatcher.ts` because the Components registry uses the
+ * same offset-based shape.
+ */
+function offsetPaginationToMeta(args: {
+  total: number;
+  limit?: number;
+  offset?: number;
+}) {
+  const total = args.total;
+  const limit = args.limit && args.limit > 0 ? args.limit : total || 1;
+  const offset = args.offset ?? 0;
+  const page = Math.floor(offset / limit) + 1;
+  const totalPages = limit > 0 ? Math.max(1, Math.ceil(total / limit)) : 1;
+  return {
+    total,
+    page,
+    limit,
+    totalPages,
+    hasNext: page < totalPages,
+    hasPrev: page > 1,
+  };
+}
+
+// Every helper these handlers use to provision or rebind a table now lives beside the field-group
+// schema service, so each transport reaches the same provisioning rather than only the one that
+// happened to hold it privately.
+
+/**
+ * Where log lines go when DI has registered no logger.
+ *
+ * Every method is present, so a caller that logs cannot fail on a missing one — which is the whole
+ * difference between this and an empty object, and the reason it is a named value rather than a
+ * fallback written inline at the call site.
+ */
+const DISCARDED_LOG: Logger = {
+  debug: () => undefined,
+  info: () => undefined,
+  warn: () => undefined,
+  error: () => undefined,
+};
+
+/**
+ * Read a `migrationStatus` filter off the query string.
+ *
+ * 🔴 REJECTED rather than ignored when it is not a status this system has. Both silent alternatives
+ * are worse and in different ways: passing it through returns an empty list, which a caller cannot
+ * tell from "no field groups are in that state"; dropping it returns the UNFILTERED list, which is
+ * worse still, because the caller asked to narrow and got everything back looking narrowed. A
+ * refusal that names the accepted values is the only answer a client can act on.
+ *
+ * The accepted set is `FIELD_GROUP_MIGRATION_STATUSES`, the same list the schema declares, so this
+ * cannot drift into accepting a status the column never holds.
+ */
+function readMigrationStatus(
+  raw: string | undefined
+): FieldGroupMigrationStatus | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  if (
+    !FIELD_GROUP_MIGRATION_STATUSES.includes(raw as FieldGroupMigrationStatus)
+  ) {
+    // The canonical validation envelope rather than a bespoke message, so the admin's existing
+    // `parseApiError` maps it like every other field error instead of needing a special case.
+    throw NextlyError.validation({
+      errors: [
+        {
+          path: "migrationStatus",
+          code: "INVALID_VALUE",
+          message: `Must be one of: ${FIELD_GROUP_MIGRATION_STATUSES.join(", ")}.`,
+        },
+      ],
+      logContext: {
+        reason: "unknown migration status filter",
+        migrationStatus: raw,
+      },
+    });
+  }
+  return raw as FieldGroupMigrationStatus;
+}
+
+/**
+ * Exported so guards can be DERIVED from the real method registry rather than restating it.
+ *
+ * `BUILDER_METHODS` names a subset of these by string, and a rename here leaves a dead entry there
+ * that guards nothing — silently, because an unrecognised name simply means "not builder surface".
+ * A test reading these keys turns that into a failure by name.
+ */
+/**
+ * The fields that place one field group, as its own editor lists them.
+ *
+ * Unlike the list page's count, this refuses when the field lists cannot be
+ * read: the answer is the whole response, and an empty list would claim the
+ * field group is used nowhere when that is not known.
+ */
+async function placementsOf(slug: string) {
+  const adapter = getAdapterFromDI();
+  if (!adapter) throw placementsUnreadable(slug, "no database adapter");
+  try {
+    // Loaded when asked, as the list and the delete path load it.
+    const { fieldGroupUsedBy } = await import(
+      "../../domains/collections/services/collection-dependents"
+    );
+    const { owners } = await readableFieldOwners(adapter);
+    return await fieldGroupUsedBy(slug, {
+      fieldOwners: () => Promise.resolve(owners),
+    });
+  } catch (error) {
+    throw placementsUnreadable(slug, error);
+  }
+}
+
+/**
+ * Every stored field list this reader may learn about, for where a field
+ * group is used and how often. A collection or Single the reader may not read
+ * is left out, by the same decision their own lists are scoped by
+ * (`readableSlugAllowlist`), so neither answer names or counts one those
+ * lists hide. A delete's refusal reads every field list instead: it must know
+ * every use, whoever asks.
+ */
+async function readableFieldOwners(
+  adapter: NonNullable<ReturnType<typeof getAdapterFromDI>>
+): Promise<{
+  owners: FieldOwner[];
+  /** Whether the reader may read every collection and Single there is. */
+  complete: boolean;
+}> {
+  const { ownersReadableBy, readFieldOwners } = await import(
+    "../../domains/collections/services/collection-dependents"
+  );
+  const reader = readAuthenticatedUser();
+  const caller = reader ? readAccessCallerForDispatch(reader) : undefined;
+  const [collection, single, owners] = await Promise.all([
+    readableOwnerSlugs(caller, "collection"),
+    readableOwnerSlugs(caller, "single"),
+    readFieldOwners(adapter),
+  ]);
+  const readable = ownersReadableBy(owners, { collection, single });
+  // Every collection and Single is an owner, so dropping any means the
+  // reader may not read all of them.
+  return { owners: readable, complete: readable.length === owners.length };
+}
+
+/**
+ * The slugs of `kind` the reader may read, or `undefined` for no reader.
+ * A registry that cannot be enumerated rejects rather than answering none:
+ * leaving out a whole kind would claim the field group is used less, or not
+ * at all, when that is not known. The caller turns the rejection into its
+ * own "could not be read".
+ */
+async function readableOwnerSlugs(
+  caller: ReturnType<typeof readAccessCallerForDispatch> | undefined,
+  kind: "collection" | "single"
+): Promise<string[] | undefined> {
+  if (!caller) return undefined;
+  const { slugs, reachable } = await readableSlugsOfKind(caller, kind);
+  if (!reachable) {
+    throw NextlyError.serviceUnavailable({
+      logContext: { reason: "readable-owners-unreachable", kind },
+    });
+  }
+  return slugs;
+}
+
+/** The refusal when a field group's uses cannot be read. */
+function placementsUnreadable(slug: string, cause: unknown): NextlyError {
+  return NextlyError.serviceUnavailable({
+    publicMessage: `Where the field group "${slug}" is used could not be read. Nothing is known about its uses. Fix the cause in the server log and try again.`,
+    ...(cause instanceof Error ? { cause } : {}),
+    logContext: {
+      reason: "field-group-placements-unreadable",
+      slug,
+      error: cause instanceof Error ? cause.message : String(cause),
+    },
+  });
+}
+
+/**
+ * How many fields place each field group on a list page, or `null` when that
+ * cannot be read. The list still answers without it: a count is something
+ * the page shows, not something the request depends on, so an unreadable
+ * field list leaves each row saying it has no count rather than refusing the
+ * whole list. Read once for the page, the same answer a delete would give
+ * about each field group's fields.
+ */
+async function placementCountsFor(
+  slugs: readonly string[]
+): Promise<Map<string, number> | null> {
+  const adapter = getAdapterFromDI();
+  if (!adapter || slugs.length === 0) return null;
+  try {
+    // Loaded when a list asks, as the delete path loads it: the registry's
+    // other callers never need the dependents readers.
+    const { fieldGroupPlacementCounts } = await import(
+      "../../domains/collections/services/collection-dependents"
+    );
+    const { owners, complete } = await readableFieldOwners(adapter);
+    // A count from part of the site would read as the whole of it ("not
+    // used" for a field group only a hidden owner places), so a reader who
+    // cannot read every collection and Single is shown none. Decided by the
+    // reader, not by any one field group, so a missing count hints at no
+    // hidden use.
+    if (!complete) return null;
+    return await fieldGroupPlacementCounts(slugs, {
+      fieldOwners: () => Promise.resolve(owners),
+    });
+  } catch (error) {
+    (getLoggerFromDI() ?? DISCARDED_LOG).warn(
+      "Field-group list: the use counts could not be read; each row shows none.",
+      { error: error instanceof Error ? error.message : String(error) }
+    );
+    return null;
+  }
+}
+
+export const COMPONENTS_METHODS: Record<
+  string,
+  MethodHandler<ComponentsServices>
+> = {
+  listComponents: {
+    // Registry returns BaseListResult `{data,total}` with limit/offset
+    // semantics; offsetPaginationToMeta synthesises the canonical
+    // PaginationMeta so the wire shape matches every other dispatcher.
+    execute: async (svc, p) => {
+      // Read first, so an owner it does not know is refused before any work.
+      const owner = readListOwner(p.owner);
+      const limit = toNumber(p.limit);
+      // A 1-based `page`, as the admin's list asks, or an explicit `offset`.
+      const offset = readListOffset(p, limit);
+      // The site's own field groups or the plugins', as conditions on the
+      // same query. Field groups carry no per-reader allowlist, so the
+      // plugins' list is the plugins' slugs.
+      const slugLists = await slugListsForOwner(
+        owner,
+        "fieldGroups",
+        undefined
+      );
+      const result = await svc.registry.listComponents({
+        source: p.source as "code" | "ui" | undefined,
+        // 🔴 Filtered by the DATABASE, not by the caller narrowing a page it was already sent.
+        // A page is a window over the whole set, so a client-side filter can only ever search the
+        // window: selecting "diverged" would show an empty table while a diverged group sat on
+        // page two — hiding precisely the state an operator opened this screen to find.
+        migrationStatus: readMigrationStatus(p.migrationStatus),
+        search: p.search,
+        limit,
+        offset,
+        ...slugLists,
+      });
+      const placedBy = await placementCountsFor(
+        result.data.map(component => component.slug)
+      );
+      return respondList(
+        result.data.map(component => ({
+          ...component,
+          placedBy: placedBy?.get(component.slug) ?? null,
+        })),
+        offsetPaginationToMeta({ total: result.total, limit, offset })
+      );
+    },
+  },
+
+  // What creating a field group under an address would answer, for the Builder's new-entity
+  // dialog and the field picker; writes nothing.
+  checkComponentAddress: {
+    execute: (_svc, _p, body) => respondAddressCheck("fieldGroup", body),
+  },
+  createComponent: {
+    execute: async (svc, _, body) => {
+      const b = body as
+        | {
+            slug?: string;
+            label?: string;
+            fields?: FieldConfig[];
+            admin?: Record<string, unknown>;
+            description?: string;
+            // i18n: Internationalization opt-in; persists to dynamic_components.localized and
+            // provisions the companion comp_<slug>_locales table.
+            localized?: boolean;
+          }
+        | undefined;
+
+      // A missing or empty address is the address rule's refusal, answered with its reason as the
+      // Builder's address check answers it, before the request's other shape is judged. The
+      // service judges the address again, against the other field groups, under its lock.
+      assertAddressAllowed("fieldGroup", b?.slug);
+      if (!b?.slug || !b?.fields) {
+        throw new Error("Component slug and fields are required");
+      }
+
+      // These direct create/update handlers persist and run DDL without the
+      // preview/apply handlers below. Their own rules cover names and shapes;
+      // what none of them can judge is a plugin type's own options, so an
+      // unsatisfiable declaration would be stored and fail on every write.
+      assertValidPluginFieldOptions(b.fields);
+
+      const isLocalized = b.localized === true;
+      // i18n: a localized component stores translatable values via the
+      // app's `localization` config; creating one without that config
+      // would split the tables into a shape the runtime cannot write to.
+      if (isLocalized) {
+        assertLocalizationConfigured("component", b.slug);
+      }
+      const schemaHash = calculateSchemaHash(b.fields);
+      // The table is named by the service, under the naming the site's storage is on, so the
+      // created table and the registry row agree.
+
+      // The table-name conflict is refused inside the service, alongside the DDL it guards, so all
+      // three create transports get it rather than this one alone.
+
+      // One service owns the table change and the registry write. This handler used to hold the
+      // DDL itself, which is why the other two create transports could not perform the schema
+      // half and shipped a registry row describing a table that was never made.
+      const metadata = getFieldGroupMetadataServiceFromDI();
+      if (!metadata) {
+        throw NextlyError.internal({
+          logContext: {
+            reason: "field-group-metadata-service-unavailable",
+            slug: b.slug,
+          },
+        });
+      }
+      const { record: created, migrationStatus } =
+        await metadata.createFieldGroup({
+          slug: b.slug,
+          label: b.label || b.slug,
+          fields: b.fields,
+          admin: b.admin,
+          description: b.description,
+          source: "ui",
+          locked: false,
+          // i18n: persist the Internationalization flag so the component reads/writes per language.
+          localized: isLocalized,
+          schemaHash,
+          schemaVersion: 1,
+        });
+
+      // Migration status drives the toast copy so admins immediately
+      // know whether the table was applied.
+      const message =
+        migrationStatus === "applied"
+          ? `Component "${b.slug}" created and table applied!`
+          : `Component "${b.slug}" created. Run migrations to apply the table.`;
+      return respondMutation(message, created, { status: 201 });
+    },
+  },
+
+  getComponent: {
+    // registry.getComponent throws NextlyError on not-found, so we never
+    // see a null doc here.
+    execute: async (svc, p) => {
+      const slug = requireParam(p, "slug", "Component slug");
+      const component = await svc.registry.getComponent(slug);
+      return respondDoc(component);
+    },
+  },
+
+  // The fields that place one field group, and what holds each: what its own
+  // editor lists as using it. The field group is looked up first, so one
+  // that does not exist answers not found before anything else is read.
+  getComponentUsedBy: {
+    execute: async (svc, p) => {
+      const slug = requireParam(p, "slug", "Component slug");
+      await svc.registry.getComponent(slug);
+      const placements = await placementsOf(slug);
+      return respondList(
+        placements,
+        offsetPaginationToMeta({ total: placements.length })
+      );
+    },
+  },
+
+  updateComponent: {
+    execute: async (svc, p, body) => {
+      const slug = requireParam(p, "slug", "Component slug");
+      const b = body as
+        | {
+            label?: string;
+            fields?: FieldConfig[];
+            admin?: Record<string, unknown>;
+            description?: string;
+            // i18n: Internationalization toggle; honoured when defined, undefined leaves the
+            // existing value untouched. Persists to dynamic_components.localized.
+            localized?: boolean;
+          }
+        | undefined;
+
+      // 🔴 A transport, and nothing more. The lock check, the localization gate, the plugin-option
+      // validation, the companion transition and the registry write all live in the metadata
+      // service, so this path and the two that never ran DDL now perform the SAME operation. What
+      // used to be here could not be shared, which is exactly why they diverged.
+      const metadataService = getFieldGroupMetadataServiceFromDI();
+      if (!metadataService) {
+        throw NextlyError.internal({
+          logContext: {
+            reason: "field-group-metadata-service-unavailable",
+            slug,
+          },
+        });
+      }
+      const { record } = await metadataService.updateFieldGroup({
+        slug,
+        label: b?.label,
+        description: b?.description,
+        admin: b?.admin,
+        fields: b?.fields as unknown as FieldDefinition[] | undefined,
+        // 🔴 Read through the shared helper, never off the cast body. `b` is a type assertion over
+        // whatever JSON arrived, so `localized: "false"` survives it as a truthy string: the
+        // transition would take the ENABLED branch and drop the main table's translatable columns
+        // while the registry, which stores `data.localized === true`, recorded the group disabled.
+        // The collection and single dispatchers already read it this way.
+        localized: readRequestLocalized(b),
+        source: "ui",
+      });
+
+      return respondMutation(`Component "${slug}" updated.`, record);
+    },
+  },
+
+  // Preview component schema changes — dry-run diff returning rename candidates
+  // and classification. Mirrors previewSchemaChanges in collection-dispatcher.
+  previewComponentSchemaChanges: {
+    execute: async (svc, p, body) => {
+      const slug = requireParam(p, "slug", "Component slug");
+      const component = await svc.registry.getComponent(slug);
+      if (!component) throw new Error("Component not found");
+      refuseChangeDefinedInCode(component, "component", slug);
+
+      const { fields } = body as { fields: unknown[] };
+      if (!fields) throw new Error("fields is required in request body");
+      // Same rules as the ui-schema.json mirror (see api/fields-payload):
+      // an invalid field must fail HERE, not only at the file write, or
+      // the DB and the committed manifest diverge silently.
+      // A field name the field group already holds keeps working whatever its case.
+      assertValidFieldsPayload(fields, {
+        kind: "component",
+        stored: component.fields ?? [],
+      });
+      // A pair of sibling fields this save would create is refused before anything is planned;
+      // one the entity already holds keeps working (judged against the stored fields).
+      assertNoNewSiblingClashes(
+        { kind: "fieldGroup", slug },
+        fields,
+        component.fields ?? []
+      );
+
+      const currentFields = (component.fields ??
+        []) as unknown as FieldDefinition[];
+      const tableName = component.tableName;
+
+      const adapter = getAdapterFromDI();
+      if (!adapter) throw new Error("Database adapter not initialized");
+      const dialect = adapter.dialect;
+      const db = adapter.getDrizzle();
+
+      const desired = await buildFullDesiredSchema();
+      desired.components[slug] = {
+        slug,
+        tableName,
+        // As the apply's first push creates them (`fieldsAsFirstPushed`).
+        fields: fieldsAsFirstPushed({
+          oldFields: currentFields,
+          newFields: fields as FieldDefinition[],
+          entity: component,
+          requestedLocalized: readRequestLocalized(body),
+        }) as DesiredFieldGroup["fields"],
+        // i18n: carry the localized flag so the push diff omits translatable columns
+        // from the component's main table (they live in comp_<slug>_locales, reconciled
+        // out-of-band below) — mirrors the collection/single apply path.
+        // The request's flag wins when the Builder sent one, as in the collection and Single
+        // previews, so a change that also turns translation on or off is diffed as it will apply.
+        localized:
+          readRequestLocalized(body) ??
+          (component as { localized?: boolean }).localized === true,
+        // Authored in the Schema Builder: this is the Builder's own save path.
+        builderOwned: true,
+        // What the fields were before this save, as the apply states it.
+        recordedFields: recordedFieldsOf(component),
+      };
+
+      const preview = await builderSchemaPreviewBody({
+        desired,
+        db,
+        dialect,
+        slug: slug,
+        tableName,
+        builtBy: "fieldGroup",
+        entity: component,
+        currentFields,
+        newFields: fields as FieldDefinition[],
+        requestedLocalized: readRequestLocalized(body),
+        schemaVersion: component.schemaVersion,
+      });
+      // What the save writes beyond the person's change, for the review to show before they
+      // confirm, as a collection's does: each conversion an adoption makes, each fill and delete.
+      const answers = body as SchemaChangeAnswers;
+      const review = await reviewBuilderSchemaChange(builderSaveDeps(), {
+        kind: "fieldGroup",
+        slug,
+        table: tableName,
+        stored: fieldGroupEntity(component),
+        fields: fields as FieldDefinition[],
+        // Each move checked as the save checks it, and what its column does not carry named.
+        moves: readRequestedMoves(body),
+        localized:
+          readRequestLocalized(body) ??
+          (component as { localized?: boolean }).localized === true,
+        answers: {
+          renameResolutions: answers.renameResolutions ?? [],
+          eventResolutions: answers.eventResolutions ?? [],
+          ...(answers.resolutions === undefined
+            ? {}
+            : { resolutions: answers.resolutions }),
+          ...(answers.acknowledgedConversions === undefined
+            ? {}
+            : { acknowledgedConversions: answers.acknowledgedConversions }),
+        },
+      });
+      return respondData({ ...preview, ...review });
+    },
+  },
+
+  // Apply confirmed component schema changes via PushSchemaPipeline.
+  // Mirrors applySchemaChanges in collection-dispatcher.
+  applyComponentSchemaChanges: {
+    execute: async (svc, p, body) => {
+      const slug = requireParam(p, "slug", "Component slug");
+      // 🔴 The exclusion opens BEFORE the component is read, because the guard below decides on
+      // what that read returns. Reading the status outside it answers only whether the group was
+      // diverged at the instant of the read: `updateFieldGroup` commits its companion DDL and
+      // persists the row and the divergence marker as separate steps, so a read landing between
+      // them sees the OLD status, passes the guard, and starts a second apply from a definition
+      // the database has already moved past.
+      //
+      // This handler does the schema work itself rather than calling the metadata service, which
+      // is why the service-level exclusion did not reach it. Taking the lock here puts the read,
+      // the check, the DDL and the registry write inside one exclusion — the depth the exclusion
+      // was always meant to be held at.
+      // 🔴 Everything decidable from the REQUEST ALONE is decided before the lock is taken, because
+      // taking it is not free: with `issuesDdl` the exclusion may CREATE and seed the lock table on
+      // a database that has never had one, and it can refuse outright when a migration holds the
+      // row or the role lacks DDL rights. A malformed request would then be answered with a
+      // permission error, a contention error, or a new table — none of which is "this payload is
+      // invalid", and the last of which is a write performed on the way to rejecting a request.
+      //
+      // The split is what each check READS, not how cheap it is. These three read the body and
+      // nothing else, so no concurrent writer can change their answer and holding the lock buys
+      // them nothing. Every check below the exclusion reads the database, and that is exactly why
+      // it belongs inside.
+      const {
+        fields,
+        confirmed,
+        schemaVersion,
+        resolutions,
+        renameResolutions,
+        eventResolutions,
+        localized: requestLocalized,
+        acknowledgedConversions,
+      } = body as {
+        fields: unknown[];
+        confirmed: boolean;
+        schemaVersion?: number;
+        resolutions?: Record<string, FieldResolution>;
+        renameResolutions?: BrowserRenameResolution[];
+        eventResolutions?: Resolution[];
+        // i18n: the builder sends the current toggle so a save that flips i18n AND changes fields
+        // provisions the companion in the same apply. Undefined = leave the persisted value.
+        localized?: boolean;
+        acknowledgedConversions?: string[];
+      };
+
+      if (!confirmed) throw new Error("Schema changes must be confirmed");
+      if (!fields) throw new Error("fields is required in request body");
+      // Same rules as the ui-schema.json mirror (see api/fields-payload):
+      // an invalid field must fail HERE, not only at the file write, or
+      // the DB and the committed manifest diverge silently.
+      assertValidFieldsPayload(fields, { stored: "under-lock" });
+      // The fields the save moves, each kept by statements its migration file carries.
+      const moves = readRequestedMoves(body);
+
+      return withSchemaChangeExcluded(
+        {
+          adapter: getAdapterFromDI(),
+          // An app whose DI has not registered a logger still runs its schema changes, so the
+          // absence is not a reason to refuse — it only costs the report of a lock that was
+          // skipped. Discarding those lines is the caller's position, stated here rather than
+          // left to a partial object the exclusion would call methods on.
+          logger: getLoggerFromDI() ?? DISCARDED_LOG,
+          label: `apply schema changes to field group "${slug}"`,
+          // The apply writes a migration where a writer is registered: its folder is held first.
+          migrationsDir: container.has("builderSaveSetup")
+            ? container.get<{ migrationsDir: string }>("builderSaveSetup")
+                .migrationsDir
+            : undefined,
+          // This path runs the push pipeline, so it issues DDL and may create the lock table.
+          issuesDdl: true,
+        },
+        async () => {
+          // As stored, past the registry row cache: its version is checked and advanced below.
+          const component = await svc.registry.getComponentForWrite(slug);
+          if (!component) throw new Error("Component not found");
+          refuseChangeDefinedInCode(component, "component", slug);
+
+          // 🔴 The same refusal the metadata service makes, from the same function rather than a copy.
+          // This route moves storage exactly as `updateFieldGroup` does and reaches the registry by a
+          // different path, so a guard living only there left this door open: an operator refused in
+          // the admin could compound the very edit that was refused by coming through the builder.
+          //
+          // Deliberately NOT applied to `getComponent` or `previewComponentSchemaChanges` above. Those
+          // read; they move no storage, and they are how an operator inspects a diverged group in order
+          // to reconcile it. Refusing them would make the state harder to escape rather than safer,
+          // which is the same reason metadata-only edits stay allowed.
+          assertNotDiverged(slug, component);
+          // A field name the field group already holds keeps working whatever its case; one this
+          // save creates is the Builder's own. Judged against the fields as stored now.
+          assertBuilderFieldNames(fields, component.fields ?? [], {
+            surface: "fieldGroup",
+          });
+          // A pair of sibling fields this save would create is refused before any statement or
+          // archive write, against the fields as stored now; one the field group already holds keeps
+          // working. Asked here because this road reaches its DDL through no shared service.
+          assertNoNewSiblingClashes(
+            { kind: "fieldGroup", slug },
+            fields,
+            component.fields ?? []
+          );
+          // Nor may the save leave this field group placed inside itself, judged against every
+          // field group as stored now, inside the exclusion.
+          assertSaveLeavesNoFieldGroupCycle({
+            saved: { slug, fields },
+            stored: await svc.registry.getAllFieldLists(),
+          });
+
+          // i18n: prefer the request's localized flag over the persisted one (stale on a
+          // simultaneous toggle+field-change save); fall back to the registry value.
+          const wasLocalized =
+            (component as { localized?: boolean }).localized === true;
+          const isLocalized =
+            requestLocalized !== undefined
+              ? requestLocalized === true
+              : wasLocalized;
+          // i18n: gate the Internationalization enable on the app-level
+          // `localization` config (false→true transition only).
+          if (!wasLocalized && isLocalized) {
+            assertLocalizationConfigured("component", slug);
+          }
+          // Where the field group's translatable values live, before and after this save: per language
+          // when it is translated, or always under `experimental.perLanguageStorage`, where turning
+          // translation on or off moves nothing. Every step below that lays out or moves values reads
+          // these; the registry keeps the field group's own flag.
+          const wasStored = storesPerLanguage({ localized: wasLocalized });
+          const isStored = storesPerLanguage({ localized: isLocalized });
+
+          const currentVersion = component.schemaVersion ?? 1;
+          // Reject a stale UI save before any DDL runs so two admins editing the
+          // same component cannot silently overwrite each other (last-write-wins).
+          assertSchemaVersionMatch(schemaVersion, currentVersion, slug);
+          const tableName = component.tableName;
+
+          const legacyBundle = resolutions
+            ? { tableName, byFieldName: resolutions }
+            : undefined;
+
+          const adapter = getAdapterFromDI();
+          if (!adapter) throw new Error("Database adapter not initialized");
+          // A field renamed onto a column that is already there is refused before anything
+          // changes. In this dialog such a change is never offered as a rename, only as the old
+          // column dropped beside a field kept on the column that is there, so it is found from
+          // the field lists.
+          await refuseRenamedFieldOntoTakenColumn(
+            adapter,
+            {
+              previousFields: (component.fields ??
+                []) as unknown as FieldDefinition[],
+              fields: fields as unknown as FieldDefinition[],
+              mainTable: tableName,
+              wasLocalized: wasStored,
+              isLocalized: isStored,
+              dialect: adapter.dialect,
+              builtBy: "fieldGroup",
+            },
+            { fieldGroup: slug }
+          );
+          // The dialog's answer on a translated field's rename, refused when it does not
+          // say, before anything changes.
+          // The history checks a save makes, before anything below changes the table.
+          const builderSave = builderSaveDeps();
+          await checkBuilderSaveHistory(builderSave);
+          const companionRename = await resolveCompanionRename(
+            renameResolutions,
+            {
+              tableName,
+              oldFields: (component.fields ??
+                []) as unknown as FieldDefinition[],
+              newFields: fields as unknown as FieldDefinition[],
+              wasLocalized: wasStored,
+              isLocalized: isStored,
+              dialect: adapter.dialect,
+              builtBy: "fieldGroup",
+            }
+          );
+          // A translated relation renamed and switched at once is refused: the companion's
+          // rename carries its values as they are.
+          refuseCompanionRenameSwitch({
+            rename: companionRename,
+            oldFields: component.fields ?? [],
+            newFields: fields,
+            subject: `Field group '${slug}'`,
+            component: true,
+          });
+          // Whether the push applies this save rather than its file, asked at most once. A save
+          // whose moves would need the push is refused here, before the preflights below write
+          // anything; the write reuses the answer.
+          let pushAnswer: Promise<boolean> | undefined;
+          const pushes = () =>
+            (pushAnswer ??= pushCarriesValues({
+              oldFields: (component.fields ??
+                []) as unknown as FieldDefinition[],
+              newFields: fields as unknown as FieldDefinition[],
+              wasStored,
+              isStored,
+              renamed: companionRename,
+              liveTable: async () =>
+                (
+                  await introspectLiveSnapshot(
+                    adapter.getDrizzle(),
+                    adapter.dialect,
+                    [tableName]
+                  )
+                ).tables[0],
+              columnOf: field =>
+                getComponentRowColumnDescriptor(
+                  field,
+                  adapter.dialect,
+                  "fieldGroup"
+                ),
+              renames: renamedFieldsOf(renameResolutions ?? []),
+              moved: moves,
+            }));
+          await refuseMovesOffTheFile({
+            moves,
+            writes: builderSave !== undefined,
+            pushReason: () => entityPushReason(builderSave, pushes),
+          });
+          // A field leaving translation has preconditions of its own, asked before the apply
+          // alters anything.
+          await archiveFieldsLeavingTranslation({
+            // This builder made the table, which decides the column bounds compared.
+            builtBy: "fieldGroup",
+            // The rename the admin chose, or that none was; when none was offered (a storage
+            // change, or no single candidate), the preflight finds it from the fields and refuses
+            // what it must.
+            renamed: companionRename,
+            tableName: tableName,
+            defaultLocale: appLocalization()?.defaultLocale ?? "en",
+            languageOrder: appLanguageOrder(),
+            adapter,
+            entity: slug,
+            kind: "fieldGroup",
+            oldFields: (component.fields ?? []) as unknown as FieldDefinition[],
+            newFields: fields as unknown as FieldDefinition[],
+            wasLocalized: wasStored,
+            isLocalized: isStored,
+            // This apply's push refuses a main-table column drop the admin did not confirm.
+            mainDropsConfirmed: true,
+          });
+          // 🔴 Resolved BEFORE the apply. The runtime refresh at the end of this
+          // handler suppresses its own failures by design, so a probe placed there
+          // could let the handler report success over an unregistered or stale
+          // table. The apply only alters user columns, so this answer is the same
+          // either side of it — and asking now means a probe that cannot answer
+          // fails the request before anything commits.
+          const componentTypeColumn = await resolveComponentTypeColumn(
+            adapter,
+            tableName
+          );
+
+          const dialect = adapter.dialect;
+          const db = adapter.getDrizzle();
+          const databaseName =
+            dialect === "mysql"
+              ? extractDatabaseNameFromUrl(process.env.DATABASE_URL)
+              : undefined;
+
+          // A Required or Unique field leaving translation is pushed without its setting first,
+          // and the setting is pushed once the companion reconcile has copied its values in,
+          // before its companion column is dropped.
+          const settingsDeferred = fieldsWithLeavingSettingsDeferred({
+            oldFields: (component.fields ?? []) as unknown as FieldDefinition[],
+            newFields: fields as unknown as FieldDefinition[],
+            wasLocalized: wasStored,
+            isLocalized: isStored,
+            renamed: companionRename,
+          });
+
+          const desired = await buildFullDesiredSchema();
+          desired.components[slug] = {
+            slug,
+            tableName,
+            fields: (settingsDeferred ?? fields) as DesiredFieldGroup["fields"],
+            // i18n: carry the localized flag so the push diff omits translatable columns
+            // from the component's main table (they live in comp_<slug>_locales, reconciled
+            // out-of-band below) — mirrors the collection/single apply path.
+            localized: isLocalized,
+            // Authored in the Schema Builder: this is the Builder's own save path.
+            builderOwned: true,
+            // What the fields were before this save: a relation's previous shape, which SQLite's
+            // column cannot tell (`withRecordedShapes`).
+            recordedFields: recordedFieldsOf(component),
+          };
+
+          // A failed push changed nothing where it stopped at its first question, asked before
+          // any statement; any other failure on MySQL or SQLite may have changed it.
+          const firstQuestion = new FirstQuestionWatch();
+          const landing = landingPush(
+            builderSchemaPush({
+              dialect,
+              db,
+              adapter,
+              databaseName,
+              slug,
+              kind: "component",
+              resolutions: [
+                renameResolutions ?? [],
+                eventResolutions ?? [],
+                legacyBundle,
+              ],
+              firstQuestion,
+              // A translated field's values the companion reconcile after the push drops, asked of
+              // the push by field name, as the save's file road asks them.
+              fields: {
+                tableName,
+                builtBy: "fieldGroup",
+                oldFields: (component.fields ?? []) as unknown as FieldDefinition[],
+                newFields: fields as unknown as FieldDefinition[],
+                wasLocalized,
+                isLocalized,
+              },
+            }),
+            dialect,
+            firstQuestion
+          );
+          // Notes once the push may have changed the database, so a failure after it keeps the
+          // files that record it.
+          const push = landing.push;
+          // The push excludes companion tables, so comp_<slug>_locales is brought in step right
+          // after it: created on the first translatable field, then ADD/DROPped as the field set
+          // changes.
+          // The change applied by the push and written as the field group's migration, so its table
+          // stands on record for every migration after it, as a collection's Builder save leaves it.
+          const companion: BuilderCompanionReconcile = {
+            slug,
+            tableName,
+            oldFields: component.fields as unknown as FieldDefinition[],
+            newFields: fields as unknown as FieldDefinition[],
+            localized: isStored,
+            wasLocalized: wasStored,
+            adapter,
+            renamed: companionRename ?? undefined,
+            // The settings the first push left off, once the shared columns hold the default
+            // language's values. A new desired schema rather than an edit of the first: the
+            // pipeline keeps the last one it applied, by reference, to skip a push that changes
+            // nothing.
+            settleLeaving: settingsDeferred
+              ? leavingSettingsStep({
+                  adapter,
+                  entity: slug,
+                  tableName,
+                  builtBy: "fieldGroup",
+                  oldFields: (component.fields ??
+                    []) as unknown as FieldDefinition[],
+                  newFields: fields as unknown as FieldDefinition[],
+                  renamed: companionRename,
+                  push: () =>
+                    push({
+                      ...desired,
+                      components: {
+                        ...desired.components,
+                        [slug]: {
+                          ...desired.components[slug],
+                          fields: fields as DesiredFieldGroup["fields"],
+                        },
+                      },
+                    }),
+                })
+              : undefined,
+          };
+          const newSchemaVersion = currentVersion + 1;
+          // The registry's row of the save, in the registry this database holds: the fields it
+          // applied, whether it is translated, and the advanced schema version, written with the
+          // stored version in one transaction and the cached rows cleared after it.
+          const registryTable = await resolveFieldGroupRegistryName(adapter);
+          // Handed the fields that applied where the save's file stopped part way and was settled.
+          const writeRow = (
+            stored: readonly unknown[] = fields
+          ): Promise<void> =>
+            writeAppliedFieldsRow(adapter, {
+              table: registryTable,
+              slug,
+              fields: stored as FieldConfig[],
+              localized: isLocalized,
+              schemaVersion: newSchemaVersion,
+            });
+          // The runtime table this process reads and writes the field group through, built from the
+          // fields its row records: the save's, or those a stopped save settled to.
+          const refreshRuntime = (stored: readonly unknown[]): void => {
+            registerComponentRuntimeSchema(
+              adapter,
+              dialect,
+              tableName,
+              stored as FieldConfig[],
+              componentTypeColumn,
+              isStored
+            );
+          };
+          const { registryWritten } = await writeBuilderSchemaChange(
+            builderSave,
+            () =>
+              pushAndReconcileCompanion(push, desired, "component", companion),
+            {
+              kind: "fieldGroup",
+              slug,
+              table: tableName,
+              stored: fieldGroupEntity(component),
+              fields: fields as unknown as FieldDefinition[],
+              localized: isLocalized,
+              moves,
+              answers: {
+                renameResolutions: renameResolutions ?? [],
+                eventResolutions: eventResolutions ?? [],
+                ...(resolutions ? { resolutions } : {}),
+                // The conversions an adoption makes that the review showed and the person confirmed.
+                ...(acknowledgedConversions === undefined
+                  ? {}
+                  : { acknowledgedConversions }),
+              },
+              // What the push moves beside the table, as a collection's save writes it: a renamed
+              // nested field group's rows moved to its new name, and any junction tables.
+              ...(builderSave === undefined
+                ? {}
+                : await entityRelations(
+                    builderSave.adapter,
+                    getLoggerFromDI() ?? DISCARDED_LOG,
+                    tableName,
+                    (component.fields ?? []) as unknown as FieldDefinition[],
+                    fields as unknown as FieldDefinition[]
+                  )),
+            },
+            landing.landed,
+            {
+              // The push where the save carries values across its change; its own migration file,
+              // run in tries as `nextly migrate` runs it, where it carries none.
+              pushWhen: pushes,
+              afterFile: () =>
+                reconcileBuilderCompanion("component", companion),
+              // The push's questions, asked of the file before anything is written: a rename the
+              // request does not answer, or a drop it does not confirm, refuses the save as the
+              // push refuses it.
+              questions: entityDialogQuestions({
+                desired,
+                db,
+                dialect,
+                tableName,
+                // The builder that made the table, which the offered rename is judged by.
+                builtBy: "fieldGroup",
+                oldFields: (component.fields ??
+                  []) as unknown as FieldDefinition[],
+                newFields: fields as unknown as FieldDefinition[],
+                wasLocalized,
+                isLocalized,
+                renameResolutions,
+                eventResolutions,
+                legacy: legacyBundle,
+              }),
+              // On the file road the row is written in the file's own transaction, so a failed
+              // write leaves the save as it was and is answered as the failure it is. Not where the
+              // translations table is reconciled after the file: the row would then record the
+              // change before that step holds it, so it is written after it, as before.
+              ...(registryInFileTransaction({ wasStored, isStored })
+                ? { registry: writeRow, settled: refreshRuntime }
+                : {}),
+            }
+          );
+
+          // Post-apply: update dynamic_components fields JSON + schema_hash directly
+          // (not via the registry helper, whose auto-bump would also reset
+          // migration_status). Advance schema_version here so the optimistic-lock
+          // check above sees a new value on the next save (without the bump the
+          // stored version never changes and a second stale save would pass), and
+          // persist `localized` so a simultaneous toggle+field-change save keeps the
+          // flag. The write is non-fatal (the DDL already succeeded), but track
+          // whether it landed so the response never reports a version the DB did not
+          // persist.
+          try {
+            // The registry this database holds. The failure is otherwise silent
+            // in the worst way: the DDL has already committed, this write is
+            // treated as non-fatal, and the stale row rebuilds the pre-change
+            // runtime schema on the next restart.
+            // Written already, in the file's transaction, where the save ran its file.
+            if (!registryWritten) await writeRow();
+          } catch (err) {
+            // 🔴 The DDL has ALREADY COMMITTED. Reporting success here is worse than the failure
+            // itself: the tables hold the new shape, the row still describes the old one, and the
+            // version is deliberately not advanced — so an editor loaded before this save still
+            // PASSES the optimistic-lock check and plans its next transition from a shape the
+            // database no longer has. That is the retry `assertNotDiverged` exists to refuse,
+            // arriving through the one door that had no guard.
+            //
+            // Recorded through the shared decision so this path and the metadata service answer
+            // the same state identically. It returns only when the row turns out to already carry
+            // this edit — the write landed and the raise was in reading it back, which MySQL
+            // produces routinely because its update is an UPDATE followed by a SELECT. Every other
+            // outcome throws, which is the point: nobody is told the schema was applied.
+            const { recordStrandedTransition } = await import(
+              "../../domains/field-groups/services/record-stranded-transition"
+            );
+            const expectedHash = calculateSchemaHash(fields as FieldConfig[]);
+            await recordStrandedTransition({
+              registry: svc.registry,
+              logger: getLoggerFromDI() ?? DISCARDED_LOG,
+              slug,
+              expectedSchemaVersion: currentVersion,
+              tableName,
+              wasLocalized: isLocalized,
+              cause: err,
+              // This edit is carried by the row only if BOTH the shape it wrote and the version it
+              // wrote are there. The hash alone would accept a row another writer had advanced
+              // past to the same field set, and the version alone would accept any later write.
+              readBackSettled: async () => {
+                try {
+                  // As stored: whether this save's own write landed.
+                  const current = await svc.registry.getComponentForWrite(slug);
+                  if (current.schemaHash !== expectedHash) return null;
+                  if (current.schemaVersion !== newSchemaVersion) return null;
+                  if ((current.localized === true) !== isLocalized) return null;
+                  return current;
+                } catch {
+                  // A re-read that fails is the likely case when the database is why the write
+                  // raised, and doubt must resolve to "not settled" — treating an unreadable row
+                  // as written would swallow the divergence this path exists to surface.
+                  return null;
+                }
+              },
+            });
+          }
+
+          // Post-apply: refresh in-memory runtime schema so CRUD paths reflect
+          // the new column layout without requiring a server restart.
+          // Must use registerComponentRuntimeSchema (not generateRuntimeSchema)
+          // so the registered table includes component system columns
+          // (_parent_id, _parent_table, _parent_field, _order, _component_type)
+          // instead of collection columns (title, slug).
+          refreshRuntime(fields);
+
+          // Reached only when the registry write landed, or when it raised and the row was found
+          // to carry this edit anyway. Either way the version reported is the one now stored, so
+          // there is no longer a branch that reports a version the database did not persist.
+          return respondAction(`Schema applied for component '${slug}'`, {
+            newSchemaVersion,
+          });
+        }
+      );
+    },
+  },
+
+  // What reconciling a field group WOULD change, computed without changing anything.
+  //
+  // 🔴 Deliberately OUTSIDE `withSchemaChangeExcluded`, unlike the repair below. Two reasons, and
+  // the first is the decisive one: the exclusion is entered with `issuesDdl: true`, so asking it
+  // CREATES a lock table on a database that has never run a storage migration — a preview that
+  // writes to the database to tell you what a write would do. The storage migration's own dry run
+  // takes no lock for exactly this reason, so a preview stays usable with a read-only credential.
+  //
+  // The looser guarantee that buys is the right one for what this answers. A plan read outside the
+  // exclusion can be stale by the time it is approved, and nothing here relies on it not being:
+  // the repair re-plans under the exclusion and refuses unless the row still carries the version
+  // this preview reported. So a stale preview cannot become a wrong write — it becomes a refusal.
+  previewComponentReconcile: {
+    execute: async (svc, p) => {
+      const slug = requireParam(p, "slug", "Component slug");
+
+      const adapter = getAdapterFromDI();
+      if (!adapter) {
+        throw NextlyError.internal({
+          logContext: { reason: "reconcile-preview-requires-adapter", slug },
+        });
+      }
+
+      const { previewFieldGroupReconcile } = await import(
+        "../../domains/field-groups/services/field-group-reconcile-service"
+      );
+      const preview = await previewFieldGroupReconcile({
+        registry: svc.registry,
+        adapter,
+        slug,
+      });
+
+      // A read, so the document envelope rather than the mutation one: nothing was changed and
+      // there is no message to report about a change that did not happen.
+      return respondDoc(preview);
+    },
+  },
+
+  // Repair a field group's stored definition to describe its live tables.
+  //
+  // The exit from `diverged`, so `assertNotDiverged` is deliberately NOT called: this is the one
+  // operation the state exists to permit. Also deliberately not gated on the status being
+  // `diverged` — a recording write that failed after its DDL committed leaves a divergence with no
+  // mark, and the operation is idempotent on a healthy group.
+  reconcileComponent: {
+    execute: async (svc, p, body) => {
+      const slug = requireParam(p, "slug", "Component slug");
+
+      // The version a preview reported, when this call is approving one. Absent for a caller that
+      // never previewed, which keeps repairing against whatever it reads.
+      const b = body as { expectedSchemaVersion?: number } | undefined;
+      const expectedSchemaVersion = b?.expectedSchemaVersion;
+      if (
+        expectedSchemaVersion !== undefined &&
+        !Number.isInteger(expectedSchemaVersion)
+      ) {
+        throw NextlyError.validation({
+          errors: [
+            {
+              path: "expectedSchemaVersion",
+              code: "INVALID_VALUE",
+              message: "Must be the whole number a preview reported.",
+            },
+          ],
+          logContext: { slug, received: typeof expectedSchemaVersion },
+        });
+      }
+
+      const adapter = getAdapterFromDI();
+      if (!adapter) {
+        // Without a database there are no live tables, so there is nothing to reconcile AGAINST —
+        // unlike the schema services' generate-only mode, this operation is meaningless dry.
+        throw NextlyError.internal({
+          logContext: { reason: "reconcile-requires-adapter", slug },
+        });
+      }
+      const logger = getLoggerFromDI() ?? DISCARDED_LOG;
+
+      // Inside the exclusion even though no DDL runs: the plan is computed from a read of the
+      // registry AND the catalog, and an apply committing between those reads would hand the
+      // planner a pair that never coexisted. The version-conditional write catches the registry
+      // half of that race; holding the exclusion closes the catalog half too.
+      return withSchemaChangeExcluded(
+        {
+          adapter,
+          logger,
+          label: `reconcile field group "${slug}"`,
+          // 🔴 TRUE even though this operation issues no DDL of its own, because the exclusion has
+          // to be REAL for the answer to mean anything. With `false` the session takes no lock at
+          // all on a database that has never run a storage migration, so a first migration can
+          // start mid-operation and rename the table, the discriminator or the registry while the
+          // planner is reading them — and those pointer updates need not advance `schema_version`,
+          // so the version-conditional write does not reject the mixed snapshot and records it as
+          // `synced`. An operation whose entire output is the claim "this definition describes
+          // these tables" must not be able to certify a pair that never coexisted.
+          //
+          // The cost that argues for `false` elsewhere does not apply here. Collections take that
+          // shape outside development because they record a migration FILE and must keep working
+          // for a role holding DML but no DDL. This is builder surface — refused in production
+          // whatever `showBuilder` says — so a server that can reach it is one that already
+          // accepts schema changes from a browser, and creating a one-time lock table is
+          // strictly less than what it has already permitted.
+          issuesDdl: true,
+        },
+        async () => {
+          const { reconcileFieldGroup } = await import(
+            "../../domains/field-groups/services/field-group-reconcile-service"
+          );
+          const report = await reconcileFieldGroup({
+            registry: svc.registry,
+            adapter,
+            logger,
+            slug,
+            // Spread so an absent value stays absent: passing `undefined` explicitly would be
+            // indistinguishable from "no preview to honour" only by luck of how the callee reads
+            // it, and this way the two cases differ in the object itself.
+            ...(expectedSchemaVersion !== undefined
+              ? { expectedSchemaVersion }
+              : {}),
+          });
+
+          // The canonical mutation envelope: this method can rewrite the registry row, so its
+          // result is `item` like every other definition write — not a bespoke top-level key a
+          // consumer would need special handling for.
+          return respondMutation(
+            report.unchanged
+              ? `"${slug}" already describes its tables; nothing was changed.`
+              : `Reconciled "${slug}" against its live tables.`,
+            report
+          );
+        }
+      );
+    },
+  },
+
+  deleteComponent: {
+    // Spec divergence: spec §5.1 / §7.4 strictly maps delete to
+    // respondMutation, but registry.deleteComponent returns void (no
+    // deleted record to surface). We use respondAction here so the wire
+    // shape is `{ message, slug }` rather than the awkward
+    // `{ message, item: undefined }` that respondMutation would emit.
+    // If registry.deleteComponent is later refactored to return the
+    // deleted record, switch this back to respondMutation.
+    execute: async (svc, p) => {
+      const slug = requireParam(p, "slug", "Component slug");
+
+      const isLocked = await svc.registry.isLocked(slug);
+      if (isLocked) {
+        // Defined in code, as updateComponent's locked branch answers.
+        throw NextlyError.definedInCode({
+          thing: "component",
+          change: "delete",
+          logContext: {
+            reason: "component-locked",
+            slug,
+          },
+        });
+      }
+
+      // The registry's delete writes it as the field group's migration where a writer is set up,
+      // so every entry point that deletes one leaves no snapshot still recording its table.
+      await svc.registry.deleteComponent(slug);
+
+      return respondAction(`Component "${slug}" deleted successfully.`, {
+        slug,
+      });
+    },
+  },
+};
+
+/**
+ * Dispatch a Components method call. Resolves the registry from DI and
+ * throws a descriptive error if it isn't registered yet.
+ */
+export function dispatchComponents(
+  method: string,
+  params: Params,
+  body: unknown
+): Promise<unknown> {
+  const componentRegistry = getComponentRegistryFromDI();
+  if (!componentRegistry) {
+    throw new Error(
+      "Components service not initialized. " +
+        "Ensure registerServices() or getNextly() has been called before API requests."
+    );
+  }
+
+  const handler = COMPONENTS_METHODS[method];
+  if (!handler) throw new Error(`Unknown method: ${method}`);
+  return handler.execute({ registry: componentRegistry }, params, body);
+}

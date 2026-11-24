@@ -1,0 +1,189 @@
+/**
+ * Rename a collection or Single: its registry row and everything keyed by its
+ * slug, in one transaction, and then the in-process state that answers by
+ * slug.
+ *
+ * The one path both registries rename through, so the collection and the
+ * Single rename cannot come to move different things or to forget a cache.
+ *
+ * @module domains/entity-rename/rename-entity
+ */
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import type {
+  SupportedDialect,
+  TransactionContext,
+} from "@nextlyhq/adapter-drizzle/types";
+
+import { getDialectTables } from "../../database/index";
+import { container } from "../../di";
+import { collectionTag, singleTag } from "../../revalidation/compute-tags";
+import type { CacheRevalidator } from "../../revalidation/types";
+import { writingPermissions } from "../../services/lib/permissions";
+import type { Logger } from "../../shared/types";
+import { clearRegistryRowCache } from "../dynamic-collections/services/collection-row-cache";
+import { countRegistryWriteOn } from "../schema/schema-version";
+import { withSchemaChangeExcluded } from "../schema/services/schema-change-exclusion";
+import type { WebhookEndpointRegistry } from "../webhooks/endpoint-registry";
+import {
+  clearWebhookRecording,
+  setWebhookRecording,
+} from "../webhooks/recording-policy";
+
+import { refuseManyToManyLinks } from "./many-to-many-links";
+import {
+  moveEntitySlug,
+  slugKeyedTablesPresent,
+  type EntitySlugMove,
+} from "./move-entity-slug";
+import {
+  moveRelationshipTargets,
+  refuseUnmovableTargets,
+} from "./relationship-targets";
+
+/**
+ * Write the registry row with `writeRegistry` and move every declared table
+ * to the new slug, on one transaction. `writeRegistry` answers null when no
+ * row held the old slug; nothing is moved then, and null is returned.
+ *
+ * A collection a many-to-many relationship uses is refused first, in the same
+ * transaction and before the registry row is written (`refuseManyToManyLinks`).
+ *
+ * All of it holds the schema lock, as every Schema Builder change does
+ * (`withSchemaChangeExcluded`), because it rewrites the registry: a rename
+ * started while a migration or another schema change holds the lock is refused
+ * at once, before anything is read or written. It writes rows and no DDL, so
+ * it creates no lock table where there is none.
+ *
+ * The new slug is judged first inside that lock (`judgeTarget`), so a collection
+ * or Single created or renamed onto the same address while this rename waited
+ * is seen, and one that tries while it holds the lock is refused. Required, so
+ * no road renames without judging where it is going. The lock is released when
+ * the transaction ends, before the post-commit work below, which may wait on
+ * the cache.
+ *
+ * The transaction runs inside the permissions gate, because it moves the
+ * entity's permission rows: every cached answer about who may do what is
+ * retired once it has finished, committed or not, as for any permission
+ * write. After a commit, the cached list of webhook endpoints is dropped, so
+ * the next delivery reads the filters the rename rewrote, and so is a renamed
+ * collection's cached schema under either slug; and the cached content read
+ * under either slug is flushed.
+ */
+export async function renameEntity<T>(
+  adapter: DrizzleAdapter,
+  input: {
+    dialect: SupportedDialect;
+    move: EntitySlugMove;
+    writeRegistry: (tx: TransactionContext) => Promise<T | null>;
+    /**
+     * Refuse the new slug (by throwing) when the address rule does: run inside
+     * the schema lock, before anything is read or written.
+     */
+    judgeTarget: () => Promise<void>;
+    logger: Logger;
+  }
+): Promise<T | null> {
+  const { dialect, move, writeRegistry, judgeTarget, logger } = input;
+  const written = await withSchemaChangeExcluded(
+    {
+      adapter,
+      logger,
+      label: `rename ${move.kind} "${move.from}" to "${move.to}"`,
+      issuesDdl: false,
+    },
+    async () => {
+      await judgeTarget();
+      const present = await slugKeyedTablesPresent(adapter);
+      return writingPermissions(getDialectTables(dialect).permissions, () =>
+        adapter.transaction(async tx => {
+          await refuseManyToManyLinks(tx, move, present);
+          // What the stored relationships point at, refused before anything is written.
+          await refuseUnmovableTargets(tx, move, present);
+          const row = await writeRegistry(tx);
+          // Cleared as the row moves, so the reads below and any later in the
+          // transaction find the row under its new slug, not the old one read
+          // before it.
+          clearRegistryRowCache();
+          if (row === null) return null;
+          // The stored schema version's count moves with the row, in this
+          // transaction (or the registry write it runs inside).
+          await countRegistryWriteOn(tx, dialect);
+          await moveEntitySlug(tx, { dialect, present, move });
+          // Read after the registry row is written, so a collection relating to itself is
+          // pointed at its new slug too.
+          await moveRelationshipTargets(tx, move, present);
+          return row;
+        })
+      );
+    }
+  );
+  if (written !== null && container.has("webhookEndpointRegistry")) {
+    container
+      .get<WebhookEndpointRegistry>("webhookEndpointRegistry")
+      .invalidate();
+  }
+  if (written !== null && move.kind === "collection") {
+    dropCachedSchemas(move);
+  }
+  if (written !== null) await flushCachedContent(move);
+  return written;
+}
+
+/**
+ * Flush the content cached under both slugs, through the cache revalidator
+ * every content write flushes through. A page cached under the old slug would
+ * keep serving the renamed entity's content, with no write to its old name
+ * ever coming to flush it; one cached under the new slug, before it named
+ * anything, would keep answering that there is nothing there. Best-effort, as
+ * every flush is: the rename has committed.
+ */
+async function flushCachedContent(move: EntitySlugMove): Promise<void> {
+  if (!container.has("cacheRevalidator")) return;
+  const tagOf = move.kind === "collection" ? collectionTag : singleTag;
+  await container
+    .get<CacheRevalidator>("cacheRevalidator")
+    .flush([{ tags: [tagOf(move.from), tagOf(move.to)] }]);
+}
+
+/**
+ * Drop a renamed collection's cached Drizzle table under both slugs, in each
+ * cache that holds one: the collection service's, and the content handler's,
+ * which the entry reads and writes use. The old slug's entry still points at
+ * the renamed collection's table, so a collection later created under that
+ * slug would read and write it; the new slug's is rebuilt from the moved
+ * registry row on its next read.
+ */
+function dropCachedSchemas(move: EntitySlugMove): void {
+  if (container.has("collectionService")) {
+    const service = container.get<{
+      invalidateSchemaForSlug(slug: string): void;
+    }>("collectionService");
+    service.invalidateSchemaForSlug(move.from);
+    service.invalidateSchemaForSlug(move.to);
+  }
+  if (container.has("collectionsHandler")) {
+    const handler = container.get<{
+      invalidateCollectionSchema(slug: string): void;
+    }>("collectionsHandler");
+    handler.invalidateCollectionSchema(move.from);
+    handler.invalidateCollectionSchema(move.to);
+  }
+}
+
+/**
+ * Carry a Builder entity's webhook recording decision from its old slug to its
+ * new one in this process. `record` is the decision the rename committed, read
+ * from the registry row the rename wrote, not from this process's map: a
+ * re-read of the stored decisions that lands between the commit and this call
+ * has already moved the decision to the new slug and dropped the old one, and
+ * the old slug read then would answer the default and undo it. The old slug's
+ * entry is dropped, so an entity later created there starts from the default.
+ */
+export function moveWebhookRecording(
+  move: EntitySlugMove,
+  record: boolean
+): void {
+  clearWebhookRecording(move.kind, move.from);
+  setWebhookRecording(move.kind, move.to, record, "db");
+}

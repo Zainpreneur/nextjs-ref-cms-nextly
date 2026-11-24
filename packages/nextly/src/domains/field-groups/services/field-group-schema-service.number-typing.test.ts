@@ -1,0 +1,94 @@
+import { describe, it, expect } from "vitest";
+
+import type { FieldConfig } from "../../../collections/fields/types";
+
+import {
+  FieldGroupSchemaService,
+  type SupportedDialect,
+} from "./field-group-schema-service";
+
+// Identifier quote per dialect, so assertions can tie a column type to its name.
+const QUOTE: Record<SupportedDialect, string> = {
+  postgresql: '"',
+  mysql: "`",
+  sqlite: '"',
+};
+
+// Builds a bare number field with whatever storage settings a case is pinning.
+// The double cast is deliberate: `dbType`, `precision`, `scale` and
+// `options.format` are declared on the individual number-field type rather than
+// the FieldConfig union, so a plain cast cannot reach them. Spelling each
+// variant as a fully-typed field would bury the one property under test.
+const numberField = (extra: Record<string, unknown> = {}): FieldConfig =>
+  ({ name: "value", type: "number", ...extra }) as unknown as FieldConfig;
+
+function columnSql(dialect: SupportedDialect, field: FieldConfig): string {
+  return new FieldGroupSchemaService(dialect).generateMigrationSQL(
+    "comp_widget",
+    [field]
+  );
+}
+
+// Component number fields previously always became floating-point columns,
+// unlike the same field in a collection. These cases pin each storage mode to
+// the column type the runtime and the generated Drizzle schema build for it,
+// spelled as the column descriptor spells it, which the creator reads —
+// a mismatch means the created table can never match the desired schema, so
+// every later diff re-alters the same column.
+describe("FieldGroupSchemaService number column typing", () => {
+  // The default: whole numbers, so an integer column rather than a float that
+  // would silently round-trip 1 as 1.0.
+  it("types a default number field as an integer column (not real/double)", () => {
+    const expected: Record<SupportedDialect, string> = {
+      postgresql: "int4",
+      mysql: "int",
+      sqlite: "integer",
+    };
+    for (const dialect of Object.keys(expected) as SupportedDialect[]) {
+      const q = QUOTE[dialect];
+      const sql = columnSql(dialect, numberField());
+      expect(sql).toContain(`${q}value${q} ${expected[dialect]}`);
+      expect(sql).not.toMatch(
+        new RegExp(`${q}value${q}\\s+(real|double|float8)`, "i")
+      );
+    }
+  });
+
+  // dbType:"decimal" means money-like exactness, so the declared precision and
+  // scale must reach the column. SQLite has no parameterised decimal, so its
+  // NUMERIC affinity is the closest equivalent.
+  it("types a dbType:decimal number field as an exact decimal column", () => {
+    const expected: Record<SupportedDialect, string> = {
+      postgresql: "numeric(10, 2)",
+      mysql: "decimal(10,2)",
+      sqlite: "numeric",
+    };
+    for (const dialect of Object.keys(expected) as SupportedDialect[]) {
+      const q = QUOTE[dialect];
+      const sql = columnSql(
+        dialect,
+        numberField({ dbType: "decimal", precision: 10, scale: 2 })
+      );
+      expect(sql).toContain(`${q}value${q} ${expected[dialect]}`);
+    }
+  });
+
+  // format:"float" opts into approximate storage. Each dialect's value is the
+  // 8-byte type the runtime's `doublePrecision`/`double`/`real` column maps to,
+  // not merely "some float" — PostgreSQL REAL (float4) would not match.
+  it("types an options.format:float number field as a floating-point column", () => {
+    const expected: Record<SupportedDialect, string> = {
+      postgresql: "float8",
+      mysql: "double",
+      sqlite: "real",
+    };
+    for (const dialect of Object.keys(expected) as SupportedDialect[]) {
+      const q = QUOTE[dialect];
+      const sql = columnSql(
+        dialect,
+        numberField({ options: { format: "float" } })
+      );
+      expect(sql).toContain(`${q}value${q} ${expected[dialect]}`);
+    }
+  });
+});

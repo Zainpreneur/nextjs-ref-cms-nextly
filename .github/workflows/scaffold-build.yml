@@ -1,0 +1,1025 @@
+name: Scaffold build
+
+# Does a scaffolded project actually INSTALL and BUILD?
+#
+# The per-PR `scaffold-smoke` job in `ci.yml` answers a narrower question. It runs
+# `--skip-install` to stay fast, so it proves the CLI writes files and never that what it
+# wrote resolves. The nightly `scaffold-and-build` in `package-smoke.yml` does the real
+# install and build, and is gated `if: github.event_name != 'pull_request'`.
+#
+# Between them sits a class of change nothing on a pull request can see: one that alters
+# what a scaffolded project DEPENDS ON or IMPORTS. Its failure mode is not a red test —
+# it is every newly scaffolded project failing on the user's machine, hours before the
+# nightly reports it. A template that references a font package, a dependency the
+# generator stops emitting, an import that resolves here and not from a published
+# tarball: all merge green today.
+#
+# Deliberately NOT solved by relaxing the nightly job's gate. That workflow's
+# `pull_request.paths` filter already includes `pnpm-lock.yaml`, so dropping the `if:`
+# would put a ~30-minute install-and-build on every dependency bump — the most frequent
+# pull request in the repo, and the one least likely to change what a scaffold imports.
+# The cost belongs on changes to the scaffolder and its templates, which are rare.
+on:
+  # The nightly newest-minor run calls this same matrix with the newest Next.js
+  # and React minors to install before each build. A pull request passes no
+  # input, so that install step is skipped and its run is unchanged.
+  workflow_call:
+    inputs:
+      versions:
+        description: "Space-separated `name@version` specs to install into the scaffolded app before it builds"
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      # `templates/plugin/**` is deliberately absent. A plugin scaffold is a publishable
+      # LIBRARY rather than a Next app, so the assertions below — a root layout, font packages,
+      # a `.next` directory — do not describe it, and a job that triggered on it while testing
+      # something else would claim a coverage it does not have. Tracked separately.
+      #
+      - "templates/base/**"
+      - "templates/blank/**"
+      - "templates/blog/**"
+      - "packages/create-nextly-app/**"
+      - ".github/workflows/scaffold-build.yml"
+      - ".github/actions/serve-workspace-packages/**"
+
+permissions:
+  contents: read
+
+# A pull request's newer push supersedes its last run. Every other run (a push
+# to main through ci.yml, the nightly newest-minor) keeps a group of its own
+# event and commit, so one commit's run on main is never cancelled by the next.
+concurrency:
+  group: scaffold-build-${{ github.event_name == 'pull_request' && github.ref || format('{0}-{1}', github.event_name, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  scaffold-build:
+    name: Scaffold ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    # One OS and one Node line. Cross-platform path handling is `scaffold-smoke`'s
+    # question and native-module ABI coverage is the nightly matrix's; repeating either
+    # here would buy minutes of duplicate signal.
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      # Legs are listed explicitly rather than crossed, because these axes are not independent:
+      # the template source is a property of the CLI rather than of any one package manager,
+      # and the pnpm version only means anything on a pnpm leg. A cross product would spend
+      # minutes on combinations that test nothing new.
+      #
+      # The rule each leg answers to: this job triggers on a set of paths, and every BEHAVIOUR
+      # those paths can change should be exercised by some leg. Triggering on a path whose
+      # behaviour no leg runs is the defect this job exists to catch, turned on itself.
+      #
+      # THREE behaviours are knowingly not covered, and they are listed rather than left for
+      # someone to infer from a green run:
+      #
+      # 1. The non-sqlite dialects. A scaffold's build script is `nextly migrate && next
+      #    build`, so a postgres or mysql leg needs a live and EMPTY database rather than only
+      #    a connection string — measured, a postgres scaffold fails its build with
+      #    ECONNREFUSED without one. That needs service containers, which is its own change;
+      #    until then a CLI edit that misnames an adapter passes here.
+      # 2. `downloadTemplate`, the runtime Codeload fetch. Only content templates are
+      #    downloaded — `blank` always resolves locally or from the packed tarball — and every
+      #    blog leg below passes `--local-template` so it reads the templates under review
+      #    rather than a published branch. A broken Codeload URL, archive filter, branch
+      #    handling or extraction path therefore still merges green. Covering it needs a leg
+      #    that passes `--branch`, which only works for a same-repository pull request: a fork's
+      #    branch does not exist under `nextlyhq/nextly` for Codeload to fetch. A leg that
+      #    silently no-ops on forks would report a coverage it does not have on exactly the
+      #    contributions least able to check it, so it is named here instead.
+      matrix:
+        include:
+          # The default scaffold, and the baseline everything else varies from.
+          - name: blank
+            template: blank
+            pm: npm
+            source: local
+
+          # npm installs a HOISTED tree, so an import of an undeclared transitive dependency
+          # resolves there and the build passes — while the same project fails for anyone
+          # invoking the CLI through pnpm, whose layout does not expose subdependencies at the
+          # root. The asymmetry is between the two RESOLVERS, so one template covers it.
+          #
+          # pnpm 9 is the one STRICTEST about the generated `pnpm-workspace.yaml`: through 9.3,
+          # the presence of that file declared a workspace and a missing `packages` key failed
+          # the install outright. pnpm relaxed it in 9.4 when the file became the general
+          # settings home, so a leg on any current pnpm would not see it.
+          #
+          # The version is PINNED here rather than inherited. This leg used to get pnpm 9 for
+          # free, because the repo's own `packageManager` was `pnpm@9.0.0` — so when that pin
+          # moved to 12.5.1 the leg silently started testing 12 while still named for 9, and
+          # the pre-9.4 behaviour it exists to cover stopped being covered by anything. An
+          # inherited version is not a version this leg chose.
+          #
+          # `9.0` and not `9`: `npm install -g pnpm@9` resolves to the newest 9.x, which is
+          # past the 9.4 relaxation and therefore has nothing to say here. `9.0` pins the 9.0.x
+          # line, which is both what the repo used to run and inside the strict window. The
+          # check step below matches on the `<version>.` prefix, which `9.0` satisfies and a
+          # three-part `9.0.0` would not.
+          - name: blank-pnpm9
+            template: blank
+            pm: pnpm
+            source: local
+            pnpmVersion: "9.0"
+
+          # The same resolver on a modern pnpm, because the two read the generated workspace
+          # file DIFFERENTLY and each ignores what the other enforces. pnpm 9 runs dependency
+          # build scripts by default and never consults `allowBuilds` or
+          # `onlyBuiltDependencies` — so on that leg alone, a regression that dropped either
+          # key stays green while pnpm 10+ users get an install that aborts with
+          # ERR_PNPM_IGNORED_BUILDS and a better-sqlite3 with no compiled binding.
+          - name: blank-pnpm11
+            template: blank
+            pm: pnpm
+            source: local
+            pnpmVersion: "11"
+
+          # NO `--local-template`, so the CLI falls back to the templates BUNDLED in the packed
+          # tarball. Every other leg passes the flag, so a break in the bundled-template copy —
+          # or `templates` dropped from the published `files` — would leave all of them green
+          # while an ordinary `create-nextly-app --template blank` fails with
+          # "Template not found".
+          - name: blank-bundled
+            template: blank
+            pm: npm
+            source: bundled
+
+          # The blog template, which carries everything `blank` does not: a query layer over
+          # the Direct API, a generated build script with a search-index step, and migrations
+          # shipped as per-dialect SQL variants. `blank` exercises none of it, so a change that
+          # breaks the blog template alone reaches users through a green run without these.
+          - name: blog-code-first
+            template: blog
+            approach: code-first
+            pm: npm
+            source: local
+
+          # The SAME template through the schema-builder approach, which is a different config
+          # (`collections: []`, so the schema lives in the database) reaching the same query
+          # layer. The two approaches share every file under src/, so a repair verified on one
+          # says nothing about the other.
+          #
+          # On pnpm, because no blog leg has ever run one: the blog template pulls more
+          # dependencies than `blank` — Pagefind among them — and pnpm's non-hoisted layout is
+          # where an undeclared transitive import fails.
+          - name: blog-visual
+            template: blog
+            approach: visual
+            pm: pnpm
+            source: local
+
+          # The blog served under Cache Components, which every scaffold has on: on an empty
+          # database and again on seeded content (`serveChecks`), each from a build of its own.
+          # Rendering under Cache Components does not depend on the dialect or the package
+          # manager, so one SQLite leg covers it.
+          - name: blog-cache-components
+            template: blog
+            approach: code-first
+            pm: npm
+            source: local
+            serveChecks: "on"
+
+          # Not a scaffold: an EXISTING app, as `create-next-app` makes it with its defaults,
+          # which since 16.4 turn Cache Components on (`cacheComponents: true` and
+          # `partialPrefetching: true`). Nextly runs with both on, so adding Nextly to such an
+          # app keeps them and adds Nextly's cache handlers. The leg asserts that on the config
+          # create-nextly-app leaves, then builds the app and boots it, so the user path
+          # through the existing-app installer is exercised end to end: until this leg, no
+          # job ran that installer at all.
+          - name: existing-create-next-app
+            template: blank
+            pm: npm
+            source: local
+            existing: create-next-app
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Restore pnpm store
+        uses: ./.github/actions/pnpm-store
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the CLI and core
+        run: pnpm turbo build --filter=create-nextly-app --filter=nextly
+
+      # Packed and installed from the tarball rather than run from source, so the run
+      # exercises the `files` list a published package actually ships. A generator that
+      # works from the repo and omits a template from `files` is exactly the failure this
+      # is looking for.
+      - name: Pack the CLI
+        run: |
+          mkdir -p /tmp/nextly-pack
+          (cd packages/create-nextly-app && pnpm pack --pack-destination /tmp/nextly-pack)
+
+      # Every leg installs the packages under review, and the comment on this action says
+      # why a leg must not take them from npm.
+      - name: Pack the workspace packages and serve them from a registry
+        uses: ./.github/actions/serve-workspace-packages
+
+      # AFTER the repo's own install, build and pack, all of which must run on the pinned
+      # pnpm. Only the scaffold's install is being varied.
+      #
+      # Into its OWN prefix, placed on PATH through `GITHUB_PATH`, rather than a plain
+      # `npm install -g`. `pnpm/action-setup` has already put its own bin directory on PATH,
+      # and a global install landing behind it would leave the pinned pnpm in front — the leg
+      # would then run 9 while claiming 11. `GITHUB_PATH` entries are PREPENDED, so this wins.
+      - name: Install the pnpm the scaffold should use
+        if: matrix.pnpmVersion != ''
+        shell: bash
+        run: |
+          npm install -g --prefix /tmp/pnpm-shim "pnpm@${{ matrix.pnpmVersion }}"
+          echo "/tmp/pnpm-shim/bin" >> "$GITHUB_PATH"
+
+      # A separate step because `GITHUB_PATH` takes effect for SUBSEQUENT steps, so the check
+      # cannot live in the one above.
+      #
+      # Asked from the SCAFFOLD directory rather than the checkout, and the difference is not a
+      # detail: pnpm 10+ reads `packageManager` and re-executes itself as that version, so a
+      # freshly installed pnpm answers `12.5.1` — the repo's pin — anywhere inside this
+      # repository, while the scaffold, which runs outside it, is genuinely on the matrix
+      # version. The version that governs an install is the one resolved where that install
+      # happens. (pnpm 9 does not re-execute at all, so the 9.0 leg is on it either way; the
+      # check below is what proves that rather than assuming it.)
+      #
+      # Without this the leg is unfalsifiable: an install that failed, or landed off PATH,
+      # leaves the pinned pnpm in place and the leg reports a green for a version it never ran.
+      - name: Check the scaffold will use that pnpm
+        if: matrix.pnpmVersion != ''
+        shell: bash
+        run: |
+          mkdir -p /tmp/scaffold-build
+          actual=$(cd /tmp/scaffold-build && pnpm --version)
+          echo "pnpm resolved where the scaffold runs: $actual"
+          case "$actual" in
+            "${{ matrix.pnpmVersion }}".*) ;;
+            *) echo "expected pnpm ${{ matrix.pnpmVersion }}.x, got $actual"; exit 1 ;;
+          esac
+
+      - name: Scaffold with a real install
+        shell: bash
+        run: |
+          mkdir -p /tmp/scaffold-build
+          cd /tmp/scaffold-build
+          tarball=$(ls /tmp/nextly-pack/*.tgz | head -1)
+          # `--local-template` points the CLI at THIS checkout, so the legs that pass it read
+          # the template contents under review rather than whatever the packed tarball carries.
+          # The `bundled` leg deliberately does not, which is how the tarball's own copy gets
+          # exercised.
+          #
+          # `npm exec --package=<tarball> -- <bin>` is the explicit form; `npx --yes <tarball>`
+          # routes the path through sh on npm 11 and fails on the tgz. No `--skip-install`: the
+          # install is the point.
+          #
+          # The package manager the CLI installs with follows the one that INVOKED it, so the
+          # leg is chosen here rather than by a flag.
+          args="--template ${{ matrix.template }} --yes"
+          # Only the content templates have approaches; `blank` rejects the flag.
+          if [ -n "${{ matrix.approach }}" ]; then
+            args="$args --approach ${{ matrix.approach }}"
+          fi
+          # Omitted on the `bundled` leg so the CLI falls back to the templates inside the
+          # packed tarball rather than reading this checkout.
+          if [ "${{ matrix.source }}" = "local" ]; then
+            args="$args --local-template $GITHUB_WORKSPACE/templates"
+          fi
+
+          # The existing-app leg: the app comes from `create-next-app`, at the release that
+          # matches the Next.js this workspace builds with, and Nextly is added INTO it. With
+          # `--yes` it takes create-next-app's defaults, the ones a user gets; `--src-dir` only
+          # puts the app where the checks below look for it.
+          if [ "${{ matrix.existing }}" = "create-next-app" ]; then
+            next_version=$(node -p "require('$GITHUB_WORKSPACE/apps/playground/node_modules/next/package.json').version")
+            npx --yes "create-next-app@$next_version" scaffolded-app --yes --use-npm --src-dir
+            cd scaffolded-app
+            # The fixture, checked before it is relied on: if create-next-app stops turning
+            # Cache Components on, this leg would test turning it on from off instead, which
+            # the scaffolder's unit tests cover, while claiming create-next-app's defaults.
+            grep -q 'cacheComponents: true' next.config.ts || {
+              echo "create-next-app $next_version did not turn Cache Components on; this leg no longer tests its defaults"
+              cat next.config.ts
+              exit 1
+            }
+            npm exec --yes --package="$tarball" -- create-nextly-app . --yes --database sqlite \
+              --local-template "$GITHUB_WORKSPACE/templates"
+            exit 0
+          fi
+
+          if [ "${{ matrix.pm }}" = "pnpm" ]; then
+            pnpm dlx "$tarball" scaffolded-app $args
+          else
+            npm exec --yes --package="$tarball" -- create-nextly-app scaffolded-app $args
+          fi
+
+      # What the existing-app leg exists for: create-nextly-app left the app's config with
+      # both options on and Nextly's cache handlers added beside them. Red on a
+      # create-nextly-app that leaves the config alone. What Next.js finally read from it is
+      # asserted after the build.
+      - name: Check create-nextly-app added Nextly's cache handlers
+        if: matrix.existing == 'create-next-app'
+        shell: bash
+        run: |
+          cd /tmp/scaffold-build/scaffolded-app
+          cat next.config.ts
+          for line in 'cacheComponents: true' 'partialPrefetching: true' \
+            'cacheHandler: require.resolve("nextly/cache-handler")' 'cacheMaxMemorySize: 0' \
+            'cacheHandlers: { default: require.resolve("nextly/cache-handlers") }'; do
+            grep -qF "$line" next.config.ts || {
+              echo "next.config.ts does not set $line after create-nextly-app"
+              exit 1
+            }
+          done
+
+      # The controls, before the build's verdict is worth anything. A job that scaffolded
+      # nothing, or scaffolded into the wrong directory, would otherwise reach a build
+      # step with nothing to build and report whatever that produces.
+      - name: Check the scaffold produced what the build needs
+        shell: bash
+        run: |
+          cd /tmp/scaffold-build/scaffolded-app
+          test -f package.json || { echo "no package.json: the scaffold did not run"; exit 1; }
+          test -d node_modules || { echo "no node_modules: the install did not run"; exit 1; }
+          test -f src/app/layout.tsx || { echo "no root layout: the template did not copy"; exit 1; }
+
+          # A scaffold writes a real `.env`, so without this the first `git add .` in a new
+          # project commits it. Checked on every leg because the file reaches the project by two
+          # different routes — from this checkout on the `local` legs and from the packed tarball
+          # on `bundled` — and only the second is where npm strips it out.
+          test -f .gitignore || { echo "no .gitignore: a new project would commit its .env"; exit 1; }
+
+          # The agent guide, and the pointer that makes Claude Code read it. Asserted on
+          # every leg because they reach a project by two different routes — from this
+          # checkout on the `local` legs, from the packed tarball on `bundled` — and only
+          # the second is where a missing `files` entry would drop them.
+          # A template's guide, so not on the existing-app leg: there AGENTS.md is
+          # create-next-app's own, with no CLAUDE.md beside it, and the installer leaves
+          # the app's files alone.
+          if [ "${{ matrix.existing }}" != "create-next-app" ]; then
+            test -f AGENTS.md || { echo "no AGENTS.md: the scaffold shipped no agent guide"; exit 1; }
+            test -f CLAUDE.md || { echo "no CLAUDE.md: nothing points Claude Code at AGENTS.md"; exit 1; }
+
+            # The guide is generated from a template, so an unresolved placeholder would ship
+            # `{{databaseDialect}}` to the reader as if it were the answer.
+            if grep -q '{{' AGENTS.md; then
+              echo "AGENTS.md still contains an unreplaced {{placeholder}}"
+              grep -n '{{' AGENTS.md
+              exit 1
+            fi
+          fi
+
+          # `node_modules` says an install ran; it does not say WHICH installer ran. The CLI
+          # picks that from the forwarded `npm_config_user_agent`, so a regression there — or a
+          # pnpm release that stops forwarding it — would quietly run npm instead, and npm's
+          # hoisted, build-script-running tree passes everything these pnpm legs exist to check.
+          # The lockfile is the installer's own signature.
+          # Both directions, because the misclassification runs both ways. `pnpm/action-setup`
+          # has put pnpm on this runner, so an npm leg that was detected AS pnpm installs
+          # perfectly well here and `npm run build` reuses those modules — while an ordinary npm
+          # user, with no pnpm on their machine, fails during scaffolding. Asserting only the
+          # pnpm side would leave that one green.
+          case "${{ matrix.pm }}" in
+            pnpm)
+              test -f pnpm-lock.yaml || {
+                echo "no pnpm-lock.yaml: this leg claims pnpm but something else installed"
+                exit 1
+              }
+              ;;
+            npm)
+              test -f package-lock.json || {
+                echo "no package-lock.json: this leg claims npm but something else installed"
+                exit 1
+              }
+              ;;
+            *)
+              echo "unknown package manager '${{ matrix.pm }}': no lockfile to identify it by"
+              exit 1
+              ;;
+          esac
+
+          # The font checks are about the TEMPLATES' layouts. The existing-app leg keeps
+          # create-next-app's own layout, which loads its font through `next/font/google`
+          # and imports no `@fontsource` package, so the control below would always find
+          # nothing there.
+          if [ "${{ matrix.existing }}" = "create-next-app" ]; then
+            echo "existing app: its layout is create-next-app's, not a template's; no font packages to check"
+            exit 0
+          fi
+
+          # Every package the layouts import must be installed. Derived from the sources
+          # rather than named here: a list in this file is a second answer to a question
+          # the templates already answer, and the two agree only until someone changes a
+          # face.
+          missing=""
+          for pkg in $(grep -rhoE '@fontsource(-variable)?/[a-z0-9-]+' src/ | sort -u); do
+            [ -d "node_modules/$pkg" ] || missing="$missing $pkg"
+          done
+          if [ -n "$missing" ]; then
+            echo "imported but not installed:$missing"
+            exit 1
+          fi
+
+          # A positive control on that loop. It reports success by finding nothing
+          # missing, which is also what a `grep` that matched nothing produces — so the
+          # count it scanned has to be non-zero.
+          found=$(grep -rhoE '@fontsource(-variable)?/[a-z0-9-]+' src/ | sort -u | wc -l)
+          echo "font packages imported by the scaffold: $found"
+          [ "$found" -gt 0 ] || { echo "scanned no font imports at all"; exit 1; }
+
+      # The scaffold's own install already resolved these from the local registry, so there is
+      # nothing to repin. What remains is the assertion that it did: the install exits 0 either
+      # way, and a published copy carries the same name and version as the packed one, so
+      # nothing about the manifest distinguishes them. The packed tarball's entry file is diffed
+      # against the installed one.
+      - name: Check the packages under review are the ones installed
+        shell: bash
+        run: |
+          cd /tmp/scaffold-build/scaffolded-app
+          rm -rf /tmp/pack-check && mkdir -p /tmp/pack-check
+          tar -xzf /tmp/nextly-workspace-packs/nextly-*.tgz -C /tmp/pack-check
+          if ! diff -q /tmp/pack-check/package/dist/index.mjs \
+                       node_modules/nextly/dist/index.mjs > /dev/null; then
+            echo "installed nextly does NOT match the packed workspace build"
+            echo "the install fell through to a published copy; this leg would test the last release"
+            exit 1
+          fi
+          echo "installed nextly matches the packed workspace build"
+
+          # The generated manifest has to be exactly what the CLI wrote. What this replaces
+          # rewrote it, and every version of that rewrite widened the app's dependency graph:
+          # an import the generator deliberately never declares would then compile here and fail
+          # in a real project. Asserting the manifest is untouched is what keeps these legs a
+          # test of the dependency boundary rather than of a boundary CI invented.
+          node -e "
+            const manifest = require('/tmp/scaffold-build/scaffolded-app/package.json');
+            const specs = {
+              ...manifest.dependencies,
+              ...manifest.devDependencies,
+              ...manifest.optionalDependencies,
+            };
+            const rewritten = Object.entries(specs)
+              .filter(([, spec]) => String(spec).startsWith('file:'))
+              .map(([name]) => name);
+            if (rewritten.length > 0) {
+              console.error('the manifest carries file: specifiers: ' + rewritten.join(', '));
+              process.exit(1);
+            }
+            if (manifest.pnpm && manifest.pnpm.overrides) {
+              console.error('the manifest carries pnpm.overrides');
+              process.exit(1);
+            }
+            console.log('the generated manifest is unmodified');
+          "
+
+      # `nextly generate:types` writes types and Zod schemas into the project, and
+      # what it writes has to compile there: every import resolving from the
+      # project, the augmented `nextly` module found. Every leg installs this
+      # change's packages, so the generator under review is the one tested,
+      # and before the build, whose type-check then covers the generated files too.
+      - name: Check the generated types and schemas compile
+        shell: bash
+        run: |
+          cd /tmp/scaffold-build/scaffolded-app
+          if [ "${{ matrix.pm }}" = pnpm ]; then
+            NEXTLY_TELEMETRY_DISABLED=1 pnpm exec nextly generate:types
+            pnpm exec tsc --noEmit
+          else
+            NEXTLY_TELEMETRY_DISABLED=1 npx --no-install nextly generate:types
+            npx --no-install tsc --noEmit
+          fi
+          schemas=$(find src -name '*.zod.ts' | wc -l | tr -d ' ')
+          echo "generated Zod schemas: $schemas"
+          # Only a code-first scaffold declares collections in its config, so only
+          # that approach must write a schema. The blank template and the config
+          # create-nextly-app writes into an existing app declare none, and the
+          # visual approach's schema lives in the database: generation has nothing
+          # to write for those, and the compile above is the whole check.
+          if [ "${{ matrix.approach }}" = code-first ]; then
+            [ "$schemas" -gt 0 ] || { echo "generate:types wrote no Zod schema"; exit 1; }
+          fi
+
+      # Only the nightly newest-minor run sets the input (see `on.workflow_call`).
+      # The specs are passed through the environment, and the caller checks
+      # their shape, so nothing from them is read as shell syntax.
+      - name: Install the newest Next.js and React minors
+        if: inputs.versions
+        shell: bash
+        env:
+          VERSIONS: ${{ inputs.versions }}
+        run: |
+          cd /tmp/scaffold-build/scaffolded-app
+          read -ra specs <<< "$VERSIONS"
+          if [ "${{ matrix.pm }}" = pnpm ]; then pnpm add "${specs[@]}"; else npm install "${specs[@]}"; fi
+
+      # A template's `build` script runs `nextly migrate` first. Nextly joins an existing app
+      # without touching its scripts, so that leg runs the step the installation guide gives
+      # an existing app before its build: neither `next build` nor a production start creates
+      # a table, and a production start refuses a database `nextly migrate` has not set up.
+      - name: Build the scaffolded project
+        shell: bash
+        run: |
+          cd /tmp/scaffold-build/scaffolded-app
+          if [ "${{ matrix.existing }}" = "create-next-app" ]; then
+            NEXTLY_TELEMETRY_DISABLED=1 npx --no-install nextly migrate
+          fi
+          npm run build
+
+      # `next build` exiting 0 is the assertion, and this is the check that it did the
+      # work rather than short-circuiting: a build that produced no output would
+      # otherwise pass on its exit code alone.
+      - name: Check the build produced output
+        shell: bash
+        run: |
+          cd /tmp/scaffold-build/scaffolded-app
+          test -d .next || { echo "no .next: the build produced nothing"; exit 1; }
+
+          # Every app this CLI makes or joins runs with Cache Components and Partial
+          # Prefetching on, with Nextly's cache handlers. Read from the config Next.js
+          # resolved for the build, rather than from next.config's text, so a setting the
+          # file spells but Next.js never received fails here.
+          node -e '
+            const { config } = require("./.next/required-server-files.json");
+            const problems = [];
+            if (config.cacheComponents !== true) problems.push("cacheComponents is not on");
+            if (config.partialPrefetching !== true) problems.push("partialPrefetching is not on");
+            if (!/[\\/]nextly[\\/]dist[\\/]cache-handler\.mjs$/.test(config.cacheHandler ?? ""))
+              problems.push("cacheHandler is not Nextly'"'"'s: " + config.cacheHandler);
+            if (config.cacheMaxMemorySize !== 0) problems.push("cacheMaxMemorySize is not 0");
+            if (!/[\\/]nextly[\\/]dist[\\/]cache-handlers\.mjs$/.test(config.cacheHandlers?.default ?? ""))
+              problems.push("cacheHandlers.default is not Nextly'"'"'s: " + config.cacheHandlers?.default);
+            if (problems.length > 0) {
+              console.error("the build did not run with Nextly'"'"'s settings:\n- " + problems.join("\n- "));
+              process.exit(1);
+            }
+            console.log("the build ran with Cache Components and Partial Prefetching on, and Nextly'"'"'s cache handlers");
+          '
+
+          # Nothing may have been fetched from Google at build time. Asserted on the
+          # OUTPUT rather than on the log: Next emits these modules only when the
+          # `next/font/google` loader actually runs, so their absence is structural.
+          # Not on the existing-app leg: there the font is create-next-app's own layout,
+          # which is the user's code, not anything Nextly wrote.
+          if [ -z "${{ matrix.existing }}" ] && grep -rq "internal/font/google" .next; then
+            echo "the build ran the Google font loader, which needs the network"
+            exit 1
+          fi
+
+      # The step below writes categories, tags and posts into the scaffold's database, and
+      # the Cache Components check after it first serves an EMPTY one, so the database the
+      # build left is kept here, while no server holds it, for that check to put back.
+      - name: Keep the empty database for the Cache Components check
+        if: matrix.serveChecks == 'on'
+        shell: bash
+        run: |
+          cd /tmp/scaffold-build/scaffolded-app
+          url=$(grep -E '^DATABASE_URL=' .env | head -1 | cut -d= -f2- | tr -d "\"'")
+          db=${url#file:}
+          [ -f "$db" ] || { echo "no SQLite database at $db (DATABASE_URL=$url)"; exit 1; }
+          mkdir -p /tmp/blog-empty-db
+          for f in "$db" "$db-wal" "$db-shm"; do
+            [ -f "$f" ] && cp "$f" /tmp/blog-empty-db/
+          done
+          echo "$db" > /tmp/blog-empty-db/path
+
+      # A fresh blog has no categories or tags, so its build renders no archive page, and
+      # Next.js counted the archive routes as static. The archive pages read `searchParams`
+      # for pagination, which a static render refuses, so every category and tag page
+      # answered 500: an unknown one, and one created after the build. This serves the
+      # build and asks for an archive that does not exist: the not-found page, never a 500.
+      # Then, with the server running, it adds a category, a tag and ten posts in both, as
+      # an editor would after deploying, and asks for each archive's two pages: nine posts
+      # on the first, the tenth on `?page=2`, so the new archives render on request and
+      # read their pagination. It also adds a category and a tag whose slug is the one the
+      # build used as its placeholder, `__none__`, with a post in both: a slug is free text,
+      # so on a request that archive is a real one, and lists its post.
+      - name: Check the blog answers unknown and new categories and tags
+        if: matrix.template == 'blog'
+        shell: bash
+        run: |
+          cd /tmp/scaffold-build/scaffolded-app
+          # With the operator's setup token, as a deployment sets it: the freshness
+          # check below makes its administrator through first-administrator setup.
+          setup_token=scaffold-setup-token-Qx7Vb2Lm9Rt4Wz8Np3Hk6Jd1Fs5Gc0Ya
+          NEXTLY_SETUP_TOKEN=$setup_token PORT=3101 NEXT_TELEMETRY_DISABLED=1 NEXTLY_TELEMETRY_DISABLED=1 npm start > /tmp/blog-start.log 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 60); do
+            curl -s -o /dev/null http://localhost:3101/ && break
+            sleep 1
+          done
+          fetch() {
+            status=$(curl -s -o /tmp/archive.html -w '%{http_code}' "http://localhost:3101$1")
+            echo "$1: $status"
+            case "$status" in
+              200|404) ;;
+              *) tail -40 /tmp/blog-start.log; exit 1 ;;
+            esac
+          }
+          for path in /categories/no-such-category /tags/no-such-tag; do
+            fetch "$path"
+            grep -q 'NEXT_HTTP_ERROR_FALLBACK;404' /tmp/archive.html || {
+              echo "$path did not render the not-found page"
+              exit 1
+            }
+          done
+
+          # Written through nextly's local API, as the site's own code would. The project's
+          # TypeScript loads as CommonJS, and `nextly/config`, which its config imports, is
+          # served only to `import`, so the project is marked as a module while the script
+          # runs, and put back after.
+          mkdir -p scripts
+          cat > scripts/add-after-build.mts <<'TS'
+          import { getNextly } from "nextly";
+
+          import config from "../nextly.config";
+
+          const nextly = await getNextly({ config });
+          const data = { title: "After Build", name: "After Build", slug: "after-build" };
+          const category = await nextly.create({ collection: "categories", data });
+          const tag = await nextly.create({ collection: "tags", data });
+          for (let i = 1; i <= 10; i += 1) {
+            await nextly.create({
+              collection: "posts",
+              data: {
+                title: `After build ${i}`,
+                slug: `after-build-${i}`,
+                excerpt: `Post ${i} written after the build.`,
+                categories: [category.item.id],
+                tags: [tag.item.id],
+                status: "published",
+                publishedAt: new Date(Date.now() - i * 60_000).toISOString(),
+              },
+            });
+          }
+          const named = { title: "None", name: "None", slug: "__none__" };
+          const namedCategory = await nextly.create({ collection: "categories", data: named });
+          const namedTag = await nextly.create({ collection: "tags", data: named });
+          await nextly.create({
+            collection: "posts",
+            data: {
+              title: "In the placeholder's slug",
+              slug: "in-the-placeholder-slug",
+              excerpt: "A post in the archives named __none__.",
+              categories: [namedCategory.item.id],
+              tags: [namedTag.item.id],
+              status: "published",
+              publishedAt: new Date().toISOString(),
+            },
+          });
+          process.exit(0);
+          TS
+          cp package.json /tmp/package.json.bak
+          npm pkg set type=module
+          npx --yes tsx@4.21.0 --env-file=.env scripts/add-after-build.mts
+          cp /tmp/package.json.bak package.json
+
+          for archive in /categories/after-build /tags/after-build; do
+            for page in "" "?page=2"; do
+              fetch "$archive$page"
+              # `|| true`: a page listing none is a count of 0 for the check below, not
+              # a grep failure that ends the step without saying why.
+              listed=$({ grep -o 'href="/blog/after-build-[0-9]*"' /tmp/archive.html || true; } | sort -u | wc -l)
+              expected=9
+              [ -n "$page" ] && expected=1
+              [ "$listed" -eq "$expected" ] || {
+                echo "$archive$page listed $listed posts, expected $expected"
+                tail -40 /tmp/blog-start.log
+                exit 1
+              }
+            done
+          done
+          for archive in /categories/__none__ /tags/__none__; do
+            fetch "$archive"
+            if grep -q 'NEXT_HTTP_ERROR_FALLBACK;404' /tmp/archive.html ||
+              ! grep -q 'href="/blog/in-the-placeholder-slug"' /tmp/archive.html; then
+              echo "$archive did not list its post"
+              tail -40 /tmp/blog-start.log
+              exit 1
+            fi
+          done
+          # The freshness check, on every blog leg: under Cache Components the app's
+          # "use cache" read function and Nextly's cache handlers make the first read
+          # after a write the new version, as without it.
+          # A write through the REST API, a Route Handler, expires the post's cached page
+          # before it responds: the next request, made after the response, reads the new
+          # title. It writes as the site's first administrator, made through the setup
+          # route with the operator's token, as a new site gets one: a fresh database
+          # holds no role or account until then.
+          base=http://localhost:3101
+          owner='{"email":"owner@example.com","password":"Owner-Passw0rd!-check"}'
+          # The auth routes take a double-submitted CSRF token: the cookie the csrf route
+          # sets, and the same value in a header.
+          jar=/tmp/fresh-check-cookies
+          rm -f "$jar"
+          csrf=$(curl -s --max-time 10 -c "$jar" "$base/admin/api/auth/csrf" | jq -r '.token // .data.token // empty')
+          [ -n "$csrf" ] || { echo "the csrf route gave no token"; exit 1; }
+          post_auth() {
+            curl -s --max-time 30 -b "$jar" -c "$jar" -o "$2" -w '%{http_code}' -X POST "$base/admin/api/auth/$1" \
+              -H 'Content-Type: application/json' -H "Origin: $base" -H "x-csrf-token: $csrf" -d "$3"
+          }
+          setup=$(jq -cn --arg t "$setup_token" '{email: "owner@example.com", name: "Owner", password: "Owner-Passw0rd!-check", setupToken: $t}')
+          code=$(post_auth setup /tmp/setup.json "$setup")
+          [ "$code" = 201 ] || { echo "setup answered $code"; cat /tmp/setup.json; exit 1; }
+          code=$(post_auth login /tmp/login.json "$owner")
+          [ "$code" = 200 ] || { echo "login answered $code"; cat /tmp/login.json; exit 1; }
+          # Signed in by the session cookies the login set, as the admin is.
+          api() {
+            curl -s --max-time 30 -b "$jar" -c "$jar" -H "Origin: $base" -H "x-csrf-token: $csrf" "$@"
+          }
+          post=$(api "$base/admin/api/collections/posts/entries?limit=20&depth=0" |
+            jq -c '[.items[]? | select(.status == "published")][0] // empty')
+          [ -n "$post" ] || { echo "the API lists no published post to write to"; exit 1; }
+          id=$(echo "$post" | jq -r '.id'); slug=$(echo "$post" | jq -r '.slug'); old=$(echo "$post" | jq -r '.title')
+          # An update names the version it read, as the admin's own save does.
+          rev=$(echo "$post" | jq -r '._rev // empty')
+          [ -n "$rev" ] || { echo "the API listed the post without its version"; echo "$post"; exit 1; }
+          page="$base/blog/$slug"
+          # Read twice, so the page is in the cache before the write.
+          for _ in 1 2; do
+            curl -sf --max-time 30 -o /tmp/before.html "$page" || { echo "$page did not answer before the write"; exit 1; }
+          done
+          grep -qF "$old" /tmp/before.html || { echo "$page does not show its title \"$old\" before the write"; exit 1; }
+          # The slug is sent unchanged, so the page stays at the URL just read.
+          new="Fresh after the write $(date +%s)"
+          code=$(api -o /tmp/patch.json -w '%{http_code}' -X PATCH "$base/admin/api/collections/posts/entries/$id" \
+            -H 'Content-Type: application/json' -d "$(jq -cn --arg t "$new" --arg s "$slug" --arg r "$rev" '{title: $t, slug: $s, _rev: $r}')")
+          [ "$code" = 200 ] || { echo "the update answered $code"; cat /tmp/patch.json; exit 1; }
+          # One read, in sequence after the response: no retry, since the expiry must
+          # have completed by then.
+          curl -sf --max-time 30 -o /tmp/after.html "$page" || { echo "$page did not answer after the write"; exit 1; }
+          if ! grep -qF "$new" /tmp/after.html; then
+            grep -qF "$old" /tmp/after.html && echo "$page still shows the title \"$old\" after the update to \"$new\" responded"
+            echo "$page does not show the updated title \"$new\""
+            exit 1
+          fi
+          echo "$page shows \"$new\" on the first read after the write"
+
+      # Under Cache Components every route streams a static shell, so a browser's first request
+      # for an unknown slug is answered with the not-found page and `noindex` before its status
+      # can change, and Next.js stores that render: every later request gets 404. Asked
+      # per detail route, as a browser and as a crawler, each with a slug of its own.
+      #
+      # A crawler in `htmlLimitedBots` (Googlebot here) is rendered afresh on every request and
+      # nothing is stored for it, and the blog's detail pages sit under the frontend's
+      # `loading.tsx` boundary, so their not-found always arrives after the response started.
+      # Next.js documents that case in its streaming guide (Status codes): "If a `notFound()`
+      # fires mid-stream, Next.js cannot go back and change the status to `404`. Instead, it
+      # injects `<meta name="robots" content="noindex">` into the streamed HTML so that search
+      # engines don't index the page." So a crawler is held to that, on its first request and
+      # on each later one: a 200 that carries the not-found page and `noindex`, never an
+      # indexable 200. A true 404 for it needs the not-found raised before that boundary.
+      #
+      # Then the demo content goes in through nextly's local API, as the template's seed
+      # route does, and the app is built again from a clean `.next`, as a fresh deploy
+      # would be: the build cache keeps the first build's cached reads, so reusing it
+      # would build from the empty database's answers. The seeded build is served and a
+      # page of each kind, taken from its sitemap, must answer 200. Both serves fail on
+      # Next.js reporting uncached data or the clock read too early.
+      - name: Check the blog under Cache Components
+        if: matrix.serveChecks == 'on'
+        shell: bash
+        run: |
+          cd /tmp/scaffold-build/scaffolded-app
+          # In a session of its own, so `stop` ends npm and the `next start` it runs
+          # together: signalling npm alone leaves Next.js holding the port, and the
+          # next serve would be answered by the server it was meant to replace.
+          server=""
+          serve() {
+            PORT=3102 NEXT_TELEMETRY_DISABLED=1 NEXTLY_TELEMETRY_DISABLED=1 setsid npm start > "$1" 2>&1 &
+            server=$!
+            for _ in $(seq 1 60); do
+              curl -s -o /dev/null http://localhost:3102/api/health && return 0
+              sleep 1
+            done
+            echo "the app did not start"; tail -40 "$1"; exit 1
+          }
+          stop() {
+            [ -n "$server" ] || return 0
+            kill -- -"$server" 2>/dev/null || true
+            wait "$server" 2>/dev/null || true
+            server=""
+            # curl exits non-zero once nothing listens on the port.
+            for _ in $(seq 1 30); do
+              curl -s -o /dev/null http://localhost:3102/ || return 0
+              sleep 1
+            done
+            echo "port 3102 still answers after the server was stopped"; exit 1
+          }
+          trap stop EXIT
+          clean_log() {
+            if grep -nE 'uncached or runtime data|unstable value' "$1"; then
+              tail -60 "$1"; exit 1
+            fi
+          }
+          crawler='Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+          browser='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130.0 Safari/537.36'
+
+          # The database the build left, from before the step above added content.
+          db=$(cat /tmp/blog-empty-db/path)
+          rm -f "$db" "$db-wal" "$db-shm"
+          for f in /tmp/blog-empty-db/*; do
+            case "$f" in */path) ;; *) cp "$f" "$(dirname "$db")/" ;; esac
+          done
+          cmp "$db" "/tmp/blog-empty-db/$(basename "$db")" || { echo "the empty database was not put back"; exit 1; }
+
+          serve /tmp/blog-cc-empty.log
+          for route in /blog /authors /categories /tags; do
+            for agent in browser crawler; do
+              ua=$browser
+              [ "$agent" = crawler ] && ua=$crawler
+              path="$route/no-such-$agent"
+              if [ "$agent" = crawler ]; then
+                # Three requests, a moment apart, each judged whole: a regression to an
+                # indexable 200 fails on whichever request it shows up in.
+                for ask in first second third; do
+                  status=$(curl -s -A "$ua" -o /tmp/unknown.html -w '%{http_code}' "http://localhost:3102$path")
+                  echo "$agent $path, $ask: $status"
+                  if [ "$status" != 200 ] || ! grep -q '<meta name="robots" content="noindex' /tmp/unknown.html ||
+                    ! grep -q 'NEXT_HTTP_ERROR_FALLBACK;404' /tmp/unknown.html; then
+                    echo "$path did not answer the crawler's $ask request with the not-found page and noindex"
+                    tail -40 /tmp/blog-cc-empty.log; exit 1
+                  fi
+                  sleep 2
+                done
+                continue
+              fi
+              status=$(curl -s -A "$ua" -o /tmp/unknown.html -w '%{http_code}' "http://localhost:3102$path")
+              echo "$agent $path, first: $status"
+              if [ "$status" != 200 ] || ! grep -q 'noindex' /tmp/unknown.html ||
+                ! grep -q 'NEXT_HTTP_ERROR_FALLBACK;404' /tmp/unknown.html; then
+                echo "$path did not answer the not-found page with noindex"
+                tail -40 /tmp/blog-cc-empty.log; exit 1
+              fi
+              # Stored once the first response finishes, so a moment may pass.
+              status=""
+              for _ in 1 2 3 4 5; do
+                status=$(curl -s -A "$ua" -o /dev/null -w '%{http_code}' "http://localhost:3102$path")
+                [ "$status" = 404 ] && break
+                sleep 1
+              done
+              echo "$agent $path, later: $status"
+              [ "$status" = 404 ] || { echo "$path never answered 404"; exit 1; }
+            done
+          done
+          stop
+          clean_log /tmp/blog-cc-empty.log
+
+          # Inside the app, since it imports `nextly` and the app's own config, which
+          # resolve from the script's folder. A file the scaffold already has at
+          # that path is refused rather than replaced, so the check never runs a
+          # substitute in place of the app's own file.
+          mkdir -p scripts
+          if [ -e scripts/seed-for-check.mts ]; then
+            echo "the scaffold already has scripts/seed-for-check.mts"; exit 1
+          fi
+          set -o noclobber
+          cat > scripts/seed-for-check.mts <<'TS'
+          import { getNextly } from "nextly";
+
+          import config from "../nextly.config";
+          import { seed } from "../src/endpoints/seed";
+
+          const nextly = await getNextly({ config });
+          const result = await seed({ nextly, config });
+          console.log(JSON.stringify(result.summary));
+          process.exit(0);
+          TS
+          set +o noclobber
+          cp package.json /tmp/package.json.bak
+          npm pkg set type=module
+          npx --yes tsx@4.21.0 --env-file=.env scripts/seed-for-check.mts
+          cp /tmp/package.json.bak package.json
+
+          rm -rf .next
+          npm run build
+
+          serve /tmp/blog-cc-seeded.log
+          curl -sf -o /tmp/sitemap.xml http://localhost:3102/sitemap.xml
+          pages="/ /blog /feed.xml"
+          for kind in blog authors categories tags; do
+            url=$(grep -o "<loc>[^<]*/$kind/[^<]*</loc>" /tmp/sitemap.xml | head -1 | sed -E 's#</?loc>##g')
+            [ -n "$url" ] || { echo "the sitemap lists no /$kind/ page"; cat /tmp/sitemap.xml; exit 1; }
+            pages="$pages /${url#*://*/}"
+          done
+          for page in $pages; do
+            status=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:3102$page")
+            echo "$page: $status"
+            [ "$status" = 200 ] || { tail -40 /tmp/blog-cc-seeded.log; exit 1; }
+          done
+          stop
+          clean_log /tmp/blog-cc-seeded.log
+
+      # A build proves the app compiles; this proves it serves. The existing-app installer
+      # writes the routes, the instrumentation hook and the config Nextly starts from, so the
+      # health route answering with a connected database is Nextly running in the user's
+      # app, and the admin's setup page loading is its admin mounted there. The log must not
+      # carry Nextly's start-time warning about Cache Components being off: the config this
+      # app ended with has it on.
+      - name: Boot the existing app and reach Nextly
+        if: matrix.existing == 'create-next-app'
+        shell: bash
+        run: |
+          cd /tmp/scaffold-build/scaffolded-app
+          PORT=3100 NEXT_TELEMETRY_DISABLED=1 NEXTLY_TELEMETRY_DISABLED=1 npm start > /tmp/existing-app-start.log 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          health=""
+          for _ in $(seq 1 60); do
+            health=$(curl -sf http://localhost:3100/api/health || true)
+            [ -n "$health" ] && break
+            sleep 1
+          done
+          echo "health: $health"
+          echo "$health" | node -e '
+            let d = "";
+            process.stdin.on("data", c => (d += c)).on("end", () => {
+              const body = JSON.parse(d || "{}");
+              if (body.ok !== true || body.database?.connected !== true) {
+                console.error("Nextly did not report healthy with a connected database");
+                process.exit(1);
+              }
+            });
+          ' || { tail -40 /tmp/existing-app-start.log; exit 1; }
+          status=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3100/admin/setup)
+          echo "admin setup page: $status"
+          [ "$status" = 200 ] || { tail -40 /tmp/existing-app-start.log; exit 1; }
+          if grep -q "Nextly supports only Cache Components and Partial Prefetching on" /tmp/existing-app-start.log; then
+            echo "Nextly warned that Cache Components is off in an app whose config has it on"
+            exit 1
+          fi
+
+      # The blog template ships a search page whose index is built after `next build`. Two
+      # separate questions, because one green can hide the other:
+      #
+      #  - is Pagefind DECLARED by the generated project? `npx -y pagefind` downloads on
+      #    demand, so the index appearing proves only that the network worked. Dropping
+      #    pagefind from the generated manifest leaves every artifact assertion passing while
+      #    an offline or locked-down install has nothing to run.
+      #  - can the index actually be PRODUCED? A fresh scaffold has no posts, so the real
+      #    build correctly indexes nothing and writes no bundle — meaning the success path
+      #    ships untested unless something gives it a page to read. The fixture below is that
+      #    positive control: without it this job asserts only that the empty case is handled.
+      - name: Check the blog can build its search index
+        if: matrix.template == 'blog'
+        shell: bash
+        run: |
+          cd /tmp/scaffold-build/scaffolded-app
+          node -e '
+            const pkg = require("./package.json");
+            const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+            if (!deps.pagefind) {
+              console.error("the generated project does not declare pagefind");
+              process.exit(1);
+            }
+            console.log("pagefind declared:", deps.pagefind);
+          '
+
+          # A page where the build puts posts, so the glob is exercised against the layout
+          # `next build` really produces rather than an assumed one.
+          test -d .next/server/app || { echo "no build output to place a fixture in"; exit 1; }
+          mkdir -p .next/server/app/blog
+          cat > .next/server/app/blog/ci-fixture.html <<'HTML'
+          <!doctype html><html lang="en"><body><main><h1>Indexable fixture</h1>
+          <p>Content that the search index must contain after this run.</p></main></body></html>
+          HTML
+
+          npm run search:index
+
+          test -f public/pagefind/pagefind.js || {
+            echo "the search index step reported success but wrote no bundle"
+            exit 1
+          }
+
+      # Installing once is not the whole of a package manager's job. Shipping
+      # `pnpm-workspace.yaml` for the build allowlist makes the project a workspace ROOT on
+      # pnpm 9, and pnpm refuses `pnpm add` into a workspace root without `-w`
+      # (ERR_PNPM_ADDING_TO_ROOT) — so a scaffold can install cleanly and still refuse the
+      # first thing a user does with it. Text assertions over the generated config cannot
+      # see that; only running the command can.
+      - name: Check the scaffold accepts a new dependency
+        if: matrix.pm == 'pnpm'
+        shell: bash
+        run: |
+          cd /tmp/scaffold-build/scaffolded-app
+          pnpm add is-odd --ignore-scripts
+          # `pnpm add` exiting 0 is the assertion; this is the control that it did the work.
+          # A version that resolved to nothing, or an add that no-opped, would otherwise pass
+          # on the exit code alone.
+          node -e '
+            const deps = require("./package.json").dependencies || {};
+            if (!deps["is-odd"]) { console.error("pnpm add exited 0 but added nothing"); process.exit(1); }
+            console.log("added is-odd", deps["is-odd"]);
+          '

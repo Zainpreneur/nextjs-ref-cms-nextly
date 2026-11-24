@@ -1,0 +1,327 @@
+/**
+ * Runtime entry — `nextly/runtime`
+ *
+ * This subpath aggregates everything that runs **inside a Next.js
+ * request lifecycle** and therefore is allowed to (transitively)
+ * import `next/navigation`, `next/cache`, `next/headers`, etc.
+ *
+ * The package's root entry (`nextly`) deliberately does NOT
+ * re-export from here. That keeps the root Node-safe so:
+ *   - The CLI can load user configs without dragging Next.js in.
+ *   - Plugin authors can `import { defineCollection } from "nextly"`
+ *     in their own packages without pulling `next/*` into a module
+ *     graph that gets bundled for the browser.
+ *
+ * The distinction is what an import PULLS IN, not what a package
+ * manager installs. `next` is the one peer dependency this package
+ * does not mark optional, so a consumer resolves it whichever subpath
+ * they import; choosing the root does not avoid it. What the root
+ * avoids is Next.js appearing in a graph that has no request
+ * lifecycle to run inside.
+ *
+ * Templates wire the catch-all admin route from this subpath:
+ *
+ * ```ts
+ * // src/app/admin/[[...params]]/route.ts (or app router catch-all)
+ * import { createDynamicHandlers } from "nextly/runtime";
+ * export const { GET, POST, PATCH, DELETE } = createDynamicHandlers();
+ * ```
+ *
+ * Industry alignment: this mirrors how Payload separates
+ * `@payloadcms/next` (runtime) from `payload` (core), and how tRPC
+ * isolates Next.js code under `@trpc/server/adapters/next-app-dir`.
+ */
+
+export {
+  bumpSchemaVersion,
+  createDynamicHandlers,
+  getCollectionsHandler,
+  getCollectionsService,
+} from "./routeHandler";
+
+// F1 cache revalidation — the Next adapter + read-side tagging helpers. Safe to
+// import here: this subpath is already Next-coupled. The write-side adapter
+// resolves `next/cache` lazily, so importing these never forces `next` at load.
+export {
+  NextCacheRevalidator,
+  registerNextCacheRevalidator,
+  nextlyTags,
+  nextlySingleTags,
+  nextlySiteSettingsTags,
+  entryIdTag,
+  cachedFind,
+  // Whether the app registered its `"use cache"` read function, for a
+  // component that must refuse to read through `unstable_cache` under Cache
+  // Components, where a miss fails the prerender.
+  cachedReadRegistered,
+  registerCachedRead,
+  runRegisteredRead,
+  type CachedRead,
+  releaseBoundedRevalidate,
+  type NextCacheModule,
+  type CachedFindOptions,
+} from "./runtime/cache";
+// Whether a value says Cache Components is on, for code an app bundles: it
+// reads `process.env.__NEXT_CACHE_COMPONENTS`, which Next.js inlines there,
+// and asks this the question nextly itself asks of that value.
+export { cacheComponentsEnabled } from "./cache-components";
+
+// SEO bridge — map the plugin's `seo` field group to a Next `Metadata` object.
+// The `next` import is type-only, so this never forces `next` at load.
+export {
+  buildMetadata,
+  type BuildMetadataOptions,
+  type MetadataEntry,
+  type SeoMetaInput,
+} from "./runtime/seo";
+
+// @experimental Structured data placed in a page: the props of the JSON-LD
+// script element, `<script {...jsonLdScriptProps(data)} />`, escaped so no
+// value can end it.
+export { jsonLdScriptProps, type JsonLdScriptProps } from "./runtime/seo";
+
+// The page-metadata contract: what a plugin that works out a page's head is
+// asked and answers. The route helpers ask it by default; see
+// `runtime/seo/page-metadata-contract`.
+export {
+  PAGE_METADATA_CAPABILITY,
+  PAGE_METADATA_SERVICE,
+  type PageMetadataAnswer,
+  type PageMetadataImage,
+  type PageImagePreview,
+  type PageMetadataInput,
+  type PageMetadataResolver,
+  type PageMetadataSource,
+  type PageMetadataValues,
+  type PageListItem,
+  type PageQuestion,
+  type PageRobots,
+  type PageStructuredDataHints,
+  type StructuredDataNode,
+  type StructuredDataValue,
+} from "./runtime/seo";
+
+// Whether a failure means Nextly is unavailable, and what a page render does
+// about it: in production it fails rather than serving the page without what
+// Nextly gives it (the page's SEO head, say). The route helpers' head follows
+// it; a route asking Nextly for its page itself can too. `@experimental`.
+export {
+  failRenderWhenUnavailable,
+  isNextlyUnavailable,
+} from "./errors/unavailable";
+
+// Draft previews — the route that turns a scoped preview link into a draft
+// session, and the reader a read path asks what that session may see. `next` is
+// not imported at all: the caller passes `draftMode` and `cookies` in, which
+// also keeps both testable without a request.
+export {
+  PREVIEW_SCOPE_COOKIE,
+  createPreviewRoute,
+  readPreviewScope,
+  readPreviewSession,
+  previewGrantsDraft,
+  type PreviewRouteConfig,
+  type PreviewScopeReaderConfig,
+} from "./runtime/preview/preview-route";
+
+// The JOIN between the two above: a `draft` hook that grants exactly what the
+// request's token covers. Exported because the join is security-critical and
+// short, which is the combination that gets retyped subtly wrong — and its
+// failure grants every draft rather than erroring.
+export { previewDraftGate } from "./runtime/preview/preview-draft-gate";
+
+// The site's Proxy: the app's `proxy.ts` hands each request to the handlers
+// plugins contribute (`contributes.proxy`).
+export { createNextlyProxy, type NextlyProxyDeps } from "./runtime/proxy";
+
+// The Single counterpart. A sibling rather than a branch: a collection gate
+// returns an entry id so the route can compare it against the row a PATH
+// resolved to, while a Single has no path and no id — its slug is its identity —
+// so its gate settles the question and answers a boolean.
+export { previewSingleDraftGate } from "./runtime/preview/preview-single-draft-gate";
+export type { PreviewSingleDraftGateConfig } from "./runtime/preview/preview-single-draft-gate";
+export type {
+  PreviewDraftGateConfig,
+  DraftGateRequest,
+} from "./runtime/preview/preview-draft-gate";
+
+// Content routing + sitemap/robots delivery. `next`/`react` are type-only and
+// `next/navigation` resolves lazily, so importing these never forces them.
+// `requireNextly` is the default a content route falls back to when
+// `ContentRouteConfig.nextly` names no reader, and a helper built ON such a
+// route needs the instance the route reads through. It is exported so the
+// helper can reach it the same way, rather than the route handing a reader to
+// every callback in order to share one.
+//
+// It reads the registered singleton and throws when there is none, so it says
+// so in its name. It used to be exported here as `getNextly`, which is also the
+// name `nextly` exports for a function that initialises, takes required config
+// and returns a promise — two different functions, one name, opposite tolerance
+// for an uninitialised process.
+//
+// Worth knowing before reaching for it: where the route was given an explicit
+// `nextly` reader, as a per-tenant setup must, this resolves the GLOBAL
+// singleton and not that reader. Pass the reader for those.
+export { requireNextly } from "./direct-api/nextly";
+
+// The reader a published page's lists read through: published entries and
+// public fields only, whatever the list asks. `@experimental` until the page
+// builder's data lists ship on it.
+export {
+  createPublicReader,
+  toPublicFind,
+  toPublicFindSingle,
+  PUBLIC_FILTER_OPS,
+} from "./runtime/routing/public-reader";
+export type {
+  PublicCountQuery,
+  PublicFilter,
+  PublicFilterOp,
+  PublicReader,
+  PublicReaderBinding,
+  PublicReaderDeclarations,
+  PublicReaderSource,
+  PublicReadQuery,
+  PublicReadResult,
+  PublicSingleQuery,
+  PublicSingleResult,
+  PublicSource,
+  PublicSourceReader,
+} from "./runtime/routing/public-reader";
+
+// Whether a failed read was refused by access, which a route built on the
+// public reader answers as not found, as nextly's own routes do; and the wait
+// for the request that an enforced, uncached read takes first, so a prerender
+// never mistakes it for build-time work. `@experimental` with the public
+// reader.
+export { isReadRefusal } from "./runtime/routing/miss-or-denied";
+export { deferToRequest } from "./runtime/routing/defer-to-request";
+// Whether the request is in Next's draft mode, the one check a public content
+// route asks before its draft gate. `@experimental` with the content routes.
+export { isDraftModeRequest } from "./runtime/routing/draft-mode";
+
+// The frame a page builder named query's `run` executes in: inside it, the
+// Direct API refuses every call, and only the reader handed to the query
+// reads, through the frame's door. `@experimental` with named queries.
+export {
+  openNamedQueryFrame,
+  type NamedQueryFrame,
+} from "./auth/named-query-scope";
+
+// The reader a page builder's canvas reads the same lists with: the same
+// queries, read as the person editing, drafts included. `@experimental` with
+// the public reader.
+export {
+  createEditorReader,
+  toEditorFind,
+  toEditorFindById,
+  toEditorFindSingle,
+} from "./runtime/routing/editor-reader";
+export type {
+  EditorByIdQuery,
+  EditorReaderPerson,
+  EditorReaderSource,
+  EditorSourceReader,
+} from "./runtime/routing/editor-reader";
+
+// What a binding on a published page reads besides a list, `@experimental`
+// with the reader: the site settings through their public allowlist (a write
+// to them expires `nextlySiteSettingsTags()`), read from the instance a page
+// is served by when one is given (`PublicSiteSettingsSource`), and the field
+// shapes a binding is checked against, as the anonymous visitor may read
+// them. Both load the service container inside the call, so importing this
+// entry loads neither.
+export {
+  readPublicSiteSettings,
+  type PublicSiteSettings,
+  type PublicSiteSettingsSource,
+} from "./runtime/site-settings-read";
+// And the same fields as declared, whoever may read them: what a save judges
+// a binding against, since binding a field the public may not read is allowed.
+export {
+  bindingFieldShapes,
+  declaredFieldShapes,
+  type BindingFieldShape,
+  type BindingFieldShapesOptions,
+  type BindingSourceRef,
+} from "./runtime/routing/binding-field-shapes";
+
+export {
+  resolveContent,
+  isReservedPath,
+  contentPageMetadata,
+  contentPageStructuredData,
+  singlePageMetadata,
+  singlePageStructuredData,
+  createContentRoute,
+  createPublicContentRoute,
+  createSingleRoute,
+  createPublicSingleRoute,
+  slugToStaticParam,
+  LIST_PAGE_SEGMENT,
+  listPageNumber,
+  listPageOf,
+  slugToPath,
+  nextlySitemap,
+  nextlyRobots,
+  confirmedLanguage,
+  requestLanguage,
+  servedAddress,
+  type RequestLanguage,
+  type ContentEntry,
+  type ResolveContentOptions,
+  type ContentRoute,
+  type StaticContentRoute,
+  type ContentRouteArgs,
+  type ContentRouteParams,
+  type ContentStaticParamsArgs,
+  type ContentRouteConfig,
+  type RenderContext,
+  type NextlyContentReader,
+  type SingleRoute,
+  type SingleRouteArgs,
+  type SingleRouteParams,
+  type SinglePageAnswerConfig,
+  type SingleRouteConfig,
+  type SingleContext,
+  type SingleDraftRequest,
+  type SingleDocument,
+  type NextlySingleReader,
+  type ResolvedContext,
+  type NextlySitemapEntry,
+  type NextlySitemapOptions,
+  type NextlyRobotsOptions,
+} from "./runtime/routing";
+
+// @experimental How each language's address is formed, as the site declares
+// it (`languageAddresses`), for a page's links to its other languages.
+export {
+  languageAddressOf,
+  type LanguageAddress,
+  type LanguageAddressRule,
+} from "./domains/i18n/language-addresses";
+
+// @experimental Keeps the app's generated component map up to date in
+// development. Call it from the admin's server layout, with the list the map's
+// strings-only companion exports:
+//
+//   import { checkAdminComponents } from "nextly/runtime";
+//   import { registeredComponentPaths } from "../../../types/generated/plugin-admin-components.generated";
+//   import config from "../../../../nextly.config";
+//
+//   export default async function AdminLayout({ children }) {
+//     await checkAdminComponents({ config, registeredComponentPaths });
+//     return children;
+//   }
+//
+// In development a map that is out of date is written again, or warned about
+// where it cannot be; in production it does nothing. It never refuses the
+// admin: a widget whose component is missing draws its card's error state, and
+// `nextly generate:types --check` holds the committed map to the config in CI.
+// Here rather than on
+// `nextly/next`: that entry is client-safe, and the check reads the boot's
+// plugins and writes files, which only a request on the server may do.
+export {
+  checkAdminComponents,
+  type AdminComponentCheckInput,
+} from "./domains/widgets/declaration/component-map-check";

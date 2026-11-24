@@ -1,0 +1,267 @@
+/**
+ * Define Config Helper
+ *
+ * Provides the `defineConfig()` function for creating the main Nextly
+ * configuration file. This is the primary API for aggregating collections,
+ * singles, and configuring TypeScript/database output paths.
+ *
+ * Type definitions and the pure sanitization step live in
+ * `src/shared/types/config.ts`. This file keeps the validation that throws
+ * (user-field constraints, localization, workflows) and re-exports the types
+ * for backwards compatibility. The rules across entities (one slug each, one
+ * table per field group, one Single per address, no cycle among field groups)
+ * are judged where the configuration is loaded or the site starts
+ * with every other problem in it.
+ *
+ * @module collections/config/define-config
+ * @since 1.0.0
+ *
+ * @example
+ * ```typescript
+ * // nextly.config.ts
+ * import { defineConfig } from '@nextly/core';
+ * import Posts from './src/collections/posts';
+ * import Users from './src/collections/users';
+ * import Media from './src/collections/media';
+ * import SiteSettings from './src/singles/site-settings';
+ *
+ * export default defineConfig({
+ *   collections: [Posts, Users, Media],
+ *   singles: [SiteSettings],
+ *   typescript: {
+ *     outputFile: './src/types/nextly-types.ts',
+ *   },
+ * });
+ * ```
+ */
+
+import { unknownPresetSlugs } from "../../auth/preset-reach";
+import { PRESET_ROLE_SLUGS } from "../../auth/role-presets";
+import { validateLocalizationConfig } from "../../domains/i18n/config/validate";
+import { validateLanguageAddressRule } from "../../domains/i18n/language-addresses";
+import { workflowAttachmentsOf } from "../../domains/workflows/attachments";
+import { NextlyError } from "../../errors/nextly-error";
+import type {
+  DeclaredWidgetsRecord,
+  WidgetsOfPlugins,
+} from "../../plugins/declared-widgets";
+import type { PluginDefinition } from "../../plugins/plugin-context";
+import { assertNoLegacyFieldGroupKey } from "../../shared/legacy-field-group-key";
+import {
+  sanitizeConfig,
+  type NextlyConfig,
+  type SanitizedNextlyConfig,
+} from "../../shared/types/config";
+import { assertValidUserConfig } from "../../users/config/validate-user-config";
+
+// Re-export config types so existing importers (`from "./define-config"`)
+// keep working after the types moved to `src/shared/types/config.ts`.
+export type {
+  AdminBrandingColors,
+  AdminBrandingConfig,
+  AdminConfig,
+  ApiKeysConfig,
+  DatabaseConfig,
+  ExperimentalConfig,
+  NextlyConfig,
+  PluginOverride,
+  RateLimitingConfig,
+  SanitizedApiKeysConfig,
+  SanitizedNextlyConfig,
+  SanitizedRateLimitingConfig,
+  SecurityConfig,
+  TypeScriptConfig,
+} from "../../shared/types/config";
+
+// Re-export sanitizeConfig for callers that want to sanitize without validating.
+export { sanitizeConfig } from "../../shared/types/config";
+
+// ============================================================
+// defineConfig Function
+// ============================================================
+
+/**
+ * Refuses a `presetGrants` entry naming something that is not a preset role:
+ * a misspelt `"editors"` would leave the collection closed to the editors it
+ * was meant to open it to, and nothing would say so.
+ */
+function assertValidPresetGrants(
+  presetGrants: NextlyConfig["presetGrants"]
+): void {
+  const errors = Object.entries(presetGrants ?? {}).flatMap(
+    ([slug, presets]) => {
+      const unknown = Array.isArray(presets)
+        ? unknownPresetSlugs(presets)
+        : [String(presets)];
+      return unknown.length === 0
+        ? []
+        : [
+            {
+              path: `presetGrants.${slug}`,
+              code: "GRANTS_PRESETS_INVALID",
+              message: `presetGrants.${slug} names ${unknown.map(u => `"${u}"`).join(", ")}, which is not a preset role. The preset roles are ${PRESET_ROLE_SLUGS.join(", ")}.`,
+            },
+          ];
+    }
+  );
+  if (errors.length > 0) {
+    throw NextlyError.validation({
+      errors,
+      logContext: { presetGrants: errors.map(e => e.path) },
+    });
+  }
+}
+
+/**
+ * Validate a raw Nextly configuration.
+ *
+ * Judges user-field constraints, localization and workflows, and throws on a
+ * failure. The rules across entities are not judged here (see the module note).
+ */
+function validateNextlyConfig(config: NextlyConfig): void {
+  // The rules across entities (one slug each, one table per field group, one Single per address,
+  // no cycle among field groups) are judged with every other problem where the configuration is
+  // loaded or started (`crossEntityProblems`), not here: a throw here, while the configuration
+  // file is imported, would stop before them.
+  assertNoLegacyFieldGroupKey(config, "defineConfig");
+
+  if (config.users) {
+    // Plugin field types this config declares for the users surface, with the
+    // storage each declares. Config is validated here at definition time,
+    // before boot registers plugin field types into the global registry, so
+    // the users validator accepts these directly rather than rejecting a valid
+    // code-defined plugin user field, and reads a field's storage from here.
+    const configUsersTypes = new Map(
+      (config.plugins ?? [])
+        .flatMap(plugin => plugin.contributes?.fieldTypes ?? [])
+        .filter(fieldType =>
+          (fieldType.surfaces ?? ["entries"]).includes("users")
+        )
+        .map(fieldType => [fieldType.type, fieldType.storage] as const)
+    );
+    assertValidUserConfig(config.users, configUsersTypes);
+  }
+
+  assertValidPresetGrants(config.presetGrants);
+
+  if (config.languageAddresses !== undefined) {
+    validateLanguageAddressRule(config.languageAddresses, config.localization);
+  }
+
+  if (config.localization) {
+    validateLocalizationConfig(config.localization);
+  } else {
+    // Fail fast: a collection/single that declares localization (at the entity or
+    // field level) requires an app-level `localization` config. Without it,
+    // migrations would still move fields into companion tables while the runtime
+    // read/write services have no locale config to populate or split them, so the
+    // localized entity would silently break instead of failing at config time.
+    const localizedSlug = findLocalizedEntitySlug(config);
+    if (localizedSlug) {
+      throw new Error(
+        `Entity '${localizedSlug}' (collection/single/component) declares localized content ` +
+          `but the app has no \`localization\` config. Add a top-level \`localization\` block ` +
+          `(locales + defaultLocale) or remove the \`localized\` flags.`
+      );
+    }
+  }
+
+  // Each attached workflow needs drafts kept beside the live version, and one
+  // slug names one definition. What only the server can judge (a password
+  // field, a component) is checked at boot and in `nextly build`.
+  workflowAttachmentsOf(config);
+}
+
+/** True if any field in the tree opts into localization (`localized: true`). */
+function hasLocalizedField(fields: readonly unknown[] | undefined): boolean {
+  if (!fields) return false;
+  for (const field of fields) {
+    if (field && typeof field === "object") {
+      const rec = field as { localized?: unknown; fields?: unknown };
+      if (rec.localized === true) return true;
+      // Layout fields (row/tabs/collapsible) nest their children under `fields`.
+      if (Array.isArray(rec.fields) && hasLocalizedField(rec.fields))
+        return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The slug of the first collection or single that declares localization — either
+ * at the entity level (`localized: true`) or through a localized field — or null
+ * if none does. Used to reject localized content when the app has no localization
+ * config.
+ */
+function findLocalizedEntitySlug(config: NextlyConfig): string | null {
+  const entities = [
+    ...(config.collections ?? []),
+    ...(config.singles ?? []),
+    // Components localize too — a localized component with no app-level localization config
+    // would route translatable writes to main comp_ columns the localized schema omits.
+    ...(config.fieldGroups ?? []),
+  ];
+  for (const entity of entities) {
+    const rec = entity as {
+      slug?: string;
+      localized?: unknown;
+      fields?: unknown[];
+    };
+    if (rec.localized === true || hasLocalizedField(rec.fields)) {
+      return rec.slug ?? "(unknown)";
+    }
+  }
+  return null;
+}
+
+/**
+ * Define the Nextly configuration for your application.
+ *
+ * This is the main entry point for configuring Nextly. It validates
+ * the configuration, applies sensible defaults via `sanitizeConfig()`,
+ * and returns a fully normalized config object.
+ *
+ * **Validation:**
+ * - Validates user-field constraints, localization and workflows (throws)
+ * - Does NOT judge the rules across entities: duplicate slugs, a field
+ *   group's table collision, two Singles at one address and field groups
+ *   placed in a cycle are reported, with every other problem, where the
+ *   configuration is loaded (every command) or the site starts, which refuse
+ *   it. To judge a configuration, load it with any command that reads its
+ *   entities, such as `nextly migrate:check`, which reports every problem.
+ *
+ * **Defaults Applied (via sanitizeConfig):**
+ * - `collections`: `[]`
+ * - `singles`: `[]`
+ * - `components`: `[]`
+ * - `typescript.outputFile`: `'./src/types/generated/nextly-types.ts'`
+ * - `typescript.declare`: `true`
+ * - `db.schemasDir`: `'./src/db/schemas/collections'`
+ * - `db.migrationsDir`: `'./src/db/migrations'`
+ * - `storage`: `[]`
+ * - `plugins`: `[]`
+ * - `rateLimit`: enabled with defaults (100 read / 30 write per minute)
+ *
+ * @param config - The Nextly configuration object
+ * @returns Normalized configuration with all defaults applied
+ * @throws Error if a rule it judges fails (e.g., an invalid users block)
+ */
+export function defineConfig<
+  // `| []` asks for the list as a tuple, so a plugin typed `any` stays one element rather than
+  // typing the whole list `any[]`; see `WidgetsOfPlugins`.
+  P extends readonly PluginDefinition[] | [] = PluginDefinition[],
+>(
+  config: Omit<NextlyConfig, "plugins"> & { plugins?: P }
+): SanitizedNextlyConfig & DeclaredWidgetsRecord<WidgetsOfPlugins<P>> {
+  // The plugins as their own type `P`, inferred from the list as written, so each keeps its
+  // widgets' types, and the returned type records those widgets for the generated component
+  // map. At run time the config is validated and sanitized as before, its plugins copied into a
+  // fresh array, since `P` may be read-only and the config's own field is not.
+  const { plugins, ...rest } = config;
+  const written: NextlyConfig = {
+    ...rest,
+    ...(plugins === undefined ? {} : { plugins: [...plugins] }),
+  };
+  validateNextlyConfig(written);
+  return sanitizeConfig(written);
+}

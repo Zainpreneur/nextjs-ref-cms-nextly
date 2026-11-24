@@ -1,0 +1,221 @@
+/**
+ * Direct API Type Definitions — Barrel Export
+ *
+ * Re-exports every Direct API type from its domain module so consumers can
+ * import any public type from `./direct-api/types` unchanged. See each domain
+ * module for the full type inventory.
+ *
+ * @packageDocumentation
+ */
+
+export type {
+  // after Tasks 13-21 migrated every in-tree consumer to `ListResult<T>`.
+  ListResult,
+  MutationResult,
+  PaginationMeta,
+  // Legacy Payload-style paginated shape, kept exported for callers that
+  // have not migrated yet but no longer used by the Direct API itself.
+  PaginatedResponse,
+  WhereFilter,
+  QueryOperator,
+  FieldCondition,
+  RichTextOutputFormat,
+  GeneratedTypes,
+  CollectionSlug,
+  SingleSlug,
+  DataFromCollectionSlug,
+  DataFromSingleSlug,
+  InProcessRow,
+  RowFromCollectionSlug,
+  RowFromSingleSlug,
+  UserContext,
+  RequestContext,
+  DirectAPIConfig,
+  PopulateOptions,
+  RunAsPrincipal,
+} from "./shared";
+
+export type {
+  FindArgs,
+  RowReviewState,
+  FindByIDArgs,
+  CreateArgs,
+  UpdateArgs,
+  RewriteFieldArgs,
+  RewriteSingleFieldArgs,
+  PublishArgs,
+  PublishResult,
+  DeleteArgs,
+  CountArgs,
+  GroupArgs,
+  TimeseriesArgs,
+  BulkDeleteArgs,
+  DuplicateArgs,
+  CreateFromSourceArgs,
+  CountResult,
+  GroupResult,
+  TimeseriesResult,
+  DeleteResult,
+  BulkOperationResult,
+} from "./collections";
+
+export type {
+  FindSingleArgs,
+  FoundSingle,
+  UpdateSingleArgs,
+  SingleDefinition,
+  FindSinglesArgs,
+  SingleEntry,
+  SingleListResult,
+} from "./singles";
+
+export type {
+  AuthArgs,
+  LoginArgs,
+  LogoutArgs,
+  RegisterArgs,
+  ChangePasswordArgs,
+  ForgotPasswordArgs,
+  ResetPasswordArgs,
+  VerifyEmailArgs,
+  UnlockArgs,
+  LoginResult,
+  RegisterResult,
+  AuthResult,
+} from "./auth";
+
+export type {
+  FindUsersArgs,
+  FindOneUserArgs,
+  FindUserByIDArgs,
+  CreateUserArgs,
+  UpdateUserArgs,
+  DeleteUserArgs,
+  ListUserIdentitiesArgs,
+  UnlinkIdentityArgs,
+} from "./users";
+
+export type {
+  UploadFileData,
+  UploadMediaArgs,
+  FindMediaArgs,
+  FindMediaByIDArgs,
+  FindMediaByIDsArgs,
+  MediaCopyArgs,
+  MediaCopiesArgs,
+  UpdateMediaArgs,
+  DeleteMediaArgs,
+  BulkDeleteMediaArgs,
+  ListFoldersArgs,
+  CreateFolderArgs,
+} from "./media";
+
+export type {
+  FormsConfig,
+  FindFormsArgs,
+  FindFormBySlugArgs,
+  SubmitFormArgs,
+  SubmitFormResult,
+  FormSubmissionsArgs,
+} from "./forms";
+
+export type {
+  // Slug and data types resolve against the `Config.fieldGroups` map that
+  // `TypeGenerator` emits, so callers narrow to the same field-group slugs the
+  // generated file declares.
+  FieldGroupSlug,
+  DataFromFieldGroupSlug,
+  FieldGroupDefinition,
+  FindFieldGroupsArgs,
+  FindFieldGroupBySlugArgs,
+  CreateFieldGroupArgs,
+  UpdateFieldGroupArgs,
+  DeleteFieldGroupArgs,
+} from "./field-groups";
+
+export type {
+  FindEmailProvidersArgs,
+  FindEmailProviderByIDArgs,
+  CreateEmailProviderArgs,
+  UpdateEmailProviderArgs,
+  DeleteEmailProviderArgs,
+  SetDefaultProviderArgs,
+  TestEmailProviderArgs,
+  FindEmailTemplatesArgs,
+  FindEmailTemplateByIDArgs,
+  FindEmailTemplateBySlugArgs,
+  CreateEmailTemplateArgs,
+  UpdateEmailTemplateArgs,
+  DeleteEmailTemplateArgs,
+  PreviewEmailTemplateArgs,
+  // @experimental The template ownership methods' arguments and results.
+  OverrideEmailTemplateArgs,
+  ResetEmailTemplateArgs,
+  CompareEmailTemplateArgs,
+  ApplyEmailTemplateUpdateArgs,
+  UndoEmailTemplateUpdateArgs,
+  EmailTemplateComparison,
+  EmailTemplateVersion,
+  OwnerChange,
+  OwnerChangeChoice,
+  OwnerUpdateUndo,
+  FindUserFieldsArgs,
+  FindUserFieldByIDArgs,
+  CreateUserFieldArgs,
+  UpdateUserFieldArgs,
+  DeleteUserFieldArgs,
+  ReorderUserFieldsArgs,
+  SendEmailArgs,
+  SendTemplateEmailArgs,
+  SendEmailResult,
+  QueueEmailArgs,
+  QueueTemplateEmailArgs,
+  QueuedEmail,
+  QueuedEmailState,
+  CancelQueuedEmailArgs,
+  RetryQueuedEmailArgs,
+  FindEmailActivityArgs,
+  FindEmailDeliveriesArgs,
+  FindQueuedEmailsArgs,
+  EmailLastSentArgs,
+  EmailOverdueArgs,
+  FindEmailDeliveryByIDArgs,
+  SearchEmailActivityArgs,
+  ActivityEntry,
+  ActivityPage,
+  AddressSearchPage,
+  DeliveryActivity,
+  DeliveryDetail,
+  QueuedEmailActivity,
+  QueuedEmailDetail,
+  QueuedEmailOverdue,
+  TemplatesLastSent,
+} from "./email";
+
+export type {
+  ApiKeyMeta,
+  ApiKeyTokenType,
+  ExpiresIn,
+  Role,
+  Permission,
+  FindRolesArgs,
+  FindRoleByIDArgs,
+  CreateRoleArgs,
+  UpdateRoleArgs,
+  DeleteRoleArgs,
+  GetRolePermissionsArgs,
+  SetRolePermissionsArgs,
+  FindPermissionsArgs,
+  FindPermissionByIDArgs,
+  CreatePermissionArgs,
+  DeletePermissionArgs,
+  CheckAccessArgs,
+  ApiKeyResult,
+  ListApiKeysArgs,
+  FindApiKeyByIDArgs,
+  CreateApiKeyArgs,
+  UpdateApiKeyArgs,
+  RevokeApiKeyArgs,
+  CheckApiKeyArgs,
+  CheckApiKeyResult,
+} from "./rbac";

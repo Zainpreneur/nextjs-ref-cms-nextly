@@ -1,0 +1,972 @@
+/**
+ * Direct API Email Namespaces
+ *
+ * Factories for the email-related Direct API sub-namespaces:
+ * - `nextly.email.*`             — raw send + template send
+ * - `nextly.emailProviders.*`    — provider CRUD
+ * - `nextly.emailTemplates.*`    — template CRUD + preview + layout
+ * - `nextly.emailDeliveries.*`   — the delivery log and queued email, read
+ * - `nextly.userFields.*`        — user field definitions CRUD
+ *
+ * Each of these shares the same plumbing (error conversion, optional
+ * pagination), so they live in one file.
+ *
+ * A call that asks to be checked (`overrideAccess: false`) on providers,
+ * templates or user fields is judged as the REST route for the same operation
+ * judges its caller, before any work: `read-`, `create-`, `update-` or
+ * `delete-` on `email-providers` or `email-templates` (sending a test asks
+ * create, making a provider the default and every change to a template's
+ * ownership ask update, previewing a template asks create), and on `settings`
+ * for user fields (reordering them asks update). A checked call that names
+ * nobody is refused as unauthenticated. A trusted call is unchanged. Sending
+ * through `nextly.email.*` is the site's own code acting, with no REST
+ * counterpart, so it takes no grant; cancelling a queued email as a person
+ * (`email.cancelQueued`) asks `manage-email-deliveries`, and the Activity
+ * reads (`emailDeliveries.*`) ask `read-email-deliveries`, as their REST
+ * routes do.
+ *
+ * @packageDocumentation
+ */
+
+import {
+  SYSTEM_READ_POLICY,
+  SYSTEM_WRITE_POLICY,
+} from "../../domains/auth/system-write-policy";
+import { scopedSender, SITE_KEY_SCOPE } from "../../domains/email/send-claims";
+import type {
+  EmailTemplateComparison,
+  OwnerUpdateUndo,
+} from "../../domains/email/services/email-template-service";
+import type { EmailSendOutcome } from "../../domains/email/services/send-failures";
+import { NextlyError } from "../../errors/nextly-error";
+import type { EmailProviderRecord } from "../../schemas/email-providers/types";
+import type { EmailTemplateRecord } from "../../schemas/email-templates/types";
+import type { UserFieldDefinitionRecord } from "../../schemas/user-field-definitions/types";
+import type { UpdateEmailTemplateInput } from "../../services/email/email-template-service";
+import type {
+  ApplyEmailTemplateUpdateArgs,
+  CompareEmailTemplateArgs,
+  OverrideEmailTemplateArgs,
+  ResetEmailTemplateArgs,
+  UndoEmailTemplateUpdateArgs,
+} from "../types/email";
+import type {
+  ActivityEntry,
+  ActivityPage,
+  AddressSearchPage,
+  CancelQueuedEmailArgs,
+  RetryQueuedEmailArgs,
+  CreateEmailProviderArgs,
+  CreateEmailTemplateArgs,
+  CreateUserFieldArgs,
+  DeleteEmailProviderArgs,
+  DeleteEmailTemplateArgs,
+  DeleteUserFieldArgs,
+  DeliveryActivity,
+  DeliveryDetail,
+  DirectAPIConfig,
+  EmailLastSentArgs,
+  EmailOverdueArgs,
+  FindEmailActivityArgs,
+  FindEmailDeliveriesArgs,
+  FindEmailDeliveryByIDArgs,
+  SearchEmailActivityArgs,
+  FindEmailProviderByIDArgs,
+  FindEmailProvidersArgs,
+  FindEmailTemplateByIDArgs,
+  FindEmailTemplateBySlugArgs,
+  FindEmailTemplatesArgs,
+  FindQueuedEmailsArgs,
+  FindUserFieldByIDArgs,
+  FindUserFieldsArgs,
+  ListResult,
+  MutationResult,
+  PreviewEmailTemplateArgs,
+  ReorderUserFieldsArgs,
+  QueuedEmail,
+  QueuedEmailActivity,
+  QueuedEmailDetail,
+  QueuedEmailOverdue,
+  QueueEmailArgs,
+  QueueTemplateEmailArgs,
+  SendEmailArgs,
+  SendEmailResult,
+  SendTemplateEmailArgs,
+  SetDefaultProviderArgs,
+  TemplatesLastSent,
+  TestEmailProviderArgs,
+  UpdateEmailProviderArgs,
+  UpdateEmailTemplateArgs,
+  UpdateUserFieldArgs,
+} from "../types/index";
+
+import type { NextlyContext } from "./context";
+import {
+  checkRead,
+  checkWrite,
+  directApiActor,
+  isNotFoundError,
+  mergeConfig,
+  sliceListResult,
+} from "./helpers";
+
+/**
+ * The Direct API's result for a send: the service's outcome, with `error`
+ * filled from the failure's reason, as the result type has always declared.
+ * Fields with nothing to say are left out.
+ */
+function directResult(result: EmailSendOutcome): SendEmailResult {
+  return {
+    success: result.success,
+    messageId: result.messageId,
+    ...(result.failure
+      ? { error: result.failure.reason, failure: result.failure }
+      : {}),
+    ...(result.refused ? { refused: result.refused } : {}),
+    ...(result.repeat ? { repeat: result.repeat } : {}),
+    ...(result.partlyDelivered
+      ? {
+          partlyDelivered: result.partlyDelivered,
+          recipients: result.recipients,
+        }
+      : {}),
+  };
+}
+
+/** The `send` options for a message, from the Direct API's arguments. */
+function messageOptions(args: SendEmailArgs) {
+  return {
+    // Every recipient, as given: the service delivers to each one and
+    // refuses a list it cannot deliver whole.
+    to: args.to,
+    subject: args.subject,
+    html: args.html,
+    plainText: args.text,
+    from: args.from,
+    replyTo: args.replyTo,
+    // Forward cc/bcc so the Direct API matches the REST route and service.
+    cc: args.cc,
+    bcc: args.bcc,
+    providerId: args.providerId,
+    attachments: args.attachments,
+    person: args.person,
+    idempotencyKey: args.idempotencyKey,
+  };
+}
+
+/**
+ * The `sendWithTemplate` options from the Direct API's arguments, or
+ * undefined when none is given, so the template's own defaults apply.
+ */
+function templateOptions(args: SendTemplateEmailArgs) {
+  const options: {
+    providerId?: string;
+    from?: string;
+    replyTo?: string;
+    cc?: string[];
+    bcc?: string[];
+    attachments?: typeof args.attachments;
+    person?: typeof args.person;
+    idempotencyKey?: string;
+  } = {};
+  if (args.providerId) options.providerId = args.providerId;
+  // The send's own From and Reply-To win over the template's, which win
+  // over the provider's default (the service applies that order).
+  if (args.from) options.from = args.from;
+  if (args.replyTo) options.replyTo = args.replyTo;
+  // Only set cc/bcc when non-empty so an empty array doesn't make
+  // options truthy and override the "no options" undefined below.
+  if (args.cc?.length) options.cc = args.cc;
+  if (args.bcc?.length) options.bcc = args.bcc;
+  if (args.attachments) options.attachments = args.attachments;
+  // Anything given is forwarded, so the send validates it as `send` does;
+  // only an absent person is left out.
+  if (args.person !== undefined) options.person = args.person;
+  if (args.idempotencyKey !== undefined) {
+    options.idempotencyKey = args.idempotencyKey;
+  }
+  return Object.keys(options).length > 0 ? options : undefined;
+}
+
+/** The send service as the site's own code sends through it. */
+function siteSender(ctx: NextlyContext): NextlyContext["emailSendService"] {
+  return scopedSender(ctx.emailSendService, SITE_KEY_SCOPE);
+}
+
+/**
+ * `nextly.email.*` namespace — send raw or template-based emails.
+ */
+export interface EmailNamespace {
+  send(args: SendEmailArgs): Promise<SendEmailResult>;
+  sendWithTemplate(args: SendTemplateEmailArgs): Promise<SendEmailResult>;
+  /** @experimental Queue an email: stored, sent right after, retried on a temporary failure. */
+  queue(args: QueueEmailArgs): Promise<QueuedEmail>;
+  /** @experimental Queue an email made from a template, rendered at each attempt. */
+  queueWithTemplate(args: QueueTemplateEmailArgs): Promise<QueuedEmail>;
+  /**
+   * @experimental Cancel a queued email as a person: one waiting, or failed
+   * with its message held, is cancelled; one being sent is asked to stop,
+   * which takes effect if that attempt fails. The plugin that queued it is
+   * told who cancelled it. A checked call needs `manage-email-deliveries`.
+   */
+  cancelQueued(
+    args: CancelQueuedEmailArgs
+  ): Promise<MutationResult<{ id: string; state: string }>>;
+  /**
+   * Retry a queued email now, as a person: one waiting or retrying is
+   * attempted now; one failed with its message still held waits again, due
+   * now. Refused while an attempt is with the provider, and for one sent,
+   * cancelled, or whose message was cleared. A checked call needs
+   * `manage-email-deliveries`.
+   */
+  retryQueued(
+    args: RetryQueuedEmailArgs
+  ): Promise<MutationResult<{ id: string; state: string }>>;
+}
+
+/**
+ * Build the `email` namespace for a `Nextly` instance.
+ */
+export function createEmailNamespace(ctx: NextlyContext): EmailNamespace {
+  return {
+    async send(args: SendEmailArgs): Promise<SendEmailResult> {
+      const result = await siteSender(ctx).send(messageOptions(args));
+      return directResult(result);
+    },
+
+    async sendWithTemplate(
+      args: SendTemplateEmailArgs
+    ): Promise<SendEmailResult> {
+      const result = await siteSender(ctx).sendWithTemplate(
+        args.template,
+        // Every recipient, as given (see `send`).
+        args.to,
+        args.variables ?? {},
+        templateOptions(args)
+      );
+      return directResult(result);
+    },
+
+    queue(args: QueueEmailArgs): Promise<QueuedEmail> {
+      return siteSender(ctx).queue(messageOptions(args));
+    },
+
+    queueWithTemplate(args: QueueTemplateEmailArgs): Promise<QueuedEmail> {
+      return siteSender(ctx).queueWithTemplate(
+        args.template,
+        args.to,
+        args.variables ?? {},
+        templateOptions(args)
+      );
+    },
+
+    async cancelQueued(
+      args: CancelQueuedEmailArgs
+    ): Promise<MutationResult<{ id: string; state: string }>> {
+      // A precondition: judged before anything is read or cancelled.
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailDeliveries.cancel
+      );
+      const actor = directApiActor(ctx.defaultConfig, args);
+      const item = await ctx.emailSendService.cancelQueued(args.id, {
+        userId: actor?.type === "user" ? (actor.id ?? null) : null,
+        actor,
+      });
+      return { message: "Email cancelled.", item };
+    },
+
+    async retryQueued(
+      args: RetryQueuedEmailArgs
+    ): Promise<MutationResult<{ id: string; state: string }>> {
+      // A precondition: judged before anything is read or retried.
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailDeliveries.retry
+      );
+      const item = await ctx.emailSendService.retryQueued(args.id, {
+        actor: directApiActor(ctx.defaultConfig, args),
+      });
+      return { message: "Email will be tried again now.", item };
+    },
+  };
+}
+
+/**
+ * @experimental `nextly.emailDeliveries.*` namespace — the Email hub's
+ * Activity reads. None returns an address, subject or body. A checked call
+ * needs `read-email-deliveries`.
+ */
+export interface EmailDeliveriesNamespace {
+  /** Delivery records, newest first, by outcome, template, provider and time. */
+  find(args?: FindEmailDeliveriesArgs): Promise<ActivityPage<DeliveryActivity>>;
+  /**
+   * Queued emails and the deliveries of sends not queued, merged newest
+   * first under one cursor, by status, template, provider and time.
+   */
+  activity(args?: FindEmailActivityArgs): Promise<ActivityPage<ActivityEntry>>;
+  /**
+   * The merged Activity for one exact address, found by its digests under
+   * the current and previous secrets, with a notice that older records
+   * cannot be found. Recorded in the activity log as the caller's search,
+   * without the address.
+   */
+  search(args: SearchEmailActivityArgs): Promise<AddressSearchPage>;
+  /** Queued emails, newest first, by state, template and time. */
+  findQueued(
+    args?: FindQueuedEmailsArgs
+  ): Promise<ActivityPage<QueuedEmailActivity>>;
+  /** When each template was last sent. */
+  lastSent(args?: EmailLastSentArgs): Promise<TemplatesLastSent>;
+  /** Whether queued email is overdue because the jobs trigger is not running. */
+  overdue(args?: EmailOverdueArgs): Promise<QueuedEmailOverdue>;
+  /** One delivery's detail and timeline; null for an id that names none. */
+  findByID(args: FindEmailDeliveryByIDArgs): Promise<DeliveryDetail | null>;
+  /** One queued email's detail and attempts; null for an id that names none. */
+  findQueuedByID(
+    args: FindEmailDeliveryByIDArgs
+  ): Promise<QueuedEmailDetail | null>;
+}
+
+/**
+ * Build the `emailDeliveries` namespace for a `Nextly` instance. Each read
+ * is checked first, as its REST route checks it.
+ */
+export function createEmailDeliveriesNamespace(
+  ctx: NextlyContext
+): EmailDeliveriesNamespace {
+  const checked = async (args: DirectAPIConfig): Promise<void> => {
+    await checkRead(
+      ctx.defaultConfig,
+      args,
+      SYSTEM_READ_POLICY.emailDeliveries.read
+    );
+  };
+  return {
+    async find(args = {}) {
+      await checked(args);
+      return ctx.emailDeliveryActivity.listDeliveries(args);
+    },
+    async activity(args = {}) {
+      await checked(args);
+      return ctx.emailDeliveryActivity.listActivity(args);
+    },
+    async search(args) {
+      await checked(args);
+      return ctx.emailDeliveryActivity.searchByAddress(
+        args,
+        directApiActor(ctx.defaultConfig, args)
+      );
+    },
+    async findQueued(args = {}) {
+      await checked(args);
+      return ctx.emailDeliveryActivity.listQueuedEmails(args);
+    },
+    async lastSent(args = {}) {
+      await checked(args);
+      return ctx.emailDeliveryActivity.lastSentByTemplate(args.slugs);
+    },
+    async overdue(args = {}) {
+      await checked(args);
+      return ctx.emailDeliveryActivity.overdue();
+    },
+    async findByID(args) {
+      await checked(args);
+      return ctx.emailDeliveryActivity.findDelivery(args.id);
+    },
+    async findQueuedByID(args) {
+      await checked(args);
+      return ctx.emailDeliveryActivity.findQueuedEmail(args.id);
+    },
+  };
+}
+
+/**
+ * `nextly.emailProviders.*` namespace — CRUD on provider configurations.
+ *
+ * `setDefault` keeps returning the bare provider record because it's a
+ * non-CRUD action whose primary value is the resulting record itself.
+ */
+export interface EmailProvidersNamespace {
+  find(args?: FindEmailProvidersArgs): Promise<ListResult<EmailProviderRecord>>;
+  findByID(
+    args: FindEmailProviderByIDArgs
+  ): Promise<EmailProviderRecord | null>;
+  create(
+    args: CreateEmailProviderArgs
+  ): Promise<MutationResult<EmailProviderRecord>>;
+  update(
+    args: UpdateEmailProviderArgs
+  ): Promise<MutationResult<EmailProviderRecord>>;
+  delete(
+    args: DeleteEmailProviderArgs
+  ): Promise<MutationResult<{ id: string }>>;
+  setDefault(
+    args: SetDefaultProviderArgs
+  ): Promise<MutationResult<EmailProviderRecord>>;
+  test(
+    args: TestEmailProviderArgs
+  ): Promise<{ success: boolean; error?: string }>;
+}
+
+/**
+ * Build the `emailProviders` namespace for a `Nextly` instance.
+ */
+export function createEmailProvidersNamespace(
+  ctx: NextlyContext
+): EmailProvidersNamespace {
+  return {
+    async find(
+      args: FindEmailProvidersArgs = {}
+    ): Promise<ListResult<EmailProviderRecord>> {
+      await checkRead(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_READ_POLICY.emailProviders.read
+      );
+      const providers = await ctx.emailProviderService.listProviders();
+      return sliceListResult(providers, args.limit, args.page);
+    },
+
+    async findByID(
+      args: FindEmailProviderByIDArgs
+    ): Promise<EmailProviderRecord | null> {
+      await checkRead(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_READ_POLICY.emailProviders.read
+      );
+      const config = mergeConfig(ctx.defaultConfig, args);
+      try {
+        return await ctx.emailProviderService.getProvider(args.id);
+      } catch (error) {
+        if (config.disableErrors && isNotFoundError(error)) {
+          return null;
+        }
+        throw error;
+      }
+    },
+
+    async create(
+      args: CreateEmailProviderArgs
+    ): Promise<MutationResult<EmailProviderRecord>> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailProviders.create
+      );
+      const item = await ctx.emailProviderService.createProvider(
+        {
+          name: args.data.name,
+          type: args.data.type,
+          fromEmail: args.data.fromEmail,
+          fromName: args.data.fromName,
+          configuration: args.data.configuration,
+          isDefault: args.data.isDefault,
+          // Named explicitly, like every property above it. This object is
+          // built key by key rather than spread from `data`, so a property the
+          // argument type offers and this list omits is dropped in silence:
+          // `createProvider` reads `isActive ?? true`, and a provider someone
+          // asked to create deactivated would begin sending.
+          isActive: args.data.isActive,
+        },
+        directApiActor(ctx.defaultConfig, args)
+      );
+      return { message: "Email provider created.", item };
+    },
+
+    async update(
+      args: UpdateEmailProviderArgs
+    ): Promise<MutationResult<EmailProviderRecord>> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailProviders.update
+      );
+      const item = await ctx.emailProviderService.updateProvider(
+        args.id,
+        args.data,
+        directApiActor(ctx.defaultConfig, args)
+      );
+      return { message: "Email provider updated.", item };
+    },
+
+    async delete(
+      args: DeleteEmailProviderArgs
+    ): Promise<MutationResult<{ id: string }>> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailProviders.delete
+      );
+      await ctx.emailProviderService.deleteProvider(
+        args.id,
+        directApiActor(ctx.defaultConfig, args)
+      );
+      return {
+        message: "Email provider deleted.",
+        item: { id: args.id },
+      };
+    },
+
+    async setDefault(
+      args: SetDefaultProviderArgs
+    ): Promise<MutationResult<EmailProviderRecord>> {
+      // The same envelope every other mutation in this namespace returns.
+      // Promotion changes a row, so a caller reads the result the way it reads
+      // a create or an update rather than remembering that one of the five
+      // hands its record back bare.
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailProviders.makeDefault
+      );
+      const item = await ctx.emailProviderService.setDefault(
+        args.id,
+        directApiActor(ctx.defaultConfig, args)
+      );
+      return { message: "Default email provider set.", item };
+    },
+
+    async test(
+      args: TestEmailProviderArgs
+    ): Promise<{ success: boolean; error?: string }> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailProviders.sendTest
+      );
+      return await ctx.emailProviderService.testProvider(
+        args.id,
+        args.to,
+        args.mode
+      );
+    },
+  };
+}
+
+/**
+ * `nextly.emailTemplates.*` namespace — CRUD + preview.
+ *
+ * Layouts are ordinary rows with `kind: "layout"`, edited through the
+ * same `create`/`update`/`find` calls; `preview` keeps its bespoke
+ * shape because it is a non-CRUD action with a domain-specific return.
+ */
+export interface EmailTemplatesNamespace {
+  find(args?: FindEmailTemplatesArgs): Promise<ListResult<EmailTemplateRecord>>;
+  findByID(
+    args: FindEmailTemplateByIDArgs
+  ): Promise<EmailTemplateRecord | null>;
+  findBySlug(
+    args: FindEmailTemplateBySlugArgs
+  ): Promise<EmailTemplateRecord | null>;
+  create(
+    args: CreateEmailTemplateArgs
+  ): Promise<MutationResult<EmailTemplateRecord>>;
+  update(
+    args: UpdateEmailTemplateArgs
+  ): Promise<MutationResult<EmailTemplateRecord>>;
+  delete(
+    args: DeleteEmailTemplateArgs
+  ): Promise<MutationResult<{ id: string }>>;
+  preview(
+    args: PreviewEmailTemplateArgs
+  ): Promise<{ subject: string; html: string }>;
+  /** @experimental Override a core or plugin template with the site's version. */
+  override(
+    args: OverrideEmailTemplateArgs
+  ): Promise<MutationResult<EmailTemplateRecord>>;
+  /** @experimental Return an overridden template to its owner's version. */
+  reset(
+    args: ResetEmailTemplateArgs
+  ): Promise<MutationResult<EmailTemplateRecord>>;
+  /** @experimental An overridden template beside its owner's current version, change by change. */
+  compare(args: CompareEmailTemplateArgs): Promise<EmailTemplateComparison>;
+  /** @experimental Apply a review of the owner's update. */
+  applyUpdate(
+    args: ApplyEmailTemplateUpdateArgs
+  ): Promise<MutationResult<EmailTemplateRecord> & { undo: OwnerUpdateUndo }>;
+  /** @experimental Undo an applied review. */
+  undoUpdate(
+    args: UndoEmailTemplateUpdateArgs
+  ): Promise<MutationResult<EmailTemplateRecord>>;
+}
+
+/**
+ * Build the `emailTemplates` namespace for a `Nextly` instance.
+ */
+export function createEmailTemplatesNamespace(
+  ctx: NextlyContext
+): EmailTemplatesNamespace {
+  return {
+    async find(
+      args: FindEmailTemplatesArgs = {}
+    ): Promise<ListResult<EmailTemplateRecord>> {
+      await checkRead(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_READ_POLICY.emailTemplates.read
+      );
+      const templates = await ctx.emailTemplateService.listTemplates();
+      return sliceListResult(templates, args.limit, args.page);
+    },
+
+    async findByID(
+      args: FindEmailTemplateByIDArgs
+    ): Promise<EmailTemplateRecord | null> {
+      await checkRead(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_READ_POLICY.emailTemplates.read
+      );
+      const config = mergeConfig(ctx.defaultConfig, args);
+      try {
+        return await ctx.emailTemplateService.getTemplate(args.id);
+      } catch (error) {
+        if (config.disableErrors && isNotFoundError(error)) {
+          return null;
+        }
+        throw error;
+      }
+    },
+
+    async findBySlug(
+      args: FindEmailTemplateBySlugArgs
+    ): Promise<EmailTemplateRecord | null> {
+      await checkRead(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_READ_POLICY.emailTemplates.read
+      );
+      const config = mergeConfig(ctx.defaultConfig, args);
+      try {
+        const template = await ctx.emailTemplateService.getTemplateBySlug(
+          args.slug
+        );
+        if (!template) {
+          if (config.disableErrors) {
+            return null;
+          }
+          throw NextlyError.notFound({
+            logContext: { slug: args.slug, entity: "emailTemplate" },
+          });
+        }
+        return template;
+      } catch (error) {
+        if (error instanceof NextlyError) {
+          throw error;
+        }
+        if (config.disableErrors && isNotFoundError(error)) {
+          return null;
+        }
+        throw error;
+      }
+    },
+
+    async create(
+      args: CreateEmailTemplateArgs
+    ): Promise<MutationResult<EmailTemplateRecord>> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailTemplates.create
+      );
+      const item = await ctx.emailTemplateService.createTemplate(
+        {
+          name: args.data.name,
+          slug: args.data.slug,
+          subject: args.data.subject,
+          htmlContent: args.data.htmlContent,
+          plainTextContent: args.data.textContent,
+          kind: args.data.kind,
+          preheader: args.data.preheader,
+          layoutId: args.data.layoutId,
+          fromOverride: args.data.fromOverride,
+          replyTo: args.data.replyTo,
+          cc: args.data.cc,
+          bcc: args.data.bcc,
+          useLayout: args.data.useLayout,
+          variables: args.data.variables,
+          attachments: args.data.attachments,
+          description: args.data.description,
+          format: args.data.format,
+          blocks: args.data.blocks,
+        },
+        directApiActor(ctx.defaultConfig, args)
+      );
+      return { message: "Email template created.", item };
+    },
+
+    async update(
+      args: UpdateEmailTemplateArgs
+    ): Promise<MutationResult<EmailTemplateRecord>> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailTemplates.update
+      );
+      const { textContent, variables, attachments, ...rest } = args.data;
+      const updateData: UpdateEmailTemplateInput = {
+        ...rest,
+      };
+      if (textContent !== undefined) {
+        updateData.plainTextContent = textContent;
+      }
+      if (variables !== undefined) {
+        updateData.variables = variables;
+      }
+      if (attachments !== undefined) {
+        updateData.attachments = attachments;
+      }
+      const item = await ctx.emailTemplateService.updateTemplate(
+        args.id,
+        updateData,
+        directApiActor(ctx.defaultConfig, args)
+      );
+      return { message: "Email template updated.", item };
+    },
+
+    async delete(
+      args: DeleteEmailTemplateArgs
+    ): Promise<MutationResult<{ id: string }>> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailTemplates.delete
+      );
+      await ctx.emailTemplateService.deleteTemplate(
+        args.id,
+        directApiActor(ctx.defaultConfig, args)
+      );
+      return {
+        message: "Email template deleted.",
+        item: { id: args.id },
+      };
+    },
+
+    async preview(
+      args: PreviewEmailTemplateArgs
+    ): Promise<{ subject: string; html: string }> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailTemplates.preview
+      );
+      return await ctx.emailTemplateService.previewTemplate(
+        args.id,
+        args.data ?? {}
+      );
+    },
+
+    async override(
+      args: OverrideEmailTemplateArgs
+    ): Promise<MutationResult<EmailTemplateRecord>> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailTemplates.update
+      );
+      const item = await ctx.emailTemplateService.overrideTemplate(
+        args.id,
+        { version: args.version },
+        directApiActor(ctx.defaultConfig, args)
+      );
+      return { message: "Email template overridden.", item };
+    },
+
+    async reset(
+      args: ResetEmailTemplateArgs
+    ): Promise<MutationResult<EmailTemplateRecord>> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailTemplates.update
+      );
+      const item = await ctx.emailTemplateService.resetTemplate(
+        args.id,
+        directApiActor(ctx.defaultConfig, args)
+      );
+      return { message: "Email template reset to its owner's version.", item };
+    },
+
+    async compare(
+      args: CompareEmailTemplateArgs
+    ): Promise<EmailTemplateComparison> {
+      await checkRead(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_READ_POLICY.emailTemplates.read
+      );
+      return await ctx.emailTemplateService.compareTemplate(args.id);
+    },
+
+    async applyUpdate(
+      args: ApplyEmailTemplateUpdateArgs
+    ): Promise<
+      MutationResult<EmailTemplateRecord> & { undo: OwnerUpdateUndo }
+    > {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailTemplates.update
+      );
+      const { template, undo } =
+        await ctx.emailTemplateService.applyOwnerUpdate(
+          args.id,
+          args.choices,
+          args.review,
+          directApiActor(ctx.defaultConfig, args)
+        );
+      return { message: "Owner's update applied.", item: template, undo };
+    },
+
+    async undoUpdate(
+      args: UndoEmailTemplateUpdateArgs
+    ): Promise<MutationResult<EmailTemplateRecord>> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.emailTemplates.update
+      );
+      const item = await ctx.emailTemplateService.undoOwnerUpdate(
+        args.id,
+        args.undo,
+        directApiActor(ctx.defaultConfig, args)
+      );
+      return { message: "Owner's update undone.", item };
+    },
+  };
+}
+
+/**
+ * `nextly.userFields.*` namespace — CRUD on user field definitions.
+ *
+ * `reorder` keeps its array return type because the wire-side equivalent
+ * also returns the reordered list as a non-CRUD action.
+ */
+export interface UserFieldsNamespace {
+  find(
+    args?: FindUserFieldsArgs
+  ): Promise<ListResult<UserFieldDefinitionRecord>>;
+  findByID(
+    args: FindUserFieldByIDArgs
+  ): Promise<UserFieldDefinitionRecord | null>;
+  create(
+    args: CreateUserFieldArgs
+  ): Promise<MutationResult<UserFieldDefinitionRecord>>;
+  update(
+    args: UpdateUserFieldArgs
+  ): Promise<MutationResult<UserFieldDefinitionRecord>>;
+  delete(args: DeleteUserFieldArgs): Promise<MutationResult<{ id: string }>>;
+  reorder(args: ReorderUserFieldsArgs): Promise<UserFieldDefinitionRecord[]>;
+}
+
+/**
+ * Build the `userFields` namespace for a `Nextly` instance.
+ */
+export function createUserFieldsNamespace(
+  ctx: NextlyContext
+): UserFieldsNamespace {
+  return {
+    async find(
+      args: FindUserFieldsArgs = {}
+    ): Promise<ListResult<UserFieldDefinitionRecord>> {
+      await checkRead(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_READ_POLICY.settings.read
+      );
+      const allFields = args.includeInactive
+        ? await ctx.userFieldDefinitionService.listFields()
+        : await ctx.userFieldDefinitionService.getMergedFields();
+      return sliceListResult(allFields, args.limit, args.page);
+    },
+
+    async findByID(
+      args: FindUserFieldByIDArgs
+    ): Promise<UserFieldDefinitionRecord | null> {
+      await checkRead(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_READ_POLICY.settings.read
+      );
+      const config = mergeConfig(ctx.defaultConfig, args);
+      try {
+        return await ctx.userFieldDefinitionService.getField(args.id);
+      } catch (error) {
+        if (config.disableErrors && isNotFoundError(error)) {
+          return null;
+        }
+        throw error;
+      }
+    },
+
+    async create(
+      args: CreateUserFieldArgs
+    ): Promise<MutationResult<UserFieldDefinitionRecord>> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.userFields.create
+      );
+      const item = await ctx.userFieldDefinitionService.createField({
+        name: args.data.name,
+        label: args.data.label,
+        type: args.data.type,
+        required: args.data.required,
+        defaultValue: args.data.defaultValue,
+        options: args.data.options,
+        placeholder: args.data.placeholder,
+        description: args.data.description,
+        sortOrder: args.data.sortOrder,
+        source: "ui",
+      });
+      return { message: "User field created.", item };
+    },
+
+    async update(
+      args: UpdateUserFieldArgs
+    ): Promise<MutationResult<UserFieldDefinitionRecord>> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.userFields.update
+      );
+      const item = await ctx.userFieldDefinitionService.updateField(
+        args.id,
+        args.data
+      );
+      return { message: "User field updated.", item };
+    },
+
+    async delete(
+      args: DeleteUserFieldArgs
+    ): Promise<MutationResult<{ id: string }>> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.userFields.delete
+      );
+      await ctx.userFieldDefinitionService.deleteField(args.id);
+      return {
+        message: "User field deleted.",
+        item: { id: args.id },
+      };
+    },
+
+    async reorder(
+      args: ReorderUserFieldsArgs
+    ): Promise<UserFieldDefinitionRecord[]> {
+      await checkWrite(
+        ctx.defaultConfig,
+        args,
+        SYSTEM_WRITE_POLICY.userFields.update
+      );
+      return await ctx.userFieldDefinitionService.reorderFields(
+        args.orderedIds
+      );
+    },
+  };
+}

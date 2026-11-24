@@ -1,0 +1,1437 @@
+"use client";
+
+/**
+ * useEntryForm Hook
+ *
+ * Custom hook for managing entry form state, validation, and submission.
+ * Handles both create and edit modes, generating Zod schemas from collection
+ * field definitions and providing submit/delete handlers.
+ *
+ * @module components/entries/EntryForm/useEntryForm
+ * @since 1.0.0
+ */
+
+import { zodResolver } from "@hookform/resolvers/zod";
+import type { FieldConfig } from "nextly/config";
+import {
+  type RefObject,
+  useMemo,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { useForm, type UseFormReturn } from "react-hook-form";
+import { z } from "zod";
+
+import { copiedValuesFor } from "@admin/components/features/entries/copied-values";
+import type { EditorRestore } from "@admin/components/features/versions/editor-restore";
+import { useFormRestore } from "@admin/components/features/versions/useEditorRestoreSurface";
+import { useCreateEntry } from "@admin/hooks/queries/useCreateEntry";
+import { useDeleteEntry } from "@admin/hooks/queries/useDeleteEntry";
+import { useDiscardWorkingDraft } from "@admin/hooks/queries/useDiscardWorkingDraft";
+import {
+  useUpdateEntry,
+  type UseUpdateEntryOptions,
+} from "@admin/hooks/queries/useUpdateEntry";
+import { useAsksTranslationStatus } from "@admin/hooks/useCanRequest";
+import {
+  autosaveScopeFor,
+  documentRecordingKey,
+} from "@admin/hooks/useDocumentAutosave";
+import { collectionSingularLabel } from "@admin/lib/collection-label";
+import { versionOf } from "@admin/lib/document-version";
+import { generateClientSchema } from "@admin/lib/field-validation";
+import { getDefaultValues } from "@admin/lib/form/default-values";
+import {
+  holdsPlaceholders,
+  withoutPlaceholders,
+} from "@admin/lib/form/stored-references";
+import { readsHeldDraft } from "@admin/lib/held-draft";
+import type { Entry, EntryValue } from "@admin/types/collection";
+import type { RemovedFromCodeMark } from "@admin/types/removed-from-code";
+
+import { submitDocument } from "./submit-document";
+import {
+  deleteFailed,
+  submitBusy,
+  submitFailed,
+  type DeleteOutcome,
+  type SubmitOutcome,
+} from "./submit-outcome";
+import type { DocumentActionOutcome } from "./useDocumentActionBindings";
+import { useRefusedForm } from "./useRefusedForm";
+import {
+  useVersionConflict,
+  type VersionConflict,
+  type VersionConflictState,
+} from "./useVersionConflict";
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/**
+ * Form mode - create new entry or edit existing
+ */
+export type EntryFormMode = "create" | "edit";
+
+/**
+ * Preview configuration for collection
+ */
+export interface EntryFormPreviewConfig {
+  /** Function to generate preview URL from entry data (code-first) */
+  url?: (entry: Record<string, unknown>) => string | null;
+  /** URL template with {fieldName} placeholders (UI collections) */
+  urlTemplate?: string;
+  /** Whether to open preview in new tab (default: true) */
+  openInNewTab?: boolean;
+  /** Custom label for preview button */
+  label?: string;
+}
+
+/**
+ * Collection data required for form generation.
+ * Supports both old API format (schemaDefinition.fields) and
+ * new API format (fields directly at root).
+ */
+export interface EntryFormCollection extends RemovedFromCodeMark {
+  /** Collection slug/name for API calls */
+  name: string;
+  /** Slug for new API format */
+  slug?: string;
+  /** Display label for the collection */
+  label?: string;
+  /** Singular label for UI text */
+  labels?: {
+    singular?: string;
+    plural?: string;
+  };
+  /**
+   * Schema definition containing field configurations (legacy format).
+   * New API returns fields directly at root level.
+   */
+  schemaDefinition?: {
+    fields: FieldConfig[];
+  };
+  /**
+   * Direct fields array (new API format).
+   * Takes precedence over schemaDefinition.fields.
+   */
+  fields?: FieldConfig[];
+  /** Admin configuration including preview settings */
+  admin?: {
+    preview?: EntryFormPreviewConfig;
+    /**
+     * Whether the collection's entries are deleted through an action of their
+     * own, which a plugin draws: the editor then offers no Delete of its own.
+     */
+    disableDelete?: boolean;
+  };
+  /**
+   * Whether the collection has the Draft/Published status feature enabled.
+   * When `true`, the entry form shows separate Save Draft / Publish buttons
+   * and a status pill in the slug strip / Document panel. Backed by the
+   * `dynamic_collections.status` boolean column.
+   */
+  status?: boolean;
+  /**
+   * Whether the collection has multilingual content enabled (i18n). When `true`, text-like
+   * fields are translatable by default and the entry editor exposes per-language editing.
+   * Backed by the `dynamic_collections.localized` boolean column.
+   */
+  localized?: boolean;
+  /**
+   * Whether the draft/published working-draft split is enabled (drafts on a
+   * versioned collection). When `true` on a `status` collection, saving an
+   * already-published entry stores a pending working draft instead of writing
+   * the live row; a separate Publish promotes it. Read-only, derived
+   * server-side — only code-first collections enable it.
+   */
+  draftsEnabled?: boolean;
+  /**
+   * The workflow that holds the collection's publishing, from the schema
+   * read; `null` (or absent) where none is attached. A new entry in a
+   * collection that has one leads with Save draft.
+   */
+  workflow?: { slug: string; label: string } | null;
+  /**
+   * Why drafts are off, when the configuration asked for them. With
+   * `localized-component`, a draft saved before may still be held, and the
+   * editor reads it (`readsHeldDraft`).
+   */
+  draftsDisabledReason?: string;
+}
+
+/**
+ * Helper to get fields from a collection, supporting both old and new API formats.
+ */
+export function getCollectionFields(
+  collection: EntryFormCollection
+): FieldConfig[] {
+  return collection.fields || collection.schemaDefinition?.fields || [];
+}
+
+/**
+ * Entry data structure for edit mode
+ */
+export interface EntryData {
+  id: string;
+  createdAt?: string;
+  updatedAt?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Options for the useEntryForm hook
+ */
+export interface UseEntryFormOptions {
+  /** Collection configuration with schema */
+  collection: EntryFormCollection;
+  /** Existing entry data (for edit mode) */
+  entry?: EntryData | null;
+  /** Form mode - 'create' or 'edit' */
+  mode: EntryFormMode;
+  /** Callback when form is successfully submitted */
+  onSuccess?: (entry: EntryData) => void;
+  /** Callback when form submission fails */
+  onError?: (error: unknown) => void;
+  /** Callback when entry is deleted (edit mode only) */
+  onDelete?: () => void;
+  /** Callback when form is cancelled */
+  onCancel?: () => void;
+  /** Active content locale — the update targets this language's values. */
+  locale?: string;
+  /**
+   * Whether the entry was READ with the working-draft overlay (`draft`), so the
+   * update's optimistic cache key matches the query the form is showing. The
+   * full-page editor reads the overlay for a drafts collection; an embedded
+   * editor (relationship quick-edit) reads the live row, so it must say so here
+   * or its optimistic update, rollback, and `cancelQueries` would target a
+   * different `detailScoped` key than the one on screen. Defaults to the
+   * collection's split when unset — the full-page editor's read mode.
+   */
+  readDraft?: boolean;
+  /**
+   * Whether the host holds the document's writes now (it is someone else's,
+   * or a past version is on screen). Asked immediately before every write:
+   * a save's, after its validation, and a refused publish's recovery's.
+   * Absent, writes are never held.
+   */
+  writesHeld?: () => boolean;
+  /**
+   * The host's Save of the pending change that never publishes, as its Save
+   * control runs it, for a refused publish's recovery to store the form with.
+   */
+  saveWithoutPublishing?: RefObject<
+    (() => Promise<DocumentActionOutcome>) | undefined
+  >;
+  /**
+   * Hears a refused publish's recovery start the form afresh, its take
+   * written: a write to the pending change, as a save is, after the save it
+   * ran first.
+   */
+  onRecovered?: () => void;
+}
+
+/**
+ * Submit intent for `handleSubmit`. Each intent maps to a deterministic
+ * status transition + payload shape (see `useEntryForm.handleSubmit`).
+ *
+ * signature couldn't distinguish "save my changes while keeping the
+ * entry published" from "promote a draft to published" — both arrived
+ * as `status: "published"`. The intent explicitly names the user's
+ * action so the payload shape can match (e.g. `unpublish` sends only
+ * `{ status: "draft" }` without other dirty fields, matching what
+ * Payload's Unpublish button does).
+ */
+export type EntryFormIntent =
+  | "save-draft"
+  | "publish"
+  | "save-working-draft"
+  | "save-changes"
+  | "unpublish";
+
+/**
+ * Send a blank optional field as `null` rather than an empty string.
+ *
+ * An untouched optional field reaches submit as `""`, which validation accepts.
+ * Persisting that literal would make "empty" mean two different things
+ * depending on how the row was written — `""` from the admin, `NULL` from the
+ * API or a migration — so `WHERE col IS NULL` would quietly miss rows. It also
+ * breaks optional unique fields outright: `""` is a real value to a unique
+ * index, so the second entry left blank collides with the first.
+ *
+ * `preserveBlank` names the fields that must keep their empty string. Password
+ * fields rely on it: the edit form seeds them with `""` to mean "keep the
+ * stored hash", which the server drops before writing, whereas `null` reads as
+ * an intentional clear and would wipe the hash — or fail a required password.
+ *
+ * Only `""` is rewritten. `0`, `false` and `[]` are genuine values and pass
+ * through untouched, as does a required field, which cannot be blank and still
+ * reach this point. Nested values (groups, repeaters) are objects and are left
+ * alone, so a password inside a container is unaffected either way.
+ */
+function blankToNull(
+  data: Record<string, unknown>,
+  preserveBlank?: ReadonlySet<string>
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(data).map(([key, value]) => [
+      key,
+      value === "" && !preserveBlank?.has(key) ? null : value,
+    ])
+  );
+}
+
+/**
+ * Names of the top-level password fields in a field list, for `preserveBlank`.
+ *
+ * Only the top level is collected because that is the only level
+ * `mapIntentToPayload` rewrites — a password nested in a group or repeater sits
+ * inside an object value and is never touched.
+ */
+export function passwordFieldNames(fields: FieldConfig[]): Set<string> {
+  const names = new Set<string>();
+  for (const field of fields) {
+    const { name, type } = field as { name?: string; type?: string };
+    if (type === "password" && name) names.add(name);
+  }
+  return names;
+}
+
+/**
+ * Map a submit intent to the wire payload. Pure helper extracted so the
+ * mapping can be unit-tested without renderHook plumbing.
+ *
+ * - `save-draft` / `publish`: dirty form fields plus the canonical status.
+ * - `save-changes`: dirty form fields plus status="published" — the entry
+ *   was already published; we re-assert the column without changing the
+ *   lifecycle state.
+ * - `unpublish`: status only, no other field changes. Strips any pending
+ *   dirty edits so a confirm-modal misclick can't ship unrelated changes
+ *   to the public site (matches the Payload pattern).
+ * - undefined intent: pass `rawData` through unchanged. Used by the
+ *   single-Save button when drafts aren't enabled on the collection.
+ *
+ * `preserveBlank` is forwarded to `blankToNull` — see there for why password
+ * fields must keep their empty string.
+ */
+export function mapIntentToPayload(
+  rawData: Record<string, unknown>,
+  intent?: EntryFormIntent,
+  preserveBlank?: ReadonlySet<string>
+): Record<string, unknown> {
+  const data = blankToNull(rawData, preserveBlank);
+  switch (intent) {
+    case "save-draft":
+      return { ...data, status: "draft" };
+    case "publish":
+      return { ...data, status: "published" };
+    case "save-working-draft":
+      // A status-less save on a drafts-enabled, already-published entry: the
+      // server stores the pending edit as a working draft and leaves the live
+      // row untouched (draft/published split). Omitting `status` is exactly
+      // what triggers that; a later Publish promotes the draft to live.
+      return data;
+    case "save-changes":
+      return { ...data, status: "published" };
+    case "unpublish":
+      return { status: "draft" };
+    default:
+      return data;
+  }
+}
+
+/**
+ * Return type for useEntryForm hook
+ */
+export interface UseEntryFormReturn {
+  /** React Hook Form instance */
+  form: UseFormReturn<Record<string, unknown>>;
+  /**
+   * The values a restore puts into the form, which the history fills and the
+   * save names the sources of.
+   */
+  formRestore: EditorRestore;
+  /** What the form starts from for the entry on screen. */
+  defaultValues: Record<string, unknown>;
+  /** Handle form submission. The optional `intent` arg names the user's
+   *  action; payload shape is derived from intent. Omit for non-status
+   *  collections (single Save button submits with whatever status the
+   *  server already has). Resolves to what the submission came to; never
+   *  rejects. */
+  handleSubmit: (
+    e?: React.BaseSyntheticEvent,
+    intent?: EntryFormIntent
+  ) => Promise<SubmitOutcome>;
+  /** Publish (`published`) or unpublish (`draft`) the saved entry with a
+   *  write naming its status alone, without the form: what a user who may
+   *  publish and not change the document sends. Resolves to what the write
+   *  came to; never rejects. */
+  writeStatus: (status: "published" | "draft") => Promise<SubmitOutcome>;
+  /** Delete the entry (edit mode only). Resolves to what the delete came to;
+   *  never rejects. */
+  handleDelete: () => Promise<DeleteOutcome>;
+  /** Discard the pending working draft (draft/published split), reverting the
+   *  editor to the live published row. No-op outside edit mode. Resolves once the
+   *  discard succeeds and REJECTS if it fails, so the confirm dialog can show its
+   *  progress until then and stay open for a retry on failure. */
+  handleDiscardWorkingDraft: () => Promise<void>;
+  /** Handle form cancellation */
+  handleCancel: () => void;
+  /** Whether form is currently submitting */
+  isSubmitting: boolean;
+  /**
+   * Whether a refused publish's recovery is running, through to its reloaded
+   * entry: the fields are read-only meanwhile.
+   */
+  recovering: boolean;
+  /** Whether entry is being deleted */
+  isDeleting: boolean;
+  /** Whether form has unsaved changes */
+  isDirty: boolean;
+  /** Form mode */
+  mode: EntryFormMode;
+  /** Collection being edited */
+  collection: EntryFormCollection;
+  /** Original entry data (edit mode) */
+  entry: EntryData | null;
+  /** Singular label for the collection */
+  singularLabel: string;
+  /**
+   * The save refused because the entry changed since the copy on screen
+   * started, while the author has not chosen what to do; null otherwise.
+   */
+  versionConflict: VersionConflict | null;
+  /**
+   * Save the refused edits over the newer version, on purpose. Rejects, with
+   * the conflict left open and saying why, when the save does not go through.
+   */
+  saveAnyway: () => Promise<void>;
+  /**
+   * Keep the refused edits as a recovery point, then show the current
+   * version. Rejects, replacing nothing, when the edits cannot be kept. With
+   * `keepEdits` false, for an entry that keeps no recovery points, the edits
+   * are discarded, as the conflict said they would be.
+   */
+  loadCurrentVersion: (keepEdits: boolean) => Promise<void>;
+  /** The version the copy on screen started from, sent with every write. */
+  versionStartedFrom: () => string | undefined;
+  /** Edits restored from a recovery point began from this version. */
+  adoptRecoveredVersion: (startedFrom: string | undefined) => void;
+  /**
+   * Hold the form on someone else's change the lock told of, so no read
+   * replaces the edits before the author chooses; `loadCurrentVersion` then
+   * keeps them as it does after a refused save.
+   */
+  holdForVersionChange: VersionConflictState["holdForChange"];
+  /** Let go of a hold on the version, as a save that went through does. */
+  releaseVersionHold: VersionConflictState["release"];
+  /**
+   * The author keeps editing after a load of the current version that has
+   * not read it yet: that version no longer replaces the edits when it does.
+   */
+  stopAwaitingCurrentVersion: () => void;
+  /**
+   * The author's own change, made by a plugin's surface: the first copy of
+   * this entry NEWER than the one now on screen is taken in keeping the
+   * unsaved edits over it, as after the form's own save. A read of the same
+   * or an older version (one that started before the change) leaves it
+   * expected; the expectation ends with that newer copy, or with the entry.
+   */
+  expectOwnChange: () => void;
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/**
+ * Recursively extracts default values from field configurations.
+ * Handles nested fields in groups and arrays.
+ */
+
+/**
+ * Gets the singular label for a collection.
+ *
+ * Delegates to the shared resolver rather than restating the fallback, so the
+ * heading of this form and the shortcut that opens it name the entity
+ * identically -- and keep doing so if the order ever changes.
+ */
+function getSingularLabel(collection: EntryFormCollection): string {
+  return collectionSingularLabel(collection);
+}
+
+// ============================================================================
+// Hook
+// ============================================================================
+
+/**
+ * useEntryForm - Manages entry form state and operations
+ *
+ * Provides a complete form management solution including:
+ * - Zod schema generation from collection fields
+ * - Default value initialization
+ * - Create and update mutations
+ * - Delete operation
+ * - Dirty state tracking
+ *
+ * @example Create mode
+ * ```tsx
+ * const { form, handleSubmit, isSubmitting } = useEntryForm({
+ *   collection,
+ *   mode: "create",
+ *   onSuccess: (entry) => navigate(`/entries/${entry.id}`),
+ * });
+ * ```
+ *
+ * @example Edit mode
+ * ```tsx
+ * const { form, handleSubmit, handleDelete, isDirty } = useEntryForm({
+ *   collection,
+ *   entry: existingEntry,
+ *   mode: "edit",
+ *   onSuccess: () => toast.success("Entry updated"),
+ *   onDelete: () => navigate("/entries"),
+ * });
+ * ```
+ */
+/** What makes an entry a different one for the form: see `useEntryForm`. */
+interface EntryIdentity {
+  id: unknown;
+  version: string | null;
+  /** The language and read it was loaded for, and a working draft's overlay. */
+  place: string;
+  /** The entry and language, which a refused save's conflict is about. */
+  scope: string;
+}
+
+function entryIdentity(
+  entry: EntryData,
+  locale: string | undefined,
+  readDraft: boolean | undefined
+): EntryIdentity {
+  return {
+    id: entry.id,
+    version: typeof entry.updatedAt === "string" ? entry.updatedAt : null,
+    place: JSON.stringify([
+      locale ?? null,
+      readDraft ?? null,
+      entry._isWorkingDraft === true,
+    ]),
+    scope: JSON.stringify([entry.id, locale ?? null]),
+  };
+}
+
+/**
+ * How far an arriving entry resets the form. A different entry, language, read
+ * or working-draft overlay starts it again; so does a new version, unless it is
+ * this author's own save coming back (while the save is in flight, or matching
+ * the version it stored). The same identity again — a save's own optimistic
+ * copy or rollback, or newer content a working-draft save left the version of
+ * unchanged — and this author's own echo both keep what is unsaved.
+ */
+function resetDecision(
+  last: EntryIdentity | undefined,
+  next: EntryIdentity,
+  ownSave: OwnWrites
+): "keep-unsaved" | "own-change" | "full" {
+  if (last === undefined) return "full";
+  if (last.id !== next.id || last.place !== next.place) return "full";
+  if (last.version === next.version) return "keep-unsaved";
+  const ownEcho =
+    ownSave.inFlight ||
+    (next.version !== null && next.version === ownSave.storedVersion);
+  if (ownEcho) return "keep-unsaved";
+  // A version newer than the one on screen when the author's own plugin
+  // surface changed the entry: unsaved edits stay over it, as over their own
+  // save, and the copy starts from it. A read that started before the change
+  // brings no newer version and is judged as it always was.
+  return newerThan(next.version, ownSave.ownChange) ? "own-change" : "full";
+}
+
+/**
+ * Whether `version` is newer than the one an expected own change was made
+ * over. Versions are the entry's `updatedAt`, so newer is later in time; a
+ * change made over a copy with no version is passed by any version.
+ */
+function newerThan(
+  version: string | null,
+  ownChange: OwnWrites["ownChange"]
+): boolean {
+  if (ownChange === undefined || version === null) return false;
+  if (ownChange.over === null) return true;
+  return Date.parse(version) > Date.parse(ownChange.over);
+}
+
+/**
+ * What the form knows of its own writes, which decides how a newer copy of
+ * the entry is taken in: a save in flight, the version the last save stored,
+ * and whether the author's own plugin surface has just changed the entry.
+ */
+interface OwnWrites {
+  inFlight: boolean;
+  storedVersion?: string;
+  /**
+   * A change the author's own plugin surface made, being read back: the
+   * entry it was made on and the version on screen when it was made.
+   */
+  ownChange?: { id: EntryIdentity["id"]; over: string | null };
+}
+
+/**
+ * A reset that keeps what is unsaved: the fields the author changed keep their
+ * values and every other field takes the arriving one, and the form keeps the
+ * errors it shows, what was touched, and that it was submitted, so a failed
+ * save's field errors and re-validation survive the rollback that follows it.
+ */
+const KEEP_UNSAVED = {
+  keepDirtyValues: true,
+  keepDirty: true,
+  keepErrors: true,
+  keepTouched: true,
+  keepIsSubmitted: true,
+  keepSubmitCount: true,
+} as const;
+
+/**
+ * What the form takes in once a save is stored: normally the stored row, so a
+ * value the server normalised becomes the form's starting point. The row a
+ * save answers with leaves out a link the editor may not read, though, which
+ * the form held as a placeholder and sent as the reference it stands for.
+ * Taking that row in would drop the link from the form and the next save would
+ * remove it, so when the save sent a placeholder the form keeps what it sent,
+ * placeholders and all, until the page hands over the document merged with
+ * its stored links again.
+ */
+function storedAfterSave(
+  fields: FieldConfig[],
+  sent: Record<string, unknown>,
+  row: EntryData
+): Record<string, unknown> {
+  return holdsPlaceholders(fields, sent) ? sent : getDefaultValues(fields, row);
+}
+
+/** A host that holds nothing: writes are never held. */
+const writesNeverHeld = () => false;
+/** A host with no Save to offer a recovery. */
+const noSaveWithoutPublishing: RefObject<undefined> = { current: undefined };
+
+/**
+ * The entry form's write gate, declared once with its refused publish's way
+ * out: the latch every submission takes, and the recovery that takes it too.
+ *
+ * The latch is the synchronous half of the submit guard. `isSubmitting` is
+ * render state: it publishes one render behind the mutation, so two
+ * submissions in the same turn both read false and both write — two identical
+ * creates. The latch is set the moment the first submission enters and
+ * released when it settles, closing that gap.
+ *
+ * The recovery reads its gate when it runs, so it starts the form afresh from
+ * the defaults of the render then on screen, which carry the reloaded entry.
+ *
+ * Which entry, in which language, is on screen, as a submission asks once it
+ * is about to write: it started in one, and the form may hold another's
+ * values by then.
+ */
+function useEntryWriteGate(gate: {
+  form: UseFormReturn<Record<string, unknown>>;
+  defaultValues: Record<string, unknown>;
+  collection: string;
+  entry: EntryData | null;
+  locale: string | undefined;
+  writesHeld: () => boolean;
+  saveWithoutPublishing: RefObject<
+    (() => Promise<DocumentActionOutcome>) | undefined
+  >;
+  onRecovered: (() => void) | undefined;
+  /** The entry the form was last reset from; see `useConflictHold`. */
+  resetKey: RefObject<EntryIdentity | undefined>;
+}) {
+  const submissionLatch = useRef(false);
+  // The version the copy on screen started from, sent with every write, and
+  // the conflict a write refused because the entry changed since opens.
+  const version = useVersionConflict();
+  const hold = useConflictHold(version, gate.resetKey);
+  const scope = JSON.stringify([
+    gate.collection,
+    gate.entry?.id ?? null,
+    gate.locale ?? null,
+  ]);
+  // A new visit each time the scope changes, so going away and coming back
+  // is a move too: the form started afresh from cached values in between.
+  const scopeNow = useRef({ scope });
+  if (scopeNow.current.scope !== scope) scopeNow.current = { scope };
+  const { refusedForm, recovering } = useRefusedForm({
+    scope,
+    writesHeld: gate.writesHeld,
+    latch: submissionLatch,
+    saveWithoutPublishing: gate.saveWithoutPublishing,
+    resetToDocument: () => {
+      gate.form.reset(gate.defaultValues);
+      // Unsaved work is gone, and with it what a copy put into the form.
+      copiedValuesFor(gate.form.control).clear();
+      gate.onRecovered?.();
+    },
+    version: version.startedFrom,
+  });
+  return { submissionLatch, scopeNow, refusedForm, recovering, version, hold };
+}
+
+/**
+ * The hold a save refused because the entry changed since keeps on the form:
+ * no read resets the edits until the author chooses, and once they chose to
+ * load the current version, only a read newer than the refused edits does.
+ */
+function useConflictHold(
+  version: VersionConflictState,
+  resetKey: RefObject<EntryIdentity | undefined>
+): {
+  /** Whether a read of `read`, whose identity is `next`, leaves the form alone. */
+  holdsRead: (read: EntryData, next: EntryIdentity) => boolean;
+  /** The author chose the current version before the read that brings it. */
+  awaitCurrent: () => void;
+  /** The author keeps editing after all: no read is awaited to replace the form. */
+  stopAwaiting: () => void;
+  /** The form was reset from `read`, as far as `decision` says. */
+  resetBy: (
+    read: EntryData,
+    decision: ReturnType<typeof resetDecision>
+  ) => void;
+} {
+  const { pinned, refusedFrom, release, adoptRead } = version;
+  // Set when the author chose to load the current version before the read
+  // that brings it arrived: the next entry newer than the refused edits
+  // replaces the form.
+  const awaitingCurrent = useRef(false);
+  const holdsRead = useCallback(
+    (read: EntryData, next: EntryIdentity) => {
+      if (movedElsewhere(resetKey.current, next, pinned, awaitingCurrent)) {
+        // A read of another entry or language: the conflict was about the
+        // refused one, and holding this read would leave the form showing
+        // and saving that document's values. It goes, and the read resets
+        // the form as any other document's does.
+        awaitingCurrent.current = false;
+        release();
+        return false;
+      }
+      if (awaitingCurrent.current) {
+        // The read the author asked for: newer than the version the refused
+        // edits began from, which are kept as a recovery point.
+        if (versionOf(read) === refusedFrom()) return true;
+        awaitingCurrent.current = false;
+        release();
+        return false;
+      }
+      if (!pinned()) return false;
+      // A refused save holds the form: the newer version that follows the
+      // refusal must not reset the edits before the author chooses. Noted,
+      // so it is not taken for a newer one once they have.
+      resetKey.current = next;
+      return true;
+    },
+    [pinned, refusedFrom, release, resetKey]
+  );
+  const awaitCurrent = useCallback(() => {
+    awaitingCurrent.current = true;
+  }, []);
+  const stopAwaiting = useCallback(() => {
+    awaitingCurrent.current = false;
+  }, []);
+  // A read replaces the copy: its version is what the copy starts from. An
+  // echo of this author's own save keeps the version that save answered.
+  const resetBy = useCallback(
+    (read: EntryData, decision: ReturnType<typeof resetDecision>) => {
+      // A plugin's own change is a read too: its version is what the copy
+      // starts from, though the unsaved edits stay over it.
+      if (decision !== "keep-unsaved") adoptRead(read);
+    },
+    [adoptRead]
+  );
+  return { holdsRead, awaitCurrent, stopAwaiting, resetBy };
+}
+
+/** Whether `next` is another document than the one a conflict holds the form for. */
+function movedElsewhere(
+  last: EntryIdentity | undefined,
+  next: EntryIdentity,
+  pinned: () => boolean,
+  awaitingCurrent: RefObject<boolean>
+): boolean {
+  if (!pinned() && !awaitingCurrent.current) return false;
+  return last !== undefined && last.scope !== next.scope;
+}
+
+/**
+ * The author's choices on a save refused because the entry changed since.
+ *
+ * Save anyway: the refused write again, saving over the newer version on
+ * purpose, after the dialog that says whose changes it replaces. The form
+ * takes in what it stored, as after any save.
+ *
+ * Load the current version: the edits are first kept as a recovery point that
+ * remembers the version they began from, so nothing typed is lost; only then
+ * does the form take the current version. When the point cannot be written,
+ * nothing is replaced and the conflict stays open.
+ */
+function useConflictChoices(choices: {
+  version: VersionConflictState;
+  hold: { awaitCurrent: () => void };
+  entry: EntryData | null;
+  defaultValues: Record<string, unknown>;
+  form: UseFormReturn<Record<string, unknown>>;
+  fields: FieldConfig[];
+  collection: string;
+  locale: string | undefined;
+  readDraft: boolean | undefined;
+  resetKey: RefObject<EntryIdentity | undefined>;
+  ownSave: RefObject<OwnWrites>;
+  submissionLatch: RefObject<boolean>;
+  /** Whether writes are held, as the form's own saves ask before writing. */
+  writesHeld: () => boolean;
+  /** The entry's update, which the form's own saves go through as well. */
+  update: UseUpdateEntryOptions<Entry, Record<string, unknown>>;
+  onSuccess: UseEntryFormOptions["onSuccess"];
+}): Pick<UseEntryFormReturn, "saveAnyway" | "loadCurrentVersion"> & {
+  updateMutation: ReturnType<
+    typeof useUpdateEntry<Entry, Record<string, unknown>>
+  >;
+} {
+  const {
+    version,
+    hold,
+    entry,
+    defaultValues,
+    form,
+    fields,
+    collection,
+    locale,
+    readDraft,
+    resetKey,
+    ownSave,
+    submissionLatch,
+    writesHeld,
+    update,
+    onSuccess,
+  } = choices;
+  const updateMutation = useUpdateEntry(update);
+  // The entry and the values the form would take from it, as last handed
+  // over, for loading the current version on the author's choice.
+  const latest = useRef({ entry, defaultValues });
+  latest.current = { entry, defaultValues };
+
+  const saveAnyway = useCallback(async (): Promise<void> => {
+    const payload = version.overwrite();
+    if (!payload || !entry?.id || submissionLatch.current) return;
+    // Through the same gate as a save: someone else holding the document
+    // now stores nothing over their work.
+    if (writesHeld()) {
+      version.failed(HELD_NOTHING_SAVED);
+      return;
+    }
+    // The values the refused edits were typed as: a link the editor cannot
+    // see is a placeholder there, which the stored row leaves out. A refused
+    // status write carried none, so the form keeps what it holds, as after
+    // a status write that went through.
+    const sent = version.refusedValues();
+    submissionLatch.current = true;
+    ownSave.current.inFlight = true;
+    const write = version.writeFor();
+    try {
+      const result = await updateMutation.mutateAsync(payload as never);
+      ownSave.current.storedVersion = storedVersionOf(result.item);
+      write.answered(result.item);
+      write.released();
+      if (sent !== undefined) {
+        form.reset(storedAfterSave(fields, sent, result.item));
+      }
+      onSuccess?.(result.item);
+    } catch (error) {
+      version.failed(saveFailure(error));
+      throw error;
+    } finally {
+      ownSave.current.inFlight = false;
+      submissionLatch.current = false;
+    }
+  }, [
+    version,
+    entry?.id,
+    submissionLatch,
+    writesHeld,
+    ownSave,
+    updateMutation,
+    form,
+    fields,
+    onSuccess,
+  ]);
+
+  const loadCurrentVersion = useCallback(
+    async (keepEdits: boolean): Promise<void> => {
+      if (!version.pinned()) return;
+      if (keepEdits) {
+        await keepRefusedEdits(
+          version,
+          autosaveScopeFor("collection", collection, entry?.id),
+          form.getValues(),
+          locale
+        );
+      }
+      const current = latest.current;
+      if (
+        !current.entry ||
+        versionOf(current.entry) === version.refusedFrom()
+      ) {
+        // The read that brings the current version is still on its way.
+        hold.awaitCurrent();
+        return;
+      }
+      resetKey.current = entryIdentity(current.entry, locale, readDraft);
+      version.release();
+      version.adoptRead(current.entry);
+      form.reset(current.defaultValues);
+      copiedValuesFor(form.control).clear();
+    },
+    [version, hold, collection, entry?.id, form, locale, readDraft, resetKey]
+  );
+
+  return { updateMutation, saveAnyway, loadCurrentVersion };
+}
+
+/**
+ * Keep the refused edits as a recovery point that remembers the version they
+ * began from. Rejects, with the conflict saying why, when it cannot be written.
+ */
+async function keepRefusedEdits(
+  version: VersionConflictState,
+  scope: Parameters<VersionConflictState["keepEdits"]>[0],
+  values: Record<string, unknown>,
+  locale: string | undefined
+): Promise<void> {
+  try {
+    await version.keepEdits(scope, values, locale);
+  } catch (error) {
+    version.failed(
+      "Your edits could not be kept, so nothing was replaced. Try again."
+    );
+    throw error;
+  }
+}
+
+/** What Save anyway says when someone else holds the document. */
+const HELD_NOTHING_SAVED =
+  "Someone else is editing this document now, so nothing was saved.";
+
+/** The version a stored row's `updatedAt` names, for recognising its echo. */
+function storedVersionOf(row: EntryData): string | undefined {
+  return typeof row.updatedAt === "string" ? row.updatedAt : undefined;
+}
+
+/** Why a save did not go through, as the conflict says it. */
+function saveFailure(error: unknown): string {
+  return error instanceof Error
+    ? error.message
+    : "The save did not go through.";
+}
+
+export function useEntryForm({
+  collection,
+  entry = null,
+  mode,
+  onSuccess,
+  onError,
+  onDelete,
+  onCancel,
+  locale,
+  readDraft,
+  writesHeld = writesNeverHeld,
+  saveWithoutPublishing = noSaveWithoutPublishing,
+  onRecovered,
+}: UseEntryFormOptions): UseEntryFormReturn {
+  // Get fields from collection (supports both old and new API formats)
+  const fields = getCollectionFields(collection);
+
+  // Generate Zod schema from collection fields. Mode matters: password
+  // fields are write-only server-side, so edit forms treat blank as "keep
+  // the current password" instead of a required-field failure.
+  const schema = useMemo(() => {
+    try {
+      return generateClientSchema(fields, { mode });
+    } catch (error) {
+      console.error("Failed to generate schema:", error);
+      // Fallback to permissive schema
+      return z.record(z.string(), z.unknown());
+    }
+  }, [fields, mode]);
+
+  // Generate default values
+  const defaultValues = useMemo(() => {
+    const entryData = entry as Record<string, unknown> | null;
+    return getDefaultValues(fields, entryData ?? undefined);
+  }, [fields, entry]);
+
+  // Initialize form
+  //
+  // Why mode: "onSubmit" — Mobeen flagged that the previous "onBlur"
+  // setting fired field-level validation the moment a required field
+  // was blurred empty (including the very common "click into title,
+  // tab away" path on a fresh create page). Inline errors and the
+  // top-level toast both lit up before the user had even tried to
+  // save. Switching to "onSubmit" keeps the form quiet until the user
+  // explicitly clicks Save / Save Draft / Publish, then RHF's default
+  // `reValidateMode: "onChange"` keeps the errors in sync as the user
+  // fixes them.
+  const form = useForm<Record<string, unknown>>({
+    resolver: zodResolver(schema),
+    defaultValues,
+    mode: "onSubmit",
+  });
+  const formRestore = useFormRestore(form);
+
+  // Reset the form to the entry when the entry changes. defaultValues is
+  // useMemo'd on (fields, entry), and the query cache's structural sharing
+  // hands back the same object for a refetch of identical data, so this runs
+  // for changed content rather than on every keystroke or refetch. `form` is
+  // a stable RHF ref.
+  //
+  // How far is `resetDecision`'s, on the entry's identity: its id, its stored
+  // version, the language and the read it was loaded for, and whether a
+  // working draft is overlaid. A save rewrites the cache without changing any
+  // of those — its optimistic copy before the request, and the stored entry
+  // put back (as a new object) when the request fails — and a full reset to
+  // either wiped unsaved work and the errors the failure had just set. Every
+  // save of a published entry's working draft also keeps the published row's
+  // `updatedAt`, so a colleague's newer draft has the same identity and is told
+  // apart only by its values: the untouched fields show it. The stored row
+  // this author's own save puts in the cache arrives as a new version, and
+  // keeps whatever they typed while the save was in flight; it is recognised
+  // while the save is in flight, and afterwards by the version it stored,
+  // because it can arrive on either side of the save's own reset. Any other
+  // new version — a restore, a colleague's save — starts the form again from
+  // it, as Restore promises when it warns unsaved work is discarded.
+  // Set by a discard and cleared by the next document the page hands over;
+  // see `handleDiscardWorkingDraft`.
+  const [awaitingEntry, setAwaitingEntry] = useState(false);
+  const resetKey = useRef<EntryIdentity | undefined>(undefined);
+  const ownSave = useRef<OwnWrites>({
+    inFlight: false,
+  });
+  // The submit guard's synchronous half, the form as a refused publish's way
+  // out reaches it, which takes the same latch, and the version every write
+  // carries.
+  const { submissionLatch, scopeNow, refusedForm, recovering, version, hold } =
+    useEntryWriteGate({
+      form,
+      defaultValues,
+      collection: collection.name,
+      entry,
+      locale,
+      writesHeld,
+      saveWithoutPublishing,
+      onRecovered,
+      resetKey,
+    });
+  // Stable across renders, so the reset below runs on a new entry alone, never
+  // because the conflict opened or closed.
+  const { holdsRead, resetBy } = hold;
+
+  useEffect(() => {
+    if (!entry || mode !== "edit") return;
+    const next = entryIdentity(entry, locale, readDraft);
+    if (holdsRead(entry, next)) return;
+    const decision = resetDecision(resetKey.current, next, ownSave.current);
+    // Taken in once: a later newer version is someone else's again.
+    // Taken in once: a later newer version is someone else's again. And
+    // another entry ends it, since it was about the one it was made on.
+    if (
+      decision === "own-change" ||
+      ownSave.current.ownChange?.id !== next.id
+    ) {
+      ownSave.current.ownChange = undefined;
+    }
+    resetKey.current = next;
+    resetBy(entry, decision);
+    form.reset(defaultValues, decision === "full" ? undefined : KEEP_UNSAVED);
+    // A form started afresh, on another entry or language or a version not this author's, holds
+    // nothing a copy put into it; one keeping unsaved work keeps its copies with it.
+    if (decision === "full") copiedValuesFor(form.control).clear();
+    setAwaitingEntry(false);
+  }, [entry, mode, defaultValues, form, locale, readDraft, holdsRead, resetBy]);
+
+  // Mutations - pass setError to enable server error mapping to form fields
+  const createMutation = useCreateEntry({
+    collectionSlug: collection.name,
+    showToast: true,
+    setError: form.setError,
+    // A refusal's reason goes on its field only where the form draws one,
+    // which its conditions decide from the values on screen.
+    fields,
+    valueAt: path => form.getValues(path),
+  });
+
+  // The read asks every language's translation state only of a user who may
+  // read it, and the save keys its cache on the same choice.
+  const asksTranslationStatus = useAsksTranslationStatus(collection.name);
+  const { updateMutation, saveAnyway, loadCurrentVersion } = useConflictChoices(
+    {
+      version,
+      hold,
+      entry,
+      defaultValues,
+      form,
+      fields,
+      collection: collection.name,
+      locale,
+      readDraft,
+      resetKey,
+      ownSave,
+      submissionLatch,
+      writesHeld,
+      onSuccess,
+      update: {
+        collectionSlug: collection.name,
+        entryId: entry?.id ?? "",
+        showToast: true,
+        setError: form.setError,
+        // For the labels a refusal over out-of-date shared fields names them by.
+        fields,
+        // And whether the form draws a refused field, by its conditions.
+        valueAt: path => form.getValues(path),
+        // Route the save to the active content language.
+        locale,
+        // Match the editor's read mode so the optimistic update, rollback, and
+        // cancelQueries key onto the same cached document the form is showing. The
+        // caller passes how it read the entry; absent that, assume the full-page
+        // editor's mode (the working-draft overlay for a drafts collection).
+        draft: readDraft ?? readsHeldDraft(collection),
+        translationStatus: asksTranslationStatus,
+        refusedForm,
+      },
+    }
+  );
+
+  // Password fields submit "" to mean "keep the stored hash", so they are
+  // exempt from the blank-to-null normalization applied on submit.
+  const blankPasswordFields = useMemo(
+    () => passwordFieldNames(fields),
+    [fields]
+  );
+
+  const deleteMutation = useDeleteEntry({
+    collectionSlug: collection.name,
+    showToast: true,
+  });
+
+  const discardMutation = useDiscardWorkingDraft({
+    collectionSlug: collection.name,
+    entryId: entry?.id ?? "",
+    // The editor discards the language it is showing. Without this a localized
+    // document's discard falls to the default language, throwing away a pending
+    // change the author is not looking at and leaving the one they are.
+    locale,
+  });
+
+  // Singular label for UI
+  const singularLabel = getSingularLabel(collection);
+
+  // The mutations run in parallel, so nothing downstream serialises a second
+  // write against a first one still in flight — the guard has to live HERE,
+  // at the one gate every submission passes through, not in the controls the
+  // handler must not depend on.
+  const isSubmitting =
+    createMutation.isPending ||
+    updateMutation.isPending ||
+    discardMutation.isPending ||
+    awaitingEntry;
+
+  // The synchronous half of the same guard: `submissionLatch`, declared above
+  // because a refused publish's recovery takes it too.
+
+  // Submit handler. The intent arg names the user's button click and
+  // determines payload shape (see EntryFormIntent). Without an intent,
+  // submission keeps the existing status and just persists dirty fields
+  // (used by the single-Save button when drafts aren't enabled).
+  //
+  // Resolves to what the submission came to, never rejects: the toasts and
+  // field messages report to the author as before, and the outcome reports to
+  // the caller, which may have to act on it (save, then open the builder).
+  //
+  const handleSubmit = useCallback(
+    async (
+      e?: React.BaseSyntheticEvent,
+      intent?: EntryFormIntent
+    ): Promise<SubmitOutcome> => {
+      e?.preventDefault();
+      if (isSubmitting || submissionLatch.current) return submitBusy;
+      submissionLatch.current = true;
+      // The saved row, for `onSuccess` once the form has taken it in.
+      let savedRow: EntryData | undefined;
+      // The entry and language this submission is for.
+      const startedIn = scopeNow.current;
+      try {
+        const outcome = await submitDocument({
+          form,
+          event: e,
+          // Asked again once validation is done, immediately before the
+          // write: the document can change hands while it runs.
+          mayWrite: () => !writesHeld(),
+          // And the editor can move to another entry or language.
+          stillShown: () => scopeNow.current === startedIn,
+          // This entry's recovery points, addressed as its recorder does.
+          // The values a restore put in, whose sources the save names.
+          restore: formRestore,
+          recordingsFor: documentRecordingKey(
+            autosaveScopeFor("collection", collection.name, entry?.id)
+          ),
+          // Why: intent → payload mapping is the core PR-3 bug fix —
+          // extracted to mapIntentToPayload above so the contract is
+          // unit-testable without renderHook plumbing.
+          toPayload: values =>
+            mapIntentToPayload(values, intent, blankPasswordFields),
+          write: async data => {
+            // What is sent: a link the editor cannot see is held in the form
+            // as a placeholder and written as the reference it stands for.
+            const payload = withoutPlaceholders(fields, data) as Record<
+              string,
+              EntryValue
+            >;
+            if (mode === "create") {
+              const result = await createMutation.mutateAsync(payload);
+              savedRow = result.item;
+              return {
+                item: result.item,
+                stored: storedAfterSave(fields, data, result.item),
+              };
+            }
+            if (!entry?.id) {
+              throw new Error("Entry ID is required for update");
+            }
+            // entryId is passed to useUpdateEntry hook, so we just pass data
+            // here, with the version the copy started from.
+            ownSave.current.inFlight = true;
+            const write = version.writeFor();
+            const result = await updateMutation
+              .mutateAsync(version.withVersion(payload))
+              // A save made from an older version holds the edits on
+              // screen and opens the conflict; the failure is still told.
+              .catch(write.refusedThen(payload, data))
+              .finally(() => {
+                ownSave.current.inFlight = false;
+              });
+            ownSave.current.storedVersion =
+              typeof result.item.updatedAt === "string"
+                ? result.item.updatedAt
+                : undefined;
+            write.answered(result.item);
+            // Saved, so the copy is the current version: nothing a change
+            // told before still holds it.
+            write.released();
+            savedRow = result.item;
+            return {
+              item: result.item,
+              stored: storedAfterSave(fields, data, result.item),
+            };
+          },
+          // Server errors are mapped to form fields through the setError the
+          // mutation hooks are given; this reports the failure onwards.
+          onFailure: onError,
+        });
+        // The entry, not the envelope: the mutation resolves to the whole
+        // response so the hook can report post-commit failures, and this
+        // callback's contract is the saved row.
+        if (outcome.ok && savedRow !== undefined) onSuccess?.(savedRow);
+        return outcome;
+      } finally {
+        submissionLatch.current = false;
+      }
+    },
+    [
+      form,
+      formRestore,
+      mode,
+
+      entry?.id,
+      collection.name,
+      createMutation,
+      updateMutation,
+      isSubmitting,
+      onSuccess,
+      onError,
+      blankPasswordFields,
+      fields,
+      writesHeld,
+      submissionLatch,
+      scopeNow,
+      version,
+    ]
+  );
+
+  // A write of the status alone. It names no field, so the server judges it by
+  // the publish or unpublish permission alone, and it does not read the form:
+  // a user who may only publish cannot change what the form holds, and a
+  // check of it could refuse what the server would allow. The same latch as a
+  // submission, so a double click writes once.
+  const writeStatus = useCallback(
+    async (status: "published" | "draft"): Promise<SubmitOutcome> => {
+      if (mode !== "edit" || !entry?.id) {
+        return {
+          ok: false,
+          reason: "refused",
+          message: "Only a saved entry can be published or unpublished.",
+        };
+      }
+      if (isSubmitting || submissionLatch.current) return submitBusy;
+      submissionLatch.current = true;
+      const write = version.writeFor();
+      try {
+        const result = await updateMutation.mutateAsync(
+          version.withVersion({ status })
+        );
+        write.answered(result.item);
+        write.released();
+        onSuccess?.(result.item);
+        return { ok: true, item: result.item };
+      } catch (error) {
+        write.refused(error, { status });
+        onError?.(error);
+        return submitFailed(error);
+      } finally {
+        submissionLatch.current = false;
+      }
+    },
+    [
+      mode,
+      entry?.id,
+      updateMutation,
+      isSubmitting,
+      onSuccess,
+      onError,
+      submissionLatch,
+      version,
+    ]
+  );
+
+  // Delete handler. Resolves once the delete has been answered, with what it
+  // came to, and never rejects: the toast reports to the author as before, and
+  // the outcome reports to a caller that acts on it.
+  const handleDelete = useCallback(async (): Promise<DeleteOutcome> => {
+    if (mode !== "edit" || !entry?.id) {
+      return {
+        ok: false,
+        reason: "refused",
+        message: "Only a saved entry can be deleted.",
+      };
+    }
+
+    try {
+      await deleteMutation.mutateAsync(entry.id);
+      onDelete?.();
+      return { ok: true };
+    } catch (error) {
+      console.error("Delete error:", error);
+      onError?.(error);
+      return deleteFailed(error);
+    }
+  }, [mode, entry?.id, deleteMutation, onDelete, onError]);
+
+  // Discard handler (draft/published split). Throws away the pending working
+  // draft and resets the editor to the live published values the discard
+  // returns; the hook also invalidates the entry so the cache refetches the
+  // same row. A no-op outside edit mode or before the entry exists.
+  const handleDiscardWorkingDraft = useCallback(async () => {
+    if (mode !== "edit" || !entry?.id) {
+      return;
+    }
+    // Discard is a write like any other: the same latch the submit gate holds
+    // keeps a save started in the same turn from running concurrently, whose
+    // completion order would otherwise decide the working-draft state. A
+    // latched call is REFUSED, not queued silently — every other path here
+    // rejects so the awaiting confirm dialog stays open with its retry
+    // context, and a refused discard must not close it as though it landed.
+    if (isSubmitting || submissionLatch.current) {
+      const latchedError = new Error(
+        "A save is already in progress — wait for it to finish, then discard again."
+      );
+      onError?.(latchedError);
+      throw latchedError;
+    }
+    submissionLatch.current = true;
+    try {
+      // With the version the copy started from: a discard moves the entry's
+      // version, so the copy then starts from the one it answered.
+      const result = await discardMutation.mutateAsync(version.startedFrom());
+      version.adoptRead(result.item);
+      form.reset(getDefaultValues(fields, result.item));
+      // The working draft is discarded, copies into it with it.
+      copiedValuesFor(form.control).clear();
+      // The discard answers with the live row as the API populates it, which
+      // leaves out a related item the editor may not read, so a save of these
+      // values would delete those links. Saving waits for the page to hand
+      // over the document again, merged with its stored links.
+      setAwaitingEntry(true);
+    } catch (error) {
+      console.error("Discard working draft error:", error);
+      onError?.(error);
+      // Rethrow after surfacing the error so the confirm dialog, which awaits
+      // this, stays open on failure and keeps its retry context rather than
+      // closing as it does on success.
+      throw error;
+    } finally {
+      submissionLatch.current = false;
+    }
+  }, [
+    isSubmitting,
+    mode,
+    entry?.id,
+    discardMutation,
+    form,
+    fields,
+    onError,
+    submissionLatch,
+    version,
+  ]);
+
+  // The author's own plugin surface changed the entry: the copy read back is
+  // theirs, so it keeps their unsaved edits over it. Until released.
+  const expectOwnChange = useCallback((): void => {
+    const shown = resetKey.current;
+    if (shown === undefined) return;
+    // Made over the version on screen now; only a newer one is its copy.
+    ownSave.current.ownChange = { id: shown.id, over: shown.version };
+  }, []);
+
+  // Cancel handler
+  const handleCancel = useCallback(() => {
+    onCancel?.();
+  }, [onCancel]);
+
+  return {
+    form,
+    formRestore,
+    defaultValues,
+    handleSubmit,
+    writeStatus,
+    handleDelete,
+    // Returned as a promise (not fire-and-forget) so the confirm dialog can
+    // await the discard and keep its loading state visible until it settles.
+    handleDiscardWorkingDraft: () => handleDiscardWorkingDraft(),
+    handleCancel,
+    isSubmitting,
+    recovering,
+    isDeleting: deleteMutation.isPending,
+    isDirty: form.formState.isDirty,
+    mode,
+    collection,
+    entry,
+    singularLabel,
+    versionConflict: version.conflict,
+    saveAnyway,
+    loadCurrentVersion,
+    versionStartedFrom: version.startedFrom,
+    adoptRecoveredVersion: version.adoptRecovered,
+    holdForVersionChange: version.holdForChange,
+    releaseVersionHold: version.release,
+    stopAwaitingCurrentVersion: hold.stopAwaiting,
+    expectOwnChange,
+  };
+}

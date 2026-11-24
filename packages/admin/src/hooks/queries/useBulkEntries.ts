@@ -1,0 +1,340 @@
+/**
+ * useBulkEntries hooks (server-bulk pattern).
+ *
+ * TanStack Query mutation hooks for bulk entry operations. Each hook
+ * dispatches a single round-trip to the server's bulk endpoint
+ * (`POST /api/collections/{slug}/entries/bulk-delete` or
+ * `POST /api/collections/{slug}/entries/bulk-update`). The server
+ * runs per-row deletes/updates concurrently via Promise.allSettled,
+ * with full hooks + access-control pipeline preserved per row.
+ *
+ * Result shape (`BulkResponse<T>`):
+ *   - `message`: server-authored toast string (e.g. "Deleted 4 of 5 entries.")
+ *   - `items`:   successful records (full record for update; `{id}` for delete)
+ *   - `errors`:  per-item failures with canonical NextlyErrorCode + message
+ *
+ * @see services/entryApi.ts for the underlying calls
+ * @see lib/api/response-types.ts for `BulkResponse<T>` definition
+ */
+
+import {
+  useMutation,
+  useQueryClient,
+  type UseMutationResult,
+} from "@tanstack/react-query";
+
+import { toast } from "@admin/components/ui/toaster";
+import type { BulkResponse, PerItemError } from "@admin/lib/api/response-types";
+import { STALE_VERSION_CODE } from "@admin/lib/document-version";
+import {
+  toastMutationResult,
+  warningText,
+  type HookWarning,
+} from "@admin/lib/mutation-warnings";
+import {
+  entryApi,
+  entryKeys,
+  type UpdateEntryPayload,
+} from "@admin/services/entryApi";
+import type { Entry } from "@admin/types/collection";
+
+import { refreshRemovedFromCodeSchema } from "./removed-from-code-refusal";
+
+/**
+ * Callback payload for bulk operation lifecycle hooks. Carries the
+ * canonical `BulkResponse` shape so the consumer can render rich
+ * partial-failure UX (per-item code + message) without losing the
+ * scalar counts that older callers rely on.
+ */
+export interface BulkCallbackPayload<T> {
+  /** Number of items that succeeded (mirrors `items.length`). */
+  succeeded: number;
+  /** Number of items that failed (mirrors `errors.length`). */
+  failed: number;
+  /** Total items attempted (`succeeded + failed`). */
+  total: number;
+  /** Server-authored summary message (e.g. "Deleted 4 of 5 entries."). */
+  message: string;
+  /** Successful records returned by the server. */
+  items: T[];
+  /** Per-item failures with canonical NextlyErrorCode + public message. */
+  errors: PerItemError[];
+  /**
+   * What the server reported about the writes that DID happen.
+   *
+   * Distinct from `errors`, which are per-item failures that stopped a write:
+   * these describe committed writes — a post-commit hook that failed, or an
+   * advisory about the state one left behind. Present here as well as in the
+   * built-in toast, because a consumer that turns `showToast` off to render its
+   * own feedback would otherwise have no route to them at all.
+   */
+  warnings?: HookWarning[];
+}
+
+/** Build the callback payload from a server `BulkResponse<T>`. */
+/**
+ * Say what a bulk write did, and separately what it has to report.
+ *
+ * ONE owner for both bulk hooks, so delete and update cannot drift into two
+ * ways of saying the same thing — the reason `toastMutationResult` exists for
+ * single-entry writes, and this defers to it whenever nothing failed.
+ *
+ * A per-item failure keeps the headline: those writes did NOT happen, and that
+ * is what the user has to decide about. The advisories still travel, because a
+ * bulk response that produced both and showed one of them misdescribes its own
+ * outcome — and because an author publishing ten pages at once was otherwise
+ * told nothing that an author publishing one of them would have been told.
+ */
+function toastBulkResult<T>(payload: BulkCallbackPayload<T>): void {
+  // Read OFF the payload rather than taken as a second argument. The payload is
+  // what a consumer's own callback receives, so deriving the toast from it
+  // keeps one answer to "which warnings does this operation report". Passing
+  // the response's array alongside made two, aliased today and free to diverge
+  // the moment `toCallbackPayload` filters or defaults anything — and the two
+  // that then disagreed would be the built-in feedback and the custom feedback
+  // meant to replace it.
+  const warnings = payload.warnings;
+  if (payload.failed === 0) {
+    toastMutationResult(payload.message, warnings);
+    return;
+  }
+  // Plain text rather than the rich detail the single-entry presenter renders:
+  // this module is not a component file, and a joined sentence carries the same
+  // information without turning it into one.
+  // Through the SAME formatter the element path uses, so a failed row does not
+  // cost the surviving rows their identity: several identically-worded notices
+  // name no page at all.
+  // Documents changed since they were selected are named apart: they were
+  // refused so no one's later work is replaced, and opening them shows it.
+  const changed = payload.errors.filter(e => e.code === STALE_VERSION_CODE);
+  const changedNote =
+    changed.length > 0
+      ? `${changed.length === 1 ? "1 entry" : `${changed.length} entries`} changed since you selected ${changed.length === 1 ? "it" : "them"}, so ${changed.length === 1 ? "it was" : "they were"} left as ${changed.length === 1 ? "it is" : "they are"}: open ${changed.length === 1 ? "it" : "them"} to see the change.`
+      : "";
+  const detail = [changedNote, ...(warnings ?? []).map(warningText)]
+    .filter(text => text.length > 0)
+    .join(" ");
+  toast.warning(payload.message, {
+    ...(detail.length > 0 ? { description: detail } : {}),
+  });
+}
+
+function toCallbackPayload<T>(
+  response: BulkResponse<T>
+): BulkCallbackPayload<T> {
+  return {
+    succeeded: response.items.length,
+    failed: response.errors.length,
+    total: response.items.length + response.errors.length,
+    message: response.message,
+    items: response.items,
+    errors: response.errors,
+    // Carried into the callback as well as the built-in toast. A consumer that
+    // turns `showToast` off to render its own feedback is the one caller with
+    // no other route to these — the presenter it opted out of was the only
+    // thing reading them, so readiness notices and post-commit hook failures
+    // both vanished for exactly the surface that meant to handle them itself.
+    ...(response.warnings === undefined ? {} : { warnings: response.warnings }),
+  };
+}
+
+// ============================================================================
+// useBulkDeleteEntries
+// ============================================================================
+
+/**
+ * Options for useBulkDeleteEntries hook.
+ */
+export interface UseBulkDeleteEntriesOptions {
+  /** The collection slug/name containing the entries. */
+  collectionSlug: string;
+  /** Fired after the bulk request completes (success OR partial failure). */
+  onComplete?: (result: BulkCallbackPayload<{ id: string }>) => void;
+  /** Fired when the request resolved (regardless of partial failures). */
+  onSuccess?: (result: BulkCallbackPayload<{ id: string }>) => void;
+  /**
+   * Fired when the request itself rejected (network error, 4xx, 5xx).
+   * Per-item failures inside a 200 response do NOT trigger this callback;
+   * use `onComplete` to inspect `result.errors` for partial failures.
+   */
+  onError?: (error: Error) => void;
+  /** Whether to show a toast notification with `result.message` (default: true). */
+  showToast?: boolean;
+}
+
+/**
+ * Bulk-delete multiple entries in a single round-trip.
+ *
+ * Hits `POST /api/collections/{slug}/entries/bulk-delete`. Server runs
+ * per-row delete concurrently with full hook + access-control pipeline.
+ *
+ * @example Bulk delete with confirmation dialog
+ * ```tsx
+ * const bulkDelete = useBulkDeleteEntries({
+ *   collectionSlug: 'posts',
+ *   onComplete: result => {
+ *     if (result.failed > 0) {
+ *       openPartialFailureModal(result.errors);
+ *     }
+ *   },
+ * });
+ * bulkDelete.mutate(selectedIds);
+ * ```
+ */
+export function useBulkDeleteEntries({
+  collectionSlug,
+  onComplete,
+  onSuccess,
+  onError,
+  showToast = true,
+}: UseBulkDeleteEntriesOptions): UseMutationResult<
+  BulkResponse<{
+    id: string;
+  }>,
+  Error,
+  string[],
+  unknown
+> {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (ids: string[]) => {
+      return entryApi.deleteByIDs(collectionSlug, ids);
+    },
+    onSuccess: response => {
+      // Invalidate list + count queries; remove deleted detail entries
+      // from cache so any open detail page sees the canonical 404 from
+      // the server next time it refetches rather than a stale read.
+      void queryClient.invalidateQueries({
+        queryKey: entryKeys.listsByCollection(collectionSlug),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: entryKeys.counts(),
+      });
+      response.items.forEach(({ id }) => {
+        queryClient.removeQueries({
+          queryKey: entryKeys.detail(collectionSlug, id),
+        });
+      });
+
+      const payload = toCallbackPayload(response);
+
+      if (showToast) toastBulkResult(payload);
+
+      onComplete?.(payload);
+      onSuccess?.(payload);
+    },
+    onError: error => {
+      // A refusal because the collection was removed from code reads its
+      // schema again, so a screen opened before the removal turns read-only.
+      refreshRemovedFromCodeSchema(queryClient, error);
+      // Network / non-2xx error: the server-bulk request itself failed.
+      // Partial-success failures (200 with errors[]) come through onSuccess.
+      if (showToast) {
+        toast.error(
+          error instanceof Error ? error.message : "Bulk delete failed."
+        );
+      }
+      onError?.(error instanceof Error ? error : new Error(String(error)));
+    },
+  });
+}
+
+// ============================================================================
+// useBulkUpdateEntries
+// ============================================================================
+
+/**
+ * Options for useBulkUpdateEntries hook.
+ */
+export interface UseBulkUpdateEntriesOptions {
+  /** The collection slug/name containing the entries. */
+  collectionSlug: string;
+  /** Fired after the bulk request completes (success OR partial failure). */
+  onComplete?: (result: BulkCallbackPayload<Entry>) => void;
+  /** Fired when the request resolved (regardless of partial failures). */
+  onSuccess?: (result: BulkCallbackPayload<Entry>) => void;
+  /** Fired when the request itself rejected (network error, 4xx, 5xx). */
+  onError?: (error: Error) => void;
+  /** Whether to show a toast notification with `result.message` (default: true). */
+  showToast?: boolean;
+}
+
+/** What a bulk update writes, and to which documents. */
+export interface BulkUpdateVariables {
+  ids: string[];
+  data: UpdateEntryPayload;
+  /**
+   * Each document's version, as the list showed it: each is judged by its
+   * own, and one changed since is refused alone. All the ids or none.
+   */
+  revs?: Record<string, string>;
+}
+
+/**
+ * Bulk-update multiple entries in a single round-trip.
+ *
+ * Hits `POST /api/collections/{slug}/entries/bulk-update`. Server runs
+ * per-row update concurrently with full hook + validation + access-control
+ * pipeline. Successes carry the full mutated record so the admin can
+ * refresh local state without a re-fetch.
+ *
+ * @example Bulk publish selected drafts
+ * ```tsx
+ * const bulkUpdate = useBulkUpdateEntries({ collectionSlug: 'posts' });
+ * bulkUpdate.mutate({ ids: selectedIds, data: { status: 'published' } });
+ * ```
+ */
+export function useBulkUpdateEntries({
+  collectionSlug,
+  onComplete,
+  onSuccess,
+  onError,
+  showToast = true,
+}: UseBulkUpdateEntriesOptions): UseMutationResult<
+  BulkResponse<Entry>,
+  Error,
+  BulkUpdateVariables,
+  unknown
+> {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (variables: BulkUpdateVariables) => {
+      return entryApi.updateByIDs(collectionSlug, variables);
+    },
+    onSuccess: response => {
+      void queryClient.invalidateQueries({
+        queryKey: entryKeys.listsByCollection(collectionSlug),
+      });
+      // Invalidate per-detail queries for updated entries so any open
+      // detail view sees the new values on next refetch.
+      response.items.forEach(item => {
+        const id = (item as { id?: string }).id;
+        if (id) {
+          void queryClient.invalidateQueries({
+            queryKey: entryKeys.detail(collectionSlug, id),
+          });
+        }
+      });
+
+      const payload = toCallbackPayload(response);
+
+      if (showToast) toastBulkResult(payload);
+
+      onComplete?.(payload);
+      onSuccess?.(payload);
+    },
+    onError: error => {
+      // A refusal because the collection was removed from code reads its
+      // schema again, so a screen opened before the removal turns read-only.
+      refreshRemovedFromCodeSchema(queryClient, error);
+      if (showToast) {
+        toast.error(
+          error instanceof Error ? error.message : "Bulk update failed."
+        );
+      }
+      onError?.(error instanceof Error ? error : new Error(String(error)));
+    },
+  });
+}

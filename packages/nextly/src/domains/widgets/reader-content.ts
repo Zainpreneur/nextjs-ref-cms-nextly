@@ -1,0 +1,401 @@
+/**
+ * What content THIS reader can see, asked once and shared.
+ *
+ * Two questions, and they are kept apart on purpose. Which collections and
+ * singles the reader HAS -- what the `collections:present` and
+ * `singles:present` conditions gate the management cards on, and what the
+ * onboarding steps tick -- is the registries' own readable listing, the same
+ * one the list endpoints scope their rows by, so a card and the condition that
+ * offers it describe one set. Which of those a widget may QUERY is narrower:
+ * a collection whose stored shape is known to be ahead of its table has no
+ * source, and a count over it would throw. The content question walks only
+ * the second set, so an install whose one collection is mid-migration is told
+ * it has a collection and no content, rather than nothing at all.
+ *
+ * Each question has one implementation here because three callers ask them
+ * -- the conditions, the onboarding steps and the dashboard's onboarding
+ * endpoint -- and a second copy would agree on the day it was written and
+ * drift afterwards: one counting drafts and the other not produces a dashboard
+ * that offers an onboarding card while telling the reader their install has
+ * content.
+ *
+ * Its own module rather than a helper inside either caller, because the two
+ * import each other's neighbours: the condition evaluator names the onboarding
+ * answer, and the onboarding answer needs this counting. A shared leaf has no
+ * cycle to break.
+ *
+ * @module domains/widgets/reader-content
+ */
+
+import { callerMayPerform } from "../../auth/access/route-gate-adapters";
+import {
+  registeredWriteLanguagesFor,
+  withRuleLanguage,
+} from "../../auth/access/rule-language";
+import {
+  AUTHORIZATION_CONCURRENCY,
+  authorizationGroups,
+  readAccessCaller,
+} from "../../auth/entity-read-access";
+import { requireNextly } from "../../direct-api/nextly";
+import type { FindArgs } from "../../direct-api/types/collections";
+import { NextlyError } from "../../errors/nextly-error";
+import { rethrowIfAnyRuleCouldNotRun } from "../../errors/rule-could-not-run";
+import type { ReadCaller } from "../../services/dashboard/readable-resources";
+import { readableSlugsOfKind } from "../../services/lib/readable-slug-allowlist";
+
+import { createDisabledCollections } from "./collection-sources";
+import { isKeptOffDashboard } from "./kept-off-dashboard";
+import { listSources, sourceKindFromId, sourceTarget } from "./sources";
+
+/**
+ * The access arguments every reader-scoped count here reads through.
+ *
+ * The SAME shape a widget query uses, so a condition and the cards it governs
+ * cannot disagree about who the reader is. `overrideAccess: false` is the whole
+ * point: a count taken with the guard off would describe an install rather than
+ * a reader.
+ */
+function readArgs(caller: ReadCaller) {
+  return {
+    overrideAccess: false as const,
+    user: caller.user,
+    ...(caller.authenticatedScope
+      ? ({ actor: caller.authenticatedScope } satisfies Pick<
+          FindArgs<string>,
+          "actor"
+        >)
+      : {}),
+  };
+}
+
+/**
+ * The collections this reader may read, by slug.
+ *
+ * 🔴 The REGISTRY'S listing, permission-filtered -- `readableSlugAllowlist`,
+ * the allowlist the collections list endpoint scopes its rows by -- and not
+ * the widget source registry. The sources withhold a collection whose stored
+ * metadata is known to be ahead of its table, and one whose migration label
+ * declines to claim the table at all; derived from them, this answered "no
+ * collections" for an install whose one collection sat `pending` or `failed`,
+ * and the management card that would have listed that collection -- the one
+ * place a reader could see it needed attention -- was withheld with it. A
+ * card that lists registry rows is gated on registry rows.
+ */
+export async function readableCollectionSlugs(
+  caller: ReadCaller
+): Promise<string[]> {
+  return (await readableOfKind(caller, "collection")).slugs;
+}
+
+/**
+ * The reader's slugs of one kind as the dashboard counts them, and whether the
+ * registry could be read.
+ *
+ * 🔴 `reachable` is kept rather than folded into an empty list. An unreadable
+ * registry reads as "nothing here" to anything that sees only the slugs, and
+ * "nothing here" is the answer that offers the empty-install cards and ticks
+ * no setup step: a registry outage would tell an established site that it had
+ * no content. Whoever decides what to tell the reader reads `reachable`.
+ *
+ * Less what the dashboard keeps off: a collection or Single kept off it does
+ * not make a card worth offering, since the card would leave it out and draw
+ * empty. That includes one removed from code (`keptOffDashboard`), whose
+ * registry row can outlive its table, so no reader of this list queries a
+ * table that is gone.
+ */
+export async function readableOfKind(
+  caller: ReadCaller,
+  kind: "collection" | "single"
+): Promise<{ slugs: string[]; reachable: boolean }> {
+  const read = await readableSlugsOfKind(readAccessCaller(caller), kind);
+  return {
+    slugs: read.slugs.filter(slug => !isKeptOffDashboard(kind, slug)),
+    reachable: read.reachable,
+  };
+}
+
+/**
+ * The singles this reader may read, by slug.
+ *
+ * The same listing as {@link readableCollectionSlugs}, of the other registry,
+ * for the same reason: the singles card lists what the singles list endpoint
+ * answers, and this is the allowlist that endpoint scopes by.
+ */
+export async function readableSingleSlugs(
+  caller: ReadCaller
+): Promise<string[]> {
+  return (await readableOfKind(caller, "single")).slugs;
+}
+
+/**
+ * Whether this reader could create an entry in ANY collection they can read.
+ *
+ * Answers the grants ALONE: `false` means this reader holds `create-<slug>` on
+ * none of the collections named. An empty `readable` is therefore `false` too,
+ * and that is not the same statement as "cannot write a first entry" -- with
+ * nothing in reach there was no grant to find. The caller composes that case
+ * (see `ConditionProbe.mayCreateEntry`, which asks whether they could make a
+ * collection instead); answering it here would make this function two questions
+ * wearing one name.
+ *
+ * 🔴 Decided through {@link callerMayPerform}, not through the bare permission
+ * check beside it. For a scoped API KEY the two disagree: the bare check reads
+ * the stamped grant and stops, while a real write also evaluates the
+ * collection's code-defined `access.create` against that scope. A key stamped
+ * `create-<slug>` whose code rule refuses it would therefore have been told it
+ * may create -- and the step it was offered is refused by the write, which is
+ * the defect this predicate exists to prevent, wearing a different hat.
+ *
+ * Short-circuits on the first grant, and walks in {@link authorizationGroups}
+ * order otherwise: one decision, then bounded groups, so a cold per-user cache
+ * is populated once rather than missed by every member of the first fan-out.
+ *
+ * `mayCreateIn` decides one collection, {@link createVerdict} by default. A
+ * caller asking this over two sets for one request passes one memoised across
+ * both, so no collection's rules are evaluated twice and the two answers cannot
+ * disagree about it.
+ */
+export async function readerMayCreateEntry(
+  caller: ReadCaller,
+  readable: readonly string[],
+  mayCreateIn: (slug: string) => Promise<boolean> = createVerdict(caller)
+): Promise<boolean> {
+  for (const group of authorizationGroups(readable)) {
+    // `allSettled`, as the read decision beside it: a lookup that threw has
+    // told us nothing, and nothing must not read as a grant. The slug counts
+    // as refused and the rest of the set still answers.
+    const settled = await Promise.allSettled(
+      group.map(slug => mayCreateIn(slug))
+    );
+    // A rule that could not run never answered: the request ends with that,
+    // not with its collection counted as refused.
+    rethrowIfAnyRuleCouldNotRun(settled);
+    if (settled.some(result => result.status === "fulfilled" && result.value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether this reader may `action` one collection or Single: the decision a
+ * real write makes, through {@link callerMayPerform}, judged in the languages
+ * that write involves.
+ *
+ * The action a card offers opens a page by a link that names no language
+ * (`/admin/collections/<slug>/create`, `/admin/singles/<slug>`), and the
+ * write that page makes names none either, so it is judged as the route
+ * gate judges a write naming no language: in the default language alone
+ * (`registeredWriteLanguagesFor(undefined)`). Outside that, a rule would be
+ * told every configured language, and one that allows a reader the default
+ * language only would refuse here what the page then lets them do.
+ */
+function writeVerdict(
+  caller: ReadCaller,
+  action: "create" | "update"
+): (slug: string) => Promise<boolean> {
+  return slug =>
+    withRuleLanguage(registeredWriteLanguagesFor(undefined), () =>
+      callerMayPerform(caller.authenticatedScope, action, slug, caller.user)
+    );
+}
+
+/** Whether this reader may create an entry in one collection ({@link writeVerdict}). */
+export function createVerdict(
+  caller: ReadCaller
+): (slug: string) => Promise<boolean> {
+  return writeVerdict(caller, "create");
+}
+
+/**
+ * Whether this reader may update one Single or a collection's entries
+ * ({@link writeVerdict}), as {@link createVerdict} decides creating, so the
+ * two never come to disagree with the write about who may.
+ */
+export function updateVerdict(
+  caller: ReadCaller
+): (slug: string) => Promise<boolean> {
+  return writeVerdict(caller, "update");
+}
+
+/**
+ * Of the reader's collections or Singles, the ones a widget may QUERY.
+ *
+ * A published source is what says an entity's stored shape is not known to be
+ * ahead of its table: the source builder withholds one whose DDL a reload
+ * refused, and one whose migration label declines to claim the table. A read
+ * of an entity outside this set may throw -- the table can be absent -- and a
+ * condition that throws goes unanswered, which HIDES its widget; so the walks
+ * here stay inside it, and a fresh install whose one collection is
+ * mid-migration keeps its onboarding card.
+ */
+export function queryableSlugs(
+  kind: "collection" | "single",
+  readable: readonly string[]
+): string[] {
+  const published = new Set(
+    listSources()
+      .filter(source => sourceKindFromId(source.id) === kind)
+      .map(source => sourceTarget(source.id))
+  );
+  return readable.filter(slug => published.has(slug));
+}
+
+/**
+ * The collections whose definition turns creating entries off in the admin
+ * (`admin.disableCreate`, as a form's submissions do). The Create card offers
+ * none of them, so neither may the condition that offers the card.
+ *
+ * Read from the record the source refresh keeps (`createDisabledCollections`),
+ * which every dashboard request makes before it asks a condition: one read of
+ * every collection's definition per request, not a second one here.
+ *
+ * THROWS while the registry has never been read. "Unknown" must not read as
+ * "none turn creating off", which would offer Create on a collection the card
+ * then leaves out; a condition that throws goes unanswered, and the optional
+ * card it decides is withheld.
+ */
+export function createDisabledSlugs(): Promise<ReadonlySet<string>> {
+  const recorded = createDisabledCollections();
+  // A rejection rather than a throw: the probe asks this inside `Promise.all`,
+  // and the refusal belongs to the one condition that asked.
+  if (recorded === undefined) {
+    return Promise.reject(
+      NextlyError.internal({
+        logContext: {
+          reason: "the collection registry has not been read this process",
+        },
+      })
+    );
+  }
+  return Promise.resolve(recorded);
+}
+
+/**
+ * How long the content check may take before it answers "unknown".
+ *
+ * Five seconds: long enough for a few rounds of counts on a slow database, and
+ * short enough that a dashboard waiting on it is not mistaken for a hung one.
+ * Past it the answer is honestly not known, and "not known" must never read as
+ * "empty" -- telling a reader with content that their install is empty is the
+ * onboarding equivalent of losing their work.
+ */
+export const CONTENT_CHECK_BUDGET_MS = 5_000;
+
+/** What the content check can say: found some, found none, or ran out of time to know. */
+export type ContentAnswer = boolean | "unknown";
+
+/**
+ * Whether this reader can see any content at all.
+ *
+ * Counted CONCURRENTLY, at most {@link AUTHORIZATION_CONCURRENCY} collections at
+ * once (the bound the read decisions before it keep), and stops starting counts
+ * at the first collection holding a row. On an install with content that is the
+ * first round; only a genuinely empty install counts every collection, and then
+ * against empty tables. All inside {@link CONTENT_CHECK_BUDGET_MS}: an answer
+ * not reached by then is "unknown", which every reader of this treats as not
+ * empty. A Direct API count takes no signal, so a count already running when
+ * the check stops cannot be cancelled: it finishes, and its answer is ignored.
+ *
+ * Asked per collection through the ordinary counted read rather than through
+ * one unscoped total, because "any content" has to mean "any content THIS
+ * reader may read": a total taken with the guard off would answer from rows the
+ * reader is not allowed to know exist.
+ *
+ * `status: "all"` because a draft is content. A reader who has written one post
+ * and not published it is not looking at an empty install, and telling them
+ * they are is the onboarding equivalent of losing their work.
+ *
+ * A count that FAILS fails the check, as it did when the counts ran one after
+ * another: nothing is known about that collection, and guessing either way
+ * would be wrong.
+ */
+export async function readerHasContent(
+  caller: ReadCaller,
+  /**
+   * The reader's collections, when the caller already has them.
+   *
+   * Optional rather than required so this stays usable on its own, and passed
+   * by the condition probe so one layout read resolves the reader's
+   * permissions against every collection ONCE rather than per condition.
+   */
+  resolved?: readonly string[]
+): Promise<ContentAnswer> {
+  const slugs = queryableSlugs(
+    "collection",
+    resolved ?? (await readableCollectionSlugs(caller))
+  );
+  return anyHoldsEntry(slugs, async slug => {
+    const { total } = await requireNextly().count({
+      collection: slug,
+      status: "all",
+      ...readArgs(caller),
+    });
+    return total;
+  });
+}
+
+/**
+ * Whether any of `slugs` holds an entry, by `count`, with at most `limit`
+ * counts in flight, answering "unknown" once `budgetMs` has passed.
+ *
+ * Answers as soon as it knows: the first non-zero count answers `true` without
+ * waiting for the counts still in flight, and no count starts after an answer.
+ * Its own function so the pool's bound and its stopping can be watched with a
+ * count the test controls.
+ */
+export function anyHoldsEntry(
+  slugs: readonly string[],
+  count: (slug: string) => Promise<number>,
+  limit: number = AUTHORIZATION_CONCURRENCY,
+  budgetMs: number = CONTENT_CHECK_BUDGET_MS
+): Promise<ContentAnswer> {
+  if (slugs.length === 0) return Promise.resolve(false);
+  return new Promise<ContentAnswer>((resolve, reject) => {
+    let next = 0;
+    let inFlight = 0;
+    let answered = false;
+    const timer = setTimeout(() => answer("unknown"), budgetMs);
+    // A check that answered in a millisecond must not hold the process open
+    // for the rest of its budget.
+    timer.unref?.();
+
+    function answer(value: ContentAnswer): void {
+      if (answered) return;
+      answered = true;
+      clearTimeout(timer);
+      resolve(value);
+    }
+
+    function fail(error: unknown): void {
+      if (answered) return;
+      answered = true;
+      clearTimeout(timer);
+      // The count's own failure, passed on as it came; a thrown non-Error is
+      // wrapped so the caller always rejects with one.
+      reject(error instanceof Error ? error : new Error(String(error)));
+    }
+
+    function launch(): void {
+      while (!answered && inFlight < limit && next < slugs.length) {
+        const slug = slugs[next];
+        next += 1;
+        if (slug === undefined) continue;
+        inFlight += 1;
+        // Through a resolved promise, so a count that throws as it is called
+        // fails the check rather than escaping this loop.
+        Promise.resolve()
+          .then(() => count(slug))
+          .then(total => {
+            inFlight -= 1;
+            if (total > 0) answer(true);
+            else launch();
+          }, fail);
+      }
+      if (!answered && inFlight === 0 && next >= slugs.length) answer(false);
+    }
+
+    launch();
+  });
+}

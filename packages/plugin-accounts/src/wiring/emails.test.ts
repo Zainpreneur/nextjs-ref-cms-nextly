@@ -1,0 +1,150 @@
+import { describe, expect, it } from "vitest";
+
+import type { AccountsEmail } from "../flows/mail";
+
+import { accountsEmailTemplates, emailVariables, templateSlug } from "./emails";
+
+const base = { accountId: "a-1", to: "dana@example.com" };
+
+/** One email of every kind, as the flows queue them. */
+const SAMPLES: {
+  [K in AccountsEmail["kind"]]: Extract<AccountsEmail, { kind: K }>;
+} = {
+  "verify-address": {
+    ...base,
+    kind: "verify-address",
+    link: "L",
+    code: "123456",
+    notMeLink: "N",
+    refs: { link: "ref-1", code: "ref-2", notMeLink: "ref-3" },
+  },
+  "sign-up-taken": {
+    ...base,
+    kind: "sign-up-taken",
+    deactivated: false,
+    signInLink: "S",
+    resetLink: "R",
+  },
+  "reset-password": {
+    ...base,
+    kind: "reset-password",
+    link: "L",
+    refs: { link: "ref-1" },
+  },
+  "reset-required": {
+    ...base,
+    kind: "reset-required",
+    link: "L",
+    refs: { link: "ref-1" },
+  },
+  "address-change-asked": {
+    ...base,
+    kind: "address-change-asked",
+    newAddress: "new@example.com",
+    cancelLink: "C",
+    refs: { cancelLink: "ref-1" },
+  },
+  "confirm-new-address": {
+    ...base,
+    kind: "confirm-new-address",
+    link: "L",
+    code: "123456",
+    refs: { link: "ref-1", code: "ref-2" },
+  },
+  "address-in-use": { ...base, kind: "address-in-use" },
+  "address-changed": {
+    ...base,
+    kind: "address-changed",
+    newAddress: "new@example.com",
+  },
+  "account-deleted": { ...base, kind: "account-deleted" },
+  "password-changed": { ...base, kind: "password-changed" },
+  invitation: {
+    kind: "invitation",
+    accountId: null,
+    to: "dana@example.com",
+    link: "L",
+    name: "Dana Reyes",
+    expiresAt: "2026-11-30T12:00:00.000Z",
+    expiresAtText: "30 November 2026, 5:00 PM",
+    timeZone: "Asia/Karachi",
+    refs: { link: "ref-1" },
+  },
+  "invitation-has-account": {
+    ...base,
+    kind: "invitation-has-account",
+    signInLink: "S",
+    resetLink: "R",
+  },
+};
+
+describe("the accounts email templates", () => {
+  it("give every kind a template whose variables its email carries", () => {
+    const templates = new Map(
+      accountsEmailTemplates().map(template => [template.slug, template])
+    );
+
+    for (const email of Object.values(SAMPLES)) {
+      const template = templates.get(templateSlug(email.kind));
+      expect(template, email.kind).toBeDefined();
+      const variables = emailVariables(email);
+      for (const variable of template?.variables ?? []) {
+        expect(
+          variables[variable.name],
+          `${email.kind}: ${variable.name}`
+        ).toBeTruthy();
+      }
+    }
+    expect(templates.size).toBe(Object.keys(SAMPLES).length);
+  });
+
+  it("say when each is sent", () => {
+    const templates = accountsEmailTemplates();
+    expect(templates).toHaveLength(Object.keys(SAMPLES).length);
+    for (const template of templates) {
+      expect(template.description?.trim(), template.slug).toBeTruthy();
+    }
+  });
+
+  it("say what sends each template", () => {
+    const templates = accountsEmailTemplates();
+    expect(templates).toHaveLength(Object.keys(SAMPLES).length);
+    for (const template of templates) {
+      expect(template.sentBy?.length, template.slug).toBeGreaterThan(0);
+      for (const line of template.sentBy ?? []) {
+        expect(line.trim(), template.slug).toBeTruthy();
+      }
+    }
+
+    const bySlug = new Map(templates.map(t => [t.slug, t.sentBy]));
+    expect(bySlug.get(templateSlug("verify-address"))).toEqual([
+      "Someone signs up",
+      "Someone asks for a new verification link",
+    ]);
+  });
+
+  it("mark as carrying a secret every email with a link or code that acts for whoever holds it, and no other", () => {
+    // A link that verifies, resets, confirms or cancels for whoever opens it,
+    // or a code that does the same. The sign-in and reset links of
+    // `sign-up-taken` lead to the ordinary pages, and carry nothing.
+    const secret: AccountsEmail["kind"][] = [
+      "verify-address",
+      "reset-password",
+      "reset-required",
+      "address-change-asked",
+      "confirm-new-address",
+      "invitation",
+    ];
+    const marked = accountsEmailTemplates()
+      .filter(template => template.carriesSecret === true)
+      .map(template => template.slug)
+      .sort();
+    expect(marked).toEqual(secret.map(templateSlug).sort());
+  });
+
+  it("never hands a template the recipient, the account's id or its secrets' refs", () => {
+    expect(Object.keys(emailVariables(SAMPLES["reset-password"]))).toEqual([
+      "link",
+    ]);
+  });
+});

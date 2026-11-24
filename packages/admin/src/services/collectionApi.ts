@@ -1,0 +1,234 @@
+import type { ListResponse, TableParams } from "@nextlyhq/ui";
+
+import { buildQuery as buildQueryUtil } from "../lib/api/buildQuery";
+import { fetcher } from "../lib/api/fetcher";
+import { protectedApi } from "../lib/api/protectedApi";
+import type { MutationResponse } from "../lib/api/response-types";
+import type {
+  Collection,
+  CreateCollectionPayload,
+  UpdateCollectionPayload,
+  Entry,
+} from "../types/collection";
+import type { ApiCollection } from "../types/entities";
+
+import { withListOwner, type ListOwner } from "./list-owner";
+
+// Build query string for pagination and search using shared utility
+const buildQuery = (params: TableParams): string => {
+  return buildQueryUtil(params, {
+    fieldMapping: {
+      name: "name",
+      email: "email",
+      roles: "roles",
+      created: "createdAt",
+    },
+    validSortFields: ["name", "email", "createdAt", "roles"],
+  });
+};
+
+/**
+ * The path a list of collections is read from, for `params`: the one place it is
+ * spelled, shared by the list's own read and the admin's startup request,
+ * which must name exactly the path the read will ask for.
+ */
+export function collectionsListPath(
+  params: TableParams,
+  owner?: ListOwner
+): string {
+  const query = withListOwner(buildQuery(params), owner);
+  return `/collections${query ? `?${query}` : ""}`;
+}
+
+/**
+ * Fetch collections with pagination.
+ */
+export const fetchCollections = async (
+  params: TableParams,
+  // The site's collections or the plugins'; none lists both.
+  owner?: ListOwner
+): Promise<ListResponse<ApiCollection>> => {
+  const url = collectionsListPath(params, owner);
+
+  const result = await fetcher<ListResponse<ApiCollection>>(url, {}, true);
+
+  if (process.env.NODE_ENV === "development") {
+    const withSG = result.items.filter(
+      (c: ApiCollection) => c.admin?.sidebarGroup
+    );
+    if (withSG.length > 0) {
+      console.log(
+        "[fetchCollections] Collections with sidebarGroup in API response:",
+        withSG.map((c: ApiCollection) => ({
+          name: c.name,
+          sidebarGroup: c.admin?.sidebarGroup,
+          admin: c.admin,
+        }))
+      );
+    } else {
+      console.log(
+        "[fetchCollections] No collections have admin.sidebarGroup. Sample admin fields:",
+        result.items
+          .slice(0, 3)
+          .map((c: ApiCollection) => ({ name: c.name, admin: c.admin }))
+      );
+    }
+  }
+
+  return result;
+};
+
+/**
+ * Delete a collection. Caller expects void; we discard the body.
+ */
+export const deleteCollection = async (collectionId: string): Promise<void> => {
+  await fetcher<MutationResponse<ApiCollection>>(
+    `/collections/${collectionId}`,
+    {
+      method: "DELETE",
+    },
+    true
+  );
+};
+
+/** What one plugin says deleting collections takes with it. */
+export interface CollectionDeleteImpactGroup {
+  /** The plugin's name, which the dialog lists the items under. */
+  plugin: string;
+  items: Array<{ label: string; kind: string }>;
+}
+
+/**
+ * What deleting `slugs` together takes with it besides their own entries, by
+ * plugin: the server asks each plugin's collection-delete hook, and deletes
+ * nothing. The first slug goes in the path and the rest in `?together=`, as
+ * the delete itself sends them.
+ */
+export const fetchCollectionDeleteImpact = async (
+  slugs: readonly string[]
+): Promise<CollectionDeleteImpactGroup[]> => {
+  const [first, ...rest] = slugs;
+  if (first === undefined) return [];
+  const together =
+    rest.length > 0 ? `?together=${encodeURIComponent(rest.join(","))}` : "";
+  const result = await protectedApi.get<{
+    impact: CollectionDeleteImpactGroup[];
+  }>(
+    `/collections/schema/${encodeURIComponent(first)}/delete-impact${together}`
+  );
+  return result.impact;
+};
+
+/** The type of {@link collectionApi}. */
+type CollectionApiType = {
+  readonly fetchCollections: typeof fetchCollections;
+  readonly deleteCollection: typeof deleteCollection;
+  readonly list: () => Promise<Collection[]>;
+  readonly get: (collectionName: string) => Promise<Collection>;
+  readonly getSchema: (collectionName: string) => Promise<Collection>;
+  readonly create: (
+    payload: CreateCollectionPayload
+  ) => Promise<{ message: string }>;
+  readonly update: (
+    collectionName: string,
+    payload: UpdateCollectionPayload
+  ) => Promise<{ message: string }>;
+  readonly remove: (collectionName: string) => Promise<{ message: string }>;
+  readonly listEntries: (collectionName: string) => Promise<Entry[]>;
+  readonly createEntry: (
+    collectionName: string,
+    data: Record<string, unknown>
+  ) => Promise<{ message: string }>;
+  readonly deleteEntry: (
+    collectionName: string,
+    entryId: string
+  ) => Promise<{ message: string }>;
+};
+
+/**
+ * Collection API client surface.
+ *
+ * The `protectedApi.*` calls below receive the raw canonical body
+ * straight from `fetcher`. List endpoints return `ListResponse<T>`;
+ * bare reads (get, getSchema, listEntries) return the doc directly;
+ * create/update/remove/createEntry/deleteEntry return
+ * `MutationResponse<T>`. The legacy `{ message }` projection is
+ * preserved by mapping `response.message` from the mutation envelope.
+ */
+export const collectionApi: CollectionApiType = {
+  fetchCollections,
+  deleteCollection,
+  list: async (): Promise<Collection[]> => {
+    const result =
+      await protectedApi.get<ListResponse<Collection>>("/collections");
+    return result.items;
+  },
+
+  get: async (collectionName: string): Promise<Collection> => {
+    return protectedApi.get<Collection>(`/collections/${collectionName}`);
+  },
+
+  getSchema: async (collectionName: string): Promise<Collection> => {
+    return protectedApi.get<Collection>(
+      `/collections/schema/${collectionName}`
+    );
+  },
+
+  create: async (
+    payload: CreateCollectionPayload
+  ): Promise<{ message: string }> => {
+    const result = await protectedApi.post<MutationResponse<ApiCollection>>(
+      "/collections",
+      payload
+    );
+    return { message: result.message };
+  },
+
+  update: async (
+    collectionName: string,
+    payload: UpdateCollectionPayload
+  ): Promise<{ message: string }> => {
+    const result = await protectedApi.patch<MutationResponse<ApiCollection>>(
+      `/collections/${collectionName}`,
+      payload
+    );
+    return { message: result.message };
+  },
+
+  remove: async (collectionName: string): Promise<{ message: string }> => {
+    const result = await protectedApi.delete<MutationResponse<ApiCollection>>(
+      `/collections/${collectionName}`
+    );
+    return { message: result.message };
+  },
+
+  listEntries: async (collectionName: string): Promise<Entry[]> => {
+    // Sub-resource list endpoints return ListResponse<Entry> (`{ items, meta }`);
+    // the legacy callers expect a bare array, so we project items.
+    const result = await protectedApi.get<ListResponse<Entry>>(
+      `/collections/${collectionName}/entries`
+    );
+    return result.items;
+  },
+
+  createEntry: async (
+    collectionName: string,
+    data: Record<string, unknown>
+  ): Promise<{ message: string }> => {
+    const result = await protectedApi.post<MutationResponse<Entry>>(
+      `/collections/${collectionName}/entries`,
+      data
+    );
+    return { message: result.message };
+  },
+
+  deleteEntry: async (
+    collectionName: string,
+    entryId: string
+  ): Promise<{ message: string }> => {
+    const result = await protectedApi.delete<MutationResponse<Entry>>(
+      `/collections/${collectionName}/entries/${entryId}`
+    );
+    return { message: result.message };
+  },
+} as const;

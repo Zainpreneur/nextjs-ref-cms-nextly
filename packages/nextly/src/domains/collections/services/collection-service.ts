@@ -1,0 +1,1537 @@
+/**
+ * CollectionService - Unified service for collection operations
+ *
+ * This service provides a clean API for both collection metadata (CRUD on collections)
+ * and entry operations (CRUD on documents within collections). It follows the new
+ * service layer architecture with:
+ *
+ * - Exception-based error handling using NextlyError
+ * - RequestContext for user/locale context
+ * - PaginatedResult for list operations
+ * - Transaction-aware methods (*InTransaction) using adapter transactions
+ * - Database adapter abstraction for multi-DB support (PostgreSQL, MySQL, SQLite)
+ *
+ * Internally delegates to CollectionMetadataService and CollectionEntryService
+ * for the actual implementation, converting their return format to the new pattern.
+ *
+ * @example
+ * ```typescript
+ * import { CollectionService, NextlyError } from 'nextly';
+ *
+ * const service = new CollectionService(adapter, logger, metadataService, entryService);
+ *
+ * // Create a collection
+ * const collection = await service.createCollection({
+ *   name: 'posts',
+ *   label: 'Blog Posts',
+ *   fields: [...]
+ * }, context);
+ *
+ * // Create an entry
+ * const entry = await service.createEntry('posts', { title: 'Hello' }, context);
+ *
+ * // Error handling
+ * try {
+ *   const entry = await service.findEntryById('posts', 'nonexistent', context);
+ * } catch (error) {
+ *   if (NextlyError.is(error)) {
+ *     console.log(error.code); // 'NOT_FOUND'
+ *     console.log(error.statusCode); // 404
+ *   }
+ * }
+ *
+ * // Transaction support
+ * await service.withTransaction(async (tx) => {
+ *   const entry = await service.createEntryInTransaction(tx, 'posts', data, context);
+ *   await service.updateEntryInTransaction(tx, 'posts', entry.id, moreData, context);
+ * });
+ * ```
+ */
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import type { TransactionContext } from "@nextlyhq/adapter-drizzle/types";
+
+// PR 4 migration: replaced legacy ServiceError throws with the unified
+// NextlyError API. The orchestrator still translates the inner
+// MetadataServiceResult / CollectionServiceResult shapes (returned by
+// metadata/entry services for backward compatibility) into thrown
+// NextlyErrors at this boundary so callers see the new error model.
+import type { RequestActor } from "../../../auth/request-actor";
+import { NextlyError } from "../../../errors";
+import { errorFromServiceEnvelope } from "../../../errors/from-service-envelope";
+import type { RevalidationIntent } from "../../../revalidation/types";
+import type { FieldDefinition } from "../../../schemas/dynamic-collections";
+import type { CollectionEntryService } from "../../../services/collections/collection-entry-service";
+import type {
+  RequestContext,
+  PaginatedResult,
+  QueryOptions,
+  SortOptions,
+  Logger,
+} from "../../../services/shared";
+import { BaseService } from "../../../shared/base-service";
+import type { CompanionSchema } from "../../i18n/runtime/companion-io";
+import { stopReleasesHolding } from "../../releases/early-stop";
+import {
+  parseFieldRenameAnswers,
+  withFieldRenameAnswers,
+  withoutRenameAnswers,
+  type FieldRenameAnswer,
+} from "../../schema/field-rename-answers";
+import {
+  parseFieldRewrite,
+  rewriteCallerOf,
+  rewritesSingle,
+  type FieldRewriteResult,
+} from "../../versions/field-rewrite";
+import type { WhereFilter } from "../query/query-operators";
+
+import type { CollectionMetadataService } from "./collection-metadata-service";
+import type { BatchOperationResult, BulkUpdateEntry } from "./collection-types";
+import { forwardedFromContext } from "./forwarded-context";
+
+/**
+ * Convert the structured {@link SortOptions} into the entry service's string
+ * sort format (`-field` = desc, `field` = asc). Returns `undefined` when no
+ * sort is requested so the entry service keeps its default ordering.
+ */
+function serializeSort(sort: SortOptions | undefined): string | undefined {
+  if (!sort) return undefined;
+  return sort.direction === "desc" ? `-${sort.field}` : sort.field;
+}
+
+/**
+ * Collection metadata returned from operations
+ */
+export interface Collection {
+  id: string;
+  name: string;
+  label: string;
+  tableName: string;
+  description?: string;
+  icon?: string;
+  schemaDefinition: {
+    fields: FieldDefinition[];
+  };
+  createdBy?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/**
+ * Input for creating a collection
+ */
+export interface CreateCollectionInput {
+  name: string;
+  label: string;
+  description?: string;
+  icon?: string;
+  /** Whether the collection has Draft/Published enabled. */
+  status?: boolean;
+  /** i18n: whether the collection is localized (translatable fields + companion table). */
+  localized?: boolean;
+  fields: FieldDefinition[];
+}
+
+/**
+ * Input for updating a collection
+ */
+export interface UpdateCollectionInput {
+  label?: string;
+  description?: string;
+  icon?: string;
+  fields?: FieldDefinition[];
+  /**
+   * @experimental For a field `fields` removes and another of the same type it adds, whether
+   * that is a rename (`"rename"`, keeping the values) or not (`"drop_and_add"`). A change
+   * that makes such a pair without answering it is refused, never taken for a rename.
+   */
+  renames?: FieldRenameAnswer[];
+}
+
+/**
+ * Options for listing collections
+ */
+export interface ListCollectionsOptions {
+  page?: number;
+  limit?: number;
+  search?: string;
+  sortBy?: "slug" | "createdAt" | "updatedAt";
+  sortOrder?: "asc" | "desc";
+  includeSchema?: boolean;
+}
+
+/**
+ * Entry (document) within a collection
+ */
+export interface CollectionEntry {
+  id: string;
+  [key: string]: unknown;
+  createdAt: Date;
+  updatedAt: Date;
+  /**
+   * The entry's version: changed by every save and by no read, and naming each
+   * language the read or write covered. Opaque — hand it back as it is.
+   *
+   * @experimental An update that hands it back is refused when it is no
+   *   longer the current version (`STALE_VERSION`).
+   */
+  _rev?: string;
+}
+
+/**
+ * A create from a source as the entry service takes it, from a caller's
+ * request context. The source is copied field by field, so nothing beyond
+ * the entry it names reaches the copy from the caller's object.
+ */
+function copyRequestOf(
+  collectionName: string,
+  data: Record<string, unknown>,
+  source: { collection: string; id: string; field?: string },
+  context: RequestContext
+): Parameters<CollectionEntryService["createEntryFromSource"]>[0] {
+  const forwarded = forwardedFromContext(context);
+  return {
+    collectionName,
+    source: {
+      collection: source.collection,
+      id: source.id,
+      ...(source.field === undefined ? {} : { field: source.field }),
+    },
+    data,
+    user: forwarded.user,
+    overrideAccess: forwarded.overrideAccess,
+    authenticatedScope: forwarded.authenticatedScope,
+    context: forwarded.context,
+    request: forwarded.request,
+    locale: forwarded.locale,
+    ...(forwarded.actor === undefined ? {} : { actor: forwarded.actor }),
+  };
+}
+
+/**
+ * CollectionService - Unified service for collection and entry operations
+ *
+ * Provides both collection metadata CRUD (create/update/delete collections)
+ * and entry CRUD (documents within collections) with:
+ *
+ * - Exception-based error handling (throws NextlyError)
+ * - Type-safe RequestContext
+ * - PaginatedResult for list operations
+ * - Database adapter abstraction for multi-DB support
+ * - Transaction support via adapter transactions
+ *
+ * @extends BaseService - Provides adapter access, transaction helpers, and WHERE clause builders
+ */
+export class CollectionService extends BaseService {
+  constructor(
+    adapter: DrizzleAdapter,
+    logger: Logger,
+    private readonly metadataService: CollectionMetadataService,
+    private readonly entryService: CollectionEntryService
+  ) {
+    super(adapter, logger);
+  }
+
+  /**
+   * Revalidation intents produced by createEntryInTransaction /
+   * updateEntryInTransaction / deleteEntryInTransaction calls made during an
+   * owned transaction, keyed by the transaction handle so concurrent
+   * transactions (one pooled client each on Postgres/MySQL) never share a
+   * collector. The wrappers push into it; `withTransaction` drains it once the
+   * transaction commits.
+   */
+  private readonly pendingTxIntents = new Map<unknown, RevalidationIntent[]>();
+
+  /**
+   * Transaction handles whose `*InTransaction` wrappers recorded at least one
+   * outbox event, so `withTransaction` can offer the fast drain once after the
+   * owning transaction commits — the tx-API wrappers return only the entry, so
+   * the event signal (like the revalidation intent) has nowhere else to go.
+   */
+  private readonly pendingTxEvents = new Set<unknown>();
+
+  /**
+   * Transaction handles whose `*InTransaction` wrappers committed at least one
+   * write, independent of whether that write produced a revalidation intent or an
+   * outbox event. `withTransaction` offers the opportunistic retention pass for
+   * any committed write (matching the automatic path), so a write that opts out
+   * of BOTH revalidation and recording still triggers the pass rather than
+   * relying on those optional signals.
+   */
+  private readonly pendingTxCommittedWrites = new Set<unknown>();
+
+  /**
+   * Documents that `updateEntryInTransaction` / `deleteEntryInTransaction`
+   * saved or deleted during an owned transaction, keyed by its handle like the
+   * intents, so `withTransaction` hands them to the early stop once it commits:
+   * a scheduled release holding one may now have a hard problem. Not before,
+   * because the early stop reads through the database as any reader does and
+   * would not see the transaction's own writes, and its stop is a transaction
+   * of its own, which must not open inside this one.
+   */
+  private readonly pendingTxDocuments = new Map<
+    unknown,
+    { collectionName: string; entryId: string }[]
+  >();
+
+  /**
+   * Run work inside a database transaction, then flush the cache-revalidation
+   * intents produced by any createEntryInTransaction / updateEntryInTransaction /
+   * deleteEntryInTransaction calls made against the same `tx`. The flush happens
+   * after the transaction commits, so a rolled-back write busts nothing. Because
+   * the wrappers return only the entry (or void), this is the supported way to
+   * coordinate atomic multi-writes with correct revalidation — without it the
+   * committed writes' intents would have nowhere to go.
+   *
+   * Unlike the base helper, this yields the adapter's `TransactionContext` (the
+   * handle the *InTransaction wrappers expect), not a raw driver transaction.
+   *
+   * Warm each collection's localized readiness before opening the transaction — see
+   * {@link warmLocalizedReadiness}. It cannot be done from inside one, and without it the writes
+   * commit with their version snapshots and outbound events missing every localized component
+   * value.
+   *
+   * @example
+   * ```typescript
+   * await service.warmLocalizedReadiness('posts');
+   * await service.withTransaction(async (tx) => {
+   *   const entry = await service.createEntryInTransaction(tx, 'posts', data, context);
+   *   await service.updateEntryInTransaction(tx, 'posts', entry.id, moreData, context);
+   * });
+   * ```
+   */
+  override async withTransaction<T>(
+    work: (tx: TransactionContext) => Promise<T>
+  ): Promise<T> {
+    let ownsFlush = false;
+    let collector: RevalidationIntent[] | undefined;
+    let sawEvent = false;
+    let sawCommittedWrite = false;
+    let touched: { collectionName: string; entryId: string }[] = [];
+    const result = await this.adapter.transaction(async tx => {
+      collector = this.pendingTxIntents.get(tx);
+      if (!collector) {
+        collector = [];
+        this.pendingTxIntents.set(tx, collector);
+        ownsFlush = true;
+      }
+      try {
+        return await work(tx);
+      } finally {
+        // Drop the per-tx bindings on both commit and rollback, so a throwing or
+        // failed-to-commit transaction never leaks its collector in
+        // pendingTxIntents. Only the frame that created the collector removes
+        // it, so a nested withTransaction sharing the handle leaves the outer's
+        // binding intact. Capture the event signal before dropping it so the
+        // post-commit drain below can see it.
+        if (ownsFlush) {
+          sawEvent = this.pendingTxEvents.has(tx);
+          sawCommittedWrite = this.pendingTxCommittedWrites.has(tx);
+          touched = this.pendingTxDocuments.get(tx) ?? [];
+          this.pendingTxIntents.delete(tx);
+          this.pendingTxEvents.delete(tx);
+          this.pendingTxCommittedWrites.delete(tx);
+          this.pendingTxDocuments.delete(tx);
+        }
+      }
+    });
+    // Reached only on a successful commit; a rejected transaction throws above
+    // and flushes nothing. The captured `collector` outlives the map binding.
+    // This transaction may have joined an enclosing one, on any dialect, so
+    // the flush and maintenance wait for that one's commit.
+    const collectedIntents = collector ?? [];
+    await this.afterCommit(async () => {
+      if (ownsFlush && collectedIntents.length > 0) {
+        await this.entryService.flushRevalidationIntents(collectedIntents);
+      }
+      // A committed transaction runs the same post-write maintenance the
+      // automatic paths run: the opportunistic retention pass for any committed
+      // write — tracked independently of the optional revalidation/recording
+      // signals so a write that opted out of both still prunes — and the fast
+      // drain once when an outbox event was recorded, so tx-API writes deliver,
+      // and prune, as promptly as the non-transaction paths instead of waiting
+      // for an unrelated operation.
+      if (ownsFlush && (sawCommittedWrite || sawEvent)) {
+        await this.entryService.offerPostCommitTxMaintenance({
+          committedWrite: sawCommittedWrite || sawEvent,
+          recordedEvent: sawEvent,
+        });
+      }
+      if (touched.length > 0) {
+        await stopReleasesHolding({
+          documents: touched.map(document => ({
+            scopeKind: "collection",
+            scopeSlug: document.collectionName,
+            entryId: document.entryId,
+          })),
+        });
+      }
+    });
+    return result;
+  }
+
+  /**
+   * Record a wrapper's revalidation intent against the active owned transaction,
+   * if one is in progress, so `withTransaction` can flush it after commit. A
+   * no-op when the caller obtained `tx` some other way (there is nowhere to defer
+   * the flush to); such callers should use the lower-level
+   * `CollectionEntryService.*InTransaction`, whose results carry the intent.
+   */
+  private collectTxIntent(
+    tx: TransactionContext,
+    intent: RevalidationIntent | undefined
+  ): void {
+    if (!intent) return;
+    this.pendingTxIntents.get(tx)?.push(intent);
+  }
+
+  /**
+   * Record that a wrapper's `*InTransaction` write appended an outbox event
+   * against the active owned transaction, so `withTransaction` offers the fast
+   * drain once after commit. Only tracked when a collector exists for this `tx`
+   * (a `withTransaction` frame owns it); a caller that obtained `tx` some other
+   * way owns the drain, exactly as it owns the revalidation flush.
+   */
+  private collectTxEvent(
+    tx: TransactionContext,
+    eventRecorded: boolean | undefined
+  ): void {
+    if (!eventRecorded) return;
+    if (this.pendingTxIntents.has(tx)) this.pendingTxEvents.add(tx);
+  }
+
+  /**
+   * Record that a wrapper's `*InTransaction` write succeeded against the active
+   * owned transaction, so `withTransaction` offers retention for the committed
+   * write even when it produced no intent and no event. A failed wrapper throws
+   * (rolling the transaction back), so only committed writes reach here.
+   */
+  private collectTxCommittedWrite(
+    tx: TransactionContext,
+    success: boolean | undefined
+  ): void {
+    if (!success) return;
+    if (this.pendingTxIntents.has(tx)) this.pendingTxCommittedWrites.add(tx);
+  }
+
+  /**
+   * Record a document a wrapper's `*InTransaction` write saved or deleted
+   * against the active owned transaction, for `withTransaction` to hand to the
+   * early stop after commit. A caller that obtained `tx` some other way owns
+   * that, as it owns the revalidation flush; a release it leaves with a hard
+   * problem is still stopped at its instant.
+   */
+  private collectTxDocument(
+    tx: TransactionContext,
+    collectionName: string,
+    entryId: string
+  ): void {
+    if (!this.pendingTxIntents.has(tx)) return;
+    const documents = this.pendingTxDocuments.get(tx) ?? [];
+    documents.push({ collectionName, entryId });
+    this.pendingTxDocuments.set(tx, documents);
+  }
+
+  /**
+   * The tail every `*InTransaction` wrapper shares: collect what the write left
+   * for `withTransaction` to flush after commit, then turn a failed envelope
+   * into the error it came from and hand back the data of a successful one.
+   *
+   * Collected BEFORE the success check, and that ordering is the contract. The
+   * mutation layer sets the intent only once the row is written and carries it
+   * even on a hook-failure result, so a caller that commits despite the failure
+   * still busts the tags; a genuine rollback drops the collector unflushed, so
+   * collecting first is always safe.
+   *
+   * Every failure goes through the converter, including the code-less 404 and
+   * 403 that used to short-circuit to a factory: the converter answers those
+   * with the same generic error, the identifiers stay in the log context and
+   * never reach the wire, and short-circuiting only meant those two outcomes
+   * arrived without the failure they came from.
+   */
+  private settleTxWrite<T>(
+    tx: TransactionContext,
+    result: Parameters<CollectionService["mapLegacyErrorToNextlyError"]>[0] & {
+      revalidationIntent?: RevalidationIntent;
+      eventRecorded?: boolean;
+    },
+    failure: { message: string; logContext: Record<string, unknown> }
+  ): T {
+    this.collectTxIntent(tx, result.revalidationIntent);
+    this.collectTxEvent(tx, result.eventRecorded);
+    this.collectTxCommittedWrite(tx, result.success);
+
+    if (!result.success) {
+      this.logger.warn(failure.message, {
+        ...failure.logContext,
+        message: result.message,
+        statusCode: result.statusCode,
+      });
+      throw this.mapLegacyErrorToNextlyError(result, {
+        entity: "entry",
+        ...failure.logContext,
+      });
+    }
+    return result.data as T;
+  }
+
+  /**
+   * Register dynamic collection schemas for runtime use.
+   *
+   * This should be called during app initialization to register
+   * the generated Drizzle schema files for dynamic collections.
+   *
+   * @param schemas - Object mapping schema names to Drizzle table definitions
+   *
+   * @example
+   * ```typescript
+   * import * as dynamicSchemas from "@/db/schemas/dynamic";
+   *
+   * const service = getCollectionsService();
+   * service.registerDynamicSchemas(dynamicSchemas);
+   * ```
+   */
+  /** {@link CollectionMetadataService.companionSchemaOf}. */
+  // Reached only through the DI container, which the dead-code gate cannot trace.
+  // fallow-ignore-next-line unused-class-member
+  companionSchemaOf(
+    slug: string,
+    executor?: unknown
+  ): Promise<CompanionSchema | null> {
+    return this.metadataService.companionSchemaOf(slug, executor);
+  }
+
+  registerDynamicSchemas(schemas: Record<string, unknown>): void {
+    this.metadataService.registerDynamicSchemas(schemas);
+  }
+
+  /** Drop the cached Drizzle schema for one slug so the next load rebuilds it. */
+  invalidateSchemaForSlug(collectionName: string): void {
+    this.metadataService.invalidateSchemaForSlug(collectionName);
+  }
+
+  /**
+   * Create a new collection
+   *
+   * @param input - Collection creation data
+   * @param context - Request context with user info
+   * @returns Created collection
+   * @throws NextlyError if creation fails
+   *
+   * @example
+   * ```typescript
+   * const collection = await service.createCollection({
+   *   name: 'posts',
+   *   label: 'Blog Posts',
+   *   fields: [
+   *     { name: 'title', type: 'text', required: true },
+   *     { name: 'content', type: 'richText' },
+   *   ]
+   * }, context);
+   * ```
+   */
+  async createCollection(
+    input: CreateCollectionInput,
+    context: RequestContext
+  ): Promise<Collection> {
+    this.logger.debug("Creating collection", {
+      name: input.name,
+      userId: context.user?.id,
+    });
+
+    const result = await this.metadataService.createCollection({
+      ...input,
+      createdBy: context.user?.id,
+    });
+
+    if (!result.success) {
+      this.logger.warn("Collection creation failed", {
+        name: input.name,
+        message: result.message,
+      });
+      throw this.mapLegacyErrorToNextlyError(result);
+    }
+
+    const created = result.data as Record<string, unknown>;
+    this.logger.info("Collection created", {
+      name: input.name,
+      collectionId: created?.id,
+    });
+
+    return created as unknown as Collection;
+  }
+
+  /**
+   * List collections with pagination
+   *
+   * @param options - Pagination and filter options
+   * @param context - Request context
+   * @returns Paginated list of collections
+   * @throws NextlyError if listing fails
+   */
+  async listCollections(
+    options: ListCollectionsOptions = {},
+    // `_context` is intentionally unused today; it stays in the signature so
+    // callers (and future ACL/multitenant logic) can pass request context.
+    _context: RequestContext
+  ): Promise<PaginatedResult<Collection>> {
+    // Not the options themselves: they carry the request, whose headers hold
+    // the caller's credentials.
+    this.logger.debug("Listing collections");
+
+    const result = await this.metadataService.listCollections(options);
+
+    if (!result.success) {
+      throw this.mapLegacyErrorToNextlyError(result);
+    }
+
+    const limit = options.limit ?? 10;
+    const page = options.page ?? 1;
+    const offset = (page - 1) * limit;
+    const total = (result.meta?.total as number) ?? 0;
+    const items = (result.data ?? []) as unknown as Collection[];
+
+    return {
+      data: items,
+      pagination: {
+        total,
+        limit,
+        offset,
+        hasMore: offset + items.length < total,
+      },
+    };
+  }
+
+  /**
+   * Get a single collection by name
+   *
+   * @param collectionName - Name of the collection
+   * @param context - Request context
+   * @returns Collection metadata
+   * @throws NextlyError with NOT_FOUND if collection doesn't exist
+   */
+  async getCollection(
+    collectionName: string,
+    // `_context` is intentionally unused today; preserved for future ACL hooks.
+    _context: RequestContext
+  ): Promise<Collection> {
+    this.logger.debug("Getting collection", { collectionName });
+
+    const result = await this.metadataService.getCollection({ collectionName });
+
+    if (!result.success) {
+      // Generic "Not found." per §13.8; collection name moves to logContext.
+      throw NextlyError.notFound({
+        logContext: { entity: "collection", collectionName },
+      });
+    }
+
+    return result.data as unknown as Collection;
+  }
+
+  /**
+   * Update a collection's metadata and/or schema
+   *
+   * @param collectionName - Name of the collection to update
+   * @param input - Update data
+   * @param context - Request context
+   * @returns Updated collection
+   * @throws NextlyError if update fails
+   */
+  async updateCollection(
+    collectionName: string,
+    input: UpdateCollectionInput,
+    // `_context` is intentionally unused today; preserved for future ACL hooks.
+    _context: RequestContext
+  ): Promise<Collection> {
+    this.logger.debug("Updating collection", { collectionName, input });
+
+    // Run with the input's answers, so a pair it doesn't answer is refused, not guessed.
+    const result = await withFieldRenameAnswers(
+      parseFieldRenameAnswers(input.renames),
+      () =>
+        this.metadataService.updateCollection(
+          { collectionName },
+          withoutRenameAnswers(input)
+        )
+    );
+
+    if (!result.success) {
+      this.logger.warn("Collection update failed", {
+        collectionName,
+        message: result.message,
+      });
+      throw this.mapLegacyErrorToNextlyError(result);
+    }
+
+    this.logger.info("Collection updated", { collectionName });
+
+    return result.data as unknown as Collection;
+  }
+
+  /**
+   * @experimental Hold collection `collectionName`'s registry row for share
+   * inside `tx` until it ends, and answer whether the collection exists.
+   *
+   * For a write that must not outlive the collection it names: a delete of
+   * the collection holds the row for update before it removes anything, so
+   * the write either commits before the delete reads what to remove with it,
+   * or waits for the delete and is told the collection is gone. On SQLite,
+   * with one writer at a time, the row is only read. On MySQL, where a table
+   * drop commits the delete's row locks, the collection's named lock holds
+   * the two apart until the delete has removed the row.
+   *
+   * @param tx - The transaction the write runs in
+   * @param collectionName - The collection the write names
+   * @returns Whether the collection exists
+   */
+  async holdCollectionInTransaction(
+    tx: TransactionContext,
+    collectionName: string
+  ): Promise<boolean> {
+    return this.metadataService.holdCollectionIn(tx, collectionName);
+  }
+
+  /**
+   * @experimental Hold entry `entryId` of collection `collectionName` for
+   * share inside `tx` until it ends, and answer whether it exists.
+   *
+   * For a write that must not outlive the entry it names: a delete of the
+   * entry locks its row for update before it removes it, and runs its
+   * in-transaction handlers after, so the write either commits before the
+   * delete goes on, and those handlers see it, or waits for the delete and is
+   * told the entry is gone. The entry's collection is held first, as
+   * {@link holdCollectionInTransaction} holds it, so a delete of the whole
+   * collection takes turns with the write as well. On SQLite, with one writer
+   * at a time, the rows are only read. Reads only whether the collection and
+   * the row are there, on `tx`'s connection.
+   *
+   * @param tx - The transaction the write runs in
+   * @param collectionName - The collection of the entry the write names
+   * @param entryId - The entry the write names
+   * @returns Whether the entry exists
+   */
+  async holdEntryInTransaction(
+    tx: TransactionContext,
+    collectionName: string,
+    entryId: string
+  ): Promise<boolean> {
+    return this.metadataService.holdEntryIn(tx, collectionName, entryId);
+  }
+
+  /**
+   * Delete a collection
+   *
+   * @param collectionName - Name of the collection to delete
+   * @param context - Request context
+   * @throws NextlyError if deletion fails
+   */
+  async deleteCollection(
+    collectionName: string,
+    // `_context` is intentionally unused today; preserved for future ACL hooks.
+    _context: RequestContext
+  ): Promise<void> {
+    this.logger.debug("Deleting collection", { collectionName });
+
+    const result = await this.metadataService.deleteCollection({
+      collectionName,
+    });
+
+    if (!result.success) {
+      throw this.mapLegacyErrorToNextlyError(result);
+    }
+
+    this.logger.info("Collection deleted", { collectionName });
+  }
+
+  /**
+   * Create a new entry in a collection
+   *
+   * @param collectionName - Name of the collection
+   * @param data - Entry data
+   * @param context - Request context with user info
+   * @returns Created entry
+   * @throws NextlyError if creation fails
+   *
+   * @example
+   * ```typescript
+   * const post = await service.createEntry('posts', {
+   *   title: 'Hello World',
+   *   content: 'My first post',
+   * }, context);
+   * ```
+   */
+  async createEntry(
+    collectionName: string,
+    data: Record<string, unknown>,
+    context: RequestContext
+  ): Promise<CollectionEntry> {
+    this.logger.debug("Creating entry", {
+      collectionName,
+      userId: context.user?.id,
+    });
+
+    const result = await this.entryService.createEntry(
+      {
+        collectionName,
+        ...forwardedFromContext(context),
+      },
+      data
+    );
+
+    if (!result.success) {
+      // A duplicate is thrown to the caller, which receives it and decides:
+      // several writers making one row at once (parallel build workers) is
+      // no fault, so only other failures are warned of here. Told by its
+      // code, since other refusals (a hook's conflict) answer 409 too.
+      const log = result.code === "DUPLICATE" ? "debug" : "warn";
+      this.logger[log]("Entry creation failed", {
+        collectionName,
+        message: result.message,
+        statusCode: result.statusCode,
+      });
+      throw this.mapLegacyErrorToNextlyError(result);
+    }
+
+    this.logger.info("Entry created", {
+      collectionName,
+      entryId: (result.data as Record<string, unknown> | undefined)?.id,
+    });
+
+    return result.data as CollectionEntry;
+  }
+
+  /**
+   * @experimental Create an entry that copies a stored one: read `source` as
+   * the caller, then create `data` in `collectionName`, its field validators
+   * told what it copies (`PluginFieldWrite.copiedFrom`), so a value the
+   * source already holds, in a form and a field the caller's read could see,
+   * may count as no change. A source the caller may not read is refused as
+   * that read refuses it (NOT_FOUND for one they cannot see), and nothing is
+   * created. A duplicate is this create, with data built from the source.
+   *
+   * Intended to become stable, since plugins call it. Server-only: no REST
+   * route reaches it, and nothing a request sends can name a copy.
+   *
+   * @param collectionName - The collection the new entry is created in
+   * @param data - Entry data
+   * @param source - The entry it copies, and the field its value came from
+   * where that differs from the field it is written to
+   * @param context - Request context with user info
+   * @returns Created entry
+   * @throws NextlyError if the source read or the creation fails
+   */
+  // Reached only through the plugin facade's method list, which the dead-code
+  // gate cannot trace.
+  // fallow-ignore-next-line unused-class-member
+  async createEntryFromSource(
+    collectionName: string,
+    data: Record<string, unknown>,
+    source: { collection: string; id: string; field?: string },
+    context: RequestContext
+  ): Promise<CollectionEntry> {
+    const result = await this.entryService.createEntryFromSource(
+      copyRequestOf(collectionName, data, source, context)
+    );
+    if (!result.success) {
+      this.logger.warn("Entry creation from a source failed", {
+        collectionName,
+        sourceCollection: source.collection,
+        message: result.message,
+        statusCode: result.statusCode,
+      });
+      throw this.mapLegacyErrorToNextlyError(result, {
+        entity: "entry",
+        collectionName: source.collection,
+        entryId: source.id,
+      });
+    }
+    return result.data as CollectionEntry;
+  }
+
+  /**
+   * @experimental {@link createEntryFromSource} inside `tx`: the source is
+   * read as the caller on the transaction and the entry created on it, so a
+   * dry run rolled back after it judges the copy as the create itself does.
+   * Preceded by {@link warmLocalizedReadiness} for both collections.
+   * Intended to become stable with it.
+   */
+  // Reached only through the plugin facade's method list, which the dead-code
+  // gate cannot trace.
+  // fallow-ignore-next-line unused-class-member
+  async createEntryFromSourceInTransaction(
+    tx: TransactionContext,
+    collectionName: string,
+    data: Record<string, unknown>,
+    source: { collection: string; id: string; field?: string },
+    context: RequestContext
+  ): Promise<CollectionEntry> {
+    const result = await this.entryService.createEntryFromSourceInTransaction(
+      tx,
+      copyRequestOf(collectionName, data, source, context)
+    );
+    return this.settleTxWrite<CollectionEntry>(tx, result, {
+      message: "Entry creation from a source in transaction failed",
+      logContext: { collectionName, sourceCollection: source.collection },
+    });
+  }
+
+  /**
+   * Bulk-create entries in a single transaction (D56).
+   *
+   * Returns an index-based {@link BatchOperationResult} — the natural shape for
+   * creates, which have no caller-supplied ids to key failures by (mirrors the
+   * existing batch ops `createEntries`/`updateEntries`/`deleteEntries`).
+   *
+   * @param collectionName - Name of the collection
+   * @param data - Array of entry payloads to create
+   * @param context - Request context (carries `overrideAccess` for elevation)
+   * @returns Per-batch result: counts, created ids, and index-keyed failures
+   */
+  async createMany(
+    collectionName: string,
+    data: Record<string, unknown>[],
+    context: RequestContext
+  ): Promise<BatchOperationResult> {
+    // The bulk pipeline writes its rows in one pass and does not perform the
+    // localized split a single create does, so it cannot store a row in a
+    // named language. A locale it accepted and could not honour would file
+    // every row under the default language and report success — a caller
+    // told nothing, which is worse than being told no. Refused up front, by
+    // name, with the write that does honour it; a bulk create is one
+    // statement, so there is no per-row failure to report it through.
+    if (context.locale !== undefined) {
+      throw NextlyError.invalidInput({
+        message:
+          "createMany cannot write in a locale; create the rows one at a time with createEntry.",
+        logContext: {
+          reason: "create-many-locale-unsupported",
+          collectionName,
+          locale: context.locale,
+        },
+      });
+    }
+
+    this.logger.debug("Creating entries (bulk)", {
+      collectionName,
+      count: data.length,
+    });
+
+    return this.entryService.createEntries(
+      {
+        collectionName,
+        ...forwardedFromContext(context),
+      },
+      data
+    );
+  }
+
+  /**
+   * Bulk-update entries in a single transaction.
+   *
+   * Each entry names the row it patches, so one call can apply a DIFFERENT
+   * patch per row. Applying the SAME patch to several rows is the same call
+   * with the patch repeated, which is why there is one method rather than two:
+   * a by-filter variant could express only the second, and would need its own
+   * access, hook and revalidation pass to do it.
+   *
+   * Partial success, like `createMany`: a failed entry does not stop the rest,
+   * and the ones that committed are reported in `ids`.
+   *
+   * 🔴 `errors[].index` indexes the `entries` array THIS caller passed, so the
+   * row a failure is about is `entries[index].id`. The result shape is shared
+   * with the creates, which have no caller-supplied ids to key failures by.
+   *
+   * @param collectionName - Name of the collection
+   * @param entries - `{ id, data }` per row; `data` is a partial patch
+   * @param context - Request context (carries `overrideAccess` for elevation)
+   * @returns Per-batch result: counts, updated ids, and index-keyed failures
+   *
+   * @experimental Graduates per D55 once a first-party plugin exercises it in
+   *   production; `packages/plugin-sdk/STABILITY.md` is the authority.
+   */
+  async updateMany(
+    collectionName: string,
+    entries: BulkUpdateEntry[],
+    context: RequestContext
+  ): Promise<BatchOperationResult> {
+    // Refused for the same reason `createMany` refuses it: the bulk pipeline
+    // takes no locale at all, so one accepted here would be dropped on the way
+    // in and every row written to the default language while the call reported
+    // success. A caller told nothing is worse off than a caller told no.
+    if (context.locale !== undefined) {
+      throw NextlyError.invalidInput({
+        message:
+          "updateMany cannot write in a locale; update the rows one at a time with updateEntry.",
+        logContext: {
+          reason: "update-many-locale-unsupported",
+          collectionName,
+          locale: context.locale,
+        },
+      });
+    }
+
+    this.logger.debug("Updating entries (bulk)", {
+      collectionName,
+      count: entries.length,
+    });
+
+    return this.entryService.updateEntries(
+      {
+        collectionName,
+        ...forwardedFromContext(context),
+      },
+      entries
+    );
+  }
+
+  /**
+   * List entries in a collection
+   *
+   * @param collectionName - Name of the collection
+   * @param options - Query options (pagination, sort, where)
+   * @param context - Request context
+   * @returns Paginated list of entries
+   * @throws NextlyError if listing fails
+   */
+  async listEntries(
+    collectionName: string,
+    options: QueryOptions = {},
+    context: RequestContext
+  ): Promise<PaginatedResult<CollectionEntry>> {
+    // Not the options themselves: they carry the request, whose headers hold
+    // the caller's credentials.
+    this.logger.debug("Listing entries", { collectionName });
+
+    const limit = options.pagination?.limit ?? 10;
+    const page = options.pagination?.page ?? 1;
+    const offset = options.pagination?.offset ?? (page - 1) * limit;
+
+    const result = await this.entryService.listEntries({
+      collectionName,
+      ...forwardedFromContext(context),
+      page,
+      limit,
+      // D56: forward the rich-query options the facade previously dropped, so
+      // filtering/sorting/relation-population through `ctx.services.collections`
+      // actually applies. `depth`/`select` stay undefined when omitted so the
+      // entry service keeps its default depth.
+      where: options.where as WhereFilter | undefined,
+      sort: serializeSort(options.sort),
+      depth: options.depth,
+      select: options.select,
+    });
+
+    if (!result.success || !result.data) {
+      throw this.mapLegacyErrorToNextlyError(result);
+    }
+
+    const paginatedResponse = result.data;
+    return {
+      data: paginatedResponse.docs as CollectionEntry[],
+      pagination: {
+        total: paginatedResponse.totalDocs,
+        limit: paginatedResponse.limit,
+        offset,
+        hasMore: paginatedResponse.hasNextPage,
+      },
+    };
+  }
+
+  /**
+   * Count entries matching an optional filter (D56 aggregation-lite).
+   *
+   * Lets plugins answer "how many?" without loading rows or dropping to
+   * `ctx.db.raw`. For richer aggregations (sum/avg/group-by) use the
+   * `ctx.db.raw` escape hatch (D33) — relational aggregation pipelines are out of scope.
+   *
+   * @param collectionName - Name of the collection
+   * @param options - Optional `where` filter and full-text `search`
+   * @param context - Request context (carries `overrideAccess` for elevation)
+   * @returns Number of matching entries
+   * @throws NextlyError if counting fails
+   */
+  async count(
+    collectionName: string,
+    options: { where?: Record<string, unknown>; search?: string } = {},
+    context: RequestContext
+  ): Promise<number> {
+    this.logger.debug("Counting entries", { collectionName });
+
+    const result = await this.entryService.countEntries({
+      collectionName,
+      ...forwardedFromContext(context),
+      where: options.where as WhereFilter | undefined,
+      search: options.search,
+    });
+
+    if (!result.success || !result.data) {
+      throw this.mapLegacyErrorToNextlyError(result);
+    }
+
+    return result.data.totalDocs;
+  }
+
+  /**
+   * How many entries carry each distinct value of one field, over the rows a
+   * `count` with the same filter would count.
+   *
+   * Not on `ctx.services.collections`: a plugin reaches it only through
+   * `ctx.services.ownCollections`, whose safe-delete bookkeeping needs it.
+   *
+   * @param collectionName - Name of the collection
+   * @param options - The field to group by, an optional `where`, and a bucket cap
+   * @param context - Request context
+   * @returns The buckets, largest first, and whether the cap left any out
+   * @throws NextlyError if grouping fails
+   */
+  async group(
+    collectionName: string,
+    options: {
+      groupBy: string;
+      where?: Record<string, unknown>;
+      bucketLimit?: number;
+    },
+    context: RequestContext
+  ): Promise<{
+    buckets: { value: string | null; count: number }[];
+    truncated: boolean;
+  }> {
+    this.logger.debug("Grouping entries", { collectionName });
+
+    const result = await this.entryService.groupEntries({
+      collectionName,
+      ...forwardedFromContext(context),
+      groupBy: options.groupBy,
+      where: options.where as WhereFilter | undefined,
+      ...(options.bucketLimit === undefined
+        ? {}
+        : { bucketLimit: options.bucketLimit }),
+    });
+
+    if (!result.success || !result.data) {
+      throw this.mapLegacyErrorToNextlyError(result);
+    }
+
+    return {
+      buckets: result.data.buckets,
+      truncated: result.data.truncated,
+    };
+  }
+
+  /**
+   * Find an entry by ID
+   *
+   * @param collectionName - Name of the collection
+   * @param entryId - ID of the entry
+   * @param context - Request context
+   * @returns Entry data
+   * @throws NextlyError with NOT_FOUND if entry doesn't exist
+   */
+  async findEntryById(
+    collectionName: string,
+    entryId: string,
+    context: RequestContext
+  ): Promise<CollectionEntry> {
+    this.logger.debug("Finding entry by ID", { collectionName, entryId });
+
+    const result = await this.entryService.getEntry({
+      collectionName,
+      entryId,
+      ...forwardedFromContext(context),
+      // A read of one document only, so it is named here rather than in the
+      // seam every facade method spreads: a list or a write has no first
+      // published language to answer in.
+      wholeDocumentFallback: context.wholeDocumentFallback,
+    });
+
+    if (!result.success) {
+      // Every failure goes through the converter, including the code-less 404
+      // and 403 that used to short-circuit to a factory here. The converter
+      // answers those with the same generic error -- the identifiers stay in
+      // the log context and never reach the wire -- and short-circuiting only
+      // meant those two outcomes arrived without the failure they came from.
+      throw this.mapLegacyErrorToNextlyError(result, {
+        entity: "entry",
+        collectionName,
+        entryId,
+      });
+    }
+
+    return result.data as CollectionEntry;
+  }
+
+  /**
+   * Update an entry
+   *
+   * @param collectionName - Name of the collection
+   * @param entryId - ID of the entry to update
+   * @param data - Update data
+   * @param context - Request context
+   * @returns Updated entry
+   * @throws NextlyError if update fails
+   */
+  async updateEntry(
+    collectionName: string,
+    entryId: string,
+    data: Record<string, unknown>,
+    context: RequestContext
+  ): Promise<CollectionEntry> {
+    this.logger.debug("Updating entry", { collectionName, entryId });
+
+    const result = await this.entryService.updateEntry(
+      {
+        collectionName,
+        entryId,
+        ...forwardedFromContext(context),
+      },
+      data
+    );
+
+    if (!result.success) {
+      // Every failure goes through the converter, including the code-less 404
+      // and 403 that used to short-circuit to a factory here. The converter
+      // answers those with the same generic error -- the identifiers stay in
+      // the log context and never reach the wire -- and short-circuiting only
+      // meant those two outcomes arrived without the failure they came from.
+      this.logger.warn("Entry update failed", {
+        collectionName,
+        entryId,
+        message: result.message,
+      });
+      throw this.mapLegacyErrorToNextlyError(result, {
+        entity: "entry",
+        collectionName,
+        entryId,
+      });
+    }
+
+    this.logger.info("Entry updated", { collectionName, entryId });
+
+    return result.data as CollectionEntry;
+  }
+
+  /**
+   * @experimental Rewrite one field of an entry on its live copy and on every
+   * pending draft that holds it, in one transaction, without publishing, from
+   * the version the caller read. See `domains/versions/field-rewrite`.
+   *
+   * @param input - The rewrite of an entry, parsed here (`FieldRewriteRequest`)
+   * @param context - Who it is made as
+   * @param plugin - The plugin making it, by the name it booted under, for
+   *   history. Passed only by a plugin's own services, from its identity.
+   * @throws NextlyError if it is refused
+   */
+  async rewriteField(
+    input: unknown,
+    context: RequestContext,
+    plugin?: string
+  ): Promise<FieldRewriteResult> {
+    const request = parseFieldRewrite(input);
+    // A Single's rewrite reaches the Single's own write path, which a
+    // plugin's services route it to before this one.
+    if (rewritesSingle(request)) {
+      throw NextlyError.invalidInput({
+        message:
+          "A collection entry's rewrite names `collection` and `id`; this service rewrites no Single.",
+      });
+    }
+    const result = await this.entryService.rewriteField({
+      request,
+      ...rewriteCallerOf(context, plugin),
+    });
+    if (!result.success) {
+      throw this.mapLegacyErrorToNextlyError(result, {
+        entity: "entry",
+        collectionName: request.collection,
+        entryId: request.id,
+      });
+    }
+    return result.data as FieldRewriteResult;
+  }
+
+  /**
+   * Delete an entry
+   *
+   * @param collectionName - Name of the collection
+   * @param entryId - ID of the entry to delete
+   * @param context - Request context
+   * @throws NextlyError if deletion fails
+   */
+  async deleteEntry(
+    collectionName: string,
+    entryId: string,
+    context: RequestContext
+  ): Promise<void> {
+    // A delete removes the DOCUMENT: the row and every translation with it.
+    // There is no per-language delete, so a locale here reads as one and is
+    // not one — a caller asking to remove the French translation would remove
+    // the English, the German and the row, and be told nothing. Refused by
+    // name rather than ignored; the day a translation can be removed on its
+    // own, this is where it is honoured.
+    if (context.locale !== undefined) {
+      throw NextlyError.invalidInput({
+        message:
+          "deleteEntry removes every translation of a document; a locale cannot scope it.",
+        logContext: {
+          reason: "delete-entry-locale-unsupported",
+          collectionName,
+          entryId,
+          locale: context.locale,
+        },
+      });
+    }
+
+    this.logger.debug("Deleting entry", { collectionName, entryId });
+
+    const result = await this.entryService.deleteEntry({
+      collectionName,
+      entryId,
+      ...forwardedFromContext(context),
+    });
+
+    if (!result.success) {
+      // Every failure goes through the converter, including the code-less 404
+      // and 403 that used to short-circuit to a factory here. The converter
+      // answers those with the same generic error -- the identifiers stay in
+      // the log context and never reach the wire -- and short-circuiting only
+      // meant those two outcomes arrived without the failure they came from.
+      throw this.mapLegacyErrorToNextlyError(result, {
+        entity: "entry",
+        collectionName,
+        entryId,
+      });
+    }
+
+    this.logger.info("Entry deleted", { collectionName, entryId });
+  }
+
+  /**
+   * Resolve this collection's localized companion verdicts on the pooled connection.
+   *
+   * Run it BEFORE opening a transaction that uses the `*InTransaction` methods below. They cannot
+   * do it for themselves: resolving a verdict issues a query, a query against a missing relation
+   * aborts the whole transaction on PostgreSQL, and a pooled probe taken while a transaction is
+   * open waits for a connection that transaction will not release until it ends.
+   *
+   * Nothing throws when it is skipped, which is the reason it is worth calling. An unresolved
+   * verdict reads as unusable, so the writes commit normally while their durable version snapshots
+   * and outbound events quietly omit every localized component value — an omission that surfaces
+   * from a consumer of the event, by which point the snapshot is the historical record.
+   *
+   * Read-only and idempotent. Safe for a collection that is not localized.
+   */
+  async warmLocalizedReadiness(collectionName: string): Promise<void> {
+    await this.entryService.warmLocalizedReadiness(collectionName);
+  }
+  /**
+   * Rebuild the record of which media items every entry of a collection uses,
+   * for `nextly media reindex-usage`. Returns how many entries it read.
+   */
+  // Reached only through the DI container, which the dead-code gate cannot trace.
+  // fallow-ignore-next-line unused-class-member
+  async rebuildMediaUsage(collectionName: string): Promise<number> {
+    return this.entryService.rebuildMediaUsage(collectionName);
+  }
+
+  /**
+   * Create an entry within an existing transaction
+   *
+   * Use this when you need to coordinate multiple operations atomically.
+   *
+   * @param tx - Transaction context from adapter
+   * @param collectionName - Name of the collection
+   * @param data - Entry data
+   * @param context - Request context
+   * @returns Created entry
+   * @throws Error if underlying service doesn't support transaction context
+   *
+   * Preceded by {@link warmLocalizedReadiness} for this collection, as in the example.
+   *
+   * @example
+   * ```typescript
+   * await service.warmLocalizedReadiness('posts');
+   * await service.withTransaction(async (tx) => {
+   *   const entry = await service.createEntryInTransaction(tx, 'posts', data, context);
+   *   await service.updateEntryInTransaction(tx, 'posts', entry.id, moreData, context);
+   * });
+   * ```
+   */
+  async createEntryInTransaction(
+    tx: TransactionContext,
+    collectionName: string,
+    data: Record<string, unknown>,
+    context: RequestContext
+  ): Promise<CollectionEntry> {
+    this.logger.debug("Creating entry in transaction", {
+      collectionName,
+      userId: context.user?.id,
+    });
+
+    const result = await this.entryService.createEntryInTransaction(
+      tx,
+      {
+        collectionName,
+        ...forwardedFromContext(context),
+      },
+      data
+    );
+
+    const entry = this.settleTxWrite<CollectionEntry>(tx, result, {
+      message: "Entry creation in transaction failed",
+      logContext: { collectionName },
+    });
+
+    this.logger.info("Entry created in transaction", {
+      collectionName,
+      entryId: entry?.id,
+    });
+
+    return entry;
+  }
+
+  /**
+   * Update an entry within an existing transaction
+   *
+   * Preceded by {@link warmLocalizedReadiness} for this collection. This method runs entirely on
+   * the caller's transaction, where a companion verdict can only be read and never resolved, and
+   * an unresolved one reads as unusable — so without the warm-up the update commits while its
+   * previous/post version snapshots and its outbound event omit every localized component value.
+   *
+   * @param tx - Transaction context from adapter
+   * @param collectionName - Name of the collection
+   * @param entryId - ID of the entry to update
+   * @param data - Update data
+   * @returns Updated entry
+   * @throws Error if underlying service doesn't support transaction context
+   */
+  async updateEntryInTransaction(
+    tx: TransactionContext,
+    collectionName: string,
+    entryId: string,
+    data: Record<string, unknown>,
+    context: RequestContext
+  ): Promise<CollectionEntry> {
+    this.logger.debug("Updating entry in transaction", {
+      collectionName,
+      entryId,
+    });
+
+    const result = await this.entryService.updateEntryInTransaction(
+      tx,
+      {
+        collectionName,
+        entryId,
+        ...forwardedFromContext(context),
+      },
+      data
+    );
+
+    const entry = this.settleTxWrite<CollectionEntry>(tx, result, {
+      message: "Entry update in transaction failed",
+      logContext: { collectionName, entryId },
+    });
+    this.collectTxDocument(tx, collectionName, entryId);
+
+    this.logger.info("Entry updated in transaction", {
+      collectionName,
+      entryId,
+    });
+
+    return entry;
+  }
+
+  /**
+   * Delete an entry within an existing transaction
+   *
+   * @param tx - Transaction context from adapter
+   * @param collectionName - Name of the collection
+   * @param entryId - ID of the entry to delete
+   * @param context - Request context
+   * @throws Error if underlying service doesn't support transaction context
+   */
+  async deleteEntryInTransaction(
+    tx: TransactionContext,
+    collectionName: string,
+    entryId: string,
+    context: RequestContext,
+    /**
+     * Acting identity, forwarded to the recorded `entry.deleted` event so an
+     * API-key delete through this wrapper keeps key attribution. `RequestContext`
+     * carries only `user`, so the actor is passed alongside it.
+     */
+    actor?: RequestActor
+  ): Promise<void> {
+    this.logger.debug("Deleting entry in transaction", {
+      collectionName,
+      entryId,
+    });
+
+    const result = await this.entryService.deleteEntryInTransaction(tx, {
+      collectionName,
+      entryId,
+      ...forwardedFromContext(context),
+      // The actor passed beside the context wins over one the context names.
+      ...(actor === undefined ? {} : { actor }),
+    });
+
+    this.settleTxWrite<unknown>(tx, result, {
+      message: "Entry deletion in transaction failed",
+      logContext: { collectionName, entryId },
+    });
+    this.collectTxDocument(tx, collectionName, entryId);
+
+    this.logger.info("Entry deleted in transaction", {
+      collectionName,
+      entryId,
+    });
+  }
+
+  /**
+   * Translate a legacy CollectionServiceResult / MetadataServiceResult failure
+   * into a thrown NextlyError. Only used for non-404/403 cases — those have
+   * dedicated factory calls inline at each call site so identifiers can move
+   * cleanly to logContext.
+   *
+   * Per §13.8, the public message is generic for the matched factory; the
+   * inner legacy message moves to logContext for operators only and never
+   * reaches the wire.
+   */
+  /**
+   * Rebuild the error a failed service envelope came from.
+   *
+   * Delegates to the shared converter so a plugin calling
+   * `ctx.services.collections` is handed the same error a REST or Direct API
+   * caller would get. This kept its own status table, which sent anything
+   * outside 400/401/403/404/409 to an internal error -- so a hook throwing
+   * `rateLimited()` reached a plugin as a 500 -- and whose input type omitted
+   * `code`, `errors` and `publicData` entirely, so a validation failure also
+   * arrived without its per-field issues.
+   */
+  private mapLegacyErrorToNextlyError(
+    result: {
+      success: boolean;
+      statusCode: number;
+      code?: string;
+      message: string;
+      messageKey?: string;
+      publicData?: unknown;
+      data: unknown;
+      errors?: Array<{
+        path?: string;
+        field?: string;
+        code?: string;
+        message: string;
+      }>;
+    },
+    // What the caller knows and the envelope does not: which entity and which
+    // ids. Operator-only, so it goes to the log context and never the wire.
+    logContext: Record<string, unknown> = {}
+  ): NextlyError {
+    return errorFromServiceEnvelope(result, {
+      innerMessage: result.message,
+      ...logContext,
+    });
+  }
+}

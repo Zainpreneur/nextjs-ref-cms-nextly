@@ -1,0 +1,228 @@
+/**
+ * The dashboard's arrangement in a browser: one order everywhere, and the card
+ * menu's Remove and Undo by keyboard alone.
+ *
+ * jsdom has no layout, so the component tests can say what the grid renders
+ * but not where it puts it. These measure the drawn page: the order a reader
+ * sees, the order the page is read in and the order Tab visits must be one
+ * order, at a width where cards sit side by side and at one where they wrap
+ * differently, with cards of mixed heights: a short card beside a tall one
+ * leaves a gap below it, and no later card is drawn out of order to fill it.
+ *
+ * Each test returns the reader to the default dashboard when it ends, so the
+ * specs that follow see the dashboard a new site has.
+ *
+ * @module tests/dashboard-arrangement.spec
+ */
+import { expect, type Page } from "@playwright/test";
+
+import { test } from "./support/test";
+import { gotoAdmin } from "./support/admin";
+import { sizeBoundsOf } from "./support/dashboard-sizes";
+import { LOCK } from "./support/locks";
+import { resetToDefault } from "./support/dashboard-layout";
+
+// Shares state with other specs; see support/locks.ts for what each lock guards.
+test.describe.configure({ lock: [LOCK.dashboard] });
+
+const CELLS = '[data-testid^="widget-cell-"]';
+
+/**
+ * A card menu's last item, which takes the card off the dashboard: "Remove", or "Hide setup" on
+ * the setup card, which shows to the suite's super-admin until setup is done.
+ */
+const REMOVE = /^(Remove|Hide setup)$/;
+
+/**
+ * The cards' widget ids in DOM order: the order the page is read in. A card
+ * hidden while empty keeps its cell but is not drawn (`display: none`), so a
+ * reader never meets it; it is left out here as it is from the visual order.
+ */
+async function readingOrder(page: Page): Promise<string[]> {
+  return page
+    .locator(CELLS)
+    .evaluateAll(cells =>
+      cells
+        .filter(cell => cell.checkVisibility())
+        .map(cell => cell.getAttribute("data-testid") ?? "")
+    );
+}
+
+/** The same cards sorted as drawn: by row (top), then left to right. */
+async function visualOrder(page: Page): Promise<string[]> {
+  const boxes = await page.locator(CELLS).evaluateAll(cells =>
+    cells.map(cell => {
+      const box = cell.getBoundingClientRect();
+      return {
+        id: cell.getAttribute("data-testid") ?? "",
+        top: Math.round(box.top),
+        left: Math.round(box.left),
+        visible: box.width > 0 && box.height > 0,
+      };
+    })
+  );
+  return boxes
+    .filter(box => box.visible)
+    .sort((a, b) => a.top - b.top || a.left - b.left)
+    .map(box => box.id);
+}
+
+/**
+ * Save the default dashboard with its cards at mixed heights: each card alternately at the
+ * shortest and the tallest height its widget allows. Answers whether any two heights differ.
+ */
+async function placeMixedHeights(page: Page): Promise<boolean> {
+  const read = await page.request.get("/admin/api/dashboard/layout");
+  const layout = (await read.json()) as {
+    version: number;
+    scope: string;
+    placements: Array<{ id: string; widgetId: string; w: number; h: number }>;
+  };
+  const placements = [];
+  for (const [index, placement] of layout.placements.entries()) {
+    const bounds = await sizeBoundsOf(page, placement.widgetId);
+    placements.push({
+      ...placement,
+      h: index % 2 === 0 ? bounds.max.h : bounds.min.h,
+    });
+  }
+  const write = await page.request.put("/admin/api/dashboard/layout", {
+    data: { placements, version: layout.version, scope: layout.scope },
+  });
+  expect(write.ok()).toBe(true);
+  return new Set(placements.map(p => p.h)).size > 1;
+}
+
+/** Opens customise mode from the keyboard. */
+async function customize(page: Page): Promise<void> {
+  const begin = page.getByTestId("dashboard-edit-begin");
+  await begin.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("button", { name: "Save" })).toBeVisible();
+}
+
+test.afterEach(async ({ page }) => {
+  await resetToDefault(page);
+});
+
+for (const width of [1440, 820]) {
+  test(`visual, reading and tab order agree at ${width}px`, async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await gotoAdmin(page, "/");
+    // Mixed heights, or a grid that backfilled gaps could still pass.
+    expect(await placeMixedHeights(page)).toBe(true);
+    await page.reload();
+    await expect(
+      page.locator(CELLS).filter({ visible: true }).first()
+    ).toBeVisible();
+
+    const reading = await readingOrder(page);
+    // More than one card, or "agree" proves nothing.
+    expect(reading.length).toBeGreaterThan(2);
+    expect(await visualOrder(page)).toEqual(reading);
+
+    // Tab visits each card's menu in the same order.
+    await customize(page);
+    const menus = page.getByRole("button", { name: /^Card actions for / });
+    const expected = await menus.evaluateAll(buttons =>
+      buttons.map(button => button.getAttribute("aria-label") ?? "")
+    );
+    const visited: string[] = [];
+    for (let i = 0; i < 400 && visited.length < expected.length; i += 1) {
+      await page.keyboard.press("Tab");
+      const label = await page.evaluate(
+        () => document.activeElement?.getAttribute("aria-label") ?? ""
+      );
+      if (label.startsWith("Card actions for ") && !visited.includes(label)) {
+        visited.push(label);
+      }
+    }
+    expect(visited).toEqual(expected);
+  });
+}
+
+test("removes a card, brings it back and saves a removal, by keyboard alone", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await gotoAdmin(page, "/");
+  await expect(
+    page.locator(CELLS).filter({ visible: true }).first()
+  ).toBeVisible();
+  const before = await readingOrder(page);
+
+  await customize(page);
+  // Counted in customise mode: a card whose content draws nothing is hidden
+  // at rest and shown there, so the rest count is a different population.
+  const inCustomize = await readingOrder(page);
+  const menus = page.getByRole("button", { name: /^Card actions for / });
+  const firstLabel = (await menus.first().getAttribute("aria-label")) ?? "";
+  const secondLabel = (await menus.nth(1).getAttribute("aria-label")) ?? "";
+  const title = firstLabel.replace("Card actions for ", "");
+
+  // Open the first card's menu and choose Remove, the last item.
+  await menus.first().focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("menu")).toBeVisible();
+  await page.keyboard.press("End");
+  await expect(page.getByRole("menuitem", { name: REMOVE })).toBeFocused();
+  await page.keyboard.press("Enter");
+
+  // Gone from the grid, the notice offers it back, and focus is on the next
+  // card's menu.
+  await expect(page.locator(CELLS)).toHaveCount(inCustomize.length - 1);
+  await expect(
+    page.getByRole("button", { name: `Undo removing ${title}` })
+  ).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.activeElement?.getAttribute("aria-label"))
+    )
+    .toBe(secondLabel);
+
+  // Reach Undo with Tab and press it.
+  let onUndo = false;
+  for (let i = 0; i < 400 && !onUndo; i += 1) {
+    await page.keyboard.press("Tab");
+    onUndo =
+      (await page.evaluate(
+        () => document.activeElement?.getAttribute("aria-label") ?? ""
+      )) === `Undo removing ${title}`;
+  }
+  expect(onUndo).toBe(true);
+  await page.keyboard.press("Enter");
+  await expect(page.locator(CELLS)).toHaveCount(inCustomize.length);
+  expect(await readingOrder(page)).toEqual(inCustomize);
+
+  // Nothing has changed now, so there is nothing to save. Focus is back on the
+  // restored card's menu: remove it again, and save that from the keyboard.
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.activeElement?.getAttribute("aria-label"))
+    )
+    .toBe(firstLabel);
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("menu")).toBeVisible();
+  await page.keyboard.press("End");
+  await expect(page.getByRole("menuitem", { name: REMOVE })).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page.locator(CELLS)).toHaveCount(inCustomize.length - 1);
+
+  const save = page.getByRole("button", { name: "Save" });
+  await save.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("dashboard-edit-begin")).toBeVisible();
+
+  // The removal was stored: after a reload the card is still gone, and every
+  // other card keeps its order.
+  const removedCell = inCustomize[0];
+  await page.reload();
+  await expect(
+    page.locator(CELLS).filter({ visible: true }).first()
+  ).toBeVisible();
+  expect(await readingOrder(page)).toEqual(
+    before.filter(id => id !== removedCell)
+  );
+});

@@ -1,0 +1,283 @@
+import { afterEach, describe, expect, it } from "vitest";
+
+import { select, text, textarea } from "../../../collections/fields/helpers";
+import { defineConfig } from "../../../collections/config/define-config";
+import { definePlugin } from "../../../plugins/plugin-context";
+import {
+  clearFieldTypes,
+  registerFieldType,
+} from "../../../domains/schema/field-types/field-type-registry";
+import {
+  checkUserFieldName,
+  checkUserFieldType,
+  RESERVED_USER_FIELD_NAMES,
+  userFieldColumnName,
+  validateUserConfig,
+} from "../validate-user-config";
+
+describe("checkUserFieldName", () => {
+  it("accepts an ordinary field name", () => {
+    expect(checkUserFieldName("phoneNumber")).toBeNull();
+    expect(checkUserFieldName("phone_number")).toBeNull();
+    expect(checkUserFieldName("a1")).toBeNull();
+  });
+
+  it.each([...RESERVED_USER_FIELD_NAMES])(
+    "rejects the built-in name %s",
+    name => {
+      expect(checkUserFieldName(name)?.code).toBe("USER_FIELD_NAME_RESERVED");
+    }
+  );
+
+  it("refuses interfaceLanguage, naming it and saying to rename the app's field", () => {
+    // The column each user's own interface language is kept in: a custom
+    // field of that name would answer to the same name on the merged user.
+    const refusal = checkUserFieldName("interfaceLanguage");
+
+    expect(refusal?.code).toBe("USER_FIELD_NAME_RESERVED");
+    expect(refusal?.message).toContain("'interfaceLanguage'");
+    expect(refusal?.message).toMatch(/rename/i);
+  });
+
+  it("matches reserved names regardless of case", () => {
+    for (const name of ["Email", "EMAIL", "eMaIl", "ID", "PassWordHash"]) {
+      expect(checkUserFieldName(name)?.code).toBe("USER_FIELD_NAME_RESERVED");
+    }
+  });
+
+  it("rejects a SQL keyword", () => {
+    expect(checkUserFieldName("select")?.code).toBe(
+      "USER_FIELD_NAME_SQL_KEYWORD"
+    );
+  });
+
+  it("rejects names that cannot be a column identifier", () => {
+    for (const name of ["1abc", "has-dash", "has space", "has.dot", ""]) {
+      expect(checkUserFieldName(name)).not.toBeNull();
+    }
+  });
+
+  it("rejects a missing or non-string name", () => {
+    expect(checkUserFieldName(undefined)?.code).toBe(
+      "USER_FIELD_NAME_REQUIRED"
+    );
+    expect(checkUserFieldName(null)?.code).toBe("USER_FIELD_NAME_REQUIRED");
+    expect(checkUserFieldName(42)?.code).toBe("USER_FIELD_NAME_REQUIRED");
+  });
+
+  it("reports the built-in conflict for a name that is also a SQL keyword", () => {
+    // `password` is both; the built-in conflict is the actionable reason.
+    expect(checkUserFieldName("password")?.code).toBe(
+      "USER_FIELD_NAME_RESERVED"
+    );
+  });
+
+  it("names the offending value so the message can be shown as-is", () => {
+    expect(checkUserFieldName("email")?.message).toContain("email");
+  });
+
+  it.each(["userId", "user_id", "UserId", "created_at", "updated_at"])(
+    "rejects %s, whose column is one user_ext keeps for itself",
+    name => {
+      const rejection = checkUserFieldName(name);
+      expect(rejection?.code).toBe("USER_FIELD_NAME_RESERVED");
+      expect(rejection?.message).toContain(userFieldColumnName(name));
+    }
+  );
+});
+
+describe("userFieldColumnName", () => {
+  it("is the snake-case column a field is stored in", () => {
+    expect(userFieldColumnName("employeeId")).toBe("employee_id");
+    expect(userFieldColumnName("bio")).toBe("bio");
+    expect(userFieldColumnName("foo_bar")).toBe("foo_bar");
+  });
+});
+
+describe("validateUserConfig: unique only where a column can carry it", () => {
+  it.each([
+    ["a textarea", textarea({ name: "about", unique: true })],
+    [
+      "a multi-value select",
+      select({
+        name: "tags",
+        hasMany: true,
+        unique: true,
+        options: [{ label: "A", value: "a" }],
+      }),
+    ],
+  ])("refuses unique on %s", (_label, field) => {
+    const result = validateUserConfig({ fields: [field] });
+
+    expect(result.errors.map(e => e.code)).toContain(
+      "USER_FIELD_UNIQUE_UNSUPPORTED"
+    );
+    expect(result.errors[0].path).toBe("fields[0].unique");
+  });
+
+  it("accepts unique on a text field", () => {
+    const result = validateUserConfig({
+      fields: [text({ name: "employeeId", unique: true })],
+    });
+
+    expect(result.errors).toEqual([]);
+  });
+
+  describe("a plugin field type", () => {
+    afterEach(() => {
+      clearFieldTypes();
+    });
+
+    function registerHandleType(storage: "text" | "longText" | "json") {
+      registerFieldType({
+        type: "handle",
+        storage,
+        component: "@acme/handles/admin#Handle",
+        surfaces: ["users"],
+      });
+    }
+
+    it.each(["longText", "json"] as const)(
+      "refuses unique when it is stored as %s",
+      storage => {
+        registerHandleType(storage);
+        const result = validateUserConfig({
+          fields: [{ name: "handle", type: "handle", unique: true }],
+        } as unknown as Parameters<typeof validateUserConfig>[0]);
+
+        const rejection = result.errors.find(
+          e => e.code === "USER_FIELD_UNIQUE_UNSUPPORTED"
+        );
+        expect(rejection?.path).toBe("fields[0].unique");
+      }
+    );
+
+    it.each(["longText", "json"] as const)(
+      "refuses unique on a type the config declares as %s, before it is registered",
+      storage => {
+        // `defineConfig` validates users before boot registers the plugins'
+        // field types, so the storage comes from the declaration.
+        const result = validateUserConfig(
+          {
+            fields: [{ name: "handle", type: "handle", unique: true }],
+          } as unknown as Parameters<typeof validateUserConfig>[0],
+          new Map([["handle", storage]])
+        );
+
+        expect(result.errors.map(e => e.code)).toContain(
+          "USER_FIELD_UNIQUE_UNSUPPORTED"
+        );
+      }
+    );
+
+    it("refuses it through defineConfig, from the plugin that declares the type", () => {
+      const plugin = definePlugin({
+        name: "@test/handles",
+        version: "1.0.0",
+        nextly: ">=0.0.0",
+        contributes: {
+          fieldTypes: [
+            {
+              type: "handle",
+              storage: "longText",
+              component: "@acme/handles/admin#Handle",
+              surfaces: ["users"],
+            },
+          ],
+        },
+        init() {},
+      });
+
+      expect(() =>
+        defineConfig({
+          plugins: [plugin],
+          users: {
+            fields: [{ name: "handle", type: "handle", unique: true }],
+          },
+        } as unknown as Parameters<typeof defineConfig>[0])
+      ).toThrow(/USER_FIELD_UNIQUE_UNSUPPORTED/);
+    });
+
+    it("accepts unique when it is stored as text", () => {
+      registerHandleType("text");
+      const result = validateUserConfig({
+        fields: [{ name: "handle", type: "handle", unique: true }],
+      } as unknown as Parameters<typeof validateUserConfig>[0]);
+
+      expect(result.errors.map(e => e.code)).not.toContain(
+        "USER_FIELD_UNIQUE_UNSUPPORTED"
+      );
+    });
+  });
+});
+
+describe("validateUserConfig: one column per field", () => {
+  it("refuses two fields stored in the same column", () => {
+    const result = validateUserConfig({
+      fields: [text({ name: "fooBar" }), text({ name: "foo_bar" })],
+    });
+
+    const duplicate = result.errors.find(
+      e => e.code === "USER_FIELD_NAME_DUPLICATE"
+    );
+    expect(duplicate?.path).toBe("fields[1].name");
+    expect(duplicate?.message).toContain("foo_bar");
+  });
+
+  it("still refuses two names that differ only in case", () => {
+    const result = validateUserConfig({
+      fields: [text({ name: "foobar" }), text({ name: "FOOBAR" })],
+    });
+
+    expect(result.errors.map(e => e.code)).toContain(
+      "USER_FIELD_NAME_DUPLICATE"
+    );
+  });
+
+  it("accepts fields stored in different columns", () => {
+    const result = validateUserConfig({
+      fields: [text({ name: "fooBar" }), text({ name: "foo_baz" })],
+    });
+
+    expect(result.errors).toEqual([]);
+  });
+});
+
+describe("checkUserFieldType", () => {
+  it("accepts every supported type", () => {
+    for (const type of [
+      "text",
+      "textarea",
+      "number",
+      "email",
+      "select",
+      "radio",
+      "checkbox",
+      "date",
+    ]) {
+      expect(checkUserFieldType(type)).toBeNull();
+    }
+  });
+
+  it("rejects a type with no user_ext column representation", () => {
+    expect(checkUserFieldType("relationship")?.code).toBe(
+      "USER_FIELD_TYPE_NOT_ALLOWED"
+    );
+    expect(checkUserFieldType("richText")?.code).toBe(
+      "USER_FIELD_TYPE_NOT_ALLOWED"
+    );
+  });
+
+  it("rejects a missing type", () => {
+    expect(checkUserFieldType(undefined)?.code).toBe(
+      "USER_FIELD_TYPE_REQUIRED"
+    );
+  });
+
+  it("describes a non-string type without stringifying caller data", () => {
+    const rejection = checkUserFieldType({ nested: "object" });
+    expect(rejection?.code).toBe("USER_FIELD_TYPE_NOT_ALLOWED");
+    expect(rejection?.message).toContain("object");
+    expect(rejection?.message).not.toContain("nested");
+  });
+});

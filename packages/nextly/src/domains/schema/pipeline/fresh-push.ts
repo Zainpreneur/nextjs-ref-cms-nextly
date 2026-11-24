@@ -1,0 +1,649 @@
+// Direct pushSchema helper for fresh / static-tables-only flows.
+//
+// What this is: a thin wrapper around drizzle-kit v1's per-dialect
+// pushSchema with no diff engine, no Classifier, no PromptDispatcher,
+// no MigrationJournal. Used by:
+//
+//   - `cli/commands/dev-server.ts:ensureCoreTables` — pushes the static
+//     core tables (users, permissions, dynamic_collections, etc.) on a
+//     fresh DB. The pipeline's apply() iterates only `desired.collections`,
+//     so it can't materialise the static internal tables.
+//   - `cli/commands/migrate-fresh.ts:reconcileMysqlSchema` — safety net
+//     for historical MySQL drift after `migrate:fresh --seed` runs the
+//     bundled migrations. Pushes static schemas to fill any gaps.
+//   - `domains/schema/migrate/core-reconcile.ts` — `nextly migrate`
+//     Phase 1 core-table reconciliation.
+//   - `init/first-run.ts` — first-boot setup.
+//
+// Why this exists separately from `applyDesiredSchema`: per the user
+// decision Q3=A (2026-04-28), `nextly migrate:fresh` and the boot
+// static-tables push stay on a simple direct-pushSchema path. They
+// never need prompts (prompts on a fresh DB would be silly), they never
+// need classifier events (no existing data to classify against), they
+// never need a journal entry (these are setup operations, not user
+// schema changes).
+//
+// All three dialects share one flow on v1: pushSchema generates the
+// statements diffed against the LIVE database, and we execute them
+// ourselves so the drop-guard + destructive-statement scan can inspect
+// the SQL first (drizzle-kit's own result.apply() would run everything
+// opaquely — including DROPs for user tables absent from a core-only
+// push, the historical data-loss bug the guard exists for).
+//
+// Boot-safety policy: unexpected destructive statements are STRIPPED
+// and reported (result.hints + console.warn), not thrown — a server
+// boot must not brick over a statement we were never going to run.
+// The interactive pipeline (pushschema-pipeline.ts) takes the opposite
+// stance and throws, because a user is present to act on the failure.
+
+import type { KitHint } from "../../../database/drizzle-kit-lazy";
+import {
+  getMySQLDrizzleKit,
+  getPgDrizzleKit,
+  getSQLiteDrizzleKit,
+} from "../../../database/drizzle-kit-lazy";
+import { isMissingColumnError } from "../../../database/missing-column";
+import { NextlyError } from "../../../errors/nextly-error";
+import { consoleLogger } from "../../../shared/types";
+import { pluginMigratedTableSet } from "../ownership/drop-guard";
+
+import { currentMysqlDatabaseName } from "./database-url";
+import {
+  drizzleTableNames,
+  filterUnsafeStatements,
+  findUnexpectedDestructiveStatements,
+} from "./filter-unsafe-statements";
+import { pushInActiveSchema } from "./pg-active-schema-push";
+import { assertSchemaLockHeld, markedForSchemaLock } from "./schema-lock";
+import { isIdempotencyError, splitStatements } from "./sql-statement-utils";
+
+// Re-exported so existing importers (v1-golden suite) keep working; the
+// implementation lives in sql-statement-utils.ts.
+export { splitStatements };
+
+export type FreshPushDialect = "postgresql" | "mysql" | "sqlite";
+
+// Result shape returned to callers. Success is signalled by returning at
+// all (errors throw). `hints` carries drizzle-kit's own hints (empty in
+// every observed rc.4 scenario) plus one entry per destructive statement
+// the boot-safety policy stripped.
+export interface FreshPushResult {
+  hints: KitHint[];
+  statementsExecuted: string[];
+}
+
+/**
+ * Push a static / fresh schema directly via drizzle-kit v1, bypassing the
+ * pipeline's diff + classifier + prompt machinery. All dialects route
+ * through pushSchema; statements are executed by Nextly (never by kit's
+ * apply()) so the drop-guard and destructive-statement scan run first.
+ *
+ * Throws on:
+ *   - Unknown dialect (front-of-function guard, defends against callers
+ *     that bypass TS).
+ *   - Dialect-execution errors that aren't `already exists` /
+ *     `Duplicate column` (caller handles them — `migrate:fresh`
+ *     swallows known drift errors, `ensureCoreTables` has its own
+ *     SQLite raw-SQL fallback).
+ */
+export async function freshPushSchema(
+  dialect: FreshPushDialect,
+  db: unknown,
+  schema: Record<string, unknown>,
+  options: FreshPushOptions = {}
+): Promise<FreshPushResult> {
+  // Entry-point dialect guard. TS already narrows callers to the union,
+  // but a runtime check makes the failure mode obvious for callers that
+  // bypass the type system (e.g. plugin authors with `as any` somewhere).
+  if (dialect !== "postgresql" && dialect !== "mysql" && dialect !== "sqlite") {
+    throw NextlyError.internal({
+      logContext: { reason: `Unsupported dialect: ${String(dialect)}` },
+    });
+  }
+
+  // TWO PASSES, when and only when the first one degraded.
+  //
+  // The rename resolver crashes while pairing a live table outside the desired
+  // schema against one being ADDED, and the recovery baseline is diffed from an
+  // empty snapshot — so it creates missing tables and silently drops every
+  // alteration to a table that already exists. That is why a column added to a
+  // core table never reached an installation holding ordinary content.
+  //
+  // Once the first pass has created what was missing, nothing is added any
+  // more. The resolver has no pair to resolve, does not crash, and drizzle-kit
+  // emits the alterations itself — including the table rebuilds SQLite needs
+  // for a nullability change, which it already knows how to express and this
+  // code would otherwise have to reimplement.
+  //
+  // The second pass runs only after a degraded one. An ordinary push already
+  // applied everything, and re-running it would be a wasted introspection on
+  // every boot.
+  //
+  // On SQLite both passes run in one transaction, as PostgreSQL's statements
+  // do, so a push that stops part-way (killed, its connection lost, a pass it
+  // refuses) leaves nothing behind: a table rebuild stopped between its steps
+  // would otherwise leave its `__new_` table for the next run to trip on.
+  const passes = async (open?: () => void): Promise<FreshPushResult> => {
+    const first = await planForDialect(dialect, db, schema, options);
+    const firstPass = await applyPushResult(dialect, db, schema, first, open);
+    if (!isDegraded(first)) return firstPass;
+
+    const second = await planForDialect(dialect, db, schema, options);
+    // A second pass that degrades again adds no column either: on a push
+    // that must not report success with columns missing, that is a refusal,
+    // and SQLite's transaction undoes the first pass with it.
+    if (options.refuseUnplannable === true && isDegraded(second)) {
+      throw new UnplannablePushError(
+        "the push degraded twice to the additive-tables-only baseline"
+      );
+    }
+    const secondPass = await applyPushResult(dialect, db, schema, second, open);
+    return {
+      hints: [...firstPass.hints, ...secondPass.hints],
+      statementsExecuted: [
+        ...firstPass.statementsExecuted,
+        ...secondPass.statementsExecuted,
+      ],
+    };
+  };
+  return dialect === "sqlite"
+    ? inSqliteTransaction(db, open => passes(open))
+    : passes();
+}
+
+/** How a caller of `freshPushSchema` wants a push it cannot plan handled. */
+export interface FreshPushOptions {
+  /**
+   * Refuse, before any statement runs, a push drizzle-kit cannot plan: its
+   * rename resolver crashing on PostgreSQL, a degraded first pass on MySQL
+   * (whose introspection is scoped to the desired tables, so a degraded pass
+   * there never has the benign cause SQLite's has), or on SQLite a second
+   * pass that degrades again. Without it those fall back as before: the
+   * error on PostgreSQL, the additive-tables-only baseline elsewhere. The
+   * core upgrade sets it, since it must never report success with columns
+   * missing.
+   */
+  refuseUnplannable?: boolean;
+}
+
+/**
+ * A push drizzle-kit cannot plan, refused before any statement ran (on
+ * SQLite, with what ran undone). Its caller names what to do.
+ */
+export class UnplannablePushError extends Error {
+  override name = "UnplannablePushError";
+  constructor(readonly detail: string) {
+    super(`The schema push cannot be planned: ${detail}.`);
+  }
+}
+
+/** Whether a push result is the additive-tables-only baseline. */
+function isDegraded(result: { hints: KitHint[] }): boolean {
+  return result.hints.some(h => h.hint.startsWith(DEGRADED_PASS_HINT));
+}
+
+/**
+ * One pass's statements, refusing what `options` says cannot be planned:
+ * PostgreSQL's resolver crash, and a degraded pass on MySQL.
+ */
+async function planForDialect(
+  dialect: FreshPushDialect,
+  db: unknown,
+  schema: Record<string, unknown>,
+  options: FreshPushOptions
+): Promise<{ sqlStatements: string[]; hints: KitHint[] }> {
+  let result: { sqlStatements: string[]; hints: KitHint[] };
+  try {
+    result = await pushForDialect(dialect, db, schema);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (options.refuseUnplannable === true && /HintsHandler/.test(message)) {
+      throw new UnplannablePushError(message);
+    }
+    throw err;
+  }
+  if (
+    options.refuseUnplannable === true &&
+    dialect === "mysql" &&
+    isDegraded(result)
+  ) {
+    throw new UnplannablePushError(
+      "drizzle-kit's rename resolver crashed, and MySQL's fallback adds no column"
+    );
+  }
+  return result;
+}
+
+/**
+ * Run `body` in one SQLite transaction, opened by `body` before its first
+ * statement (`open`), so a push with nothing to run touches nothing. Foreign
+ * keys are off around it (the pragma does nothing inside a transaction), and
+ * checked before the commit: a rebuild that left orphaned child rows fails the
+ * push and is undone. Anything that fails, the commit included, is rolled back
+ * before foreign keys are switched on again. Exported for its tests.
+ */
+export async function inSqliteTransaction<T>(
+  db: unknown,
+  body: (open: () => void) => Promise<T>
+): Promise<T> {
+  const { sql: sqlTag } = await import("drizzle-orm");
+  const run = (q: string) =>
+    (db as { run: (q: unknown) => unknown }).run(sqlTag.raw(q));
+  let opened = false;
+  const open = () => {
+    if (opened) return;
+    run("PRAGMA foreign_keys = OFF");
+    opened = true;
+    run("BEGIN");
+  };
+  try {
+    let result: T;
+    try {
+      result = await body(open);
+      if (!opened) return result;
+      const violations = (db as { all?: (q: unknown) => unknown[] }).all?.(
+        sqlTag.raw("PRAGMA foreign_key_check")
+      );
+      if (violations && violations.length > 0) {
+        throw NextlyError.internal({
+          logContext: {
+            reason:
+              `fresh-push: PRAGMA foreign_key_check reported ` +
+              `${violations.length} violation(s) after the reconcile — a ` +
+              `table rebuild left orphaned child rows (#5782 class)`,
+          },
+        });
+      }
+      // Inside the guard too: a COMMIT that fails (SQLITE_BUSY) leaves the
+      // transaction open, and foreign keys could not be switched back on, nor
+      // the connection used again, until it is rolled back.
+      run("COMMIT");
+    } catch (err) {
+      if (opened) rollbackQuietly(run);
+      throw err;
+    }
+    return result;
+  } finally {
+    if (opened) run("PRAGMA foreign_keys = ON");
+  }
+}
+
+/** Roll back, where a failure has already ended the transaction too. */
+function rollbackQuietly(run: (q: string) => unknown): void {
+  try {
+    run("ROLLBACK");
+  } catch {
+    // The transaction is already gone (the connection closed, or SQLite
+    // rolled it back itself); there is nothing left to undo.
+  }
+}
+
+/**
+ * Filter one push result for safety and execute what survives.
+ *
+ * Extracted so a degraded first pass and the retry after it go through exactly
+ * the same guards — a second path here is a second place for a destructive
+ * statement to slip past.
+ */
+async function applyPushResult(
+  dialect: FreshPushDialect,
+  db: unknown,
+  schema: Record<string, unknown>,
+  result: { sqlStatements: string[]; hints: KitHint[] },
+  /** SQLite's: opens the push's transaction before its first statement. */
+  open?: () => void
+): Promise<FreshPushResult> {
+  // The statements to run and the ones to strip, as `planFreshPush` reports
+  // them; the stripped ones are surfaced via hints + warn below.
+  const { runnable, blocked, degraded } = await planPushResult(
+    dialect,
+    db,
+    schema,
+    result
+  );
+  const offenders = new Set(blocked);
+  const hints: KitHint[] = [
+    ...result.hints,
+    ...[...offenders].map(statement => ({
+      hint: "blocked destructive statement on fresh-push",
+      statement,
+    })),
+  ];
+  // v1 hints were EMPTY in every observed rc.4 scenario; if the kit ever
+  // starts attaching them (some carry a `statement` its own apply() would
+  // run first), that is an uninterpreted signal — surface it loudly so a
+  // boot log never silently swallows a data-loss precondition.
+  for (const h of result.hints) {
+    // Nextly-authored diagnostics (the resolver-crash fallback) are already
+    // interpreted — only genuinely-unknown kit hints deserve the warning.
+    if (h.hint.startsWith("[nextly]")) continue;
+    consoleLogger.warn(
+      `[Nextly schema] fresh-push received a drizzle-kit hint it does not ` +
+        `interpret: ${h.hint}${h.statement ? ` [${h.statement}]` : ""}`
+    );
+  }
+  for (const statement of offenders) {
+    consoleLogger.warn(
+      `[Nextly schema] fresh-push blocked a destructive statement emitted ` +
+        `by drizzle-kit (core reconciles must never destroy data; route ` +
+        `intentional drops through migrations): ${statement}`
+    );
+  }
+
+  // A degraded pass cannot add a column, so an index over one it lacks is a
+  // casualty of the baseline rather than a fault; the pass that follows builds
+  // both in order.
+  const executed = await executeStatements(
+    dialect,
+    db,
+    runnable,
+    degraded,
+    open
+  );
+
+  return { hints, statementsExecuted: executed };
+}
+
+/** What one push pass would do, worked out without executing anything. */
+export interface FreshPushPlan {
+  /** The statements the pass runs, in order. */
+  runnable: string[];
+  /** The destructive statements it strips and never runs. */
+  blocked: string[];
+  /**
+   * Whether the pass degraded to the additive-tables-only baseline. A second
+   * pass then follows once this one has run; it is not planned here, since
+   * what it emits depends on what this one created.
+   */
+  degraded: boolean;
+}
+
+/**
+ * What a push of `schema` would run and what it would strip, read-only: the
+ * statements drizzle-kit generates against the live database, through the
+ * same filters the push applies them with (`planPushResult`). Nothing is
+ * executed. A dry run names these; the push itself runs them.
+ */
+export async function planFreshPush(
+  dialect: FreshPushDialect,
+  db: unknown,
+  schema: Record<string, unknown>,
+  options: FreshPushOptions = {}
+): Promise<FreshPushPlan> {
+  // Planned through the same refusal the push makes, so a plan never shows a
+  // push the run would refuse (`refuseUnplannable`) as one it would make.
+  return planPushResult(
+    dialect,
+    db,
+    schema,
+    await planForDialect(dialect, db, schema, options)
+  );
+}
+
+/**
+ * One push result filtered for safety: the one judgement of which of its
+ * statements run, for the push and for its plan alike. Plugin-migrated tables
+ * are never dropped by push, whatever the desired set says (an unreadable
+ * registry reads as "nothing claimed"); and destructive statements the kit
+ * emitted unexpectedly are stripped, never executed (boot-safety: see the
+ * header comment for why this path strips where the pipeline throws).
+ */
+async function planPushResult(
+  dialect: FreshPushDialect,
+  db: unknown,
+  schema: Record<string, unknown>,
+  result: { sqlStatements: string[]; hints: KitHint[] }
+): Promise<FreshPushPlan> {
+  const safe = filterUnsafeStatements(
+    splitStatements(result.sqlStatements),
+    drizzleTableNames(schema),
+    await pluginMigratedTableSet(db, dialect),
+    dialect
+  );
+  const offenders = new Set(findUnexpectedDestructiveStatements(safe));
+  return {
+    runnable: safe.filter(s => !offenders.has(s)),
+    blocked: [...offenders],
+    degraded: result.hints.some(h => h.hint.startsWith(DEGRADED_PASS_HINT)),
+  };
+}
+
+/**
+ * Marks a pass that degraded to the additive-TABLES-only baseline.
+ *
+ * That baseline is diffed from an EMPTY snapshot, so it can create a missing
+ * table but never alter an existing one. Recognising it is what lets the push
+ * run again once the tables exist.
+ */
+const DEGRADED_PASS_HINT = "[nextly] pushSchema hit v1's rename-resolver crash";
+
+// Per-dialect pushSchema invocation. MySQL's v1 entrypoint requires the
+// database name positionally; resolve it from the live connection so
+// callers don't have to thread it through.
+async function pushForDialect(
+  dialect: FreshPushDialect,
+  db: unknown,
+  schema: Record<string, unknown>
+): Promise<{ sqlStatements: string[]; hints: KitHint[] }> {
+  switch (dialect) {
+    case "postgresql": {
+      const kit = await getPgDrizzleKit();
+      // Scope introspection to the DESIRED tables (same W6 fix as the
+      // pipeline's Phase D). Without the tables filter, any live table
+      // outside the desired set — e.g. the migrate lock table, which exists
+      // BEFORE the core reconcile runs inside the lock — pairs against an
+      // added table in v1's differ and crashes its rename resolver
+      // (`resolver(table) was called without a HintsHandler`). 0.31 emitted
+      // a DROP instead, which filterUnsafeStatements blocked; v1 crashes
+      // before emission, so the scoping must happen at introspection time.
+      // fresh-push is create-only reconcile — orphans are none of its
+      // business.
+      // The configured schema, for the same reason the pipeline's Phase D
+      // uses it: the adapter writes through `search_path`, so introspecting
+      // `public` would compare against a namespace nothing is in, and the
+      // desired tables must be read as that schema's too.
+      return pushInActiveSchema(schema, (active, desired) =>
+        kit.pushSchema(desired, db, {
+          schemas: [active],
+          tables: drizzleTableNames(schema),
+        })
+      );
+    }
+    case "mysql": {
+      const kit = await getMySQLDrizzleKit();
+      const databaseName = await currentMysqlDatabaseName(db);
+      // Introspection scoped to the DESIRED tables, as PostgreSQL's is above
+      // and for the same reason: a site's `dc_*` content tables would
+      // otherwise read as dropped, pair against a table this push adds, and
+      // crash the rename resolver. The fallback below then replays the
+      // baseline, whose `ADD CONSTRAINT` for every core foreign key the
+      // database already holds fails on its duplicate name, so the first
+      // `nextly migrate` after a release that adds a core table failed on
+      // every MySQL site with content.
+      return withResolverCrashFallback(
+        () =>
+          kit.pushSchema(schema, db, databaseName, {
+            tables: drizzleTableNames(schema),
+          }),
+        async () =>
+          kit.generateMigration(
+            await kit.generateDrizzleJson({}),
+            await kit.generateDrizzleJson(schema)
+          )
+      );
+    }
+    case "sqlite": {
+      const kit = await getSQLiteDrizzleKit();
+      return withResolverCrashFallback(
+        () => kit.pushSchema(schema, db),
+        async () =>
+          kit.generateMigration(
+            await kit.generateDrizzleJson({}),
+            await kit.generateDrizzleJson(schema)
+          )
+      );
+    }
+  }
+}
+
+// The SQLite payload entrypoint accepts no tables filter, so its
+// introspection sees the WHOLE live database. When an upgrade adds a new
+// core table while any non-core table exists (user dc_* content, the
+// migrate lock), v1's differ pairs the "dropped" orphan against the added
+// table and its rename resolver throws `Internal error: resolver(table) was
+// called without a HintsHandler` BEFORE emitting anything (probe-verified).
+// PG and MySQL avoid this by scoping introspection to the desired tables
+// above, so on MySQL this is only a backstop. SQLite survives the baseline
+// because its foreign keys live inside CREATE TABLE, which is skipped for a
+// table that exists; MySQL's are separate `ADD CONSTRAINT` statements that
+// fail on an existing name, which is why MySQL must not depend on it. The
+// recovery is the pre-v1 applyViaGenerate shape: generate the pure-CREATE
+// baseline from an empty snapshot. That set contains no drops by construction, and the
+// downstream idempotency-tolerant executor skips tables that already exist,
+// so the reconcile degrades to additive-TABLES-only instead of crashing the
+// boot.
+//
+// Deliberate scope: because the baseline is diffed from an EMPTY
+// snapshot it emits only CREATE TABLE — never ALTER TABLE ADD COLUMN. A core
+// table that already exists but is missing a newly-added COLUMN is therefore
+// NOT reconciled in this degraded pass (its CREATE is skipped as
+// already-existing). That is acceptable here: Nextly's own core-schema
+// evolution ships through the migration journal, not through this boot-time
+// ensure, and the crash that triggered this fallback is transient — it
+// clears once the orphan tables are gone, so the next clean reconcile diffs
+// live→desired normally and adds any missing column. Recovering columns here
+// would require a scoped live diff, which is exactly the operation that
+// crashed; parsing DDL by hand in a recovery path is not worth the fragility.
+async function withResolverCrashFallback(
+  push: () => Promise<{ sqlStatements: string[]; hints: KitHint[] }>,
+  generateBaseline: () => Promise<string[]>
+): Promise<{ sqlStatements: string[]; hints: KitHint[] }> {
+  try {
+    return await push();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (!/HintsHandler/.test(message)) throw err;
+    const sqlStatements = await generateBaseline();
+    return {
+      sqlStatements,
+      hints: [
+        {
+          // The `[nextly]` prefix marks this as a Nextly-authored
+          // diagnostic — freshPushSchema's warn loop skips it so operators
+          // are not told a fully-handled fallback is an "uninterpreted
+          // drizzle-kit hint".
+          hint:
+            DEGRADED_PASS_HINT +
+            " (live tables outside the desired schema); applied the " +
+            "additive-TABLES-only baseline, then re-pushed so the " +
+            "alterations it cannot express are not lost",
+        },
+      ],
+    };
+  }
+}
+
+/**
+ * Whether a failed statement is an index the additive baseline could not build
+ * yet.
+ *
+ * The baseline is diffed from an EMPTY snapshot, so it carries every index in
+ * the desired schema while emitting no `ALTER TABLE ADD COLUMN` at all. An
+ * index naming a column the live table has not gained yet therefore fails on a
+ * precondition the same pass is incapable of satisfying. Skipping it is safe
+ * only because a degraded pass is always followed by another, and that one adds
+ * the column and then indexes it.
+ *
+ * Narrow on purpose: only CREATE INDEX, only a missing-column error, and only
+ * when the caller says the pass degraded. A failure to create an index for any
+ * other reason still stops the reconcile.
+ */
+function isIndexAwaitingItsColumn(statement: string, err: unknown): boolean {
+  return (
+    /^\s*CREATE\s+(UNIQUE\s+)?INDEX/i.test(statement) &&
+    isMissingColumnError(err)
+  );
+}
+
+// Executes statements per dialect, swallowing idempotency errors
+// ("already exists" / duplicate column) so re-runs over an existing
+// schema reconcile instead of failing. v1 wraps driver errors in
+// DrizzleQueryError with the original error on `.cause`, so both the
+// wrapper message and the cause message are checked.
+async function executeStatements(
+  dialect: FreshPushDialect,
+  db: unknown,
+  statements: string[],
+  degraded: boolean,
+  /** SQLite's: opens the push's transaction (`inSqliteTransaction`). */
+  open?: () => void
+): Promise<string[]> {
+  if (statements.length === 0) return [];
+  const { sql: sqlTag } = await import("drizzle-orm");
+  const executed: string[] = [];
+
+  type SqliteRunDb = { run: (q: unknown) => unknown };
+  type AsyncExecuteDb = { execute: (q: unknown) => Promise<unknown> };
+  type PgTxDb = {
+    transaction: (
+      fn: (tx: { execute: (q: unknown) => Promise<unknown> }) => Promise<void>
+    ) => Promise<void>;
+  };
+
+  if (dialect === "postgresql") {
+    // One transaction for an atomic reconcile (PG supports transactional
+    // DDL). Idempotency errors abort a PG transaction, so re-runs over an
+    // existing schema are expected to emit zero statements instead.
+    await (db as PgTxDb).transaction(async tx => {
+      for (const stmt of statements) {
+        // A run that lost the schema lock starts no further statement, and each carries the run's
+        // claim so a run taking the lock over can find and stop it.
+        await assertSchemaLockHeld();
+        await tx.execute(sqlTag.raw(markedForSchemaLock(stmt)));
+        executed.push(stmt);
+      }
+      // The commit is what lands the reconcile: refused, and the transaction undone, as a
+      // statement is, so a run that lost the lock while its last statement ran changes nothing.
+      await assertSchemaLockHeld();
+    });
+    return executed;
+  }
+
+  if (dialect === "sqlite") {
+    // #5782 defense, independent of drizzle-kit's emitted choreography: the
+    // interactive pipeline toggles PRAGMA foreign_keys OFF/ON outside any
+    // transaction and runs foreign_key_check after apply — this boot path
+    // must not rely on the kit's INLINE pragma statements staying present
+    // and correctly ordered across RC bumps. The toggle, the transaction and
+    // the integrity check are `inSqliteTransaction`'s, around every pass.
+    const run = (q: string) => (db as SqliteRunDb).run(sqlTag.raw(q));
+    open?.();
+    for (const stmt of statements) {
+      await assertSchemaLockHeld();
+      try {
+        run(stmt);
+        executed.push(stmt);
+      } catch (err) {
+        if (isIdempotencyError(err)) continue;
+        if (degraded && isIndexAwaitingItsColumn(stmt, err)) continue;
+        throw err;
+      }
+    }
+    return executed;
+  }
+
+  for (const stmt of statements) {
+    await assertSchemaLockHeld();
+    try {
+      await (db as AsyncExecuteDb).execute(
+        sqlTag.raw(markedForSchemaLock(stmt))
+      );
+      executed.push(stmt);
+    } catch (err) {
+      if (isIdempotencyError(err)) continue;
+      if (degraded && isIndexAwaitingItsColumn(stmt, err)) continue;
+      throw err;
+    }
+  }
+  return executed;
+}

@@ -1,0 +1,889 @@
+/**
+ *
+ * Tests for `createEntry`, `updateEntry`, `deleteEntry`, and `getEntry` —
+ * the write/mutation surface of CollectionEntryService.
+ *
+ * Covers:
+ * - createEntry: basic fields, hook execution order, slug generation,
+ *   relationship normalisation, error handling.
+ * - getEntry: success, 404, access control, depth, field selection.
+ * - updateEntry: 404 existing entry check, hooks.
+ * - deleteEntry: 404, hooks, access control, success response.
+ */
+
+import {
+  describe,
+  it,
+  expect,
+  vi,
+  beforeEach,
+  afterEach,
+  beforeAll,
+} from "vitest";
+
+// A field rule is handed the caller's roles and grants; with no database
+// behind this suite the real lookups refuse, so they answer here.
+vi.mock("../../../services/lib/permissions", async importOriginal => ({
+  ...(await importOriginal<
+    typeof import("../../../services/lib/permissions")
+  >()),
+  listRoleSlugsForUser: vi.fn(async () => []),
+  listEffectiveGrants: vi.fn(async () => []),
+}));
+
+import {
+  clearFieldFunctions,
+  registerFieldFunctions,
+} from "../../../shared/lib/field-level-registry";
+
+import { NextlyError } from "../../../errors/nextly-error";
+import { CollectionEntryService } from "../../../services/collections/collection-entry-service";
+
+import {
+  createMockSchema,
+  createMockDb,
+  createMockAdapter,
+  silentLogger,
+  createMockFileManager,
+  createMockCollection,
+  createMockCollectionService,
+  createMockRelationshipService,
+  createMockHookRegistry,
+  createMockRbacAccessControlService,
+  createMockComponentDataService,
+  createSampleEntry,
+  callerMay,
+  fakeActorForUser,
+  fakeUserHoldsPermission,
+  fakeUserIsSuperAdmin,
+  resetCallerAccess,
+} from "./collection-test-helpers";
+import { loadDialectTables } from "../../../database/dialect-tables";
+
+// The postgresql tables this file reads; the unit setup loads only
+// the run's own dialect, as an app's adapter would.
+beforeAll(async () => {
+  await Promise.all(["postgresql"].map(d => loadDialectTables(d)));
+});
+
+// ── Module mocks ──────────────────────────────────────────────────────────
+
+// The caller the collection gate decides for: a signed-in user's actions are
+// set per test (`callerMay`), and every test starts from one holding all.
+vi.mock("../../../auth/access/resolve-actor", async importOriginal => ({
+  ...(await importOriginal<object>()),
+  ...(await (async () => {
+    const fake = await import("./collection-test-helpers");
+    return {
+      actorForUser: fake.fakeActorForUser,
+      actorForVisitor: fake.fakeActorForVisitor,
+      userHoldsPermission: fake.fakeUserHoldsPermission,
+      userIsSuperAdmin: fake.fakeUserIsSuperAdmin,
+    };
+  })()),
+}));
+
+vi.mock("../../../di/container", () => ({
+  container: {
+    get: vi.fn(),
+    has: vi.fn().mockReturnValue(false),
+  },
+}));
+
+vi.mock("../../../database/index", () => ({
+  getDialectTables: vi.fn(() => ({})),
+}));
+
+vi.mock("../../../collections/fields/guards", () => ({
+  isFieldGroupField: vi.fn().mockReturnValue(false),
+}));
+
+vi.mock("../../../lib/case-conversion", () => ({
+  keysToCamelCase: vi.fn((obj: unknown) => obj),
+  toSnakeCase: vi.fn((str: string) =>
+    str.replace(/([A-Z])/g, "_$1").toLowerCase()
+  ),
+}));
+
+vi.mock("../../../types/pagination", () => ({
+  buildPaginatedResponse: vi.fn(
+    (
+      docs: unknown[],
+      opts: { total: number; page: number; limit: number }
+    ) => ({
+      docs,
+      totalDocs: opts.total,
+      page: opts.page,
+      limit: opts.limit,
+      totalPages: Math.ceil(opts.total / opts.limit) || 1,
+      hasNextPage: false,
+      hasPrevPage: false,
+      nextPage: null,
+      prevPage: null,
+      pagingCounter: 1,
+    })
+  ),
+  clampLimit: vi.fn((limit: number) => Math.min(Math.max(1, limit), 500)),
+  calculateOffset: vi.fn((page: number, limit: number) => (page - 1) * limit),
+  PAGINATION_DEFAULTS: { page: 1, limit: 10, maxLimit: 500 },
+}));
+
+vi.mock("../../../services/collections/query-operators", () => ({
+  buildWhereClause: vi.fn().mockReturnValue(null),
+  extractGeoFilters: vi.fn((where: unknown) => ({
+    geoFilters: [],
+    cleanedWhere: where,
+  })),
+  extractComponentFieldConditions: vi.fn((where: unknown) => ({
+    componentFilters: [],
+    cleanedWhere: where,
+  })),
+  // No key reaches a component table, as no condition is a component one.
+  componentFilterTargets: vi.fn(() => []),
+}));
+
+vi.mock("../../../services/collections/geo-utils", () => ({
+  applyGeoFilters: vi.fn(),
+  sortByDistance: vi.fn(),
+}));
+
+vi.mock("../../../hooks/context-builder", () => ({
+  buildContext: vi.fn((opts: Record<string, unknown>) => opts),
+}));
+
+// Hoisted so every instance shares one spy. A per-instance `vi.fn()` is unreachable from a test,
+// which would leave this seam unobservable — and an unobservable seam is exactly where hook
+// dispatch could move ahead of the access check without any assertion noticing.
+const storedHookExecute = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ data: undefined, errors: [] })
+);
+
+// Field hooks are an independently movable dispatcher: `updateEntry` calls `runFieldHooks`
+// directly, so it is a fourth door the ordering assertions have to watch. Spied rather than
+// stubbed wholesale, so the rest of the registry keeps its real behaviour.
+const runFieldHooksSpy = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+
+// Relationship normalisation mutates the caller's data before the write. It is a seventh door:
+// `shapeWriteParts` calls it directly, so it can move above the gate independently of every hook
+// and validator. Spied rather than stubbed, so the rest of the module keeps its real behaviour.
+const normalizeRelationshipFieldsSpy = vi.hoisted(() => vi.fn());
+
+vi.mock("../../../shared/lib/field-transform", async importActual => {
+  const actual = await importActual<Record<string, unknown>>();
+  return {
+    ...actual,
+    normalizeRelationshipFields: vi.fn(
+      (...args: Parameters<typeof normalizeRelationshipFieldsSpy>) => {
+        normalizeRelationshipFieldsSpy(...args);
+        return (
+          actual.normalizeRelationshipFields as (...inner: unknown[]) => unknown
+        )(...args);
+      }
+    ),
+  };
+});
+
+vi.mock("../../../shared/lib/field-level-registry", async importActual => {
+  const actual = await importActual<Record<string, unknown>>();
+  return { ...actual, runFieldHooks: runFieldHooksSpy };
+});
+
+// Mocked by relative path, not by the `@nextly/hooks/stored-hook-executor` alias the source
+// imports: `vi.mock` does not resolve the tsconfig-path aliases that `vite-tsconfig-paths`
+// applies to real imports, so the alias form registers a mock against a specifier nothing
+// resolves to and the real class is constructed instead. That failure is silent — the factory
+// simply never runs — so the spy stays untouched and every `not.toHaveBeenCalled()` assertion
+// against it passes without observing anything.
+vi.mock("../../../hooks/stored-hook-executor", () => {
+  class MockStoredHookExecutor {
+    execute = storedHookExecute;
+  }
+  return { StoredHookExecutor: MockStoredHookExecutor };
+});
+
+vi.mock("../../../lib/field-transform", () => ({
+  transformRichTextFields: vi.fn((entry: unknown) => entry),
+}));
+
+// A schema-supplied `validate` callback is application code that runs on the caller's data, so
+// it belongs behind the access gate for the same reason hooks do. Returning a non-string passes
+// the documented contract, which keeps this observable without changing any outcome.
+const titleValidate = vi.fn().mockReturnValue(true);
+
+// A field-level `access.update` callback is configuration-supplied code that also resolves the
+// caller's grants, so running it for a caller about to be refused both executes application code
+// and performs a lookup on their behalf. It reaches the service through the function registry
+// rather than through the collection, so it is a separate door from the validator above.
+const titleFieldAccess = vi.fn().mockResolvedValue(true);
+
+// `updateEntry` reads `schemaDefinition.fields` in preference to `fields`, so both lists carry
+// the validator: attaching it to only one leaves the assertion watching a list nothing reads.
+function withTitleValidator<T extends { name: string }>(
+  fields: T[]
+): (T & { validate?: typeof titleValidate })[] {
+  return fields.map(field =>
+    field.name === "title" ? { ...field, validate: titleValidate } : field
+  );
+}
+
+// The shared fixture declares `author` as `type: "relation"`, but `normalizeRelationshipFields`
+// dispatches on `type === "relationship"`. A value under the shared spelling therefore reaches the
+// normaliser and is skipped, so an ordering assertion on the spy passes while the mechanism it
+// names never runs. Corrected here rather than in the shared helper, which other suites rely on.
+function asRelationshipFields<T extends { name: string; type?: string }>(
+  fields: T[]
+): T[] {
+  return fields.map(field =>
+    field.type === "relation" ? { ...field, type: "relationship" } : field
+  );
+}
+
+function collectionWithTitleValidator() {
+  const base = createMockCollection();
+  const shape = <T extends { name: string; type?: string }>(fields: T[]) =>
+    asRelationshipFields(withTitleValidator(fields));
+  return {
+    ...base,
+    schemaDefinition: {
+      ...base.schemaDefinition,
+      fields: shape(base.schemaDefinition.fields),
+    },
+    fields: shape(base.fields),
+  };
+}
+
+// ── Test suite ────────────────────────────────────────────────────────────
+
+describe("CollectionEntryService — Mutation Contracts", () => {
+  let service: CollectionEntryService;
+  let schema: ReturnType<typeof createMockSchema>;
+  let selectData: { rows: unknown[] };
+  let mockDb: ReturnType<typeof createMockDb>;
+  let mockAdapter: ReturnType<typeof createMockAdapter>;
+  let mockFileManager: ReturnType<typeof createMockFileManager>;
+  let mockCollectionService: ReturnType<typeof createMockCollectionService>;
+  let mockRelationshipService: ReturnType<typeof createMockRelationshipService>;
+  let mockHookRegistry: ReturnType<typeof createMockHookRegistry>;
+  let mockRbac: ReturnType<typeof createMockRbacAccessControlService>;
+  let mockComponentDataService: ReturnType<
+    typeof createMockComponentDataService
+  >;
+
+  afterEach(() => {
+    // The function registry is module-global, so a registration left behind would apply to every
+    // later test in the file.
+    clearFieldFunctions();
+  });
+
+  beforeEach(() => {
+    resetCallerAccess();
+    fakeActorForUser.mockClear();
+    fakeUserHoldsPermission.mockClear();
+    fakeUserIsSuperAdmin.mockClear();
+    vi.clearAllMocks();
+
+    schema = createMockSchema();
+    selectData = { rows: [] };
+    mockDb = createMockDb(selectData);
+    mockAdapter = createMockAdapter(mockDb);
+    mockFileManager = createMockFileManager(schema);
+    mockCollectionService = createMockCollectionService();
+    mockRelationshipService = createMockRelationshipService();
+    mockHookRegistry = createMockHookRegistry();
+    mockRbac = createMockRbacAccessControlService();
+    mockComponentDataService = createMockComponentDataService();
+
+    service = new CollectionEntryService(
+      mockAdapter as never,
+      silentLogger as never,
+      mockFileManager as never,
+      mockCollectionService as never,
+      mockRelationshipService as never,
+      mockHookRegistry as never,
+      mockComponentDataService as never,
+      mockRbac as never
+    );
+  });
+
+  // ── createEntry ─────────────────────────────────────────────────────
+
+  describe("createEntry", () => {
+    it("should check collection-level access before creating", async () => {
+      selectData.rows = [{ id: "new-1", title: "New Post" }];
+
+      await service.createEntry(
+        { collectionName: "posts", user: { id: "user-1", role: "editor" } },
+        { title: "New Post" }
+      );
+
+      expect(fakeUserHoldsPermission).toHaveBeenCalled();
+    });
+
+    it("should return 403 when access is denied", async () => {
+      callerMay();
+
+      const result = await service.createEntry(
+        { collectionName: "posts", user: { id: "user-1" } },
+        { title: "Forbidden Post" }
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(403);
+    });
+
+    it("should bypass access control when overrideAccess is true", async () => {
+      selectData.rows = [{ id: "new-1", title: "New Post" }];
+
+      const result = await service.createEntry(
+        { collectionName: "posts", overrideAccess: true },
+        { title: "Direct API Post" }
+      );
+
+      // checkCollectionAccess returns null when overrideAccess is true, so
+      // the write is never gated.
+      expect(result.success).toBe(true);
+    });
+
+    it("should execute beforeOperation hooks", async () => {
+      selectData.rows = [{ id: "new-1", title: "New Post" }];
+
+      await service.createEntry(
+        { overrideAccess: true, collectionName: "posts" },
+        { title: "Hooked Post" }
+      );
+
+      expect(mockHookRegistry.executeBeforeOperation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          collection: "posts",
+          operation: "create",
+        })
+      );
+    });
+
+    it("should execute beforeCreate hooks", async () => {
+      selectData.rows = [{ id: "new-1", title: "New Post" }];
+
+      await service.createEntry(
+        { overrideAccess: true, collectionName: "posts" },
+        { title: "Hooked Post" }
+      );
+
+      expect(mockHookRegistry.execute).toHaveBeenCalledWith(
+        "beforeCreate",
+        expect.any(Object)
+      );
+    });
+
+    it("runs field-level beforeChange after collection-level beforeChange", async () => {
+      // The field phase is the last HOOK before the write and is handed the
+      // record, so a collection-level beforeChange is not the final word on any
+      // field. Core normalisation still follows both, so neither is the final
+      // STEP. Payload dispatches the two levels in this order too.
+      selectData.rows = [{ id: "new-1", title: "New Post" }];
+
+      await service.createEntry(
+        { overrideAccess: true, collectionName: "posts" },
+        { title: "Ordered Post" }
+      );
+
+      // The registry mock is an untyped record, so its call list is too;
+      // the parameter is named as what a recorded call is.
+      const collectionPhase = mockHookRegistry.execute.mock.calls.findIndex(
+        (call: unknown[]) => call[0] === "beforeChange"
+      );
+      expect(collectionPhase, "collection beforeChange ran").toBeGreaterThan(
+        -1
+      );
+
+      const fieldPhase = runFieldHooksSpy.mock.calls.findIndex(
+        call => (call[0] as { phase?: string }).phase === "beforeChange"
+      );
+      expect(fieldPhase, "field beforeChange ran").toBeGreaterThan(-1);
+
+      // Invocation order across two different mocks, since neither list alone
+      // can say which came first.
+      const collectionOrder =
+        mockHookRegistry.execute.mock.invocationCallOrder[collectionPhase];
+      const fieldOrder = runFieldHooksSpy.mock.invocationCallOrder[fieldPhase];
+      expect(collectionOrder).toBeLessThan(fieldOrder!);
+    });
+
+    it("should execute afterCreate hooks", async () => {
+      selectData.rows = [{ id: "new-1", title: "New Post" }];
+
+      await service.createEntry(
+        { overrideAccess: true, collectionName: "posts" },
+        { title: "Hooked Post" }
+      );
+
+      expect(mockHookRegistry.execute).toHaveBeenCalledWith(
+        "afterCreate",
+        expect.any(Object)
+      );
+    });
+
+    it("should load collection metadata for fields", async () => {
+      selectData.rows = [{ id: "new-1", title: "Test" }];
+
+      await service.createEntry(
+        { overrideAccess: true, collectionName: "posts" },
+        { title: "Test" }
+      );
+
+      expect(mockCollectionService.getCollection).toHaveBeenCalledWith("posts");
+    });
+
+    it("should carry the DUPLICATE code on a unique-violation failure", async () => {
+      // A duplicate insert surfaces as NextlyError.duplicate out of the
+      // entry-write transaction. The legacy result envelope must keep the
+      // code alongside the 409 status: boundary translators (dispatcher,
+      // Direct API) need it to rebuild DUPLICATE instead of guessing
+      // CONFLICT from the bare status.
+      // No companion schema → not localized; lets the write reach the
+      // transaction, where the duplicate is raised.
+      mockFileManager.loadCompanionSchema = vi.fn().mockResolvedValue(null);
+      mockAdapter.transaction = vi
+        .fn()
+        .mockRejectedValue(NextlyError.duplicate());
+
+      const result = await service.createEntry(
+        { overrideAccess: true, collectionName: "posts" },
+        { title: "Duplicate Post" }
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(409);
+      expect(result.code).toBe("DUPLICATE");
+      expect(result.message).toBe("Resource already exists.");
+    });
+
+    it("should return error when collection service fails", async () => {
+      // getCollection is called first in access check, then again for fields.
+      // Reject both calls to ensure the error propagates.
+      mockCollectionService.getCollection.mockRejectedValue(
+        new Error("Collection 'missing' not found")
+      );
+
+      const result = await service.createEntry(
+        { overrideAccess: true, collectionName: "missing" },
+        { title: "Test" }
+      );
+
+      // createEntry catches all errors via mapDbErrorToServiceError
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(500);
+    });
+
+    it("should return CollectionServiceResult shape", async () => {
+      selectData.rows = [{ id: "new-1", title: "Test" }];
+
+      const result = await service.createEntry(
+        { overrideAccess: true, collectionName: "posts" },
+        { title: "Test" }
+      );
+
+      expect(result).toHaveProperty("success");
+      expect(result).toHaveProperty("statusCode");
+      expect(result).toHaveProperty("message");
+      expect(result).toHaveProperty("data");
+    });
+  });
+
+  // ── getEntry ──────────────────────────────────────────────────────────
+
+  describe("getEntry", () => {
+    it("should return the entry when found", async () => {
+      const entry = createSampleEntry();
+      selectData.rows = [entry];
+
+      const result = await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.statusCode).toBe(200);
+      expect(result.data).toBeDefined();
+    });
+
+    it("should return 404 when entry is not found", async () => {
+      selectData.rows = [];
+
+      const result = await service.getEntry({
+        collectionName: "posts",
+        entryId: "nonexistent",
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(404);
+      expect(result.message).toBe("Entry not found");
+    });
+
+    it("should check collection-level access", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+        user: { id: "user-1", role: "viewer" },
+      });
+
+      expect(fakeUserHoldsPermission).toHaveBeenCalled();
+    });
+
+    it("should return 403 when access is denied", async () => {
+      callerMay();
+
+      const result = await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+        user: { id: "user-1" },
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(404); // May not read it either, so answered as missing.
+    });
+
+    it("should execute beforeOperation hooks", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      expect(mockHookRegistry.executeBeforeOperation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          collection: "posts",
+          operation: "read",
+          args: expect.objectContaining({ id: "entry-1" }),
+        })
+      );
+    });
+
+    it("should expand relationships", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+        depth: 1,
+      });
+
+      expect(mockRelationshipService.expandRelationships).toHaveBeenCalled();
+    });
+
+    it("should populate component data", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      expect(mockComponentDataService.populateComponentData).toHaveBeenCalled();
+    });
+
+    it("should apply field selection", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      const result = await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+        select: { title: true },
+      });
+
+      expect(result.success).toBe(true);
+    });
+  });
+
+  // ── updateEntry ─────────────────────────────────────────────────────
+
+  describe("updateEntry", () => {
+    it("should return 404 when entry does not exist", async () => {
+      selectData.rows = [];
+
+      const result = await service.updateEntry(
+        {
+          overrideAccess: true,
+          collectionName: "posts",
+          entryId: "nonexistent",
+        },
+        { title: "Updated", _overwrite: true }
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(404);
+      expect(result.message).toBe("Entry not found");
+    });
+
+    it("should check access with existing document for owner checks", async () => {
+      const existingEntry = createSampleEntry();
+      selectData.rows = [existingEntry];
+
+      await service.updateEntry(
+        {
+          collectionName: "posts",
+          entryId: "entry-1",
+          user: { id: "user-1", role: "editor" },
+        },
+        { title: "Updated", _overwrite: true }
+      );
+
+      expect(fakeUserHoldsPermission).toHaveBeenCalled();
+    });
+
+    it("should return 403 when access denied", async () => {
+      selectData.rows = [createSampleEntry()];
+      callerMay();
+
+      const result = await service.updateEntry(
+        {
+          collectionName: "posts",
+          entryId: "entry-1",
+          user: { id: "user-1" },
+        },
+        { title: "Updated", _overwrite: true }
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(404); // May not read it either, so answered as missing.
+    });
+
+    it("runs no hook for a caller it refuses", async () => {
+      // Authorization is a precondition, so nothing may run on behalf of a caller about to be
+      // refused. Hooks are the sharp case: they reach outside this process, so one dispatched
+      // before the gate is an effect a refused request still caused.
+      //
+      // The 403 assertion above cannot see this — a hook fired before the check leaves the status
+      // unchanged — and moving hook dispatch above the access check still compiles.
+      selectData.rows = [createSampleEntry()];
+      mockCollectionService.getCollection.mockResolvedValue(
+        collectionWithTitleValidator()
+      );
+      registerFieldFunctions("collection", "posts", [
+        { name: "title", type: "text", access: { update: titleFieldAccess } },
+      ]);
+      callerMay();
+
+      await service.updateEntry(
+        { collectionName: "posts", entryId: "entry-1", user: { id: "user-1" } },
+        // A relationship value shaped as the admin sends it: an object carrying display
+        // properties, which normalisation reduces to its id.
+        {
+          title: "Updated",
+          author: { id: "user-9", name: "Ada" },
+          _overwrite: true,
+        }
+      );
+
+      // EVERY dispatch seam, not the one that happened to be handy. Asserting only
+      // `executeBeforeOperation` leaves `execute` — which carries `beforeUpdate` — and the stored
+      // hook executor free to move above the gate with this test still green.
+      expect(mockHookRegistry.executeBeforeOperation).not.toHaveBeenCalled();
+      expect(mockHookRegistry.execute).not.toHaveBeenCalled();
+      expect(runFieldHooksSpy).not.toHaveBeenCalled();
+      expect(storedHookExecute).not.toHaveBeenCalled();
+      expect(titleValidate).not.toHaveBeenCalled();
+      expect(titleFieldAccess).not.toHaveBeenCalled();
+      expect(normalizeRelationshipFieldsSpy).not.toHaveBeenCalled();
+    });
+
+    it("runs those same hooks for a caller it allows", async () => {
+      // The positive control the assertions above need, and it has to cover the same seams: one
+      // that never dispatches — a renamed method, a mock that stopped being wired — satisfies
+      // `not.toHaveBeenCalled()`, and the ordering rule then reads as enforced while nothing
+      // checks it.
+      selectData.rows = [createSampleEntry()];
+      mockCollectionService.getCollection.mockResolvedValue(
+        collectionWithTitleValidator()
+      );
+      registerFieldFunctions("collection", "posts", [
+        { name: "title", type: "text", access: { update: titleFieldAccess } },
+      ]);
+
+      await service.updateEntry(
+        { collectionName: "posts", entryId: "entry-1", user: { id: "user-1" } },
+        // A relationship value shaped as the admin sends it: an object carrying display
+        // properties, which normalisation reduces to its id.
+        {
+          title: "Updated",
+          author: { id: "user-9", name: "Ada" },
+          _overwrite: true,
+        }
+      );
+
+      expect(mockHookRegistry.executeBeforeOperation).toHaveBeenCalled();
+      expect(mockHookRegistry.execute).toHaveBeenCalled();
+      expect(runFieldHooksSpy).toHaveBeenCalled();
+      expect(storedHookExecute).toHaveBeenCalled();
+      expect(titleValidate).toHaveBeenCalled();
+      expect(titleFieldAccess).toHaveBeenCalled();
+      expect(normalizeRelationshipFieldsSpy).toHaveBeenCalled();
+      // The mechanism, not just the entry point: normalisation reduces the admin's object to its
+      // id, and the data object is mutated in place, so this reads what the call actually did.
+      const normalised = normalizeRelationshipFieldsSpy.mock.calls[0]?.[0] as
+        | Record<string, unknown>
+        | undefined;
+      expect(normalised?.author).toBe("user-9");
+    });
+
+    it("should execute beforeOperation hooks", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      await service.updateEntry(
+        { overrideAccess: true, collectionName: "posts", entryId: "entry-1" },
+        { title: "Updated", _overwrite: true }
+      );
+
+      expect(mockHookRegistry.executeBeforeOperation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          collection: "posts",
+          operation: "update",
+        })
+      );
+    });
+
+    it("should execute beforeUpdate and afterUpdate hooks", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      await service.updateEntry(
+        { overrideAccess: true, collectionName: "posts", entryId: "entry-1" },
+        { title: "Updated", _overwrite: true }
+      );
+
+      expect(mockHookRegistry.execute).toHaveBeenCalledWith(
+        "beforeUpdate",
+        expect.any(Object)
+      );
+      expect(mockHookRegistry.execute).toHaveBeenCalledWith(
+        "afterUpdate",
+        expect.any(Object)
+      );
+    });
+
+    it("should return CollectionServiceResult shape", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      const result = await service.updateEntry(
+        { overrideAccess: true, collectionName: "posts", entryId: "entry-1" },
+        { title: "Updated", _overwrite: true }
+      );
+
+      expect(result).toHaveProperty("success");
+      expect(result).toHaveProperty("statusCode");
+      expect(result).toHaveProperty("message");
+      expect(result).toHaveProperty("data");
+    });
+  });
+
+  // ── deleteEntry ─────────────────────────────────────────────────────
+
+  describe("deleteEntry", () => {
+    it("should return 404 when entry does not exist", async () => {
+      selectData.rows = [];
+
+      const result = await service.deleteEntry({
+        overrideAccess: true,
+        collectionName: "posts",
+        entryId: "nonexistent",
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(404);
+      expect(result.message).toBe("Entry not found");
+    });
+
+    it("should check access with existing document for owner checks", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      await service.deleteEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+        user: { id: "user-1", role: "editor" },
+      });
+
+      expect(fakeUserHoldsPermission).toHaveBeenCalled();
+    });
+
+    it("should return 403 when access denied", async () => {
+      selectData.rows = [createSampleEntry()];
+      callerMay();
+
+      const result = await service.deleteEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+        user: { id: "user-1" },
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(404); // May not read it either, so answered as missing.
+    });
+
+    it("should execute beforeOperation hooks", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      await service.deleteEntry({
+        overrideAccess: true,
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      expect(mockHookRegistry.executeBeforeOperation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          collection: "posts",
+          operation: "delete",
+          args: expect.objectContaining({ id: "entry-1" }),
+        })
+      );
+    });
+
+    it("should execute beforeDelete and afterDelete hooks", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      await service.deleteEntry({
+        overrideAccess: true,
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      expect(mockHookRegistry.execute).toHaveBeenCalledWith(
+        "beforeDelete",
+        expect.any(Object)
+      );
+      expect(mockHookRegistry.execute).toHaveBeenCalledWith(
+        "afterDelete",
+        expect.any(Object)
+      );
+    });
+
+    it("should return success with the deleted entry data", async () => {
+      const entry = createSampleEntry();
+      selectData.rows = [entry];
+
+      const result = await service.deleteEntry({
+        overrideAccess: true,
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.statusCode).toBe(200);
+    });
+
+    it("should return 500 on unexpected error", async () => {
+      mockFileManager.loadDynamicSchema.mockRejectedValueOnce(
+        new Error("Disk failure")
+      );
+
+      const result = await service.deleteEntry({
+        overrideAccess: true,
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(500);
+    });
+  });
+});

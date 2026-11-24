@@ -1,0 +1,1006 @@
+import {
+  isDatabaseBusy,
+  isDbError,
+  type DbErrorKind,
+} from "../database/errors";
+
+import {
+  NEXTLY_ERROR_STATUS,
+  genericPublicMessage,
+  type NextlyErrorCode,
+} from "./error-codes";
+import type {
+  NotMigratedPublicData,
+  PublicData,
+  ReleaseNotDeletablePublicData,
+  ReleaseProblemsPublicData,
+  RuleCouldNotRunPublicData,
+  SharedFieldsConflictPublicData,
+  StaleVersionPublicData,
+  VersionRequiredPublicData,
+  ValidationPublicData,
+  WorkflowRefusalPublicData,
+} from "./public-data";
+import { DATABASE_BUSY_RETRY_AFTER_SECONDS } from "./retry-after";
+
+/**
+ * Default mapping from DbErrorKind to NextlyError contract. Used by
+ * `NextlyError.fromDatabaseError`. Public messages are intentionally generic
+ * per spec §13.8 — no DB driver text, no constraint names, no field hints.
+ *
+ * `satisfies Record<DbErrorKind, ...>` makes the mapping exhaustive at
+ * compile time: adding a new DbErrorKind without updating this table is a
+ * type error.
+ */
+const DB_ERROR_MAPPING = {
+  "unique-violation": {
+    code: "DUPLICATE",
+    statusCode: 409,
+    publicMessage: "Resource already exists.",
+  },
+  "fk-violation": {
+    code: "VALIDATION_ERROR",
+    statusCode: 400,
+    publicMessage: "Referenced record does not exist.",
+  },
+  "not-null-violation": {
+    code: "VALIDATION_ERROR",
+    statusCode: 400,
+    publicMessage: "A required field is missing.",
+  },
+  constraint: {
+    code: "VALIDATION_ERROR",
+    statusCode: 400,
+    publicMessage: "The provided data violates a constraint.",
+  },
+  deadlock: {
+    code: "CONFLICT",
+    statusCode: 409,
+    publicMessage: "The operation could not be completed. Please retry.",
+  },
+  "serialization-failure": {
+    code: "CONFLICT",
+    statusCode: 409,
+    publicMessage: "The operation could not be completed. Please retry.",
+  },
+  // The statement or transaction that waited never ran; the retry hint says
+  // when, and becomes Retry-After on REST.
+  busy: {
+    code: "DATABASE_BUSY",
+    statusCode: NEXTLY_ERROR_STATUS.DATABASE_BUSY,
+    publicMessage: genericPublicMessage("DATABASE_BUSY"),
+    publicData: { retryAfterSeconds: DATABASE_BUSY_RETRY_AFTER_SECONDS },
+  },
+  timeout: {
+    code: "DATABASE_ERROR",
+    statusCode: 500,
+    publicMessage: "The operation timed out. Please try again.",
+  },
+  "connection-lost": {
+    code: "DATABASE_ERROR",
+    statusCode: 500,
+    publicMessage: "A temporary database error occurred. Please try again.",
+  },
+  syntax: {
+    code: "INTERNAL_ERROR",
+    statusCode: 500,
+    publicMessage: "An unexpected error occurred.",
+  },
+  internal: {
+    code: "INTERNAL_ERROR",
+    statusCode: 500,
+    publicMessage: "An unexpected error occurred.",
+  },
+} satisfies Record<
+  DbErrorKind,
+  {
+    code: string;
+    statusCode: number;
+    publicMessage: string;
+    publicData?: PublicData;
+  }
+>;
+
+/**
+ * Code accepted by NextlyError: canonical codes get autocomplete, but plugin
+ * authors may use any UPPER_SNAKE string. The `(string & {})` trick preserves
+ * the literal union for IntelliSense without collapsing to plain `string`.
+ */
+export type NextlyErrorCodeLike = NextlyErrorCode | (string & {});
+
+type NextlyErrorOpts = {
+  code: NextlyErrorCodeLike;
+  publicMessage: string;
+  publicData?: PublicData;
+  messageKey?: string;
+  logMessage?: string;
+  logContext?: Record<string, unknown>;
+  statusCode?: number;
+  cause?: Error;
+};
+
+export type NextlyErrorResponseJSON = {
+  code: string;
+  message: string;
+  messageKey?: string;
+  data?: PublicData;
+  requestId: string;
+};
+
+// Cross-realm brand so NextlyError.is identifies instances structurally,
+// surviving package-boundary mismatches (multiple bundled copies, plugin
+// bundles, etc.). Symbol.for shares the symbol across module instances via
+// the global registry. Inheritance (e.g., legacy direct-api NotFoundError
+// extends NextlyError) propagates the brand through the prototype chain.
+const NEXTLY_ERROR_BRAND: unique symbol = Symbol.for("nextly/NextlyError");
+
+function hasBrand(value: unknown): boolean {
+  if (
+    value === null ||
+    (typeof value !== "object" && typeof value !== "function")
+  ) {
+    return false;
+  }
+  return (value as Record<symbol, unknown>)[NEXTLY_ERROR_BRAND] === true;
+}
+
+/**
+ * Unified error class for Nextly. Used at every throw site across services,
+ * direct API, auth, and plugins. Carries two distinct payloads:
+ *
+ *   - Public  (`code`, `publicMessage`, `publicData`, `statusCode`, `messageKey`)
+ *     sent in HTTP responses and Server Action results.
+ *   - Log     (`logMessage`, `logContext`, `cause`, stack trace)
+ *     written to the server logger; never serialised to the wire.
+ *
+ * Use the static factories (notFound, forbidden, validation, ...) for the
+ * common cases. Use the free-form constructor for plugin codes or one-off
+ * shapes.
+ */
+export class NextlyError extends Error {
+  readonly code: NextlyErrorCodeLike;
+  readonly statusCode: number;
+  readonly publicMessage: string;
+  readonly publicData?: PublicData;
+  readonly messageKey?: string;
+  readonly logMessage?: string;
+  readonly logContext?: Record<string, unknown>;
+  override readonly cause?: Error;
+  readonly timestamp: Date;
+
+  constructor(opts: NextlyErrorOpts) {
+    // Use publicMessage as Error.message — purely for stack-trace ergonomics.
+    // It is never read off Error.message in serialisation; toResponseJSON and
+    // toLogJSON are the only paths to the wire and the log.
+    super(opts.publicMessage);
+    this.name = "NextlyError";
+    this.code = opts.code;
+    this.publicMessage = opts.publicMessage;
+    this.publicData = opts.publicData;
+    this.messageKey = opts.messageKey;
+    this.logMessage = opts.logMessage;
+    this.logContext = opts.logContext;
+    // useDefineForClassFields (ES2022 default) resets values set by super(),
+    // so we cast to bypass the readonly modifier and assign after super().
+    (this as { cause?: Error }).cause = opts.cause;
+    this.timestamp = new Date();
+    this.statusCode = NextlyError.resolveStatusCode(opts);
+
+    // Maintain proper stack trace in V8 environments.
+    Error.captureStackTrace?.(this, NextlyError);
+  }
+
+  // Stamp the brand on the prototype so all instances (including subclass
+  // instances during the migration shim) carry it via inheritance.
+  static {
+    (NextlyError.prototype as unknown as Record<symbol, unknown>)[
+      NEXTLY_ERROR_BRAND
+    ] = true;
+  }
+
+  private static resolveStatusCode(opts: NextlyErrorOpts): number {
+    if (typeof opts.statusCode === "number") return opts.statusCode;
+    if (opts.code in NEXTLY_ERROR_STATUS) {
+      return NEXTLY_ERROR_STATUS[opts.code as NextlyErrorCode];
+    }
+    return 500;
+  }
+
+  /** HTTP-safe JSON. Strips logMessage / logContext / cause / stack. */
+  toResponseJSON(requestId: string): NextlyErrorResponseJSON {
+    const json: NextlyErrorResponseJSON = {
+      code: String(this.code),
+      message: this.publicMessage,
+      requestId,
+    };
+    if (this.messageKey) json.messageKey = this.messageKey;
+    if (this.publicData !== undefined) json.data = this.publicData;
+    return json;
+  }
+
+  /** Operator-facing JSON for log lines. Includes everything. */
+  toLogJSON(requestId: string): Record<string, unknown> {
+    return {
+      code: this.code,
+      statusCode: this.statusCode,
+      publicMessage: this.publicMessage,
+      messageKey: this.messageKey,
+      logMessage: this.logMessage,
+      logContext: this.logContext,
+      cause: this.cause
+        ? {
+            name: this.cause.name,
+            message: this.cause.message,
+            stack: this.cause.stack,
+          }
+        : undefined,
+      timestamp: this.timestamp.toISOString(),
+      requestId,
+    };
+  }
+
+  // ────────────────────────────────────────────────────────────────────
+  // Static factories — the recommended throw site for every common case.
+  // Public messages here follow the §13.8 rubric: complete sentence,
+  // generic, no identifiers, no value echoing, no policy hints.
+  // ────────────────────────────────────────────────────────────────────
+
+  static invalidCredentials(opts?: {
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "AUTH_INVALID_CREDENTIALS",
+      publicMessage: "Invalid email or password.",
+      logMessage: "Login failed",
+      logContext: opts?.logContext,
+    });
+  }
+
+  /**
+   * The password was correct and the address is unverified. Thrown only once
+   * the password is proven, so only someone who holds it learns the address
+   * is unverified; every other refusal stays
+   * {@link NextlyError.invalidCredentials}.
+   */
+  static emailNotVerified(opts?: {
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "EMAIL_NOT_VERIFIED",
+      publicMessage:
+        "Verify your email address to sign in. Check your inbox for the link.",
+      logMessage: "Login refused: email not verified",
+      logContext: opts?.logContext,
+    });
+  }
+
+  static authRequired(opts?: {
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "AUTH_REQUIRED",
+      publicMessage: "Authentication required.",
+      logContext: opts?.logContext,
+    });
+  }
+
+  /**
+   * Distinct from `authRequired`: the caller was authenticated but the
+   * session token expired. Clients key on the TOKEN_EXPIRED *code* to
+   * silently refresh and retry rather than redirecting to login; the public
+   * message stays the generic spec §13.6 string ("Authentication required.")
+   * so the wire never reveals the session state — same as `authRequired`.
+   */
+  static tokenExpired(opts?: {
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "TOKEN_EXPIRED",
+      publicMessage: "Authentication required.",
+      logContext: opts?.logContext,
+    });
+  }
+
+  static notFound(opts?: {
+    // Declared so a rebuild from a status-only envelope can chain the failure
+    // it came from. Without it the option is accepted and dropped whenever it
+    // arrives through a spread, which reads as forwarded and is not.
+    cause?: Error;
+    // A domain-specific message overriding the generic default, for a resource
+    // whose absence is answered on more than one surface and has to read the
+    // same on each. Mirrors `conflict`: without it a caller reaching the same
+    // resource through two entry points is told two different things, and the
+    // one that is not this factory wins by having a message at all.
+    message?: string;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "NOT_FOUND",
+      publicMessage: opts?.message ?? "Not found.",
+      cause: opts?.cause,
+      logContext: opts?.logContext,
+    });
+  }
+
+  static forbidden(opts?: {
+    cause?: Error;
+    logContext?: Record<string, unknown>;
+    /**
+     * What the caller needs to act on the refusal, where saying it leaks nothing they may not
+     * know: for a workflow step, the permission it needs. Absent, the refusal carries no data.
+     */
+    publicData?: PublicData;
+  }): NextlyError {
+    return new NextlyError({
+      code: "FORBIDDEN",
+      publicMessage: "You don't have permission to perform this action.",
+      publicData: opts?.publicData,
+      cause: opts?.cause,
+      logContext: opts?.logContext,
+    });
+  }
+
+  /**
+   * Something only a signed-in person can do, asked by a caller that is not
+   * one: an API key, or a request acting as no person. Forbidden, and the
+   * message says so, since it is about what kind of caller asked, not about
+   * the caller's permissions. `doing` completes "Only a signed-in person can".
+   */
+  static personOnly(opts: {
+    doing: string;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "FORBIDDEN",
+      publicMessage: `Only a signed-in person can ${opts.doing}.`,
+      logContext: opts.logContext,
+    });
+  }
+
+  /**
+   * A role or permission built into Nextly, which is never changed or
+   * deleted. Forbidden, and the message says so: it is a fact about the role,
+   * not about the caller's permissions.
+   */
+  static builtIn(opts: {
+    thing: "role" | "permission";
+    change: "change" | "delete" | "assign" | "inherit";
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    const done = {
+      change: "changed",
+      delete: "deleted",
+      assign: "assigned",
+      inherit: "inherited",
+    }[opts.change];
+    return new NextlyError({
+      code: "FORBIDDEN",
+      publicMessage: `This ${opts.thing} is built in, so it can't be ${done}.`,
+      logContext: opts.logContext,
+    });
+  }
+
+  /**
+   * A request from a site not allowed to make it: its own `Origin` names a
+   * site the installation does not allow. Forbidden, and the message says so;
+   * the origin is the caller's own, so naming its kind tells them nothing.
+   */
+  static originRefused(opts?: {
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "FORBIDDEN",
+      publicMessage:
+        "This request came from a site that isn't allowed to make it.",
+      logContext: opts?.logContext,
+    });
+  }
+
+  /**
+   * A Single deleted without `force`: Singles hold a site's lasting settings,
+   * so they are not deleted from here, only by an admin or CLI clean-up that
+   * passes `force`. Forbidden, and the message says so.
+   */
+  static singleNotDeletable(opts?: {
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "FORBIDDEN",
+      publicMessage: "A Single can't be deleted from here.",
+      logContext: opts?.logContext,
+    });
+  }
+
+  /**
+   * A collection, Single or component defined in code, which is changed by
+   * changing its code and not from here. Forbidden, and the message says so:
+   * it is a fact about the thing, not about the caller's permissions, so it
+   * names no permission and no policy. The lock's detail goes to the log
+   * through `logContext`.
+   */
+  static definedInCode(opts: {
+    thing: "collection" | "Single" | "component";
+    change: "change" | "delete";
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "FORBIDDEN",
+      publicMessage: `This ${opts.thing} is defined in code, so it can't be ${
+        opts.change === "change" ? "changed" : "deleted"
+      } here.`,
+      logContext: opts.logContext,
+    });
+  }
+
+  /**
+   * A write to an entry of a collection or Single removed from code: its
+   * registry row says the app's code defines it, and the running configuration
+   * no longer declares it. Its entries are read-only until it is retired or
+   * declared again, so the message names the entity, says what happened and
+   * gives both ways out. `publicData` carries the kind and the slug, which the
+   * caller named, so a client can mark the entity without parsing the sentence.
+   */
+  static removedFromCode(opts: {
+    kind: "collection" | "single";
+    slug: string;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    const thing = opts.kind === "single" ? "Single" : "collection";
+    const its = opts.kind === "single" ? "it" : "its entries";
+    return new NextlyError({
+      code: "ENTITY_REMOVED_FROM_CODE",
+      publicMessage:
+        `The ${thing} "${opts.slug}" was removed from code, so ${its} ` +
+        `can't be changed. To retire it, run \`nextly migrate:create\` and ` +
+        `then \`nextly migrate\`. To keep it, declare it again in ` +
+        `nextly.config.ts.`,
+      publicData: { kind: opts.kind, slug: opts.slug },
+      logContext: { kind: opts.kind, slug: opts.slug, ...opts.logContext },
+    });
+  }
+
+  /**
+   * A read or write of a collection or Single the database has not been
+   * migrated for: the column of one of its declared fields is missing, its
+   * table is missing, or this running instance never registered it (an
+   * entity a migration added after the instance started). The message names
+   * the entity, the field or the table, and `nextly migrate`; the driver's
+   * error stays on `cause`, for the log, so no SQL reaches the answer.
+   */
+  static notMigrated(
+    opts: NotMigratedPublicData & {
+      cause?: Error;
+      logContext?: Record<string, unknown>;
+    }
+  ): NextlyError {
+    const { cause, logContext, ...publicData } = opts;
+    const entity = `${publicData.kind === "single" ? "Single" : "collection"} "${publicData.slug}"`;
+    // A field or table is named only when the caller passed it in, that is,
+    // only to a caller who may know it; the log always has both.
+    const field =
+      publicData.field === undefined
+        ? "a field"
+        : `the field "${publicData.field}"`;
+    const table =
+      publicData.table === undefined ? "" : ` "${publicData.table}"`;
+    const publicMessage =
+      publicData.reason === "column"
+        ? `The database has not been migrated for ${field} of the ${entity}. Run \`nextly migrate\`.`
+        : publicData.reason === "table"
+          ? `The database has not been migrated for the ${entity}: its table${table} does not exist. Run \`nextly migrate\`.`
+          : `The ${entity}${publicData.table === undefined ? "" : ` (table "${publicData.table}")`} is not registered in this running instance. Run \`nextly migrate\`, then restart the server.`;
+    return new NextlyError({
+      code: "ENTITY_NOT_MIGRATED",
+      publicMessage,
+      publicData,
+      logMessage: "The database has not been migrated for this entity",
+      logContext: { ...publicData, ...logContext },
+      cause,
+    });
+  }
+
+  /**
+   * An autosave where the collection or Single does not autosave: its owner
+   * switched autosave off, or it keeps no drafts to autosave into. Forbidden,
+   * and the message says so, since it is a setting and not a permission.
+   */
+  static autosaveOff(opts: {
+    scopeKind: string;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "FORBIDDEN",
+      publicMessage: `Autosave is turned off for this ${
+        opts.scopeKind === "single" ? "Single" : "collection"
+      }.`,
+      logContext: opts.logContext,
+    });
+  }
+
+  /**
+   * A submit for review naming a step that does not submit: an approval, a
+   * request for changes or a move. Its own code, so a caller that may only
+   * submit is told this is not a step it can take this way, never the refusal
+   * the step itself would meet. Names the step, the caller's own word.
+   */
+  static stepNotSubmit(opts: {
+    step: string;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "WORKFLOW_STEP_NOT_SUBMIT",
+      publicMessage: "That step does not submit for review.",
+      publicData: { step: opts.step },
+      logContext: opts.logContext,
+    });
+  }
+
+  /**
+   * A submit for review naming no step, of a part whose stage no submit step
+   * leaves: content already in review, or a workflow that enters review by
+   * another kind of step. Names the part and its stage, which a read of the
+   * document tells the caller anyway.
+   */
+  static noSubmitStep(opts: {
+    part: string | null;
+    stage: string;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "WORKFLOW_NO_SUBMIT_STEP",
+      publicMessage:
+        "No step submits this content for review from the stage it is in.",
+      publicData: { part: opts.part, stage: opts.stage },
+      logContext: opts.logContext,
+    });
+  }
+
+  /**
+   * An API key refused because its role allows more than the person creating
+   * it may do. The sentence is FORBIDDEN's and names no permission; which one
+   * exceeded goes to the log through `logContext`. The code is its own, so a
+   * client can tell "choose a smaller role" from plain FORBIDDEN.
+   */
+  static apiKeyRoleAboveCreator(opts?: {
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "API_KEY_ROLE_ABOVE_CREATOR",
+      publicMessage: genericPublicMessage("FORBIDDEN"),
+      logContext: opts?.logContext,
+    });
+  }
+
+  /**
+   * A cookie-authenticated write refused because its origin or CSRF token did
+   * not check out. The public message names no detail of which check failed;
+   * that goes to the log through `logMessage`.
+   */
+  static csrfFailed(opts?: {
+    logMessage?: string;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "CSRF_FAILED",
+      publicMessage:
+        "This request could not be verified. Reload the page and try again.",
+      logMessage: opts?.logMessage,
+      logContext: opts?.logContext,
+    });
+  }
+
+  /**
+   * A call the caller got wrong, where naming the mistake IS the value of the
+   * error.
+   *
+   * The only factory that takes its public message from the caller. The
+   * generic messages elsewhere exist so an HTTP response cannot leak internal
+   * detail; this one is for arguments and configuration a developer controls
+   * and must be told about — a missing option, an unusable combination — where
+   * `internal()` would reduce the one useful sentence to "An unexpected error
+   * occurred." Do not pass user-supplied data through it.
+   */
+  static invalidInput(opts: {
+    message: string;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "INVALID_INPUT",
+      publicMessage: opts.message,
+      logContext: opts.logContext,
+    });
+  }
+
+  static validation(opts: {
+    errors: ValidationPublicData["errors"];
+    cause?: Error;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "VALIDATION_ERROR",
+      publicMessage: "Validation failed.",
+      publicData: { errors: opts.errors },
+      cause: opts.cause,
+      logContext: opts.logContext,
+    });
+  }
+
+  static conflict(opts?: {
+    reason?: "version" | "state";
+    // A domain-specific, actionable message overriding the generic default,
+    // for state conflicts where "refresh and try again" would misdirect the
+    // caller (a disabled endpoint, an in-flight delivery, and so on).
+    message?: string;
+    /**
+     * What a caller needs to act on the conflict: for a release refused over
+     * its documents, the problems by code and member; for a release that
+     * cannot be deleted, the reason; for a pending change refused over the
+     * fields every language shares, why and which fields; for a workflow
+     * step, the parts it could not move and why.
+     */
+    data?:
+      | ReleaseProblemsPublicData
+      | ReleaseNotDeletablePublicData
+      | SharedFieldsConflictPublicData
+      | WorkflowRefusalPublicData;
+    cause?: Error;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "CONFLICT",
+      publicMessage:
+        opts?.message ??
+        "The resource has changed since you last loaded it. Please refresh and try again.",
+      publicData: opts?.data,
+      cause: opts?.cause,
+      logContext: { reason: opts?.reason, ...opts?.logContext },
+    });
+  }
+
+  /**
+   * An update made from a version of the document that is no longer its
+   * current one. Never retried: the same version stays out of date, so the
+   * caller must read the document again and decide.
+   *
+   * @experimental
+   */
+  /**
+   * An update that said neither which version of a document it was made from
+   * nor that it overwrites whatever is stored. Without `bulk`, an update of
+   * one document, which sends back the version it read. `bulk` names an
+   * update that writes the same values to many documents, which can carry no
+   * one document's version: by its ids, which can be given a version each
+   * (`keys.revs`), or by a query, which cannot. The keys are the write path's
+   * to name, so the message spells them as the request does.
+   *
+   * @experimental
+   */
+  static versionRequired(opts: {
+    bulk?: "ids" | "query";
+    keys: { version: string; overwrite: string; revs: string };
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    const { version, overwrite, revs } = opts.keys;
+    if (opts.bulk === undefined) {
+      const one: VersionRequiredPublicData = {
+        versionKey: version,
+        overwriteKey: overwrite,
+      };
+      return new NextlyError({
+        code: "VERSION_REQUIRED",
+        publicMessage: `This update must say which version of the document it changes. Send back the \`${version}\` from your last read of it, or set \`${overwrite}: true\` to replace whatever is stored.`,
+        publicData: one,
+        logContext: opts.logContext,
+      });
+    }
+    const byIds = opts.bulk === "ids";
+    const data: VersionRequiredPublicData = {
+      versionKey: version,
+      overwriteKey: overwrite,
+      ...(byIds ? { revsKey: revs } : {}),
+    };
+    const message = `An update that writes the same values to many documents must set \`${overwrite}: true\`: it can't carry each document's version. Or update each document with its own \`${version}\`.`;
+    return new NextlyError({
+      code: "VERSION_REQUIRED",
+      publicMessage: byIds
+        ? `${message} Or give each document's \`${version}\` in \`${revs}\`.`
+        : message,
+      publicData: data,
+      logContext: opts.logContext,
+    });
+  }
+
+  static staleVersion(opts: {
+    data: StaleVersionPublicData;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "STALE_VERSION",
+      publicMessage: `This document changed since the version you gave. Its current version is ${opts.data.currentVersion}.`,
+      publicData: opts.data,
+      logContext: opts.logContext,
+    });
+  }
+
+  /**
+   * `message` replaces the generic sentence where the caller can name what is
+   * already taken without leaking anything, such as a public address and the
+   * page holding it.
+   */
+  static duplicate(opts?: {
+    message?: string;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "DUPLICATE",
+      publicMessage: opts?.message ?? "Resource already exists.",
+      logContext: opts?.logContext,
+    });
+  }
+
+  static rateLimited(opts?: {
+    retryAfterSeconds?: number;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "RATE_LIMITED",
+      publicMessage: "Too many requests. Please try again later.",
+      publicData:
+        opts?.retryAfterSeconds !== undefined
+          ? { retryAfterSeconds: opts.retryAfterSeconds }
+          : undefined,
+      logContext: opts?.logContext,
+    });
+  }
+
+  /**
+   * A request that waited `pool.connectionTimeoutMs` for a database
+   * connection and was given none. The statement or transaction that waited
+   * never ran; work committed before it stays committed. The same error
+   * `fromDatabaseError` gives a busy DbError, from the same table row.
+   */
+  static databaseBusy(opts?: {
+    cause?: Error;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    const busy = DB_ERROR_MAPPING.busy;
+    return new NextlyError({
+      code: busy.code,
+      statusCode: busy.statusCode,
+      publicMessage: busy.publicMessage,
+      publicData: busy.publicData,
+      cause: opts?.cause,
+      logContext: opts?.logContext,
+    });
+  }
+
+  /**
+   * An access or field rule the request needs could not run, because its own
+   * database query waited out the bound for a connection. Not a refusal: the
+   * rule never answered. Names the collection or Single whose rule it is, and
+   * the field for a field's rule, and says when to retry.
+   */
+  static ruleCouldNotRun(opts: {
+    subject: string;
+    field?: string;
+    cause?: Error;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    // Typed as the published shape names it, so the payload and the type a
+    // client reads it by cannot drift apart.
+    const publicData: RuleCouldNotRunPublicData = {
+      subject: opts.subject,
+      ...(opts.field !== undefined ? { field: opts.field } : {}),
+      retryAfterSeconds: DATABASE_BUSY_RETRY_AFTER_SECONDS,
+    };
+    return new NextlyError({
+      code: "RULE_COULD_NOT_RUN",
+      statusCode: NEXTLY_ERROR_STATUS.RULE_COULD_NOT_RUN,
+      publicMessage: genericPublicMessage("RULE_COULD_NOT_RUN"),
+      publicData,
+      cause: opts.cause,
+      logContext: opts.logContext,
+    });
+  }
+
+  /**
+   * What a request boundary answers with for a thrown value that is not a
+   * NextlyError: "database busy" when the request waited out its bound for a
+   * connection, which is retryable and no fault of the server's code, and an
+   * internal error for anything else.
+   *
+   * The busy case has to be read here because it usually arrives raw:
+   * `withDbErrors` converts only DbErrors, so a driver's error passes through
+   * services unconverted to the boundary that answers the request.
+   */
+  static fromUnexpected(error: unknown): NextlyError {
+    return NextlyError.busyOr(error, () =>
+      NextlyError.internal({
+        cause: error instanceof Error ? error : undefined,
+      })
+    );
+  }
+
+  /**
+   * "Database busy" when `error` is a request that waited out its bound for
+   * a connection, and `otherwise()` for anything else.
+   *
+   * For a boundary that answers an unexpected failure with an error of its
+   * own choosing rather than an internal one (a 503 for a flow that must not
+   * answer on incomplete data), so that a busy database still answers there
+   * as it does everywhere else. `fromUnexpected` is this rule with the
+   * internal error as its fallback.
+   */
+  static busyOr(error: unknown, otherwise: () => NextlyError): NextlyError {
+    if (!isDatabaseBusy(error)) return otherwise();
+    return NextlyError.databaseBusy({
+      cause: error instanceof Error ? error : undefined,
+    });
+  }
+
+  static internal(opts?: {
+    cause?: Error;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "INTERNAL_ERROR",
+      publicMessage: "An unexpected error occurred.",
+      cause: opts?.cause,
+      logContext: opts?.logContext,
+    });
+  }
+
+  /**
+   * The app is set up so nextly cannot work: a missing `config`, or a Next.js
+   * or React outside the supported ranges. The public message stays generic;
+   * what to change goes in `logMessage`, for the operator.
+   */
+  static configuration(opts: {
+    logMessage: string;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "CONFIGURATION_ERROR",
+      publicMessage: "Server configuration error.",
+      logMessage: opts.logMessage,
+      logContext: opts.logContext,
+    });
+  }
+
+  // Accepts an optional `logMessage` override so callers (e.g. the health
+  // route) can record a specific operator narrative ("Health check failed")
+  // while the public message stays canonical per spec §13.8.5.
+  /**
+   * A service outside Nextly failed, such as an email provider, where trying again may help: the
+   * job queue records it as an attempt's error and tries again.
+   */
+  static externalService(opts: {
+    publicMessage: string;
+    logMessage?: string;
+    cause?: Error;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "EXTERNAL_SERVICE_ERROR",
+      publicMessage: opts.publicMessage,
+      logMessage: opts.logMessage,
+      cause: opts.cause,
+      logContext: opts.logContext,
+    });
+  }
+
+  static serviceUnavailable(opts?: {
+    /**
+     * What the caller is told, when "try again later" is the wrong advice.
+     *
+     * The default assumes waiting resolves it. Some causes are not transient —
+     * a lock with no expiry is held until an operator clears it — and there the
+     * default sends someone to retry a request that cannot start succeeding.
+     * Supply a message naming what to DO; it reaches an API response, so it
+     * carries a remedy rather than internal state.
+     */
+    publicMessage?: string;
+    logMessage?: string;
+    cause?: Error;
+    logContext?: Record<string, unknown>;
+  }): NextlyError {
+    return new NextlyError({
+      code: "SERVICE_UNAVAILABLE",
+      publicMessage:
+        opts?.publicMessage ?? "Service unavailable. Please try again later.",
+      logMessage: opts?.logMessage,
+      cause: opts?.cause,
+      logContext: opts?.logContext,
+    });
+  }
+
+  /**
+   * Convert a DbError (or arbitrary unknown thrown by the DB layer) to a
+   * NextlyError with a generic public message and rich logContext. Used by
+   * `withDbErrors` for auto-conversion (Pattern A) and by services that
+   * catch DB errors at boundaries (Pattern B). Spec §8.2 mapping table.
+   *
+   * Never leaks DB driver text, constraint names, or table names into
+   * `publicMessage`. All DB context goes into `logContext`. The original
+   * DbError is preserved as `cause`.
+   */
+  static fromDatabaseError(error: unknown): NextlyError {
+    if (isDbError(error)) {
+      // DB_ERROR_MAPPING is exhaustive over DbErrorKind via `satisfies` so
+      // this lookup always succeeds at compile time.
+      const mapping = DB_ERROR_MAPPING[error.kind];
+      // Build logContext conditionally so log lines aren't cluttered with
+      // `undefined` keys for absent fields.
+      const logContext: Record<string, unknown> = {
+        dbKind: error.kind,
+        dialect: error.dialect,
+      };
+      // DbError.code is the dialect-specific code (SQLSTATE, errno, etc.) —
+      // not an actual constraint name. Surface it as `dbCode` so operators
+      // know what they're reading. Constraint-name-to-field mapping is
+      // per-call-site (§8.6).
+      if (error.code !== undefined) logContext.dbCode = error.code;
+      if (error.meta !== undefined) logContext.meta = error.meta;
+
+      return new NextlyError({
+        code: mapping.code,
+        statusCode: mapping.statusCode,
+        publicMessage: mapping.publicMessage,
+        publicData: "publicData" in mapping ? mapping.publicData : undefined,
+        logMessage: "Database error",
+        logContext,
+        cause: error,
+      });
+    }
+
+    // Non-DbError fallback: wrap as INTERNAL_ERROR and preserve cause when
+    // it is an Error. Non-Error values (strings, numbers) flow through
+    // without a cause but still get the generic public message.
+    return new NextlyError({
+      code: "INTERNAL_ERROR",
+      statusCode: 500,
+      publicMessage: "An unexpected error occurred.",
+      logMessage: "Non-DbError passed to fromDatabaseError",
+      cause: error instanceof Error ? error : undefined,
+      logContext: error instanceof Error ? undefined : { value: String(error) },
+    });
+  }
+
+  // ────────────────────────────────────────────────────────────────────
+  // Type guards. Structural rather than `instanceof` so they survive
+  // package-boundary mismatches (one consumer's NextlyError is a
+  // different module instance from another's).
+  // ────────────────────────────────────────────────────────────────────
+
+  static is(err: unknown): err is NextlyError {
+    return hasBrand(err);
+  }
+
+  static isCode(err: unknown, code: NextlyErrorCodeLike): err is NextlyError {
+    return hasBrand(err) && (err as NextlyError).code === code;
+  }
+
+  static isNotFound(err: unknown): err is NextlyError {
+    return NextlyError.isCode(err, "NOT_FOUND");
+  }
+
+  static isValidation(err: unknown): err is NextlyError {
+    return NextlyError.isCode(err, "VALIDATION_ERROR");
+  }
+
+  static isAuthRequired(err: unknown): err is NextlyError {
+    return NextlyError.isCode(err, "AUTH_REQUIRED");
+  }
+
+  static isForbidden(err: unknown): err is NextlyError {
+    return NextlyError.isCode(err, "FORBIDDEN");
+  }
+
+  static isConflict(err: unknown): err is NextlyError {
+    return NextlyError.isCode(err, "CONFLICT");
+  }
+
+  static isRateLimited(err: unknown): err is NextlyError {
+    return NextlyError.isCode(err, "RATE_LIMITED");
+  }
+}

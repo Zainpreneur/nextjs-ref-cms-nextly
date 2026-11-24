@@ -1,0 +1,31 @@
+{
+  "title": "Plugins",
+  "pages": [
+    "index",
+    "author-guide",
+    "auth",
+    "signed-in-people",
+    "security-helpers",
+    "lifecycle",
+    "services",
+    "caching",
+    "permissions",
+    "security",
+    "routes",
+    "proxy",
+    "admin-ui",
+    "schema",
+    "public-addresses",
+    "testing",
+    "stability",
+    "distribution",
+    "contributing",
+    "api-reference",
+    "error-reference",
+    "form-builder",
+    "seo",
+    "mcp",
+    "accounts",
+    "commerce"
+  ]
+}

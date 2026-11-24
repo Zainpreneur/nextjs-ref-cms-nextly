@@ -1,0 +1,178 @@
+/**
+ * What a surface inside a document editor uses to take part in its actions:
+ * committing work it holds before the document is stored, and having a write
+ * the document depends on counted before it is.
+ *
+ * Both are safe to call outside a document editor, where there is no action to
+ * take part in: the first registers nothing and the second tracks nothing, so
+ * a component drawn in both places needs no test for which one it is in.
+ *
+ * @module components/features/entries/EntryForm/useDocumentActionHooks
+ */
+import { useCallback, useEffect, useRef } from "react";
+
+import type { DocumentAction, EditorDocumentAction } from "./document-actions";
+import { reasonFor } from "./DocumentActionBar";
+import { useDocumentActionsContext } from "./DocumentActionsContext";
+import {
+  NOTHING_CHANGED_REASON,
+  type BeforeDocumentAction,
+  type DocumentActionBindings,
+  type DocumentActionOutcome,
+  type DocumentSaveState,
+} from "./useDocumentActionBindings";
+import type { TrackedWritesVerdict } from "./useStoringGate";
+
+/** The document's actions as a surface inside the editor sees them. */
+export interface DocumentActions {
+  /**
+   * Every action this document offers, in the order and placement the
+   * editor's own header gives it, each with why it cannot run at this instant
+   * when it cannot.
+   */
+  actions: readonly DocumentAction[];
+  /** The action that leads, when one does. */
+  primary: DocumentAction | undefined;
+  /** Runs one action as its control would, and says what it came to. */
+  run: DocumentActionBindings["run"];
+  /** Whether the document's work is stored. */
+  saveState: DocumentSaveState;
+  /**
+   * Runs the Save action, as `run("save")` does, where that Save is offered
+   * and keeps the work unpublished: a draft, or a working draft beside the
+   * live version. Answers `{ ok: true }` without saving where Save is refused
+   * only because nothing has changed, since what is stored already is the
+   * work. Undefined where it is not offered (someone who may not
+   * change the document) or where it would publish (a published document
+   * whose collection keeps no drafts) or there is no draft to keep (a
+   * collection with no status), so a surface that must never publish, such
+   * as a preview that saves first, can tell before it offers to.
+   */
+  saveWithoutPublishing?: () => Promise<DocumentActionOutcome>;
+  /**
+   * When this document was last stored in this session, whatever the save
+   * state now says, or null before the first store. A new value means a store
+   * succeeded: a surface that holds the work it committed to it can count that
+   * work as stored, while the save state still reads "unsaved" for work it
+   * holds beyond it.
+   */
+  storedAt: Date | null;
+}
+
+/**
+ * The document's actions, for a surface drawn inside a document editor —
+ * a plugin's document view, which replaces the form body and its header —
+ * or null outside one.
+ *
+ * Derived from what the header draws rather than decided again: the same
+ * actions, the same reasons, and running one does what its control does.
+ */
+export function useDocumentActions(): DocumentActions | null {
+  const hosted = useDocumentActionsContext();
+  if (hosted === null) return null;
+  const offered = hosted.actions.flatMap(action => {
+    const binding = hosted.bindings[action.id];
+    if (binding === undefined) return [];
+    const reason = reasonFor(action, binding);
+    const published = publishedAction(action);
+    return [
+      reason === undefined
+        ? published
+        : { ...published, disabledReason: reason },
+    ];
+  });
+  const save = offered.find(action => action.id === "save");
+  return {
+    actions: offered,
+    primary: offered.find(action => action.placement === "primary"),
+    run: hosted.run,
+    saveState: hosted.saveState,
+    // The bar's own Save through `run`, so its permission, lock, before-save
+    // steps and save state all apply; the host's own binding is only asked
+    // whether that Save would leave the document unpublished. A plugin cannot
+    // replace Save (`OVERRIDABLE_DOCUMENT_ACTIONS` is Delete and Unpublish),
+    // so the Save asked about is the one `run` runs.
+    ...(save !== undefined && hosted.saveWithoutPublishing !== undefined
+      ? {
+          // Refused only because nothing has changed, the stored version
+          // already is the work, which is what a caller asks; every other
+          // refusal leaves work unstored and is answered as the Save answers.
+          saveWithoutPublishing: () =>
+            save.disabledReason === NOTHING_CHANGED_REASON
+              ? Promise.resolve<DocumentActionOutcome>({ ok: true })
+              : hosted.run("save"),
+        }
+      : {}),
+    storedAt: hosted.lastStoredAt,
+  };
+}
+
+/**
+ * An action in its published shape. The editor's arrow beside the primary
+ * action (`publish-menu`) is not a placement the published contract names, so
+ * a plugin's view is handed such an action as a `menu` one in the `document`
+ * group: where the editor itself draws it when there is no arrow to draw it
+ * on, and where Add to release sat before the arrow, so a view drawing the
+ * menu by group still finds it.
+ */
+function publishedAction(action: EditorDocumentAction): DocumentAction {
+  return action.placement === "publish-menu"
+    ? { ...action, placement: "menu", group: "document" }
+    : { ...action, placement: action.placement };
+}
+
+/**
+ * Runs `handler` before every action that stores the editor's work — Save and
+ * Publish, from any control, the shortcut or a plugin — while the calling
+ * component is mounted. It may be asynchronous, and the action waits for it;
+ * throwing refuses the action with the error's message, and throwing an
+ * `AbortError` cancels it, as an author's "no" to a question does.
+ *
+ * The latest `handler` is the one run, so it may close over render state
+ * without re-registering on every render.
+ */
+export function useBeforeDocumentAction(handler: BeforeDocumentAction): void {
+  const register = useDocumentActionsContext()?.registerBeforeAction;
+  const latest = useRef(handler);
+  useEffect(() => {
+    latest.current = handler;
+  });
+  useEffect(() => {
+    if (register === undefined) return undefined;
+    return register((action, store) => latest.current(action, store));
+  }, [register]);
+}
+
+/**
+ * Waits for every write the document depends on but does not contain (see
+ * `useTrackedWrite`), as its Save and Publish wait for them, and says what
+ * they came to. For a second document stored from inside this editor, which
+ * depends on the same writes; outside a document editor, nothing is tracked
+ * and it answers `null` at once.
+ */
+export function useTrackedWritesSettled(): () => Promise<TrackedWritesVerdict> {
+  const settle = useDocumentActionsContext()?.settleWrites;
+  return useCallback(
+    () => (settle === undefined ? Promise.resolve(null) : settle()),
+    [settle]
+  );
+}
+
+/**
+ * Tracks a write the document depends on but does not contain, under a label
+ * an author would recognise ("Site colours"). Storing actions wait for it and
+ * are refused, naming the label, while its latest attempt has failed; writing
+ * the same label again successfully clears that.
+ */
+export function useTrackedWrite(): (
+  label: string,
+  write: Promise<unknown>
+) => void {
+  const track = useDocumentActionsContext()?.trackWrite;
+  return useCallback(
+    (label: string, write: Promise<unknown>) => {
+      track?.(label, write);
+    },
+    [track]
+  );
+}

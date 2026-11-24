@@ -1,0 +1,143 @@
+/**
+ * MySQL schema for the email delivery log.
+ *
+ * See `./postgres.ts` for what this table deliberately does not hold — the
+ * recipient's address, the rendered subject, the body — and for why the retry
+ * columns are present and inert. MySQL differences: `varchar(36)` ids,
+ * `datetime` for timestamps.
+ *
+ * @module schemas/email-deliveries/mysql
+ */
+// fallow-ignore-file code-duplication
+
+import {
+  mysqlTable,
+  varchar,
+  text,
+  int,
+  datetime,
+  index,
+  boolean,
+} from "drizzle-orm/mysql-core";
+
+import {
+  EMAIL_DELIVERY_PRINCIPAL_ID_LENGTH,
+  EMAIL_DELIVERY_PRINCIPAL_KIND_LENGTH,
+} from "./widths";
+
+export const emailDeliveriesMysql = mysqlTable(
+  "email_deliveries",
+  {
+    id: varchar("id", { length: 36 }).primaryKey(),
+
+    /**
+     * No foreign key, unlike PostgreSQL and SQLite.
+     *
+     * A deleted provider therefore leaves this pointing at a row that is gone,
+     * rather than being nulled: nothing in the service clears it, and there is
+     * no constraint here to do it instead.
+     *
+     * Declaring one is correct and is NOT safe to do on its own. An existing
+     * installation can already hold these dangling values, and MySQL refuses to
+     * add the constraint while any row violates it (`ERROR 1452`), so core
+     * reconciliation would fail against exactly the databases that need the
+     * repair. The rows have to be nulled BEFORE the constraint is applied, and
+     * nothing in the schema pipeline does that yet.
+     *
+     * Readers must not assume it resolves. `provider_type` beside it keeps
+     * every row meaningful without the join, and no read path follows this id
+     * expecting to find a provider.
+     */
+    providerId: varchar("provider_id", { length: 36 }),
+
+    providerType: varchar("provider_type", { length: 50 }).notNull(),
+    templateSlug: varchar("template_slug", { length: 255 }),
+
+    /** Keyed SHA-256 of the lowercased, trimmed recipient address, hex encoded. */
+    recipientHash: varchar("recipient_hash", { length: 64 }).notNull(),
+
+    /** `to`, `cc` or `bcc` — see the PostgreSQL module for why each gets a row. */
+    recipientKind: varchar("recipient_kind", { length: 3 }).notNull(),
+
+    /** `sent` or `failed`. A drain would add `pending` and `retrying`. */
+    status: varchar("status", { length: 20 }).notNull(),
+
+    /** Attempts actually made. Always 1 until something retries. */
+    attemptCount: int("attempt_count").notNull().default(1),
+
+    /** Reserved for a drain. Always NULL today — see the PostgreSQL module. */
+    nextAttemptAt: datetime("next_attempt_at", { fsp: 3 }),
+
+    /** Why it failed, with anything address-shaped removed. */
+    error: text("error"),
+
+    /** Unbounded — see the PostgreSQL module. A bounded column loses rows. */
+    messageId: text("message_id"),
+
+    /** Swept by `domains/email/prune.ts`. See the PostgreSQL definition. */
+    retentionClass: varchar("retention_class", { length: 50 }).notNull(),
+    // The person a plugin's email went to: see the PostgreSQL definition.
+    principalKind: varchar("principal_kind", {
+      length: EMAIL_DELIVERY_PRINCIPAL_KIND_LENGTH,
+    }),
+    principalId: varchar("principal_id", {
+      length: EMAIL_DELIVERY_PRINCIPAL_ID_LENGTH,
+    }),
+    // The keyed digest of the idempotency key the send carried, on every
+    // record of that send; cleared on all of them when any one is erased.
+    keyDigest: varchar("key_digest", { length: 64 }),
+    queuedId: varchar("queued_id", { length: 36 }),
+    templateOwner: text("template_owner"),
+    templateOverridden: boolean("template_overridden"),
+    templateDigest: varchar("template_digest", { length: 64 }),
+    failureKind: varchar("failure_kind", { length: 16 }),
+    failureStatus: int("failure_status"),
+    providerOrigin: varchar("provider_origin", { length: 16 }),
+
+    /**
+     * `fsp: 3` — milliseconds, not whole seconds.
+     *
+     * A bare MySQL `datetime` truncates to the second, and this table appends
+     * one row per recipient per send. Several messages within one second would
+     * store an identical timestamp, and a newest-first read with a limit would
+     * then break the tie on whatever the index happened to return — an
+     * arbitrary subset rather than the latest sends. PostgreSQL and SQLite
+     * already keep sub-second precision.
+     */
+    createdAt: datetime("created_at", { fsp: 3 }).notNull(),
+  },
+  t => [
+    // The unfiltered read — "what happened recently", and the default this
+    // service serves. Every other index below leads with a different column,
+    // so none of them can order the whole table; without this one the default
+    // list degrades to a full scan and sort as the log grows.
+    index("email_deliveries_created_idx").on(t.createdAt),
+    index("email_deliveries_recipient_idx").on(t.recipientHash, t.createdAt),
+    index("email_deliveries_status_created_idx").on(t.status, t.createdAt),
+    index("email_deliveries_provider_idx").on(t.providerId, t.createdAt),
+    index("email_deliveries_provider_type_idx").on(t.providerType, t.createdAt),
+    index("email_deliveries_retention_idx").on(t.retentionClass, t.createdAt),
+    // Erasure finds a person's rows by kind and id.
+    index("email_deliveries_principal_idx").on(t.principalKind, t.principalId),
+    // Erasure clears a send's key digest from all its records.
+    index("email_deliveries_key_idx").on(t.keyDigest),
+    index("email_deliveries_queued_idx").on(t.queuedId),
+    index("email_deliveries_provider_origin_idx").on(
+      t.providerOrigin,
+      t.createdAt
+    ),
+    index("email_deliveries_template_idx").on(
+      t.templateSlug,
+      t.status,
+      t.createdAt
+    ),
+    index("email_deliveries_template_created_idx").on(
+      t.templateSlug,
+      t.createdAt,
+      t.id
+    ),
+  ]
+);
+
+export type EmailDeliveryMysql = typeof emailDeliveriesMysql.$inferSelect;
+export type EmailDeliveryInsertMysql = typeof emailDeliveriesMysql.$inferInsert;

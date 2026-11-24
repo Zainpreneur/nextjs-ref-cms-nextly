@@ -1,0 +1,456 @@
+/**
+ * `system:releases` — the dashboard's view of what ships next.
+ *
+ * The first source answered by a DOMAIN SERVICE rather than compiled to a
+ * collection query, and it is here rather than in the widgets domain because
+ * the registration is PUSHED: widgets knows nothing about releases, so a domain
+ * can publish a source without editing a file it does not own, and the widgets
+ * package does not acquire a dependency on most of the codebase to offer a card.
+ *
+ * 🔴 The resolver adds no access rule of its own. `ReleasesService.find` calls
+ * its own `authorize` before it reads, so every row this returns has already
+ * been judged by the rule that owns it. A filter applied here would be a second
+ * implementation of that rule, agreeing on the day it is written and drifting
+ * afterwards — which is what `domains/widgets/system-sources.ts` exists to
+ * prevent, and what Strapi's homepage widgets got wrong (strapi#22921).
+ *
+ * @module domains/releases/releases-widget-source
+ */
+
+import { container } from "../../di/container";
+import { NextlyError } from "../../errors/nextly-error";
+import type { ReadCaller } from "../../services/dashboard/readable-resources";
+import { WINDOW_KEYS_REFUSED, type WidgetQuery } from "../widgets/query";
+import type { WidgetResult, WidgetResultField } from "../widgets/result";
+import { refuseUnconsumedQueryFields } from "../widgets/sources";
+import { RELEASES_SOURCE_ID } from "../widgets/system-source-ids";
+import { registerSystemSource } from "../widgets/system-sources";
+
+import {
+  RELEASE_ATTENTION_REASONS,
+  type ReleaseAttentionReason,
+} from "./release-tabs";
+import type { ReleaseRow } from "./releases-repository";
+import type {
+  ReleaseActor,
+  ReleaseReadinessEntry,
+  ReleasesService,
+} from "./services/releases-service";
+
+export { RELEASES_SOURCE_ID };
+
+/**
+ * How many releases the card reads when the query names no limit.
+ *
+ * A cap rather than a page size: `find` is bounded by `scheduledAfter` as well,
+ * so this only decides how much of an unusually crowded schedule a card draws.
+ */
+const DEFAULT_LIMIT = 5;
+
+/**
+ * The fields this source publishes, and the ONLY names a query may reference.
+ *
+ * Deliberately three of `ReleaseRow`'s eleven. `createdBy`, `revision`,
+ * `publishedAt` and the rest are either an internal identifier or a fact about
+ * a release that has already shipped, and a source's field list is the
+ * allowlist every `select` is checked against — so publishing a column here is
+ * publishing it to every reader who may see the source at all.
+ */
+const RELEASE_FIELDS = [
+  // What a row links to: the release itself, which this reader may read, since the service
+  // returned it to them.
+  { name: "id", type: "string" as const, label: "ID" },
+  { name: "title", type: "string" as const, label: "Release" },
+  { name: "state", type: "string" as const, label: "State" },
+  { name: "scheduledAt", type: "date" as const, label: "Scheduled" },
+  /*
+   * How many documents the release holds, and how many of them its checks
+   * report a hard problem on: the release list's own two reads,
+   * `memberCounts` and `readinessOf`, made only for a query that SELECTS the
+   * field, so a query that does not ask pays for neither. Both are counts the
+   * release list already shows this reader beside the release, documents they
+   * may not read included, so they tell the reader nothing the list does not.
+   * `issues` is `null` for a release the batch read leaves unchecked: one
+   * holding more documents than a release may now hold, which only its own
+   * page checks.
+   */
+  { name: "entries", type: "number" as const, label: "Entries" },
+  { name: "issues", type: "number" as const, label: "Issues" },
+  // What a row is: `"release"`, or `"attention"` for a reason releases need
+  // attention, with that reason and how many of the reader's releases it holds.
+  { name: "kind", type: "string" as const, label: "Kind" },
+  /*
+   * 🔴 SELECTING this field is what asks for the attention rows: a query whose
+   * `select` names `reason` gets one row per reason this reader's releases need
+   * attention for (`stopped`, `overdue`), each with its `count`, before the
+   * upcoming releases. Every other query, including one with no `select` at
+   * all, gets the upcoming releases alone, exactly as before these rows existed.
+   * Selecting a field adds rows here and nowhere else, so the rule is stated
+   * on the field it hangs on.
+   */
+  { name: "reason", type: "string" as const, label: "Needs attention" },
+  { name: "count", type: "number" as const, label: "Releases" },
+];
+
+/**
+ * The fields a release row carries when the query selects none: the three it
+ * has always carried, so a query that never asked for the attention fields is
+ * answered with exactly the rows it was answered with before they existed.
+ */
+const DEFAULT_RELEASE_NAMES = ["title", "state", "scheduledAt"];
+
+/**
+ * The service, resolved at CALL time rather than at registration.
+ *
+ * `registerReleasesWidgetSource` runs during boot's registry reset, before the
+ * container necessarily holds `releasesService`; a resolver that captured the
+ * instance would either fail at boot or pin the first one built and survive a
+ * hot reload holding it. This is the same lookup `direct-api/namespaces/releases`
+ * makes, including the `has` guard, for the same reason.
+ */
+function service(): ReleasesService {
+  if (!container.has("releasesService")) {
+    // The public sentence stays the uniform internal-error one; the reason an
+    // operator needs goes to the log rather than into a body a client reads.
+    throw NextlyError.internal({
+      logContext: { reason: "releases-service-unregistered" },
+    });
+  }
+  return container.get<ReleasesService>("releasesService");
+}
+
+/**
+ * The dashboard caller, as the releases domain spells one.
+ *
+ * `overrideAccess` is deliberately never set: this is a reader's request, and
+ * the service must judge it as one. The API key's own stamped scope travels
+ * when present, because a narrowly scoped key must be judged on that scope
+ * rather than on the roles of whoever minted it.
+ */
+function actorFor(caller: ReadCaller): ReleaseActor {
+  return {
+    userId: caller.user.id,
+    // 🔴 Forwarded, because `ReleaseActor.userRoles` exists precisely so a
+    // code-defined access rule evaluates against the real user rather than
+    // against an empty list. Both other constructors of this actor already send
+    // it — `direct-api/namespaces/releases` and `api/releases` — so omitting it
+    // here would make this the one caller whose roles vanish, and a rule that
+    // reads them would deny a reader the other two admit.
+    ...(caller.user.roles !== undefined && { userRoles: caller.user.roles }),
+    ...(caller.authenticatedScope !== undefined && {
+      authenticatedScope: caller.authenticatedScope,
+    }),
+  };
+}
+
+/** What a release row carries beside its own columns, when the query asked for it. */
+interface ReleaseFacts {
+  entries?: ReadonlyMap<string, number>;
+  issues?: ReadonlyMap<string, number | null>;
+}
+
+/** A release row reduced to the fields this source declares. */
+function projected(
+  row: ReleaseRow,
+  names: readonly string[],
+  facts: ReleaseFacts
+) {
+  const full: Record<string, unknown> = {
+    kind: "release",
+    id: row.id,
+    title: row.title,
+    state: row.state,
+    scheduledAt: row.scheduledAt,
+    entries: facts.entries?.get(row.id),
+    issues: facts.issues?.get(row.id),
+  };
+  return Object.fromEntries(names.map(name => [name, full[name]]));
+}
+
+/**
+ * How many of a release's documents its checks report a hard problem on, as
+ * one reader is told it: the documents they may read with at least one hard
+ * finding, and the ones they may not, from the per-collection tally readiness
+ * gives for those. Counted by document, so one document with two problems is
+ * one issue; soft findings are notes and never stop a release. `null` for a
+ * release the batch read left unchecked.
+ */
+function issuesOf(entry: ReleaseReadinessEntry): number | null {
+  if (!entry.checked) return null;
+  const shown = new Set(entry.hard.map(finding => finding.memberId)).size;
+  return entry.hidden.reduce((count, part) => count + part.hard, shown);
+}
+
+/**
+ * The facts the query selected for these releases, each read once for all of
+ * them through the releases service as the caller, the reads the release list
+ * makes for its own page.
+ */
+async function releaseFacts(
+  rows: readonly ReleaseRow[],
+  names: readonly string[],
+  caller: ReadCaller
+): Promise<ReleaseFacts> {
+  const ids = rows.map(row => row.id);
+  if (ids.length === 0) return {};
+  const [counts, readiness] = await Promise.all([
+    names.includes("entries")
+      ? service().memberCounts(ids, actorFor(caller))
+      : undefined,
+    names.includes("issues")
+      ? service().readinessOf(ids, actorFor(caller))
+      : undefined,
+  ]);
+  return {
+    ...(counts && {
+      entries: new Map(ids.map(id => [id, counts[id]?.total ?? 0])),
+    }),
+    ...(readiness && {
+      issues: new Map(
+        readiness.map(entry => [entry.releaseId, issuesOf(entry)])
+      ),
+    }),
+  };
+}
+
+/**
+ * The columns to head a list with, when the query chose them.
+ *
+ * Mirrors the collection path: `fields` is present only when the query declared
+ * `select`, because without one the rows carry whatever the source holds and
+ * there are no columns the widget chose.
+ */
+function describeFields(
+  select: readonly string[] | undefined
+): WidgetResultField[] | undefined {
+  if (!select || select.length === 0) return undefined;
+  // The whole declared field. `scheduledAt` is a `date`, and publishing only
+  // its label left the renderer printing the ISO string it crossed as.
+  const declared = new Map(RELEASE_FIELDS.map(f => [f.name, f]));
+  const seen = new Set<string>();
+  const described: WidgetResultField[] = [];
+  for (const name of select) {
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const field = declared.get(name);
+    if (field !== undefined) {
+      described.push({ name, label: field.label, type: field.type });
+    }
+  }
+  return described.length > 0 ? described : undefined;
+}
+
+/**
+ * What this resolver does with each field of a widget query.
+ *
+ * 🔴 An exhaustive `Record` over `keyof WidgetQuery`, not a list of fields to
+ * reject. This resolver asks ONE fixed question, so any field it does not
+ * consume would otherwise be accepted by `validateReadWidgetQuery` and then
+ * quietly dropped — answering a different question than the caller asked, with
+ * rows that look entirely right. Listing the rejects instead is what let
+ * `status` through: `where` and `sort` were named and the third was not.
+ *
+ * Keyed on the TYPE, so adding a field to `WidgetQuery` fails `check-types`
+ * here until someone decides what it means for this source. That is a
+ * deliberate, visible coupling; the alternative is a silent one, and the silent
+ * one has already produced this defect once.
+ */
+const QUERY_FIELD_USE: Record<keyof WidgetQuery, "consumed" | "refused"> = {
+  source: "consumed",
+  op: "consumed",
+  select: "consumed",
+  limit: "consumed",
+  where: "refused",
+  sort: "refused",
+  status: "refused",
+  groupBy: "refused",
+  // This source answers a fixed question over rows it assembles itself, so it
+  // has no date column to place them on.
+  dateField: "refused",
+  interval: "refused",
+  // A window bounds rows by when they were created; this source answers a
+  // fixed question that has none.
+  ...WINDOW_KEYS_REFUSED,
+};
+
+/** Refuse a query carrying anything this source cannot honour. */
+function refuseUnconsumed(query: WidgetQuery): void {
+  refuseUnconsumedQueryFields(query, QUERY_FIELD_USE, RELEASES_SOURCE_ID);
+}
+
+/**
+ * Answer "what ships next", soonest first.
+ *
+ * 🔴 `order: "soonest"` is what makes the limit keep the right end. The
+ * repository's default is recent-first, which is correct for "what happened"
+ * and returns the FURTHEST-OUT releases for this question — with real rows, in
+ * a plausible order, so nothing in the result says it is wrong.
+ *
+ * `tab: "upcoming"`, the Releases list's own Upcoming tab, rather than a
+ * window of its own: a release scheduled for next year is still the next one
+ * when nothing is closer, and one a few minutes past its instant, which the
+ * runner reaches on its next pass, is still upcoming until the tab's rule says
+ * it is overdue. The rows and the attention line come from one read,
+ * `upcomingWithAttention`, which judges both tabs' queries at one instant, so
+ * every scheduled release is in exactly one of the card's rows or its overdue
+ * line, by the one rule and the one clock reading that decide both
+ * (`release-tabs`).
+ *
+ * Every field this source does not consume is REFUSED rather than ignored —
+ * see `QUERY_FIELD_USE`. The declared fields are the allowlist a `where` is
+ * checked against and `status` is accepted by the validator for every source,
+ * so a caller may express either; this resolver asks a fixed question, so
+ * honouring the validation while discarding the selector would answer a
+ * different question than the one asked and look correct doing it.
+ */
+async function resolveReleases(
+  query: WidgetQuery,
+  caller: ReadCaller
+): Promise<WidgetResult> {
+  refuseUnconsumed(query);
+
+  const { upcoming: rows, attention } = await service().upcomingWithAttention(
+    {
+      limit: query.limit ?? DEFAULT_LIMIT,
+      // The attention rows are opt-in: see `reason` in `RELEASE_FIELDS`.
+      attention: query.select?.includes("reason") === true,
+    },
+    actorFor(caller)
+  );
+
+  const names = query.select?.length
+    ? query.select.filter(name => RELEASE_FIELDS.some(f => f.name === name))
+    : DEFAULT_RELEASE_NAMES;
+  const facts = await releaseFacts(rows, names, caller);
+
+  return {
+    op: "list",
+    items: [
+      ...attentionRows(attention, names),
+      ...rows.map(row => projected(row, names, facts)),
+    ],
+    ...(describeFields(query.select) && {
+      fields: describeFields(query.select),
+    }),
+  };
+}
+
+/**
+ * The reasons this reader's releases need attention, each with how many it
+ * holds, as rows before the upcoming ones -- only for a query that SELECTS
+ * `reason`, which is what asked the service for the counts at all.
+ *
+ * Opt-in, so every query that does not ask is answered exactly as it was before
+ * these rows existed. Counted by the Needs attention tab's own query for each
+ * reason, the count the Releases list shows for it, so the card and the list
+ * cannot disagree; a reason holding none is absent rather than a row reading 0.
+ * Not limited: `limit` sizes the upcoming releases, and there is one row per
+ * reason at most.
+ */
+function attentionRows(
+  attention: Partial<Record<ReleaseAttentionReason, number>>,
+  names: readonly string[]
+): Record<string, unknown>[] {
+  const counted = RELEASE_ATTENTION_REASONS.map(reason => ({
+    kind: "attention",
+    reason,
+    count: attention[reason] ?? 0,
+  }));
+  return counted
+    .filter(row => row.count > 0)
+    .map(row =>
+      Object.fromEntries(
+        names.map(name => [name, (row as Record<string, unknown>)[name]])
+      )
+    );
+}
+
+/**
+ * Whether this dashboard caller may read releases, by the decision every
+ * release read makes.
+ *
+ * For a reader outside this domain that must leave a release-derived count out
+ * entirely, rather than show it as zero or fail, for a caller who may not read
+ * releases.
+ *
+ * @experimental
+ */
+export function callerMayReadReleases(caller: ReadCaller): Promise<boolean> {
+  return service().mayRead(actorFor(caller));
+}
+
+/**
+ * Whether a release exists that this dashboard caller may read: the releases
+ * domain's own answer (`anyReadable`), one id read rather than a count.
+ *
+ * Refused, as every release read is, for a caller who may not read releases;
+ * ask {@link callerMayReadReleases} first to answer "no" instead.
+ *
+ * @experimental
+ */
+export function callerMayReadAnyRelease(caller: ReadCaller): Promise<boolean> {
+  return service().anyReadable(actorFor(caller));
+}
+
+/**
+ * How many releases are overdue, for this dashboard caller: the releases
+ * domain's own count of its Needs attention tab narrowed to overdue, so a
+ * reader shows exactly the releases that tab's overdue filter lists and never
+ * decides "overdue" for itself.
+ *
+ * Refused, as every release read is, for a caller who may not read releases;
+ * ask {@link callerMayReadReleases} first to leave the count out instead.
+ *
+ * @experimental
+ */
+export function overdueReleaseCount(caller: ReadCaller): Promise<number> {
+  return service().count(
+    { tab: "attention", reason: "overdue" },
+    actorFor(caller)
+  );
+}
+
+/**
+ * How many releases stopped, for this dashboard caller: a scheduled publish
+ * that failed and left the release unpublished. The releases domain's own count
+ * of its Needs attention tab narrowed to stopped, as {@link overdueReleaseCount}
+ * is to overdue, so "stopped" is decided there and nowhere else.
+ *
+ * Refused, as every release read is, for a caller who may not read releases;
+ * ask {@link callerMayReadReleases} first to leave the count out instead.
+ *
+ * @experimental
+ */
+export function stoppedReleaseCount(caller: ReadCaller): Promise<number> {
+  return service().count(
+    { tab: "attention", reason: "stopped" },
+    actorFor(caller)
+  );
+}
+
+/**
+ * Publish the source and the function that answers it.
+ *
+ * Called from the boot-time registry reset, which is the one choke point both
+ * boot paths funnel through — so a dev-server hot reload republishes exactly
+ * once rather than colliding with the previous boot's registration.
+ *
+ * `supports` names `list` and nothing else. This source answers one fixed
+ * question, the next releases due, and the service's `count` answers a
+ * different one (how many a tab of the list holds); declaring an op this
+ * source does not answer would put the refusal in front of a reader rather
+ * than here.
+ */
+export function registerReleasesWidgetSource(): void {
+  registerSystemSource(
+    {
+      id: RELEASES_SOURCE_ID,
+      label: "Upcoming releases",
+      kind: "system",
+      titleField: "title",
+      supports: ["list"],
+      fields: RELEASE_FIELDS,
+    },
+    resolveReleases
+  );
+}

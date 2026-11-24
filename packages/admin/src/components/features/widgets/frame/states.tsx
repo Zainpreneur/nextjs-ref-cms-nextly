@@ -1,0 +1,360 @@
+"use client";
+
+/**
+ * The four states a card shows instead of its content, and the skeleton it shows first.
+ *
+ * The frame draws these for every card, core or plugin, from its `CardState`
+ * (`card-state`): one wording, one look, one place an action goes. A widget supplies data and a
+ * body, and reports a state its own data says with `FrameState`; it never draws one itself, which
+ * is what kept them differing card by card before.
+ *
+ * None of them is a live region. The dashboard announces through its one polite region, and a
+ * card that announced its own error would talk over it (see `WidgetCard`).
+ *
+ * @module components/features/widgets/frame/states
+ */
+
+import { Button, Skeleton } from "@nextlyhq/ui";
+import type { JSX } from "react";
+
+import { Lock, RefreshCw, XCircle } from "@admin/components/icons";
+import { ChecklistOutline } from "@admin/components/shared/checklist";
+import { Link } from "@admin/components/ui/link";
+import { cn } from "@admin/lib/utils";
+
+import {
+  FIGURE_VALUE_CLASS,
+  LIST_CLASS,
+  LIST_DETAIL_CLASS,
+  LIST_LABEL_CLASS,
+  LIST_ROW_CLASS,
+  LIST_ROW_HEIGHT_CLASS,
+  ROWS_STACK_CLASS,
+  TABLE_CELL_CLASS,
+  TABLE_CLASS,
+  TABLE_HEAD_ROW_CLASS,
+  TABLE_HEADING_CLASS,
+  TABLE_ROW_CLASS,
+  TABLE_ROW_HEIGHT_CLASS,
+} from "./geometry";
+import { useListDensity } from "./list-rows";
+import type { RowsLayout } from "./tier";
+
+/**
+ * The kinds of body a skeleton can be shaped like, so it matches what will arrive: one for each
+ * display a card is drawn as.
+ */
+export type SkeletonShape = "figure" | "rows" | "chart" | "bars" | "checklist";
+
+/**
+ * One line of a skeleton, as tall as a line of `lineClass` and no taller: the bar is `1em` of
+ * the line's own type, set at the top of a line box the line's own leading decides.
+ */
+function SkeletonLine({
+  lineClass,
+  width,
+}: {
+  lineClass: string;
+  width: string;
+}) {
+  return (
+    <div className={lineClass}>
+      <Skeleton className={cn("inline-block h-[1em] align-top", width)} />
+    </div>
+  );
+}
+
+/**
+ * The rows a list or table card will draw, in the same fixed-height row boxes at the card's
+ * density (`frame/geometry`).
+ *
+ * Its "View all" line is not held here: it is drawn in the card's footer, which the frame keeps
+ * whether or not it holds anything, so an answer that brings the line moves nothing.
+ */
+function SkeletonRows({ rows, layout }: { rows: number; layout: RowsLayout }) {
+  const widths = ["w-full", "w-4/5", "w-3/5"];
+  // The card's density, as the rows that will arrive are drawn at.
+  const density = useListDensity();
+  const rowHeight = LIST_ROW_HEIGHT_CLASS[density];
+  return (
+    <div className={ROWS_STACK_CLASS}>
+      {layout.kind === "table" ? (
+        <table className={TABLE_CLASS}>
+          <thead>
+            <tr className={TABLE_HEAD_ROW_CLASS}>
+              {Array.from({ length: layout.columns }, (_, c) => (
+                <th key={c} className={TABLE_HEADING_CLASS}>
+                  <Skeleton className="inline-block h-[1em] w-1/2 align-top" />
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {Array.from({ length: rows }, (_, r) => (
+              <tr
+                key={r}
+                className={cn(TABLE_ROW_CLASS, TABLE_ROW_HEIGHT_CLASS[density])}
+              >
+                {Array.from({ length: layout.columns }, (_, c) => (
+                  <td key={c} className={TABLE_CELL_CLASS}>
+                    <Skeleton
+                      className={cn(
+                        "inline-block h-[1em] align-top",
+                        widths[(r + c) % 3]
+                      )}
+                    />
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : (
+        <div className={LIST_CLASS}>
+          {Array.from({ length: rows }, (_, r) => (
+            <div key={r} className={cn(LIST_ROW_CLASS, rowHeight)}>
+              <SkeletonLine
+                lineClass={LIST_LABEL_CLASS}
+                width={widths[r % 3]}
+              />
+              {layout.kind === "list-detail" && (
+                <SkeletonLine lineClass={LIST_DETAIL_CLASS} width="w-2/5" />
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The steps a checklist card's loading state draws when nothing says how many:
+ * four, the setup checklist's count once a project's sample content is
+ * answered, which is most of its life (five before it, fewer without Singles).
+ */
+const CHECKLIST_OUTLINE_STEPS = 4;
+
+/**
+ * A skeleton shaped like the body that has not arrived yet: a figure where a number will be,
+ * rows where a list will be. A generic block would jump into a different shape when the data
+ * lands, which is the layout shift this exists to avoid.
+ *
+ * A figure and rows are drawn in the very line boxes the loaded body uses (`frame/geometry`), so
+ * the answer arrives at the skeleton's own height. `layout` says how a rows skeleton is laid
+ * out; absent, rows are drawn as plain lines.
+ */
+export function CardSkeleton({
+  shape = "rows",
+  rows: givenRows,
+  layout,
+}: {
+  shape?: SkeletonShape;
+  rows?: number;
+  layout?: RowsLayout;
+}): JSX.Element {
+  if (shape === "checklist") {
+    // A checklist's own lines (`ChecklistOutline`), as many as it is told or
+    // the steps a project's setup has for most of its life, so the steps land
+    // at the outline's height.
+    return (
+      <div data-testid="card-skeleton" data-shape={shape}>
+        <span className="sr-only">Loading</span>
+        <ChecklistOutline steps={givenRows ?? CHECKLIST_OUTLINE_STEPS} />
+      </div>
+    );
+  }
+  const rows = givenRows ?? 3;
+  if ((shape === "rows" && layout) || shape === "figure") {
+    return (
+      <div data-testid="card-skeleton" data-shape={shape}>
+        {/* Read when a reader reaches the card, not announced: the body is already
+            `aria-busy`, and the grid's one live region announces the batch, so a
+            status per card would speak once for every card loading at the same time. */}
+        <span className="sr-only">Loading</span>
+        {shape === "figure" ? (
+          <SkeletonLine lineClass={FIGURE_VALUE_CLASS} width="w-1/3" />
+        ) : (
+          <SkeletonRows rows={rows} layout={layout ?? { kind: "list" }} />
+        )}
+      </div>
+    );
+  }
+  return (
+    <div
+      className="grid gap-2.5"
+      data-testid="card-skeleton"
+      data-shape={shape}
+    >
+      <span className="sr-only">Loading</span>
+      {shape === "chart" && <Skeleton className="h-32 w-full" />}
+      {(shape === "rows" || shape === "bars") &&
+        Array.from({ length: rows }, (_, i) => (
+          <Skeleton
+            key={i}
+            className={
+              shape === "bars"
+                ? "h-4 w-full"
+                : i % 3 === 1
+                  ? "h-3.5 w-4/5"
+                  : i % 3 === 2
+                    ? "h-3.5 w-3/5"
+                    : "h-3.5 w-full"
+            }
+          />
+        ))}
+    </div>
+  );
+}
+
+/** What an empty card says, and the one thing the person may do about it. */
+export interface CardEmptyContent {
+  /** What will appear here: "No posts yet". */
+  title: string;
+  /** One line on what fills it: "Your newest posts show here." */
+  detail?: string;
+  /**
+   * At most ONE action, and only one the person may take. The caller decides that; the frame
+   * draws what it is given and never a second button: a link for an `href`, a button for an
+   * `onSelect`, such as one opening the card's own settings. `onIntent` is called as a pointer
+   * comes over the button or focus reaches it, so what it opens can start loading.
+   */
+  action?:
+    | { label: string; href: string }
+    | { label: string; onSelect: () => void; onIntent?: () => void };
+}
+
+/** The frame's own empty state, for a card whose body says nothing more particular. */
+export const EMPTY_DEFAULT: CardEmptyContent = { title: "Nothing to show yet" };
+
+/**
+ * The height an empty state with an action takes stacked: its title's line (`text-sm`, 20 px),
+ * the gap under it (4 px), the action's margin (8 px) and the action (32 px). A body shorter than
+ * this, such as a two-row card's, lays the title and the action in one row instead, so the action
+ * stays inside the body rather than running under the footer's room.
+ */
+export const EMPTY_STACKED_WITH_ACTION_PX: number = 20 + 4 + 8 + 32;
+
+export function CardEmpty({
+  title,
+  detail,
+  action,
+  inline = false,
+}: CardEmptyContent & {
+  /** The title and the action in one row, for a body too short to stack them. */
+  inline?: boolean;
+}): JSX.Element {
+  return (
+    <div
+      className={
+        inline
+          ? "flex flex-wrap items-center justify-center gap-x-3 gap-y-1"
+          : "grid justify-items-center gap-1"
+      }
+      data-testid="card-empty"
+      data-layout={inline ? "inline" : "stacked"}
+    >
+      <p className="text-sm font-semibold text-foreground">{title}</p>
+      {/* A one-row state has no room for a second line; its title says what is missing. */}
+      {detail && !inline && (
+        <p className="text-xs text-muted-foreground">{detail}</p>
+      )}
+      {action && "href" in action && (
+        <Link
+          href={action.href}
+          className={cn(
+            "inline-flex h-8 items-center rounded-md border border-border px-3 text-sm font-medium text-foreground hover:bg-primary/5",
+            !inline && "mt-2"
+          )}
+        >
+          {action.label}
+        </Link>
+      )}
+      {action && "onSelect" in action && (
+        // The button the link stands beside elsewhere, so the two read as one kind of step.
+        <Button
+          variant="outline"
+          size="sm"
+          className={inline ? undefined : "mt-2"}
+          onClick={action.onSelect}
+          onPointerEnter={action.onIntent}
+          onFocus={action.onIntent}
+          data-testid="card-empty-action"
+        >
+          {action.label}
+        </Button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The one "not available" state. It reads the same, word for word, whether the card's source
+ * is forbidden to this person, no longer exists, or is a collection kept off the dashboard: a
+ * different message for "forbidden" would tell a person that the thing they cannot see exists.
+ */
+export const UNAVAILABLE_TITLE = "Not available to you";
+export const UNAVAILABLE_DETAIL =
+  "What this card shows isn't available to your account.";
+
+export function CardUnavailable(): JSX.Element {
+  return (
+    <div
+      className="grid justify-items-center gap-1"
+      data-testid="card-unavailable"
+    >
+      <Lock className="mb-1 h-5 w-5 text-muted-foreground" aria-hidden="true" />
+      <p className="text-sm font-semibold text-foreground">
+        {UNAVAILABLE_TITLE}
+      </p>
+      <p className="text-xs text-muted-foreground">{UNAVAILABLE_DETAIL}</p>
+    </div>
+  );
+}
+
+/**
+ * A card whose data failed to load. It keeps the card's title (the frame draws it), says what
+ * happened, and offers Retry for this card only when the caller can retry it.
+ */
+export function CardError({
+  message,
+  title,
+  onRetry,
+}: {
+  message: string;
+  /** The card's title, for Retry's accessible name. */
+  title: string;
+  onRetry?: () => void;
+}): JSX.Element {
+  return (
+    <div
+      className="grid justify-items-center gap-1"
+      data-testid="widget-card-error"
+    >
+      {/* An icon is ink, so it takes the danger status's text colour; the solid one is for fills. */}
+      <XCircle
+        className="mb-1 h-5 w-5 text-danger-text"
+        aria-hidden="true"
+        data-testid="widget-card-error-mark"
+      />
+      {/* A string expression rather than JSX text, so the apostrophe is written as itself. */}
+      <p className="text-sm font-semibold text-foreground">
+        {"This card couldn't load"}
+      </p>
+      <p className="text-xs text-muted-foreground">{message}</p>
+      {onRetry && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="mt-2"
+          onClick={onRetry}
+          aria-label={`Retry ${title}`}
+          data-testid="card-retry"
+        >
+          <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+          Retry
+        </Button>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,645 @@
+import { buildErrorResponse } from "../../api/error-response";
+import { readOrGenerateRequestId } from "../../api/request-id";
+import type { AuditLogWriter } from "../../domains/audit/audit-log-writer";
+import {
+  isLimitStoreDown,
+  signInLimitUnavailable,
+} from "../../domains/limits/core-limit-outage";
+import type { LimitStore } from "../../domains/limits/limit-store";
+import { NextlyError } from "../../errors/nextly-error";
+import type { RateLimitStore } from "../../middleware/rate-limit";
+import type { PluginContext } from "../../plugins/plugin-context";
+import { getTrustedClientIp } from "../../utils/get-trusted-client-ip";
+import type { CredentialUserRow } from "../credentials/verify-credentials";
+import { authRateLimiter } from "../middleware/rate-limiter";
+import type {
+  UnknownSourceCounter,
+  UnknownSourceVerdict,
+} from "../middleware/unknown-source-counter";
+import type { ChallengeRegistry } from "../pipeline/challenge";
+import type { AuthHookRegistry } from "../pipeline/hooks";
+import type { SpentChallenges } from "../pipeline/spent-challenges";
+import type { AuthStrategy } from "../pipeline/types";
+import type { AccountState } from "../session/account-state";
+import type { SessionRoles } from "../session/session-roles";
+
+import { handleAcceptInvite } from "./accept-invite";
+import { handleAuthUi, type AuthUiMeta } from "./auth-ui";
+import { handleChallengeResolve } from "./challenge-resolve";
+import { handleChangePassword } from "./change-password";
+import { handleCsrf } from "./csrf";
+import { handleForgotPassword } from "./forgot-password";
+import { buildAuthErrorResponse } from "./handler-utils";
+import type { RefreshTokenRecord } from "./issue-session";
+import { handleLogin } from "./login";
+import { handleLogout } from "./logout";
+import { handlePending } from "./pending";
+import { noteUnresolvedAuthRequest } from "./proxy-posture";
+import { handleRefresh } from "./refresh";
+import { handleRegister } from "./register";
+import { handleResetPassword } from "./reset-password";
+import { handleSession } from "./session";
+import type { WithSessionRowTransaction } from "./session-row";
+import { handleSetInitialPassword } from "./set-initial-password";
+import { handleSetupStatus, handleSetup, type SetupHandlerDeps } from "./setup";
+import {
+  admitUnknownSource,
+  countsOf,
+  type ReadingPlace,
+  type StoredTokenKind,
+} from "./unknown-source";
+import { handleVerifyEmail, handleResendVerification } from "./verify-email";
+
+/**
+ * POST paths under `/auth/*` that share one per-IP rate-limit bucket.
+ * Login is the obvious credential-stuffing target, but register /
+ * forgot-password / reset-password are also sensitive (user enumeration,
+ * mailbomb, token-grinding) and an attacker who maxes one shouldn't be
+ * able to refresh their budget by switching to another.
+ */
+const RATE_LIMITED_AUTH_PATHS = new Set([
+  "login",
+  "register",
+  "forgot-password",
+  // Sends an email on request, like forgot-password: unlimited, it is a way
+  // to mail any registered address as often as someone likes.
+  "verify-email/resend",
+  // Consumes the single-use verification token, as reset-password consumes
+  // its own: the same grind surface for an attacker holding no token.
+  "verify-email",
+  "reset-password",
+  // Same bucket as reset-password: both consume a token, so both are
+  // grind-able by an attacker holding no token at all.
+  "accept-invite",
+  "challenge/resolve",
+  // Consumes a single-purpose pending token and sets a password — same
+  // grind/replay surface as the other token-consuming paths.
+  "set-initial-password",
+]);
+
+/**
+ * POST paths under `/auth/*` whose handler counts a request against the same
+ * auth rate limit itself, once it has judged it: setup, which counts only a
+ * wrong setup token, so a valid one completes setup whatever the budget holds.
+ * The router does not limit these before they are handled.
+ */
+const HANDLER_LIMITED_AUTH_PATHS = new Set(["setup"]);
+
+/**
+ * The setup dependencies with a token store in place. Absent, setup in
+ * production stays closed (no token is valid) and outside production needs
+ * none: the safe answer for code that built its dependencies before setup had
+ * a token.
+ */
+function withSetupToken<T extends { isProduction: boolean }>(
+  deps: T & { setupToken?: SetupHandlerDeps["setupToken"] }
+): T & { setupToken: SetupHandlerDeps["setupToken"] } {
+  if (deps.setupToken) {
+    return deps as T & { setupToken: SetupHandlerDeps["setupToken"] };
+  }
+  return {
+    ...deps,
+    setupToken: {
+      required: deps.isProduction,
+      verify: () => Promise.resolve("invalid"),
+      confirm: () => Promise.resolve("invalid"),
+      spend: () => Promise.resolve(),
+      claim: () => Promise.resolve({ release: () => Promise.resolve() }),
+    },
+  };
+}
+
+/**
+ * Whether a request to `authPath` is judged by the auth rate limit, before it
+ * is handled or by its handler.
+ *
+ * Exported because the REST limit leaves exactly these requests to the auth
+ * limit when their client address cannot be resolved, and one answer keeps
+ * the two from disagreeing: an auth path the auth limit does not cover is
+ * then held to the REST limit's ceiling like any other request.
+ */
+export function hasAuthRateLimit(method: string, authPath: string): boolean {
+  return (
+    method.toUpperCase() === "POST" &&
+    (RATE_LIMITED_AUTH_PATHS.has(authPath) ||
+      HANDLER_LIMITED_AUTH_PATHS.has(authPath))
+  );
+}
+
+/**
+ * @experimental Combined dependency interface for all auth handlers.
+ * Defined as a standalone interface (not multi-extends) to avoid TS2320 conflicts
+ * where the same method name has different return types across handler deps.
+ * The route handler builds this from the DI container services and config.
+ *
+ * Experimental while the auth pipeline (D71) it carries is: its members follow
+ * the handlers, and change with them.
+ */
+export interface AuthRouterDeps {
+  secret: string;
+  isProduction: boolean;
+  accessTokenTTL: number;
+  refreshTokenTTL: number;
+  maxLoginAttempts: number;
+  lockoutDurationSeconds: number;
+  loginStallTimeMs: number;
+  requireEmailVerification: boolean;
+  /**
+   * Spec §13.2 opt-in flag. When false (the spec default), email-conflict
+   * registrations silent-success with a generic message. When true, the
+   * handler returns 409 DUPLICATE so the user knows the email is in use
+   * (trades enumeration risk for UX).
+   */
+  revealRegistrationConflict: boolean;
+  /** Whether strangers may register (`auth.allowRegistration`); off by default. */
+  allowRegistration: boolean;
+  /**
+   * Dev-only auto-login config (config.admin.devAutoLogin). Hard-blocked
+   * at runtime when isProduction is true. When set, the session handler
+   * issues a real session for the named user on the first /admin visit
+   * if no valid session is present. See packages/nextly/src/auth/handlers/session.ts.
+   */
+  devAutoLogin: false | { email: string; password?: string };
+  allowedOrigins: string[];
+  /**
+   * When true, client-IP resolution honors `X-Forwarded-For` (filtered
+   * through `trustedProxyIps`). When false (default), proxy headers are
+   * ignored.
+   */
+  trustProxy: boolean;
+  /** CIDR list of proxy IPs (from TRUSTED_PROXY_IPS). */
+  trustedProxyIps: string[];
+  /**
+   * Rate limit on auth write endpoints. `requestsPerHour: 0` disables it.
+   * A request whose client address resolves counts in that address's one
+   * bucket across every limited route. One whose address cannot be resolved
+   * counts against the account it names, under a shared ceiling; see
+   * `auth/handlers/unknown-source`.
+   */
+  authRateLimit: {
+    requestsPerHour: number;
+    windowMs: number;
+    /**
+     * Where the window lives. Absent means this process's memory, which is
+     * correct for one instance and wrong by a factor of the instance count
+     * anywhere else — see `auth/middleware/rate-limiter`.
+     */
+    store?: RateLimitStore;
+    /**
+     * Where core's own limits count: `store` when the app configured one,
+     * else the limit store the site selected. Absent means this process's
+     * memory.
+     */
+    counts?: RateLimitStore;
+    /**
+     * Where unknown-source admissions are counted. Absent means `counts`
+     * when it is set, else this process's own counter.
+     */
+    unknownSourceCounter?: UnknownSourceCounter;
+  };
+  /**
+   * The address of the account a stored token belongs to, without using the
+   * token up, or `null` when it belongs to none. The limiter counts a token
+   * request from an unresolvable address against that account. Absent, every
+   * such request counts against the account-less budget.
+   */
+  findTokenOwner?: (
+    kind: StoredTokenKind,
+    token: string
+  ) => Promise<string | null>;
+  /**
+   * The limit store the site selected, where the two-factor attempt budget
+   * is counted when no store of the earlier contract is configured.
+   */
+  limitStore?: LimitStore;
+  /**
+   * The two-factor flows a correct answer has settled, kept in the database.
+   * Core always supplies it (`databaseSpentChallenges`). Absent, the marks
+   * are kept in the rate-limit store as they used to be, so single use holds
+   * across instances only where that store is shared.
+   */
+  spentChallenges?: SpentChallenges;
+  /**
+   * Writer for security-sensitive auth events. Handlers call
+   * `auditLog.write(...)` on failed CSRF, failed login, password change,
+   * role mutation, and user delete. Writer is fail-safe; any DB error
+   * logs a warning and the request continues.
+   */
+  auditLog: AuditLogWriter;
+
+  // Auth extensibility pipeline (D71). Built in deps-bridge from config +
+  // plugin contributes.auth. With no strategies/hooks beyond the built-in
+  // password strategy, the login/challenge flow is identical to the legacy path.
+  /** Ordered auth strategies (config opt-in first, built-in `password` last). */
+  authStrategies: AuthStrategy[];
+  /** Auth-flow hook registry (beforeLogin/afterAuthenticate/customizeClaims/…). */
+  authHooks: AuthHookRegistry;
+  /** Challenge registry for multi-step auth (e.g. 2FA). */
+  challengeRegistry: ChallengeRegistry;
+  /** Base plugin context handed to strategies/hooks/challenges. */
+  pluginCtx: PluginContext;
+  /** Pending-auth token TTL in seconds (default 300). */
+  challengeTokenTTL: number;
+  /** Max challenge-resolve attempts before failing (default 5). */
+  maxChallengeAttempts: number;
+  /** Aggregated auth-page UI (D57), served pre-auth from GET /auth/ui. */
+  authUi: AuthUiMeta;
+
+  // User lookups (widest return type to satisfy all handlers)
+  findUserByEmail: (email: string) => Promise<CredentialUserRow | null>;
+  findUserById: (userId: string) => Promise<{
+    id: string;
+    email: string;
+    name: string;
+    image: string | null;
+    isActive: boolean;
+    mustChangePassword: boolean | null;
+  } | null>;
+  /**
+   * The account facts the shared session gate decides on, read fresh at the
+   * moment a session is issued rather than carried from whichever strategy
+   * authenticated the user.
+   *
+   * `passwordUpdatedAt` is the column as stored, `null` only when no password
+   * was ever set. It is the version a session is earned against, and the
+   * row lock in {@link withSessionRowTransaction} compares it with the value
+   * read there, so both must read the same column the same way.
+   */
+  fetchAccountState: (userId: string) => Promise<AccountState | null>;
+
+  incrementFailedAttempts: (userId: string) => Promise<void>;
+  lockAccount: (userId: string, lockedUntil: Date) => Promise<void>;
+  resetFailedAttempts: (userId: string) => Promise<void>;
+
+  /** The roles in force, and when the first of them lapses; see `SessionRoles`. */
+  fetchSessionRoles: (userId: string) => Promise<SessionRoles>;
+  fetchCustomFields: (userId: string) => Promise<Record<string, unknown>>;
+
+  storeRefreshToken: (record: RefreshTokenRecord) => Promise<void>;
+  findRefreshTokenByHash: (tokenHash: string) => Promise<{
+    id: string;
+    userId: string;
+    expiresAt: Date;
+    userAgent: string | null;
+    ipAddress: string | null;
+  } | null>;
+  deleteRefreshToken: (id: string) => Promise<void>;
+  /**
+   * Runs a session's refresh-row write — for a sign-in or a rotation — in one
+   * transaction that first locks the user row and re-reads its account state.
+   *
+   * The contract a replacement must keep, because the session refuses or
+   * survives a concurrent revocation on it:
+   *
+   * - Every operation `work` receives runs in the ONE transaction, and a
+   *   throw from `work` rolls back everything it wrote.
+   * - `lockAccountState` locks the user row before reading it: `FOR SHARE` on
+   *   PostgreSQL and `FOR UPDATE` on MySQL, so a deactivation or a password
+   *   set waits for the write and the write waits for one already holding the
+   *   row; on SQLite the transaction itself must hold the write lock
+   *   (`BEGIN IMMEDIATE`).
+   * - It returns `passwordUpdatedAt` as {@link fetchAccountState} does. A
+   *   different value there refuses the session as a password changed since.
+   */
+  withSessionRowTransaction: WithSessionRowTransaction;
+  deleteRefreshTokenByHash: (tokenHash: string) => Promise<void>;
+  deleteAllRefreshTokensForUser: (userId: string) => Promise<void>;
+
+  /** Whether anyone holds the `super-admin` role: setup's gate. */
+  hasAdministrator: () => Promise<boolean>;
+  /**
+   * The production setup token, and the claim one setup holds at a time.
+   * Optional for code that builds these dependencies itself: without it,
+   * setup in production refuses every token, and outside production needs
+   * none, as before.
+   */
+  setupToken?: SetupHandlerDeps["setupToken"];
+  createSuperAdmin: (data: {
+    email: string;
+    name: string;
+    password: string;
+  }) => Promise<{ id: string; email: string; name: string } | null>;
+  seedPermissions: () => Promise<void>;
+
+  // These throw NextlyError on failure and return the success-case data
+  // directly; handlers catch NextlyError and serialise via toResponseJSON.
+  registerUser: (data: {
+    email: string;
+    password: string;
+    name: string;
+  }) => Promise<{ id: string; email: string; name: string | null }>;
+
+  generatePasswordResetToken: (
+    email: string,
+    redirectPath?: string
+  ) => Promise<{ token?: string }>;
+  resetPasswordWithToken: (
+    token: string,
+    newPassword: string
+  ) => Promise<{ email: string }>;
+  acceptInvite: (
+    token: string,
+    newPassword: string
+  ) => Promise<{ userId: string }>;
+  /**
+   * Replaces an admin-set password and clears the must-change flag. Returns
+   * the `passwordUpdatedAt` it wrote, read back as stored: the session the
+   * change issues is judged against that version.
+   */
+  setInitialPassword: (
+    userId: string,
+    newPassword: string
+  ) => Promise<{
+    userId: string;
+    passwordUpdatedAt: Date | null;
+    sessionEpoch: number;
+  }>;
+  changePassword: (
+    userId: string,
+    currentPassword: string,
+    newPassword: string
+  ) => Promise<{ success: boolean; error?: string }>;
+
+  verifyEmail: (
+    token: string
+  ) => Promise<{ success: boolean; error?: string; email?: string }>;
+  resendVerificationEmail: (
+    email: string
+  ) => Promise<{ success: boolean; error?: string }>;
+}
+
+/**
+ * @experimental Route an auth request to the appropriate handler.
+ * Returns null if the path doesn't match any auth route (caller handles 404).
+ *
+ * @param request - The incoming HTTP request
+ * @param authPath - The path after the auth prefix (e.g., "login", "setup-status")
+ * @param deps - Injected service dependencies
+ */
+export async function routeAuthRequest(
+  request: Request,
+  authPath: string,
+  deps: AuthRouterDeps
+): Promise<Response | null> {
+  const response = await dispatchAuthRequest(request, authPath, deps);
+  return applyNoStoreCache(response);
+}
+
+async function dispatchAuthRequest(
+  request: Request,
+  authPath: string,
+  deps: AuthRouterDeps
+): Promise<Response | null> {
+  const method = request.method.toUpperCase();
+
+  if (method === "GET") {
+    switch (authPath) {
+      case "setup-status":
+        return handleSetupStatus(request, withSetupToken(deps));
+      case "session":
+        return handleSession(request, deps);
+      case "csrf":
+        return handleCsrf(request, deps);
+      case "ui":
+        // Public (pre-auth): the login screen fetches the auth-page UI config.
+        return handleAuthUi(request, deps);
+      case "pending":
+        // Public (pre-auth): the login page asks which challenge, if any, an
+        // interrupted login left outstanding. Answers from the HttpOnly
+        // cookie and never returns the token itself.
+        return handlePending(request, deps);
+      default:
+        return null;
+    }
+  }
+
+  if (method === "POST") {
+    let place: ReadingPlace | undefined;
+    // Only the paths limited before handling; setup limits itself.
+    if (RATE_LIMITED_AUTH_PATHS.has(authPath)) {
+      const limited = await checkAuthIpRateLimit(request, authPath, deps);
+      if (limited.refused) return limited.refused;
+      place = limited.place;
+    }
+    // A body the limiter stopped reading is read to its end by the handler,
+    // at the client's pace, so its reading place is held until the handler
+    // has answered, however it ends.
+    try {
+      return await handleAuthPost(request, authPath, deps);
+    } finally {
+      place?.release();
+    }
+  }
+
+  if (method === "PATCH") {
+    return auditCsrfFailure(request, authPath, deps, () => {
+      switch (authPath) {
+        case "change-password":
+          return handleChangePassword(request, deps);
+        default:
+          return Promise.resolve(null);
+      }
+    });
+  }
+
+  return null;
+}
+
+/** The handler for an auth POST the limit has admitted. */
+function handleAuthPost(
+  request: Request,
+  authPath: string,
+  deps: AuthRouterDeps
+): Promise<Response | null> {
+  return auditCsrfFailure(request, authPath, deps, () => {
+    switch (authPath) {
+      case "login":
+        return handleLogin(request, deps);
+      case "challenge/resolve":
+        return handleChallengeResolve(request, deps);
+      case "logout":
+        return handleLogout(request, deps);
+      case "refresh":
+        return handleRefresh(request, deps);
+      case "setup":
+        // Setup is not on the limited paths: a valid token must open it
+        // whatever the budgets hold. Only a wrong token is counted.
+        return handleSetup(request, withSetupToken(deps), {
+          limitWithoutValidToken: async wrong => {
+            const limited = await checkAuthIpRateLimit(wrong, "setup", deps);
+            // Setup has already read its whole body and hands the limiter
+            // those bytes, so nothing is left to read from the client: a
+            // place the limiter held for the rest is given back at once.
+            limited.place?.release();
+            return limited.refused;
+          },
+        });
+      case "register":
+        return handleRegister(request, deps);
+      case "forgot-password":
+        return handleForgotPassword(request, deps);
+      case "reset-password":
+        return handleResetPassword(request, deps);
+      case "accept-invite":
+        return handleAcceptInvite(request, deps);
+      case "set-initial-password":
+        return handleSetInitialPassword(request, deps);
+      case "verify-email":
+        return handleVerifyEmail(request, deps);
+      case "verify-email/resend":
+        return handleResendVerification(request, deps);
+      default:
+        return Promise.resolve(null);
+    }
+  });
+}
+
+/**
+ * Stamp `Cache-Control: no-store` (and the legacy `Pragma: no-cache`)
+ * on every `/auth/*` response, regardless of the handler that produced
+ * it. Auth responses can carry tokens, session cookies, or account-state
+ * hints; none of those should ever live in a shared / browser / proxy
+ * cache.
+ *
+ * Centralising at the router means individual handlers don't have to
+ * remember to add the header (and don't have to thread headers
+ * through `new Response(...)` literals scattered across the dir).
+ *
+ * Returns the same `Response` object with mutated headers; `Headers`
+ * is mutable on `Response.headers`, so no clone is needed.
+ */
+function applyNoStoreCache(response: Response | null): Response | null {
+  if (!response) return response;
+  response.headers.set("Cache-Control", "no-store");
+  response.headers.set("Pragma", "no-cache");
+  return response;
+}
+
+/**
+ * Write a `csrf-failed` audit event whenever a dispatched handler
+ * returns a 403 carrying `error.code === "CSRF_FAILED"`. Centralising
+ * this in the router avoids touching every individual handler. Body
+ * parsing is gated on the cheap status check first, so happy-path
+ * requests pay nothing.
+ */
+async function auditCsrfFailure(
+  request: Request,
+  authPath: string,
+  deps: AuthRouterDeps,
+  dispatch: () => Promise<Response | null>
+): Promise<Response | null> {
+  const response = await dispatch();
+  if (!response || response.status !== 403) return response;
+
+  try {
+    const body = await response.clone().json();
+    if (body?.error?.code !== "CSRF_FAILED") return response;
+    await deps.auditLog.write({
+      kind: "csrf-failed",
+      ipAddress: getTrustedClientIp(request, {
+        trustProxy: deps.trustProxy,
+        trustedProxyIps: deps.trustedProxyIps,
+      }),
+      userAgent: request.headers.get("user-agent"),
+      metadata: { path: authPath, method: request.method.toUpperCase() },
+    });
+  } catch {
+    /* response had no JSON body or audit write failed silently */
+  }
+  return response;
+}
+
+/**
+ * Rate limit on auth write endpoints.
+ *
+ * Returns a 429 `Response` as `refused` when the request's budget is spent for
+ * the current window, or `refused: null` when the request should proceed,
+ * with the reading place an admitted request still holds (`ReadingPlace`),
+ * which the caller gives back once the handler has answered. A request whose client
+ * address resolves through the trusted-proxy settings counts in that
+ * address's bucket of the shared sliding-window `rateLimiter` (the one the
+ * API-key middleware uses). One whose address cannot be resolved (every
+ * request, where no proxy is trusted) counts against the account it names,
+ * under a ceiling shared by all of them (`admitUnknownSource`): one bucket for
+ * every such request let anyone refuse sign-in to everyone. The backing store
+ * is in-memory, so single-instance deployments are the documented beta scope
+ * until a shared store lands.
+ */
+async function checkAuthIpRateLimit(
+  request: Request,
+  authPath: string,
+  deps: AuthRouterDeps
+): Promise<{ refused: Response | null; place?: ReadingPlace }> {
+  const limit = deps.authRateLimit.requestsPerHour;
+  if (limit <= 0) return { refused: null }; // explicitly disabled
+
+  const ip = getTrustedClientIp(request, {
+    trustProxy: deps.trustProxy,
+    trustedProxyIps: deps.trustedProxyIps,
+  });
+
+  if (ip === null) noteUnresolvedAuthRequest(request);
+  let admission: Awaited<ReturnType<typeof admitUnknownSource>>;
+  try {
+    admission =
+      ip === null
+        ? await admitUnknownSource(request, authPath, deps)
+        : { verdict: await admitAddress(ip, deps) };
+  } catch (error) {
+    // Refused while the store is away: admitting would let sign-in attempts
+    // run uncounted for as long as it is (see `core-limit-outage`).
+    if (isLimitStoreDown(error)) {
+      return {
+        refused: buildAuthErrorResponse(
+          signInLimitUnavailable(error),
+          readOrGenerateRequestId(request)
+        ),
+      };
+    }
+    throw error;
+  }
+  const result = admission.verdict;
+  if (result.allowed) return { refused: null, place: admission.place };
+
+  const retryAfter = Math.max(
+    1,
+    Math.ceil((result.resetAt - Date.now()) / 1000)
+  );
+  // The one error body every refusal is answered with; the budget's state
+  // rides in its headers.
+  const refused = buildErrorResponse(
+    new NextlyError({
+      code: "RATE_LIMITED",
+      publicMessage:
+        "Too many auth requests from this IP. Please try again later.",
+      publicData: { retryAfterSeconds: retryAfter },
+    }),
+    {
+      requestId: readOrGenerateRequestId(request),
+      headers: {
+        "x-ratelimit-limit": String(limit),
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-reset": String(result.resetAt),
+      },
+    }
+  );
+  return { refused };
+}
+
+/**
+ * Admit or refuse a request from a resolved client address: that address's
+ * one bucket, at the configured budget, as it always has been.
+ */
+async function admitAddress(
+  ip: string,
+  deps: AuthRouterDeps
+): Promise<UnknownSourceVerdict> {
+  const result = await authRateLimiter(countsOf(deps.authRateLimit)).check(
+    `auth-ip:${ip}`,
+    deps.authRateLimit.requestsPerHour,
+    deps.authRateLimit.windowMs
+  );
+  return result.allowed
+    ? { allowed: true }
+    : { allowed: false, by: "budget", resetAt: result.resetAt.getTime() };
+}

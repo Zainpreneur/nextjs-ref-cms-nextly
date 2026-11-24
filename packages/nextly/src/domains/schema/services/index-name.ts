@@ -1,0 +1,363 @@
+// What an index on one column is called.
+//
+// Two places have to agree on this: the DDL that creates the index, and the desired schema the
+// live-versus-desired diff compares a table against. When they disagreed, every diff reported the
+// installed index as unexpected and the declared one as missing, so a reconcile replaced an index
+// with an identical index for as long as anyone kept running it.
+//
+// The bound is 63 bytes of UTF-8, which is the smaller of the two limits that matter and
+// therefore the only safe one. MySQL REFUSES an identifier over 64 characters. PostgreSQL accepts
+// one and silently TRUNCATES it to 63 bytes, so at 64 two names differing only in their last
+// character arrive as a single identifier — a collision no error reports. A collection name and a
+// field name may each be 50 characters, so the composed name reaches 105 and the bound is
+// genuinely reachable; with letters outside ASCII it is reached sooner.
+
+import { NextlyError } from "../../../errors/nextly-error";
+import { listMarkedUnique, uniqueNotOnListMessage } from "../field-rules";
+import { isMysqlTextOrBlobType } from "../pipeline/sql-templates/create-index";
+
+/**
+ * The index name for one column of one table, bounded so every dialect stores it whole.
+ *
+ * A name within the bound is returned unchanged, which keeps the common case readable and keeps
+ * every index created before the bound existed addressable by its own name. A longer one keeps as
+ * much of the readable prefix as fits and ends in a hash of the WHOLE name, so two long names
+ * sharing a prefix stay distinct.
+ */
+export function indexNameForColumn(tableName: string, column: string): string {
+  return boundedIdentifier(`idx_${tableName}_${column}`);
+}
+
+/**
+ * Any derived identifier, bounded so every dialect stores it whole.
+ *
+ * The one rule every derived schema-object name goes through — index, foreign key, check — so a
+ * constraint cannot be named by a spelling that one dialect refuses (MySQL, past 64) and another
+ * silently truncates (PostgreSQL, past 63). A truncated name no longer matches the name the desired
+ * schema declares, so the diff would propose dropping and re-adding the constraint on every
+ * comparison, and nothing that looks constraints up by name would ever find it.
+ *
+ * A name within the bound is returned unchanged; a longer one keeps as much of its readable prefix
+ * as fits and ends in a hash of the WHOLE name, so two long names sharing a prefix stay distinct.
+ */
+export function boundedIdentifier(full: string): string {
+  return fitWithSuffix(full, fnv1a36(full));
+}
+
+/**
+ * A stored value bounded to the `maxBytes` of UTF-8 its column holds on every dialect, the way
+ * an identifier is: unchanged when it fits, else as much of its readable prefix as fits followed
+ * by a hash of the WHOLE value, so two long values sharing a prefix stay distinct where a plain
+ * truncation would store them as one.
+ */
+export function boundedValue(full: string, maxBytes: number): string {
+  return fitWithSuffix(full, fnv1a36(full), maxBytes);
+}
+
+/**
+ * `full` unchanged when it fits in `maxBytes`, otherwise its prefix followed by `_<suffix>`.
+ *
+ * The truncation itself, shared by the two ways a suffix is chosen: a hash of the whole name, or
+ * the column-list digest a compound index name already carries.
+ */
+function fitWithSuffix(
+  full: string,
+  suffix: string,
+  maxBytes: number = MAX_INDEX_NAME_LENGTH
+): string {
+  if (identifierBytes(full) <= maxBytes) return full;
+  // The suffix is base-36, so its characters are its bytes.
+  return `${utf8Prefix(full, maxBytes - suffix.length - 1)}_${suffix}`;
+}
+
+const utf8 = new TextEncoder();
+
+/**
+ * How long an identifier is where the bound applies: in UTF-8 bytes.
+ *
+ * PostgreSQL's limit is in bytes (`NAMEDATALEN` 64, so 63 usable), and it
+ * stores a name in the database's encoding, UTF-8 by default. Counted in
+ * characters, a name of 40 accented letters passed as 40 and was 80 bytes, so
+ * PostgreSQL kept the first 63 bytes of it, a name nothing declared. MySQL
+ * counts characters (64), which a name within 63 bytes always satisfies. For a
+ * name of ASCII letters, digits and underscores the two counts are equal, so
+ * every such name is bounded exactly as before.
+ */
+export function identifierBytes(name: string): number {
+  return utf8.encode(name).length;
+}
+
+/**
+ * The longest leading part of `text` within `maxBytes` of UTF-8, cut between
+ * characters: a cut inside one would leave half a character in the name.
+ */
+function utf8Prefix(text: string, maxBytes: number): string {
+  let prefix = "";
+  let bytes = 0;
+  for (const character of text) {
+    const size = identifierBytes(character);
+    if (bytes + size > maxBytes) break;
+    prefix += character;
+    bytes += size;
+  }
+  return prefix;
+}
+
+/**
+ * The name of a foreign key over these columns, when its declaration names none.
+ *
+ * Exported because two sides must derive it identically: the desired schema, and live
+ * introspection on SQLite, which stores no name for a foreign key and so has to derive the one
+ * the desired side declared.
+ */
+export function foreignKeyNameForColumns(
+  tableName: string,
+  columns: readonly string[]
+): string {
+  return boundedIdentifier(`fk_${tableName}_${columns.join("_")}`);
+}
+
+/**
+ * The name a relationship's key takes when it moves to another target table.
+ *
+ * The new key is added before the old one is dropped, so the column is never left without one
+ * (MySQL commits each schema statement), and two keys cannot share a name. So a move alternates
+ * between the column's usual name (`foreignKeyNameForColumns`) and one naming the new target: a key
+ * under the usual name moves to `fk_<table>_<column>_to_<target>`, and one under any other name
+ * moves back to the usual name. Bounded as every derived identifier is.
+ */
+export function movedForeignKeyName(
+  tableName: string,
+  column: string,
+  currentName: string,
+  targetTable: string,
+  // Names the table's other keys hold or will hold: another column's usual name can spell the
+  // same as this one's moved name (`owner` and `owner_to_dc_editors`), so a taken one is skipped.
+  taken: ReadonlySet<string> = new Set()
+): string {
+  const usual = foreignKeyNameForColumns(tableName, [column]);
+  const held = new Set([...taken].map(name => name.toLowerCase()));
+  const free = (name: string) => !held.has(name.toLowerCase());
+  if (currentName.toLowerCase() !== usual.toLowerCase() && free(usual)) {
+    return usual;
+  }
+  const moved = foreignKeyNameForColumns(tableName, [
+    column,
+    "to",
+    targetTable,
+  ]);
+  // The first of `moved`, `moved_2`, `moved_3`, ... that no other key holds.
+  const candidate = (attempt: number) =>
+    attempt === 1 ? moved : boundedIdentifier(`${moved}_${attempt}`);
+  let attempt = 1;
+  while (!free(candidate(attempt))) attempt++;
+  return candidate(attempt);
+}
+
+/**
+ * The SQL name of a check constraint, from the table and the check's own name.
+ *
+ * Scoped by the table because MySQL, unlike PostgreSQL, requires check names to be unique across
+ * the whole schema: two tables each declaring a check called `status` would otherwise collide on
+ * the second CREATE TABLE.
+ */
+export function checkConstraintName(tableName: string, name: string): string {
+  return boundedIdentifier(`ck_${tableName}_${name}`);
+}
+
+/**
+ * A short, stable digest of a string.
+ *
+ * FNV-1a. Not for secrecy — only to tell apart two names a plain truncation
+ * would merge, and to disambiguate a compound index whose joined column list
+ * is not a unique description of it.
+ */
+function fnv1a36(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(36).padStart(7, "0");
+}
+
+/**
+ * The index name for one or more columns.
+ *
+ * A single column delegates to the existing namers, so every index created
+ * before compound indexes existed keeps exactly the name it has.
+ *
+ * A compound index CANNOT use the joined column list alone: column names may
+ * contain underscores, so `["a", "b"]` and `["a_b"]` both render `idx_t_a_b`,
+ * and `["a","b"]` and `["b","a"]` are different indexes that must not share a
+ * name. The ordered list is therefore hashed with a separator no identifier
+ * can contain, and the digest is part of the name.
+ */
+export function indexNameForColumns(
+  tableName: string,
+  columns: readonly string[],
+  unique: boolean
+): string {
+  if (columns.length === 0) {
+    throw NextlyError.validation({
+      errors: [
+        {
+          path: `${tableName}.indexes`,
+          code: "INVALID",
+          message: "An index must name at least one column.",
+        },
+      ],
+    });
+  }
+  if (columns.length === 1) {
+    return unique
+      ? uniqueIndexNameForColumn(tableName, columns[0])
+      : indexNameForColumn(tableName, columns[0]);
+  }
+
+  const prefix = unique ? "uq_" : "idx_";
+  // NUL cannot appear in an identifier, so the digest distinguishes the
+  // ORDER and the BOUNDARIES of the column list, not merely its letters.
+  const digest = fnv1a36(columns.join("\u0000"));
+  return fitWithSuffix(
+    `${prefix}${tableName}_${columns.join("_")}_${digest}`,
+    digest
+  );
+}
+
+/**
+ * In UTF-8 bytes (`identifierBytes`): PostgreSQL truncates past it; MySQL
+ * refuses past 64 characters, which a name within it never reaches.
+ */
+export const MAX_INDEX_NAME_LENGTH = 63;
+
+/**
+ * The name of the UNIQUE index on a column.
+ *
+ * Derived from `indexNameForColumn` rather than composed, so it inherits the length bound and the
+ * disambiguating hash. Composing `uq_${table}_${column}` directly looks equivalent and is not: for
+ * names near their limits it exceeds 63 characters, which MySQL refuses outright and PostgreSQL
+ * truncates — leaving the created index under a name that disagrees with the one the desired schema
+ * declares, which is the disagreement this naming exists to prevent.
+ */
+export function uniqueIndexNameForColumn(
+  tableName: string,
+  column: string
+): string {
+  return indexNameForColumn(tableName, column).replace(/^idx_/, "uq_");
+}
+
+/**
+ * Whether the dialect can index a column of this type at all.
+ *
+ * MySQL cannot index a JSON column: it answers that indexing is supported "only via generated
+ * columns on a specified JSON path". PostgreSQL and SQLite index the value, so the same field
+ * means the same thing everywhere it can.
+ *
+ * Asked by BOTH the statements that create indexes and the desired schema the diff compares a
+ * table against. When only the statements knew, the desired schema went on declaring an index the
+ * generator deliberately never wrote, and every reconcile emitted a `CREATE INDEX` on a JSON
+ * column that MySQL rejects — the same failure, once per attempt, indefinitely.
+ */
+export function columnTypeIsIndexable(
+  columnType: string,
+  dialect: string
+): boolean {
+  if (dialect !== "mysql") return true;
+  return !/\bjson\b/i.test(columnType);
+}
+
+/**
+ * Whether a column's uniqueness can be carried as a NAMED index on this dialect.
+ *
+ * Strictly narrower than `columnTypeIsIndexable`: a type the dialect cannot index at all cannot
+ * carry uniqueness as an index either, and MySQL additionally refuses to key a `TEXT`/`BLOB`
+ * column without a length — in both spellings alike, the inline constraint and the index. Such a
+ * column keeps the inline form, which fails the CREATE atomically rather than creating the table
+ * and then failing on a separate index statement MySQL has already auto-committed past.
+ *
+ * Asked by all three places that have an opinion about a unique column: the statements that CREATE
+ * a table, the statements that ADD a column to one, and the desired schema the diff compares a
+ * live table against. When only the generators knew, the desired schema went on declaring
+ * `uq_<table>_<column>` for columns no generator would ever index, so every reconcile proposed a
+ * `CREATE UNIQUE INDEX` the server rejects — the same failure, once per attempt, indefinitely.
+ */
+export function uniquenessCanBeAnIndex(
+  columnType: string,
+  dialect: string
+): boolean {
+  if (!columnTypeIsIndexable(columnType, dialect)) return false;
+  if (dialect !== "mysql") return true;
+  // The same TEXT/BLOB question the index renderer asks before keying a column by prefix, every
+  // size of both included.
+  return !isMysqlTextOrBlobType(columnType);
+}
+
+/**
+ * Refuses the first relation holding a list that `fields` marks unique, nested and translated ones
+ * included (`listMarkedUnique`). Each generator and the Builder's save ask it of the fields as
+ * declared, before anything is filtered by where it is stored or any statement is made.
+ */
+export function refuseUniqueOnList(
+  tableName: string,
+  fields: readonly unknown[],
+  dialect: string
+): void {
+  const listName = listMarkedUnique(fields);
+  if (listName !== undefined) {
+    throw uniqueNotOnListError(tableName, listName, dialect);
+  }
+}
+
+/**
+ * The refusal for a relationship holding a list marked unique, on every dialect and every road
+ * that judges it: no dialect keeps such uniqueness (`relationHoldsReferenceList` says why), so the
+ * mark is refused before any statement, naming the field and what to do instead.
+ */
+function uniqueNotOnListError(
+  tableName: string,
+  fieldName: string,
+  dialect: string
+): NextlyError {
+  return NextlyError.validation({
+    errors: [
+      {
+        path: `fields.${fieldName}`,
+        code: "UNIQUE_NOT_ON_LIST",
+        message: uniqueNotOnListMessage(fieldName),
+      },
+    ],
+    logContext: { tableName, field: fieldName, dialect },
+  });
+}
+
+/**
+ * The refusal for a field marked unique whose column `dialect` cannot key: a
+ * MySQL TEXT or BLOB, say. One error for every path that judges it, the
+ * Builder's own DDL and the save writer alike.
+ */
+export function uniquenessNotEnforceableError(
+  tableName: string,
+  field: { name: string; type: string },
+  dialect: string
+): NextlyError {
+  return NextlyError.validation({
+    errors: [
+      {
+        path: `fields.${field.name}`,
+        code: "UNIQUE_NOT_ENFORCEABLE_ON_DIALECT",
+        message:
+          `"${field.name}" is marked unique, but ${dialect} cannot enforce ` +
+          `uniqueness on a ${field.type} column. Store the value in a short-variant ` +
+          `text field, which becomes a bounded VARCHAR the server can key, or remove ` +
+          `the unique flag.`,
+      },
+    ],
+    logContext: {
+      tableName,
+      field: field.name,
+      type: field.type,
+      dialect,
+    },
+  });
+}

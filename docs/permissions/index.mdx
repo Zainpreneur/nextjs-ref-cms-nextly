@@ -1,0 +1,681 @@
+---
+title: Roles and Permissions
+description: Control who can do what, down to individual fields.
+---
+
+Access control answers two questions, at two levels of detail: what a role may do in each
+collection or Single, and which fields inside its documents it may see or change. See
+[Limits](#limits) for what it can't restrict.
+
+## Availability
+
+|            |                                                                                                                                                   |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Built in   | No plugin required, and not gated behind a paid tier                                                                                              |
+| Admin      | A **Roles** screen for managing roles and their grants                                                                                            |
+| Applies to | The REST API and the admin. The Direct API runs as trusted server code and **bypasses collection, Single and field rules by default** — see below |
+
+## Roles and grants
+
+A role holds grants named `<action>-<resource>`: `create-posts`, `delete-media`,
+`publish-content-releases`, `update-users`. A user's roles are the union of their grants.
+
+Because grants are per-resource, a role can be narrow in a way that is actually useful — a
+release manager who may schedule releases without holding a general read grant over
+everything.
+
+### The preset roles reach a collection only once it is opened to them
+
+Nextly comes with four preset roles, Admin, Editor, Author and Viewer, whose grants are
+rules rather than lists: Admin holds everything but changing roles, permissions and users;
+Editor full control of content and media; Author creates and edits content without
+publishing or deleting it; Viewer reads content and media, but not the staff accounts or the
+API keys. Super-admins hold every permission.
+
+A collection reaches a preset only once it is opened to that preset by name. Until then,
+whether it comes from your code, the Schema Builder or a plugin, only super-admins and the
+roles you grant it to by name reach it, so adding a collection never widens what an existing
+role can do. Open one with `grants.presets`; each preset named applies its own rule there:
+
+```ts
+import { defineCollection, text } from "nextly/config";
+
+export const Posts = defineCollection({
+  slug: "posts",
+  fields: [text({ name: "title" })],
+  // Admin, Editor and Author write it; Viewer reads it.
+  grants: { presets: ["admin", "editor", "author", "viewer"] },
+});
+```
+
+`grants: { presets: [] }` keeps a collection closed to every preset and says so. To open or
+close a collection you don't define in code, a plugin's or one made in the Schema Builder,
+name it in `presetGrants` in your config, which wins over the collection's own `grants`:
+
+```ts
+import { defineConfig } from "nextly/config";
+
+export default defineConfig({
+  presetGrants: { pages: ["admin", "editor", "author", "viewer"] },
+});
+```
+
+A permission a plugin or your app declares can name the presets that may hold it with
+`presets`; `presets: []` keeps it from every preset (Admin otherwise takes every plugin
+permission), for a permission that opens private data. Singles and Nextly's own resources
+are unchanged. Both are `@experimental`.
+
+### Upgrading: existing collections keep their preset grants
+
+The first time `nextly migrate`, or a development start, runs a release where new collections
+start closed, it records which presets held grants on each existing collection, before it
+sets any grant, and keeps those presets on them. No editor loses a collection. A collection
+added after that starts closed. A new install records none.
+
+Each such run then warns of the collections kept open only by that record, and names, for
+information, those no preset reaches. Add `grants.presets` (or `presetGrants`) to each kept
+one to keep it as it is, or `presets: []` to close it, so your configuration says what the
+record does. One change has no record behind it: Viewer no longer reads users or API keys,
+from the first run of this release.
+
+## Collection access
+
+Grants say what a role may do. When a collection declares an `access` rule for an
+operation, that rule only narrows the grant: a signed-in user or an API key needs the
+grant first, and the rule then lets them through only by returning `true`. A rule that
+returns `true` never admits someone whose role lacks the grant, so a rule adds your own
+condition and need not check the permission itself; it only ever narrows what the Roles
+screen grants. Plugin-defined people hold no grants and are judged by the rule alone (see
+the end of this section):
+
+```ts
+import { defineCollection, relationship, text } from "nextly/config";
+
+export const Posts = defineCollection({
+  slug: "posts",
+  fields: [
+    text({ name: "title" }),
+    relationship({ name: "author", relationTo: "users" }),
+  ],
+  access: {
+    read: true,
+    // Narrowed: the role's update-posts, and not while a content freeze is on.
+    update: () => process.env.CONTENT_FREEZE !== "on",
+  },
+});
+```
+
+A rule is given the caller's `permissions` spelled as the Roles screen spells them —
+`update-posts` — for a signed-in user and an API key alike. A visitor is given the Public
+role's permissions (see below). A super-admin is admitted before any collection or Single
+rule runs; field rules still apply to them.
+
+Rules were once given the other spelling, `posts:update`. That spelling is no longer in
+the list, so a rule checking it does not allow; check `update-posts`, as the Roles screen
+spells it.
+
+**Don't check a role's name in a rule.** `roles.includes("editor")` refuses a role an admin
+created that holds `update-posts`, and every API key whose roles carry none of the names you
+listed, while the Roles screen says both may act. The role's permissions are what the admin
+manages, so a rule that reads them stays in step with that screen.
+
+`true` admits every caller with no session, for reads and writes alike, and every signed-in
+user or API key holding the grant.
+
+A collection whose `access` says nothing about an operation falls back to grants: a
+signed-in user needs `read-posts` to read `posts`.
+
+A caller with **no session** — the Direct API with `overrideAccess: false` and no `user`, or
+a plugin service call made `{ as: "public" }` — is a visitor, judged by the built-in
+**Public** role: it may do what the Public role holds, and where the collection declares a
+rule for the operation, only where that rule answers `true`. `nextly migrate` makes the
+Public role and grants it `read-media`, the read of each collection and Single whose read rule
+answers a visitor `true`, and what your plugins declare for it, and no write; a plugin's
+install grants what that plugin declares, and a development start (`next dev`) does the same as
+`nextly migrate`. A production start grants nothing, so run `nextly migrate` before serving.
+Each grant is made once, so one you take away on the **Roles** screen stays away. Without the
+grant, a visitor is refused whatever the rule says.
+A collection that takes anonymous writes on purpose, such as a contact form, says so with a
+rule, and the Public role is granted the write on the **Roles** screen:
+
+```ts
+defineCollection({
+  slug: "contact-messages",
+  access: {
+    // Visitors may send a message, once the Public role holds
+    // create-contact-messages.
+    create: () => true,
+    // Reading them needs the grant, which the Public role does not hold.
+    read: ({ permissions }) => permissions.includes("read-contact-messages"),
+    // Update and delete need no rule: the Public role holds neither, and a
+    // signed-in user needs the grant.
+  },
+  fields: [
+    /* ... */
+  ],
+});
+```
+
+Publishing and unpublishing always need a signed-in user, whatever the rule says.
+
+A signed-in user must hold the permission through their roles, and an **API key** in its own
+grants, and then satisfy the rule if there is one.
+
+A plugin-defined signed-in person, such as a shop's customer, is different: they
+hold no grants, so a rule is the only way in. A rule sees them as `principal`
+beside a `null` `user`; a collection with no rule for the operation refuses them,
+and a rule set to `true` admits them as it admits any visitor. See
+[Signed-in people of your own kind](/docs/plugins/signed-in-people#let-a-person-read-and-write-your-collections).
+
+### Upgrading: visitors read only what the Public role holds
+
+Before visitors were judged by the Public role, they could read every collection and Single
+with no `read` rule. Now they read one only where the Public role holds its read, which
+`nextly migrate` grants only where the read rule answers `true`. A collection with no read rule, or with one
+that answers visitors with a filter, is no longer served to them.
+
+The first time the Public role is made after upgrading, by `nextly migrate` or a development
+start, Nextly logs once which collections and Singles visitors could read before and can't now. A new install isn't told, and the notice isn't repeated: a
+collection kept private by having no read rule is ordinary. To let visitors read one again,
+either:
+
+- for one with no read rule, declare that anyone may read it, and the Public role is
+  granted its read the next time `nextly migrate` runs (or a development start):
+
+  ```ts
+  defineCollection({
+    slug: "posts",
+    access: { read: () => true },
+    fields: [
+      /* ... */
+    ],
+  });
+  ```
+
+- or grant the Public role its read (`read-posts`) on the **Roles** screen. This is the way
+  for one whose read rule answers with a filter, which still applies to visitors once the
+  Public role holds the read; declaring `read: () => true` there would open the entries the
+  filter leaves out.
+
+### A read rule that answers with a filter (experimental)
+
+A collection's `read` rule may return a filter, written as a list's `where` is, instead of
+`true`. The caller then reads only the entries the filter matches. The filter narrows what
+the grant allows and never widens it: a signed-in user or an API key still needs
+`read-<collection>`, a caller with no session reads the matching entries in place of the
+public default, a plugin-defined person, who holds no grants, reads the matching entries
+by the rule alone, and the rule's filter is added to whatever the caller asked for.
+
+This is not finished. In this release a list, its total, a count, and the group and
+timeseries reads made through the Direct API or a plugin service apply the filter, as do a
+REST list and count of a collection's entries, and a page the website resolves by its slug.
+A read by id, through the Direct API, a plugin service or REST, reads an entry the filter
+matches and answers one it does not match exactly as an entry that does not exist. It
+returns the published entry the filter matched, and does not show a pending draft of it yet. A
+populated relationship shows the related rows the filter matches, and a row it does not match
+comes back as a row the caller may not read does. A check of whether the caller may read the
+collection at all answers yes: `ctx.caller.can`, `GET /me/capabilities`, which collections the
+dashboard and its widgets count and list, and the entity reader behind versions, translations
+and content events. What those then read is limited to the entries the filter matches, and a
+document lock is read only for a document the filter matches. Every other REST route still
+refuses a caller whose rule answers with a filter, as it did before.
+
+A refused read and a missing one give the same answer, not the same time. A read rule that
+does slow work makes a refused read slower than a read of a slug that does not exist, so a
+signed-in caller probing repeatedly can tell that a collection exists and has a read rule.
+Nothing about what the rule allows or what the entries hold reaches them. Keep a read rule's
+own work small where that matters.
+
+`defineCollection` types the filter by the collection's own fields, so a misspelt field or
+operator, or a value of the wrong kind, fails to compile:
+
+```ts
+import { defineCollection, text } from "nextly/config";
+
+export const Notes = defineCollection({
+  slug: "notes",
+  fields: [text({ name: "title" })],
+  access: {
+    // A signed-in reader sees the notes they created; a visitor sees none.
+    read: ({ user }) => (user ? { createdBy: { equals: user.id } } : false),
+  },
+});
+```
+
+A rule may be `async` and look things up before it answers, such as the caller's team in
+another collection, returning `{ team: { equals: team } }`. The filter it returns names
+fields of its own collection.
+
+The keys are the collection's top-level fields, declared with a field factory or written
+inline, and the system fields `id`, `title`, `slug`, `createdAt`, `updatedAt`, `createdBy`
+and `status` (which matches only on a collection with `status: true`). A field inside a
+group (`"seo.title"`) isn't typed yet, and rich text, JSON, password, chips, repeater, group
+and component fields aren't keys. Where the checker can't know the field names, because the
+fields are built at runtime or typed as `FieldConfig[]`, the filter is untyped and is checked
+when the rule runs.
+
+A collection's `create` rule, a Single's rules and a field's rules answer `true` or
+`false`: a filter from one is a type error, and is refused when the rule runs. A
+collection's write rules may answer a filter too, described next.
+
+The filter is part of every read of the collection, so index the fields it names
+(`index: true` on a field you declare).
+
+A rule's filter can't use `near` or `within` yet, nor a field inside a component, nor the
+keys a list's `where` reserves for a request's own view: `_translated`, `_pendingChange` and
+`_inRelease`. A rule whose
+filter does is refused, and the refusal is logged once with the collection and the
+operation.
+
+### Write rules that answer with a filter (experimental)
+
+A collection's `update`, `delete`, `publish` and `unpublish` rules may return a filter as
+its `read` rule may, typed by the collection's fields in the same way. The write then
+changes an entry only if the filter matches it. An entry outside the filter is refused and
+left as it was: with a 403 where the caller may read the entry, and as a missing entry
+(404) where it may not. The filter applies to a signed-in user, an API key or a
+plugin-defined person: a visitor, with none of them, is refused a write whose rule answers a
+filter, whatever the filter matches.
+
+```ts
+import { defineCollection, relationship, text } from "nextly/config";
+
+export const Posts = defineCollection({
+  slug: "posts",
+  fields: [
+    text({ name: "title" }),
+    relationship({ name: "author", relationTo: "users" }),
+  ],
+  access: {
+    read: () => true,
+    // An author edits and deletes only their own posts.
+    update: ({ user }) => (user ? { author: { equals: user.id } } : false),
+    delete: ({ user }) => (user ? { author: { equals: user.id } } : false),
+  },
+});
+```
+
+- An update may not move an entry out of its filter: one that would leave the entry
+  outside it is refused, and nothing changes. On a collection with drafts, an edit held as a
+  pending change is refused when it changes a field the update filter names.
+- A publish or unpublish of one language is matched in that language. A publish of every
+  language asks the rule in each language it puts live and matches the entry in each; an
+  unpublish of every language is matched in the default language.
+- The Direct API, a plugin service and REST apply these filters, REST for an entry's
+  update, delete, publish and unpublish, and for restoring a version, discarding or
+  autosaving a held edit, and taking the live shared values into it.
+- Bulk and batch writes match each entry they name or find against the filter, as a single
+  write does: the entries it matches are written, and each other one fails on its own,
+  with a 403 or as a missing entry as a single write would. A write by query picks only the
+  entries its filter matches, and each is judged again as it is written.
+- A release admits a document as a member only where its author's filter matches it, and
+  the release's run judges each member again as it writes it.
+- A delete's hooks can run for a delete that a concurrent change then refuses: see
+  [A delete's hooks and outside effects](/docs/configuration/collections#a-deletes-hooks-and-outside-effects).
+
+### What `status` means in a filter
+
+On a collection with `status: true`, a filter may name `status`. It matches the entry's own
+Draft/Published state, `"draft"` or `"published"`. On a collection without `status: true`, a filter
+on `status` matches nothing.
+
+In a read rule, `status` is added to the read's own Draft/Published scope; it never widens it. A
+visitor reads published entries whatever the rule says. A rule can keep a signed-in reader to
+published entries even when they ask for drafts:
+
+```ts
+import { defineCollection, text } from "nextly/config";
+
+export const Articles = defineCollection({
+  slug: "articles",
+  status: true,
+  fields: [text({ name: "title" })],
+  access: {
+    // A visitor reads only what is published anyway, and editors see drafts;
+    // any other signed-in reader sees only what is published, even with
+    // status: "all".
+    read: ({ user, permissions }) =>
+      !user || permissions.includes("update-articles")
+        ? true
+        : { status: { equals: "published" } },
+  },
+});
+```
+
+The rule answers a visitor `true` rather than the filter. The Public role is granted a
+collection's read by `nextly migrate` only where its read rule answers a visitor exactly `true`. A rule
+that answers a visitor a filter leaves Public without `read-articles`, and a visitor is then
+refused before any filter applies.
+
+A published entry with an edit held for review is still `"published"`. A reader the filter admits
+gets the published version, not the held edit.
+
+In a write rule, the entry has to match before the write and still match after it. That makes
+`status` a poor choice in a write filter:
+
+- `update: () => ({ status: { equals: "draft" } })` lets the caller edit drafts. It refuses an
+  edit that also publishes, because the entry would leave the filter.
+- A `publish` rule filtering on `status: { equals: "draft" }` refuses every publish, because
+  publishing moves the entry out of that filter. Limit publishing by who owns the entry or by
+  another field instead.
+
+`status` is the entry's own state. With `localized: true`, a translation's own Draft/Published
+state isn't a filter key, and neither are the reserved keys `_translated`, `_pendingChange` and
+`_inRelease`. A rule that uses any of them is refused.
+
+### Yes-or-no questions under a filter
+
+Some checks ask only whether the caller may act on a collection, and name no entry. A filter can't
+answer them exactly, so they answer as follows:
+
+- **A read** answers yes: the caller may read the entries the filter matches. This covers
+  `ctx.caller.can`, `nextly.access.check`, `GET /me/capabilities` and the dashboard's counts.
+- **An update, delete, publish or unpublish** answers **no** from `ctx.caller.can(...)` in a plugin
+  route and from `nextly.access.check(...)`. A yes there would let code act past the filter, since
+  that answer applies none.
+- **The admin's hints answer yes**, a filter counting as the permission held: the capability cells,
+  a dashboard widget's or attention item's offer, and giving up a document lock. The write they lead
+  to applies the filter itself.
+
+So for an author whose update rule answers a filter:
+
+```ts
+const mayEdit = await ctx.caller.can("update", "posts");
+// false: the answer would cover every post, and the author may change only their own.
+```
+
+The capability cell for `posts` still offers the author the Edit action. The write it leads to
+applies the filter.
+
+### Rules that answer by language
+
+A rule is told the language a request acts in, as `locale`, and every language it
+involves, as `locales`. A write in one language, such as an update with `?locale=de`, is
+told that language. A write that changes more than one language asks the rule once in each
+language it changes, told that one as `locale`, and goes ahead only where every answer
+allows it: a delete is asked in each language its entry holds, and a delete or a bulk
+delete of several entries judges each entry by its own languages. Where the rule answers
+a filter in each language, the entry must match each language's filter. An update by query
+writes the default language, so it is asked in that language. An unpublish of every
+language is asked once, told every language, and matched in the default language. A
+collection that keeps no languages is asked once. In a collection with localized field groups, a delete asks every
+configured language.
+
+```ts
+import { defineCollection, text } from "nextly/config";
+
+export const Posts = defineCollection({
+  slug: "posts",
+  localized: true,
+  fields: [text({ name: "title" })],
+  access: {
+    read: () => true,
+    // Nobody changes the German content through these rules.
+    update: ({ locale }) => locale !== "de",
+    delete: ({ locale }) => locale !== "de",
+  },
+});
+```
+
+Here an entry with a German translation can't be deleted, and an entry with English
+content alone can. An admin screen's offer to delete is a hint: it shows where the rule
+allows a delete in some language, and each delete is still judged by its entry's
+languages.
+
+## Only their own entries
+
+A grant covers a whole collection: `update-posts` lets a role edit every post. To let
+authors edit and delete only the posts they wrote, while editors keep every post, have the
+collection's `update` and `delete` rules return a filter on the author (experimental, see
+[Write rules that answer with a filter](#write-rules-that-answer-with-a-filter-experimental)).
+The blog template's Posts collection does this:
+
+```ts
+import type { AccessControlContext } from "nextly";
+import { defineCollection, relationship, text } from "nextly/config";
+
+// Whoever may publish posts changes every post; anyone else only their own.
+const ownPostsUnlessPublisher = ({
+  user,
+  permissions,
+}: AccessControlContext) => {
+  if (permissions.includes("publish-posts")) return true;
+  return user ? { author: { equals: user.id } } : false;
+};
+
+export const Posts = defineCollection({
+  slug: "posts",
+  fields: [
+    text({ name: "title" }),
+    relationship({
+      name: "author",
+      relationTo: "users",
+      // Only a publisher sets or changes who wrote a post.
+      access: {
+        create: ({ permissions }) => permissions.includes("publish-posts"),
+        update: ({ permissions }) => permissions.includes("publish-posts"),
+      },
+    }),
+  ],
+  access: {
+    read: () => true,
+    update: ownPostsUnlessPublisher,
+    delete: ownPostsUnlessPublisher,
+  },
+  hooks: {
+    // A new post that names no author is the caller's own.
+    beforeChange: [
+      ({ operation, data, user }) =>
+        operation === "create" && data && !data.author && user
+          ? { ...data, author: user.id }
+          : data,
+    ],
+  },
+});
+```
+
+- **The filter narrows a grant; it never grants one.** An author still needs `update-posts`
+  to edit a post and `delete-posts` to delete one. The filter then limits which posts. A
+  signed-in user or an API key without the grant is refused, whatever the rule returns.
+- **The line is a grant, not a role's name.** `publish-posts` decides who changes every
+  post, so an admin moves the line on the Roles screen by granting it. A rule checking
+  `roles.includes("editor")` would refuse a custom role holding the same grants (see
+  [Collection access](#collection-access)).
+- **Outside the filter, nothing changes.** An author's update or delete of another author's
+  post is refused, and the post is left as it was. An update that would move a post out of
+  the filter, by giving it another author, is refused too.
+- **Keep the field the filter names honest.** The filter is only as good as `author`. Its
+  field rule lets only a publisher set it, so an author can't file a post under someone
+  else's name or hand their own away. The hook makes a new post its creator's; without it, a
+  post an author creates has no author, and they could never edit it again.
+- **Super-admins and trusted server code are not filtered.** A super-admin is admitted
+  before any collection rule runs, and the Direct API applies rules only with
+  `overrideAccess: false` (see [below](#the-direct-api-bypasses-these-rules-by-default)).
+
+**Index the fields your filters use.** Every filtered list, count and change runs the
+filter's condition. A relationship to one collection, such as `author`, gets an index
+already. Another field a filter names, such as a `team` text field, takes `index: true`
+(see [Indexes on your collections](/docs/database/extending-the-schema#indexes-on-your-collections)).
+
+A filter names fields of its own collection: it can't follow a relationship
+(`author.team`). Look the related ids up first in an `async` rule, then filter on a field
+of your own. What else a filter may hold is in
+[A read rule that answers with a filter](#a-read-rule-that-answers-with-a-filter-experimental).
+
+## Collections closed to super-admin (experimental)
+
+A super-admin passes every collection rule. A collection holding data the site's
+administrators must not read through the admin, such as health or pay records, can be closed
+to super-admin: its entries are then refused to every super-admin person and to every
+full-access API key carrying its maker's super-admin authority, at every way in (the REST API
+and the admin, the Direct API as that person, related rows, counts and search), whatever other
+permissions they hold. Other roles keep the collection's own grants and rules, and trusted
+server code (`overrideAccess: true`) is not a caller, so your app's own code still reads it.
+
+Close one in code:
+
+```ts
+import { defineCollection, text } from "nextly/config";
+
+export const PayRecords = defineCollection({
+  slug: "pay-records",
+  fields: [text({ name: "summary" })],
+  closedToSuperAdmin: true,
+});
+```
+
+A collection whose code says nothing, one made in the Schema Builder for instance, is closed
+or opened again from the super-admin role's page under **Roles**, which lists each
+collection's mark. Changing one asks the super-admin to enter their password again before it
+is saved, and a session left open or a stolen session cookie cannot change it. A collection
+whose code sets the mark shows it there and cannot be changed there. The same change is
+`PATCH /admin/api/roles/screen/closed-to-super-admin` with `{ collection, closed, password }`,
+from a super-admin's session on the site's own origin.
+
+Every change is written to the audit log as `collection-super-admin-access-changed`, with who
+made it, when, the collection, and its value before and after (`"open"` or `"closed"`). A
+change made in code is recorded, with no person, by the first `nextly migrate` or development
+start that applies it. A change made on one server reaches the others within five seconds.
+
+The mark is a deterrent with a trail, not a wall against a determined super-admin: one can
+open the collection again, and the audit log shows it. Data that must never be reachable from
+the admin belongs out of its reach by other means.
+
+## Related rows
+
+A populated relationship is read with the same check as reading the related collection
+directly. Reading `posts` at a depth that populates `author` returns the author only to a
+caller who could read that `users` row by name:
+
+- **A signed-in user** needs `read-<collection>`, as they would to read it directly, and then
+  the collection's read rule if it declares one.
+- **A visitor** needs the Public role to hold `read-<collection>`, and then the collection's
+  read rule if it declares one.
+- **An API key** always needs `read-<collection>` in its own grants, and then the collection's
+  rule if it has one. A key granted only `read-posts` does not see populated authors.
+- **A plugin-defined person** holds no grants, so the related collection's read rule alone
+  decides, and one with no read rule refuses them (see
+  [Signed-in people of your own kind](/docs/plugins/signed-in-people#let-a-person-read-and-write-your-collections)).
+- **`users` and media** have no rules of their own, so the grant decides: a signed-in user or
+  an API key needs `read-users` to see a populated user and `read-media` to see an upload's
+  media row. Visitors keep media, which public pages embed, but never see a populated user:
+  no visitor can read a user directly. A page your server renders with the Direct API reads
+  as the system by default, so it still shows authors.
+
+This holds at every depth, inside groups and repeaters, for each collection of a polymorphic
+relationship separately, on a Single, and for the entry a create or an update returns. Where
+the related collection's read rule answers with a filter, only the rows it matches are
+populated.
+
+A related row the caller may not read comes back exactly as a reference to a row that no
+longer exists would: the stored id for a single relationship, left out of a list, `null` for
+an upload. The rest of the response is served. A read made with `overrideAccess`, including
+one that runs as the system, keeps populating related rows; a route that names its trusted
+collections keeps populating those.
+
+## Field-level access
+
+Any field takes its own `access`, with separate `create`, `read` and `update` rules:
+
+```ts
+import { defineCollection, text } from "nextly/config";
+
+export const Users = defineCollection({
+  slug: "users",
+  fields: [
+    text({ name: "name" }),
+    text({
+      name: "internalNotes",
+      // Only callers who may manage users see or change the notes.
+      access: {
+        read: ({ permissions }) => permissions.includes("update-users"),
+        update: ({ permissions }) => permissions.includes("update-users"),
+      },
+    }),
+  ],
+});
+```
+
+A field the reader may not see is removed from the response rather than blanked, and a
+field they may not change is rejected on write rather than silently dropped.
+
+A field the reader may not see cannot be used to choose rows either: filtering, sorting
+or grouping on it is refused with a `400` that names the field, and a collection's search
+leaves it out. Before a query there is no entry yet, so the `read` rule is asked without
+one. A rule that allows the reader outright, like the one above, lets an admin filter on
+`internalNotes`. A rule that needs the entry to decide, such as `({ req, data }) =>
+data?.owner === req.user?.id`, cannot allow, so the field can't be queried at all, not
+even by its owner. That keeps a filter or an ordering from revealing the value on entries
+where the reader can't see it.
+
+This is the level most systems either do not have or sell separately. It is what lets one
+collection serve two audiences — an editor who sees the article, and a finance user who
+also sees the fields describing what it cost.
+
+The Page Builder's page code and custom CSS are not read-restricted this way. Anyone who may
+edit a page can read its code and CSS, draft, published and history, and visitors get the
+published ones in the page; only people with **Manage page builder site settings** may change
+them, as
+[site code](/docs/page-builder/site-code#page-code) and
+[custom CSS](/docs/page-builder/custom-css#who-may-change-page-and-block-css) explain. Page
+code is printed into the published page, so it must never hold a secret.
+
+## The Direct API bypasses these rules by default
+
+The Direct API is trusted server code, so `overrideAccess` defaults to `true` and collection,
+Single and field rules are **skipped**. This is deliberate — server code fetching content for a
+page should not be filtered as though it were an anonymous visitor — but it means a query
+written on behalf of a request does not enforce anything unless you say so:
+
+```ts
+const posts = await nextly.find({
+  collection: "posts",
+  // Both are needed to judge the request's own caller.
+  overrideAccess: false,
+  user: requestUser,
+});
+```
+
+<Callout type="warn">
+  **Leaving `overrideAccess` at its default is the case that leaks.** Reading on
+  behalf of a visitor without setting `overrideAccess: false` returns rows that
+  visitor was not allowed to see. This is the easiest way to expose data with
+  Nextly.
+</Callout>
+
+Passing a `user` lets a rule decide by who is asking, never by which document. Collection and
+Single rules never see a document: they answer before any document is read. Most answer yes or
+no. The exception, experimental, is a collection rule that answers with a filter, which limits
+the reads or the writes it judges to the entries it matches (see [Only their own
+entries](#only-their-own-entries) and [Limits](#limits)).
+
+Forgetting the `user` is a different and much less dangerous mistake. The caller then has no
+session and holds no permissions, so a rule that checks them refuses the request rather than
+answering loosely: you get an authorization error, not somebody else's rows. If a query that
+should return data returns "authentication required", a missing `user` alongside
+`overrideAccess: false` is the first thing to check. Where no rule names the operation, a read
+keeps the public default, but a create, update or delete is refused; only a rule that answers
+`true` lets such a write through.
+
+Field-level rules behave differently: they run whenever `overrideAccess` is `false`, user or
+not, because "which fields may this writer set" has a sensible answer for nobody. Internal
+code that genuinely needs to write a protected field says so with `overrideAccess: true`.
+
+## Limits
+
+- **A grant covers a whole collection or Single.** Grants are per resource and action. To
+  limit a role to some entries, such as an author's own posts, return a filter from the
+  collection's rule: see [Only their own entries](#only-their-own-entries).
+- **Field-level rules are code.** The **Roles** screen assigns grants; it has no field-level
+  permissions. A field's `access` is written in your config.
+- **Rules are code.** Access rules can't be set in the admin or in the Visual Schema
+  Builder, and a collection made in the Visual Schema Builder can't carry rule functions,
+  so its access comes from grants alone.
+- **Two callers skip rules.** A super-admin is admitted before any collection or Single
+  rule runs, though field rules still apply to them. The Direct API skips collection,
+  Single and field rules unless you pass `overrideAccess: false` (see above).
+
+## Related
+
+- [Authentication](/docs/guides/authentication) — how a user proves who they are
+- [Audit log](/docs/audit-log) — what they did

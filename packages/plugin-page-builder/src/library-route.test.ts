@@ -1,0 +1,1300 @@
+/**
+ * What the insert panel is allowed to be told about the pattern library.
+ *
+ * The assertions that matter most are the two the author never sees: that the
+ * read runs as the USER rather than with the instance's identity, and that it
+ * asks the collection the host actually has rather than the one this package
+ * declared. Getting either wrong offers every pattern to everyone, or none to
+ * anyone, and the panel looks the same in both cases.
+ */
+import {
+  DOCUMENT_FORMAT_VERSION,
+  patternRefusal,
+} from "@nextlyhq/blocks-engine";
+import { describe, expect, it, vi } from "vitest";
+
+import {
+  COMPLETION_CONCURRENCY,
+  COMPONENT_LIST_PAGE_SIZE,
+  DEFAULT_COMPONENT_STORE,
+  LIBRARY_PAGE_SIZE,
+  MAX_LIBRARY_BYTES,
+  MAX_LIBRARY_PATTERNS,
+  readComponentLibrary,
+  readPatternLibrary,
+  type CollectionPage,
+  type ComponentLibraryContext,
+  type ListPosition,
+  type PatternLibraryContext,
+} from "./library-route";
+
+/** A stored row as the collection hands one back. */
+function row(id: string, extra: Record<string, unknown> = {}) {
+  return {
+    id,
+    title: `Pattern ${id}`,
+    granularity: "section",
+    content: { formatVersion: 1, kind: "pattern", nodes: [] },
+    ...extra,
+  };
+}
+
+/**
+ * A pattern-route context whose service answers with the pages given, in order.
+ *
+ * The spy is the point: what this route decides is WHICH read it makes, so the
+ * arguments it passed are the observable behaviour rather than an
+ * implementation detail.
+ */
+function contextOver(
+  pages: unknown[][],
+  self: Record<string, string | undefined> = {}
+) {
+  const queue = [...pages];
+  // `hasMore` comes from the SERVICE, so the stub answers it the way the
+  // service does: whether another page exists, which a shortened page cannot be
+  // asked about by looking at its length.
+  const listEntries = vi.fn((_slug: string, _options: unknown, _ctx: unknown) =>
+    Promise.resolve({
+      data: queue.shift() ?? [],
+      pagination: { hasMore: queue.length > 0 },
+    })
+  );
+  const ctx: PatternLibraryContext = {
+    self: { collections: self },
+    user: { id: "u1" },
+    services: { collections: { listEntries } },
+  };
+  return { ctx, listEntries };
+}
+
+/**
+ * One page as the component route's own listing answers it: the rows, whether
+ * more exist, and the id the next page starts after.
+ *
+ * The stub computes the cursor the way the route does — the last row's id —
+ * so a fake that stops naming one is a fake that stopped modelling the
+ * service, rather than a walk that quietly changed.
+ */
+function pageOf(data: unknown[], hasMore: boolean): CollectionPage {
+  // Scanned BACKWARD, as production does. Inspecting only the final row makes
+  // the stub fall back to the offset where production would carry a cursor, so
+  // a page ending in an unreadable row exercises a different path here than the
+  // one that runs — and the pagination cases would pass about the wrong walk.
+  for (let i = data.length - 1; i >= 0; i -= 1) {
+    const row = data[i];
+    if (typeof row !== "object" || row === null) continue;
+    const id = (row as { id?: unknown }).id;
+    if (typeof id === "string" && id !== "") return { data, hasMore, next: id };
+  }
+  return { data, hasMore };
+}
+
+/**
+ * A component-route context over the injected reads: a listing that answers
+ * the pages given, and a by-id read that answers per id.
+ *
+ * The two spies are what the route is judged by, for the reason the pattern
+ * stub's is: which reads it makes, against which slug, are the behaviour.
+ */
+function componentContext(
+  components: {
+    pages?: unknown[][];
+    /** The by-id answer per component id; absent means the read found nothing. */
+    byId?: Record<string, unknown>;
+  } = {},
+  self: Record<string, string | undefined> = {}
+) {
+  const queue = [...(components.pages ?? [])];
+  const list = vi.fn(
+    (_slug: string, _at: ListPosition): Promise<CollectionPage> => {
+      const data = queue.shift() ?? [];
+      return Promise.resolve(pageOf(data, queue.length > 0));
+    }
+  );
+  // The by-id read answers on the NEXT macrotask, and counts how many reads
+  // are waiting at once: that is the observable of a walk that overlaps its
+  // reads, and a stub answering synchronously could never show more than one.
+  const inFlight = { now: 0, most: 0 };
+  const read = vi.fn(async (_slug: string, id: string) => {
+    inFlight.now += 1;
+    inFlight.most = Math.max(inFlight.most, inFlight.now);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    inFlight.now -= 1;
+    return components.byId?.[id];
+  });
+  const ctx: ComponentLibraryContext = {
+    self: { collections: self },
+    user: { id: "u1" },
+    components: { list, read },
+    store: DEFAULT_COMPONENT_STORE,
+  };
+  return { ctx, list, read, inFlight };
+}
+
+/** How many times the pattern collection was paged. */
+function patternReads(listEntries: { mock: { calls: unknown[][] } }): number {
+  return listEntries.mock.calls.length;
+}
+
+describe("what the library read asks for", () => {
+  it("states NO lifecycle, and lets the service bound it", async () => {
+    // Drafts must not be offered, and saying so here is how that goes wrong.
+    // The read runs as the user, and an untrusted caller that states no
+    // lifecycle already gets public states only — asked of the collection's
+    // WORKFLOW, which knows which states are public and which release is due.
+    //
+    // A literal `status: "published"` is ANDed with that, so it re-hides a
+    // draft belonging to a release whose time has come but whose drain has not
+    // run; and it is a state NAME, so a workflow that calls its public state
+    // anything else matches nothing and the library comes back empty.
+    const { ctx, listEntries } = contextOver([[row("a")]]);
+
+    await readPatternLibrary(ctx);
+
+    const options = listEntries.mock.calls[0]?.[1] as
+      | { where?: unknown }
+      | undefined;
+    expect(options?.where).toBeUndefined();
+  });
+
+  it("asks for a DETERMINISTIC order, because it pages", async () => {
+    // These are independent offset queries, and the service adds `ORDER BY`
+    // only when a sort is asked for. Unordered, SQL is free to return rows in a
+    // different order for successive pages — so one pattern arrives twice and
+    // another never at all. The key has to be UNIQUE to be a tie-breaker.
+    const { ctx, listEntries } = contextOver([[row("a")]]);
+
+    await readPatternLibrary(ctx);
+
+    expect(listEntries.mock.calls[0]?.[1]).toMatchObject({
+      sort: { field: "id", direction: "asc" },
+    });
+  });
+
+  it("reads AS THE USER, not with the instance's identity", async () => {
+    // The route is authenticated, and this is what makes it also AUTHORIZED: a
+    // read with the instance's own identity answers every caller with every
+    // pattern, whatever the collection's permissions say.
+    const { ctx, listEntries } = contextOver([[row("a")]]);
+
+    await readPatternLibrary(ctx);
+
+    expect(listEntries.mock.calls[0]?.[2]).toEqual({
+      as: "user",
+      user: { id: "u1" },
+    });
+  });
+
+  it("reads as an API key's own scope, not its owner's", async () => {
+    // A key may read less than the person who made it. Handed the user alone,
+    // the service resolves the owner's grants.
+    const { ctx, listEntries } = contextOver([[row("a")]]);
+    const scope = { actorType: "apiKey", permissions: ["read-patterns"] };
+
+    await readPatternLibrary({ ...ctx, authenticatedScope: scope });
+
+    expect(listEntries.mock.calls[0]?.[2]).toEqual({
+      as: "user",
+      user: { id: "u1" },
+      authenticatedScope: scope,
+    });
+  });
+
+  it("asks the collection the HOST has, not the one this package declared", async () => {
+    // An integrator may rename the collection. A route holding the literal
+    // reads a collection that does not exist and answers an empty library,
+    // which looks exactly like a site that has saved no patterns yet.
+    const { ctx, listEntries } = contextOver([[row("a")]], {
+      patterns: "design-patterns",
+    });
+
+    await readPatternLibrary(ctx);
+
+    expect(listEntries.mock.calls[0]?.[0]).toBe("design-patterns");
+  });
+
+  it("falls back to the declared slug when the host renamed nothing", async () => {
+    // The control for the test above: without it, a reader that always returned
+    // the fallback would pass that one and this one would be the same green.
+    const { ctx, listEntries } = contextOver([[row("a")]]);
+
+    await readPatternLibrary(ctx);
+
+    expect(listEntries.mock.calls[0]?.[0]).toBe("patterns");
+  });
+});
+
+describe("what one row becomes", () => {
+  it("carries the document whole, under the name the PANEL reads", async () => {
+    // What a pattern document must BE is the planner's question, asked before
+    // the panel offers it. A second reading here would be a narrower one that
+    // disagrees the first time the format gains a field.
+    const document = {
+      formatVersion: 1,
+      kind: "pattern",
+      nodes: [{ id: "x" }],
+    };
+    const { ctx } = contextOver([[row("a", { content: document })]]);
+
+    const library = await readPatternLibrary(ctx);
+
+    expect(library.items[0]?.document).toEqual(document);
+    expect(library.items[0]).not.toHaveProperty("content");
+  });
+
+  it("carries a null keywords through rather than dropping it", async () => {
+    // Nextly writes an unset non-required field as SQL NULL and reads it back
+    // with the KEY PRESENT, so the ordinary pattern saved without keywords
+    // arrives as `null`. The panel's own reader is written to meet that.
+    const { ctx } = contextOver([[row("a", { keywords: null })]]);
+
+    const library = await readPatternLibrary(ctx);
+
+    expect(library.items[0]).toHaveProperty("keywords", null);
+  });
+
+  it("drops a row it cannot key, keeps the rest, and labels a row without a title by its id", async () => {
+    // One pattern stops being offered rather than all of them — the direction
+    // the remote-pattern reader already moves in. A row with no id could not be
+    // planned against. A title only LABELS a row: a collection whose title
+    // field is absent, or redacted by field-level access, still holds the
+    // pattern, and the id is a label an author can find it by.
+    const { ctx } = contextOver([
+      [row("a"), { title: "no id" }, row("b", { title: "" }), row("c")],
+    ]);
+
+    const library = await readPatternLibrary(ctx);
+
+    expect(library.items.map(p => p.id)).toEqual(["a", "b", "c"]);
+    expect(library.items[1]).toMatchObject({ id: "b", title: "b" });
+  });
+});
+
+describe("how much of the library travels", () => {
+  it("keeps reading while pages come back full", async () => {
+    const full = Array.from({ length: LIBRARY_PAGE_SIZE }, (_, i) =>
+      row(`p${String(i)}`)
+    );
+    const { ctx, listEntries } = contextOver([full, [row("last")]]);
+
+    const library = await readPatternLibrary(ctx);
+
+    expect(patternReads(listEntries)).toBe(2);
+    expect(library.items).toHaveLength(LIBRARY_PAGE_SIZE + 1);
+    expect(library.meta.truncated).toBe(false);
+  });
+
+  it("takes its cursor from the greatest readable id on a page, not the last row", async () => {
+    /*
+     * Exercised HERE rather than on the component tier, because this is where
+     * the route's own `page()` runs: the component tier's listing is injected
+     * and a stub supplies the cursor, so a test there asserts the stub.
+     *
+     * A page can end in a row this reader cannot name — `readLibraryRow` skips
+     * those anyway. Taking the cursor from the final row would find none, and
+     * the walk would fall back to stepping by offset across a collection other
+     * authors are editing, which is the instability the cursor removes.
+     */
+    const { ctx, listEntries } = contextOver([
+      [row("a"), { title: "no id at all" }],
+      [row("b")],
+    ]);
+
+    const library = await readPatternLibrary(ctx);
+
+    // The second read asks for the rows AFTER the readable one, with the
+    // offset reset — not for page two of an offset walk.
+    const second = listEntries.mock.calls[1]?.[1] as
+      | { where?: unknown; pagination?: { page?: number } }
+      | undefined;
+    expect(second?.where).toEqual({ id: { greater_than: "a" } });
+    expect(second?.pagination?.page).toBe(1);
+    expect(library.items.map(p => p.id)).toEqual(["a", "b"]);
+  });
+
+  it("pages on what the SERVICE says, not on how many rows it could read", async () => {
+    // A full page every row of which was dropped still means there may be more.
+    // Reading the second page on the kept count would stop at the first page a
+    // library of unreadable rows produced, and report the rest as absent.
+    const unreadable = Array.from({ length: 3 }, () => ({ title: "no id" }));
+    const { ctx, listEntries } = contextOver([unreadable, [row("real")]]);
+
+    const library = await readPatternLibrary(ctx);
+
+    expect(patternReads(listEntries)).toBe(2);
+    expect(library.items.map(p => p.id)).toEqual(["real"]);
+  });
+
+  it("stops at the ceiling and SAYS it stopped", async () => {
+    // Silently truncating hands the author a library they will search in vain.
+    const pages = Array.from({ length: 40 }, (_, page) =>
+      Array.from({ length: LIBRARY_PAGE_SIZE }, (_, i) =>
+        row(`p${String(page)}-${String(i)}`)
+      )
+    );
+    const { ctx } = contextOver(pages);
+
+    const library = await readPatternLibrary(ctx);
+
+    expect(library.items).toHaveLength(MAX_LIBRARY_PATTERNS);
+    expect(library.meta.truncated).toBe(true);
+    expect(library.meta.count).toBe(MAX_LIBRARY_PATTERNS);
+  });
+
+  it("stops asking when every row of every page is dropped", async () => {
+    // The pattern ceiling counts patterns KEPT, so a library whose rows this
+    // reader cannot use never reaches it. Measured while break-verifying: a
+    // stop condition on the kept count asked for page after page until the
+    // process died. The bound has to be on the READS as well.
+    const unreadable = () =>
+      Array.from({ length: LIBRARY_PAGE_SIZE }, () => ({ title: "no id" }));
+    const pages = Array.from({ length: 500 }, unreadable);
+    const { ctx, listEntries } = contextOver(pages);
+
+    const library = await readPatternLibrary(ctx);
+
+    expect(patternReads(listEntries)).toBeLessThanOrEqual(
+      MAX_LIBRARY_PATTERNS / LIBRARY_PAGE_SIZE
+    );
+    expect(library.items).toHaveLength(0);
+    expect(library.meta.truncated).toBe(true);
+  });
+
+  it("does not claim truncation for a library that simply ended", async () => {
+    // The control: `truncated` has to be able to be false, or the flag above is
+    // satisfied by a reader that always sets it.
+    const { ctx } = contextOver([[row("a")]]);
+
+    const library = await readPatternLibrary(ctx);
+
+    expect(library.meta).toMatchObject({ count: 1, truncated: false });
+  });
+});
+
+describe("how much of the library travels, by weight", () => {
+  /** One full page of documents big enough that a few of them blow the budget. */
+  const heavyPage = () =>
+    Array.from({ length: LIBRARY_PAGE_SIZE }, (_, i) =>
+      row(`h${String(i)}`, {
+        content: {
+          formatVersion: DOCUMENT_FORMAT_VERSION,
+          kind: "pattern",
+          nodes: [
+            {
+              id: "n",
+              type: "core/box",
+              version: 1,
+              props: { filler: "x".repeat(200_000) },
+            },
+          ],
+        },
+      })
+    );
+
+  /**
+   * What the budget actually bounds, measured without the module's own helper.
+   *
+   * The DOCUMENTS only, because that is what {@link MAX_LIBRARY_BYTES} is
+   * spent on — the title and category are short columns with bounds of their
+   * own. `Buffer.byteLength` rather than a `TextEncoder`, so the oracle is a
+   * different implementation of "UTF-8 bytes" than the one under test and can
+   * disagree with it.
+   */
+  /** The same oracle over the whole row, which is what the wire carries. */
+  const rowWireBytes = (items: readonly unknown[]) =>
+    items.reduce<number>(
+      (n, p) => n + Buffer.byteLength(JSON.stringify(p), "utf8"),
+      0
+    );
+
+  const documentWireBytes = (
+    items: readonly { readonly document?: unknown }[]
+  ) =>
+    items.reduce(
+      (n, p) => n + Buffer.byteLength(JSON.stringify(p.document), "utf8"),
+      0
+    );
+
+  it("never returns MORE than the budget, for one oversized pattern", async () => {
+    // The ceiling was applied AFTER the row was appended, so the row that
+    // crossed it travelled anyway: a single document larger than the whole
+    // budget came back whole, which made MAX_LIBRARY_BYTES a description of the
+    // response rather than a bound on it. A host may raise the per-document
+    // limit, so a document that size is one a site can really hold.
+    //
+    // Left OUT rather than ending the read: a pattern that does not fit in an
+    // empty budget fits in no budget, so the patterns behind it are still worth
+    // reading — the same direction an unreadable row moves in, one pattern
+    // dropped instead of all of them. It is reported, like every other ceiling.
+    const huge = "x".repeat(MAX_LIBRARY_BYTES + 1_000_000);
+    const { ctx } = contextOver([
+      [
+        row("huge", {
+          content: {
+            formatVersion: DOCUMENT_FORMAT_VERSION,
+            kind: "pattern",
+            nodes: [{ id: "n", type: "core/box", version: 1, props: { huge } }],
+          },
+        }),
+        row("small"),
+      ],
+    ]);
+
+    const library = await readPatternLibrary(ctx);
+
+    expect(documentWireBytes(library.items)).toBeLessThanOrEqual(
+      MAX_LIBRARY_BYTES
+    );
+    // And the readable pattern BEHIND the oversized one still arrives.
+    expect(library.items.map(pattern => pattern.id)).toEqual(["small"]);
+    expect(library.meta.truncated).toBe(true);
+  });
+
+  it("measures the budget in WIRE bytes, which non-ASCII text multiplies", async () => {
+    // `String.length` counts UTF-16 code units. A CJK character is one of those
+    // and three bytes encoded, so a ceiling measured that way lets roughly
+    // three times its nominal size onto the wire.
+    //
+    // These rows sit UNDER the budget by UTF-16 length and well over it by
+    // UTF-8 bytes, which is what makes this a test of the measurement rather
+    // than of the ceiling: a reader counting code units never stops here.
+    const cjk = "設計".repeat(150_000);
+    const { ctx } = contextOver([
+      Array.from({ length: 20 }, (_, i) =>
+        row(`c${String(i)}`, {
+          content: {
+            formatVersion: DOCUMENT_FORMAT_VERSION,
+            kind: "pattern",
+            nodes: [{ id: "n", type: "core/box", version: 1, props: { cjk } }],
+          },
+        })
+      ),
+    ]);
+
+    const library = await readPatternLibrary(ctx);
+
+    // The control: by the length that does not count bytes, this library never
+    // reached the ceiling at all.
+    expect(JSON.stringify(library.items).length).toBeLessThan(
+      MAX_LIBRARY_BYTES
+    );
+    expect(documentWireBytes(library.items)).toBeLessThanOrEqual(
+      MAX_LIBRARY_BYTES
+    );
+    expect(library.meta.truncated).toBe(true);
+  });
+
+  it("reserves the response FRAMING, not only the rows inside it", async () => {
+    // The rows are what the budget counted, and the rows are not what is sent:
+    // `Response.json` wraps them in `{"items":[…],"meta":{…}}` and separates
+    // them with commas. A library whose rows total exactly the ceiling
+    // therefore leaves the server ABOVE it, so a proxy or platform limit set at
+    // the same 16 MiB rejects a response this route believed it had bounded.
+    //
+    // The big row sits INSIDE the ceiling and outside it once the envelope is
+    // counted, which is the whole boundary: an accounting that totals only rows
+    // admits it and answers above the limit. Reserving the framing refuses it —
+    // it cannot fit beside an envelope — and the small row behind it still
+    // arrives, which is what the liveness assertion below is checking. Filler
+    // rows cannot show this: each is larger than the envelope, so the total
+    // lands further below the ceiling than the framing costs.
+    const shell = {
+      id: "big",
+      title: "Pattern big",
+      granularity: "section",
+      description: "",
+      document: {
+        formatVersion: DOCUMENT_FORMAT_VERSION,
+        kind: "pattern",
+        nodes: [],
+      },
+    };
+    const shellBytes = Buffer.byteLength(JSON.stringify(shell), "utf8");
+    const { ctx } = contextOver([
+      [
+        row("big", {
+          description: "d".repeat(MAX_LIBRARY_BYTES - shellBytes - 40),
+          content: shell.document,
+        }),
+        row("small"),
+      ],
+    ]);
+
+    const library = await readPatternLibrary(ctx);
+
+    // Liveness: without this the test is satisfied by a library that kept
+    // NOTHING, which is the one outcome that would make the assertion below
+    // true for a reason it is not testing. Not an exact count — which rows fit
+    // is the accounting's business, and pinning it would fail the next time a
+    // field is added.
+    expect(library.items.length).toBeGreaterThan(0);
+    // The whole answer, which is what the ceiling is a ceiling on.
+    expect(
+      Buffer.byteLength(JSON.stringify(library), "utf8")
+    ).toBeLessThanOrEqual(MAX_LIBRARY_BYTES);
+  });
+
+  it("charges a row for the WHOLE of it, not only its document", async () => {
+    // `description` is a `textarea` on the patterns collection with no length
+    // of its own, so a library of rows carrying long descriptions and NO
+    // document spent nothing at all: the budget measured the one field that
+    // happened to have no bound, and every other field rode along unmeasured.
+    // Three thousand of those assemble and serialise without a ceiling ever
+    // being consulted.
+    //
+    // Each row carries a SMALL but real document, which is what makes the two
+    // readers disagree. With no document at all a reader charging only the
+    // document measures `undefined`, reports it unserialisable and drops every
+    // row — the library comes back empty and within budget, so the assertion
+    // holds for a reason that has nothing to do with what was charged.
+    const description = "d".repeat(400_000);
+    const { ctx } = contextOver([
+      Array.from({ length: 60 }, (_, i) =>
+        row(`m${String(i)}`, { description })
+      ),
+    ]);
+
+    const library = await readPatternLibrary(ctx);
+
+    expect(rowWireBytes(library.items)).toBeLessThanOrEqual(MAX_LIBRARY_BYTES);
+    expect(library.meta.truncated).toBe(true);
+  });
+
+  it("drops a row it cannot serialise rather than answering 500", async () => {
+    // A document reaching a reader is not necessarily serialisable: an
+    // `afterRead` hook may put a bigint or a cycle in one. Counting that row as
+    // costing NOTHING kept it, and `Response.json` then threw on the assembled
+    // library — so one malformed row took every usable pattern with it and the
+    // author saw a failed request rather than a shorter list.
+    //
+    // The same direction every other unreadable row moves in: one pattern
+    // dropped instead of all of them.
+    const poisoned = row("bad");
+    (poisoned.content as { nodes: unknown[] }).nodes.push({
+      id: "n",
+      type: "core/box",
+      version: 1,
+      props: { count: BigInt(1) },
+    });
+    const { ctx } = contextOver([[poisoned, row("good")]]);
+
+    const library = await readPatternLibrary(ctx);
+
+    expect(library.items.map(pattern => pattern.id)).toEqual(["good"]);
+    // And the answer is one the route can actually send.
+    expect(() => JSON.stringify(library)).not.toThrow();
+  });
+
+  it("cuts a SINGLE oversized page rather than calling it complete", async () => {
+    // The case a between-pages ceiling cannot reach: one page of a hundred
+    // two-mebibyte documents is two hundred mebibytes ALREADY assembled, and
+    // when the collection ends there the read reports it complete. The budget
+    // has to stop the accumulation rather than describe it afterwards.
+    //
+    // Asserted on the BYTES of what came back, not on the row count — the row
+    // count is well under its ceiling here, which is exactly why counting rows
+    // could not see this.
+    const { ctx } = contextOver([heavyPage()]);
+
+    const library = await readPatternLibrary(ctx);
+
+    expect(documentWireBytes(library.items)).toBeLessThanOrEqual(
+      MAX_LIBRARY_BYTES
+    );
+    expect(library.meta.truncated).toBe(true);
+  });
+
+  it("stops on BYTES, which a row count cannot bound", async () => {
+    // One valid blocks document may be two mebibytes by default and a host may
+    // raise that, so three thousand of them is gigabytes assembled on the
+    // server and then sent to a browser — from a request an author makes by
+    // opening the editor. The row ceiling cannot see that.
+    const { ctx } = contextOver(Array.from({ length: 30 }, heavyPage));
+
+    const library = await readPatternLibrary(ctx);
+
+    // Well under the row ceiling, so only the byte budget can have stopped it.
+    expect(library.items.length).toBeLessThan(MAX_LIBRARY_PATTERNS);
+    expect(library.meta.truncated).toBe(true);
+  });
+});
+
+describe("what the route answers is what the palette can offer", () => {
+  it("answers with a pattern the planner would actually place", () => {
+    // THE SEAM, and the gap that let a broken tier look finished. Every other
+    // test here asserts the route's own shape, and the wiring test asserts the
+    // array reaches the panel — so a payload whose field names the panel does
+    // not read satisfies both while offering nothing.
+    //
+    // `patternRefusal` is the gate `patternEntriesFrom` puts every row through
+    // before offering it, published by the engine, so this asks the real
+    // question rather than a restatement of it. A pattern whose `document` is
+    // absent — which is what carrying the stored `content` name produced — is
+    // refused here exactly as the palette silently skips it.
+    const document = {
+      formatVersion: DOCUMENT_FORMAT_VERSION,
+      kind: "pattern" as const,
+      nodes: [{ id: "n1", type: "core/box", version: 1, props: {} }],
+    };
+
+    expect(
+      patternRefusal(document, { parentsOf: () => undefined })
+    ).toBeUndefined();
+  });
+
+  it("carries that document through the read, under the name the panel reads", async () => {
+    const document = {
+      formatVersion: DOCUMENT_FORMAT_VERSION,
+      kind: "pattern",
+      nodes: [{ id: "n1", type: "core/box", version: 1, props: {} }],
+    };
+    const { ctx } = contextOver([[row("hero", { content: document })]]);
+
+    const library = await readPatternLibrary(ctx);
+
+    // Through the SAME gate, on what the route actually returned. Absent, this
+    // refuses; and absent is what the panel skips on.
+    expect(
+      patternRefusal(library.items[0]?.document, {
+        parentsOf: () => undefined,
+      })
+    ).toBeUndefined();
+  });
+});
+
+describe("the component tier", () => {
+  function componentRow(id: string, extra: Record<string, unknown> = {}) {
+    return {
+      id,
+      title: `Component ${id}`,
+      category: "Sections",
+      content: { formatVersion: 1, kind: "component", nodes: [] },
+      ...extra,
+    };
+  }
+  const draft = (text: string) => ({
+    formatVersion: 1,
+    kind: "component",
+    nodes: [{ id: "d1", type: "acme/text", version: 1, props: { text } }],
+  });
+
+  it("takes the document from the BY-ID read, not the listing", async () => {
+    // The listing answers with the live row; the by-id read is the only path
+    // to the working draft. A definition built from the listing would render
+    // the author a stale component beside the draft they just saved.
+    const { ctx, read } = componentContext({
+      pages: [[componentRow("header", { content: draft("live") })]],
+      byId: {
+        header: {
+          id: "header",
+          title: "Component header",
+          category: "Sections",
+          content: draft("draft"),
+        },
+      },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(read).toHaveBeenCalledWith("components", "header");
+    expect(library.items).toEqual([
+      {
+        id: "header",
+        title: "Component header",
+        category: "Sections",
+        document: draft("draft"),
+      },
+    ]);
+    expect(library.meta).toEqual({ count: 1, truncated: false });
+  });
+
+  it("labels the item from the BY-ID row too, so a draft's title and category are the ones shown", async () => {
+    // A working draft can rename a component or move it to another category
+    // as readily as it can change its content. Labelled from the live listing
+    // and drawn from the draft, the tile would be named and grouped by one
+    // version and rendered as another.
+    const { ctx } = componentContext({
+      pages: [
+        [componentRow("header", { title: "Old name", category: "Old group" })],
+      ],
+      byId: {
+        header: {
+          id: "header",
+          title: "New name",
+          category: "New group",
+          description: "From the draft",
+          content: draft("draft"),
+        },
+      },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items[0]).toEqual({
+      id: "header",
+      title: "New name",
+      category: "New group",
+      description: "From the draft",
+      document: draft("draft"),
+    });
+  });
+
+  it("keeps a component whose by-id row carries no title, labelled by its id, and the library stays whole", async () => {
+    // What a page's renderer reads of a component is its id and its document;
+    // a title is not among them. A custom collection with no title field, or
+    // one whose title is redacted by field-level access, still renders every
+    // instance on the public page — so the canvas must draw it too rather
+    // than a missing-component placeholder, and the tile is labelled by the
+    // one name the row is sure to have.
+    const { ctx } = componentContext({
+      pages: [[componentRow("a"), componentRow("b")]],
+      byId: {
+        a: { id: "a", content: draft("x") },
+        b: { id: "b", title: "B", content: draft("y") },
+      },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items.map(c => c.id)).toEqual(["a", "b"]);
+    expect(library.items[0]).toMatchObject({
+      id: "a",
+      title: "a",
+      document: draft("x"),
+    });
+    expect(library.meta.truncated).toBe(false);
+  });
+
+  it("carries a component's KEYWORDS, which the palette searches", async () => {
+    // `LibraryComponent` derives from `SavedComponent`, and the catalogue
+    // builds a component tile's search terms from `keywords` exactly as it
+    // does a pattern's. Dropped here, a component whose useful terms are in
+    // neither its title nor its description could not be found by them.
+    const { ctx } = componentContext({
+      pages: [[componentRow("a"), componentRow("b")]],
+      byId: {
+        a: {
+          id: "a",
+          title: "A",
+          keywords: "hero banner masthead",
+          content: draft("x"),
+        },
+        // The ordinary row: a non-required field is stored as SQL NULL and
+        // read back with the KEY PRESENT, which the palette's reader expects
+        // as `null` rather than as absent.
+        b: { id: "b", title: "B", keywords: null, content: draft("y") },
+      },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items[0]).toMatchObject({
+      keywords: "hero banner masthead",
+    });
+    expect(library.items[1]).toMatchObject({ keywords: null });
+  });
+
+  it('carries a component\'s "Use as" area, so the editor knows a header block', async () => {
+    // The editor points out a page that shows the set's header AND places a
+    // component marked "Use as: Header"; it reads that mark from here rather
+    // than from a second read per placed component.
+    const { ctx } = componentContext({
+      pages: [[componentRow("a"), componentRow("b"), componentRow("c")]],
+      byId: {
+        a: { id: "a", title: "A", area: "header", content: draft("x") },
+        b: { id: "b", title: "B", area: null, content: draft("y") },
+        // Not an area: a stored value the select no longer offers.
+        c: { id: "c", title: "C", area: "sidebar", content: draft("z") },
+      },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items[0]).toMatchObject({ area: "header" });
+    expect(library.items[1]).not.toHaveProperty("area");
+    expect(library.items[2]).not.toHaveProperty("area");
+  });
+
+  it("carries no keywords key for a row that has none at all", async () => {
+    // The control: a collection with no keywords field must not grow one.
+    const { ctx } = componentContext({
+      pages: [[componentRow("a")]],
+      byId: { a: { id: "a", title: "A", content: draft("x") } },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items[0]).not.toHaveProperty("keywords");
+  });
+
+  it("keys a component by the id the LISTING named when the by-id row carries none", async () => {
+    /*
+     * The by-id row is a PRESENTATION of the same row — field-level access can
+     * drop its `id` — while stored instances reference the id the collection
+     * holds, which is the one the listing named. Re-derived from the
+     * presentation, the client dropped the component and every instance of it
+     * drew as missing.
+     */
+    const { ctx } = componentContext({
+      pages: [[componentRow("a"), componentRow("b")]],
+      byId: {
+        a: { title: "A", content: draft("x") },
+        b: { title: "B", content: draft("y") },
+      },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items.map(c => c.id)).toEqual(["a", "b"]);
+    expect(library.items[0]).toMatchObject({
+      title: "A",
+      document: draft("x"),
+    });
+    expect(library.meta.truncated).toBe(false);
+  });
+
+  it("omits a component whose by-id row carries an id that is not a usable one", async () => {
+    /*
+     * A row with NO `id` key is the redaction case, and it is keyed by the
+     * listing. A row that HAS the key carrying `null`, a number or an empty
+     * string is a different thing: it answered with an identity, and that
+     * identity is not the one asked for. Read as "carries no id" its content
+     * would be served under the listing's name.
+     */
+    const { ctx } = componentContext({
+      pages: [[componentRow("a"), componentRow("b"), componentRow("c")]],
+      byId: {
+        a: { id: null, title: "A", content: draft("x") },
+        b: { id: 7, title: "B", content: draft("y") },
+        c: { id: "", title: "C", content: draft("z") },
+      },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items).toEqual([]);
+    expect(library.meta.truncated).toBe(true);
+  });
+
+  it("omits a component whose by-id row names a DIFFERENT id, and says the tier was cut", async () => {
+    /*
+     * The complement of the rule above, and the reason it is not "trust the
+     * listing's id whatever comes back". A `beforeOperation` hook can redirect
+     * the read, so the row answering for `a` may be `b`'s. Keyed by the
+     * listing, `b`'s draft would be served under `a`'s name: the canvas draws
+     * one component's content wherever the other is placed, with nothing
+     * anywhere saying so. Left out instead, and the tier is reported cut — a
+     * tile the author cannot see, with a sentence explaining why.
+     */
+    const { ctx } = componentContext({
+      pages: [[componentRow("a"), componentRow("b")]],
+      byId: {
+        a: { id: "b", title: "B", content: draft("y") },
+        b: { id: "b", title: "B", content: draft("y") },
+      },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items.map(c => c.id)).toEqual(["b"]);
+    expect(library.meta.truncated).toBe(true);
+  });
+
+  it("omits a component whose document field the read did not return at all", async () => {
+    /*
+     * A stored-empty row answers with the key PRESENT and null — the field
+     * layer writes an unset non-required field as SQL NULL and reads it back
+     * that way — and it is a legal row the panel skips. A field-level access
+     * rule or an `afterRead` hook that removes the field answers with no key
+     * at all, which is a row this caller may not read whole. Flattened into
+     * one `null`, the tier reported itself complete while the client lacked a
+     * definition every instance of it needs.
+     */
+    const { ctx } = componentContext({
+      pages: [[componentRow("a"), componentRow("b")]],
+      byId: {
+        a: { id: "a", title: "A" },
+        b: { id: "b", title: "B", content: draft("y") },
+      },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items.map(c => c.id)).toEqual(["b"]);
+    expect(library.meta.truncated).toBe(true);
+  });
+
+  it("keeps a component whose document field is stored EMPTY, and the library stays whole", async () => {
+    // The control for the rule above: null is an answer, and a legal one.
+    const { ctx } = componentContext({
+      pages: [[componentRow("a")]],
+      byId: { a: { id: "a", title: "A", content: null } },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items).toEqual([{ id: "a", title: "A", document: null }]);
+    expect(library.meta.truncated).toBe(false);
+  });
+
+  it("omits a listed component the by-id read answered nothing for, and says the tier was cut", async () => {
+    // The row vanished between the two reads, or this caller may not read it:
+    // there is no draft to overlay and nothing to offer.
+    const { ctx } = componentContext({
+      pages: [[componentRow("a"), componentRow("b")]],
+      byId: { b: { id: "b", title: "B", content: draft("y") } },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items.map(c => c.id)).toEqual(["b"]);
+    expect(library.meta.truncated).toBe(true);
+  });
+
+  it("pages from the greatest readable id, not the last row", async () => {
+    /*
+     * A page can end in a row whose id this caller cannot read — those rows are
+     * skipped by the completion anyway. Taking the cursor from the final row
+     * would find none, and the walk would fall back to stepping by offset
+     * across a collection other authors are editing, which is the instability
+     * the cursor exists to remove. Reading them once more costs nothing;
+     * losing the position costs a definition.
+     */
+    const list = vi.fn((_slug: string, at: ListPosition) => {
+      if (at.after === undefined) {
+        return Promise.resolve(
+          pageOf([componentRow("a"), { title: "no id at all" }], true)
+        );
+      }
+      return Promise.resolve(pageOf([componentRow("b")], false));
+    });
+    const ctx: ComponentLibraryContext = {
+      self: { collections: {} },
+      user: { id: "u1" },
+      components: {
+        list,
+        read: (_slug: string, id: string) =>
+          Promise.resolve({ id, title: `Component ${id}`, content: draft(id) }),
+      },
+      store: DEFAULT_COMPONENT_STORE,
+    };
+
+    const library = await readComponentLibrary(ctx);
+
+    // The second page was asked for AFTER the readable row, with the offset
+    // reset — not as page two of an offset walk.
+    expect(list.mock.calls.map(call => call[1])).toEqual([
+      { page: 1 },
+      { after: "a", page: 1 },
+    ]);
+    expect(library.items.map(c => c.id)).toEqual(["a", "b"]);
+  });
+
+  it("loses no component when a row is removed from the listing between pages", async () => {
+    /*
+     * Paged by OFFSET, the walk reads a moving collection: another author
+     * deleting a row that sorts before the next offset shifts every later row
+     * back one, and the row that moved across the boundary is never listed.
+     * It is therefore never completed, `omitted` stays false, and the response
+     * says `truncated: false` — a library reported whole while the canvas
+     * lacks a definition and draws every instance of it as missing.
+     *
+     * Paged from the last id SEEN, the same deletion moves nothing: the next
+     * page is the rows after that id, whatever happened before it.
+     */
+    const ids = Array.from(
+      { length: COMPONENT_LIST_PAGE_SIZE + 1 },
+      (_, i) => `c${String(i).padStart(2, "0")}`
+    );
+    let listing = [...ids];
+    const list = vi.fn((_slug: string, at: ListPosition) => {
+      // The collection as the service reads it: the rows after the given id,
+      // then the asked-for page of those.
+      const beyond =
+        at.after === undefined
+          ? listing
+          : listing.filter(id => id > (at.after as string));
+      const from = (at.page - 1) * COMPONENT_LIST_PAGE_SIZE;
+      const slice = beyond.slice(from, from + COMPONENT_LIST_PAGE_SIZE);
+      const hasMore = from + slice.length < beyond.length;
+      // Another author deletes the first row while page one is in the client's
+      // hands, before the walk asks for page two.
+      listing = listing.filter(id => id !== ids[0]);
+      return Promise.resolve(
+        pageOf(
+          slice.map(id => componentRow(id)),
+          hasMore
+        )
+      );
+    });
+    const ctx: ComponentLibraryContext = {
+      self: { collections: {} },
+      user: { id: "u1" },
+      components: {
+        list,
+        read: (_slug: string, id: string) =>
+          Promise.resolve({ id, title: `Component ${id}`, content: draft(id) }),
+      },
+      store: DEFAULT_COMPONENT_STORE,
+    };
+
+    const library = await readComponentLibrary(ctx);
+
+    // Every row the collection held when the walk began, none twice.
+    expect(library.items.map(c => c.id)).toEqual(ids);
+    expect(library.meta.truncated).toBe(false);
+  });
+
+  it("overlaps its by-id reads, boundedly, and admits them in listing order", async () => {
+    // A library of three thousand completed one read at a time is three
+    // thousand round trips in a row. Overlapped without bound, a page that
+    // meets the ceiling at its first row pays ninety-nine reads for nothing.
+    // The batch is what bounds both — and whatever runs together, the rows
+    // are judged in the order they were listed.
+    const ids = Array.from(
+      { length: 20 },
+      (_, i) => `c${String(i).padStart(2, "0")}`
+    );
+    const { ctx, inFlight } = componentContext({
+      pages: [ids.map(id => componentRow(id))],
+      byId: Object.fromEntries(
+        ids.map(id => [
+          id,
+          { id, title: `Component ${id}`, content: draft(id) },
+        ])
+      ),
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(inFlight.most).toBe(COMPLETION_CONCURRENCY);
+    expect(COMPLETION_CONCURRENCY).toBeGreaterThan(1);
+    expect(library.items.map(c => c.id)).toEqual(ids);
+  });
+
+  it("starts no further batch once the ceiling has stopped the read", async () => {
+    // The control for the bound above. Each row fits the budget alone and no
+    // two fit together, so the second row SPENDS it — and only the first
+    // batch's reads are ever made, however many rows the page listed.
+    const ids = Array.from(
+      { length: 20 },
+      (_, i) => `c${String(i).padStart(2, "0")}`
+    );
+    const halfPlus = "x".repeat(Math.ceil(MAX_LIBRARY_BYTES / 2) + 1);
+    const { ctx, read } = componentContext({
+      pages: [ids.map(id => componentRow(id))],
+      byId: Object.fromEntries(
+        ids.map(id => [
+          id,
+          {
+            id,
+            title: `Component ${id}`,
+            content: { ...draft(id), huge: halfPlus },
+          },
+        ])
+      ),
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items.map(c => c.id)).toEqual(["c00"]);
+    expect(library.meta.truncated).toBe(true);
+    expect(read.mock.calls.length).toBe(COMPLETION_CONCURRENCY);
+  });
+
+  it("answers the CANONICAL list envelope, and nothing beside it", async () => {
+    // `{ items, meta }` is what every list in this codebase answers with, and
+    // the shape a shared client reads. A second field beside them — a tier
+    // carried on the pattern response, say — is a second vocabulary.
+    const { ctx } = componentContext({
+      pages: [[componentRow("a")]],
+      byId: { a: { id: "a", content: draft("x") } },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(Object.keys(library).sort()).toEqual(["items", "meta"]);
+    expect(Object.keys(library.meta).sort()).toEqual(["count", "truncated"]);
+  });
+
+  it("lists in pages of one completion batch, so the rows held at once are two batches", async () => {
+    // Every listed row is read again by id, so the listing's content is
+    // never used — and the service reads whole rows whatever a caller
+    // selects. A page of a hundred rows held while its batches complete was
+    // a hundred documents of content in memory for nothing; a page of one
+    // batch holds one batch of listed rows and one of by-id rows.
+    expect(COMPONENT_LIST_PAGE_SIZE).toBeLessThanOrEqual(
+      COMPLETION_CONCURRENCY
+    );
+    expect(COMPONENT_LIST_PAGE_SIZE).toBeGreaterThan(0);
+  });
+
+  it("bounds its READS under its own page size, so the smaller page does not shrink the library", async () => {
+    // The bound on reads is derived from the page size, so a tier listing in
+    // smaller pages is allowed proportionally more of them: the library it
+    // can return is the same size, and a listing every row of which is
+    // dropped still stops.
+    const unreadable = () =>
+      Array.from({ length: COMPONENT_LIST_PAGE_SIZE }, () => ({
+        title: "no id",
+      }));
+    const { ctx, list } = componentContext({
+      pages: Array.from({ length: 1000 }, unreadable),
+      byId: {},
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(list.mock.calls.length).toBe(
+      Math.ceil(MAX_LIBRARY_PATTERNS / COMPONENT_LIST_PAGE_SIZE)
+    );
+    expect(library.items).toHaveLength(0);
+    expect(library.meta.truncated).toBe(true);
+  });
+
+  // Walks the whole ceiling, 3,000 rows and a page more, each completed and
+  // read again by id: CPU-bound work that a Windows runner spends 5.0 to 5.1 s
+  // on, at Vitest's 5 s default. Three times that, for this test alone.
+  it(
+    "still reaches the item ceiling through its smaller pages",
+    { timeout: 15_000 },
+    async () => {
+      const pages = Array.from(
+        { length: MAX_LIBRARY_PATTERNS / COMPONENT_LIST_PAGE_SIZE + 1 },
+        (_, page) =>
+          Array.from({ length: COMPONENT_LIST_PAGE_SIZE }, (_, i) =>
+            componentRow(`c${String(page * COMPONENT_LIST_PAGE_SIZE + i)}`)
+          )
+      );
+      const byId = Object.fromEntries(
+        pages.flat().map(row => [row.id, { ...row, content: draft(row.id) }])
+      );
+      const { ctx } = componentContext({ pages, byId });
+
+      const library = await readComponentLibrary(ctx);
+
+      expect(library.items).toHaveLength(MAX_LIBRARY_PATTERNS);
+      expect(library.meta.truncated).toBe(true);
+    }
+  );
+
+  it("pages the listing through the INJECTED read, deterministically, by page", async () => {
+    // The plugin-facing listing cannot ask for every lifecycle state, so the
+    // route reads through a lister the declaration binds — and it walks it
+    // the way it walks the pattern listing: page after page, in order, until
+    // the service says there is no more.
+    const { ctx, list } = componentContext({
+      pages: [[componentRow("a")], [componentRow("b")]],
+      byId: {
+        a: { id: "a", title: "A", content: draft("a") },
+        b: { id: "b", title: "B", content: draft("b") },
+      },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    // The first page from the start, the second from the id the first named.
+    expect(list.mock.calls.map(call => call[1])).toEqual([
+      { page: 1 },
+      { after: "a", page: 1 },
+    ]);
+    expect(library.items.map(c => c.id)).toEqual(["a", "b"]);
+  });
+
+  it("reads the store the plugin was told components live in, collection and field alike", async () => {
+    // A host may keep its definitions in a collection of its own and render
+    // from it; an editor reading the plugin's store regardless would draw a
+    // different definition for the same id, or none. The same statement the
+    // readiness notice follows, so one setting redirects both.
+    const { ctx, list, read } = componentContext({
+      pages: [[{ id: "a", title: "A" }]],
+      byId: {
+        a: { id: "a", title: "A", blocks: draft("a"), content: "not this" },
+      },
+    });
+    ctx.store = { collection: "site_components", field: "blocks" };
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(list.mock.calls.map(call => call[0])).toEqual(["site_components"]);
+    expect(read.mock.calls.map(call => call[0])).toEqual(["site_components"]);
+    expect(library.items[0]?.document).toEqual(draft("a"));
+  });
+
+  it("reads through the host's renamed slug", async () => {
+    const { ctx, list, read } = componentContext(
+      {
+        pages: [[componentRow("a")]],
+        byId: { a: { id: "a", title: "A", content: draft("x") } },
+      },
+      { components: "site_components" }
+    );
+
+    await readComponentLibrary(ctx);
+
+    expect(list.mock.calls.every(call => call[0] === "site_components")).toBe(
+      true
+    );
+    expect(read.mock.calls.every(call => call[0] === "site_components")).toBe(
+      true
+    );
+  });
+
+  it("carries a null document for a row saved without content, and skips nothing else", async () => {
+    // A legal row the panel will skip. Carried as null rather than omitted so
+    // the shape says the read was made and found nothing.
+    const { ctx } = componentContext({
+      pages: [[componentRow("empty")]],
+      byId: { empty: { id: "empty", title: "Empty", content: null } },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items[0]?.document).toBeNull();
+    expect(library.meta.truncated).toBe(false);
+  });
+
+  it("marks the tier CUT when a listed component's by-id read answers nothing", async () => {
+    // The row vanished between the two reads, or the service declined it. A
+    // library missing a definition the author can see in the collection is
+    // not a whole library, and saying so is what stops the panel presenting
+    // it as one.
+    const { ctx } = componentContext({
+      pages: [[componentRow("gone"), componentRow("here")]],
+      byId: { here: { id: "here", title: "Here", content: draft("x") } },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items.map(c => c.id)).toEqual(["here"]);
+    expect(library.meta.truncated).toBe(true);
+  });
+
+  it("honours the byte ceiling on its own response, and says when it cut", async () => {
+    // Its own route, its own payload, the same ceiling: a definition that does
+    // not fit is left out and reported, exactly as a pattern is.
+    const huge = "x".repeat(MAX_LIBRARY_BYTES);
+    const { ctx } = componentContext({
+      pages: [[componentRow("big"), componentRow("small")]],
+      byId: {
+        big: { id: "big", title: "Big", content: { ...draft("y"), huge } },
+        small: { id: "small", title: "Small", content: draft("z") },
+      },
+    });
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items.map(c => c.id)).toEqual(["small"]);
+    expect(library.meta.truncated).toBe(true);
+  });
+
+  it("answers an empty tier, not a cut one, for a site with no components", async () => {
+    const { ctx } = componentContext();
+
+    const library = await readComponentLibrary(ctx);
+
+    expect(library.items).toEqual([]);
+    expect(library.meta).toEqual({ count: 0, truncated: false });
+  });
+});

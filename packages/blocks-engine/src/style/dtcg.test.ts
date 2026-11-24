@@ -1,0 +1,2510 @@
+/**
+ * The door tokens leave and arrive through.
+ *
+ * The property that matters is the round trip: what this system exports, it
+ * must read back unchanged. Everything else is about being a good citizen of a
+ * format other tools also write.
+ */
+import { describe, expect, it } from "vitest";
+
+import type { DtcgNode } from "./dtcg";
+import {
+  NEXTLY_EXTENSION,
+  dtcgToTokens,
+  readFamilyList,
+  resolveAliases,
+  tokensToDtcg,
+} from "./dtcg";
+import type { SiteToken } from "./site-tokens";
+
+import { isTokenName } from "./declarations";
+import {
+  MAX_TOKEN_NAME_LENGTH,
+  MAX_TOKEN_NAME_SEGMENTS,
+  defaultSiteTokens,
+  renameSiteToken,
+} from "./site-tokens";
+
+const tokens = (list: SiteToken[]) => ({ tokens: list });
+
+/** The names of the DTCG tokens a document holds, its own extensions aside. */
+function typedNames(node: DtcgNode, at: readonly string[] = []): string[] {
+  return Object.entries(node).flatMap(([key, child]) => {
+    if (key.startsWith("$") || typeof child !== "object" || child === null) {
+      return [];
+    }
+    const entry = child as DtcgNode;
+    return "$value" in entry
+      ? [[...at, key].join(".")]
+      : typedNames(entry, [...at, key]);
+  });
+}
+
+/** The names this system carried in the document's own extension. */
+function carriedNames(document: DtcgNode): string[] {
+  const own = (document.$extensions as DtcgNode | undefined)?.[
+    NEXTLY_EXTENSION
+  ] as DtcgNode | undefined;
+  return Object.keys((own?.variables as DtcgNode | undefined) ?? {});
+}
+
+describe("export", () => {
+  it("nests a dot path into groups, because DTCG forbids a dot in a name", () => {
+    // "the following characters MUST NOT be used anywhere in a token or group
+    // name: `{`, `}`, `.`" — so `color.primary` is the token `primary` inside
+    // the group `color`, not a name with a dot in it.
+    const { document } = tokensToDtcg(
+      tokens([
+        { name: "color.primary", kind: "color", values: { light: "#2563eb" } },
+      ])
+    );
+    const group = document.color as Record<string, unknown>;
+    expect(Object.keys(document)).toEqual(["color"]);
+    expect(group.primary).toBeDefined();
+  });
+
+  it("writes a dimension as an object, which is what the format now requires", () => {
+    const { document } = tokensToDtcg(
+      tokens([
+        { name: "space.4", kind: "dimension", values: { light: "16px" } },
+      ])
+    );
+    const group = document.space as Record<string, Record<string, unknown>>;
+    expect(group["4"]?.$value).toEqual({ value: 16, unit: "px" });
+    expect(group["4"]?.$type).toBe("dimension");
+  });
+
+  it("writes a colour as components with a hex fallback", () => {
+    const { document } = tokensToDtcg(
+      tokens([{ name: "brand", kind: "color", values: { light: "#2563eb" } }])
+    );
+    const token = document.brand as Record<string, unknown>;
+    const value = token.$value as Record<string, unknown>;
+    expect(value.colorSpace).toBe("srgb");
+    expect(value.hex).toBe("#2563eb");
+    expect((value.components as number[]).length).toBe(3);
+  });
+
+  it("writes a fluid width as its largest px value, keeping the clamp() beside it", () => {
+    // A dimension may only be `px` or `rem`, so a `clamp()` has no conformant
+    // shape of its own. Its largest value is the one other tools can use; the
+    // exact CSS rides in this system's extension and in the description.
+    const css = "clamp(20rem, 80vw, 72rem)";
+    const { document, issues } = tokensToDtcg(
+      tokens([
+        { name: "content.width", kind: "dimension", values: { light: css } },
+      ])
+    );
+    expect(issues).toEqual([]);
+    const token = (document.content as Record<string, DtcgNode>).width;
+    expect(token?.$type).toBe("dimension");
+    expect(token?.$value).toEqual({ value: 1152, unit: "px" });
+    expect(token?.$description).toContain(css);
+  });
+
+  it("reads rgb() percentages as the colour they are", () => {
+    // `rgb(100% 0% 0% / 50%)` is red at half opacity. Read as plain numbers it
+    // exports as `rgb(100 0 0)` at full opacity — a dark maroon, opaque, and a
+    // design tool importing the standard `$value` sees that instead.
+    const { document } = tokensToDtcg(
+      tokens([
+        {
+          name: "brand",
+          kind: "color",
+          values: { light: "rgb(100% 0% 0% / 50%)" },
+        },
+      ])
+    );
+    const value = (document.brand as Record<string, unknown>).$value as Record<
+      string,
+      unknown
+    >;
+    expect(value.components).toEqual([1, 0, 0]);
+    expect(value.alpha).toBeCloseTo(0.5, 5);
+  });
+
+  it("keeps a family name that contains a comma in one piece", () => {
+    // The comma only separates families outside quotes. Split blindly, a real
+    // company's font becomes a fallback list ending in a family called "Inc".
+    const { document } = tokensToDtcg(
+      tokens([
+        {
+          name: "font.body",
+          kind: "fontFamily",
+          values: { light: `"ACME, Inc", serif` },
+        },
+      ])
+    );
+    const group = document.font as Record<string, Record<string, unknown>>;
+    expect(group.body?.$value).toEqual(["ACME, Inc", "serif"]);
+  });
+
+  it("exports a number whose spelling is not the canonical one", () => {
+    // `1.0` and `1e3` are valid CSS numbers DTCG can store. Reporting them as
+    // inexpressible drops usable tokens over a formatting preference.
+    for (const [css, expected] of [
+      ["1.0", 1],
+      ["1e3", 1000],
+      ["+2", 2],
+      [".5", 0.5],
+    ] as const) {
+      const { document, issues } = tokensToDtcg(
+        tokens([{ name: "n", kind: "number", values: { light: css } }])
+      );
+      expect(issues, css).toEqual([]);
+      expect((document.n as Record<string, unknown>)?.$value, css).toBe(
+        expected
+      );
+    }
+  });
+
+  it("still refuses text that is not a number at all", () => {
+    // The widening above has to stay a widening: `12px` and `1 2` are not
+    // numbers, and exporting either under `$type: number` would misdescribe it.
+    for (const css of ["12px", "1 2", "abc", ""]) {
+      const { document } = tokensToDtcg(
+        tokens([{ name: "n", kind: "number", values: { light: css } }])
+      );
+      expect(typedNames(document), css).toEqual([]);
+    }
+  });
+
+  it("exports a measure whose number is signed or has an exponent", () => {
+    // The same CSS number grammar a `number` token already gets. A narrower one
+    // here reports `+16px` and `1e3ms` as something the format cannot express
+    // and drops usable spacing and timing tokens from the exported file.
+    const measure = (kind: "dimension" | "duration", css: string): unknown =>
+      (
+        tokensToDtcg(tokens([{ name: "m", kind, values: { light: css } }]))
+          .document.m as Record<string, unknown>
+      )?.$value;
+
+    expect(measure("dimension", "+16px")).toEqual({ value: 16, unit: "px" });
+    expect(measure("dimension", "1e3px")).toEqual({ value: 1000, unit: "px" });
+    expect(measure("duration", "-1e3ms")).toEqual({ value: -1000, unit: "ms" });
+    // And a unit the format does not allow is still refused.
+    expect(measure("dimension", "16vw")).toBeUndefined();
+  });
+
+  it("decodes a hex escape inside a family name", () => {
+    // `\\26 ` is `&`, so `"ACME\\26 Co"` is the one family `ACME&Co`. Taking the
+    // character after the backslash literally exports `ACME26 Co`, a different
+    // font to every tool that reads the standard value.
+    const { document } = tokensToDtcg(
+      tokens([
+        {
+          name: "f",
+          kind: "fontFamily",
+          values: { light: `"ACME\\26 Co", serif` },
+        },
+      ])
+    );
+    expect((document.f as Record<string, unknown>)?.$value).toEqual([
+      "ACME&Co",
+      "serif",
+    ]);
+  });
+
+  it("carries a family list holding a substitution instead of naming a font", () => {
+    // DTCG stores family NAMES. Exporting the text would describe a font
+    // literally called `var(--brand-font)` to every tool that reads the
+    // standard value rather than this vendor's extension.
+    const { document, issues } = tokensToDtcg(
+      tokens([
+        {
+          name: "f",
+          kind: "fontFamily",
+          values: { light: "var(--brand-font), serif" },
+        },
+      ])
+    );
+    // No token claims a value it does not hold: the variable is carried in this
+    // system's extension, exact, rather than dropped.
+    expect(typedNames(document)).toEqual([]);
+    expect(carriedNames(document)).toEqual(["f"]);
+    expect(issues).toEqual([]);
+  });
+
+  it("keeps a quoted family that merely looks like one", () => {
+    // The quotes say it is a name somebody chose, not syntax.
+    const { document } = tokensToDtcg(
+      tokens([
+        {
+          name: "f",
+          kind: "fontFamily",
+          values: { light: `"var(--x)", serif` },
+        },
+      ])
+    );
+    expect((document.f as Record<string, unknown>)?.$value).toEqual([
+      "var(--x)",
+      "serif",
+    ]);
+  });
+
+  it("carries a family list CSS itself would drop", () => {
+    // `<family-name>` is one string OR a run of identifiers. `"Bad" "Name"` is
+    // neither, so a browser drops the declaration; joining them would export a
+    // font stack the site never rendered.
+    const { document, issues } = tokensToDtcg(
+      tokens([
+        {
+          name: "f",
+          kind: "fontFamily",
+          values: { light: `"Bad" "Name", serif` },
+        },
+      ])
+    );
+    // No token claims a value it does not hold: the variable is carried in this
+    // system's extension, exact, rather than dropped.
+    expect(typedNames(document)).toEqual([]);
+    expect(carriedNames(document)).toEqual(["f"]);
+    expect(issues).toEqual([]);
+  });
+
+  it("carries a family list that is a bare CSS-wide keyword", () => {
+    // `font-family: inherit` takes the parent's font. Exported as a `$value` it
+    // would describe a font actually named "inherit".
+    const { document, issues } = tokensToDtcg(
+      tokens([{ name: "f", kind: "fontFamily", values: { light: "inherit" } }])
+    );
+    // No token claims a value it does not hold: the variable is carried in this
+    // system's extension, exact, rather than dropped.
+    expect(typedNames(document)).toEqual([]);
+    expect(carriedNames(document)).toEqual(["f"]);
+    expect(issues).toEqual([]);
+  });
+
+  it("carries a family list whose bare item is not an identifier run", () => {
+    // `10px` tokenizes as a dimension, so a browser drops any declaration
+    // reading the token — exporting it shows a stack the site never used.
+    const { document } = tokensToDtcg(
+      tokens([
+        { name: "f", kind: "fontFamily", values: { light: "10px, serif" } },
+      ])
+    );
+    expect(typedNames(document)).toEqual([]);
+    expect(carriedNames(document)).toEqual(["f"]);
+  });
+
+  it("carries a family run separated by whitespace only JavaScript knows", () => {
+    // A vertical tab is whitespace to `\s` and a delimiter to CSS, so `My\vFont`
+    // is not a run of identifiers and the browser drops the declaration reading
+    // it. Judged by the JavaScript set it exports as a font stack the site
+    // never rendered.
+    const { document } = tokensToDtcg(
+      tokens([
+        {
+          name: "f",
+          kind: "fontFamily",
+          values: { light: "My\u000bFont, serif" },
+        },
+      ])
+    );
+    expect(typedNames(document)).toEqual([]);
+    expect(carriedNames(document)).toEqual(["f"]);
+  });
+
+  it("exports a family run separated by CSS whitespace under its ONE name", () => {
+    // The other side of that rule: a form feed IS whitespace to CSS, so the run
+    // it separates is two identifiers and the token is expressible.
+    //
+    // Exported with the separator NORMALISED, because CSS joins the identifiers
+    // of an unquoted family with a single space to form the name it matches on.
+    // `My\u000cFont` and `My Font` are one family to a browser, so exporting
+    // the author's spelling would hand every tool reading the standard value a
+    // name carrying a form feed, which matches no installed font — and would
+    // make the same value compare unequal against the family a `@font-face`
+    // declares. A quoted name is untouched: there the whitespace is the name.
+    const { document } = tokensToDtcg(
+      tokens([
+        {
+          name: "f",
+          kind: "fontFamily",
+          values: { light: "My\u000cFont, serif" },
+        },
+      ])
+    );
+    expect((document.f as Record<string, unknown>)?.$value).toEqual([
+      "My Font",
+      "serif",
+    ]);
+  });
+
+  it("still exports a quoted item that would be a keyword bare", () => {
+    const { document } = tokensToDtcg(
+      tokens([
+        {
+          name: "f",
+          kind: "fontFamily",
+          values: { light: `"inherit", serif` },
+        },
+      ])
+    );
+    expect((document.f as Record<string, unknown>)?.$value).toEqual([
+      "inherit",
+      "serif",
+    ]);
+  });
+
+  it("exports a family whose identifier run is spelled with an escape", () => {
+    // `\\31 0px` is a legal identifier naming the family `10px`. Checked after
+    // decoding it looks like a dimension, and a valid token is lost.
+    const { document } = tokensToDtcg(
+      tokens([
+        {
+          name: "f",
+          kind: "fontFamily",
+          values: { light: "\\31 0px, serif" },
+        },
+      ])
+    );
+    expect((document.f as Record<string, unknown>)?.$value).toEqual([
+      "10px",
+      "serif",
+    ]);
+  });
+
+  it.each(["--brand, serif", "My  Font, serif"])(
+    "exports the valid unquoted family list %s",
+    css => {
+      // The check has to be CSS's grammar, not a stricter one: an identifier may
+      // open with dashes, and any run of whitespace separates two of them.
+      const { document } = tokensToDtcg(
+        tokens([{ name: "f", kind: "fontFamily", values: { light: css } }])
+      );
+      expect(document).not.toEqual({});
+    }
+  );
+
+  it("carries another tool's extension data through untouched", () => {
+    // "Tools that process design token files MUST preserve any extension data
+    // they do not themselves understand."
+    const { document } = tokensToDtcg(
+      tokens([
+        {
+          name: "brand",
+          kind: "color",
+          values: { light: "#000000" },
+          extensions: { "com.figma.thing": { id: 7 } },
+        },
+      ])
+    );
+    const token = document.brand as Record<string, Record<string, unknown>>;
+    expect(token.$extensions?.["com.figma.thing"]).toEqual({ id: 7 });
+  });
+});
+
+describe("import", () => {
+  it("flattens groups back into dot paths", () => {
+    const { tokens: read } = dtcgToTokens({
+      color: {
+        primary: {
+          $type: "color",
+          $value: { colorSpace: "srgb", components: [0, 0, 0], hex: "#000000" },
+        },
+      },
+    });
+    expect(read[0]?.name).toBe("color.primary");
+  });
+
+  it("inherits a type down through groups that do not restate it", () => {
+    // "the token's type is inherited from the CLOSEST parent group with a
+    // `$type`" — so it travels past intermediate groups rather than stopping
+    // at the immediate parent. A test that put the type one level up would
+    // pass without the chain ever being walked.
+    const { tokens: read } = dtcgToTokens({
+      space: {
+        $type: "dimension",
+        inset: { small: { $value: { value: 16, unit: "px" } } },
+      },
+    });
+    expect(read[0]?.name).toBe("space.inset.small");
+    expect(read[0]?.kind).toBe("dimension");
+    expect(read[0]?.values.light).toBe("16px");
+  });
+
+  it("takes the closest type when an inner group overrides an outer one", () => {
+    const { tokens: read } = dtcgToTokens({
+      outer: {
+        $type: "dimension",
+        inner: {
+          $type: "duration",
+          fast: { $value: { value: 150, unit: "ms" } },
+        },
+      },
+    });
+    expect(read[0]?.kind).toBe("duration");
+    expect(read[0]?.values.light).toBe("150ms");
+  });
+
+  it("prefers a supplied hex over recomputing it from components", () => {
+    // The format says `hex` is the fallback representation; taking it keeps a
+    // colour byte-identical rather than round-tripping it through arithmetic.
+    const { tokens: read } = dtcgToTokens({
+      brand: {
+        $type: "color",
+        $value: {
+          colorSpace: "srgb",
+          components: [0.1, 0.2, 0.3],
+          hex: "#1a334d",
+        },
+      },
+    });
+    expect(read[0]?.values.light).toBe("#1a334d");
+  });
+
+  it("keeps the alpha of a colour that also supplies a hex", () => {
+    // `hex` is the six-digit fallback for the colour WITHOUT its alpha, so
+    // taking it alone imports a half-transparent red as an opaque one. It
+    // renders, it looks deliberate, and it is not what the file said.
+    const { tokens: read } = dtcgToTokens({
+      brand: {
+        $type: "color",
+        $value: {
+          colorSpace: "srgb",
+          components: [1, 0, 0],
+          hex: "#ff0000",
+          alpha: 0.5,
+        },
+      },
+    });
+    expect(read[0]?.values.light).toBe("rgb(255 0 0 / 0.5)");
+  });
+
+  it("reads a colour with no hex from its components", () => {
+    const { tokens: read } = dtcgToTokens({
+      brand: {
+        $type: "color",
+        $value: { colorSpace: "srgb", components: [1, 0, 0] },
+      },
+    });
+    expect(read[0]?.values.light).toBe("rgb(255 0 0)");
+  });
+
+  it("writes an imported family name as CSS that means the same name", () => {
+    // A DTCG family value is a NAME, not CSS. `ACME,Inc` unquoted is two
+    // fallback families rather than the one the file described, and a name
+    // holding a quote produces a declaration that does not parse.
+    const read = (value: unknown): string | undefined =>
+      dtcgToTokens({ f: { $type: "fontFamily", $value: value } }).tokens[0]
+        ?.values.light;
+
+    expect(read("ACME,Inc")).toBe('"ACME,Inc"');
+    expect(read('say "hi"')).toBe('"say \\"hi\\""');
+    expect(read(["ACME, Inc", "serif"])).toBe('"ACME, Inc", serif');
+  });
+
+  it("leaves a family name that needs no quotes unquoted", () => {
+    // Generic families mean the generic only while bare: quoting `serif` asks
+    // for a font actually installed under that name and loses the fallback.
+    const read = (value: unknown): string | undefined =>
+      dtcgToTokens({ f: { $type: "fontFamily", $value: value } }).tokens[0]
+        ?.values.light;
+
+    expect(read("serif")).toBe("serif");
+    expect(read("system-ui")).toBe("system-ui");
+    expect(read("My Font")).toBe("My Font");
+  });
+
+  it("quotes an imported family whose name is a CSS-wide keyword", () => {
+    // Bare, `inherit` takes the parent's font rather than naming one. The
+    // generics are the opposite case and have to stay bare.
+    const read = (value: unknown): string | undefined =>
+      dtcgToTokens({ f: { $type: "fontFamily", $value: value } }).tokens[0]
+        ?.values.light;
+    expect(read("inherit")).toBe('"inherit"');
+    expect(read("revert-layer")).toBe('"revert-layer"');
+    expect(read("serif")).toBe("serif");
+  });
+
+  it("refuses an sRGB component outside the range rather than clamping it", () => {
+    // Clamped, `[2, 0, 0]` imports as red — a colour the file did not describe,
+    // rendered and believed with nothing reported.
+    const { tokens: read, issues } = dtcgToTokens({
+      c: {
+        $type: "color",
+        $value: { colorSpace: "srgb", components: [2, 0, 0] },
+      },
+    });
+    expect(read).toEqual([]);
+    expect(issues[0]?.message).toContain("could not be read");
+  });
+
+  it("refuses a colour whose hex contradicts its components", () => {
+    // The hex is a FALLBACK for the components, not an alternative to them.
+    // Taking it imports black for a token that describes red.
+    const { tokens: read, issues } = dtcgToTokens({
+      c: {
+        $type: "color",
+        $value: {
+          colorSpace: "srgb",
+          components: [1, 0, 0],
+          hex: "#000000",
+        },
+      },
+    });
+    expect(read).toEqual([]);
+    expect(issues[0]?.message).toContain("could not be read");
+  });
+
+  it("still accepts a hex that merely rounded from its components", () => {
+    const { tokens: read } = dtcgToTokens({
+      c: {
+        $type: "color",
+        $value: {
+          colorSpace: "srgb",
+          components: [1, 0, 0],
+          hex: "#ff0000",
+        },
+      },
+    });
+    expect(read[0]?.values.light).toBe("#ff0000");
+  });
+
+  it("does not compare non-sRGB components to an sRGB hex", () => {
+    // In another space the components are not sRGB channels, so a file giving
+    // display-p3 components beside their converted sRGB fallback is valid and
+    // must import.
+    const { tokens: read } = dtcgToTokens({
+      c: {
+        $type: "color",
+        $value: {
+          colorSpace: "display-p3",
+          components: [1, 0, 0],
+          hex: "#fa0f00",
+        },
+      },
+    });
+    expect(read[0]?.values.light).toBe("#fa0f00");
+  });
+
+  it("skips a type it has no kind for, and says so", () => {
+    const { tokens: read, issues } = dtcgToTokens({
+      curve: { $type: "cubicBezier", $value: [0, 0, 1, 1] },
+    });
+    expect(read).toEqual([]);
+    expect(issues[0]?.message).toContain("cubicBezier");
+  });
+
+  it("keeps another tool's extensions but not its own", () => {
+    const { tokens: read } = dtcgToTokens({
+      brand: {
+        $type: "color",
+        $value: { colorSpace: "srgb", components: [0, 0, 0], hex: "#000000" },
+        $extensions: {
+          "com.figma.thing": { id: 7 },
+          [NEXTLY_EXTENSION]: { css: { light: "#000" }, kind: "color" },
+        },
+      },
+    });
+    expect(read[0]?.extensions).toEqual({ "com.figma.thing": { id: 7 } });
+    // Its own key is consumed rather than carried, or every round trip would
+    // nest one copy inside the next.
+    expect(read[0]?.extensions?.[NEXTLY_EXTENSION]).toBeUndefined();
+  });
+
+  it("refuses a unit the export side would never have written", () => {
+    // Export restricts the unit to `px`/`rem` and `ms`/`s`; import concatenated
+    // whatever string the file carried, so the two directions disagreed and a
+    // unit could smuggle text into a stored value.
+    const read = (unit: string): unknown =>
+      dtcgToTokens({
+        d: { $type: "dimension", $value: { value: 16, unit } },
+      }).tokens[0]?.values.light;
+
+    expect(read("px")).toBe("16px");
+    expect(read("rem")).toBe("16rem");
+    expect(read("px;color:red")).toBeUndefined();
+    expect(read("vw")).toBeUndefined();
+  });
+
+  it("reports a value it could never write, at the file that carried it", () => {
+    // The emitter refuses these anyway, so nothing unsafe reaches a stylesheet
+    // either way. What changes is where the author is told: once, naming the
+    // import, instead of on every page compile from then on.
+    const fetching = dtcgToTokens({
+      bg: {
+        $type: "color",
+        $value: { colorSpace: "srgb", components: [0, 0, 0] },
+        $extensions: {
+          [NEXTLY_EXTENSION]: {
+            css: { light: "url(https://evil.example/a.png)" },
+            kind: "color",
+          },
+        },
+      },
+    });
+    expect(fetching.tokens).toEqual([]);
+    expect(fetching.issues[0]?.message).toContain("load a file");
+
+    const unwritable = dtcgToTokens({
+      x: {
+        $type: "color",
+        $value: { colorSpace: "srgb", components: [0, 0, 0] },
+        $extensions: {
+          [NEXTLY_EXTENSION]: {
+            css: { light: "red}body{display:none" },
+            kind: "color",
+          },
+        },
+      },
+    });
+    expect(unwritable.tokens).toEqual([]);
+    expect(unwritable.issues[0]?.message).toContain("cannot be written");
+  });
+
+  it("refuses a document that is not one", () => {
+    expect(dtcgToTokens("nope").issues).toHaveLength(1);
+    expect(dtcgToTokens(null).tokens).toEqual([]);
+  });
+});
+
+describe("the round trip", () => {
+  it("reads back exactly what it wrote", () => {
+    const original: SiteToken[] = [
+      {
+        name: "color.primary",
+        kind: "color",
+        values: { light: "#2563eb", dark: "#60a5fa" },
+      },
+      { name: "space.4", kind: "dimension", values: { light: "1rem" } },
+      { name: "font.body", kind: "fontFamily", values: { light: "system-ui" } },
+      { name: "font.heavy", kind: "fontWeight", values: { light: "700" } },
+      { name: "motion.fast", kind: "duration", values: { light: "150ms" } },
+      {
+        name: "scale.ratio",
+        kind: "number",
+        values: { light: "1.5" },
+        description: "Type scale.",
+      },
+    ];
+    const { document, issues } = tokensToDtcg(tokens(original));
+    expect(issues).toEqual([]);
+    const { tokens: read } = dtcgToTokens(document);
+    expect(read).toEqual(original);
+  });
+
+  it("survives the exact values DTCG could not have expressed", () => {
+    // The point of carrying the CSS in the extension: `#2563eb` exports as
+    // components and comes back as the string that was written, not as an
+    // arithmetically equivalent `rgb()`.
+    const original: SiteToken[] = [
+      {
+        name: "brand",
+        kind: "color",
+        values: { light: "rgb(37 99 235 / 0.5)" },
+      },
+    ];
+    const { document } = tokensToDtcg(tokens(original));
+    expect(dtcgToTokens(document).tokens).toEqual(original);
+  });
+
+  it("does not accumulate its own extension over repeated trips", () => {
+    const original: SiteToken[] = [
+      { name: "brand", kind: "color", values: { light: "#000000" } },
+    ];
+    let carried = original;
+    for (let pass = 0; pass < 3; pass++) {
+      carried = dtcgToTokens(tokensToDtcg(tokens(carried)).document).tokens;
+    }
+    expect(carried).toEqual(original);
+  });
+});
+
+describe("a token's stable identity across the format", () => {
+  // The identity DTCG itself cannot express: the format knows a token by its
+  // path, so this rides in `$extensions` under the vendor key the spec asks
+  // for and the spec guarantees other tools preserve.
+  const renamed = renameSiteToken(
+    { name: "color.primary", kind: "color", values: { light: "#2563eb" } },
+    "brand.main"
+  );
+
+  const own = (
+    document: DtcgNode,
+    ...path: string[]
+  ): Record<string, unknown> => {
+    let node: Record<string, unknown> = document;
+    for (const segment of path) node = node[segment] as Record<string, unknown>;
+    const extensions = node.$extensions as Record<string, unknown>;
+    return extensions[NEXTLY_EXTENSION] as Record<string, unknown>;
+  };
+
+  it("nests under the CURRENT name and carries the identity in the extension", () => {
+    // Both halves matter and they pull apart. The path is what a designer reads
+    // in Figma, so it has to be the name the author sees; the identity is what
+    // a document and a compiled sheet key off, so it cannot be the path.
+    const { document, issues } = tokensToDtcg(tokens([renamed]));
+
+    expect(issues).toEqual([]);
+    expect(Object.keys(document)).toEqual(["brand"]);
+    expect(own(document, "brand", "main").id).toBe("color.primary");
+  });
+
+  it("reads the identity back, so a rename survives a trip through the format", () => {
+    // Exporting to Style Dictionary and importing the result must not quietly
+    // re-point a token at its own label — every reference written against the
+    // old identity would stop resolving, and stop resolving silently.
+    const { tokens: read } = dtcgToTokens(
+      tokensToDtcg(tokens([renamed])).document
+    );
+
+    expect(read).toEqual([renamed]);
+    expect(read[0]?.id).toBe("color.primary");
+    expect(read[0]?.name).toBe("brand.main");
+  });
+
+  it("writes no id at all for a token that never moved", () => {
+    // A field present on every token says nothing about identity and everything
+    // about which exporter ran, and it is data another tool must then carry.
+    const { document } = tokensToDtcg(
+      tokens([
+        { name: "color.primary", kind: "color", values: { light: "#2563eb" } },
+      ])
+    );
+
+    expect(own(document, "color", "primary")).not.toHaveProperty("id");
+  });
+
+  it("invents no identity for a file that came from somewhere else", () => {
+    // A file from Figma carries no vendor key of ours to read one out of.
+    // Minting one here would be this importer deciding what a token IS on the
+    // strength of nothing, and the honest answer — the name — is what an absent
+    // id already means everywhere else in the model.
+    const { tokens: read } = dtcgToTokens({
+      color: {
+        primary: {
+          $type: "color",
+          $value: { colorSpace: "srgb", components: [0, 0, 0], hex: "#000000" },
+        },
+      },
+    });
+
+    expect(read[0]).not.toHaveProperty("id");
+    expect(read[0]?.name).toBe("color.primary");
+  });
+
+  it("normalises away an id that merely repeats the name", () => {
+    // `id === name` states exactly what an absent id states. Keeping it would
+    // leave the model with two spellings of one fact, and a reader deciding
+    // which of them means "never renamed".
+    const { tokens: read } = dtcgToTokens({
+      brand: {
+        $type: "color",
+        $value: { colorSpace: "srgb", components: [0, 0, 0], hex: "#000000" },
+        $extensions: {
+          [NEXTLY_EXTENSION]: {
+            css: { light: "#000" },
+            kind: "color",
+            id: "brand",
+          },
+        },
+      },
+    });
+
+    expect(read[0]).not.toHaveProperty("id");
+  });
+
+  it("refuses to EXPORT an id it would refuse to import, so a file survives its own round trip", () => {
+    // The three readers of a token have to agree about what an unusable id
+    // means. `emitTokenBlocks` refuses the token and the importer below refuses
+    // it; an exporter that wrote it anyway would produce a document this very
+    // module rejects on the way back in — and reject the WHOLE token, because
+    // an id it cannot read is an identity it cannot honour.
+    const bad: SiteToken[] = [
+      {
+        id: "color}primary",
+        name: "brand.main",
+        kind: "color",
+        values: { light: "#2563eb" },
+      },
+    ];
+    const { document, issues } = tokensToDtcg(tokens(bad));
+
+    expect(Object.keys(document)).toEqual([]);
+    expect(issues.some(i => i.message.includes("id"))).toBe(true);
+    // The round trip is the property, so it is asserted as one rather than
+    // inferred from the export being empty.
+    expect(dtcgToTokens(document).tokens).toEqual([]);
+  });
+
+  it("skips a token whose stated id could never be written, rather than dropping the id", () => {
+    // Importing it WITHOUT the id is the tempting repair and it is the wrong
+    // one: the token would arrive with its name for an identity, emit a
+    // different custom property from the one the file describes, and every
+    // reference written against the stated identity would resolve to nothing.
+    const { tokens: read, issues } = dtcgToTokens({
+      brand: {
+        $type: "color",
+        $value: { colorSpace: "srgb", components: [0, 0, 0], hex: "#000000" },
+        $extensions: {
+          [NEXTLY_EXTENSION]: {
+            css: { light: "#000" },
+            kind: "color",
+            id: "color}primary",
+          },
+        },
+      },
+    });
+
+    expect(read).toEqual([]);
+    expect(issues.some(i => i.message.includes("id"))).toBe(true);
+  });
+});
+
+describe("a renamed token's long label", () => {
+  // A token's identity is its id, so a renamed token is written under that id
+  // and its display name reaches neither a stylesheet nor an exported file.
+  // Both DTCG gates therefore hold the label to the grammar and the identity to
+  // the emission cap — capping the label would drop a working token from an
+  // export and refuse it on the way back in, silently in both directions.
+  const longLabel = `label.${"a".repeat(MAX_TOKEN_NAME_LENGTH)}`;
+
+  it("straddles the cap, so the cases below mean what they say", () => {
+    expect(longLabel.length).toBeGreaterThan(MAX_TOKEN_NAME_LENGTH);
+    expect("color.primary".length).toBeLessThanOrEqual(MAX_TOKEN_NAME_LENGTH);
+  });
+
+  it("survives an export, because the id is what it is written under", () => {
+    const { document, issues } = tokensToDtcg({
+      tokens: [
+        {
+          id: "color.primary",
+          name: longLabel,
+          kind: "color",
+          values: { light: "#000000" },
+        },
+      ],
+    });
+    expect(issues).toEqual([]);
+    expect(JSON.stringify(document)).toContain("color.primary");
+  });
+
+  it("imports a token whose stated id is short, however deep its group path", () => {
+    // The import side of the same rule. A file may nest a token so deeply that
+    // its dot path exceeds the cap while stating a short id in the extension —
+    // that id is the identity, so the token is written under it and the path is
+    // only a label.
+    const deep = "g".repeat(MAX_TOKEN_NAME_LENGTH);
+    const { tokens: read, issues } = dtcgToTokens({
+      [deep]: {
+        primary: {
+          $type: "color",
+          $value: { colorSpace: "srgb", components: [0, 0, 0], hex: "#000000" },
+          $extensions: { [NEXTLY_EXTENSION]: { id: "color.primary" } },
+        },
+      },
+    });
+    expect(issues).toEqual([]);
+    expect(read[0]?.id).toBe("color.primary");
+  });
+
+  it("skips an imported token whose path is the identity and exceeds the cap", () => {
+    // With no stated id the path IS what the token is written under, so the cap
+    // applies to it. Without this the import gate has no coverage at all: the
+    // case above passes whether or not the cap is applied there.
+    const deep = "g".repeat(MAX_TOKEN_NAME_LENGTH);
+    const { tokens: read, issues } = dtcgToTokens({
+      [deep]: {
+        primary: {
+          $type: "color",
+          $value: { colorSpace: "srgb", components: [0, 0, 0], hex: "#000000" },
+        },
+      },
+    });
+    expect(read).toEqual([]);
+    expect(issues.length).toBeGreaterThan(0);
+  });
+
+  it("is refused when the LABEL is the identity, which is when it is written", () => {
+    // The control on the other side: with no id the label is the identity, so
+    // the same string is capped. Without this, a gate that accepted everything
+    // would satisfy the case above perfectly.
+    const { issues } = tokensToDtcg({
+      tokens: [
+        { name: longLabel, kind: "color", values: { light: "#000000" } },
+      ],
+    });
+    expect(issues.length).toBeGreaterThan(0);
+  });
+});
+
+describe("a label deep enough to break the reader", () => {
+  // The exporter writes one nested group per dot-separated segment and the
+  // reader walks those groups, so a deep label produces a file this package
+  // cannot read back. An exporter emitting a document that fails its own round
+  // trip is the shape this module exists to prevent, and a renamed token's
+  // label is free of the LENGTH cap — so depth needs its own bound.
+  const deepLabel = Array.from(
+    { length: MAX_TOKEN_NAME_SEGMENTS + 1 },
+    () => "a"
+  ).join(".");
+
+  it("is refused at export rather than written", () => {
+    const { issues } = tokensToDtcg({
+      tokens: [
+        {
+          id: "short.id",
+          name: deepLabel,
+          kind: "color",
+          values: { light: "#000000" },
+        },
+      ],
+    });
+    expect(issues.length).toBeGreaterThan(0);
+  });
+
+  it("still exports a label at the depth bound, so the refusal is not blanket", () => {
+    // The control. Without it a gate refusing every renamed token would satisfy
+    // the case above and look correct.
+    const atBound = Array.from(
+      { length: MAX_TOKEN_NAME_SEGMENTS },
+      () => "a"
+    ).join(".");
+    const { document, issues } = tokensToDtcg({
+      tokens: [
+        {
+          id: "short.id",
+          name: atBound,
+          kind: "color",
+          values: { light: "#000000" },
+        },
+      ],
+    });
+    expect(issues).toEqual([]);
+    expect(dtcgToTokens(document).tokens).toHaveLength(1);
+  });
+});
+
+describe("a name the object prototype already answers for", () => {
+  /*
+   * A document node is an ordinary object, so reading a segment directly finds
+   * whatever `Object.prototype` supplies. `node["constructor"]` is a function
+   * rather than `undefined`, so the emitter concluded the path was already
+   * taken and refused a token nothing had written — the document came back
+   * `{}` with "exported more than once" beside it, and the token could not
+   * leave this system at all.
+   *
+   * DERIVED rather than listed, so this widens with the grammar instead of
+   * pinning today's answer. The name rule is lowercase-only, which is why
+   * `constructor` is currently the only prototype key a token name can spell:
+   * `toString` and the rest carry capitals and are refused as names long
+   * before they reach the emitter.
+   */
+  const REACHABLE = Object.getOwnPropertyNames(Object.prototype).filter(
+    isTokenName
+  );
+
+  it("has something to test", () => {
+    // The positive control on the fixture itself. Filtered to nothing, every
+    // `it.each` below would silently run zero times and read as a pass.
+    expect(REACHABLE).toContain("constructor");
+  });
+
+  it.each(REACHABLE)("writes a token named %s", name => {
+    const { document, issues } = tokensToDtcg({
+      tokens: [{ name, kind: "number", values: { light: "1" } }],
+    });
+    expect(issues).toEqual([]);
+    // Asserted as an OWN key, because `document[name]` is truthy for every one
+    // of these whether or not anything was written.
+    expect(Object.hasOwn(document, name)).toBe(true);
+    expect(JSON.parse(JSON.stringify(document))).toHaveProperty([name]);
+  });
+
+  it("writes a token whose PATH passes through such a name", () => {
+    // The same lookup runs at every segment on the way down, not only the leaf.
+    const { document, issues } = tokensToDtcg({
+      tokens: [
+        { name: "a.constructor.b", kind: "number", values: { light: "1" } },
+      ],
+    });
+    expect(issues).toEqual([]);
+    const written = JSON.parse(JSON.stringify(document)) as Record<
+      string,
+      Record<string, Record<string, unknown>>
+    >;
+    expect(written["a"]?.["constructor"]?.["b"]).toBeDefined();
+  });
+
+  it("round-trips such a token back to the same name", () => {
+    const { document } = tokensToDtcg({
+      tokens: [{ name: "constructor", kind: "number", values: { light: "1" } }],
+    });
+    const read = dtcgToTokens(JSON.parse(JSON.stringify(document)));
+    expect(read.issues).toEqual([]);
+    expect(read.tokens.map(token => token.name)).toEqual(["constructor"]);
+  });
+
+  it("still refuses a genuine duplicate at such a name", () => {
+    // The control. Own-key lookups must not stop the emitter noticing a path
+    // it really has written already.
+    const { issues } = tokensToDtcg({
+      tokens: [
+        { name: "constructor", kind: "number", values: { light: "1" } },
+        {
+          id: "other",
+          name: "constructor",
+          kind: "number",
+          values: { light: "2" },
+        },
+      ],
+    });
+    expect(issues.map(issue => issue.message).join(" ")).toContain(
+      "exported more than once"
+    );
+  });
+});
+
+describe("a file describing one token twice", () => {
+  const withBoth = (value: unknown, stored: string, type: string): unknown => ({
+    one: {
+      $type: type,
+      $value: value,
+      $extensions: {
+        [NEXTLY_EXTENSION]: { css: { light: stored }, kind: type },
+      },
+    },
+  });
+
+  it("names a value the file states and this system did not use", () => {
+    /*
+     * The extension wins, which is right — it holds what the author typed. But
+     * when the two genuinely disagree the file's value is discarded, the next
+     * export rewrites `$value` to match, and a hand-edited file loses the edit
+     * while reporting success.
+     */
+    const read = dtcgToTokens(
+      withBoth(
+        { colorSpace: "srgb", components: [0, 0, 0] },
+        "#111111",
+        "color"
+      )
+    );
+    // The behaviour is unchanged: the stored value is still the one taken.
+    expect(read.tokens[0]?.values.light).toBe("#111111");
+    expect(read.issues.map(issue => issue.message).join(" ")).toContain(
+      "was not used"
+    );
+  });
+
+  it.each(["#111", "rgb(17 17 17)"])(
+    "stays silent when the two only SPELL it differently (%s)",
+    stored => {
+      /*
+       * The control this whole check turns on. A token stored in either of
+       * these spellings comes back from `$value` as `#111111`, so comparing the
+       * two as text reports a disagreement on files this system wrote itself —
+       * and a report that fires on correct files is the one that gets ignored.
+       */
+      const read = dtcgToTokens(
+        withBoth(
+          {
+            colorSpace: "srgb",
+            components: [0.0667, 0.0667, 0.0667],
+            hex: "#111111",
+          },
+          stored,
+          "color"
+        )
+      );
+      expect(read.tokens[0]?.values.light).toBe(stored);
+      expect(read.issues).toEqual([]);
+    }
+  );
+
+  it("stays silent for a kind it cannot compare by meaning", () => {
+    /*
+     * The documented gap, asserted so it is visible here and not only in a
+     * comment. Only colour has a normaliser to hand, and text differing is not
+     * enough on its own — `1rem` and `1.0rem` are the same dimension — so every
+     * other kind errs toward saying nothing. This fixture DOES disagree, and is
+     * still not reported.
+     */
+    const read = dtcgToTokens(
+      withBoth({ value: 1, unit: "rem" }, "2rem", "dimension")
+    );
+    expect(read.tokens[0]?.values.light).toBe("2rem");
+    expect(read.issues).toEqual([]);
+  });
+
+  it("says nothing about a token this system exported itself", () => {
+    // The round trip, end to end: our own file must never carry this line.
+    const { document } = tokensToDtcg({
+      tokens: [
+        {
+          name: "brand",
+          kind: "color",
+          values: { light: "#111", dark: "#eee" },
+        },
+      ],
+    });
+    const read = dtcgToTokens(JSON.parse(JSON.stringify(document)));
+    expect(read.issues).toEqual([]);
+    expect(read.tokens[0]?.values).toEqual({ light: "#111", dark: "#eee" });
+  });
+});
+
+describe("this system's own extension, on the way in", () => {
+  it("keeps a field this version does not read, and says nothing", () => {
+    /*
+     * This key is SPLIT, where another vendor's block is carried whole: the
+     * fields the reader knows are taken into the model, and the rest is kept
+     * beside them. A field a newer build wrote survives an import by an older
+     * one, so there is no loss to report.
+     */
+    const read = dtcgToTokens({
+      one: {
+        $type: "number",
+        $value: 1,
+        $extensions: {
+          [NEXTLY_EXTENSION]: { id: "stable", future: "keep-me" },
+        },
+      },
+    });
+    expect(read.tokens[0]?.id).toBe("stable");
+    expect(read.tokens[0]?.unreadExtension).toEqual({ future: "keep-me" });
+    expect(read.issues).toEqual([]);
+  });
+
+  it("writes that field back out where it was found", () => {
+    /*
+     * Keeping it is only half the requirement — the point of preserving is that
+     * the NEXT export carries it, which is what makes an older build safe to
+     * round-trip a newer file. Read back rather than compared as an object, so
+     * the assertion is about the key the field lands under and not only about
+     * its presence somewhere.
+     */
+    const { document } = tokensToDtcg({
+      tokens: [
+        {
+          name: "one",
+          kind: "number",
+          values: { light: "1" },
+          unreadExtension: { future: "keep-me" },
+        },
+      ],
+    });
+    const written = (document.one as { $extensions: Record<string, unknown> })
+      .$extensions[NEXTLY_EXTENSION] as Record<string, unknown>;
+    expect(written.future).toBe("keep-me");
+    // And the fields the model states are still there beside it.
+    expect(written.kind).toBe("number");
+    expect(written.css).toEqual({ light: "1" });
+  });
+
+  it("does not let a stored copy shadow a field the model states", () => {
+    /*
+     * The staleness case, and the reason the filter runs on the way OUT as well
+     * as on the way in. A token stored by a build that could not read `css`
+     * carries a copy of it; this build reads `css` into the model, so the copy
+     * is a stale statement of a value the site may since have changed. The live
+     * value has to win.
+     *
+     * Population first: the fixture really does carry the colliding keys, so a
+     * pass cannot come from an empty preserved set.
+     */
+    const stale = { css: { light: "#stale" }, kind: "color", future: "keep" };
+    expect(Object.keys(stale)).toEqual(["css", "kind", "future"]);
+
+    const { document } = tokensToDtcg({
+      tokens: [
+        {
+          name: "one",
+          kind: "number",
+          values: { light: "1" },
+          unreadExtension: stale,
+        },
+      ],
+    });
+    const written = (document.one as { $extensions: Record<string, unknown> })
+      .$extensions[NEXTLY_EXTENSION] as Record<string, unknown>;
+    expect(written.css).toEqual({ light: "1" });
+    expect(written.kind).toBe("number");
+    // The field that is genuinely unread still survives.
+    expect(written.future).toBe("keep");
+  });
+
+  it("keeps a field named `__proto__` rather than losing it to the prototype", () => {
+    /*
+     * A file is arbitrary JSON, and `JSON.parse` makes `__proto__` an ordinary
+     * own property. Building the preserved set by ASSIGNMENT would reach
+     * `Object.prototype`'s setter instead of storing anything, so the one name
+     * that most needs preserving would be the one silently dropped.
+     *
+     * Parsed rather than written as a literal, because `{ __proto__: x }` in
+     * source sets the prototype and would make this test pass against a
+     * fixture that never held the key. Asserted before it is used.
+     */
+    const own = JSON.parse(
+      '{"kind":"number","css":{"light":"1"},"__proto__":7}'
+    );
+    expect(Object.hasOwn(own, "__proto__")).toBe(true);
+
+    const read = dtcgToTokens({
+      one: {
+        $type: "number",
+        $value: 1,
+        $extensions: { [NEXTLY_EXTENSION]: own },
+      },
+    });
+    const kept = read.tokens[0]?.unreadExtension;
+    expect(kept === undefined ? [] : Object.keys(kept)).toEqual(["__proto__"]);
+    expect(Object.getPrototypeOf(kept)).toBe(Object.prototype);
+  });
+
+  it("names a per-mode value it has no mode for, rather than keeping it", () => {
+    /*
+     * The boundary of what preserving reaches, stated so it is a known limit
+     * rather than a surprise. A member added INSIDE `css` by a newer build is
+     * not preserved, because `css` is the token's value and a member written
+     * back beside a value the author has since edited would state a mode for a
+     * colour that no longer exists.
+     *
+     * Population first: the top-level field beside it IS preserved, so this
+     * asserts a difference between the two levels and not a failure to preserve
+     * anything at all.
+     */
+    const read = dtcgToTokens({
+      one: {
+        $type: "color",
+        $value: "#111111",
+        $extensions: {
+          [NEXTLY_EXTENSION]: {
+            kind: "color",
+            css: { light: "#111111", highContrast: "#000000" },
+            future: "keep-me",
+          },
+        },
+      },
+    });
+    expect(read.tokens[0]?.unreadExtension).toEqual({ future: "keep-me" });
+    expect(read.issues.map(i => i.message).join(" ")).toContain("highContrast");
+  });
+
+  it("writesNoFieldItDoesNotDeclare: a round trip preserves nothing", () => {
+    /*
+     * What holds the named field set to the emitter, asserted by BUILDING a
+     * file rather than by reading the set. Every field the emitter writes under
+     * this key is one the reader takes into the model, so re-importing this
+     * system's own export must find nothing left over — a field added to the
+     * emitter and not to the set arrives here as preserved data and fails this.
+     *
+     * Two tokens, so the assertion covers the branch that writes an id and the
+     * branch that omits it.
+     */
+    const { document } = tokensToDtcg({
+      tokens: [
+        {
+          id: "color.primary",
+          name: "brand.main",
+          kind: "color",
+          values: { light: "#111111", dark: "#eeeeee" },
+        },
+        { name: "space.4", kind: "dimension", values: { light: "1rem" } },
+      ],
+    });
+    const read = dtcgToTokens(JSON.parse(JSON.stringify(document)));
+    expect(read.issues).toEqual([]);
+    expect(read.tokens).toHaveLength(2);
+    expect(read.tokens.map(token => token.unreadExtension)).toEqual([
+      undefined,
+      undefined,
+    ]);
+  });
+
+  it("says nothing about ANOTHER vendor's fields", () => {
+    // The control: those are carried, not consumed, so nothing is lost and a
+    // report would fire on every file from every other tool.
+    const read = dtcgToTokens({
+      one: {
+        $type: "number",
+        $value: 1,
+        $extensions: { "com.figma": { anything: "at all" } },
+      },
+    });
+    expect(read.issues).toEqual([]);
+    expect(read.tokens[0]?.extensions).toEqual({
+      "com.figma": { anything: "at all" },
+    });
+  });
+});
+
+describe("a var() substitution CSS will actually make", () => {
+  it("reads a well-formed call as dynamic, closed either way", () => {
+    // The two legal terminators: the closing paren, and a comma opening a
+    // fallback. Both are values a browser substitutes into, so neither is a
+    // fault to report.
+    expect(readFamilyList("var(--brand)").kind).toBe("dynamic");
+    expect(readFamilyList("var(--brand, serif)").kind).toBe("dynamic");
+    expect(readFamilyList("var(--a, var(--b))").kind).toBe("dynamic");
+  });
+
+  it("refuses a name that is not a custom property", () => {
+    // `--` is what makes an identifier a custom property. `var(foo)` computes
+    // to nothing, so the declaration is dropped rather than falling through.
+    expect(readFamilyList("var(foo)").kind).toBe("invalid");
+  });
+
+  it("refuses a space between the name and the paren", () => {
+    // CSS produces a function token only when the identifier TOUCHES the `(`.
+    // `var (--brand)` is an identifier beside a parenthesised block, which the
+    // font-family grammar has no reading for at all.
+    expect(readFamilyList("var (--brand)").kind).toBe("invalid");
+  });
+
+  it("refuses a first argument that never terminates", () => {
+    // After the custom-property name only a comma or the closing paren may
+    // follow; anything else is a syntax error, and the browser drops the
+    // declaration rather than reading the name and ignoring the rest.
+    expect(readFamilyList("var(--brand extra)").kind).toBe("invalid");
+    expect(readFamilyList("var(--brand serif)").kind).toBe("invalid");
+  });
+
+  it("refuses a call that never closes", () => {
+    // Checking the first argument alone accepted this: the name and its comma
+    // are both well formed, and the declaration is still a syntax error the
+    // browser drops.
+    expect(readFamilyList("var(--brand, serif").kind).toBe("invalid");
+    expect(readFamilyList("var(--brand").kind).toBe("invalid");
+    // A close with nothing open is as broken as one that never closes.
+    expect(readFamilyList("var(--brand))").kind).toBe("invalid");
+  });
+
+  it("keeps an ESCAPED space inside a custom-property name", () => {
+    /*
+     * `--brand\ face` is one identifier to a browser. The reader decodes that
+     * escape before the name exists, where a literal space is indistinguishable
+     * from the whitespace that ends an argument — so the check reads the RAW
+     * spelling, where the backslash is still there.
+     */
+    const escaped = `var(--brand${String.fromCharCode(92)} face)`;
+    expect(readFamilyList(escaped).kind).toBe("dynamic");
+  });
+
+  it("reads text carrying no var() call as ordinary families", () => {
+    // The negative control for every escape case below: without a `var(` the
+    // substitution check never runs, so a result here says nothing about it.
+    expect(readFamilyList("not a var call").kind).toBe("families");
+  });
+
+  describe("a custom-property name spelled with a hex escape", () => {
+    const backslash = String.fromCharCode(92);
+    const plainName = readFamilyList("var(--brand)").parts[0]?.part.name;
+
+    it("is the same property as its plain spelling", () => {
+      /*
+       * `\62 ` is ONE escape meaning `b`: the space ends the escape and belongs
+       * to it, so `--\62 rand` is `--brand`. Reading only the backslash and the
+       * first digit left that space looking like the end of the name.
+       */
+      const reading = readFamilyList(`var(--${backslash}62 rand)`);
+      expect(plainName).toBe("var(--brand)");
+      expect(reading.parts[0]?.part.name).toBe(plainName);
+      expect(reading.kind).toBe("dynamic");
+    });
+
+    it("accepts every digit count CSS allows, with or without a terminator", () => {
+      // Up to six hex digits. With no whitespace after them, the escape simply
+      // ends where the digits do.
+      const sixDigits = readFamilyList(`var(--${backslash}000062 rand)`);
+      expect(sixDigits.parts[0]?.part.name).toBe(plainName);
+      expect(sixDigits.kind).toBe("dynamic");
+      expect(readFamilyList(`var(--${backslash}62)`).kind).toBe("dynamic");
+      expect(readFamilyList(`var(--x${backslash}62)`).kind).toBe("dynamic");
+    });
+
+    it("consumes a tab, and a CRLF pair, as the single terminator", () => {
+      /*
+       * CSS reads CRLF as one newline before tokenising, so the whole pair ends
+       * the escape. Consuming only the CR leaves the LF inside the name, where
+       * it both changes the decoded name and ends the identifier early — which
+       * is what a pattern admitting one optional whitespace character does.
+       */
+      const tab = readFamilyList(`var(--${backslash}62\trand)`);
+      expect(tab.parts[0]?.part.name).toBe(plainName);
+      expect(tab.kind).toBe("dynamic");
+      const crlf = readFamilyList(`var(--${backslash}62\r\nrand)`);
+      expect(crlf.parts[0]?.part.name).toBe(plainName);
+      expect(crlf.kind).toBe("dynamic");
+    });
+
+    it("consumes only CSS whitespace as the terminator", () => {
+      // A no-break space is an identifier character to CSS, not whitespace, so
+      // it stays in the name rather than being swallowed by the escape.
+      const nbsp = readFamilyList(`var(--${backslash}62\u00a0rand)`);
+      expect(nbsp.parts[0]?.part.name).toBe("var(--b\u00a0rand)");
+      expect(nbsp.kind).toBe("dynamic");
+    });
+
+    it("still reaches the fallback after an escaped name", () => {
+      expect(readFamilyList(`var(--${backslash}62 rand, serif)`).kind).toBe(
+        "dynamic"
+      );
+    });
+
+    it("still refuses a second word after an escaped name", () => {
+      // Consuming the escape whole must not consume what follows the name.
+      expect(readFamilyList(`var(--${backslash}62 rand extra)`).kind).toBe(
+        "invalid"
+      );
+    });
+
+    it("does not treat a backslash before a newline as an escape", () => {
+      // CSS reads `\` + newline as no escape at all, so the name ends there and
+      // the argument is malformed.
+      expect(readFamilyList(`var(--a${backslash}\nb)`).kind).toBe("invalid");
+    });
+  });
+
+  it("refuses a call whose FUNCTION NAME is written with an escape", () => {
+    /*
+     * `v\61 r(foo)` decodes to `var(foo)`, which a browser tokenises as a
+     * var() call and then rejects for its non-custom-property argument.
+     * Detection and validation now read the same raw text, so this is refused
+     * once rather than being detected by one reader and skipped by the other.
+     */
+    const escapedName = `v${String.fromCharCode(92)}61 r(foo)`;
+    expect(readFamilyList(escapedName).kind).toBe("invalid");
+  });
+
+  it("lets one malformed call spoil the list it sits in", () => {
+    // A declaration is dropped whole, so a good call beside a bad one does not
+    // rescue it.
+    expect(readFamilyList("var(--ok), var(bad)").kind).toBe("invalid");
+    expect(readFamilyList("var(--ok), var (--also-ok)").kind).toBe("invalid");
+  });
+});
+
+describe("what the reader reports it did not keep", () => {
+  const said = (input: unknown): string =>
+    dtcgToTokens(input)
+      .issues.map(issue => issue.message)
+      .join("\n");
+  const names = (input: unknown): string[] =>
+    dtcgToTokens(input).tokens.map(token => token.name);
+
+  it("says nothing about a file this system wrote", () => {
+    // The control for everything below: a reader that reported every field
+    // would satisfy each loss test without distinguishing anything.
+    const { document } = tokensToDtcg(
+      tokens([
+        {
+          name: "color.ink",
+          kind: "color",
+          values: { light: "#111111", dark: "#eeeeee" },
+          description: "Body text",
+          extensions: { "com.figma": { id: 1 } },
+        },
+        { name: "space.4", kind: "dimension", values: { light: "16px" } },
+      ])
+    );
+    const read = dtcgToTokens(document);
+    expect(read.tokens).toHaveLength(2);
+    expect(read.issues).toEqual([]);
+  });
+
+  it("names an entry that is neither a token nor a group", () => {
+    const document = {
+      good: { $type: "number", $value: 1 },
+      lost: 42,
+      nested: { deeper: "also lost" },
+    };
+    expect(names(document)).toEqual(["good"]);
+    expect(said(document)).toContain('"lost" is neither a token nor a group');
+    expect(said(document)).toContain(
+      '"nested.deeper" is neither a token nor a group'
+    );
+  });
+
+  it("names a token written inside another token", () => {
+    // The reader stops at a token, so a valid child inside one is never read.
+    const document = {
+      parent: { $type: "number", $value: 1, child: { $value: 2 } },
+    };
+    expect(names(document)).toEqual(["parent"]);
+    expect(said(document)).toContain(
+      '"parent.child" is written inside a token'
+    );
+  });
+
+  it("names a group's own $root token", () => {
+    const document = {
+      size: { $type: "number", $root: { $value: 1 }, small: { $value: 2 } },
+    };
+    expect(names(document)).toEqual(["size.small"]);
+    expect(said(document)).toContain('"size.$root" is a group\'s own token');
+  });
+
+  it("names a $type that is not a name, on a token and on a group", () => {
+    // On a token the group's type is used instead, so the token still arrives.
+    const onToken = {
+      group: { $type: "number", foo: { $type: 42, $value: 1 } },
+    };
+    expect(dtcgToTokens(onToken).tokens.map(token => token.kind)).toEqual([
+      "number",
+    ]);
+    expect(said(onToken)).toContain('"group.foo.$type" is not a usable type');
+    // On a group its children inherit nothing from it.
+    const onGroup = { group: { $type: 42, foo: { $value: 1 } } };
+    expect(said(onGroup)).toContain('"group.$type" is not a usable type');
+  });
+
+  it("names a reserved field it does not read, wherever it sits", () => {
+    const document = {
+      $themes: [],
+      foo: { $type: "number", $value: 1, $deprecated: true },
+      palette: { $extends: "{base}" },
+    };
+    expect(names(document)).toEqual(["foo"]);
+    expect(said(document)).toContain(
+      '"$themes" is a design-token field this site does not read'
+    );
+    // The format's own fields are named for what was lost, not as unknowns.
+    expect(said(document)).toContain('"foo.$deprecated" marks it deprecated');
+    expect(said(document)).toContain(
+      '"palette.$extends" inherits from another group'
+    );
+  });
+
+  it("names a group's description and extensions", () => {
+    const document = {
+      color: {
+        $description: "The brand palette",
+        $extensions: { "com.figma": { collection: "Brand" } },
+        ink: { $type: "number", $value: 1 },
+      },
+    };
+    expect(said(document)).toContain('"color.$description" belongs to a group');
+    expect(said(document)).toContain('"color.$extensions" belongs to a group');
+  });
+
+  it("names a token's description or extensions in a shape it cannot keep", () => {
+    const description = {
+      foo: { $type: "number", $value: 1, $description: 42 },
+    };
+    expect(names(description)).toEqual(["foo"]);
+    expect(said(description)).toContain('"foo.$description" is not a string');
+    const extensions = {
+      foo: { $type: "number", $value: 1, $extensions: "x" },
+    };
+    expect(said(extensions)).toContain('"foo.$extensions" is not an object');
+  });
+
+  describe("a type the stored kind overrode", () => {
+    const storedNumber = {
+      "com.nextlyhq.nextly": { css: { light: "5" }, kind: "number" },
+    };
+
+    it("names a token's own type that disagrees with the stored kind", () => {
+      // The stored kind wins, and the next export writes the token's type from
+      // it — so a file stating another type loses that type without a word.
+      const document = {
+        t: { $type: "color", $value: 1, $extensions: storedNumber },
+      };
+      expect(dtcgToTokens(document).tokens[0]?.kind).toBe("number");
+      expect(said(document)).toContain('"t" is read as the kind "number"');
+      expect(said(document)).toContain('the type "color"');
+    });
+
+    it("names an inherited or unmapped type that disagrees", () => {
+      const inherited = {
+        g: { $type: "color", t: { $value: 1, $extensions: storedNumber } },
+      };
+      expect(said(inherited)).toContain('"g.t" is read as the kind "number"');
+      const unmapped = {
+        t: { $type: "gradient", $value: 1, $extensions: storedNumber },
+      };
+      expect(said(unmapped)).toContain('the type "gradient"');
+    });
+
+    it("says nothing when the stated type is the stored kind's type", () => {
+      // The control: every file this system writes carries both, agreeing.
+      const agreeing = {
+        t: { $type: "number", $value: 5, $extensions: storedNumber },
+      };
+      expect(dtcgToTokens(agreeing).issues).toEqual([]);
+      const noType = { t: { $value: 5, $extensions: storedNumber } };
+      expect(dtcgToTokens(noType).issues).toEqual([]);
+    });
+  });
+
+  it("calls $extends an inheritance only when it names something", () => {
+    // `$extends` is a reference to another group. A value that is not a
+    // non-empty string references nothing, so there is no inheritance to have
+    // lost — only a malformed field.
+    for (const stated of [
+      42,
+      null,
+      "",
+      [],
+      { group: "base" },
+      // A string that is not a DTCG reference: a reference is `{group.path}`.
+      "base",
+      "   ",
+      "{}",
+      "{ }",
+      "{base",
+      "{a..b}",
+      "{a.}",
+      // A `$`-prefixed segment is one of the format's own keys, which the walk
+      // never reads as a group, so a path through one names no group either.
+      "{base.$private}",
+      "{$root}",
+      "{a.$b}",
+    ]) {
+      const document = {
+        g: { $extends: stated, t: { $type: "number", $value: 1 } },
+      };
+      expect(said(document)).toContain(
+        '"g.$extends" is a design-token field this site does not read'
+      );
+      expect(said(document)).not.toContain("inherits from another group");
+    }
+    const referencing = { g: { $extends: "{base}", t: { $value: 1 } } };
+    expect(said(referencing)).toContain(
+      '"g.$extends" inherits from another group'
+    );
+  });
+
+  it("reads a key as a group name exactly when a reference may name it", () => {
+    // A reference names a group, so a segment it accepts must be one the walk
+    // accepts as a group's name, and a segment the walk refuses must name
+    // nothing. Each key is judged by the WALK's own line about it: the
+    // reserved-field line when it routes the key aside, the malformed-name line
+    // when it rejects the name. A token name coming back would not do, because
+    // later checks refuse `$private.t` whether or not the walk routed it aside.
+    const walkRefusals = (key: string): string[] => [
+      `"${key}" is a design-token field this site does not read`,
+      `"${key}" is not a usable name in a design-token file`,
+    ];
+    const rows: { key: string; refusedBy?: number }[] = [
+      { key: "brand" },
+      { key: "$private", refusedBy: 0 },
+      { key: "$root", refusedBy: 0 },
+      { key: "a{b", refusedBy: 1 },
+      { key: "a}b", refusedBy: 1 },
+    ];
+    for (const { key, refusedBy } of rows) {
+      const walk = said({ [key]: { t: { $type: "number", $value: 1 } } });
+      // Each refusal is observed by its own line, so a key the walk accepts
+      // cannot pass merely because neither line was written.
+      const refused = walkRefusals(key).map(line => walk.includes(line));
+      expect({ key, refused }).toEqual({
+        key,
+        refused: walkRefusals(key).map((_, index) => index === refusedBy),
+      });
+      const referenced = said({
+        g: { $extends: `{${key}}`, t: { $type: "number", $value: 1 } },
+      }).includes("inherits from another group");
+      expect({ key, referenced }).toEqual({
+        key,
+        referenced: refusedBy === undefined,
+      });
+    }
+  });
+
+  it("never says a token arrived or was imported, which only the merge decides", () => {
+    /*
+     * The reader cannot know whether a token lands: an import can still refuse
+     * it afterwards, for a clash with the site's own tokens. So every line the
+     * reader writes about a token it read describes the READ. A line saying
+     * the token arrived or was imported would contradict that refusal.
+     */
+    const stored = (css: unknown, kind = "number") => ({
+      "com.nextlyhq.nextly": { css, kind },
+    });
+    const document = {
+      typed: {
+        $type: "color",
+        $value: 1,
+        $extensions: stored({ light: "5" }),
+      },
+      darkened: {
+        $type: "number",
+        $value: 5,
+        $extensions: stored({ light: "5", dark: 42 }),
+      },
+      // A COLOUR, because only a colour can be shown to differ in meaning: for
+      // other kinds a different spelling may be the same value, so the reader
+      // stays silent and this row would say nothing.
+      valued: {
+        $type: "color",
+        $value: { colorSpace: "srgb", components: [0, 0, 0] },
+        $extensions: stored({ light: "#111111" }, "color"),
+      },
+    };
+    const read = dtcgToTokens(document);
+    expect(read.tokens).toHaveLength(3);
+    // The control: each of the three says something, so silence cannot pass.
+    for (const name of ["typed", "darkened", "valued"]) {
+      expect(said(document)).toContain(`"${name}`);
+    }
+    for (const item of read.issues) {
+      expect(item.message).not.toMatch(/\barrived\b|\bwas imported\b/);
+    }
+  });
+
+  it("calls a group's $root a token only when it has a token's shape", () => {
+    // `$root` names a group's own token, and a token is an object carrying
+    // `$value`. Anything else under that key is malformed input, and naming it
+    // as a skipped token would describe something the file does not hold.
+    for (const stated of [42, "x", null, [], {}, { $type: "number" }]) {
+      const document = {
+        g: { $root: stated, t: { $type: "number", $value: 1 } },
+      };
+      expect(said(document)).toContain(
+        '"g.$root" is a design-token field this site does not read'
+      );
+      expect(said(document)).not.toContain("group's own token");
+    }
+    const tokenShaped = { g: { $root: { $value: 1 }, t: { $value: 2 } } };
+    expect(said(tokenShaped)).toContain('"g.$root" is a group\'s own token');
+  });
+
+  describe("a type the reader could not use", () => {
+    it("is still named when the token's value is refused as unsafe", () => {
+      // Refused after the kind is chosen, by the writability guard. The type
+      // was ignored whatever the value held, so it is named; the lines that
+      // only describe an IMPORTED token — an unusable dark value — are not.
+      const document = {
+        g: {
+          $type: "dimension",
+          t: {
+            $type: 42,
+            $value: 1,
+            $extensions: {
+              "com.nextlyhq.nextly": {
+                css: { light: "url(evil)", dark: 42 },
+                kind: "number",
+              },
+            },
+          },
+        },
+      };
+      expect(names(document)).toEqual([]);
+      expect(said(document)).toContain('"g.t.$type" is not a usable type');
+      expect(said(document)).not.toContain("group's type");
+      expect(said(document)).not.toContain("css.dark");
+    });
+
+    const stored = {
+      "com.nextlyhq.nextly": { css: { light: "5" }, kind: "number" },
+    };
+
+    it("says the group's type stood in only when it did", () => {
+      const fellBack = { g: { $type: "number", t: { $type: 42, $value: 1 } } };
+      expect(dtcgToTokens(fellBack).tokens[0]?.kind).toBe("number");
+      expect(said(fellBack)).toContain('"g.t.$type" is not a usable type');
+      expect(said(fellBack)).toContain('the group\'s type "number" was used');
+      // One line for one field: naming it structurally AND where the kind is
+      // chosen would tell the author twice.
+      const lines = dtcgToTokens(fellBack).issues.filter(item =>
+        item.message.includes('"g.t.$type"')
+      );
+      expect(lines).toHaveLength(1);
+    });
+
+    it("does not credit the group when this system's stored kind was used", () => {
+      const document = {
+        g: {
+          $type: "dimension",
+          t: { $type: 42, $value: 1, $extensions: stored },
+        },
+      };
+      expect(dtcgToTokens(document).tokens[0]?.kind).toBe("number");
+      expect(said(document)).toContain('"g.t.$type" is not a usable type');
+      expect(said(document)).not.toContain("group's type");
+    });
+
+    it("does not credit a group a root token does not have", () => {
+      const kept = { t: { $type: 42, $value: 1, $extensions: stored } };
+      expect(names(kept)).toEqual(["t"]);
+      expect(said(kept)).not.toContain("group's type");
+      // Refused for want of any type: the field is still named, with no group.
+      const refused = { t: { $type: 42, $value: 1 } };
+      expect(names(refused)).toEqual([]);
+      expect(said(refused)).toContain('"t.$type" is not a usable type');
+      expect(said(refused)).not.toContain("group's type");
+    });
+
+    it("is named ahead of every refusal, whichever check refused the token", () => {
+      // An unusable type is ignored whatever else is wrong with the token, so
+      // each way of refusing one still names it, before the refusal and
+      // crediting no group. Each row reaches a different refusal, which the
+      // row's own line proves.
+      const long = "g".repeat(MAX_TOKEN_NAME_LENGTH);
+      const badType = { $type: 42, $value: 1 };
+      const rows: {
+        label: string;
+        document: object;
+        at: string;
+        refusal: string;
+      }[] = [
+        {
+          label: "a name holding a forbidden character",
+          document: { "a{b": badType },
+          at: "a{b",
+          refusal: "may not contain",
+        },
+        {
+          label: "a name this site cannot author",
+          document: { Brand: badType },
+          at: "Brand",
+          refusal: '"Brand" is not a usable token name',
+        },
+        {
+          label: "an id that is not a usable name",
+          document: {
+            t: {
+              ...badType,
+              $extensions: { [NEXTLY_EXTENSION]: { id: "Bad Id" } },
+            },
+          },
+          at: "t",
+          refusal: "carries an id that is not a usable token name",
+        },
+        {
+          label: "a name over the length cap",
+          document: { [long]: { t: badType } },
+          at: `${long}.t`,
+          refusal: "is written under more than",
+        },
+        {
+          label: "no type to take a kind from",
+          document: { t: badType },
+          at: "t",
+          refusal: "which this site has no token kind for",
+        },
+        {
+          label: "a value the kind cannot read",
+          document: { g: { $type: "number", t: { $type: 42, $value: "x" } } },
+          at: "g.t",
+          refusal: "has a value that could not be read",
+        },
+      ];
+      for (const { label, document, at, refusal } of rows) {
+        const read = dtcgToTokens(document);
+        const lines = read.issues.map(item => item.message);
+        const typeLine = lines.findIndex(line =>
+          line.startsWith(`"${at}.$type" is not a usable type`)
+        );
+        const refusalLine = lines.findIndex(line => line.includes(refusal));
+        expect({ label, tokens: read.tokens.length }).toEqual({
+          label,
+          tokens: 0,
+        });
+        expect({ label, refused: refusalLine >= 0 }).toEqual({
+          label,
+          refused: true,
+        });
+        expect({ label, typeLine: typeLine >= 0 }).toEqual({
+          label,
+          typeLine: true,
+        });
+        expect({ label, before: typeLine < refusalLine }).toEqual({
+          label,
+          before: true,
+        });
+        expect({
+          label,
+          credited: lines.join("\n").includes("group's type"),
+        }).toEqual({
+          label,
+          credited: false,
+        });
+      }
+    });
+  });
+
+  it("does not say a refused token arrived without its metadata", () => {
+    // A field in a shape the reader cannot take is ignored whatever becomes of
+    // the token, so the line says only that; the refusal says the rest.
+    const document = {
+      t: { $type: "gradient", $value: 1, $description: 42, $extensions: "x" },
+    };
+    expect(names(document)).toEqual([]);
+    expect(said(document)).toContain('"t.$description" is not a string');
+    expect(said(document)).toContain('"t.$extensions" is not an object');
+    expect(said(document)).toContain("no token kind for");
+    expect(said(document)).not.toContain("arrived");
+  });
+
+  describe("a deprecation says what the file says", () => {
+    const rows = [
+      { label: "true", stated: true, says: "marks it deprecated" },
+      { label: "a reason", stated: "Use ink", says: "marks it deprecated" },
+      { label: "false", stated: false, says: "clears a deprecation" },
+      { label: "a number", stated: 42, says: "is not a usable deprecation" },
+      { label: "null", stated: null, says: "is not a usable deprecation" },
+    ];
+
+    for (const { label, stated, says } of rows) {
+      it(`on a token given ${label}`, () => {
+        const document = {
+          foo: { $type: "number", $value: 1, $deprecated: stated },
+        };
+        expect(names(document)).toEqual(["foo"]);
+        expect(said(document)).toContain(`"foo.$deprecated" ${says}`);
+        if (says !== "marks it deprecated") {
+          expect(said(document)).not.toContain("marks it deprecated");
+        }
+      });
+    }
+
+    it("on a group that clears it", () => {
+      const document = {
+        g: { $deprecated: false, t: { $type: "number", $value: 1 } },
+      };
+      expect(said(document)).toContain('"g.$deprecated" clears a deprecation');
+      expect(said(document)).not.toContain("marks it deprecated");
+    });
+  });
+
+  it("gives a group-only field on a token the plain unread line", () => {
+    // `$extends` and `$root` mean something only on a group. On a token there
+    // is nothing to inherit and no group token to hold, so calling either a
+    // lost inheritance or a group's token would describe a loss that did not
+    // happen.
+    const document = {
+      foo: {
+        $type: "number",
+        $value: 1,
+        $extends: "{base}",
+        $root: { $value: 2 },
+      },
+    };
+    expect(names(document)).toEqual(["foo"]);
+    expect(said(document)).toContain(
+      '"foo.$extends" is a design-token field this site does not read'
+    );
+    expect(said(document)).toContain(
+      '"foo.$root" is a design-token field this site does not read'
+    );
+    expect(said(document)).not.toContain("inherits from another group");
+    expect(said(document)).not.toContain("group's own token");
+  });
+
+  describe("reports a field exactly when the reader did not take it", () => {
+    /*
+     * The property the report exists for, asserted as AGREEMENT over several
+     * shapes of each field rather than as one message per shape: a type is said
+     * to be unusable if and only if the token did not take it. Widening what
+     * the reader accepts without the report, or the report without the reader,
+     * breaks one of these rows whatever the code looks like.
+     */
+    /*
+     * Labelled rows walked by a loop rather than `it.each`: `it.each` spreads an
+     * ARRAY row into arguments, so a row meant to test the array `["number"]`
+     * tested the string `"number"` instead, and the array shapes went untested.
+     */
+    const types = [
+      { label: "a name", stated: "number" },
+      { label: "a number", stated: 42 },
+      { label: "null", stated: null },
+      { label: "an array", stated: ["number"] },
+      { label: "an object", stated: { name: "number" } },
+    ];
+
+    for (const { label, stated } of types) {
+      it(`a token's $type given ${label}`, () => {
+        // A group type the stated one must beat, so "taken" is observable.
+        const read = dtcgToTokens({
+          g: { $type: "fontWeight", t: { $type: stated, $value: 400 } },
+        });
+        expect(read.tokens).toHaveLength(1);
+        const taken = read.tokens[0]?.kind === "number";
+        const reported = read.issues.some(item =>
+          item.message.includes('"g.t.$type" is not a usable type')
+        );
+        expect(reported).toBe(!taken);
+      });
+
+      it(`a group's $type given ${label}`, () => {
+        // With no type of its own the token has only the group's to inherit.
+        const read = dtcgToTokens({ g: { $type: stated, t: { $value: 400 } } });
+        const taken = read.tokens.length === 1;
+        const reported = read.issues.some(item =>
+          item.message.includes('"g.$type" is not a usable type')
+        );
+        expect(reported).toBe(!taken);
+      });
+    }
+
+    const descriptions = [
+      { label: "text", stated: "fine" },
+      { label: "a number", stated: 42 },
+      { label: "null", stated: null },
+      { label: "an array", stated: ["fine"] },
+      { label: "an object", stated: { text: "fine" } },
+    ];
+
+    for (const { label, stated } of descriptions) {
+      it(`a token's $description given ${label}`, () => {
+        const read = dtcgToTokens({
+          t: { $type: "number", $value: 1, $description: stated },
+        });
+        expect(read.tokens).toHaveLength(1);
+        const taken = read.tokens[0]?.description !== undefined;
+        const reported = read.issues.some(item =>
+          item.message.includes('"t.$description" is not a string')
+        );
+        expect(reported).toBe(!taken);
+      });
+    }
+
+    const extensions = [
+      { label: "an object", stated: { "com.figma": { id: 1 } } },
+      { label: "text", stated: "x" },
+      { label: "null", stated: null },
+      { label: "an array", stated: [{ "com.figma": { id: 1 } }] },
+      { label: "a number", stated: 7 },
+    ];
+
+    for (const { label, stated } of extensions) {
+      it(`a token's $extensions given ${label}`, () => {
+        const read = dtcgToTokens({
+          t: { $type: "number", $value: 1, $extensions: stated },
+        });
+        expect(read.tokens).toHaveLength(1);
+        const taken = read.tokens[0]?.extensions !== undefined;
+        const reported = read.issues.some(item =>
+          item.message.includes('"t.$extensions" is not an object')
+        );
+        expect(reported).toBe(!taken);
+      });
+    }
+  });
+
+  it("says nothing about metadata a token keeps", () => {
+    const document = {
+      foo: {
+        $type: "number",
+        $value: 1,
+        $description: "fine",
+        $extensions: { "com.figma": { id: 1 } },
+      },
+    };
+    expect(dtcgToTokens(document).issues).toEqual([]);
+  });
+
+  describe("this system's own extension", () => {
+    const withOwn = (own: unknown, type = "number"): unknown => ({
+      thing: {
+        $type: type,
+        $value: 1,
+        $extensions: { "com.nextlyhq.nextly": own },
+      },
+    });
+
+    it("names the key when it is not an object", () => {
+      expect(names(withOwn("future"))).toEqual(["thing"]);
+      expect(said(withOwn("future"))).toContain(
+        '"thing.$extensions.com.nextlyhq.nextly" is not an object'
+      );
+    });
+
+    it("names stored values it passed over for $value", () => {
+      const own = { css: { light: "99" }, kind: "bogus" };
+      expect(dtcgToTokens(withOwn(own)).tokens[0]?.values.light).toBe("1");
+      expect(said(withOwn(own))).toContain(
+        "does not state values this site can read"
+      );
+    });
+
+    it("names a stored dark value it could not take", () => {
+      const own = { css: { light: "5", dark: 42 }, kind: "number" };
+      expect(dtcgToTokens(withOwn(own)).tokens[0]?.values).toEqual({
+        light: "5",
+      });
+      expect(said(withOwn(own))).toContain('css.dark" is not a string');
+    });
+
+    it("says nothing about an extension carrying only an identity", () => {
+      expect(dtcgToTokens(withOwn({ id: "kept.identity" })).issues).toEqual([]);
+    });
+
+    it("does not claim $value was used for a token it refused", () => {
+      /*
+       * Reported where the reader CHOOSES $value, and only once that token is
+       * imported. Judged from the file's shape alone, this said "read from
+       * $value instead" beside the line saying the token was skipped.
+       */
+      const document = withOwn(
+        { css: { light: "99" }, kind: "bogus" },
+        "gradient"
+      );
+      expect(names(document)).toEqual([]);
+      expect(said(document)).toContain("no token kind for");
+      expect(said(document)).not.toContain(
+        "does not state values this site can read"
+      );
+    });
+  });
+});
+
+describe("a variable's plain label across the format", () => {
+  it("round-trips under this system's own extension", () => {
+    const token: SiteToken = {
+      name: "color.brand",
+      label: "Brand blue",
+      kind: "color",
+      values: { light: "#1d2b6b", dark: "#8fa7ff" },
+    };
+    const { document } = tokensToDtcg({ tokens: [token] });
+    const back = dtcgToTokens(document);
+    expect(back.tokens).toEqual([token]);
+  });
+
+  it("drops a label it cannot show, keeping the token and saying so", () => {
+    const back = dtcgToTokens({
+      color: {
+        brand: {
+          $type: "color",
+          $value: "#123456",
+          $extensions: {
+            "com.nextlyhq.nextly": {
+              css: { light: "#123456" },
+              kind: "color",
+              label: "x".repeat(500),
+            },
+          },
+        },
+      },
+    });
+    expect(back.tokens).toHaveLength(1);
+    expect(back.tokens[0]?.label).toBeUndefined();
+    expect(back.issues.map(i => i.message).join(" ")).toMatch(/label/);
+  });
+});
+
+describe("aliases, resolved on import", () => {
+  const base = {
+    color: {
+      $type: "color",
+      blue: {
+        $value: {
+          colorSpace: "srgb",
+          components: [29 / 255, 43 / 255, 107 / 255],
+          hex: "#1d2b6b",
+        },
+      },
+    },
+  };
+
+  it("takes the value a whole-token alias points at", () => {
+    const { tokens, issues } = dtcgToTokens({
+      ...base,
+      brand: { $type: "color", $value: "{color.blue}" },
+    });
+    expect(tokens.find(t => t.name === "brand")?.values.light).toBe("#1d2b6b");
+    expect(issues).toEqual([]);
+  });
+
+  it("follows a chain, and takes the type from the end of it", () => {
+    const { tokens } = dtcgToTokens({
+      ...base,
+      accent: { $value: "{brand}" },
+      brand: { $value: "{color.blue}" },
+    });
+    expect(tokens.find(t => t.name === "accent")).toMatchObject({
+      kind: "color",
+      values: { light: "#1d2b6b" },
+    });
+  });
+
+  it("reads a $ref written as a JSON pointer", () => {
+    const { tokens } = dtcgToTokens({
+      ...base,
+      brand: { $type: "color", $value: { $ref: "#/color/blue/$value" } },
+    });
+    expect(tokens.find(t => t.name === "brand")?.values.light).toBe("#1d2b6b");
+  });
+
+  it("skips a cycle, naming it, and keeps everything else", () => {
+    const { tokens, issues } = dtcgToTokens({
+      ...base,
+      a: { $type: "color", $value: "{b}" },
+      b: { $type: "color", $value: "{a}" },
+    });
+    expect(tokens.map(t => t.name)).toEqual(["color.blue"]);
+    expect(issues.map(i => i.message).join(" ")).toMatch(/"a".*loop/);
+  });
+
+  it("skips an alias whose target is missing", () => {
+    const { tokens, issues } = dtcgToTokens({
+      brand: { $type: "color", $value: "{color.nowhere}" },
+    });
+    expect(tokens).toEqual([]);
+    expect(issues.map(i => i.message).join(" ")).toMatch(
+      /"brand".*"color\.nowhere".*no token/
+    );
+  });
+
+  it("skips an alias whose stated type disagrees with its target", () => {
+    const { tokens, issues } = dtcgToTokens({
+      ...base,
+      gap: { $type: "dimension", $value: "{color.blue}" },
+    });
+    expect(tokens.map(t => t.name)).toEqual(["color.blue"]);
+    expect(issues.map(i => i.message).join(" ")).toMatch(
+      /"gap".*dimension.*color/
+    );
+  });
+
+  it("leaves the document it was given untouched", () => {
+    const document = {
+      ...base,
+      brand: { $type: "color", $value: "{color.blue}" },
+    };
+    const before = JSON.stringify(document);
+    resolveAliases(document);
+    expect(JSON.stringify(document)).toBe(before);
+  });
+});
+
+/**
+ * Every variable leaves in the file, whatever the format can type.
+ *
+ * DTCG has no type for a custom value, and no conformant value for a shadow
+ * this site keeps as CSS, an `em` size, a percentage or a fluid `clamp()`.
+ * Those used to be dropped, which lost most of a default site's spacing.
+ */
+describe("every variable, whatever the format can type", () => {
+  const ONE_OF_EACH: SiteToken[] = [
+    { name: "brand.ink", kind: "color", values: { light: "#123456" } },
+    { name: "gap.small", kind: "dimension", values: { light: "4px" } },
+    { name: "gap.em", kind: "dimension", values: { light: "0.75em" } },
+    { name: "gap.half", kind: "dimension", values: { light: "50%" } },
+    {
+      name: "gap.hero",
+      label: "Hero gap",
+      kind: "dimension",
+      values: {
+        light: "clamp(1rem, 0.5rem + 2vw, 2rem)",
+        dark: "clamp(1rem, 0.5rem + 3vw, 3rem)",
+      },
+      description: "Space above a hero.",
+    },
+    { name: "type.serif", kind: "fontFamily", values: { light: "Georgia" } },
+    { name: "type.heavy", kind: "fontWeight", values: { light: "800" } },
+    { name: "type.ratio", kind: "number", values: { light: "1.25" } },
+    { name: "motion.slow", kind: "duration", values: { light: "400ms" } },
+    {
+      id: "shadow.raised",
+      name: "shadow.card",
+      label: "Card",
+      kind: "shadow",
+      values: {
+        light: "0 1px 2px rgb(0 0 0 / 0.1)",
+        dark: "0 1px 2px rgb(0 0 0 / 0.6)",
+      },
+      description: "Under a card.",
+      extensions: { "com.example": { keep: true } },
+    },
+    { name: "misc.ratio", kind: "custom", values: { light: "16 / 9" } },
+  ];
+  const ALL: SiteToken[] = [...defaultSiteTokens(), ...ONE_OF_EACH];
+  const byName = (list: readonly SiteToken[]) =>
+    [...list].sort((a, b) => a.name.localeCompare(b.name));
+
+  /** The exported file as another tool receives it: plain JSON. */
+  const exported = () => {
+    const { document, issues } = tokensToDtcg(tokens(ALL));
+    return {
+      file: JSON.parse(JSON.stringify(document)) as DtcgNode,
+      issues,
+    };
+  };
+
+  it("exports every variable and reads each back exactly", () => {
+    const { file, issues } = exported();
+    expect(issues).toEqual([]);
+    const read = dtcgToTokens(file);
+    expect(read.issues).toEqual([]);
+    // Every field, a colour's display group included.
+    expect(byName(read.tokens)).toEqual(byName(ALL));
+  });
+
+  it("keeps a default site's spacing, fluid and em sizes included", () => {
+    const { file } = exported();
+    const names = dtcgToTokens(file).tokens.map(token => token.name);
+    for (const name of [
+      "space.stack",
+      "space.section-y",
+      "space.gutter",
+      "space.columns",
+      "space.card",
+      "space.paragraph",
+    ]) {
+      expect(names).toContain(name);
+    }
+  });
+
+  it("writes a fluid size as its largest px value, with its clamp() in the description", () => {
+    const { file } = exported();
+    const stack = (file.space as Record<string, DtcgNode>).stack;
+    // `clamp(1rem, 0.875rem + 0.5vw, 1.25rem)`: 1.25rem is 20px.
+    expect(stack?.$value).toEqual({ value: 20, unit: "px" });
+    expect(stack?.$description).toContain(
+      "clamp(1rem, 0.875rem + 0.5vw, 1.25rem)"
+    );
+    // A fluid size with its own description keeps it, and the import gives
+    // back only the description the author wrote.
+    const hero = (file.gap as Record<string, DtcgNode>).hero;
+    expect(hero?.$description).toContain("Space above a hero.");
+    expect(hero?.$description).toContain("clamp(1rem, 0.5rem + 2vw, 2rem)");
+  });
+
+  it("carries what the format cannot type in this system's extension, not as a token", () => {
+    const { file } = exported();
+    const carried = (
+      (file.$extensions as DtcgNode)[NEXTLY_EXTENSION] as DtcgNode
+    ).variables as DtcgNode;
+    expect(Object.keys(carried).sort()).toEqual(
+      ["gap.em", "gap.half", "misc.ratio", "space.paragraph"].sort()
+    );
+    // A shadow whose CSS reads as fields is a DTCG shadow token.
+    expect(((file.shadow as DtcgNode).card as DtcgNode).$type).toBe("shadow");
+    // None of them is also written as a token with a type of its own making.
+    expect((file.gap as DtcgNode).em).toBeUndefined();
+    expect((file.misc as DtcgNode | undefined)?.ratio).toBeUndefined();
+  });
+
+  it("says a carried variable's stored data could not be read, not that it has no type", () => {
+    const read = dtcgToTokens({
+      $extensions: {
+        [NEXTLY_EXTENSION]: {
+          variables: {
+            "gap.odd": {
+              $extensions: { [NEXTLY_EXTENSION]: { kind: "bogus" } },
+            },
+          },
+        },
+      },
+    });
+    expect(read.tokens).toEqual([]);
+    const said = read.issues.map(i => i.message).join(" ");
+    expect(said).toContain("gap.odd");
+    expect(said).toContain("could not be read");
+    expect(said).not.toContain('the type "none"');
+  });
+
+  it("takes a fluid size's description edited by another tool", () => {
+    const { file } = exported();
+    const stack = (file.space as Record<string, DtcgNode>).stack as DtcgNode;
+    stack.$description = "Edited in a design tool.";
+    const read = dtcgToTokens(file);
+    expect(
+      read.tokens.find(token => token.name === "space.stack")?.description
+    ).toBe("Edited in a design tool.");
+  });
+
+  it("writes a file that is valid DTCG", () => {
+    expect(dtcgProblems(exported().file)).toEqual([]);
+  });
+
+  it("CONTROL: the validity check finds an invented type and a bad dimension", () => {
+    expect(
+      dtcgProblems({
+        a: { $type: "custom", $value: "x" },
+        b: { $type: "dimension", $value: { value: 1, unit: "em" } },
+      })
+    ).toHaveLength(2);
+  });
+});
+
+/** The DTCG 2025.10 types, which a token's `$type` must be one of. */
+const DTCG_TYPES = new Set([
+  "color",
+  "dimension",
+  "fontFamily",
+  "fontWeight",
+  "duration",
+  "cubicBezier",
+  "number",
+  "strokeStyle",
+  "border",
+  "transition",
+  "shadow",
+  "gradient",
+  "typography",
+]);
+
+/**
+ * What makes a document not valid DTCG, for the shapes this system writes:
+ * names, token fields, every token's `$type`, and the value each type takes.
+ * The root may carry `$extensions`, as any group may.
+ */
+function dtcgProblems(node: DtcgNode, at = ""): string[] {
+  return Object.entries(node).flatMap(([key, child]) => {
+    const here = at === "" ? key : `${at}.${key}`;
+    if (key.startsWith("$")) {
+      return GROUP_FIELDS.has(key)
+        ? []
+        : [`${here}: a group field the format does not define`];
+    }
+    const named = /[.{}]/.test(key) ? [`${here}: a name with . { or }`] : [];
+    if (typeof child !== "object" || child === null) {
+      return [...named, `${here}: neither a token nor a group`];
+    }
+    const entry = child as DtcgNode;
+    return [
+      ...named,
+      ...("$value" in entry
+        ? tokenProblems(entry, here)
+        : dtcgProblems(entry, here)),
+    ];
+  });
+}
+
+const GROUP_FIELDS = new Set(["$extensions", "$description", "$type"]);
+const TOKEN_FIELDS = new Set([
+  "$type",
+  "$value",
+  "$description",
+  "$extensions",
+]);
+
+/** What makes one token invalid: an unknown field, no type, or a bad value. */
+function tokenProblems(entry: DtcgNode, here: string): string[] {
+  const fields = Object.keys(entry)
+    .filter(field => !TOKEN_FIELDS.has(field))
+    .map(() => `${here}: a token field the format does not define`);
+  const type = entry.$type;
+  if (typeof type !== "string" || !DTCG_TYPES.has(type)) {
+    return [...fields, `${here}: no DTCG type`];
+  }
+  const value = valueProblem(type, entry.$value);
+  return value === undefined ? fields : [...fields, `${here}: ${value}`];
+}
+
+/** A measure the format allows: a number with one of `units`. */
+const measureIn =
+  (units: readonly string[], type: string) =>
+  (value: unknown): string | undefined => {
+    const object = (value ?? {}) as DtcgNode;
+    return typeof object.value === "number" &&
+      units.includes(object.unit as string)
+      ? undefined
+      : `a ${type} value the format does not allow`;
+  };
+
+/** What is wrong with a value, per type, for the types this system writes. */
+const VALUE_CHECKS: Readonly<
+  Record<string, (value: unknown) => string | undefined>
+> = {
+  dimension: measureIn(["px", "rem"], "dimension"),
+  duration: measureIn(["ms", "s"], "duration"),
+  color: value =>
+    Array.isArray(((value ?? {}) as DtcgNode).components)
+      ? undefined
+      : "a colour without components",
+  number: value =>
+    typeof value === "number" ? undefined : "a number that is not a number",
+};
+
+function valueProblem(type: string, value: unknown): string | undefined {
+  return VALUE_CHECKS[type]?.(value);
+}

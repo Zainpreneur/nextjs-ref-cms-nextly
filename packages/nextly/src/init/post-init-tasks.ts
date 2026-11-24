@@ -1,0 +1,222 @@
+/**
+ * Nextly Initialization — Post-Init Tasks
+ *
+ * Idempotent background tasks executed after the DI container has been
+ * registered. Extracted from `init.ts` so the initialization orchestrator
+ * can stay focused on lifecycle/cache concerns.
+ *
+ * @module init/post-init-tasks
+ */
+
+import { isNextBuildPhase } from "@nextlyhq/adapter-drizzle/build-phase";
+
+import { repairSqliteRegistryTimestamps } from "../database/repair-sqlite-registry-timestamps";
+import {
+  repairSqliteTimestamps,
+  TIMESTAMP_REPAIR_META_KEY,
+  type TimestampRepairsDone,
+} from "../database/repair-sqlite-timestamps";
+import { getService } from "../di/service-access";
+import { warnAboutUnusableProviders } from "../domains/email/boot-check";
+import { warnAboutLateQueuedEmail } from "../domains/email/queued-email-warning";
+import { getEmailProviderRegistry } from "../domains/email/services/email-provider-registry";
+import { ownershipFromConfig } from "../domains/email/template-ownership";
+import { provisionUserFieldStorage } from "../domains/users/services/provision-user-field-storage";
+
+import { isProductionStart } from "./production-start";
+
+/**
+ * Sync the code-defined user fields, merge them with the admin's, and make sure
+ * user_ext has a column for each.
+ *
+ * Part of the start, not of the work it leaves running: until the merged
+ * fields are loaded, the user services see the code's fields alone, so a
+ * request served before then reads a person without the admin's fields and an
+ * update to one is dropped while reporting success. `nextly migrate` runs the
+ * same step (`provisionUserFieldStorage`); here it also keeps a development
+ * database current as fields change. A production start only loads the merged
+ * fields: the definitions and their columns are `nextly migrate`'s to write,
+ * so it writes neither. Never throws: nothing here may stop the app starting.
+ */
+export async function provisionUserFieldsAtStart(): Promise<void> {
+  try {
+    if (isProductionStart()) {
+      await getService("userExtSchemaService").loadMergedFields();
+      return;
+    }
+    await provisionUserFieldStorage({
+      codeFields: getService("config").users?.fields ?? [],
+      fieldDefService: getService("userFieldDefinitionService"),
+      userExtSchemaService: getService("userExtSchemaService"),
+      db: getService("adapter").getDrizzle(),
+      // A sync that fails (its table not migrated yet) doesn't stop the table
+      // being made for the fields already recorded, and nothing here may stop
+      // the app starting.
+      bestEffort: true,
+    });
+  } catch {
+    // Silently skip — the user services may not be registered
+  }
+}
+
+/**
+ * SQLite's timestamp repairs, each once, under one mark.
+ *
+ * The first rewrites timestamps an older SQLite writer stored as text. It scans every table, and
+ * leaving both encodings in one column is worse than either alone: SQLite orders integers before
+ * text whatever the values say, so a half-repaired database sorts wrongly while looking fine.
+ * The second rewrites the registries' timestamps an earlier release wrote in milliseconds.
+ *
+ * One mark records both, so a later start reads it once and sends nothing for either. A date
+ * alone is the mark of the first, written before the second was added: that database owes only
+ * the second. A failed repair never stops the app starting; the mark stays as it was, so the next
+ * start tries again. Nothing during a build, or on another dialect.
+ */
+async function repairSqliteTimestampsOnce(building: boolean): Promise<void> {
+  try {
+    const adapter = getService("adapter");
+    if (adapter.dialect !== "sqlite" || building) return;
+    const meta = getService("metaService");
+    const done = await meta.get<string | TimestampRepairsDone>(
+      TIMESTAMP_REPAIR_META_KEY
+    );
+    if (typeof done === "object" && done?.registries) return;
+    const logger = getService("logger");
+    if (!done) {
+      const { repaired, columns } = await repairSqliteTimestamps(adapter);
+      if (repaired > 0) {
+        logger.info(
+          `Repaired ${repaired} timestamp(s) stored as text in ${columns.length} column(s)`,
+          { columns }
+        );
+      }
+    }
+    const registries = await repairSqliteRegistryTimestamps(adapter);
+    if (registries.repaired > 0) {
+      logger.info(
+        `Repaired the timestamps of ${registries.repaired} registry row(s) stored in milliseconds`
+      );
+    }
+    const mark: TimestampRepairsDone = {
+      at: new Date().toISOString(),
+      registries: true,
+    };
+    await meta.set(TIMESTAMP_REPAIR_META_KEY, mark);
+  } catch {
+    // Meta or the adapter may not be registered, or the tables may not exist yet.
+  }
+}
+
+/**
+ * Run idempotent post-initialization tasks after services are registered.
+ *
+ * - Seeds built-in email templates (welcome, password-reset, email-verification, layout)
+ *
+ * The user fields are not here: the start waits for them
+ * (`provisionUserFieldsAtStart`), for the reason given there.
+ *
+ * Permission and role seeding is not here: the boot waits for it
+ * (`seedPermissionsAndRolePresets`), because a role's permissions must not be
+ * left half-written by an instance frozen after its first response.
+ *
+ * All operations are idempotent and safe to run on every startup.
+ * Failures are caught and logged — they should never prevent Nextly from starting.
+ */
+export async function runPostInitTasks(): Promise<void> {
+  // `next build` writes nothing, so the reconciliation and the repair below,
+  // which write, wait for the first start after it. The warnings after them
+  // only read, and run as at any start.
+  const building = isNextBuildPhase();
+  // Reconcile email templates with their owners: core's built-ins, each
+  // running plugin's contributions, and what the site's code sets. Owned
+  // templates follow their owner until the site overrides them, and an edit
+  // made before ownership existed is kept as an override. Idempotent.
+  // The ownership is this process's own, so the build configures it too; only
+  // the reconciliation writes.
+  try {
+    const emailTemplateService = getService("emailTemplateService");
+    emailTemplateService.configureOwnership(
+      ownershipFromConfig(getService("config"))
+    );
+    if (!building) await emailTemplateService.ensureBuiltInTemplates();
+  } catch {
+    // Silently skip — email services may not be registered,
+    // or the email_templates table may not exist yet (migrations not run)
+  }
+
+  // SQLite's timestamp repairs, once: see `repairSqliteTimestampsOnce`.
+  await repairSqliteTimestampsOnce(building);
+
+  // Name each configured translated unique field whose per-language index is not there yet. The
+  // boot never creates it, so until a migration or `db:sync` does, the rule is not enforced.
+  // Development starts only: it reads each such companion table's indexes, and a production
+  // start compares nothing with the live schema; there `nextly migrate:create` writes the index.
+  if (process.env.NODE_ENV === "development") {
+    try {
+      const [
+        { storedLocalizableEntities, warnAboutUnindexedTranslatedUnique },
+        { configTheCodeOwnsIn },
+      ] = await Promise.all([
+        import("../domains/i18n/runtime/translated-unique-boot-check"),
+        import("../di/load-dynamic-tables"),
+      ]);
+      const logger = getService("logger");
+      const adapter = getService("adapter");
+      await warnAboutUnindexedTranslatedUnique(
+        adapter,
+        // The configuration code still owns: a collection a demote handed to the Schema Builder is
+        // judged as the Builder's stored entity below, by the Builder's column rules, and not by
+        // its code entry, which the schema roads ignore (`configTheCodeOwns`).
+        await configTheCodeOwnsIn(adapter, getService("config")),
+        message => logger.warn(message),
+        // The Schema Builder's entities too, which no configuration names.
+        await storedLocalizableEntities({
+          collections: getService("collectionRegistryService"),
+          singles: getService("singleRegistryService"),
+          fieldGroups: getService("fieldGroupRegistryService"),
+        })
+      );
+    } catch {
+      // Silently skip — the adapter may not be registered, or the tables may not exist yet. A
+      // diagnostic must never be the reason a server fails to start.
+    }
+  }
+
+  // Say so when a stored provider needs a package this install does not have.
+  // Runs LAST, after plugin contributions have registered, because whether a
+  // type is usable is a question only the fully seeded registry can answer.
+  try {
+    const providerService = getService("emailProviderService");
+    const logger = getService("logger");
+
+    await warnAboutUnusableProviders({
+      listProviderTypes: async () =>
+        (await providerService.listProviders()).map(provider => provider.type),
+      isAvailable: type => {
+        const registry = getEmailProviderRegistry();
+        // An unregistered type is unusable too, and `get` throws on one rather
+        // than returning nothing -- a stored provider whose plugin was removed
+        // reaches exactly that branch. Asked before getting, so the answer is
+        // "no" instead of an exception that loses every other provider's.
+        if (!registry.has(type)) return false;
+        return (
+          registry.get(type).checkAvailability?.().status !== "needs-dependency"
+        );
+      },
+      warn: message => logger.warn(message),
+    });
+  } catch {
+    // Silently skip — the email services may not be registered, or the
+    // providers table may not exist yet. A diagnostic must never be the
+    // reason a server fails to start.
+  }
+
+  // Say so when queued email is more than 15 minutes past due: the jobs
+  // trigger isn't running, and no retry will be made until it does. The check
+  // itself never throws.
+  try {
+    await warnAboutLateQueuedEmail(getService("adapter"), getService("logger"));
+  } catch {
+    // The adapter or the logger is not registered; there is nothing to check.
+  }
+}

@@ -1,0 +1,753 @@
+/**
+ * Proof that a Schema-Builder create REQUEST leaves a Single that actually works: the physical
+ * table exists, the registry row records it as applied, and a localized create also gets its
+ * companion.
+ *
+ * ## Why this is an integration test and why it did not exist
+ *
+ * Every other test of this path stops short of a database. The dispatcher's forwarding suites pin
+ * the statements the adapter is handed; the generators' snapshots pin what each renders. Neither
+ * runs a statement, so neither can tell a create that works from one that emits perfectly-shaped
+ * DDL a real engine then rejects.
+ *
+ * That gap has been exploited before: a change to how a `slug` column's width was resolved made
+ * MySQL refuse the `CREATE UNIQUE INDEX` that follows the table, so the table was never created at
+ * all. The full unit suite read identical before and after. Only a live database disagreed.
+ *
+ * The registry row and the table are written by one service and the assertions check BOTH, because
+ * the failure this guards against is precisely the two halves disagreeing: a row saying "applied"
+ * over a table that is not there is the state a user meets as "no such table" on first read.
+ *
+ * ## What the second create proves
+ *
+ * The service claims to be recoverable and idempotent rather than atomic — the only claim
+ * available, since MySQL commits DDL implicitly and no ordering makes the pair atomic there. What
+ * makes that claim worth anything is that a create can be issued again over storage a previous
+ * attempt left behind: an empty table standing at the create's name is rebuilt from the retried
+ * request's fields, never adopted as it stands, and one holding rows refuses the create before
+ * anything is dropped or written. The repair cases are exercised directly: the tables an earlier
+ * attempt left stand with no row describing them, and a create is issued again — with the same
+ * fields, with different fields, and against a table that holds data.
+ *
+ * Self-skips per dialect on the standard rule: SQLite always runs, the servers run when their URL
+ * is set. Each dialect gets its own throwaway database.
+ *
+ * Every case runs as a development server does, where a Builder save applies its migration at
+ * once. Anywhere else a create writes the migration, records the Single pending and applies
+ * nothing, for the deploy's `nextly migrate` to run; `field-group-and-single-saves` holds that
+ * case.
+ */
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { defineCollection, text } from "../../../config";
+import { dispatchSingles } from "../../../dispatcher/handlers/single-dispatcher";
+import {
+  createTestNextly,
+  getConfiguredTestDialects,
+  type TestNextly,
+} from "../../../plugins/test-nextly";
+import type { FieldDefinition } from "../../../schemas/dynamic-collections";
+import { DynamicCollectionSchemaService } from "../../dynamic-collections/services/dynamic-collection-schema-service";
+import { introspectLiveSnapshot } from "../../schema/pipeline/diff/introspect-live";
+import { tableHasRows } from "../../schema/pipeline/live-table-facts";
+import { applyMigrationStatements } from "../../schema/services/apply-migration-statements";
+import { reconcileSingleCompanion } from "../services/reconcile-single-companion";
+let current: TestNextly | undefined;
+
+// Development, where a Builder create applies its table and records it applied.
+beforeEach(() => {
+  vi.stubEnv("NODE_ENV", "development");
+});
+
+afterEach(async () => {
+  vi.unstubAllEnvs();
+  await current?.destroy();
+  current = undefined;
+});
+
+/**
+ * The columns the live table physically carries, by name.
+ *
+ * Read through the same introspection the schema pipeline uses, because the property under test is
+ * precisely the physical table rather than what any registry or runtime schema claims about it.
+ */
+async function columnsOf(
+  instance: TestNextly,
+  table: string
+): Promise<string[]> {
+  const snapshot = await introspectLiveSnapshot(
+    instance.adapter.getDrizzle(),
+    instance.adapter.getCapabilities().dialect,
+    [table]
+  );
+  return (
+    snapshot.tables
+      .find(spec => spec.name === table)
+      ?.columns.map(column => column.name) ?? []
+  );
+}
+
+/**
+ * The tables an interrupted create of `slug` left standing, with no row describing them and no
+ * migration recording them.
+ *
+ * Made as a create applied them before it wrote its migration: the Builder creator's own
+ * statements, then a translated Single's companion. Stopped before its row, such a create left
+ * exactly this. A create through the Builder save writer runs its table and its row in one file,
+ * which records them both, so a Builder create followed by deleting the row would leave a table
+ * the migration history still records, which is not the wreckage the repair is for.
+ */
+async function leftoverOfEarlierCreate(
+  instance: TestNextly,
+  slug: string,
+  fields: Record<string, unknown>[],
+  localized = false
+): Promise<void> {
+  const adapter = instance.adapter as unknown as DrizzleAdapter;
+  const tableName = `single_${slug}`;
+  const definitions = fields as unknown as FieldDefinition[];
+  await applyMigrationStatements(
+    adapter,
+    new DynamicCollectionSchemaService(
+      undefined,
+      adapter.getCapabilities().dialect
+    ).generateMigrationSQL(tableName, definitions, {
+      isSingle: true,
+      hasStatus: false,
+      localized,
+    })
+  );
+  if (localized) {
+    await reconcileSingleCompanion({
+      slug,
+      tableName,
+      oldFields: [],
+      newFields: definitions,
+      localized: true,
+      wasLocalized: false,
+      status: false,
+      wasStatus: false,
+      adapter,
+    });
+  }
+}
+
+/** The registry's own view of a slug, or undefined when it holds none. */
+async function registryRow(
+  instance: TestNextly,
+  slug: string
+): Promise<{ migrationStatus?: string; tableName?: string } | undefined> {
+  const registry = instance.getService("singleRegistryService");
+  return (await registry.getSingleBySlug(slug)) ?? undefined;
+}
+
+for (const dialect of getConfiguredTestDialects()) {
+  describe(`createSingle applies its schema change — ${dialect}`, () => {
+    /**
+     * Slugs are per-dialect rather than shared: the suites run in one process, and a name reused
+     * across them turns a leaked row into a duplicate-slug rejection in a later suite rather than a
+     * failure where the leak happened.
+     */
+    const plain = `sc_${dialect.slice(0, 2)}_plain`;
+    const localized = `sc_${dialect.slice(0, 2)}_loc`;
+
+    it("creates the table and records it as applied", async () => {
+      current = await createTestNextly({ dialect });
+
+      await dispatchSingles(
+        "createSingle",
+        {},
+        {
+          slug: plain,
+          label: "Plain",
+          fields: [
+            { name: "body", type: "text" },
+            { name: "views", type: "number" },
+          ],
+        }
+      );
+
+      const row = await registryRow(current, plain);
+
+      // FIRST, because it is the informative failure: the service's own recorded outcome names the
+      // problem, where a bare "table missing" only says the end state is wrong.
+      expect(row?.migrationStatus).toBe("applied");
+      expect(await current.adapter.tableExists(`single_${plain}`)).toBe(true);
+    });
+
+    it("gives a localized single its companion table", async () => {
+      current = await createTestNextly({
+        dialect,
+        localization: { locales: ["en", "es"], defaultLocale: "en" },
+      });
+
+      await dispatchSingles(
+        "createSingle",
+        {},
+        {
+          slug: localized,
+          label: "Localized",
+          localized: true,
+          fields: [
+            { name: "headline", type: "text", localized: true },
+            { name: "views", type: "number" },
+          ],
+        }
+      );
+
+      const table = `single_${localized}`;
+      const row = await registryRow(current, localized);
+
+      expect(row?.migrationStatus).toBe("applied");
+      expect(await current.adapter.tableExists(table)).toBe(true);
+      // The other half of a localized single's storage. Without it the translatable value has
+      // nowhere to live, because the main table no longer carries the column either.
+      expect(await current.adapter.tableExists(`${table}_locales`)).toBe(true);
+    });
+
+    /**
+     * 🔴 The generator VALIDATES as well as renders, so a rejected create must leave nothing.
+     *
+     * A required relationship declaring `onDelete: "set null"` is refused: no database can null a
+     * reference the column forbids. That refusal comes from `generateMigrationSQL`, which means it
+     * happens on the same path that writes the table — so if the registry row were persisted
+     * first, this request would strand a `pending` Single with its permissions seeded, and the
+     * corrected retry would collide with the slug it had just created instead of succeeding.
+     */
+    it("leaves no row behind when the generator rejects the fields", async () => {
+      current = await createTestNextly({ dialect });
+
+      const rejected = {
+        slug: `${plain}_bad`,
+        label: "Bad",
+        fields: [
+          // A decimal with no digits, which the generator refuses while the DDL is still being
+          // rendered, so no statement is ever run.
+          {
+            name: "price",
+            type: "number",
+            dbType: "decimal",
+            precision: 0,
+            scale: 0,
+          },
+        ],
+      };
+
+      await expect(
+        dispatchSingles("createSingle", {}, rejected)
+      ).rejects.toMatchObject({
+        publicData: {
+          errors: [
+            expect.objectContaining({ code: "DECIMAL_PRECISION_INVALID" }),
+          ],
+        },
+      });
+
+      // Nothing persisted, so the corrected retry is a fresh create rather than a slug collision.
+      expect(await registryRow(current, rejected.slug)).toBeUndefined();
+      expect(await current.adapter.tableExists(`single_${rejected.slug}`)).toBe(
+        false
+      );
+    });
+
+    it("re-applies over a table it already created", async () => {
+      current = await createTestNextly({ dialect });
+
+      const payload = {
+        slug: plain,
+        label: "Plain",
+        fields: [{ name: "body", type: "text" }],
+      };
+
+      // The interrupted state the guarantee is about: the table landed, the row describing it did
+      // not. Recovery has to be able to finish the operation over what is already there.
+      await leftoverOfEarlierCreate(current, plain, payload.fields);
+      expect(await current.adapter.tableExists(`single_${plain}`)).toBe(true);
+      expect(await registryRow(current, plain)).toBeUndefined();
+
+      await dispatchSingles("createSingle", {}, payload);
+
+      const row = await registryRow(current, plain);
+      expect(row?.migrationStatus).toBe("applied");
+      expect(await current.adapter.tableExists(`single_${plain}`)).toBe(true);
+    });
+
+    /**
+     * 🔴 The interrupted state again, but the RETRY does not repeat the request — the fields
+     * changed in between.
+     *
+     * `CREATE TABLE IF NOT EXISTS` is a no-op over the standing table, so a create that adopted it
+     * as it stands would record `applied` while binding a runtime schema that names columns the
+     * table does not have — and every later read and write fails "column does not exist" far from
+     * the cause. `applied` has to describe the physical table, so the create rebuilds the standing
+     * wreckage from the retried request's fields.
+     */
+    it("rebuilds an orphaned table when the retried create changes the fields", async () => {
+      current = await createTestNextly({ dialect });
+      const slug = `${plain}_retry`;
+      const table = `single_${slug}`;
+
+      // The interrupted state: the table stands, the row describing it does not.
+      await leftoverOfEarlierCreate(current, slug, [
+        { name: "body", type: "text" },
+      ]);
+      expect(await current.adapter.tableExists(table)).toBe(true);
+
+      await dispatchSingles(
+        "createSingle",
+        {},
+        {
+          slug,
+          label: "Retry",
+          fields: [
+            { name: "summary", type: "text" },
+            { name: "views", type: "number" },
+          ],
+        }
+      );
+
+      expect((await registryRow(current, slug))?.migrationStatus).toBe(
+        "applied"
+      );
+      // The recorded `applied` has to describe the table that is actually there: the retried
+      // field set present, the abandoned attempt's field gone.
+      const columns = await columnsOf(current, table);
+      expect(columns).toContain("summary");
+      expect(columns).toContain("views");
+      expect(columns).not.toContain("body");
+    });
+
+    /**
+     * 🔴 A standing table that HOLDS ROWS is refused, not rebuilt — and the refusal changes
+     * nothing.
+     *
+     * Rows are the one thing an interrupted create's wreckage cannot have: a table the registry
+     * has never described has nothing that can write through it, so data proves the table is not
+     * this create's to drop. The refusal comes before any statement runs and before any row is
+     * written, so the slug stays free, the data stays where it is, and the error names the table
+     * in the way.
+     */
+    it("refuses to create over a table that holds rows, and touches nothing", async () => {
+      current = await createTestNextly({ dialect });
+      const slug = `${plain}_occupied`;
+      const table = `single_${slug}`;
+
+      await dispatchSingles(
+        "createSingle",
+        {},
+        {
+          slug,
+          label: "Occupied",
+          fields: [{ name: "body", type: "text" }],
+        }
+      );
+      const entries = current.getService("singleEntryService");
+      const written = await entries.update(
+        slug,
+        { body: "kept", _overwrite: true },
+        { overrideAccess: true }
+      );
+      expect(written.success).toBe(true);
+
+      const registry = current.getService("singleRegistryService");
+      await registry.deleteSingle(slug, { force: true });
+
+      await expect(
+        dispatchSingles(
+          "createSingle",
+          {},
+          {
+            slug,
+            label: "Occupied",
+            fields: [{ name: "headline", type: "text" }],
+          }
+        )
+      ).rejects.toThrow(/holds rows/);
+
+      // Nothing claimed and nothing destroyed. No registry row owns the slug, so the retry stays
+      // open; the table keeps the shape and the data that made it refusable. The column checks are
+      // what prove no rebuild happened — a rebuild would have put `headline` there.
+      expect(await registryRow(current, slug)).toBeUndefined();
+      const columns = await columnsOf(current, table);
+      expect(columns).toContain("body");
+      expect(columns).not.toContain("headline");
+      expect(
+        await tableHasRows(
+          current.adapter.getDrizzle(),
+          current.adapter.getCapabilities().dialect,
+          table
+        )
+      ).toBe(true);
+    });
+
+    /**
+     * 🔴 A Single's storage is a FAMILY of tables, and the create's ownership checks compare
+     * families — because a name those checks clear is one the orphan reset is licensed to DROP.
+     *
+     * Slug normalisation folds `-` to `_`, so `<slug>-locales` resolves to `single_<slug>_locales`:
+     * exactly the companion of the Single at `single_<slug>`. That companion is EMPTY until its
+     * owner saves localized content, so a main-name-only ownership scan would clear it as droppable
+     * wreckage — destroying another Single's translation storage, durably (the companion reconcile
+     * reads existence, and the rebuilt impostor exists) and silently (the create reports applied).
+     * Both directions are refused: a create landing on someone's companion, and a create whose own
+     * companion would land on someone's main table.
+     *
+     * The first direction is now refused earlier, by the one address rule: an address whose
+     * snake_case form ends in `_locales` reads as a localization companion and is never new. Its
+     * refusal must still say why, so the reason is asserted, not just a rejection. The second
+     * direction meets a Single created before that rule, which keeps working under its address.
+     */
+    it("refuses a create whose table family collides with another single's", async () => {
+      current = await createTestNextly({
+        dialect,
+        localization: { locales: ["en", "es"], defaultLocale: "en" },
+      });
+      const owner = `sc_${dialect.slice(0, 2)}_fam`;
+      const companion = `single_${owner}_locales`;
+
+      await dispatchSingles(
+        "createSingle",
+        {},
+        {
+          slug: owner,
+          label: "Fam",
+          localized: true,
+          fields: [{ name: "headline", type: "text", localized: true }],
+        }
+      );
+      expect(await current.adapter.tableExists(companion)).toBe(true);
+      const before = await columnsOf(current, companion);
+
+      // Lands exactly on the owner's companion table name.
+      await expect(
+        dispatchSingles(
+          "createSingle",
+          {},
+          {
+            slug: `${owner}-locales`,
+            label: "Fam Locales",
+            fields: [{ name: "body", type: "text" }],
+          }
+        )
+      ).rejects.toMatchObject({
+        code: "VALIDATION_ERROR",
+        publicData: {
+          errors: [
+            {
+              path: "slug",
+              code: "SLUG_RESERVED",
+              message: `Single address '${owner}-locales' cannot end in '_locales': that suffix names a localization table`,
+            },
+          ],
+        },
+      });
+
+      // The companion is untouched — same columns, no impostor rebuild — and nothing claimed the
+      // colliding slug.
+      expect(await columnsOf(current, companion)).toEqual(before);
+      expect(await registryRow(current, `${owner}-locales`)).toBeUndefined();
+
+      // The mirror direction: the new create's OWN companion name is an existing main table. No
+      // create takes a `-locales` address now, so the Single holding it is registered as one made
+      // before the rule was.
+      const taken = `sc_${dialect.slice(0, 2)}_mir`;
+      await current.getService("singleRegistryService").registerSingle({
+        slug: `${taken}-locales`,
+        label: "Mir Locales",
+        tableName: `single_${taken}_locales`,
+        fields: [{ name: "body", type: "text" }],
+        source: "ui",
+        locked: false,
+        schemaHash: "mir-locales",
+      });
+      await expect(
+        dispatchSingles(
+          "createSingle",
+          {},
+          {
+            slug: taken,
+            label: "Mir",
+            fields: [{ name: "body", type: "text" }],
+          }
+        )
+      ).rejects.toThrow(/already exists/);
+      expect(await registryRow(current, taken)).toBeUndefined();
+    });
+
+    /**
+     * 🔴 The same collision, refused by the IN-EXCLUSION guard alone.
+     *
+     * The dispatcher's preflight makes the same family comparison and throws before the service is
+     * reached, so every dispatcher-driven test above is satisfied by the outer guard whether or not
+     * the inner one works. The inner re-assertion is the one that matters most — it runs inside the
+     * schema-change exclusion, immediately before the orphan reset is licensed to DROP, and it
+     * exists precisely for registrations that land after the preflight has already passed. Driving
+     * the service directly is what makes it the only guard that can refuse.
+     */
+    it("refuses the family collision inside the exclusion, where the drop is licensed", async () => {
+      current = await createTestNextly({
+        dialect,
+        localization: { locales: ["en", "es"], defaultLocale: "en" },
+      });
+      const owner = `sc_${dialect.slice(0, 2)}_famz`;
+      await dispatchSingles(
+        "createSingle",
+        {},
+        {
+          slug: owner,
+          label: "Famz",
+          localized: true,
+          fields: [{ name: "headline", type: "text", localized: true }],
+        }
+      );
+      const companion = `single_${owner}_locales`;
+      expect(await current.adapter.tableExists(companion)).toBe(true);
+
+      const metadata = current.getService("singleMetadataService");
+      await expect(
+        metadata.createSingle({
+          slug: `${owner}-locales`,
+          label: "Famz Locales",
+          tableName: companion,
+          fields: [{ name: "body", type: "text" }],
+          source: "ui",
+          locked: false,
+          // Required by the input type. Any value does: the create is rejected on the name
+          // collision below before the hash is ever read.
+          schemaHash: "hash-collision-probe",
+        })
+      ).rejects.toThrow(/already exists/);
+
+      // Refused before the reset could touch it: the companion still stands and nothing claimed
+      // the colliding slug.
+      expect(await current.adapter.tableExists(companion)).toBe(true);
+      expect(await registryRow(current, `${owner}-locales`)).toBeUndefined();
+    });
+
+    /**
+     * 🔴 An orphan's junction tables are wreckage too, and they go with it.
+     *
+     * A many-to-many relationship renders a junction table carrying a foreign key to the main
+     * table. Left standing while the main table is dropped, the outcome diverges by dialect —
+     * MySQL refuses to drop a referenced parent outright, and PostgreSQL's CASCADE strips the
+     * junction's constraint and leaves the junction itself for the re-render's
+     * `CREATE TABLE IF NOT EXISTS` to adopt silently. So the reset reads the referencing tables
+     * from the live catalog, holds each to the same emptiness bar, and drops them FIRST. Retrying
+     * without the relationship is what makes the drop observable: a junction that was merely
+     * adopted would still exist afterwards.
+     */
+    it("rebuilds an orphan together with its junction tables", async () => {
+      current = await createTestNextly({
+        dialect,
+        collections: [
+          defineCollection({
+            slug: "tags",
+            fields: [text({ name: "title" })],
+          }),
+        ],
+      });
+      const slug = `sc_${dialect.slice(0, 2)}_jn`;
+      const table = `single_${slug}`;
+      // The generator's convention: source and target table names sorted, then the field name.
+      const junction = `dc_tags_${table}_tags`;
+
+      // The interrupted state again: tables stand, the row describing them does not.
+      await leftoverOfEarlierCreate(current, slug, [
+        {
+          name: "tags",
+          type: "relationship",
+          options: { relationType: "manyToMany", target: "tags" },
+        },
+      ]);
+      expect(await registryRow(current, slug)).toBeUndefined();
+      expect(await current.adapter.tableExists(junction)).toBe(true);
+
+      await dispatchSingles(
+        "createSingle",
+        {},
+        {
+          slug,
+          label: "Jn",
+          fields: [{ name: "body", type: "text" }],
+        }
+      );
+
+      expect((await registryRow(current, slug))?.migrationStatus).toBe(
+        "applied"
+      );
+      expect(await current.adapter.tableExists(table)).toBe(true);
+      // The abandoned attempt's junction went with its parent rather than surviving as an orphan
+      // of its own.
+      expect(await current.adapter.tableExists(junction)).toBe(false);
+    });
+
+    /**
+     * A normal schema UPDATE on a Single must stay `applied`.
+     *
+     * 🔴 The ALTER path builds its verification shape from a normalized field list that carries a
+     * synthetic `title` so the generator can see the existing system column. If that list reaches
+     * the descriptor unchanged, `title` is described as a Builder text field rather than the system
+     * one — and on MySQL the system column is `varchar(255)` while a Builder text field is not, so
+     * an ordinary successful field update would be recorded as failed.
+     */
+    it("keeps a schema update applied after adding a field", async () => {
+      current = await createTestNextly({ dialect });
+
+      await dispatchSingles(
+        "createSingle",
+        {},
+        {
+          slug: plain,
+          label: "Plain",
+          fields: [{ name: "body", type: "text" }],
+        }
+      );
+      expect((await registryRow(current, plain))?.migrationStatus).toBe(
+        "applied"
+      );
+
+      await dispatchSingles(
+        "updateSingleSchema",
+        { slug: plain },
+        {
+          fields: [
+            { name: "body", type: "text" },
+            { name: "subtitle", type: "text" },
+          ],
+        }
+      );
+
+      expect((await registryRow(current, plain))?.migrationStatus).toBe(
+        "applied"
+      );
+    });
+
+    it("rebuilds a missing table through a settings save that adds a field filling its row", async () => {
+      current = await createTestNextly({ dialect });
+      await dispatchSingles(
+        "createSingle",
+        {},
+        {
+          slug: plain,
+          label: "Plain",
+          fields: [{ name: "body", type: "text" }],
+        }
+      );
+      // The table gone from under its registered Single; the save plans the whole table again.
+      await current.adapter.executeQuery(`DROP TABLE single_${plain}`);
+
+      await dispatchSingles(
+        "updateSingleSchema",
+        { slug: plain },
+        {
+          fields: [
+            { name: "body", type: "text" },
+            {
+              name: "subtitle",
+              type: "text",
+              required: true,
+              defaultValue: "Untitled",
+            },
+          ],
+        }
+      );
+
+      expect(await current.adapter.tableExists(`single_${plain}`)).toBe(true);
+      expect((await registryRow(current, plain))?.migrationStatus).toBe(
+        "applied"
+      );
+    });
+
+    // A translated Single that lost both its tables is rebuilt as a pair: the push building the
+    // whole table makes its translations table too, so the missing one is not drift.
+    it("rebuilds a translated Single's missing table pair through a settings save that fills its row", async () => {
+      current = await createTestNextly({
+        dialect,
+        localization: { locales: ["en", "es"], defaultLocale: "en" },
+      });
+      await dispatchSingles(
+        "createSingle",
+        {},
+        {
+          slug: plain,
+          label: "Plain",
+          localized: true,
+          fields: [{ name: "body", type: "text", localized: true }],
+        }
+      );
+      await current.adapter.executeQuery(`DROP TABLE single_${plain}_locales`);
+      await current.adapter.executeQuery(`DROP TABLE single_${plain}`);
+
+      await dispatchSingles(
+        "updateSingleSchema",
+        { slug: plain },
+        {
+          localized: true,
+          fields: [
+            { name: "body", type: "text", localized: true },
+            {
+              name: "subtitle",
+              type: "text",
+              required: true,
+              defaultValue: "Untitled",
+            },
+          ],
+        }
+      );
+
+      expect(await current.adapter.tableExists(`single_${plain}`)).toBe(true);
+      expect(await current.adapter.tableExists(`single_${plain}_locales`)).toBe(
+        true
+      );
+      expect((await registryRow(current, plain))?.migrationStatus).toBe(
+        "applied"
+      );
+    });
+
+    /**
+     * 🔴 A LOCALIZED single's interrupted create is repaired the same way: by rebuilding.
+     *
+     * The companion reconcile is told `wasLocalized: false` and `oldFields: []`, because from the
+     * registry's point of view this is a brand-new localized single — the row describing the
+     * previous attempt is gone. A companion left standing would meet a plan that ADDs columns
+     * already there, which the companion path deliberately does not tolerate: a half-finished
+     * localization ENABLE reaches that code in an identical state, and tolerating it would report
+     * success while default-locale content is still stranded on the main table.
+     *
+     * Rebuilding resolves that ambiguity instead of tolerating it. Content is what distinguishes
+     * the two states — a half-enabled single carries its rows on the main table, and a main table
+     * holding rows refuses the create before anything is dropped — so a pair of empty tables has
+     * nothing to strand, and both are rebuilt from this request's fields.
+     */
+    it("repairs a localized single's tables by rebuilding the pair", async () => {
+      current = await createTestNextly({
+        dialect,
+        localization: { locales: ["en", "es"], defaultLocale: "en" },
+      });
+
+      const payload = {
+        slug: localized,
+        label: "Localized",
+        localized: true,
+        fields: [
+          { name: "headline", type: "text", localized: true },
+          { name: "views", type: "number" },
+        ],
+      };
+
+      await leftoverOfEarlierCreate(current, localized, payload.fields, true);
+      const table = `single_${localized}`;
+      expect(await current.adapter.tableExists(`${table}_locales`)).toBe(true);
+
+      await dispatchSingles("createSingle", {}, payload);
+
+      const row = await registryRow(current, localized);
+      expect(row?.migrationStatus).toBe("applied");
+      // Both halves of a localized single's storage stand after the repair: the main table and
+      // the companion the translatable value lives in.
+      expect(await current.adapter.tableExists(table)).toBe(true);
+      expect(await current.adapter.tableExists(`${table}_locales`)).toBe(true);
+    });
+  });
+}

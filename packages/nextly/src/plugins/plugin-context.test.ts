@@ -1,0 +1,924 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { publishHookPoints } from "./hook-points";
+import type { CompleteLoginDeps } from "../auth/plugin-auth-api";
+import { clearActiveExtensionSchema } from "../domains/schema/extension/build-extension-schema";
+import { col, defineTable } from "../domains/schema/extension/dsl";
+import { compileAndPublishExtensionSchema } from "../domains/schema/extension/publish";
+import { NextlyError } from "../errors/nextly-error";
+import { EventBus } from "../events/event-bus";
+
+import { getCoreVersion } from "./core-version";
+import {
+  resetPluginAuthApi,
+  setPluginAuthDepsResolver,
+} from "./plugin-auth-provider";
+import { recordPreSetupPlugins, type PluginGrants } from "./plugin-consent";
+import {
+  createPluginContext,
+  type PluginContext,
+  type PluginDefinition,
+  type PluginEvents,
+} from "./plugin-context";
+import { resolveTransformedPlugins } from "./resolve";
+import { standardWebhooks } from "./security/inbound-webhooks";
+import {
+  clearPluginDependencies,
+  publishPluginDependencies,
+} from "./plugin-dependencies";
+
+/** Marks which handle a relational namespace came from, past the owner check. */
+const ORIGIN = Symbol("origin");
+
+function makeCtx(
+  plugin?: unknown,
+  relations: () => object = () => ({ __relations: true }),
+  grants?: PluginGrants
+) {
+  const db = { __db: true };
+  // What the context asked each handle factory for, in order.
+  const built: string[] = [];
+  // A Drizzle handle shaped like the real thing: a bare one has an EMPTY
+  // query namespace, and only a relations-enabled one populates it.
+  const relationalHandle = (origin: string, rel: unknown) => {
+    built.push(`${origin}:${(rel as { id?: string }).id ?? "?"}`);
+    return { query: { [ORIGIN]: `${origin}:${(rel as { id?: string }).id}` } };
+  };
+  const logger = {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  };
+  const collections = { __collections: true };
+  const users = { __users: true };
+  const media = { __media: true };
+  const email = { __email: true };
+  const config = { plugins: [] };
+
+  // `ctx.db.transaction` routes through the adapter, so a double that omits
+  // it certifies a context production would reject. It hands back a
+  // transaction context like the real adapters do: the surface must use ITS
+  // handles, not the pooled ones.
+  const adapter = {
+    transaction: <T>(
+      work: (tx: {
+        getDrizzle: () => unknown;
+        drizzleWithRelations: (rel: unknown) => unknown;
+      }) => Promise<T>
+    ) =>
+      work({
+        getDrizzle: () => ({ ...db, query: {} }),
+        drizzleWithRelations: (rel: unknown) => relationalHandle("tx", rel),
+      }),
+    getDrizzle: (rel?: unknown) =>
+      rel === undefined ? db : relationalHandle("pool", rel),
+    // Answers "open" so a write the secrets helper starts is refused at its
+    // first question, which shows which adapter it asked.
+    transactionOpenInFlow: vi.fn(() => true),
+    // A plugin's emit inside an open transaction is held for its commit;
+    // the double commits at once.
+    afterCommit: vi.fn(async (effect: () => unknown) => {
+      await effect();
+    }),
+    select: vi.fn(async () => []),
+  };
+  const services: Record<string, () => unknown> = {
+    collectionService: () => collections,
+    userService: () => users,
+    mediaService: () => media,
+    emailService: () => email,
+    db: () => db,
+    relations,
+    dialect: () => "postgresql",
+    adapter: () => adapter,
+    logger: () => logger,
+    config: () => config,
+  };
+  const getServiceFn = ((name: string) => {
+    const resolve = services[name];
+    if (resolve === undefined) throw new Error(`unknown service: ${name}`);
+    return resolve();
+  }) as unknown as Parameters<typeof createPluginContext>[0];
+
+  // Mirrors the registry interface rather than a subset of it: a double that
+  // omits methods the real one requires certifies a context the production
+  // registry would reject.
+  const hookRegistry = {
+    register: vi.fn(),
+    unregister: vi.fn(),
+    registerBeforeOperation: vi.fn(),
+    unregisterBeforeOperation: vi.fn(),
+    registerInTransaction: vi.fn(),
+    unregisterInTransaction: vi.fn(),
+  };
+  const ctx = createPluginContext(
+    getServiceFn,
+    hookRegistry,
+    plugin as never,
+    grants
+  );
+  return { ctx, db, logger, collections, email, built, adapter };
+}
+
+describe("ctx.security.webhooks", () => {
+  it("verifies an inbound webhook on the plugin's context", async () => {
+    const { ctx } = makeCtx();
+    const result = await ctx.security.webhooks.verify(
+      new Request("https://site.example/hook", { method: "POST", body: "{}" }),
+      { scheme: standardWebhooks, secrets: ["c2VjcmV0"] }
+    );
+    // No Standard Webhooks headers: not verified, and why.
+    expect(result).toEqual({ verified: false, reason: "missing" });
+  });
+});
+
+describe("ctx.security.secrets", () => {
+  it("reaches the database through the context's own services, not the global container", async () => {
+    // A context outlives a container being cleared, as on a reload while old
+    // plugins finish tearing down: it must keep the adapter it was built for.
+    const { ctx, adapter } = makeCtx();
+    const refused = await ctx.security.secrets
+      .voidFor({ subject: "account-1" })
+      .then(
+        () => undefined,
+        (error: unknown) => error
+      );
+    expect(adapter.transactionOpenInFlow).toHaveBeenCalled();
+    expect(refused).toMatchObject({
+      logMessage: expect.stringContaining("secrets.voidFor"),
+    });
+  });
+});
+
+describe("createPluginContext (P1 reshape)", () => {
+  it("exposes db and logger at the top level", () => {
+    const { ctx, logger } = makeCtx();
+    // `ctx.db` is the typed, owner-checked surface; the raw handle it used
+    // to BE is preserved at `.raw` as a RESTRICTED wrapper — a plugin that
+    // did not declare `db.rawSql` gets only the fluent methods there, so
+    // `execute` and `run` are not reachable however the plugin is written.
+    expect(ctx.db.raw).toBeDefined();
+    expect(typeof ctx.db.table).toBe("function");
+    expect(
+      (Object.keys(ctx.db) as string[]).filter(k => k !== "raw").sort()
+    ).toEqual([
+      "contributed",
+      "delete",
+      "insert",
+      "insertReturning",
+      "query",
+      "select",
+      "table",
+      "transaction",
+      "update",
+      "withTransactionBounds",
+    ]);
+    // The restriction applies to the escape hatch too: the raw handle a
+    // plugin without rawSql receives carries only the fluent four.
+    expect(Object.keys(ctx.db.raw as object).sort()).toEqual([
+      "delete",
+      "insert",
+      "select",
+      "transaction",
+      "update",
+    ]);
+    expect(ctx.logger).toBe(logger);
+  });
+
+  it("hands the live instance to a plugin the boot granted rawSql", () => {
+    // The control: a wrapper applied unconditionally would make the granted
+    // capability buy nothing. With rawSql granted, the raw escape hatch IS
+    // the live instance the resolver handed over.
+    const { ctx, db } = makeCtx(
+      {
+        name: "@test/raw",
+        version: "1.0.0",
+        nextly: "*",
+        capabilities: { db: { rawSql: true } },
+      },
+      undefined,
+      { rawSql: ["@test/raw"], login: [] }
+    );
+    // The live instance's own members, raw SQL included, are reachable.
+    expect((ctx.db.raw as unknown as typeof db).__db).toBe(true);
+  });
+
+  it("restricts a plugin whose manifest declares rawSql without a grant", () => {
+    // The grant is the boot's verdict, not the manifest. A manifest read
+    // again here, after resolution, would let one that changed since, or an
+    // accessor that answers `true` only when read from here, grant itself.
+    let reads = 0;
+    const { ctx } = makeCtx({
+      name: "@test/raw",
+      version: "1.0.0",
+      nextly: "*",
+      capabilities: {
+        db: {
+          get rawSql() {
+            reads += 1;
+            return true;
+          },
+        },
+      },
+    });
+    expect(Object.keys(ctx.db.raw as object).sort()).toEqual([
+      "delete",
+      "insert",
+      "select",
+      "transaction",
+      "update",
+    ]);
+    expect(reads).toBe(0);
+  });
+
+  it("checks a filter payload against the schema its point declared", async () => {
+    // The declarations were collected at resolve and discarded, so
+    // `contributes.hookPoints[].payload` checked nothing and the documented
+    // development-time warning could never arrive. Asserted at the SEAM
+    // because that is where a payload exists to be checked.
+    publishHookPoints(
+      new Map([
+        [
+          "acme.seam",
+          {
+            name: "acme.seam",
+            kind: "filter" as const,
+            owner: "@acme/p",
+            payload: { safeParse: () => ({ success: false }) },
+          },
+        ],
+      ])
+    );
+    const { ctx, logger } = makeCtx();
+    await ctx.filters.apply("acme.seam", { wrong: true }, {} as never);
+    expect(logger.warn).toHaveBeenCalled();
+    publishHookPoints(new Map());
+  });
+
+  it("stays silent at a seam whose payload matches", async () => {
+    // The control. A checker that warned unconditionally would satisfy the
+    // test above while burying the log for every correct plugin.
+    publishHookPoints(
+      new Map([
+        [
+          "acme.ok",
+          {
+            name: "acme.ok",
+            kind: "filter" as const,
+            owner: "@acme/p",
+            payload: { safeParse: () => ({ success: true }) },
+          },
+        ],
+      ])
+    );
+    const { ctx, logger } = makeCtx();
+    await ctx.filters.apply("acme.ok", { fine: true }, {} as never);
+    expect(logger.warn).not.toHaveBeenCalled();
+    publishHookPoints(new Map());
+  });
+
+  it("checks a decision point's CONTEXT, the subject being decided", async () => {
+    // The verdict has one shape at every point, so a schema describing the
+    // subject always mismatched it: the check warned on every correct call.
+    const seen: unknown[] = [];
+    publishHookPoints(
+      new Map([
+        [
+          "acme.gate",
+          {
+            name: "acme.gate",
+            kind: "decision" as const,
+            owner: "@acme/p",
+            payload: {
+              safeParse: (value: unknown) => {
+                seen.push(value);
+                return {
+                  success:
+                    typeof value === "object" &&
+                    value !== null &&
+                    "subject" in value,
+                };
+              },
+            },
+          },
+        ],
+      ])
+    );
+    const { ctx, logger } = makeCtx();
+    await ctx.filters.decide("acme.gate", { allow: true }, {
+      subject: "user-7",
+    } as never);
+    expect(seen).toEqual([{ subject: "user-7" }]);
+    expect(logger.warn).not.toHaveBeenCalled();
+    publishHookPoints(new Map());
+  });
+
+  it("exposes the event bus and the core version", () => {
+    const { ctx } = makeCtx();
+    expect(ctx.events).toBeInstanceOf(EventBus);
+    expect(ctx.nextlyVersion).toBe(getCoreVersion());
+  });
+
+  describe("a plugin emitting an event", () => {
+    const plugin = { name: "@acme/billing", version: "1.0.0" };
+
+    it.each(["user.deleted", "user.created", "document.published", "auth.x"])(
+      "cannot emit the core event %s",
+      name => {
+        // A listener acting on `user.deleted` — unlinking an identity,
+        // dropping stored data — would act on a deletion that never happened.
+        const { ctx } = makeCtx(plugin);
+        const heard = vi.fn();
+        ctx.events.on(name, heard);
+        expect(() => ctx.events.emit(name, { userId: "live-user" })).toThrow(
+          expect.objectContaining({ code: "FORBIDDEN" })
+        );
+        expect(heard).not.toHaveBeenCalled();
+        ctx.events.off(name, heard);
+      }
+    );
+
+    it.each(["nextlyhq-plugin-form-builder.submitted", "billing.charged"])(
+      "cannot emit %s, outside its own namespace",
+      name => {
+        // Another plugin's event, or one a name collision would make another's:
+        // its listeners would act on something its owner never did.
+        const { ctx } = makeCtx(plugin);
+        const heard = vi.fn();
+        ctx.events.on(name, heard);
+        expect(() => ctx.events.emit(name, { formId: "f1" })).toThrow(
+          expect.objectContaining({
+            code: "FORBIDDEN",
+            logContext: expect.objectContaining({
+              reason: "plugin-emit-outside-namespace",
+            }),
+          })
+        );
+        expect(heard).not.toHaveBeenCalled();
+        ctx.events.off(name, heard);
+      }
+    );
+
+    it("still emits an event of its own", () => {
+      // The control: refusing every emit would pass the cases above.
+      const { ctx } = makeCtx(plugin);
+      const heard = vi.fn();
+      ctx.events.on("acme-billing.charged", heard);
+      ctx.events.emit("acme-billing.charged", { amount: 10 });
+      expect(heard).toHaveBeenCalledOnce();
+      ctx.events.off("acme-billing.charged", heard);
+    });
+  });
+
+  it("no longer exposes the deprecated infra alias", () => {
+    const { ctx } = makeCtx();
+    // @ts-expect-error infra was removed — db/logger are top-level.
+    expect(ctx.infra).toBeUndefined();
+  });
+
+  it("keeps the services shape; collections is ServiceOpts-wrapped", () => {
+    const { ctx, collections, email } = makeCtx();
+    // collections is wrapped for ServiceOpts elevation, and every core
+    // service reaches the plugin as a facade of its plugin methods rather
+    // than the instance, which carries the adapter its methods run on.
+    expect(ctx.services.collections).not.toBe(collections);
+    expect(ctx.services.email).not.toBe(email);
+    // Pinned as an exact list rather than a set of `toHaveProperty` checks:
+    // this surface is public API, so a member ARRIVING is as much a change as
+    // one going, and only an exhaustive comparison catches the first.
+    expect(Object.keys(ctx.services).sort()).toEqual([
+      "collections",
+      "email",
+      "jobs",
+      "media",
+      "ownCollections",
+      "plugins",
+      "singles",
+      "users",
+      "versions",
+      "workflows",
+    ]);
+  });
+});
+
+/**
+ * `ctx.db.raw.transaction` on the restricted handle: without it a plugin had
+ * no way to make several writes atomic through it.
+ */
+describe("ctx.db.raw.transaction", () => {
+  function contextOn(
+    dialect: "postgresql" | "sqlite",
+    capabilities: Record<string, unknown> = {}
+  ) {
+    const calls: string[] = [];
+    const handle = (label: string) => ({
+      select: () => calls.push(`${label}.select`),
+      insert: () => calls.push(`${label}.insert`),
+      update: () => calls.push(`${label}.update`),
+      delete: () => calls.push(`${label}.delete`),
+      execute: () => calls.push(`${label}.execute`),
+    });
+    const db = {
+      ...handle("db"),
+      transaction: async (work: (tx: unknown) => Promise<unknown>) => {
+        calls.push("db.transaction");
+        return work(handle("tx"));
+      },
+    };
+    const adapter = {
+      transaction: async (work: () => Promise<unknown>) => {
+        calls.push("adapter.transaction");
+        return work();
+      },
+    };
+    const services: Record<string, unknown> = {
+      db,
+      dialect,
+      adapter,
+      logger: { info() {}, warn() {}, error() {}, debug() {} },
+      config: { plugins: [] },
+    };
+    const ctx = createPluginContext(
+      ((name: string) => services[name] ?? {}) as never,
+      {
+        register: vi.fn(),
+        unregister: vi.fn(),
+        registerBeforeOperation: vi.fn(),
+        unregisterBeforeOperation: vi.fn(),
+        registerInTransaction: vi.fn(),
+        unregisterInTransaction: vi.fn(),
+      },
+      {
+        name: "@test/tx",
+        version: "1.0.0",
+        nextly: "*",
+        capabilities,
+      } as never,
+      {
+        rawSql: capabilities.db === undefined ? [] : ["@test/tx"],
+        login: [],
+      }
+    );
+    return { ctx, calls };
+  }
+
+  it("runs the work in the database's transaction, on its handle", async () => {
+    const { ctx, calls } = contextOn("postgresql");
+    const result = await ctx.db.raw.transaction(async tx => {
+      tx.insert({});
+      return "done";
+    });
+    expect(result).toBe("done");
+    expect(calls).toEqual(["db.transaction", "tx.insert"]);
+  });
+
+  it("hands the work a restricted handle, without execute", async () => {
+    const { ctx } = contextOn("postgresql");
+    await ctx.db.raw.transaction(async tx => {
+      expect(Object.keys(tx).sort()).toEqual([
+        "delete",
+        "insert",
+        "select",
+        "update",
+      ]);
+    });
+  });
+
+  it("runs through the adapter's transaction on SQLite with rawSql too", async () => {
+    // The live instance's own SQLite transaction refuses an async callback.
+    const { ctx, calls } = contextOn("sqlite", { db: { rawSql: true } });
+    await ctx.db.raw.transaction(async tx => {
+      tx.update({});
+    });
+    expect(calls).toEqual(["adapter.transaction", "db.update"]);
+    // And the raw surface is still there.
+    expect(typeof (ctx.db.raw as unknown as { execute: unknown }).execute).toBe(
+      "function"
+    );
+  });
+
+  it("runs through the adapter's transaction on SQLite", async () => {
+    // Drizzle's better-sqlite3 transaction refuses an async callback.
+    const { ctx, calls } = contextOn("sqlite");
+    await ctx.db.raw.transaction(async tx => {
+      tx.update({});
+    });
+    expect(calls).toEqual(["adapter.transaction", "db.update"]);
+  });
+
+  describe("a method taken off the handle and called after the transaction", () => {
+    const finished = {
+      logContext: expect.objectContaining({
+        reason: "plugin-transaction-finished",
+      }),
+    };
+
+    it.each([
+      ["PostgreSQL", "postgresql", {}, "tx.insert"],
+      // The handle there is the database's only connection, so a statement
+      // started through it runs outside any transaction.
+      ["SQLite", "sqlite", {}, "db.insert"],
+      [
+        "PostgreSQL, with rawSql",
+        "postgresql",
+        { db: { rawSql: true } },
+        "tx.insert",
+      ],
+    ] as const)(
+      "is refused on %s, and starts nothing",
+      async (_label, dialect, capabilities, statement) => {
+        const { ctx, calls } = contextOn(dialect, capabilities);
+        let insert: ((table: unknown) => unknown) | undefined;
+        await ctx.db.raw.transaction(async tx => {
+          // Read while the transaction is open, which is allowed; the read
+          // alone starts nothing.
+          insert = tx.insert as (table: unknown) => unknown;
+        });
+        expect(() => insert?.({})).toThrow(
+          expect.objectContaining(finished) as unknown as Error
+        );
+        expect(calls).not.toContain(statement);
+      }
+    );
+
+    it("still runs when it is called inside the callback", async () => {
+      // The control: a wrapper that refused every call would pass the case
+      // above.
+      const { ctx, calls } = contextOn("postgresql");
+      await ctx.db.raw.transaction(async tx => {
+        const insert = tx.insert;
+        insert({} as never);
+      });
+      expect(calls).toEqual(["db.transaction", "tx.insert"]);
+    });
+  });
+});
+
+describe("ctx.auth in a plugin's context", () => {
+  it("holds completeLogin to the boot's login grant", async () => {
+    // The shared instance answered every plugin alike, so a plugin that
+    // declared nothing could sign anyone in. A context built outside a boot
+    // holds no verdict, so it holds no grant either.
+    const { ctx } = makeCtx({
+      name: "@test/analytics",
+      version: "1.0.0",
+      nextly: "*",
+    });
+    await expect(
+      ctx.auth.completeLogin("u1", {
+        request: new Request("http://localhost/x"),
+        strategy: "test-analytics:sso",
+      })
+    ).rejects.toMatchObject({
+      logContext: expect.objectContaining({
+        reason: "plugin-login-undeclared",
+      }),
+    });
+  });
+
+  it("refuses a plugin whose init flips capabilities.auth.login on", async () => {
+    // The bypass: `init` runs as a method on the resolved definition, so
+    // `this` is the very object the context's auth wrapper can reach, and a
+    // plugin that booted without the capability could flip the flag on and
+    // then call. The wrapper answers to the verdict the boot decided, not to
+    // this mutable manifest — so the refusal must stand even though the flag
+    // the init left behind reads true.
+    setPluginAuthDepsResolver(
+      () =>
+        ({
+          secret: "test-secret-that-is-at-least-32-characters-long!!",
+          findUserById: async () => null,
+          auditLog: { write: async () => undefined },
+          trustProxy: false,
+          trustedProxyIps: [],
+        }) as unknown as CompleteLoginDeps
+    );
+    type LateLoginPlugin = {
+      name: string;
+      version: string;
+      nextly: string;
+      capabilities?: { auth?: { login?: boolean } };
+      init(ctx?: PluginContext): void;
+    };
+    const plugin: LateLoginPlugin = {
+      name: "@test/late-login",
+      version: "1.0.0",
+      nextly: "*",
+      init(this: LateLoginPlugin) {
+        this.capabilities = { auth: { login: true } };
+      },
+    };
+    const { ctx } = makeCtx(plugin);
+    // As the boot initializes: a method call, so `this` is the definition.
+    plugin.init();
+    expect(plugin.capabilities?.auth?.login).toBe(true);
+
+    await expect(
+      ctx.auth.completeLogin("u1", {
+        request: new Request("http://localhost/x"),
+        strategy: "test-late-login:sso",
+      })
+    ).rejects.toMatchObject({
+      logContext: expect.objectContaining({
+        reason: "plugin-login-undeclared",
+      }),
+    });
+    await resetPluginAuthApi();
+  });
+
+  it("refuses a plugin whose init renames itself onto a listed plugin", async () => {
+    // The name is part of the verdict, recorded when the boot resolved the
+    // plugin — NOT read back off the mutable definition, and NOT frozen
+    // either: an `init` that renames itself is plugin code assigning a
+    // property, and must not fail the boot. The assignment therefore takes
+    // effect on the definition and changes nothing the grant check reads:
+    // judged through a context built AFTER `init` ran, as the auth bridge
+    // builds its hook contexts, the call still answers for the ungranted
+    // plugin the boot resolved.
+    setPluginAuthDepsResolver(
+      () =>
+        ({
+          secret: "test-secret-that-is-at-least-32-characters-long!!",
+          findUserById: async () => null,
+          auditLog: { write: async () => undefined },
+          trustProxy: false,
+          trustedProxyIps: [],
+        }) as unknown as CompleteLoginDeps
+    );
+    const plugin = {
+      name: "@test/renames",
+      version: "1.0.0",
+      nextly: "*",
+      init(this: { name: string }) {
+        this.name = "@acme/listed";
+      },
+    };
+    const definition = plugin as unknown as PluginDefinition;
+    const { config } = resolveTransformedPlugins(
+      { plugins: [definition] },
+      {
+        coreVersion: "1.0.0",
+        consent: {
+          rawSql: ["@acme/listed"],
+          login: ["@acme/listed"],
+        },
+        declared: recordPreSetupPlugins([definition]),
+      }
+    );
+    const resolved = config.plugins[0]!;
+    const { ctx } = makeCtx(resolved, undefined, {
+      rawSql: ["@acme/listed"],
+      login: ["@acme/listed"],
+    });
+    // As the boot initializes: `init` receives its own context, and as a
+    // method call its `this` is the definition.
+    const init = resolved.init;
+    if (!init) throw new Error("the fixture declares no init");
+    init.call(resolved, ctx);
+    // The rename took effect on the definition — and granted nothing. The
+    // renamed name is raw-SQL-listed too, so every grant and owner identity
+    // reading it live would hand the plugin the other plugin's grants; the
+    // boot-time name keeps `ctx.db.raw` restricted.
+    expect(resolved.name).toBe("@acme/listed");
+    expect((ctx.db.raw as { execute?: unknown }).execute).toBeUndefined();
+
+    await expect(
+      ctx.auth.completeLogin("u1", {
+        request: new Request("http://localhost/x"),
+        strategy: "test-renames:sso",
+      })
+    ).rejects.toMatchObject({
+      logContext: expect.objectContaining({
+        reason: "plugin-login-undeclared",
+      }),
+    });
+    await resetPluginAuthApi();
+  });
+
+  it("survives an init assigning this.name to itself, grant unaffected", async () => {
+    // The freeze this replaces threw on ANY `name` assignment — even an
+    // idempotent one — failing a plugin's initialization for touching its
+    // own definition. Recording the boot-time name instead makes the
+    // assignment harmless: the boot resolves, `init` assigns, nothing
+    // crashes, and the plugin's own grant answers for it as before.
+    setPluginAuthDepsResolver(
+      () =>
+        ({
+          secret: "test-secret-that-is-at-least-32-characters-long!!",
+          findUserById: async () => null,
+          auditLog: { write: async () => undefined },
+          trustProxy: false,
+          trustedProxyIps: [],
+        }) as unknown as CompleteLoginDeps
+    );
+    const plugin = {
+      name: "@acme/selfassign",
+      version: "1.0.0",
+      nextly: "*",
+      capabilities: { auth: { login: true } },
+      init(this: { name: string }) {
+        this.name = this.name;
+      },
+    };
+    const definition = plugin as unknown as PluginDefinition;
+    const { config } = resolveTransformedPlugins(
+      { plugins: [definition] },
+      {
+        coreVersion: "1.0.0",
+        consent: { rawSql: [], login: ["@acme/selfassign"] },
+        declared: recordPreSetupPlugins([definition]),
+      }
+    );
+    const resolved = config.plugins[0]!;
+    const { ctx } = makeCtx(resolved, undefined, {
+      rawSql: [],
+      login: ["@acme/selfassign"],
+    });
+    const init = resolved.init;
+    if (!init) throw new Error("the fixture declares no init");
+    init.call(resolved, ctx);
+
+    const res = await ctx.auth.completeLogin("u1", {
+      request: new Request("http://localhost/x"),
+      strategy: "acme-selfassign:sso",
+    });
+    expect(res.status).toBe(302);
+    await resetPluginAuthApi();
+  });
+
+  describe("with two plugins that may both finish logins", () => {
+    afterEach(() => {
+      resetPluginAuthApi();
+    });
+
+    const declaringLogin = (name: string) => ({
+      name,
+      version: "1.0.0",
+      nextly: "*",
+      capabilities: { auth: { login: true } },
+    });
+    const login = (
+      ctx: ReturnType<typeof makeCtx>["ctx"],
+      strategy: string
+    ): Promise<Response> =>
+      ctx.auth.completeLogin("u1", {
+        request: new Request("http://localhost/x"),
+        strategy,
+      });
+
+    it("binds each context's completeLogin to its own plugin alone", async () => {
+      // `acme` is a string prefix of `acme-google`, the near miss: a check on
+      // the slug without its colon would let `acme` sign people in as
+      // `acme-google`. The deps answer every login that gets through with
+      // "no such user", which is enough to show the call reached the shared
+      // login rather than being refused at the plugin's door.
+      setPluginAuthDepsResolver(
+        () =>
+          ({
+            secret: "test-secret-that-is-at-least-32-characters-long!!",
+            findUserById: async () => null,
+            auditLog: { write: async () => undefined },
+            trustProxy: false,
+            trustedProxyIps: [],
+          }) as unknown as CompleteLoginDeps
+      );
+      // The verdict the boot decided once for both plugins; a context reads
+      // this, never the manifest it could reach back through.
+      const grants: PluginGrants = {
+        rawSql: [],
+        login: ["acme", "@acme/google"],
+      };
+      const acme = makeCtx(declaringLogin("acme"), undefined, grants).ctx;
+      const acmeGoogle = makeCtx(
+        declaringLogin("@acme/google"),
+        undefined,
+        grants
+      ).ctx;
+
+      await expect(login(acme, "acme-google:google")).rejects.toMatchObject({
+        code: "VALIDATION_ERROR",
+      });
+      await expect(login(acmeGoogle, "acme:google")).rejects.toMatchObject({
+        code: "VALIDATION_ERROR",
+      });
+      // The controls: each one's own strategy gets through, so the refusals
+      // above are about whose strategy it is, not a door that is shut.
+      expect((await login(acme, "acme:google")).status).toBe(302);
+      expect((await login(acmeGoogle, "acme-google:google")).status).toBe(302);
+    });
+  });
+});
+
+describe("ctx.db relational queries", () => {
+  const originOf = (namespace: unknown) =>
+    (namespace as Record<symbol, unknown>)[ORIGIN];
+
+  it("reads through the TRANSACTION's relations-enabled handle inside a transaction", async () => {
+    // The transaction context's `getDrizzle()` has an empty `query`
+    // namespace, and the pooled relational handle runs on a different
+    // connection on PostgreSQL and MySQL. Inside `ctx.db.transaction`, `query`
+    // must come from `tx.drizzleWithRelations(relations)`: the leased client, with the
+    // relations config that populates the namespace.
+    const { ctx, built } = makeCtx(undefined, () => ({ id: "r1" }));
+
+    const origin = await ctx.db.transaction(async tx => originOf(tx.query));
+
+    expect(origin).toBe("tx:r1");
+    expect(built).toEqual(["tx:r1"]);
+  });
+
+  it("resolves the relations per access rather than once per context", async () => {
+    // The registry replaces its relations object when a table is
+    // re-registered, and a context outlives that. A config captured at
+    // construction would keep querying through edges over dropped tables.
+    let current = { id: "r1" };
+    const { ctx } = makeCtx(undefined, () => current);
+
+    expect(originOf(ctx.db.query)).toBe("pool:r1");
+    current = { id: "r2" };
+    expect(originOf(ctx.db.query)).toBe("pool:r2");
+
+    const inside = await ctx.db.transaction(async tx => {
+      const first = originOf(tx.query);
+      current = { id: "r3" };
+      return [first, originOf(tx.query)];
+    });
+    expect(inside).toEqual(["tx:r2", "tx:r3"]);
+  });
+
+  it("builds no relational handle for a transaction that never reads one", async () => {
+    // A relations-enabled Drizzle instance builds a query builder per table,
+    // so a transaction doing only builder writes should not pay for it.
+    const { ctx, built } = makeCtx(undefined, () => ({ id: "r1" }));
+    await ctx.db.transaction(async () => undefined);
+    expect(built).toEqual([]);
+  });
+});
+
+/**
+ * Which other plugins' tables `ctx.db` lets a plugin reach. The context is
+ * built once, at `init`, and a config reload never runs `init` again, so what
+ * it grants by has to be read from the config in force, not kept from boot.
+ */
+describe("the plugins ctx.db lets a plugin reach", () => {
+  const notes = defineTable("notes", { id: col.id() });
+  const owner = {
+    name: "@acme/local",
+    version: "1.0.0",
+    nextly: "*",
+    contributes: { schema: { tables: [notes] } },
+  };
+  const reader = (dependsOn?: Record<string, string>) => ({
+    name: "@acme/reader",
+    version: "1.0.0",
+    nextly: "*",
+    ...(dependsOn ? { dependsOn } : {}),
+  });
+
+  afterEach(() => {
+    clearActiveExtensionSchema();
+    clearPluginDependencies();
+  });
+
+  /** A context built for a reader that depends on the owner, as at boot. */
+  async function bootedReader() {
+    await compileAndPublishExtensionSchema({
+      dialect: "postgresql",
+      plugins: [owner as never],
+      config: {},
+      logger: { warn: () => undefined },
+    });
+    const booted = reader({ "@acme/local": "*" });
+    publishPluginDependencies([owner as never, booted as never]);
+    const { ctx } = makeCtx(booted);
+    // The control: the dependency it booted with does reach the table.
+    expect(() => ctx.db.table(notes)).not.toThrow();
+    return ctx;
+  }
+
+  it("stops reaching a plugin the reloaded config no longer depends on", async () => {
+    const ctx = await bootedReader();
+    publishPluginDependencies([owner as never, reader() as never]);
+    expect(() => ctx.db.table(notes)).toThrow(NextlyError);
+  });
+
+  it("reaches nothing of another plugin's once the config no longer lists it", async () => {
+    const ctx = await bootedReader();
+    publishPluginDependencies([owner as never]);
+    expect(() => ctx.db.table(notes)).toThrow(NextlyError);
+  });
+});
+
+describe("PluginEvents", () => {
+  it("is still what it was: an object with the bus's methods alone is one", () => {
+    // Checked by the compiler: a mock or wrapper written against the type
+    // before durable events existed keeps compiling. The durable methods are
+    // on `ctx.events` through a type of their own.
+    const bus = new EventBus() as Omit<EventBus, "emit"> & {
+      emit: PluginEvents["emit"];
+    };
+    const events: PluginEvents = bus;
+    expect(events).toBe(bus);
+  });
+});

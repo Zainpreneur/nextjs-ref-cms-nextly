@@ -1,0 +1,38 @@
+/**
+ * `runtime/seo` — Next-coupled SEO bridges that turn the `@nextlyhq/plugin-seo`
+ * field group into Next.js primitives. Type-only `next` imports, so nothing
+ * here forces `next` at load.
+ *
+ * @module runtime/seo
+ */
+export { buildMetadata } from "./build-metadata";
+export type {
+  BuildMetadataOptions,
+  MetadataEntry,
+  SeoMetaInput,
+} from "./build-metadata";
+
+// Structured data placed in a page: the props of its JSON-LD script element.
+export { jsonLdScriptProps } from "./structured-data";
+export type { JsonLdScriptProps } from "./structured-data";
+
+// The page-metadata contract a plugin provides.
+export {
+  PAGE_METADATA_CAPABILITY,
+  PAGE_METADATA_SERVICE,
+} from "./page-metadata-contract";
+export type {
+  PageMetadataAnswer,
+  PageMetadataImage,
+  PageImagePreview,
+  PageMetadataInput,
+  PageMetadataResolver,
+  PageMetadataSource,
+  PageMetadataValues,
+  PageListItem,
+  PageQuestion,
+  PageRobots,
+  PageStructuredDataHints,
+  StructuredDataNode,
+  StructuredDataValue,
+} from "./page-metadata-contract";

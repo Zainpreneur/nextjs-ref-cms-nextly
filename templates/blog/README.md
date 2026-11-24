@@ -1,0 +1,274 @@
+# Blog Template
+
+> [!IMPORTANT]
+> Nextly is in alpha. APIs may change before 1.0. Pin exact versions in production.
+
+A production-quality blog starter for Nextly. Ships with:
+
+- 15 seeded posts · 3 authors · 4 categories · 8 tags
+- Modern-tech visual design with full light/dark mode parity via a 3-state theme toggle
+- Public author profiles (an `authors` collection), kept apart from the accounts that own posts, with real admin/editor/author roles
+- Homepage with admin-editable hero, featured post, latest grid, category strip, and newsletter CTA
+- Post detail with reading progress bar, auto-TOC, share buttons, prev/next, and related posts
+- Static search via Pagefind (zero server infrastructure)
+- Newsletter signup via the `@nextlyhq/plugin-form-builder` plugin
+- Rich SEO: per-author / per-category / per-tag RSS, sitemap, OG images, JSON-LD (Article, Person, CollectionPage, BreadcrumbList, WebSite)
+
+## What's Included
+
+### Collections
+
+- **Posts** - Title, slug, rich text content, featured image, author (relates to users), categories, tags, excerpt, publish date, featured flag, SEO group (metaTitle, metaDescription, ogImage, canonical, noindex). Auto-generates slug from title; computes reading time and word count on save. Uses Nextly's built-in **Draft/Published** lifecycle (`status: true` on the collection) so the admin shows separate Save Draft / Publish buttons and the public REST endpoint hides drafts by default.
+- **Categories** - Name, slug, description. Simple taxonomy.
+- **Tags** - Name, slug, description. Granular cross-cutting taxonomy.
+
+### Singles
+
+- **Site Settings** - Site name, tagline, description, logo, social handles (Twitter, GitHub, LinkedIn). Drives the Header, Footer, and SEO metadata.
+- **Navigation** - Header link list + footer "Read" link list + UI toggles (show theme toggle, show search icon).
+- **Homepage** - Hero title/subtitle + section-visibility toggles (featured post, latest grid, category strip, newsletter CTA) + newsletter heading/subheading.
+
+### Authors and bylines
+
+A post has two people fields, kept apart on purpose:
+
+- `author` (relationship to `users`): the account that owns the post. The Author role may edit only the posts whose `author` is them, and a new post's `author` is the account that creates it.
+- `byline` (relationship to `authors`, labelled **Byline**): the public author a reader is shown, with their name, page at `/authors/[slug]` and bio. A new post is credited to the profile of the account that writes it, when that account has one. A post written inside a transaction its caller holds is credited once that transaction commits. As with `author`, only a `publish-posts` holder chooses or changes it; anyone else's value is dropped, so a writer's new post is credited to their own profile, never to one they named.
+
+The **Authors** collection holds those public profiles: `name`, `slug` (unique, used by `/authors/[slug]`), `bio`, `avatar` (an image in the media library), and `account`, the account the profile belongs to (unique: an account has one profile at most, so a new post's credit is never a choice between two). Accounts stay private; profiles are readable by anyone, which is what lets a page show them, but a profile's `account` is read only by a caller who may change profiles (`update-authors`), so a visitor neither sees it nor filters on it. Deleting a profile clears the byline of the posts that named it.
+
+The demo seed creates one author profile per seeded user, in order, with its avatar uploaded to the media library, and credits each post to its author's profile. An avatar in the seed data is a file name from `src/endpoints/seed/media` or an absolute `http(s)` address, which the seed fetches; one it can't load leaves the profile without an avatar and is listed in the seed's warnings. Running the seed again credits a post an earlier run left uncredited and keeps a byline a post already has, and uploads an avatar only for a profile without one, so it adds no media for a profile that has its avatar. The users keep their `bio`, `avatarUrl` and `slug` fields, which no page reads.
+
+### Roles
+
+Three roles seeded on first run:
+
+- **Administrator** (`admin`) - full access to content, taxonomy, media, and users.
+- **Editor** (`editor`) - create, edit, and publish any post; manages categories, tags, and media.
+- **Author** (`author`) - draft and edit posts, but not publish; read taxonomy. On a code-first blog, only their own posts, which they may also delete.
+
+The seed gives each role its permissions; change them on the Roles screen at `/admin/roles/<slug>` or with `nextly.roles.setPermissions({...})`. The `super-admin` role (seeded by Nextly core) bypasses all access checks.
+
+Collection access rules in `src/access/` decide by permission, never by a role's name, so a role you create and an API key are judged by what they hold:
+
+- Posts, Categories and Tags: public can read; creating, editing and deleting need the matching permission (`create-posts`, `update-tags`, ...). Publishing a post needs `publish-posts`.
+- Media: a visitor reads it through the built-in Public role's `read-media`, granted once at the first start. Take it away on the Roles screen and it stays away.
+- Posts: editing and deleting are narrowed by who wrote the post (`src/access/own-posts.ts`). A caller holding `publish-posts` changes every post; anyone else only the posts whose `author` is them. Only a `publish-posts` holder sets or changes a post's `author`, and a new post with no author becomes its creator's.
+
+So the seeded editor edits and deletes every post, and the seeded author, who holds `update-posts` and `delete-posts` but not `publish-posts`, only their own. To let another role edit every post, give it `publish-posts`.
+
+A blog scaffolded with the visual approach registers Posts without these rules, since the Schema Builder can't store a function, so the permission alone decides. Its seed gives the author no `delete-posts`, which would reach every post, and `update-posts` lets the author edit every post. For the same reason, any writer there may set a post's `author` and `byline`. Its config registers the template's own plugin (`src/collections/Posts/credit-plugin.ts`), which adds the two hooks by the collection's slug, so a new post with neither is still owned by and credited to the account that writes it. Its collections also carry no read rule, so nothing grants the Public role their read: visitors can't read posts, authors, categories or tags over REST, while the blog's own pages read them on the server, where that role does not apply. To open them, grant the Public role their read on the Roles screen. See [Only their own entries](https://nextlyhq.com/docs/permissions#only-their-own-entries).
+
+## Pages
+
+| Route                         | What it is                                                                                                          |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `/`                           | Homepage: hero + featured + latest grid + category strip + newsletter CTA (all toggleable from the Homepage single) |
+| `/blog`                       | All posts, paginated 9 per page                                                                                     |
+| `/blog/[slug]`                | Post detail with reading progress, auto-TOC, share bar, author card, related posts, prev/next                       |
+| `/authors/[slug]`             | Profile-centered author page with big avatar, bio, stats, post grid                                                 |
+| `/categories`                 | All categories as a card grid with descriptions + post counts                                                       |
+| `/categories/[slug]`          | Category archive, paginated, per-category RSS link                                                                  |
+| `/tags`                       | Tag cloud sized by post count                                                                                       |
+| `/tags/[slug]`                | Tag archive, paginated, per-tag RSS link                                                                            |
+| `/search`                     | Client-side Pagefind search                                                                                         |
+| `/feed.xml`                   | Site-wide RSS feed                                                                                                  |
+| `/categories/[slug]/feed.xml` | Per-category RSS                                                                                                    |
+| `/tags/[slug]/feed.xml`       | Per-tag RSS                                                                                                         |
+| `/authors/[slug]/feed.xml`    | Per-author RSS                                                                                                      |
+| `/sitemap.xml`                | Sitemap covering posts, categories, tags, authors, and static pages                                                 |
+
+### Design system
+
+Light and dark modes are driven by CSS custom properties in `src/app/globals.css`. The theme toggle in the header cycles Light / System / Dark and persists to `localStorage`. First paint has the correct theme applied via an inline script in `<head>` (no flash-of-wrong-theme).
+
+Typography lives under `.prose-blog` for the rich-text renderer; tokens adjust across themes automatically.
+
+## Schema approaches
+
+The template supports both Nextly schema approaches:
+
+- **Code-first** (`configs/codefirst.config.ts`) - Full schemas in TypeScript. Best for version control and type safety.
+- **Visual** (`configs/visual.config.ts`) - Empty config. Create schemas via the Admin Panel.
+
+The two approaches are not mutually exclusive: a code-first project can add UI-defined collections later via the Schema Builder, and vice versa.
+
+## Customization
+
+### Hero, homepage sections, navigation - edit from the admin
+
+Go to `/admin/singles/homepage` and change the hero title, subtitle, or newsletter copy. Toggle sections on/off with the checkboxes. Same for Site Settings and Navigation - all three singles ship with sensible defaults but are editable without touching code.
+
+### Theme colors
+
+Edit CSS variables in `src/app/globals.css`:
+
+- Light values under `[data-theme="light"]`
+- Dark values under `[data-theme="dark"]`
+- `--color-accent` is the single accent color used for links, the reading progress bar, focus rings, and newsletter buttons
+
+### Photos
+
+Replace the placeholder gradient SVGs in `seed/media/`. See `seed/media/README.md` for a full guide on sizing, format, and where to source photography.
+
+### Adding fields to posts
+
+Edit `src/collections/Posts/index.ts`:
+
+```typescript
+// src/collections/Posts/index.ts
+fields: [
+  // ...existing fields...
+  checkbox({ name: "pinned", defaultValue: false }),
+  text({ name: "subtitle" }),
+],
+```
+
+Re-run `pnpm dev`. The schema-change handler walks you through applying the migration.
+
+### Adding pages
+
+Create new files in `src/app/(frontend)/` following the Next.js App Router conventions. The `(frontend)` route group provides the Header and Footer via `layout.tsx`.
+
+## Performance
+
+Pages pre-render at build time via `generateStaticParams`, then stay fresh through **tag-based revalidation** — no time-based `revalidate`, no rebuilds:
+
+- Every published post, author, category, and tag is pre-rendered at build.
+- Every read in `src/lib/queries/` is wrapped in Nextly's `cachedFind` and tagged with `nextlyTags(...)` / `nextlySingleTags(...)`.
+- When you publish, edit, or delete content in `/admin`, the write busts the matching tag and the affected pages regenerate on the **next** request. `src/instrumentation.ts` registers the Next cache adapter when any server process boots, so every write path busts tags — the admin API, the seed endpoint, and Server Actions — including in split serverless deployments where those run as separate functions.
+- Slugs published after the last build render on first request (`dynamicParams`).
+
+### What a write refreshes
+
+| Change in /admin                                      | Pages that refresh on next visit                                                                                                                                                                                      |
+| ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Publish / edit / delete a post                        | Homepage, `/blog` (+ pagination), the post's `/blog/[slug]`, and every author / category / tag listing it appears in                                                                                                  |
+| Rename a post's slug                                  | The new `/blog/[slug]` renders; the old URL 404s (its page regenerated and no published post matches)                                                                                                                 |
+| Edit a category / tag                                 | Its listing page and any post detail that shows it                                                                                                                                                                    |
+| Edit an author's profile                              | The `users` collection emits no cache tags, so the author's name / bio / avatar refresh within the safety-net window — on `/authors/[slug]` and wherever the author appears in post lists / details — never instantly |
+| Replace / rename / delete an image                    | Every page that rendered it, immediately — a media write busts that file's tags on commit                                                                                                                             |
+| Edit the Site settings / Navigation / Homepage single | Every page that reads that global                                                                                                                                                                                     |
+
+### Opting a write out of revalidation
+
+A bulk import or seed script can skip the cache bust by passing `disableRevalidate: true` to a Direct API write — `nextly.create({ collection: "posts", data, disableRevalidate: true })`. The write still happens; it just doesn't bust tags, which is handy when you would rather revalidate once at the end of a batch.
+
+### Time-based safety net
+
+Tag busting is exact, so post, category, tag, single, and media edits need no timer. The one exception left is `users` (authors), which still emits no cache tags. So the author page (`src/lib/queries/authors.ts`) and the post reads that embed author records (`src/lib/queries/posts.ts`) ship a one-hour backstop (`AUTHOR_REVALIDATE_SECONDS` / `RELATION_REVALIDATE_SECONDS`) so an author-profile edit appears within that window — lower it for fresher author data. Image edits no longer depend on it: a media write busts that file's tags on commit. To add a backstop to any other read, pass `revalidate: <seconds>` to its `cachedFind` call.
+
+Images use `next/image` with a `sizes` attribute so phones don't download desktop-sized files. The `unoptimized` prop is set on avatar images since they can come from arbitrary remote URLs that aren't in `next.config.images.remotePatterns`.
+
+## Data fetching
+
+All pages fetch data using Nextly's Direct API:
+
+```typescript
+import { getNextly } from "nextly";
+import nextlyConfig from "@nextly-config";
+
+export default async function BlogPage() {
+  const nextly = await getNextly({ config: nextlyConfig });
+  // Returns ListResult<T> = { items, meta }.
+  const result = await nextly.find({
+    collection: "posts",
+    where: { status: { equals: "published" } },
+    sort: "-publishedAt",
+    limit: 9,
+    depth: 2,
+  });
+  result.items; // Post[]
+  result.meta.total; // number
+  // render result.items...
+}
+```
+
+The Direct API runs in Server Components with zero HTTP overhead. Relationships populate via the `depth` parameter. React `cache()` deduplicates fetches within a single request; cross-request freshness is tag-based via `cachedFind` (see [Performance](#performance) above). See `src/lib/queries/` for the cached helpers.
+
+## Search
+
+Search uses [Pagefind](https://pagefind.app), a static search index:
+
+1. `pnpm build` compiles Next.js and runs `scripts/build-search-index.mjs`, which scans the rendered HTML and writes an index under `public/pagefind/`.
+2. The `/search` page loads `pagefind.js` on demand and runs queries entirely in the browser.
+3. No server-side search infrastructure required.
+
+To rebuild the index manually without a full site build: `pnpm search:index`.
+
+On platforms other than Vercel, set a `Content-Type: application/wasm` header for `public/pagefind/*.wasm` or Pagefind's MIME check may fail.
+
+## Newsletter
+
+The homepage and footer newsletter forms submit to the `@nextlyhq/plugin-form-builder` plugin. Submissions are stored in the `form-submissions` collection and visible at `/admin/collections/form-submissions`.
+
+A production boot refuses a configured plugin that has not been installed on its database; development only warns. The `build` script installs it for you, after migrating and against the database the build targets (`nextly migrate && nextly plugins install @nextlyhq/plugin-form-builder && next build`), so a deploy that builds against the production database needs no extra step. A visual blog registers one plugin from its own source, and its build installs it with `nextly plugins install --all`. If you deploy without building against that database, run the same two `nextly` commands there before the first production boot. When you remove a plugin from `nextly.config.ts`, remove its `nextly plugins install` from your build script too, or the build fails. See [Installing](https://nextlyhq.com/docs/guides/production-migrations#installing).
+
+The seed creates a form with slug `newsletter` on first run. If the seed skipped it (or you removed it), create a new Form at `/admin/collections/forms` with slug `newsletter` and the plugin + frontend will start working.
+
+To send a welcome email on subscription, add an `afterChange` hook on the `form-submissions` collection that calls your email provider when the referenced form's slug is `newsletter`.
+
+## SEO
+
+- **Metadata API**: every page defines `generateMetadata` with title, description, canonical, Open Graph, and Twitter card. Per-post SEO fields (metaTitle, metaDescription, ogImage, canonical, noindex) override the defaults.
+- **JSON-LD**: post detail ships Article + BreadcrumbList, category/tag archives ship CollectionPage + BreadcrumbList, author pages ship Person + BreadcrumbList, homepage ships WebSite.
+- **Sitemap**: auto-generated at `/sitemap.xml` from published content.
+- **OG images**: dynamic per-post OG at `/blog/[slug]/opengraph-image` (and similar for categories, tags, authors) - Vercel's `@vercel/og` with Next.js conventions. Uploaded per-post `seo.ogImage` takes precedence when set.
+- **RSS**: four feeds - site-wide, per-category, per-tag, per-author. All include the last 20 published posts with title, link, description, and pubDate.
+
+## File layout
+
+```
+templates/blog/
+  configs/
+    codefirst.config.ts    # Code-first schemas + plugins
+    visual.config.ts       # Empty; UI-created schemas only
+  seed/
+    media/                 # Gradient SVG placeholders (see README there)
+    seed-data.json         # 15 posts + 3 users + 4 categories + 8 tags
+    nextly.seed.ts         # Idempotent seed script (users, roles, content, forms)
+  scripts/
+    build-search-index.mjs # Pagefind index generator
+  src/
+    access/                # RBAC access-control functions
+    actions/               # Server Actions (newsletter submission)
+    app/
+      layout.tsx           # Root layout with theme-init script
+      globals.css          # Design tokens + .prose-blog
+      sitemap.ts
+      robots.ts
+      feed.xml/            # Site-wide RSS
+      opengraph-image.tsx  # Default OG image
+      (frontend)/          # Route group for the public-facing blog
+      categories/[slug]/feed.xml/
+      tags/[slug]/feed.xml/
+      authors/[slug]/feed.xml/
+    collections/
+      Posts/               # Folder collection with its own hooks
+      Categories.ts        # Flat (trivial collection)
+      Tags.ts              # Flat (trivial collection)
+    singles/
+      SiteSettings/
+      Navigation/
+      Homepage/
+    hooks/
+      auto-slug.ts         # Shared beforeValidate hook (Posts + Categories + Tags)
+    lib/
+      extract-toc.ts       # HTML -> TOC utility for post detail
+      queries/             # Cached Direct-API wrappers
+      rss.ts               # Minimal RSS 2.0 builder
+      site-url.ts
+      __scratch__/         # Developer scratchpad — debug-queries etc., not for prod
+    components/            # React components (26 total)
+```
+
+The architecture follows Payload CMS's hybrid pattern: folder-per-collection-when-complex, flat-file-when-trivial. Hooks used by multiple collections live in `src/hooks/`; collection-specific hooks live inside that collection's folder.
+
+## Extending
+
+This template is intended as a starting point. Common customizations:
+
+- **Change the aesthetic**: edit CSS tokens in `globals.css` and swap the `Geist` font in `src/app/layout.tsx` for your choice.
+- **Replace the newsletter provider**: the `submit-newsletter.ts` Server Action can call any HTTP endpoint. Swap the `form-submissions.create` body for a Resend / ConvertKit / Mailchimp API call if you'd rather bypass the Nextly admin.
+- **Add comments**: drop in Giscus (GitHub Discussions) or Commento. Comments aren't shipped by default because they're spam magnets and rarely used on modern tech blogs - but the template stays out of the way if you add them.
+- **Scheduled publishing**: add a `publishAt` date field + a cron job that flips `status: "scheduled"` to `status: "published"` when the date passes. The template doesn't ship this because it needs a job runner (Vercel Cron, BullMQ, etc.) - your infra, your choice.

@@ -1,0 +1,510 @@
+import { NextlyError } from "../../../errors/nextly-error";
+import { publicStateNames } from "../../../lib/content-states";
+
+import {
+  castText,
+  ddlType,
+  exactText,
+  lit,
+  nullSafeDiffers,
+  q,
+} from "./ddl-types";
+import type {
+  ArchiveOwner,
+  CompanionCopyRef,
+  CompanionMigrationSpec,
+  CopyLiveness,
+} from "./types";
+
+const ARCHIVE = "nextly_i18n_archive";
+
+/**
+ * DOWN migration for DISABLING localization (guarded, recoverable):
+ *   1. Re-add the columns to the main table (nullable)
+ *   2. Restore the default-locale value back onto the main table
+ *   3. Archive every NON-default-locale value into `nextly_i18n_archive`
+ *      (id is DB-generated, so the INSERT ... SELECT omits it)
+ *   4. DROP the companion table
+ */
+export function buildLocalizationDownSql(
+  spec: CompanionMigrationSpec,
+  options: Pick<LocalizationDownOptions, "afterRestore"> = {}
+): string {
+  return buildLocalizationDownStatements(spec, options)
+    .map(s => `${s};`)
+    .join("\n\n");
+}
+
+/**
+ * Statement-array form of {@link buildLocalizationDownSql} (no trailing `;` per element). The
+ * runtime disable path (a Builder-entity localization toggle, which has no migration file) runs
+ * these individually via the adapter after ensuring `nextly_i18n_archive` exists.
+ */
+/** Options for {@link buildLocalizationDownStatements}. */
+export interface LocalizationDownOptions {
+  /**
+   * Localized columns the main table ALREADY carries, which must not be re-added.
+   *
+   * Unattended provisioning can seed a companion without dropping the columns it copied from, so
+   * disabling later meets a main table that still has them. `ALTER TABLE ADD COLUMN` is not
+   * idempotent on any supported dialect, so re-adding one fails the whole disable.
+   *
+   * They are still RESTORED. Their presence says only that a column exists, never that its value
+   * is current: every localized write since the transition went to the companion alone, so a
+   * retained column holds whatever it held before the entity was localized. Treating it as an
+   * already-completed restore is what silently reverts content to its pre-localization state.
+   */
+  existingMainColumns?: readonly string[];
+  /**
+   * Statements to run once the values are back on the main table, before anything is archived or
+   * the companion dropped: the settings the main table's snapshot records of the restored columns
+   * (a Required field's NOT NULL, a Unique field's index), which a column added empty could not
+   * take before the copy. A value the setting refuses then stops the run with every translation
+   * still in place.
+   */
+  afterRestore?: readonly string[];
+  /**
+   * Whether to carry the restored row's publishing state back onto main.
+   *
+   * A verdict about the PHYSICAL tables, supplied by the caller, never derived from the spec.
+   * `spec.status` describes the shape the collection is being saved as, and a save that disables
+   * localization while turning Draft/Published on would have this read a `_status` the old
+   * companion never had — into a `status` the main table has not been given yet, because a disable
+   * deliberately runs the companion transition before the shared ALTER that adds it.
+   *
+   * When it IS there on both sides it has to travel: publishing is per locale while an entity is
+   * localized, and this path drops the companion straight after restoring, so content moved
+   * without the state it was published under cannot be corrected afterwards.
+   */
+  restoreStatus?: boolean;
+}
+
+/**
+ * Copy the default locale's companion values back onto the main row — one correlated UPDATE
+ * covering every column in `columnNames`.
+ *
+ * Shared rather than inlined because two paths owe the same copy for different reasons. A disable
+ * migration restores before it drops the companion. Unattended provisioning restores when an
+ * entity's config stops being localized, and must not drop anything — but the values it moves and
+ * the direction it moves them in are identical, and two builders would drift.
+ *
+ * The default locale is a PREFERENCE, not a filter, and here that matters more than it does at
+ * runtime. This statement runs inside a disable migration that archives the other languages and
+ * then DROPS the companion, so a parent skipped by a default-only restore keeps whatever main held
+ * before it was ever localized while its actual content leaves with the table. Ranking the parent's
+ * rows — the default first, then deterministically by locale — brings every entry back from the row
+ * it has.
+ *
+ * `WHERE EXISTS` still matters, now on the parent rather than the locale. Without it a row with no
+ * companion row at all — one created after the transition, say — assigns SQL NULL, so restoring
+ * would blank a main column nothing ever translated. There is nothing to restore for such a row,
+ * and nothing is what it should get.
+ *
+ * ONE statement covering every column, not one per column. An entity with several translatable
+ * fields would otherwise be restorable half-way: an `UPDATE` failing after earlier ones committed
+ * leaves main carrying some restored values and some pre-localization ones, with no record that a
+ * restore was even attempted. The application then serves that mixture and accepts edits on it, and
+ * the next pass repeats every column from the now-stale companion, overwriting them. A single
+ * statement cannot land partially, so the restore either happened or it did not.
+ *
+ * Returned as an array with at most one element, because the callers run a statement list and the
+ * empty case (nothing to restore) has to stay expressible.
+ */
+export function buildDefaultLocaleRestoreStatements(
+  spec: CompanionCopyRef,
+  columnNames: readonly string[],
+  options: { restoreStatus?: boolean } = {}
+): string[] {
+  if (columnNames.length === 0 && options.restoreStatus !== true) return [];
+  const { dialect, mainTable, companionTable } = spec;
+  const comp = q(companionTable, dialect);
+  const main = q(mainTable, dialect);
+  const parent = `${comp}.${q("_parent", dialect)} = ${main}.${q("id", dialect)}`;
+  const fromChosenRow = (target: string, source: string) =>
+    `${target} = ${restoredValue(spec, source)}`;
+  const assignments = [
+    ...columnNames.map(name => {
+      const col = q(name, dialect);
+      return fromChosenRow(col, col);
+    }),
+    // The publishing state of the row the values came from, carried across with them. While an
+    // entity is localized, publishing is per locale: a publish under a non-default locale updates
+    // that companion row and deliberately leaves main alone. Restoring the content without the
+    // state it was published under makes a draft public or makes live content vanish — and on this
+    // path the companion is dropped immediately afterwards, so nothing is left to correct it from.
+    ...(options.restoreStatus === true
+      ? [fromChosenRow(q("status", dialect), q("_status", dialect))]
+      : []),
+  ].join(", ");
+  return [
+    `UPDATE ${main} SET ${assignments} ` +
+      `WHERE EXISTS (SELECT 1 FROM ${comp} WHERE ${parent})`,
+  ];
+}
+
+/**
+ * The value a main row takes from the companion's `source` expression when it is restored: from
+ * the row {@link chosenRowOrder} ranks first, which is what the entry's readers saw where the
+ * spec says which rows are live, and otherwise the default language's row, else the first by
+ * language code. Where the spec says which rows are live, a row whose `source` is blank (NULL or
+ * empty, as `isBlank` reads it) ranks after every row of the same reach that has one, as a reader
+ * of that language is shown the next language that has the field, but never after a row no reader
+ * reaches: so each field is judged on its own, and two
+ * fields of one entry may come from different rows. Without that, one row per parent, the same
+ * for every column.
+ *
+ * A correlated subquery over `spec.mainTable`, for the restore above and for a precondition that
+ * has to judge the values the restore will write before it runs.
+ */
+export function restoredValue(spec: CompanionCopyRef, source: string): string {
+  const { dialect, mainTable, companionTable } = spec;
+  const comp = q(companionTable, dialect);
+  const parent = `${comp}.${q("_parent", dialect)} = ${q(mainTable, dialect)}.${q("id", dialect)}`;
+  return (
+    `(SELECT ${source} FROM ${comp} WHERE ${parent} ` +
+    `ORDER BY ${chosenRowOrder(spec, comp, source)} LIMIT 1)`
+  );
+}
+
+/**
+ * What {@link chosenRowOrder} ranks an entity's translation rows by, from the site's language
+ * order and whether each language publishes on its own; undefined without a language order, for
+ * the ranking callers had before (the default language, else the first by code). The publish
+ * states readers see are the ones a public read is bounded to (`publicStateNames`).
+ */
+export function copyLiveness(
+  languageOrder: readonly string[] | undefined,
+  companionHasStatus: boolean | undefined
+): CopyLiveness | undefined {
+  if (languageOrder === undefined) return undefined;
+  return {
+    languageOrder,
+    publicStates: publicStateNames(),
+    companionHasStatus: companionHasStatus === true,
+  };
+}
+
+/**
+ * The order a parent's translation rows are ranked in to choose the one its shared value is taken
+ * from: one ranking for the copy, the archive (which keeps every row but the chosen one) and the
+ * preview's counts, so the three cannot disagree on which language wins.
+ *
+ * With `liveness`, readers keep what they saw: the default language's row where it is live, else
+ * the first live row in the site's language order, else the default language's row, else the
+ * first in the site's order. A row is live when its language is one the site has (a language
+ * removed in Settings keeps its rows, which no reader reaches) and, where each language publishes
+ * on its own, its own `_status` is a public state. The entry's main status is not asked: it is the
+ * same for all of an entry's rows, so it cannot change their order. Without `liveness`, the default
+ * language's row, else the first by language code.
+ *
+ * `row` names the translation row: a table or an alias. With `value`, the field being chosen for,
+ * a row where it is blank (NULL or empty) ranks after every row of the same reach where it is not,
+ * as a reader is shown the next language that has it: a blank live row still ranks before any row
+ * no reader reaches.
+ */
+function chosenRowOrder(
+  spec: Pick<CompanionCopyRef, "dialect" | "defaultLocale" | "liveness">,
+  row: string,
+  value?: string
+): string {
+  const { dialect, defaultLocale, liveness } = spec;
+  const locale = `${row}.${q("_locale", dialect)}`;
+  const isDefault = `${locale} = ${lit(defaultLocale)}`;
+  if (!liveness) return `(${isDefault}) DESC, ${locale} ASC`;
+  const states = liveness.publicStates.map(lit).join(", ");
+  const conditions = [
+    ...(liveness.languageOrder.length > 0
+      ? [`${locale} IN (${liveness.languageOrder.map(lit).join(", ")})`]
+      : []),
+    ...(states !== "" && liveness.companionHasStatus
+      ? [`${row}.${q("_status", dialect)} IN (${states})`]
+      : []),
+  ];
+  const isLive = conditions.length > 0 ? conditions.join(" AND ") : "1 = 1";
+  const blankLast =
+    value === undefined
+      ? ""
+      : `CASE WHEN ${value} IS NULL OR ${castText(value, dialect)} = '' THEN 1 ELSE 0 END, `;
+  const siteOrder =
+    liveness.languageOrder.length > 0
+      ? `CASE ${locale} ${liveness.languageOrder
+          .map((code, index) => `WHEN ${lit(code)} THEN ${index}`)
+          .join(" ")} ELSE ${liveness.languageOrder.length} END, `
+      : "";
+  // Reachable rows first, then drafts of a language the site has, then a removed language's rows,
+  // and a blank one only within its tier: a published row whose field is empty showed its readers
+  // nothing, which is kept rather than a value no reader saw.
+  const listed =
+    liveness.languageOrder.length > 0
+      ? `${locale} IN (${liveness.languageOrder.map(lit).join(", ")})`
+      : "1 = 1";
+  return (
+    `CASE WHEN ${isLive} THEN 0 WHEN ${listed} THEN 1 ELSE 2 END, ` +
+    blankLast +
+    `CASE WHEN ${isDefault} THEN 0 ELSE 1 END, ${siteOrder}${locale} ASC`
+  );
+}
+
+/**
+ * The language of the row an entry's shared value of `column` is taken from, for the entry whose
+ * id is `parent`: the same ranking as {@link restoredValue}, read beside a row of another table.
+ */
+export function chosenLocaleOf(
+  spec: Pick<
+    CompanionCopyRef,
+    "dialect" | "companionTable" | "defaultLocale" | "liveness"
+  >,
+  parent: string,
+  column: string
+): string {
+  const { dialect } = spec;
+  const chosen = q("chosen", dialect);
+  return (
+    `(SELECT ${chosen}.${q("_locale", dialect)} FROM ${q(spec.companionTable, dialect)} ${chosen} ` +
+    `WHERE ${chosen}.${q("_parent", dialect)} = ${parent} ` +
+    `ORDER BY ${chosenRowOrder(spec, chosen, `${chosen}.${q(column, dialect)}`)} LIMIT 1)`
+  );
+}
+
+/**
+ * The type to give a main-table column that is about to be filled FROM the companion.
+ *
+ * Wider than the shared renderer on purpose, and only here. This statement is followed immediately
+ * by a copy out of the companion column, so the target has to hold whatever that column can hold —
+ * and on a MySQL installation created before the renderer emitted TEXT, a `longText` companion
+ * column is physically LONGTEXT. Re-adding TEXT and copying into it truncates a default-locale
+ * value past 65 535 characters, silently on a non-strict server.
+ *
+ * These statements are written into a migration file with no database to introspect, so the target
+ * cannot be read from the live column; sizing it to the widest the source could be is what makes
+ * the restore safe without one. The cost is a main column wider than a freshly created one would
+ * be, which the next schema sync reports as an ordinary type change — visible and recoverable,
+ * unlike the truncation it replaces.
+ */
+function restoreTargetType(
+  column: Parameters<typeof ddlType>[0],
+  dialect: Parameters<typeof ddlType>[1]
+): string {
+  if (dialect === "mysql" && column.kind === "longText") return "LONGTEXT";
+  return ddlType(column, dialect);
+}
+
+/**
+ * Copies every non-default language's value of one companion column into the localization
+ * archive, where `nextly i18n:restore` reads it back. One row per (entry, language), the value
+ * cast to text, recorded under the entity's slug and kind and the column's name.
+ *
+ * Safe to run more than once: a value is written only when it differs from the newest row already
+ * archived for that entry, language and field. A second run of the same change adds nothing, while
+ * a value that changed since it was last archived is archived again, and a restore takes the newest
+ * row. A value with nothing archived before and nothing to keep (NULL) is not written.
+ */
+/**
+ * The owner an archive row is recorded under. A statement that archives without knowing the
+ * entity's kind would file the values where another entity of the same slug reads them, so it is
+ * refused rather than given a default.
+ */
+export function archiveOwnerOf(
+  slug: string,
+  kind: ArchiveOwner["kind"] | undefined
+): ArchiveOwner {
+  if (kind === undefined) {
+    throw NextlyError.internal({
+      logContext: {
+        reason: "an archive write needs the entity's kind as well as its slug",
+        slug,
+      },
+    });
+  }
+  return { slug, kind };
+}
+
+function buildArchiveNonDefaultStatement(
+  ref: Pick<
+    CompanionCopyRef,
+    "dialect" | "companionTable" | "defaultLocale" | "liveness"
+  >,
+  owner: ArchiveOwner,
+  columnName: string,
+  /** The field the rows are recorded under, when it differs from the column they are read from. */
+  archivedAs: string = columnName,
+  /**
+   * Archive the kept language's value too, as a migration file does so its DOWN can put every
+   * language back where it was.
+   */
+  everyLanguage = false
+): string {
+  const { dialect, companionTable, defaultLocale } = ref;
+  const source = q("source", dialect);
+  const archived = q("archived", dialect);
+  const value = castText(`${source}.${q(columnName, dialect)}`, dialect);
+  // The language whose value becomes the shared one, and so is not archived: the row the copy
+  // takes (`chosenRowOrder`) where readers keep what they saw, else the default language.
+  const keptLocale = ref.liveness
+    ? chosenLocaleOf(ref, `${source}.${q("_parent", dialect)}`, columnName)
+    : lit(defaultLocale);
+  // Every row but the default language's where the default is the one kept: its value stays on the
+  // main table, which is where turning translation on again takes the default language's from. A
+  // kept language other than the default is archived too, so a restore can put it back as its own.
+  const rowLocale = `${source}.${q("_locale", dialect)}`;
+  const archivedLanguages = everyLanguage
+    ? "1 = 1"
+    : ref.liveness
+      ? `(${rowLocale} <> ${lit(defaultLocale)} OR ${rowLocale} <> ${keptLocale})`
+      : `${rowLocale} <> ${keptLocale}`;
+  // The value archived last for this entry, language and field, or NULL when there is none.
+  const newest =
+    `(SELECT ${archived}.${q("value", dialect)} FROM ${q(ARCHIVE, dialect)} ${archived} ` +
+    `WHERE ${archived}.${q("collection", dialect)} = ${lit(owner.slug)} ` +
+    `AND ${archived}.${q("entity_kind", dialect)} = ${lit(owner.kind)} ` +
+    // Cast, because the parent id mirrors the main table's id and can be a uuid where the archive
+    // keeps text, and PostgreSQL compares the two only explicitly. Exact, because the archive and
+    // the companion may carry different collations (see `exactText`).
+    `AND ${exactText(`${archived}.${q("entry_id", dialect)}`, dialect)} = ${exactText(castText(`${source}.${q("_parent", dialect)}`, dialect), dialect)} ` +
+    `AND ${exactText(`${archived}.${q("locale", dialect)}`, dialect)} = ${exactText(`${source}.${q("_locale", dialect)}`, dialect)} ` +
+    `AND ${archived}.${q("field", dialect)} = ${lit(archivedAs)} ` +
+    `ORDER BY ${archived}.${q("id", dialect)} DESC LIMIT 1)`;
+  return (
+    `INSERT INTO ${q(ARCHIVE, dialect)} ` +
+    `(${q("collection", dialect)}, ${q("entity_kind", dialect)}, ${q("entry_id", dialect)}, ${q("locale", dialect)}, ${q("field", dialect)}, ${q("value", dialect)}) ` +
+    `SELECT ${lit(owner.slug)}, ${lit(owner.kind)}, ${source}.${q("_parent", dialect)}, ${source}.${q("_locale", dialect)}, ${lit(archivedAs)}, ${value} ` +
+    `FROM ${q(companionTable, dialect)} ${source} WHERE ${archivedLanguages} ` +
+    `AND ${nullSafeDiffers(exactText(newest, dialect), exactText(value, dialect), dialect)}`
+  );
+}
+
+/**
+ * The archive half of a field leaving translation on its own: every non-default language's value
+ * of its companion column, written to the localization archive. A caller that writes it before
+ * altering the main table, so that an archive that refuses the write stops the change before
+ * anything else has run, passes `archive: false` to {@link buildFieldLeavesTranslationStatements}
+ * for the rest.
+ */
+export function buildFieldLeavesTranslationArchiveStatement(
+  ref: Pick<
+    CompanionCopyRef,
+    "dialect" | "companionTable" | "defaultLocale" | "liveness"
+  >,
+  owner: ArchiveOwner,
+  columnName: string,
+  /**
+   * The field the rows are recorded under, for a field renamed in the same change: read from the
+   * column it has now, recorded under the name it is restored by.
+   */
+  archivedAs: string = columnName,
+  /** Archive the kept language's value too (see `buildArchiveNonDefaultStatement`). */
+  everyLanguage = false
+): string {
+  return buildArchiveNonDefaultStatement(
+    ref,
+    owner,
+    columnName,
+    archivedAs,
+    everyLanguage
+  );
+}
+
+/**
+ * What a field that stops being translated needs before its companion column is dropped: every
+ * non-default language's value archived, then the default language's value copied onto the main
+ * table's column of the same name, which the caller has already added.
+ *
+ * Archive first, because it is the step that keeps what the drop would lose: if it fails, the
+ * column has not been touched yet. Both statements are safe to re-run before the drop, so a run
+ * stopped part-way loses nothing; a value archived twice is restored from its newest row. The copy
+ * picks its row by the same rule as disabling translation for the whole entity
+ * (`buildDefaultLocaleRestoreStatements`), so the two cannot disagree on what the shared value
+ * becomes. `archive: false` leaves out the archive write, for a caller that has made it already.
+ */
+export function buildFieldLeavesTranslationStatements(
+  ref: CompanionCopyRef,
+  owner: ArchiveOwner,
+  columnName: string,
+  options: { archive?: boolean } = {}
+): string[] {
+  return [
+    ...(options.archive === false
+      ? []
+      : [buildArchiveNonDefaultStatement(ref, owner, columnName)]),
+    ...buildDefaultLocaleRestoreStatements(ref, [columnName]),
+  ];
+}
+
+export function buildLocalizationDownStatements(
+  spec: CompanionMigrationSpec,
+  options: LocalizationDownOptions = {}
+): string[] {
+  const {
+    dialect,
+    mainTable,
+    companionTable,
+    defaultLocale,
+    collection,
+    kind,
+    columns,
+  } = spec;
+  const stmts: string[] = [];
+
+  // Reversing an ENABLE that dropped only a subset of the localized columns from main
+  // (`columnsOnMain`) must re-add and restore exactly that subset; a column main never
+  // carried has no place to come back to. Undefined means "all of `columns`" — the disable
+  // path, where every localized column belongs on main. The archive step below still spans
+  // ALL columns so no translation is lost when the companion is dropped.
+  const onMainSet = spec.columnsOnMain && new Set(spec.columnsOnMain);
+  const onMain = onMainSet
+    ? columns.filter(c => onMainSet.has(c.name))
+    : columns;
+
+  // 1. re-add columns (nullable — localized columns are always nullable), skipping any the main
+  // table still carries. Restoring them is handled below regardless: see `existingMainColumns`.
+  const alreadyPresent = new Set(options.existingMainColumns ?? []);
+  for (const c of onMain) {
+    if (alreadyPresent.has(c.name)) continue;
+    // The column the main table's snapshot records (`restoredAs`), where a migration file is
+    // written against one. Otherwise what the column the values come from carries
+    // (`carriedDefinition`): its type where it is wider than the field's own, else the widest type
+    // the values could need (`restoreTargetType`), and its default, which the restored column
+    // takes back.
+    const type =
+      c.restoredAs?.type ?? c.carried?.type ?? restoreTargetType(c, dialect);
+    const def =
+      c.restoredAs === undefined ? c.carried?.default : c.restoredAs.default;
+    stmts.push(
+      `ALTER TABLE ${q(mainTable, dialect)} ADD COLUMN ${q(c.name, dialect)} ${type}` +
+        (def === undefined ? "" : ` DEFAULT ${def}`)
+    );
+  }
+
+  // 2. restore the default-locale values onto the main row (one UPDATE covering every column)
+  stmts.push(
+    ...buildDefaultLocaleRestoreStatements(
+      spec,
+      onMain.map(c => c.name),
+      // Decided by the caller from the PHYSICAL tables, never from `spec.status`. That field is
+      // the desired shape, and a save that disables localization and turns Draft/Published on at
+      // once would have this read a `_status` the old companion does not carry — into a `status`
+      // the main table has not been given yet, since a disable runs the companion transition
+      // before the shared ALTER. Omitted means do not touch status.
+      { restoreStatus: options.restoreStatus === true }
+    )
+  );
+  stmts.push(...(options.afterRestore ?? []));
+
+  // 3. archive every translation but the one restored: the default language's, or, with the
+  // spec's ranking, the row its readers saw (`chosenRowOrder`), so nothing restored is archived
+  // and nothing archived is lost
+  for (const c of columns) {
+    stmts.push(
+      buildArchiveNonDefaultStatement(
+        { dialect, companionTable, defaultLocale, liveness: spec.liveness },
+        archiveOwnerOf(collection, kind),
+        c.name
+      )
+    );
+  }
+
+  // 4. drop the companion table
+  stmts.push(`DROP TABLE ${q(companionTable, dialect)}`);
+
+  return stmts;
+}

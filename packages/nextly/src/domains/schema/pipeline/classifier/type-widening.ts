@@ -1,0 +1,255 @@
+// Per-dialect type-widening allow-list.
+//
+// Why this exists: changing a column type is usually destructive (PG fails
+// on incompatible cast; MySQL/SQLite silently coerce), but a few well-defined
+// changes are PROVABLY safe — varchar(50) -> varchar(255), smallint -> bigint,
+// etc. The Classifier consults this allow-list to skip the destructive
+// warning prompt for those cases. Anything not on the list falls through to
+// the per-dialect warning UX (PR 3 type-warnings.ts).
+//
+// Why per-dialect: the type tokens themselves differ. PG udt_name returns
+// "int2"/"int4"/"int8" and "bpchar" (for CHAR(N)); PG SQL aliases are
+// "smallint"/"int"/"bigint" and "char"; MySQL has its own integer
+// hierarchy; SQLite is storage-class only.
+//
+// v1 limitations:
+// - MySQL signedness is ignored. `int unsigned -> int signed` is treated
+//   as a widening but could corrupt values > INT_MAX. Surfacing this in
+//   v1 would require a richer type token model; deferred.
+// - Unknown types (e.g. `numeric`, `timestamptz`, custom enums) default
+//   to non-widening so users get the destructive warning. Conservative by
+//   design — false negatives just prompt; false positives skip warnings
+//   users needed.
+
+import type { SupportedDialect } from "@nextlyhq/adapter-drizzle/types";
+
+const VARCHAR_RE = /^varchar\((\d+)\)$/i;
+const CHAR_RE = /^char\((\d+)\)$/i;
+
+// Postgres integer family. Lower rank widens to higher rank.
+// Maps both the SQL aliases (smallint/int/bigint) and the udt_name tokens
+// (int2/int4/int8) so we work whether the type came from drizzle's SQL gen
+// or from information_schema.columns.udt_name introspection.
+const PG_INT_RANK: Record<string, number> = {
+  smallint: 1,
+  int2: 1,
+  int: 2,
+  integer: 2,
+  int4: 2,
+  bigint: 3,
+  int8: 3,
+};
+
+// MySQL integer family. tinyint < smallint < mediumint < int < bigint.
+const MYSQL_INT_RANK: Record<string, number> = {
+  tinyint: 1,
+  smallint: 2,
+  mediumint: 3,
+  int: 4,
+  integer: 4,
+  bigint: 5,
+};
+
+// MySQL text family — storage capacity grows tinytext < text < mediumtext < longtext.
+const MYSQL_TEXT_RANK: Record<string, number> = {
+  tinytext: 1,
+  text: 2,
+  mediumtext: 3,
+  longtext: 4,
+};
+
+// SQLite declared types that all carry numeric storage (INTEGER, REAL or
+// NUMERIC affinity). Any precision/scale suffix is ignored — SQLite has no
+// fixed-precision decimal type.
+const SQLITE_NUMERIC_TYPE_RE =
+  /^(int|integer|tinyint|smallint|mediumint|bigint|real|float|double(\s+precision)?|numeric|decimal)$/;
+
+function isSqliteNumericType(type: string): boolean {
+  return SQLITE_NUMERIC_TYPE_RE.test(type.replace(/\(.*\)$/, "").trim());
+}
+
+function widensVarchar(from: string, to: string): boolean | null {
+  const fm = VARCHAR_RE.exec(from);
+  const tm = VARCHAR_RE.exec(to);
+  if (fm && tm) return parseInt(tm[1], 10) >= parseInt(fm[1], 10);
+  return null;
+}
+
+export function isWideningChange(
+  fromType: string,
+  toType: string,
+  dialect: SupportedDialect
+): boolean {
+  const from = fromType.toLowerCase().trim();
+  const to = toType.toLowerCase().trim();
+  if (from === to) return true;
+
+  // SQLite is storage-class only and cannot ALTER a column's declared type in
+  // place. Moving between numeric declared types keeps the stored values —
+  // each value retains its storage class, and INTEGER affinity converts only
+  // when the conversion is lossless — so it must not raise a destructive
+  // warning. Cross-family changes (text -> integer, blob -> real) still do.
+  if (dialect === "sqlite") {
+    return isSqliteNumericType(from) && isSqliteNumericType(to);
+  }
+
+  // varchar(N) -> varchar(M) widens when M >= N
+  const vw = widensVarchar(from, to);
+  if (vw !== null) return vw;
+
+  // char(N) -> varchar(M) or varchar widens (escapes fixed-width padding).
+  // PG's udt_name returns `bpchar` for CHAR(N) columns from live introspection
+  // (see introspect-live.ts), so we normalize bpchar to char-family here.
+  const fromIsCharFamily = CHAR_RE.test(from) || from === "bpchar";
+  if (fromIsCharFamily && (to === "varchar" || VARCHAR_RE.test(to))) {
+    // Only a varchar at least as long holds every fixed-width value; a shorter one cuts them.
+    // An unbounded side (PG's `bpchar`, a bare `varchar`) carries no length to compare.
+    const fromLen = CHAR_RE.exec(from);
+    const toLen = VARCHAR_RE.exec(to);
+    return fromLen && toLen
+      ? parseInt(toLen[1], 10) >= parseInt(fromLen[1], 10)
+      : true;
+  }
+  // bpchar -> text on PG widens too (text accepts any char content).
+  if (dialect === "postgresql" && from === "bpchar" && to === "text") {
+    return true;
+  }
+
+  // PG: any varchar -> text widens (unbounded text accepts anything varchar held)
+  if (
+    dialect === "postgresql" &&
+    (from === "varchar" || VARCHAR_RE.test(from)) &&
+    to === "text"
+  ) {
+    return true;
+  }
+
+  // MySQL: varchar(N) -> any text-family type widens
+  if (
+    dialect === "mysql" &&
+    VARCHAR_RE.test(from) &&
+    MYSQL_TEXT_RANK[to] !== undefined
+  ) {
+    return true;
+  }
+
+  // Integer family widening
+  const intRank = dialect === "postgresql" ? PG_INT_RANK : MYSQL_INT_RANK;
+  if (intRank[from] !== undefined && intRank[to] !== undefined) {
+    return intRank[to] >= intRank[from];
+  }
+
+  // MySQL text family widening
+  if (
+    dialect === "mysql" &&
+    MYSQL_TEXT_RANK[from] !== undefined &&
+    MYSQL_TEXT_RANK[to] !== undefined
+  ) {
+    return MYSQL_TEXT_RANK[to] >= MYSQL_TEXT_RANK[from];
+  }
+
+  return false;
+}
+
+/** A fixed-point type with its precision and optional scale, as any dialect spells it. */
+const DECIMAL_RE = /^(?:decimal|numeric)\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)$/i;
+
+/**
+ * Whether a fixed-point column of `fromType` copies every value into one of `toType`: as many
+ * digits after the point, and as many before it (precision less scale). Null when either is not
+ * a fixed-point type with a stated precision, which the other rules judge.
+ */
+function decimalHoldsEveryValue(
+  fromType: string,
+  toType: string
+): boolean | null {
+  const from = DECIMAL_RE.exec(fromType.trim());
+  const to = DECIMAL_RE.exec(toType.trim());
+  if (from === null || to === null) return null;
+  const [fromPrecision, fromScale] = [Number(from[1]), Number(from[2] ?? 0)];
+  const [toPrecision, toScale] = [Number(to[1]), Number(to[2] ?? 0)];
+  return (
+    toScale >= fromScale && toPrecision - toScale >= fromPrecision - fromScale
+  );
+}
+
+/** A SQLite declared type's affinity, by SQLite's own rules, taken in their order. */
+function sqliteAffinity(type: string): string {
+  const lower = type.toLowerCase();
+  if (lower.includes("int")) return "integer";
+  if (/char|clob|text/.test(lower)) return "text";
+  if (lower.includes("blob") || lower.trim() === "") return "blob";
+  if (/real|floa|doub/.test(lower)) return "real";
+  return "numeric";
+}
+
+/**
+ * Whether copying every value of a column of `fromType` into a new column of `toType` keeps each
+ * one as it is, and within what the new type allows: a fixed-point type with no fewer digits on
+ * either side of the point (`decimalHoldsEveryValue`), or a widening (`isWideningChange`), derived
+ * from it. On SQLite a widening in place is not one across a copy unless both types have one
+ * affinity: an integer copied into REAL is stored as a floating-point number and past 2^53 loses
+ * its last digits, and a fraction copied into INTEGER or NUMERIC keeps its REAL storage, a value
+ * the new whole-number or fixed-point type refuses, as PostgreSQL and MySQL refuse that change.
+ */
+export function copiesEveryValue(
+  fromType: string,
+  toType: string,
+  dialect: SupportedDialect
+): boolean {
+  const decimal = decimalHoldsEveryValue(fromType, toType);
+  if (decimal !== null) return decimal;
+  if (!isWideningChange(fromType, toType, dialect)) return false;
+  return (
+    dialect !== "sqlite" || sqliteAffinity(fromType) === sqliteAffinity(toType)
+  );
+}
+
+/**
+ * Whether a type change keeps every stored value of a string column without a check of the data:
+ * `varchar(n)` to `text` or to `varchar(m)` with m >= n, and either type restated. A narrower
+ * view of `isWideningChange`, derived from it, for the data-loss consent a migration's statements
+ * are judged by: the integer ranks, `char` and the other text sizes stay changes that ask.
+ */
+export function keepsEveryStringValue(
+  fromType: string,
+  toType: string,
+  dialect: SupportedDialect
+): boolean {
+  const string = (type: string) => type === "text" || VARCHAR_RE.test(type);
+  const from = fromType.toLowerCase().trim();
+  const to = toType.toLowerCase().trim();
+  return (
+    string(from) && string(to) && isWideningChange(fromType, toType, dialect)
+  );
+}
+
+/**
+ * The length a stored string may have once this type change has run, when the change can only cut
+ * strings short; null for every other change.
+ *
+ * A string column — the text family, `varchar`, `char` — narrowed to `varchar(N)` keeps every value
+ * of N characters or fewer unchanged, so the change is lossless exactly when no stored value is
+ * longer. That is a question about the data, not the types, so the classifier counts the longer
+ * values against this bound rather than asking whether the operator accepts a loss there may not be.
+ *
+ * SQLite never enforces a declared length, so nothing there is ever cut and it has no bound.
+ */
+export function stringNarrowingLimit(
+  fromType: string,
+  toType: string,
+  dialect: SupportedDialect
+): number | null {
+  if (dialect === "sqlite") return null;
+  if (isWideningChange(fromType, toType, dialect)) return null;
+  const to = VARCHAR_RE.exec(toType.toLowerCase().trim());
+  if (!to) return null;
+  const from = fromType.toLowerCase().trim();
+  const fromIsString =
+    MYSQL_TEXT_RANK[from] !== undefined ||
+    from === "varchar" ||
+    VARCHAR_RE.test(from) ||
+    CHAR_RE.test(from) ||
+    from === "bpchar";
+  return fromIsString ? parseInt(to[1], 10) : null;
+}

@@ -1,0 +1,29 @@
+/**
+ * Barrel export for all domain DI registration functions.
+ *
+ * The orchestrator in `register.ts` imports from this module and calls
+ * each function after the shared registration context is assembled.
+ */
+
+export { registerAuthServices } from "./register-auth";
+export { registerCollectionServices } from "./register-collections";
+export { registerComponentServices } from "./register-components";
+export { registerDashboardServices } from "./register-dashboard";
+export { registerDocumentLockServices } from "./register-document-lock";
+export { registerEmailServices } from "./register-email";
+export { registerJobServices } from "./register-jobs";
+export { registerNoticeServices } from "./register-notices";
+export { registerReleaseServices } from "./register-releases";
+export { registerMediaServices } from "./register-media";
+export { registerMetaServices } from "./register-meta";
+export { registerRevalidationServices } from "./register-revalidation";
+export { registerSingleServices } from "./register-singles";
+export { registerUserServices } from "./register-users";
+export { registerVersionServices } from "./register-versions";
+export { registerWebhookServices } from "./register-webhooks";
+export { registerWorkflowComparisonBaselines } from "./register-workflow-baselines";
+export { registerWorkflowNoticeKinds } from "./register-workflow-notices";
+export { registerWorkflowPublishGate } from "./register-workflow-publish-gate";
+export { registerWorkflowReleaseChecks } from "./register-workflow-release-checks";
+export { resetWidgetRegistries } from "./register-widgets";
+export type { RegistrationContext } from "./types";

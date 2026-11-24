@@ -1,0 +1,111 @@
+import { expectTypeOf } from "vitest";
+
+import type { AuthenticatedScope } from "../../auth/authenticated-scope";
+import type { AuthLimitAnswer } from "../../auth/pipeline/types";
+import { definePlugin } from "../plugin-context";
+
+import type {
+  PluginRoute,
+  PluginRouteContext,
+  PluginRouteLimitKey,
+  Middleware,
+} from "./route-types";
+
+// PluginRouteContext extends PluginContext with per-request user + params.
+expectTypeOf<PluginRouteContext>().toHaveProperty("services");
+expectTypeOf<PluginRouteContext>().toHaveProperty("db");
+expectTypeOf<PluginRouteContext>().toHaveProperty("self");
+expectTypeOf<PluginRouteContext>().toHaveProperty("user");
+expectTypeOf<PluginRouteContext>().toHaveProperty("params");
+
+// A plugin can declare contributes.routes via definePlugin.
+definePlugin({
+  name: "@acme/x",
+  version: "1.0.0",
+  nextly: ">=0.0.1",
+  contributes: {
+    routes: [
+      {
+        method: "GET",
+        path: "/ping",
+        public: true,
+        handler: (_req, ctx) => Response.json({ ok: ctx.self.name }),
+      },
+      {
+        method: "POST",
+        path: "/export",
+        requiredPermission: "export-submissions",
+        handler: () => new Response(null, { status: 204 }),
+      },
+    ] satisfies PluginRoute[],
+  },
+});
+
+// Middleware is a (req, ctx, next) => Promise<Response> function.
+const mw: Middleware = (_req, _ctx, next) => next();
+expectTypeOf(mw).toBeFunction();
+
+// `authenticatedScope` is what keeps a scoped API key judged on its own grants
+// rather than its owner's roles. Two properties are asserted here because
+// `plugin-surface.test.ts` cannot see either: it extracts export NAMES and
+// KINDS from `export {}` blocks, so ADDING a field to a `@public` type passes
+// its snapshot unchanged, in both directions.
+
+// REACHABLE, and typed — not widened to `unknown`, which is what a plugin
+// would get if the type stopped being exported from the SDK.
+expectTypeOf<PluginRouteContext>().toHaveProperty("authenticatedScope");
+expectTypeOf<PluginRouteContext["authenticatedScope"]>().toEqualTypeOf<
+  AuthenticatedScope | undefined
+>();
+// READONLY, deliberately. Editing `permissions` in place cannot narrow the
+// scope — the rule spelling is derived from `grants` and would keep the grant
+// that was just dropped — so the type refuses the edit and `narrowScope` is the
+// way to do it. A mutable array here would compile the mistake.
+expectTypeOf<
+  NonNullable<PluginRouteContext["authenticatedScope"]>["permissions"]
+>().toEqualTypeOf<readonly string[]>();
+
+// ADDITIVE. A route written before this field existed still type-checks, so
+// the change cannot have made it required. `toEqualTypeOf` above would pass on
+// a required field too — this is the half that fails if the optionality goes.
+const routeWrittenBeforeTheField: PluginRoute = {
+  method: "GET",
+  path: "/legacy",
+  handler: (_req, ctx) => Response.json({ id: ctx.user?.id ?? null }),
+};
+expectTypeOf(routeWrittenBeforeTheField).toMatchTypeOf<PluginRoute>();
+
+// OPTIONAL, asserted directly. This is the one that goes red if
+// `authenticatedScope` is ever made required — the breaking change the
+// `@public` tag on this type promises not to make.
+//
+// `{} extends Pick<T, K>` is true only when K is optional: a required key
+// leaves `Pick` demanding it, and the empty object stops being assignable.
+type KeyIsOptional<T, K extends keyof T> =
+  Record<string, never> extends Pick<T, K> ? true : false;
+
+expectTypeOf<
+  KeyIsOptional<PluginRouteContext, "authenticatedScope">
+>().toEqualTypeOf<true>();
+
+// The control for the line above: `user` is REQUIRED on this context (it is
+// `AuthUser | null`, never absent), so the helper must say so. Without this,
+// a helper that returned `true` for everything would satisfy the assertion.
+expectTypeOf<
+  KeyIsOptional<PluginRouteContext, "user">
+>().toEqualTypeOf<false>();
+
+// `limitKey` is an OPTIONAL addition: every route declared before it still
+// compiles. It answers as an auth strategy's `limitKey` does, sync or async,
+// from the request and its parsed body.
+expectTypeOf<KeyIsOptional<PluginRoute, "limitKey">>().toEqualTypeOf<true>();
+expectTypeOf<
+  NonNullable<PluginRoute["limitKey"]>
+>().toEqualTypeOf<PluginRouteLimitKey>();
+expectTypeOf<PluginRouteLimitKey>().parameter(0).toEqualTypeOf<{
+  request: Request;
+  body: Record<string, unknown>;
+}>();
+expectTypeOf<ReturnType<PluginRouteLimitKey>>().toEqualTypeOf<
+  AuthLimitAnswer | Promise<AuthLimitAnswer>
+>();

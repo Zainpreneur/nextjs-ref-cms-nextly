@@ -1,0 +1,483 @@
+/**
+ * Access gate for sharing a preview: minting a link, and listing or revoking a
+ * document's links, which {@link authorizePreviewSharer} decides as one rule.
+ *
+ * A preview token is a bearer credential: whoever holds it reads the entry it
+ * names, with no session of their own, and the runtime consumes it with
+ * `draft: true` and `overrideAccess: true`. So minting must authorize the view
+ * the token will actually hand out, not a weaker one that happens to be easier
+ * to ask for.
+ *
+ * Two questions, because the token's view needs both and they are decided by
+ * different rules:
+ *
+ * 1. **May this caller read this entry at all** — including one that has never
+ *    been published, which is the case previews exist for.
+ * 2. **May this caller edit this entry** — which is what the draft overlay
+ *    itself requires before surfacing a working draft.
+ *
+ * Both are asked through `collectionsHandler`, the instance that actually
+ * serves collection reads and writes, so a verdict here is the verdict the real
+ * operation would reach. This mirrors `api/versions-access.ts`, which gates
+ * version history the same way and for the same reason.
+ *
+ * @module api/preview-access
+ */
+
+import {
+  everyLanguage,
+  registeredWriteAsNamedLanguagesFor,
+  withRuleLanguage,
+} from "../auth/access/rule-language";
+import { buildUserContext } from "../auth/user-context";
+import { getService } from "../di";
+import {
+  previewCallerAuthorized,
+  type AuthorizedPreviewCaller,
+} from "../domains/collections/services/preview-redirect-resolver";
+import { EVERY_TRANSLATION } from "../domains/i18n/locale-selector";
+import {
+  singleDocumentEditable,
+  singleDocumentReadable,
+  singleStoredDocumentReadable,
+} from "../domains/singles/services/single-document-access";
+import type { UserContext } from "../domains/singles/types";
+import { errorFromServiceEnvelope } from "../errors/from-service-envelope";
+import { NextlyError } from "../errors/nextly-error";
+import { getCachedNextly } from "../init";
+import { resolveRoleSlugs } from "../services/lib/permissions";
+
+import { requireRouteCollectionAccess } from "./route-auth";
+
+/**
+ * Turn a read outcome into a verdict, keeping "denied" and "could not ask"
+ * apart.
+ *
+ * A 403 or 404 is an answer: this caller does not get this row, and the two are
+ * deliberately collapsed because telling them apart would reveal which entry ids
+ * exist.
+ *
+ * Anything else is the read failing rather than refusing, and it keeps the
+ * status the service gave it. Flattening every other outcome to 500 would erase
+ * what the caller needs to act on — a rate limit's 429 and its retry interval
+ * become an opaque server error, and a validation failure loses its field
+ * detail. The shared converter rebuilds the service's own error, which is what
+ * the Direct API boundary does with the same envelope.
+ */
+function readVerdict(read: {
+  success: boolean;
+  statusCode: number;
+  code?: string;
+  message?: string;
+  messageKey?: string;
+  publicData?: unknown;
+}): boolean {
+  if (read.success) return true;
+  if (read.statusCode === 403 || read.statusCode === 404) return false;
+  throw errorFromServiceEnvelope(
+    { ...read, message: read.message ?? "Preview authorization read failed" },
+    { reason: "preview-mint-probe-failed" }
+  );
+}
+
+/**
+ * Confirm the caller may be handed a preview link for this entry.
+ *
+ * Throws `forbidden` when they may not, with the same answer for a row hidden by
+ * a rule, an id that matches nothing, and an entry the caller may read but not
+ * edit. Those are different reasons and one answer on purpose: a caller who is
+ * refused a link learns only that they are refused.
+ *
+ * @throws {NextlyError} `forbidden` when no link may be minted.
+ */
+export async function assertEntryPreviewable(
+  collection: string,
+  entryId: string,
+  user: UserContext,
+  options: {
+    /**
+     * Whether the CALLER has already passed the coarse RBAC / code-defined
+     * access gate for `update` on this collection.
+     *
+     * Required, and per call site rather than defaulted, because it is true for
+     * one caller and false for the other and the wrong answer is silent. The
+     * mint runs behind `requireRouteCollectionAccess(req, "update", collection)`
+     * and would repeat that check for nothing. A preview RENDER runs on an
+     * anonymous public request with no route gate at all, so assuming it ran
+     * skips the very check that catches a sharer whose role was withdrawn —
+     * the check that makes revocation reach links already in circulation.
+     *
+     * A default would pick one of those and be wrong for the other in whichever
+     * direction nobody notices.
+     */
+    routeAuthorized: boolean;
+    /**
+     * The language the link is to, when it names one. The entry is read in it,
+     * at the mint and at every open, and the grant names it, so the grant
+     * answers for that translation and no other. A link naming no language
+     * is read as it always was.
+     */
+    locale?: string | undefined;
+  }
+): Promise<AuthorizedPreviewCaller> {
+  const collections = getService("collectionsHandler");
+  const { locale } = options;
+
+  // Enforced and as the caller, which is the same evaluation the bearer's read
+  // will face. `status: "all"` is the part a plain by-id read cannot express: a
+  // status-enabled collection otherwise filters to published only, so an entry
+  // that has never been published reports as missing — exactly the entry an
+  // editor most wants to share for review.
+  //
+  // Read in the language the link is to, which its grant then names. A link
+  // naming none is to the entry in every language, so it is read in every
+  // language and holds only where the read rule admits each of them: a rule
+  // that closes one refuses the link rather than being asked about the
+  // default language alone.
+  const read = await collections.getEntry({
+    collectionName: collection,
+    entryId,
+    depth: 0,
+    overrideAccess: false,
+    user,
+    status: "all",
+    locale: locale ?? EVERY_TRANSLATION,
+  });
+
+  if (!readVerdict(read)) {
+    throw NextlyError.forbidden({
+      logContext: {
+        reason: "preview-link-entry-not-visible",
+        collection,
+        entryId,
+      },
+    });
+  }
+
+  // The token's view is the DRAFT, and the draft overlay surfaces a pending
+  // working draft only to a caller trusted to edit the document. Reading the
+  // published row proves nothing about that: where a collection allows broad
+  // reads but restricts updates per row, a caller can read another author's
+  // published entry and would otherwise mint a credential exposing that
+  // author's unpublished edits.
+  //
+  // The subject is the REQUESTED id, deliberately — not one derived from the
+  // returned document. `read.data` is presentation data: `afterRead` may remove
+  // `id` or rewrite it to another row's, so no value in it can be trusted as the
+  // identity of what was fetched, and deriving the gate's subject from it
+  // authorized a row the bearer will not receive whenever a hook reshaped that
+  // field.
+  //
+  // The token signs the requested id, so that is the id whose editability is
+  // asserted here. Where a `beforeOperation` hook maps ids, the bearer's read
+  // resolves in ITS OWN context — `user` undefined, `overrideAccess: true` —
+  // which this boundary cannot observe. Closing that needs the consumption path
+  // to carry the minter's identity rather than a better guess here.
+  //
+  // `routeAuthorized` skips ONLY the coarse RBAC / code-defined access gate;
+  // the lifecycle and field-level rules still apply to the loaded document
+  // either way. Which makes it exactly
+  // the flag that must not be decided here: skipping a gate that DID run costs
+  // nothing, and skipping one that did not is the difference between enforcing
+  // a withdrawn role and ignoring it.
+  //
+  // Asked in the same languages as the read: the link's own, or every
+  // language for a link naming none. The edit check sets no languages of its
+  // own, so they are set here rather than left to whatever the caller set. A
+  // language the site does not configure is judged in every language.
+  const mayEdit = await withRuleLanguage(
+    locale === undefined
+      ? everyLanguage()
+      : registeredWriteAsNamedLanguagesFor(locale),
+    () =>
+      collections.canUpdateEntry({
+        collectionName: collection,
+        entryId,
+        user,
+        routeAuthorized: options.routeAuthorized,
+      })
+  );
+
+  if (!mayEdit) {
+    throw NextlyError.forbidden({
+      logContext: {
+        reason: "preview-link-draft-not-editable",
+        collection,
+        entryId,
+      },
+    });
+  }
+
+  /*
+   * The grant is PRODUCED by the check, and that is the point of returning one.
+   * A caller assembling its own would be asserting the very thing this function
+   * exists to establish; minted here it cannot exist unless every refusal above
+   * was passed for THIS document.
+   */
+  return previewCallerAuthorized(user, {
+    collection,
+    entryId,
+    // The language the read above was made in, so the grant claims no more
+    // than was checked.
+    ...(locale === undefined ? {} : { locale }),
+  });
+}
+
+/**
+ * Confirm the caller may be handed a preview link for this Single.
+ *
+ * The Single counterpart of {@link assertEntryPreviewable}, asking the same two
+ * questions for the same reason. It is NOT redundant with the route's own gate:
+ * that gate is per-slug RBAC, while the real update path additionally requires
+ * the document to exist and to be reachable in the language asked for. Stopping
+ * at the permission would mint a bearer credential for a draft the real update
+ * path refuses to show them.
+ *
+ * One answer for every refusal, deliberately: a caller who is refused a link
+ * learns only that they are refused.
+ *
+ * @throws {NextlyError} `forbidden` when no link may be minted.
+ */
+export async function assertSinglePreviewable(
+  single: string,
+  locale: string | undefined,
+  user: UserContext,
+  options: {
+    /**
+     * Whether the CALLER has already passed the coarse RBAC / code-defined
+     * access gate for `update` on this Single.
+     *
+     * Required, and per call site rather than defaulted, for the reason
+     * {@link assertEntryPreviewable} states: it is true for the mint, which
+     * runs behind `requireRouteCollectionAccess(req, "update", single)`, and
+     * false for a preview RENDER, which is an anonymous public request with no
+     * route gate at all. Assuming it ran skips the very check that notices a
+     * sharer whose role was withdrawn.
+     */
+    routeAuthorized: boolean;
+  }
+): Promise<AuthorizedPreviewCaller> {
+  const identity = {
+    user,
+    // No `actor`. It carried an API KEY's own stamped grants, and both mints
+    // now refuse a key outright — a preview link records whose permissions the
+    // draft renders through, and a key names no person.
+    // The TRANSLATION the token will name, so the gate is run against the
+    // document the bearer actually receives. A localized Single is a different
+    // document per language, and its lifecycle can differ for each —
+    // authorizing the default translation and then signing another is
+    // authorizing something else.
+    ...(locale === undefined ? {} : { locale }),
+  };
+
+  if (
+    !(await singleDocumentReadable(single, {
+      ...identity,
+      // FALSE, and this is the whole point. The mint route gated `update`, so
+      // nothing has checked this caller's READ permission — and skipping it as
+      // redundant would hand a bearer token for the draft to someone holding
+      // `update` with no read grant at all.
+      routeAuthorized: false,
+    }))
+  ) {
+    throw NextlyError.forbidden({
+      logContext: { reason: "preview-link-single-not-visible", single },
+    });
+  }
+
+  // The token's view is the DRAFT, and the draft overlay surfaces a pending
+  // working draft only to a caller trusted to EDIT the document. Reading the
+  // published one proves nothing about that.
+  if (
+    !(await singleDocumentEditable(single, {
+      ...identity,
+      // TRUE here: the mint route ran exactly this gate, so the coarse update
+      // check is the redundant one this flag exists to skip.
+      routeAuthorized: options.routeAuthorized,
+    }))
+  ) {
+    throw NextlyError.forbidden({
+      logContext: { reason: "preview-link-single-not-editable", single },
+    });
+  }
+
+  // See {@link assertEntryPreviewable}: the check produces the grant.
+  return previewCallerAuthorized(user, {
+    single,
+    // The locale this check was run FOR. Omitting it would grant every
+    // translation on the strength of one having been checked.
+    ...(locale === undefined ? {} : { locale }),
+  });
+}
+
+/**
+ * {@link assertSinglePreviewable}'s question, asked of the stored row: may this
+ * person read and edit the Single. Nothing is created and no hook runs.
+ *
+ * @throws {NextlyError} `forbidden` when they may not, or there is no row.
+ */
+async function assertSingleManageable(
+  single: string,
+  locale: string | undefined,
+  user: UserContext
+): Promise<AuthorizedPreviewCaller> {
+  const identity = {
+    user,
+    ...(locale === undefined ? {} : { locale }),
+  };
+  const readable = await singleStoredDocumentReadable(single, {
+    ...identity,
+    // FALSE: the route gated `update`, which says nothing about read.
+    routeAuthorized: false,
+  });
+  const editable =
+    readable &&
+    (await singleDocumentEditable(single, {
+      ...identity,
+      // TRUE: the route ran exactly this gate.
+      routeAuthorized: true,
+    }));
+  if (!editable) {
+    throw NextlyError.forbidden({
+      logContext: { reason: "preview-links-single-not-manageable", single },
+    });
+  }
+  return previewCallerAuthorized(user, {
+    single,
+    ...(locale === undefined ? {} : { locale }),
+  });
+}
+
+/**
+ * The one document a sharing request names: an entry, or a Single.
+ *
+ * The locale is the translation the request concerns; a Single's gate is run
+ * against it, as the mint's is.
+ */
+export type PreviewSharedDocument =
+  | { collection: string; entryId: string; locale?: string }
+  | { single: string; locale?: string };
+
+/** The authenticated route caller, as `requireRouteCollectionAccess` returns it. */
+type RouteCaller = Awaited<ReturnType<typeof requireRouteCollectionAccess>>;
+
+/** A request authorized to share one document's previews. */
+export interface AuthorizedSharer {
+  auth: RouteCaller;
+  user: UserContext;
+  grant: AuthorizedPreviewCaller;
+}
+
+/**
+ * Refuse a preview-link action from an API key.
+ *
+ * A preview link records WHOSE permissions the draft is rendered through, and a
+ * key names no person. It is authorized on the grants stamped on the KEY —
+ * deliberately, so a narrow key cannot act on the strength of its owner's
+ * account — but the only identity it could record is that owner, whose access
+ * is exactly what the key was scoped away from. Listing and revoking a
+ * document's links are refused to a key for the same reason minting is: they
+ * are the one decision, "may this person share this document".
+ */
+function refuseApiKey(auth: { authMethod: "session" | "api-key" }): void {
+  if (auth.authMethod === "api-key") {
+    throw NextlyError.personOnly({
+      doing: "manage preview links",
+      logContext: {
+        reason: "preview-link-action-by-api-key",
+        remedy:
+          "A preview link records whose permissions the draft is rendered " +
+          "through, and a key names no person. Act from a signed-in session.",
+      },
+    });
+  }
+}
+
+async function callerFor(auth: RouteCaller): Promise<UserContext> {
+  const roles = await resolveRoleSlugs(auth);
+  return buildUserContext({
+    claims: auth.claims,
+    id: auth.userId,
+    name: auth.userName,
+    email: auth.userEmail,
+    roles,
+  });
+}
+
+/**
+ * Whether this request may share previews of the document it names: the ONE
+ * rule that minting a link, listing a document's links, revoking one of them
+ * and revoking all of them each ask.
+ *
+ * One function rather than one check per endpoint, because they are one
+ * question. A person who may hand out a link to a document may see who else
+ * has and may take any of them back; a person who may not do the first may do
+ * none of them. Four copies would agree only until one was edited, and the
+ * copy that drifted would be a way to list or revoke links on a document its
+ * caller could not share.
+ *
+ * In order: a session with `update` on the collection or Single (the route's
+ * coarse gate), never a key, and then read and edit of that very entry or
+ * Single as that person. Every refusal is `forbidden`, with nothing changed.
+ *
+ * **`purpose` changes how a Single is asked, never what.** A mint asks
+ * through the Single's ordinary read, which authorizes the exact view the
+ * token will hand out, and which creates a Single that has no row yet: a link
+ * to it needs one. Listing and revoking only manage links and must change
+ * nothing, so they ask the same question of the stored row, creating nothing
+ * and running no hook. A Single with no row has no link to manage.
+ *
+ * Required, because the two are right in different places and a default
+ * would be wrong in one of them without saying so.
+ *
+ * @throws {NextlyError} `forbidden` when the request may not share it.
+ */
+export async function authorizePreviewSharer(
+  req: Request,
+  document: PreviewSharedDocument,
+  purpose: "mint" | "manage"
+): Promise<AuthorizedSharer> {
+  const slug = "single" in document ? document.single : document.collection;
+  // The language every question below is asked in. A mint makes a link to
+  // that one language, so it is judged there. Listing and revoking act on
+  // every link to the document, whatever language each is to, so they are
+  // judged in every language, whatever language the request names.
+  const locale = purpose === "mint" ? document.locale : undefined;
+  // The gate is per COLLECTION or Single, so a caller who may edit posts
+  // cannot act on another collection's links by naming it here. It is asked
+  // in that language, as the checks below are; with none, in every language.
+  const auth =
+    locale === undefined
+      ? await requireRouteCollectionAccess(req, "update", slug)
+      : await requireRouteCollectionAccess(req, "update", slug, {
+          method: "sharePreviewLink",
+          params: { locale },
+        });
+  refuseApiKey(auth);
+
+  // Booted first because the gates below resolve services from the container,
+  // and on a cold process the permission lookup itself needs them registered.
+  await getCachedNextly();
+  const user = await callerFor(auth);
+
+  // The route above ran the coarse gate for `update`, so it is the redundant
+  // one these skip. A preview RENDER passes `false`: it has no route gate.
+  const grant =
+    "single" in document
+      ? purpose === "mint"
+        ? await assertSinglePreviewable(document.single, locale, user, {
+            routeAuthorized: true,
+          })
+        : await assertSingleManageable(document.single, locale, user)
+      : await assertEntryPreviewable(
+          document.collection,
+          document.entryId,
+          user,
+          {
+            routeAuthorized: true,
+            ...(locale === undefined ? {} : { locale }),
+          }
+        );
+
+  return { auth, user, grant };
+}

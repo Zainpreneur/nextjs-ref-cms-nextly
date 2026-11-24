@@ -1,0 +1,617 @@
+/**
+ * Nextly Admin CSS - Complete Isolation Strategy
+ *
+ * This file uses CSS @layer to scope ALL Tailwind utilities within .nextly-admin
+ * This ensures zero style leakage between admin package and consumer app.
+ *
+ * How it works:
+ * 1. Import Tailwind normally
+ * 2. Use CSS @layer to control cascade order
+ * 3. Wrap utilities with .nextly-admin scope in build-css.mjs post-processing
+ *
+ * The other direction, the host's CSS reaching the admin, is closed for the
+ * host's element rules (`h2 { ... }`, `p { ... }`) by one unlayered rule the
+ * build appends after this file compiles: `isolateAdminStylesheet` in
+ * @nextlyhq/admin-css explains it. A host's unlayered rule beats every rule
+ * in this file's layers, so a rule here cannot do that job.
+ */
+/* No automatic detection: every source is named below. Tailwind reads
+ * class-shaped words from any file it scans, prose included, so scanning the
+ * whole package let a Markdown note quoting `[var(...)]` become invalid CSS
+ * and take down every admin route. */
+@import "tailwindcss" source(none);
+
+/* Design-system source of truth: tokens, @theme mappings, dark variant, base reset. */
+@import "../../../ui/src/styles/theme.css";
+
+/* Layer-2 plugin utility safelist: token-driven utilities always present in the
+ * compiled sheet so third-party plugin components can use them with no build
+ * step (they cannot add themselves to the @source scans below). */
+@import "./plugin-safelist.css";
+
+/* The admin's own source code. */
+@source "..";
+
+/* Scan @nextlyhq/ui source so Tailwind includes utility classes used by extracted components */
+@source "../../../ui/src";
+
+/* First-party plugin admin components render inside the admin shell and rely on
+ * this compiled stylesheet — Tailwind cannot auto-detect sibling packages, so
+ * without these directives any utility used only by a plugin is silently
+ * dropped from the build and becomes a no-op at runtime. */
+@source "../../../plugin-form-builder/src/admin";
+@source "../../../plugin-page-builder/src/admin";
+@source "../../../plugin-seo/src/admin";
+
+/*
+ * Native controls (scrollbars, inputs, date pickers) follow the admin's own
+ * theme. It is set on the admin's container, never on the host page's <html>.
+ */
+.nextly-admin {
+  color-scheme: light;
+}
+
+.nextly-admin.dark {
+  color-scheme: dark;
+}
+
+/* Scope overflow fix to nextly-admin only */
+.nextly-admin {
+  overflow-x: hidden;
+  --sidebar-width-safe: var(--sidebar-width, 20.5rem);
+  /*
+   * The height of the admin's one top bar, at every width. Declared here, as
+   * plain CSS, so whatever measures against the bar (the editors' sticky
+   * panels, a page that fills the window below it, an outline drawn before
+   * the admin's scripts run) reads the same number the bar is drawn at. A
+   * layout knob rather than a palette token, so it sits outside `--nx-*`.
+   */
+  --admin-bar-height: 3.5rem;
+}
+
+/*
+ * A text widget's external link says it opens a new tab. The prose is drawn
+ * by Lexical from markdown, which gives a link no room for a visually-hidden
+ * child the way the actions archetype has -- so the notice is a pseudo-element
+ * here, hidden the way `sr-only` hides, which assistive technology reads as
+ * part of the link's name. Keyed on the attribute the renderer sets rather
+ * than on a class, so a link that opens a new tab is always the link that
+ * announces it.
+ */
+[data-widget-text] a[target="_blank"]::after {
+  content: " (opens in a new tab)";
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Enhanced Calendar Styling */
+[data-slot="calendar"] {
+  background-color: var(--nx-popover);
+  color: var(--nx-popover-foreground);
+}
+
+[data-slot="calendar"] button[role="gridcell"] {
+  transition: all 0.2s ease-in-out;
+}
+
+[data-slot="calendar"] button[role="gridcell"][aria-selected="true"] {
+  background-color: var(--nx-primary) !important;
+  color: var(--nx-primary-foreground) !important;
+  font-weight: 500;
+}
+
+[data-slot="calendar"] button[role="gridcell"][data-today="true"] {
+  background-color: var(--nx-accent);
+  color: var(--nx-accent-foreground);
+  border: 1px solid color-mix(in srgb, var(--nx-primary) 20%, transparent);
+  font-weight: 500;
+}
+
+/* DatePicker specific styling. The trigger is a form control, so its edge takes
+   --nx-input, the identifying-boundary token, not the decorative --nx-border.
+   --nx-input is below 1.4.11's 3:1 minimum in light mode by decision; see
+   packages/ui/src/styles/contrast/accepted.ts. The role distinction still
+   decides which token a control uses. */
+[data-slot="date-picker-trigger"] {
+  background-color: var(--nx-background);
+  border-color: var(--nx-input);
+}
+
+.nextly-admin {
+  background-color: var(--nx-background);
+  color: var(--nx-foreground);
+  /* Font handled by CSS variable override in globals.css */
+}
+
+/**
+ * Base reset (shadcn convention), scoped to the admin so it can't affect the
+ * host document. A bare `border` utility defaults to the theme border token
+ * instead of currentColor; explicit `border-*` utilities still win (low-
+ * priority base layer). The unscoped equivalent ships in @nextlyhq/ui's
+ * pre-compiled bundle for standalone consumers.
+ */
+@layer base {
+  .nextly-admin *,
+  .nextly-admin ::before,
+  .nextly-admin ::after {
+    border-color: var(--nx-border);
+  }
+}
+
+/**
+ * Table Header & Footer Background + Border System
+ *
+ * The surface itself is `--nx-table-header-bg` in the theme's token file, where
+ * a palette change can reach it. This file only says which elements paint with
+ * it.
+ */
+.nextly-admin thead {
+  background-color: var(--nx-table-header-bg);
+}
+
+.nextly-admin tfoot {
+  background-color: var(--nx-table-header-bg);
+}
+
+.nextly-admin .table-footer {
+  background-color: var(--nx-table-header-bg);
+}
+
+/**
+ * Text Selection Styling
+ * 
+ * Ensures text selection is visible and matches brand colors
+ * Scoped to nextly-admin to prevent leakage
+ */
+.nextly-admin *::selection {
+  background-color: var(--nx-primary);
+  color: var(--nx-primary-foreground);
+}
+
+/* Global cursor pointer for interactive elements */
+[data-slot*="trigger"],
+[data-slot*="button"],
+[data-slot*="item"]:not([data-disabled="true"]),
+[data-slot="checkbox"],
+[data-slot="switch"],
+[data-slot="radio-group-item"],
+[data-slot="accordion-trigger"],
+[data-slot="tabs-trigger"],
+[data-slot="label"],
+[data-slot="date-picker-trigger"] {
+  cursor: pointer !important;
+}
+
+/* Disabled state cursor */
+[data-slot*="trigger"][disabled],
+[data-slot*="button"][disabled],
+[data-slot*="item"][data-disabled="true"],
+[data-slot="checkbox"][disabled],
+[data-slot="switch"][disabled],
+[data-slot="radio-group-item"][disabled] {
+  cursor: not-allowed !important;
+}
+
+/**
+    * Auth Pages
+    *
+    * Special styles for authentication pages (login, signup, etc.)
+    */
+.nextly-admin[data-auth-page] {
+  width: 100vw;
+  min-height: 100vh;
+  background-color: var(--nx-muted);
+}
+
+/**
+    * Sidebar Components
+    * 
+    * Styles for elements within the sidebar navigation
+    */
+
+/* Explicitly disable all sidebar transitions and animations */
+[data-sidebar="menu-button"],
+[data-sidebar="menu-sub-button"],
+[data-sidebar="menu-item"],
+[data-sidebar="menu-sub"],
+[data-sidebar="menu-content"] {
+  transition: none !important;
+  animation: none !important;
+  transform: none !important;
+}
+
+/* Prevent global data-state animations from affecting sidebar */
+.nextly-admin [data-sidebar] [data-state="open"],
+.nextly-admin [data-sidebar] [data-state="closed"],
+.nextly-admin [data-sidebar] [data-state="expanded"],
+.nextly-admin [data-sidebar] [data-state="collapsed"] {
+  animation: none !important;
+  transition: none !important;
+}
+
+[data-sidebar="group"] {
+  padding: 0.375rem;
+}
+
+[data-sidebar="menu-sub"] {
+  margin-left: 0.75rem;
+  margin-right: 0.75rem;
+  padding-left: 0.5rem;
+  padding-right: 0.5rem;
+}
+
+/**
+    * Card Components
+    * 
+    * Styles for card UI components
+    */
+.admin-card {
+  border-width: 1px;
+  background-color: var(--nx-card);
+  padding: 1.25rem;
+  transition-property: all;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  transition-duration: 150ms;
+}
+
+/**
+    * Typography
+    * 
+    * Enhanced text styles with better hierarchy and readability
+    */
+
+.admin-text {
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  color: var(--nx-muted-foreground);
+}
+
+/**
+    * Component States & Animations
+    * 
+/**
+    * Enhanced Data-Slot Component Styles
+    */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/**
+    * Enhanced Data-Slot Component Styles
+    * 
+    * Styles targeting the data-slot attributes components carry
+    */
+
+/* Button enhancements */
+[data-slot^="button"] {
+  transition: all 0.2s ease;
+}
+
+/* Neutralize browser-forced autocomplete highlights (the "yellow" box) */
+.nextly-admin input:-webkit-autofill,
+.nextly-admin input:-webkit-autofill:hover,
+.nextly-admin input:-webkit-autofill:focus,
+.nextly-admin textarea:-webkit-autofill,
+.nextly-admin textarea:-webkit-autofill:hover,
+.nextly-admin textarea:-webkit-autofill:focus,
+.nextly-admin select:-webkit-autofill,
+.nextly-admin select:-webkit-autofill:hover,
+.nextly-admin select:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--nx-foreground) !important;
+  /* Use a box-shadow inset to effectively "replace" the background color.
+   * The token inverts for dark mode, so no separate dark rule is needed. */
+  box-shadow: 0 0 0px 1000px var(--nx-background) inset !important;
+  /* Very long transition delay to prevent the background-color from changing */
+  transition: background-color 5000s ease-in-out 0s;
+  background-clip: content-box !important;
+}
+
+.form-field-wrapper {
+  margin-bottom: 1rem;
+}
+
+.form-field-wrapper:last-child {
+  margin-bottom: 0;
+}
+
+.form-label {
+  display: block;
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1.25rem;
+  color: var(--nx-foreground);
+  margin-bottom: 0.375rem;
+}
+
+.form-description {
+  font-size: 0.75rem;
+  line-height: 1rem;
+  color: var(--nx-muted-foreground);
+  margin-top: 0.25rem;
+}
+
+.form-error {
+  font-size: 0.75rem;
+  line-height: 1rem;
+  color: var(--nx-destructive);
+  margin-top: 0.25rem;
+  font-weight: 500;
+}
+
+/**
+    * Spacing & Layout Utilities
+    * 
+    * Consistent spacing scale and layout patterns
+    */
+
+/**
+    * Responsive & Layout Enhancements
+    * 
+    * Better responsive behavior and container queries
+    */
+
+/* Applies at all widths: `.border-input` is used app-wide, so it must not be
+   gated behind a breakpoint or narrow viewports fall back to the default border. */
+.border-input {
+  border-color: var(--nx-input);
+}
+
+.text-primary {
+  color: var(--nx-primary);
+}
+
+.ring-offset-background {
+  --tw-ring-offset-color: var(--nx-background);
+}
+
+/**
+ * Lexical Editor Typeahead Styles
+ *
+ * Styles for the slash command menu and other typeahead components
+ */
+.typeahead-popover {
+  background: var(--nx-popover);
+  border: 1px solid var(--nx-border);
+  border-radius: 0px !important;
+  max-height: 300px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-width: 200px;
+  z-index: 9999;
+}
+
+.typeahead-popover.slash-menu {
+  min-width: 220px;
+}
+
+.typeahead-popover ul {
+  list-style: none;
+  margin: 0;
+  padding: 0.25rem;
+}
+
+.typeahead-popover .item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  margin: 0;
+  border-radius: 0px !important;
+  cursor: pointer;
+  font-size: 0.875rem;
+  color: var(--nx-foreground);
+  transition: background-color 0.15s ease;
+}
+
+.typeahead-popover .item.selected {
+  background-color: var(--nx-accent);
+  color: var(--nx-accent-foreground);
+}
+
+.typeahead-popover .item .icon {
+  width: 1rem;
+  height: 1rem;
+  flex-shrink: 0;
+  color: var(--nx-muted-foreground);
+}
+
+.typeahead-popover .item.selected .icon {
+  color: var(--nx-accent-foreground);
+}
+
+.typeahead-popover .item .text {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Page Container Background System */
+.nextly-admin .admin-page-container {
+  background-color: var(--nx-page-background);
+}
+
+.nextly-admin.dark .admin-page-container {
+  background-color: var(--nx-page-background);
+}
+
+/* Admin Dropdown Styling (Antigravity Standard: 0px Radius) */
+.nextly-admin .admin-dropdown-content {
+  background-color: color-mix(in srgb, var(--nx-background) 95%, transparent);
+  backdrop-filter: blur(12px);
+}
+
+.nextly-admin.dark .admin-dropdown-content {
+  background-color: var(--nx-card) !important;
+  border-color: var(--nx-border);
+}
+
+/* Dropdown Item Interaction States */
+.nextly-admin .admin-dropdown-item[data-highlighted],
+.nextly-admin .admin-dropdown-item[data-active="true"],
+.nextly-admin .admin-dropdown-item:focus,
+.nextly-admin .admin-dropdown-item:focus-visible {
+  background-color: color-mix(
+    in srgb,
+    var(--nx-primary) 5%,
+    transparent
+  ) !important;
+  color: var(--nx-primary) !important;
+}
+
+.nextly-admin .admin-dropdown-item:focus svg,
+.nextly-admin .admin-dropdown-item[data-active="true"] svg,
+.nextly-admin .admin-dropdown-item[data-highlighted] svg {
+  color: var(--nx-primary) !important;
+}
+
+.nextly-admin.dark .admin-dropdown-item[data-highlighted],
+.nextly-admin.dark .admin-dropdown-item[data-active="true"],
+.nextly-admin.dark .admin-dropdown-item:focus,
+.nextly-admin.dark .admin-dropdown-item:focus-visible {
+  background-color: color-mix(
+    in srgb,
+    var(--nx-primary) 10%,
+    transparent
+  ) !important;
+  color: var(--nx-primary) !important;
+}
+
+.nextly-admin.dark .admin-dropdown-item:focus svg,
+.nextly-admin.dark .admin-dropdown-item[data-active="true"] svg,
+.nextly-admin.dark .admin-dropdown-item[data-highlighted] svg {
+  color: var(--nx-primary) !important;
+}
+
+/* ============================================
+ * CENTRALIZED HOVER STATE MANAGEMENT
+ * 
+ * These classes define all hover interactions across the dashboard.
+ * Update these classes to change hover behavior globally.
+ * Used by components: pagination, dropdowns, tables, buttons, breadcrumbs, icons.
+ * ============================================ */
+
+/*
+ * ONE UNIFIED HOVER CLASS
+ * Target class for all component hover states.
+ *
+ * The tint is `primary` (a surface) while the ink is `foreground`: these
+ * classes sit on rows, breadcrumbs, table cells and icons all over the admin,
+ * so drawing their hover text from the action token would recolor most of the
+ * app's text the moment a theme gives primary a hue.
+ */
+.hover-unified {
+  @apply hover:bg-primary/5 hover:text-foreground transition-colors;
+}
+
+/**
+ * SUBTLE ROW HOVER
+ * Specifically for lists/rows where the solid black is too harsh.
+ *
+ * The dark-mode wash is drawn from `foreground` rather than a literal white so
+ * it inverts with the page's own ink instead of staying white under a theme
+ * that gives the dark palette a tinted foreground.
+ */
+.hover-subtle-row {
+  @apply hover:bg-primary/5 hover:text-foreground dark:hover:bg-foreground/5 transition-colors;
+}
+
+.hover-subtle-row:hover * {
+  color: inherit !important;
+}
+
+/* Keep badges readable instead of inheriting the row's hover text color. */
+.hover-subtle-row:hover [data-testid*="badge"],
+.hover-subtle-row:hover .badge {
+  color: var(--nx-foreground) !important;
+}
+
+.hover-subtle-row:hover svg {
+  color: inherit !important;
+}
+
+.group-hover-unified {
+  @apply group-hover:bg-primary/5 group-hover:text-foreground;
+}
+
+/* Dark wash drawn from `foreground` so it tracks the page ink, not a literal white. */
+.group-hover-subtle-row {
+  @apply group-hover:bg-primary/5 dark:group-hover:bg-foreground/5 transition-colors;
+}
+
+.group:hover .group-hover-unified svg {
+  color: inherit !important;
+}
+
+.group:hover .group-hover-subtle-row svg {
+  color: inherit !important;
+}
+
+/*
+ * TABLE ROW HOVER (DEDICATED)
+ * Subtle primary tint; the token inverts for dark, so no OS media query.
+ */
+.hover-unified-table-row {
+  @apply hover:bg-primary/5 hover:text-foreground transition-colors;
+}
+
+.hover-unified-table-row:hover * {
+  color: inherit;
+}
+
+.hover-unified-table-row:hover svg {
+  color: inherit !important;
+}
+
+/* Table icon covers: flat shape with unified neutral background. The dark fill
+ * comes from `foreground` so the cover follows the page ink under any theme. */
+.table-row-icon-cover {
+  @apply shrink-0 flex items-center justify-center w-9 h-9 rounded-md bg-primary/5 text-foreground dark:bg-foreground/20;
+}
+
+/* Normalize table pills/badges to one monochrome look across all tables. */
+.nextly-admin table [data-slot^="badge."] {
+  background-color: color-mix(
+    in srgb,
+    var(--nx-foreground) 6%,
+    transparent
+  ) !important;
+  color: var(--nx-foreground) !important;
+  border-color: color-mix(
+    in srgb,
+    var(--nx-foreground) 8%,
+    transparent
+  ) !important;
+  box-shadow: none !important;
+}
+
+.nextly-admin.dark table [data-slot^="badge."] {
+  background-color: color-mix(
+    in srgb,
+    var(--nx-foreground) 12%,
+    transparent
+  ) !important;
+  border-color: color-mix(
+    in srgb,
+    var(--nx-foreground) 20%,
+    transparent
+  ) !important;
+}
+
+/* Interactive hover: fills with the primary token (inverts for dark). */
+.hover-muted {
+  @apply hover:bg-primary hover:text-primary-foreground transition-colors;
+}
+
+.hover-muted:hover svg {
+  color: var(--nx-primary-foreground) !important;
+}

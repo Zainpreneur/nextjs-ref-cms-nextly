@@ -1,0 +1,904 @@
+/**
+ * Restore orchestration. The cases worth pinning are the ones where writing
+ * anyway would be worse than holding back: a snapshot whose locale is unknown,
+ * and a write that reported failure without throwing.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const {
+  getVersionSpy,
+  updateEntrySpy,
+  updateSingleSpy,
+  collectionSpy,
+  singleRegistrySpy,
+  componentSpy,
+  configSpy,
+  appLocalizationSpy,
+} = vi.hoisted(() => ({
+  getVersionSpy: vi.fn(),
+  updateEntrySpy: vi.fn(),
+  updateSingleSpy: vi.fn(),
+  collectionSpy: vi.fn(),
+  singleRegistrySpy: vi.fn(),
+  componentSpy: vi.fn(),
+  configSpy: vi.fn(),
+  appLocalizationSpy: vi.fn(),
+}));
+
+// The site's languages as they are now. By default the configuration's block, as on a site that
+// declares its languages there; a site whose languages are stored answers from the registry.
+vi.mock("../../i18n/configured-locales", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../i18n/configured-locales")>()),
+  appLocalization: appLocalizationSpy,
+}));
+
+// Field-level write rules are evaluated by the update path too; stubbed here so
+// these tests exercise restore's own decisions rather than access configuration.
+vi.mock("../../../shared/lib/field-level-registry", async importOriginal => ({
+  applyFieldWriteAccess: vi.fn(),
+  applyFieldReadAccess: vi.fn(),
+  callerAccessGrants: vi.fn(
+    () => () => Promise.resolve({ permissions: [], roles: [] })
+  ),
+  getFieldFunctions: vi.fn(),
+  // A pure parse of a container's value, which the field-group walk shares
+  // with the entity's own pass: the real one, so the walk reaches what it
+  // would in a live read.
+  openNestedContainer: (
+    await importOriginal<
+      typeof import("../../../shared/lib/field-level-registry")
+    >()
+  ).openNestedContainer,
+}));
+
+vi.mock("../../../di", () => ({
+  getService: vi.fn((name: string) => {
+    switch (name) {
+      case "versionsService":
+        return { get: getVersionSpy };
+      case "collectionsHandler":
+        return { updateEntry: updateEntrySpy };
+      case "singleEntryService":
+        return { update: updateSingleSpy };
+      case "collectionRegistryService":
+        return { getCollectionBySlug: collectionSpy };
+      case "fieldGroupRegistryService":
+        return { getComponentBySlug: componentSpy };
+      case "config":
+        return configSpy();
+      default:
+        return { getSingleBySlug: singleRegistrySpy };
+    }
+  }),
+}));
+
+import {
+  applyFieldReadAccess,
+  applyFieldWriteAccess,
+} from "../../../shared/lib/field-level-registry";
+import { errorEnvelopeFields } from "../../../errors/from-service-envelope";
+import {
+  _resetPerLanguageStorage,
+  setPerLanguageStorage,
+} from "../../i18n/per-language-storage";
+import { resolveComponentSchemas, restoreVersion } from "../restore-version";
+
+// A case that stands in for an earlier release's layout leaves the one every installation runs.
+afterEach(() => _resetPerLanguageStorage());
+
+const user = { id: "u1" };
+const base = {
+  scopeKind: "collection" as const,
+  slug: "posts",
+  entryId: "e1",
+  versionNo: 3,
+  user,
+};
+
+const fields = [{ name: "title", type: "text" }];
+
+describe("restoreVersion", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: null,
+      snapshot: { title: "Old title" },
+    });
+    collectionSpy.mockResolvedValue({
+      fields,
+      localized: false,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+    updateEntrySpy.mockResolvedValue({ success: true });
+    updateSingleSpy.mockResolvedValue({ success: true });
+    singleRegistrySpy.mockResolvedValue({
+      fields,
+      localized: false,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+    componentSpy.mockResolvedValue({ fields: [] });
+    // The app's configured locales; a version naming one outside this list is
+    // treated as having no usable locale.
+    configSpy.mockReturnValue({
+      localization: {
+        defaultLocale: "en",
+        locales: [{ code: "en" }, { code: "de" }],
+      },
+    });
+    appLocalizationSpy.mockImplementation(
+      () =>
+        (configSpy() as { localization?: unknown } | undefined)?.localization
+    );
+  });
+
+  it("writes the snapshot through the normal update path", async () => {
+    await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        collectionName: "posts",
+        entryId: "e1",
+        overrideAccess: false,
+      }),
+      { title: "Old title" }
+    );
+  });
+
+  it("refuses where the collection keeps no drafts, before reading the version", async () => {
+    // Without a working draft the only place to put the version is the live
+    // document, which would publish it.
+    collectionSpy.mockResolvedValue({
+      fields,
+      localized: false,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: false } },
+    });
+
+    await expect(restoreVersion(base)).rejects.toMatchObject({
+      code: "BUSINESS_RULE_VIOLATION",
+    });
+    expect(getVersionSpy).not.toHaveBeenCalled();
+    expect(updateEntrySpy).not.toHaveBeenCalled();
+  });
+
+  it("never restores the version's status", async () => {
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: null,
+      snapshot: { title: "Old title", status: "published" },
+    });
+
+    await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(expect.anything(), {
+      title: "Old title",
+    });
+  });
+
+  it("writes only the fields it is asked for", async () => {
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: null,
+      snapshot: { title: "Old title", body: "Old body" },
+    });
+    collectionSpy.mockResolvedValue({
+      fields: [...fields, { name: "body", type: "text" }],
+      localized: false,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+
+    await restoreVersion({ ...base, fields: ["title"] });
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(expect.anything(), {
+      title: "Old title",
+    });
+  });
+
+  it("holds the write as a draft, and records each field's source", async () => {
+    await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        requireHeldDraft: true,
+        restoredFrom: { title: 3 },
+      }),
+      expect.anything()
+    );
+  });
+
+  it("writes as trusted server code when no person is named", async () => {
+    await restoreVersion({ ...base, user: undefined });
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(
+      expect.objectContaining({ overrideAccess: true }),
+      { title: "Old title" }
+    );
+    expect(updateEntrySpy.mock.calls[0]?.[0]).not.toHaveProperty("user");
+  });
+
+  it("records which version the write restored", async () => {
+    // Lineage cannot be recovered afterwards: the resulting document looks
+    // exactly like someone retyping the old content.
+    await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceVersionNo: 3 }),
+      expect.anything()
+    );
+  });
+
+  it("writes into the locale the version was captured in", async () => {
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: "de",
+      snapshot: { title: "Hallo" },
+    });
+    collectionSpy.mockResolvedValue({
+      fields,
+      localized: true,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+
+    await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(
+      expect.objectContaining({ locale: "de" }),
+      expect.anything()
+    );
+  });
+
+  it("writes into the captured locale on a site whose languages are stored, not configured", async () => {
+    configSpy.mockReturnValue({ localization: undefined });
+    appLocalizationSpy.mockReturnValue({
+      defaultLocale: "en",
+      locales: [{ code: "en" }, { code: "de" }],
+    });
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: "de",
+      snapshot: { title: "Hallo" },
+    });
+    collectionSpy.mockResolvedValue({
+      fields: [{ name: "title", type: "text", localized: true }],
+      localized: true,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+
+    await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(
+      expect.objectContaining({ locale: "de" }),
+      { title: "Hallo" }
+    );
+  });
+
+  it("restores only the shared fields of a localized version with no locale", async () => {
+    // A shared-field-only edit captures no locale because it put nothing in one.
+    // Its shared values still belong to the entity, so they apply; `title` is
+    // text, which a localized entity keeps per locale, so it is held back.
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: null,
+      snapshot: { title: "Old title", views: 41 },
+    });
+    collectionSpy.mockResolvedValue({
+      fields: [
+        { name: "title", type: "text" },
+        { name: "views", type: "number" },
+      ],
+      localized: true,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+
+    const result = await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(expect.anything(), {
+      views: 41,
+    });
+    expect(result.droppedFields).toEqual(["title"]);
+  });
+
+  it("does not name a locale when writing a version that records none", async () => {
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: null,
+      snapshot: { title: "Old title", views: 41 },
+    });
+    collectionSpy.mockResolvedValue({
+      fields: [
+        { name: "title", type: "text" },
+        { name: "views", type: "number" },
+      ],
+      localized: true,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+
+    await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(
+      expect.not.objectContaining({ locale: expect.anything() }),
+      expect.anything()
+    );
+  });
+
+  it("refuses a localized version whose every field is per-locale", async () => {
+    // Nothing survives the holdback, so there is no write to make — refusing is
+    // the honest answer rather than reporting a restore that applied nothing.
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: null,
+      snapshot: { title: "Old title" },
+    });
+    collectionSpy.mockResolvedValue({
+      fields,
+      localized: true,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+
+    await expect(restoreVersion(base)).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+    });
+    expect(updateEntrySpy).not.toHaveBeenCalled();
+  });
+
+  it("allows an unlocalized document to restore a version with no locale", async () => {
+    await expect(restoreVersion(base)).resolves.toMatchObject({
+      restoredFrom: 3,
+    });
+  });
+
+  it("reports fields the current schema can no longer accept", async () => {
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: null,
+      snapshot: { title: "Old", subtitle: "Removed since" },
+    });
+
+    const result = await restoreVersion(base);
+
+    expect(result.droppedFields).toEqual(["subtitle"]);
+    expect(updateEntrySpy).toHaveBeenCalledWith(expect.anything(), {
+      title: "Old",
+    });
+  });
+
+  it("refuses when nothing in the version applies to the current schema", async () => {
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: null,
+      snapshot: { subtitle: "Removed since" },
+    });
+
+    await expect(restoreVersion(base)).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+    });
+    expect(updateEntrySpy).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a denied write as not found", async () => {
+    // Matching the read gate: confirming the document exists to a caller who
+    // may not write it is itself disclosure.
+    updateEntrySpy.mockResolvedValue({ success: false, statusCode: 403 });
+
+    await expect(restoreVersion(base)).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+  });
+
+  // A failed restore has five ways to answer and only one of them ran through
+  // the shared converter, so the other four reached the caller naming nothing.
+  // Each outcome is checked for the failure underneath as well as its code.
+  it.each([
+    ["a denied write", 403, undefined, "NOT_FOUND"],
+    ["a missing document", 404, undefined, "NOT_FOUND"],
+    ["a collision", 409, undefined, "CONFLICT"],
+    ["a snapshot today's rules reject", 422, undefined, "VALIDATION_ERROR"],
+    ["a server fault", 500, undefined, "INTERNAL_ERROR"],
+    ["a typed failure", 429, "RATE_LIMITED", "RATE_LIMITED"],
+  ])(
+    "carries the update failure through %s",
+    async (_label, statusCode, code, expectedCode) => {
+      const original = new Error("connection terminated unexpectedly");
+      updateEntrySpy.mockResolvedValue({
+        success: false,
+        statusCode,
+        ...(code ? { code } : {}),
+        ...errorEnvelopeFields(original),
+      });
+
+      await expect(restoreVersion(base)).rejects.toMatchObject({
+        code: expectedCode,
+        cause: original,
+      });
+    }
+  );
+
+  it("restores a Single through its own update path", async () => {
+    await restoreVersion({ ...base, scopeKind: "single", slug: "settings" });
+
+    expect(updateSingleSpy).toHaveBeenCalledWith(
+      "settings",
+      { title: "Old title" },
+      expect.objectContaining({ sourceVersionNo: 3 })
+    );
+  });
+
+  it("resolves component schemas that are nested inside other components", async () => {
+    // A component may embed another; leaving the deeper one opaque means the
+    // filter can neither inspect it for credentials nor prune stale keys.
+    const componentFields = [
+      { name: "outer", type: "component", component: "wrapper" },
+    ];
+    collectionSpy.mockResolvedValue({
+      fields: componentFields,
+      localized: false,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+    componentSpy.mockImplementation((slug: string) =>
+      Promise.resolve(
+        slug === "wrapper"
+          ? {
+              fields: [{ name: "inner", type: "component", component: "leaf" }],
+            }
+          : { fields: [{ name: "secret", type: "password" }] }
+      )
+    );
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: null,
+      snapshot: { outer: { inner: {} } },
+    });
+
+    await expect(restoreVersion(base)).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+    });
+
+    // Both layers were walked: the password only becomes visible through the
+    // second one.
+    // No transaction here, so no executor: the lookups run on the pool.
+    expect(componentSpy).toHaveBeenCalledWith("wrapper", undefined);
+    expect(componentSpy).toHaveBeenCalledWith("leaf", undefined);
+  });
+
+  it("does not pass a stale locale to an entity that is no longer localized (an earlier release's layout)", async () => {
+    setPerLanguageStorage(false);
+    // The old version's locale may not even be configured any more, and the
+    // update path rejects an unknown one outright.
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: "de",
+      snapshot: { title: "Hallo" },
+    });
+    collectionSpy.mockResolvedValue({
+      fields,
+      localized: false,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+
+    await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(
+      expect.not.objectContaining({ locale: expect.anything() }),
+      expect.anything()
+    );
+  });
+
+  it("reports fields the caller may not write", async () => {
+    // Field-level write rules strip denied keys inside the update path, after
+    // it has already reported success — so without this a restore would claim
+    // to have applied content it never did.
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: null,
+      snapshot: { title: "Old", secretNote: "denied" },
+    });
+    collectionSpy.mockResolvedValue({
+      fields: [
+        { name: "title", type: "text" },
+        { name: "secretNote", type: "text" },
+      ],
+      localized: false,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+    vi.mocked(applyFieldWriteAccess).mockImplementation(
+      async ({ data }: { data: Record<string, unknown> }) => {
+        delete data.secretNote;
+      }
+    );
+
+    const result = await restoreVersion(base);
+
+    expect(result.droppedFields).toContain("secretNote");
+    expect(updateEntrySpy).toHaveBeenCalledWith(expect.anything(), {
+      title: "Old",
+    });
+  });
+
+  it("reports a denied field nested inside a container", async () => {
+    // Field-level rules strip nested keys by mutating the container in place.
+    // Probing with a shallow copy would share that container with the real
+    // payload, so the strip would land on the payload itself while the
+    // top-level key stayed present — a half-stripped write reported as a clean
+    // restore.
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: null,
+      snapshot: { meta: { caption: "Keep", secret: "denied" } },
+    });
+    collectionSpy.mockResolvedValue({
+      fields: [
+        {
+          name: "meta",
+          type: "group",
+          fields: [
+            { name: "caption", type: "text" },
+            { name: "secret", type: "text" },
+          ],
+        },
+      ],
+      localized: false,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+    vi.mocked(applyFieldWriteAccess).mockImplementation(
+      async ({ data }: { data: Record<string, unknown> }) => {
+        const meta = data.meta as Record<string, unknown> | undefined;
+        if (meta) delete meta.secret;
+      }
+    );
+
+    await expect(restoreVersion(base)).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+    });
+  });
+
+  it("leaves the payload untouched when the probe denies nothing", async () => {
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: null,
+      snapshot: { meta: { caption: "Keep" } },
+    });
+    collectionSpy.mockResolvedValue({
+      fields: [
+        {
+          name: "meta",
+          type: "group",
+          fields: [{ name: "caption", type: "text" }],
+        },
+      ],
+      localized: false,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+
+    const result = await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(expect.anything(), {
+      meta: { caption: "Keep" },
+    });
+    expect(result.droppedFields).toEqual([]);
+  });
+
+  it("writes at the captured locale when the payload reaches a component", async () => {
+    // A collection that is not localized itself can embed one that is, and the
+    // component keeps per-locale rows. Dropping the locale here would resolve
+    // the default language and restore a translation over the wrong one.
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: "de",
+      snapshot: { hero: { _componentType: "banner", heading: "Hallo" } },
+    });
+    collectionSpy.mockResolvedValue({
+      fields: [{ name: "hero", type: "component", component: "banner" }],
+      localized: false,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+    componentSpy.mockResolvedValue({
+      fields: [{ name: "heading", type: "text" }],
+      localized: true,
+    });
+
+    await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(
+      expect.objectContaining({ locale: "de" }),
+      expect.anything()
+    );
+  });
+
+  it("names no locale for an unlocalized document with no component values (an earlier release's layout)", async () => {
+    setPerLanguageStorage(false);
+    // The stale-locale case: nothing in this payload is stored per locale, and
+    // the update path rejects a locale it cannot place.
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: "de",
+      snapshot: { title: "Hallo" },
+    });
+
+    await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(
+      expect.not.objectContaining({ locale: expect.anything() }),
+      expect.anything()
+    );
+  });
+
+  it("restores shared fields when the version's locale no longer exists", async () => {
+    // Locales are removed from configuration. Carrying one anyway fails the
+    // whole write, so it is treated as a version that names none: the
+    // per-locale part is held back and the shared fields still apply.
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: "fr",
+      snapshot: { title: "Bonjour", views: 7 },
+    });
+    collectionSpy.mockResolvedValue({
+      fields: [
+        { name: "title", type: "text" },
+        { name: "views", type: "number" },
+      ],
+      localized: true,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+
+    const result = await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(
+      expect.not.objectContaining({ locale: expect.anything() }),
+      { views: 7 }
+    );
+    expect(result.droppedFields).toEqual(["title"]);
+  });
+
+  it("holds back a localized component when the captured locale is gone", async () => {
+    // The parent is not localized, so the old rule left `localeUnknown` false
+    // and the component was written with no locale — which resolves the default
+    // language and lands a German snapshot on top of it.
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: "fr",
+      snapshot: {
+        title: "Page",
+        hero: { _componentType: "banner", heading: "Bonjour" },
+      },
+    });
+    collectionSpy.mockResolvedValue({
+      fields: [
+        { name: "title", type: "text" },
+        { name: "hero", type: "component", component: "banner" },
+      ],
+      localized: false,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+    componentSpy.mockResolvedValue({
+      fields: [{ name: "heading", type: "text" }],
+      localized: true,
+    });
+
+    const result = await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(expect.anything(), {
+      title: "Page",
+    });
+    expect(result.droppedFields).toEqual(["hero"]);
+  });
+
+  it("does not write back a field the caller may not read", async () => {
+    // The history endpoints redact a snapshot before returning it. Restoring is
+    // the one path that would otherwise apply the unredacted value, letting a
+    // caller push content they were never allowed to see into the document.
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: null,
+      snapshot: { title: "Public", secret: "hidden" },
+    });
+    collectionSpy.mockResolvedValue({
+      fields: [
+        { name: "title", type: "text" },
+        { name: "secret", type: "text" },
+      ],
+      localized: false,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+    vi.mocked(applyFieldReadAccess).mockImplementation(
+      async ({ entry }: { entry: Record<string, unknown> }) => {
+        delete entry.secret;
+        return undefined;
+      }
+    );
+
+    const result = await restoreVersion(base);
+
+    expect(updateEntrySpy).toHaveBeenCalledWith(expect.anything(), {
+      title: "Public",
+    });
+    expect(result.droppedFields).toContain("secret");
+  });
+
+  it("reports an unreadable field nested inside a container", async () => {
+    getVersionSpy.mockResolvedValue({
+      versionNo: 3,
+      locale: null,
+      snapshot: { meta: { caption: "Public", secret: "hidden" } },
+    });
+    collectionSpy.mockResolvedValue({
+      fields: [
+        {
+          name: "meta",
+          type: "group",
+          fields: [
+            { name: "caption", type: "text" },
+            { name: "secret", type: "text" },
+          ],
+        },
+      ],
+      localized: false,
+      status: true,
+      versions: { enabled: true, drafts: { enabled: true } },
+    });
+    vi.mocked(applyFieldReadAccess).mockImplementation(
+      async ({ entry }: { entry: Record<string, unknown> }) => {
+        const meta = entry.meta as Record<string, unknown> | undefined;
+        if (meta) delete meta.secret;
+        return undefined;
+      }
+    );
+
+    await expect(restoreVersion(base)).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+    });
+  });
+
+  it("gives the read probe the document id it is keyed on", async () => {
+    // `id` is stripped from the payload as immutable, but a read rule keyed on
+    // the document would then run with none and hide fields the same caller can
+    // see in version history — making restore stricter than the endpoint the
+    // snapshot came from.
+    let seenId: unknown;
+    vi.mocked(applyFieldReadAccess).mockImplementation(
+      async ({ entry }: { entry: Record<string, unknown> }) => {
+        seenId = entry.id;
+        return undefined;
+      }
+    );
+
+    await restoreVersion(base);
+
+    expect(seenId).toBe("e1");
+  });
+
+  it("refuses to restore when versioning has been turned off", async () => {
+    // The write goes through the ordinary update, which captures a version only
+    // while versioning is on. Restoring anyway would overwrite live content
+    // without preserving what it replaced — a destructive act sold as a
+    // recoverable one.
+    collectionSpy.mockResolvedValue({
+      fields,
+      localized: false,
+      // Drafts as configured, versioning since turned off: the drafts a restore
+      // writes are there, but nothing would capture what it replaces.
+      status: true,
+      versions: { enabled: false, drafts: { enabled: true } },
+    });
+
+    await expect(restoreVersion(base)).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+    });
+    expect(updateEntrySpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps a rejected write's own reason instead of reporting a fault", async () => {
+    // A snapshot can fail today's rules for ordinary reasons — an option since
+    // removed, a validator tightened since. Those are answers an editor can act
+    // on, not server faults.
+    updateEntrySpy.mockResolvedValue({
+      success: false,
+      statusCode: 422,
+      message: "That option no longer exists.",
+    });
+
+    await expect(restoreVersion(base)).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+    });
+  });
+
+  it("reports a conflicting write as a conflict", async () => {
+    // A REST client reads the outer status, so flattening this into a
+    // validation error would answer 400 and stop matching the contract the same
+    // collision reports through an ordinary update.
+    updateEntrySpy.mockResolvedValue({
+      success: false,
+      statusCode: 409,
+      message: "That slug is already taken.",
+    });
+
+    await expect(restoreVersion(base)).rejects.toMatchObject({
+      code: "CONFLICT",
+    });
+  });
+
+  it("still reports a genuine server fault as one", async () => {
+    updateEntrySpy.mockResolvedValue({ success: false, statusCode: 500 });
+
+    await expect(restoreVersion(base)).rejects.toMatchObject({
+      code: "INTERNAL_ERROR",
+    });
+  });
+
+  it("rejects a version number that is not positive", async () => {
+    await expect(
+      restoreVersion({ ...base, versionNo: 0 })
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+
+    expect(getVersionSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("resolveComponentSchemas", () => {
+  const fieldsWithComponent: Parameters<typeof resolveComponentSchemas>[0] = [
+    { name: "hero", type: "component", component: "heroBlock" },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("propagates a registry lookup failure instead of marking the component unresolved", async () => {
+    // A thrown lookup is not proof the component is gone. Collapsing it into an
+    // "unresolved" marker lets a transient registry failure masquerade as a
+    // missing component, and callers then drop or expose that subtree.
+    componentSpy.mockRejectedValue(new Error("registry offline"));
+
+    await expect(
+      resolveComponentSchemas(fieldsWithComponent)
+    ).rejects.toThrow();
+  });
+
+  // Under `experimental.perLanguageStorage` a component not marked translatable keeps its
+  // translatable values per language all the same, so its subtree differs by language.
+  it("describes a component kept per language under the setting as localized", async () => {
+    componentSpy.mockResolvedValue({
+      fields: [{ name: "heading", type: "text" }],
+      localized: false,
+    });
+    setPerLanguageStorage(true);
+    try {
+      const schemas = await resolveComponentSchemas(fieldsWithComponent);
+      expect(schemas.get("heroBlock")?.localized).toBe(true);
+    } finally {
+      _resetPerLanguageStorage();
+    }
+  });
+
+  it("marks a genuinely missing component unresolved without throwing (an earlier release's layout)", async () => {
+    setPerLanguageStorage(false);
+    // A null record is a confirmed absence, not an error: the subtree is treated
+    // as unknown and dropped, and the call still succeeds.
+    componentSpy.mockResolvedValue(null);
+
+    const schemas = await resolveComponentSchemas(fieldsWithComponent);
+
+    expect(schemas.get("heroBlock")).toEqual({
+      fields: [],
+      localized: false,
+      resolved: false,
+    });
+  });
+});

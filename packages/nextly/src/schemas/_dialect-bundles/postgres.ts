@@ -1,0 +1,178 @@
+/**
+ * Flat PostgreSQL dialect bundle.
+ *
+ * Replaces the legacy `database/schema/postgres.ts` runtime surface deleted
+ * in Plan A Task 17. Re-exports every Drizzle table + relations the
+ * framework manages, drawn from the canonical per-feature
+ * `schemas/<feature>/postgres.ts` modules, under the bare names callers
+ * have always used (`apiKeys`, `users`, `dynamicCollections`, …).
+ *
+ * Tables are sourced from `<feature>/postgres.ts`. Drizzle v2 relations
+ * live in `./postgres.relations.ts` (one central defineRelations per
+ * dialect). The table modules deliberately do NOT
+ * re-export their relations — that back-edge created a table↔relations import
+ * cycle that left tables `undefined` at module-load. This bundle is the join
+ * point instead, so the dependency stays one-directional (relations → tables).
+ *
+ * Consumers reach this module through `getDialectTables("postgresql")` /
+ * `import { schema } from "@nextly/database"`. New consumers should prefer
+ * `getCoreSchema(dialect)` from `@nextly/schemas`, which returns a
+ * `NextlySchemaSnapshot` (dialect-keyed `TableSpec[]`) rather than the
+ * Drizzle-native flat namespace this bundle exposes.
+ *
+ * @module schemas/_dialect-bundles/postgres
+ * @since v0.0.3-alpha (Plan A Task 17 — replaces database/schema/postgres.ts)
+ */
+// Every dialect's bundle exports its own tables under the same names, by
+// design: one is chosen by dialect at runtime.
+// fallow-ignore-file duplicate-export
+
+// Users + Auth.js identity.
+export { users } from "../users/postgres";
+
+// The field-group storage migration's mutual-exclusion row. Present here, and not only in
+// `getCoreSchema`, because this bundle is what decides whether the table EXISTS: it is what
+// `reconcileCore` hands drizzle-kit.
+export { nextlyFieldGroupLock } from "../field-group-lock/postgres";
+// The one schema lock every schema change takes; the field-group lock above is held beside it
+// for processes of an earlier version.
+export { nextlySchemaLock } from "../field-group-lock/postgres";
+export { nextlyDocumentLock } from "../document-lock/postgres";
+export { nextlyRbacEpoch } from "../rbac-epoch/postgres";
+export { nextlyDeletedPrincipals } from "../deleted-principals/postgres";
+// Where a plugin's configuration lives. In the bundle as well as in
+// CORE_TABLE_NAMES: the manifest decides what is EXPECTED, this decides what
+// is CREATED, and a table in one but not the other is never made.
+export { nextlyPluginSettings } from "../plugin-settings/postgres";
+export { nextlyOneTimeSecrets } from "../one-time-secrets/postgres";
+export { nextlyReceivedWebhooks } from "../received-webhooks/postgres";
+export {
+  nextlyPluginEvents,
+  nextlyPluginEventDeliveries,
+} from "../plugin-events/postgres";
+export { nextlyLimitStore } from "../limit-store/postgres";
+export { nextlyCacheTagExpiries } from "../cache-tag-expiries/postgres";
+export { nextlySpentChallenges } from "../spent-challenges/postgres";
+export { nextlySchemaOwners } from "../schema-owners/postgres";
+export { nextlyWidgetLayout } from "../widget-layout/postgres";
+
+// Auth tokens.
+export {
+  emailVerificationTokens,
+  passwordResetTokens,
+  userInviteTokens,
+  refreshTokens,
+} from "../auth-tokens/postgres";
+
+// RBAC.
+export {
+  roles,
+  permissions,
+  rolePermissions,
+  userRoles,
+  roleInherits,
+} from "../rbac/postgres";
+
+// API keys.
+export { apiKeys } from "../api-keys/postgres";
+
+// Audit.
+export { auditLog, activityLog } from "../audit/postgres";
+
+// Media.
+export { media, mediaFolders } from "../media/postgres";
+
+// Nextly meta.
+export { nextlyMeta } from "../nextly-meta/postgres";
+
+// Dynamic collections / singles / components — aliased back to the bare
+// names production code uses (the legacy stub flattened
+// `dynamicCollectionsPg` → `dynamicCollections`, etc.).
+export { dynamicCollectionsPg as dynamicCollections } from "../dynamic-collections/postgres";
+export { dynamicSinglesPg as dynamicSingles } from "../dynamic-singles/postgres";
+export { dynamicFieldGroupsPg as dynamicFieldGroups } from "../dynamic-field-groups/postgres";
+
+// Singletons + lookup tables.
+export { siteSettingsPg as siteSettings } from "../site-settings/postgres";
+export { userFieldDefinitionsPg as userFieldDefinitions } from "../user-field-definitions/postgres";
+export { emailProvidersPg as emailProviders } from "../email-providers/postgres";
+export { emailDeliveriesPg as emailDeliveries } from "../email-deliveries/postgres";
+export { emailSendClaimsPg as emailSendClaims } from "../email-send-claims/postgres";
+export { emailQueuePg as emailQueue } from "../email-queue/postgres";
+export { emailQueueRecipientsPg as emailQueueRecipients } from "../email-queue-recipients/postgres";
+export { emailTemplatesPg as emailTemplates } from "../email-templates/postgres";
+
+export { nextlySchemaEventsPg as nextlySchemaEvents } from "../schema-events/postgres";
+
+// Content-version store; in the bundle so the adapter table resolver can
+// resolve `nextly_versions` (a managed core table) for runtime CRUD.
+export { nextlyVersionsPg as nextlyVersions } from "../versions/postgres";
+
+// Localization archive; in the bundle so freshPushSchema creates it. Being in
+// getCoreSchema alone only makes it diffable: the apply pushes this map, so a
+// table missing here is proposed on every reconcile and created by none.
+export { nextlyI18nArchive } from "../nextly-i18n-archive/postgres";
+
+// Webhook + event system tables. Must be in this flat bundle (not just
+// getCoreSchema) so freshPushSchema creates them on a fresh database.
+export {
+  nextlyEvents,
+  nextlyWebhooks,
+  nextlyWebhookDeliveries,
+} from "../webhooks/postgres";
+
+// Content releases; in the bundle so freshPushSchema creates them on a fresh
+// database. Being in getCoreSchema alone only makes a table diffable — the
+// apply pushes THIS map, so one missing here is proposed on every reconcile
+// and created by none.
+export {
+  nextlyReleasesPg as nextlyReleases,
+  nextlyReleaseMembersPg as nextlyReleaseMembers,
+} from "../releases/postgres";
+
+// Version pins; in the bundle so freshPushSchema creates the table on a fresh
+// database, for the reason the release tables above give.
+export { nextlyVersionPinsPg as nextlyVersionPins } from "../version-pins/postgres";
+
+// Background jobs; in the bundle for the reason the releases note above
+// gives — getCoreSchema makes a table diffable, this map is what apply
+// actually pushes.
+export { nextlyJobsPg as nextlyJobs } from "../jobs/postgres";
+
+// Each person's own notices; in the bundle for the reason the releases note
+// above gives — this map is what the push creates.
+export { nextlyNoticesPg as nextlyNotices } from "../notices/postgres";
+// Each reader's pinned entries and dashboard preferences; in the bundle for
+// the reason the releases note above gives — this map is what the push
+// creates.
+export { nextlyDashboardPinsPg as nextlyDashboardPins } from "../dashboard-pins/postgres";
+export { nextlyDashboardPreferencesPg as nextlyDashboardPreferences } from "../dashboard-preferences/postgres";
+// Which media items each document uses; in the bundle for the reason the
+// releases note above gives — this map is what the push creates.
+export { nextlyMediaUsagePg as nextlyMediaUsage } from "../media-usage/postgres";
+
+// The site's email brand settings; in the bundle for the reason the releases
+// note above gives — this map is what the push creates.
+export { nextlyEmailBrandPg as nextlyEmailBrand } from "../email-brand/postgres";
+
+// The external identities a person signed in with; in the bundle for the
+// reason the email brand above gives — this map is what the push creates.
+export { nextlyExternalIdentitiesPg as nextlyExternalIdentities } from "../external-identities/postgres";
+
+// Version view markers; in the bundle so freshPushSchema creates the table on
+// a fresh database, for the reason the release tables above give.
+export { nextlyVersionViewsPg as nextlyVersionViews } from "../version-views/postgres";
+export { nextlyReviewStatesPg as nextlyReviewStates } from "../review-states/postgres";
+export { nextlyTranslationProvenancePg as nextlyTranslationProvenance } from "../translation-provenance/postgres";
+export { nextlyWorkflowSettingsPg as nextlyWorkflowSettings } from "../workflow-settings/postgres";
+export { nextlyScheduleWindowsPg as nextlyScheduleWindows } from "../schedule-windows/postgres";
+// The record of content events; in the bundle so freshPushSchema creates the
+// tables on a fresh database, for the reason the release tables above give.
+export {
+  nextlyContentEventsPg as nextlyContentEvents,
+  nextlyContentEventPartsPg as nextlyContentEventParts,
+} from "../content-events/postgres";
+// Recorded preview links; in the bundle so freshPushSchema creates the table on
+// a fresh database, for the reason the release tables above give.
+export { nextlyPreviewLinksPg as nextlyPreviewLinks } from "../preview-links/postgres";
+export { nextlyLanguagesPg as nextlyLanguages } from "../languages/postgres";

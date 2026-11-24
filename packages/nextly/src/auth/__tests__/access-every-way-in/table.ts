@@ -1,0 +1,1096 @@
+/**
+ * The table of access cases every way in is asked about, as data.
+ *
+ * A case is who is asking, what they ask to do, to what, and which code rule
+ * that target declares. Every dimension is a list here, and the rows are
+ * generated from the lists, so adding a caller, a rule or a way in is one entry
+ * rather than a new block of tests.
+ *
+ * The suite in `suite.ts` reads it twice: it pins what each way in answers
+ * today, and checks each way in against the one answer `oneAnswer` below
+ * works out for every row.
+ */
+
+/**
+ * Who is asking.
+ *
+ * `user-with` holds every permission the targets need through a role named
+ * `editor`, and `custom-role` holds the same permissions through a role named
+ * `reviewer`, so a rule that checks a role's NAME answers them differently
+ * while the role screen says the same thing for both. `user-partial` holds
+ * read, update and publish only, through a role named `partial`, so a door
+ * that asks for the wrong action's permission answers it differently from the
+ * others. The read-only and full-access keys are made by `user-with`; the
+ * role-based keys carry `reviewer` and `partial`; `key-super-admin` is a
+ * full-access key made by the super-admin, and `key-read-only-super-admin` and
+ * `key-role-based-super-admin` are the super-admin's read-only key and a
+ * role-based key of theirs carrying `reviewer`: only the full-access one
+ * carries its maker's super-admin authority. `principal` and `principal-other`
+ * are plugin-defined signed-in people of two different kinds.
+ *
+ * Two callers exist only as a call names them, never as a request presents
+ * them, so only the doors that take a caller handed to them ask about them:
+ * `key-without-rows` is the `key-role-based` key's scope carrying its
+ * permission slugs but not the permission rows they came from, the shape a
+ * scope rebuilt from slugs takes; `user-naming-super-admin` is `user-without`
+ * handed over as a Direct API `user` that names the `super-admin` role it does
+ * not hold.
+ */
+export const CALLERS = [
+  "visitor",
+  "user-with",
+  "user-without",
+  "custom-role",
+  "super-admin",
+  "super-admin-inherited",
+  "key-read-only",
+  "key-full-access",
+  "key-role-based",
+  "key-super-admin",
+  "key-read-only-super-admin",
+  "key-role-based-super-admin",
+  "user-partial",
+  "key-partial",
+  "principal",
+  "principal-other",
+  "key-without-rows",
+  "user-naming-super-admin",
+] as const;
+export type Caller = (typeof CALLERS)[number];
+
+/** The callers only a door handed a caller can name. */
+const HANDED_ONLY: readonly Caller[] = [
+  "key-without-rows",
+  "user-naming-super-admin",
+];
+
+/** The callers a request can present: everyone else. */
+const PRESENTED = CALLERS.filter(caller => !HANDED_ONLY.includes(caller));
+
+const USERS: readonly Caller[] = [
+  "user-with",
+  "user-without",
+  "custom-role",
+  "super-admin",
+  "super-admin-inherited",
+  "user-partial",
+];
+const KEYS: readonly Caller[] = [
+  "key-read-only",
+  "key-full-access",
+  "key-role-based",
+  "key-super-admin",
+  "key-read-only-super-admin",
+  "key-role-based-super-admin",
+  "key-partial",
+];
+
+/** The keys the super-admin made. */
+const MADE_BY_SUPER_ADMIN: readonly Caller[] = [
+  "key-super-admin",
+  "key-read-only-super-admin",
+  "key-role-based-super-admin",
+];
+const STAFF: readonly Caller[] = [...USERS, ...KEYS];
+
+const PRINCIPALS: readonly Caller[] = ["principal", "principal-other"];
+
+/**
+ * The code rule a target declares, for every action it is asked about.
+ *
+ * `true` and `false` are the plain booleans the rule types and the
+ * documentation allow. `throws` fails as it is called and `async-throws`
+ * returns a promise that rejects, so a door that guards the call but awaits
+ * its result outside the guard answers the two differently. `returns-string`
+ * answers a truthy value that is not `true`, which a door judging a rule's
+ * answer truthy admits and one judging it exactly `true` refuses.
+ * `other-operation`
+ * declares only `update: false`, so a
+ * read, a create or a delete meets an access object with no rule for it.
+ * `role-name` admits a caller whose roles include one named `editor`, the
+ * shape a template rule takes when it checks names instead of permissions.
+ * `permission-spelling` checks for `<collection>:<operation>`, the spelling
+ * rules were once handed and are handed no more, so it must refuse at every
+ * door: a door that still hands a rule that spelling allows where it should
+ * not. `role-screen-spelling` admits a caller whose permissions hold
+ * `<operation>-<collection>`, as the role screen spells it, so a door that
+ * hands a rule any other spelling refuses.
+ * `principal-kind` admits only a person of the `principal` caller's kind,
+ * so a door that drops the person from the rule's context refuses it too.
+ * `user-is-key-maker` admits only the caller whose `user` is `user-with`:
+ * `user-with` itself and every key it made, since a key acts as the user who
+ * made it. A visitor and a plugin's person have no user, and the super-admin's
+ * key names its own maker, so a door that hands a rule no `user`, or the wrong
+ * one, answers it differently. `publish-false` declares only a refusing
+ * publish and unpublish rule, so a door that judges a publish by the update
+ * rule allows what it refuses.
+ *
+ * The filter kinds answer with a filter over the target's entries instead of
+ * a boolean: `returns-filter` one matching the probe entry and `async-filter`
+ * the same from a promise. `returns-empty-in` gives an empty `in` and
+ * `malformed-filter` an operator no filter has, neither of them a well-formed
+ * filter, so they stay refused once filters apply. A door that applies filters
+ * returns only the entries a well-formed one matches; until one does, a filter
+ * is not `true`, and every door refuses it.
+ */
+export const RULES = [
+  "none",
+  "true",
+  "false",
+  "returns-true",
+  "returns-false",
+  "returns-null",
+  "returns-undefined",
+  "returns-string",
+  "throws",
+  "async-true",
+  "async-false",
+  "async-throws",
+  "other-operation",
+  "role-name",
+  "permission-spelling",
+  "role-screen-spelling",
+  "principal-kind",
+  "user-is-key-maker",
+  "publish-false",
+  "returns-filter",
+  "async-filter",
+  "returns-empty-in",
+  "malformed-filter",
+] as const;
+export type Rule = (typeof RULES)[number];
+
+/**
+ * What a caller asks to do. `list` and `count` read a collection's entries
+ * through the list and count paths, which a door judges apart from the read
+ * of one entry by its id. `new-pub` creates an entry already
+ * published, which needs the create and the publish permission together.
+ */
+export const ACTIONS = [
+  "read",
+  "create",
+  "update",
+  "delete",
+  "publish",
+  "unpublish",
+  "list",
+  "count",
+  "new-pub",
+] as const;
+export type Action = (typeof ACTIONS)[number];
+
+/**
+ * The actions every collection door can ask: each names one permission. A
+ * list and a count read many entries, and a create sent as published is two
+ * permissions at once, so only the doors that send a write ask it.
+ */
+export const ENTRY_ACTIONS = ACTIONS.filter(
+  action => action !== "list" && action !== "count" && action !== "new-pub"
+);
+
+/**
+ * What is asked about. A `related` target is a rule collection reached through
+ * a relationship on another collection; `media` and `users` are the system
+ * resources, which declare no code rule. A `single-pub` target is a Single
+ * with a draft and a published status, asked to publish and unpublish.
+ *
+ * `roles` and `providers` (email providers) are resources that are not
+ * entries at all, gated by a permission alone: the role routes by one
+ * permission (`requirePermission`), the email provider routes by any of
+ * several (`requireAnyPermission`). Their names keep the target column's
+ * width, so the lines already in the answers file are unchanged.
+ *
+ * `deliveries` (email deliveries) is the Email hub's Activity, read only:
+ * its reads ask `read-email-deliveries` through the any-of check, and it has
+ * no create, update or delete of its own. It comes last, so every row
+ * already in the answers file keeps its place.
+ */
+export const TARGETS = [
+  "collection",
+  "single",
+  "related",
+  "media",
+  "users",
+  "single-pub",
+  "roles",
+  "providers",
+  "deliveries",
+] as const;
+export type Target = (typeof TARGETS)[number];
+
+/**
+ * Every way in, in the order the answer file lists them.
+ *
+ * - `rest`: the REST collection, Single, media and users routes the admin uses.
+ * - `direct`: the Direct API with `overrideAccess: false` and the caller.
+ * - `website`: the website's checked rendering path, `resolveContent`.
+ * - `route`: a plugin route gated by `requiredPermission`.
+ * - `can`: `ctx.caller.can` inside a plugin route.
+ * - `service`: a plugin service call made as the caller (`ServiceOpts`).
+ * - `entity`: `canReadEntity`, behind versions, translations, document locks,
+ *   widgets and the dashboard.
+ * - `schema`: the schema builder's collection list.
+ * - `population`: relationship and upload population.
+ * - `system`: `canReadSystemResource`, behind media and users reads.
+ * - `widget`: whether a dashboard widget whose `requiredPermission` names the
+ *   permission is offered to the caller (`widgetAudience`).
+ * - `lock`: claiming a document lock on the entry or Single, which is a
+ *   statement that the caller is editing it.
+ * - `capabilities`: what `GET /me/capabilities` tells the admin the caller
+ *   may do, which is what the admin offers and withholds.
+ * - `bulk`: the REST bulk routes by ids, which the admin's entry list sends
+ *   its row and bulk Delete, Publish and Unpublish through, answered by the
+ *   entry's own result among the items.
+ *
+ * The last four were added after the others, and come last, so every column
+ * already in the answers file keeps its place.
+ */
+export const DOORS = [
+  "rest",
+  "direct",
+  "website",
+  "route",
+  "can",
+  "service",
+  "entity",
+  "schema",
+  "population",
+  "system",
+  "widget",
+  "lock",
+  "capabilities",
+  "bulk",
+] as const;
+export type Door = (typeof DOORS)[number];
+
+/**
+ * The doors where asking for a write IS the write, each given rows of its
+ * own to write to. The others only ask a gate (`route`, `can`) or read, so
+ * nothing they answer can have been written.
+ */
+export const WRITING_DOORS: readonly Door[] = [
+  "rest",
+  "direct",
+  "service",
+  "bulk",
+];
+
+/**
+ * With or without the access-control service registered. Without it, only
+ * reads are asked: of a collection, a Single, a related row, media and users,
+ * by the callers and rules whose answers a missing service can change.
+ *
+ * `bound` is a trusted read (`overrideAccess: true`) whose bound reaches only
+ * the collection it reads, so every target it populates must be read as the
+ * caller would read it: population only.
+ *
+ * `public` asks a visitor what `service` asks one, of targets of its own on
+ * which the Public role holds {@link PUBLIC_HOLDS}; in every other setup the
+ * Public role holds what boot seeding grants it (`publicHolds`).
+ *
+ * `closed` asks what `service` asks of a collection and a related row, every
+ * caller, of rule collections of its own marked closed to super-admin
+ * (`closedToSuperAdmin`), at every door that reads or writes entries. The
+ * doors that answer about a permission alone (`route`, `can`, `widget`,
+ * `schema`, `capabilities`) are not asked: the mark refuses entries, not
+ * permissions. Its answers are `service`'s, except that super-admin
+ * authority is refused (`oneAnswer`): a super-admin person and a full-access
+ * key carrying it. A super-admin's read-only key holds the catalogue's reads
+ * without that authority, so it reads a closed collection as it reads any.
+ */
+export type Setup = "service" | "no-service" | "bound" | "public" | "closed";
+
+export interface Row {
+  setup: Setup;
+  caller: Caller;
+  action: Action;
+  target: Target;
+  rule: Rule;
+}
+
+/**
+ * Which callers a door can name, and which actions it asks of each target.
+ * `callersOf` narrows the callers for one target, where the door names fewer
+ * there than it does elsewhere.
+ */
+interface Reach {
+  callers: readonly Caller[];
+  targets: Partial<Record<Target, readonly Action[]>>;
+  callersOf?: Partial<Record<Target, readonly Caller[]>>;
+}
+
+const READ: readonly Action[] = ["read"];
+/** What a resource's own routes do: read, create, update and delete. */
+const CRUD: readonly Action[] = ["read", "create", "update", "delete"];
+/**
+ * The email deliveries: the Activity's read, and the retry of one queued
+ * email, which is its one write (an update) and is made only through REST and
+ * the Direct API.
+ */
+const READ_RETRY: readonly Action[] = ["read", "update"];
+/** A user's writes, asked apart from the read the table asked first. */
+const USER_WRITES: readonly Action[] = ["create", "update", "delete"];
+const READ_UPDATE: readonly Action[] = ["read", "update"];
+const PUBLISHING: readonly Action[] = ["publish", "unpublish"];
+const NOT_PRINCIPAL = PRESENTED.filter(caller => !PRINCIPALS.includes(caller));
+const NOT_VISITOR = PRESENTED.filter(caller => caller !== "visitor");
+/**
+ * The staff a request can present, signed in with a session or a key: what a
+ * door that refuses anyone not signed in, before any decision, can name. A
+ * visitor's refusal there is the sign-in gate's, pinned apart in
+ * `visitor-refused-before-the-decision.integration.test.ts`.
+ */
+const SIGNED_IN = NOT_PRINCIPAL.filter(caller => caller !== "visitor");
+
+/**
+ * What each door asks, with the access-control service registered.
+ *
+ * A principal is read only by routes that declare one, so the staff routes,
+ * the readers behind them and the schema list never see it. Only a resolved
+ * caller reaches `entity` and `can`: every route in front of them has already
+ * refused a visitor. A plugin route that is not public, the schema list and a
+ * document lock refuse anyone not signed in before any decision, so they ask
+ * the signed-in callers alone. `website` names a user or nobody, never a key. A
+ * plugin route's gate and `can` name one permission for one entry, so they are
+ * asked no `list` or `count`.
+ *
+ * The callers only a call can hand over are asked of the readers that take
+ * the caller handed to them, and only where their answer can differ from the
+ * caller they were made from: a scope without its rows where a code rule reads
+ * its permissions or a key's scope is judged (`entity`, `population`,
+ * `system`), and a `user` naming a role it does not hold where the role list
+ * it carries is read (`population`).
+ */
+const REACH: Record<Door, Reach> = {
+  rest: {
+    callers: NOT_PRINCIPAL,
+    targets: {
+      collection: ACTIONS,
+      single: READ_UPDATE,
+      media: READ,
+      users: CRUD,
+      "single-pub": PUBLISHING,
+      roles: CRUD,
+      providers: CRUD,
+      deliveries: READ_RETRY,
+    },
+  },
+  // Media, users, roles and email deliveries are read by the namespaces a principal cannot call
+  // (only collection and Single operations can be made as one), so they are
+  // asked of the callers REST names there. A checked read of media naming
+  // nobody is a visitor's, judged by the Public role's `read-media`.
+  direct: {
+    callers: PRESENTED,
+    targets: {
+      collection: ACTIONS,
+      single: READ_UPDATE,
+      media: READ,
+      users: READ,
+      "single-pub": PUBLISHING,
+      roles: READ,
+      deliveries: READ_RETRY,
+    },
+    callersOf: {
+      media: NOT_PRINCIPAL,
+      users: NOT_PRINCIPAL,
+      roles: NOT_PRINCIPAL,
+      deliveries: NOT_PRINCIPAL,
+    },
+  },
+  website: { callers: ["visitor", ...USERS], targets: { collection: READ } },
+  route: {
+    callers: SIGNED_IN,
+    targets: {
+      collection: ENTRY_ACTIONS,
+      single: READ_UPDATE,
+      "single-pub": PUBLISHING,
+      users: USER_WRITES,
+      roles: CRUD,
+      providers: CRUD,
+      deliveries: READ,
+    },
+  },
+  can: {
+    callers: STAFF,
+    targets: {
+      collection: ENTRY_ACTIONS,
+      single: READ_UPDATE,
+      media: READ,
+      users: CRUD,
+      "single-pub": PUBLISHING,
+      roles: CRUD,
+      providers: CRUD,
+      deliveries: READ,
+    },
+  },
+  service: { callers: PRESENTED, targets: { collection: ACTIONS } },
+  entity: {
+    callers: [...STAFF, "key-without-rows"],
+    targets: { collection: READ, single: READ },
+  },
+  schema: { callers: SIGNED_IN, targets: { collection: READ } },
+  population: {
+    callers: CALLERS,
+    targets: { related: READ, media: READ, users: READ },
+  },
+  system: {
+    callers: [...NOT_PRINCIPAL, "key-without-rows"],
+    targets: { media: READ, users: READ },
+  },
+  // A widget names one permission, so it is asked whatever `can` is asked.
+  widget: {
+    callers: STAFF,
+    targets: {
+      collection: ENTRY_ACTIONS,
+      single: READ_UPDATE,
+      media: READ,
+      users: CRUD,
+      "single-pub": PUBLISHING,
+      roles: CRUD,
+      providers: CRUD,
+      deliveries: READ,
+    },
+  },
+  // A lock is claimed by someone about to edit, so it is asked as an update.
+  lock: {
+    callers: SIGNED_IN,
+    targets: { collection: ["update"], single: ["update"] },
+  },
+  // One answer names every collection and Single with every action it has,
+  // so each is asked every action an entry route takes. Only a
+  // caller `/me` authenticates reaches it, which is a person or a key; a
+  // plugin's person signs in to the plugin, never to the admin, and a
+  // visitor is refused before the handler runs. A collection is asked no
+  // `list` or `count`: the answer names one read for an entity, as the
+  // admin's own capability does.
+  capabilities: {
+    callers: STAFF,
+    targets: {
+      collection: ENTRY_ACTIONS,
+      single: READ_UPDATE,
+      "single-pub": PUBLISHING,
+    },
+  },
+  // The bulk routes change existing entries, as the list's actions do, and
+  // only a collection has a list.
+  bulk: {
+    callers: NOT_PRINCIPAL,
+    targets: { collection: ["update", "delete", ...PUBLISHING] },
+  },
+};
+
+/** What each door asks without the access-control service. */
+const REACH_WITHOUT_SERVICE: Partial<Record<Door, Reach>> = {
+  rest: { callers: NOT_VISITOR, targets: { collection: READ, single: READ } },
+  direct: { callers: PRESENTED, targets: { collection: READ, single: READ } },
+  can: { callers: NOT_VISITOR, targets: { collection: READ, single: READ } },
+  entity: { callers: NOT_VISITOR, targets: { collection: READ, single: READ } },
+  population: {
+    callers: PRESENTED,
+    targets: { related: READ, media: READ, users: READ },
+  },
+  system: { callers: NOT_PRINCIPAL, targets: { media: READ, users: READ } },
+  widget: { callers: STAFF, targets: { collection: READ, single: READ } },
+  capabilities: {
+    callers: STAFF,
+    targets: { collection: READ, single: READ },
+  },
+};
+
+/**
+ * What a trusted read bounded to its own collection asks: only population,
+ * of a caller a Direct API call can hand over. A plugin's person is left out,
+ * since a call made as one is not a trusted read.
+ */
+const REACH_BOUND: Partial<Record<Door, Reach>> = {
+  population: {
+    callers: CALLERS.filter(caller => !PRINCIPALS.includes(caller)),
+    targets: { related: READ, media: READ, users: READ },
+  },
+};
+
+const REACH_BY_SETUP: Record<Setup, Partial<Record<Door, Reach>>> = {
+  service: REACH,
+  "no-service": REACH_WITHOUT_SERVICE,
+  bound: REACH_BOUND,
+  // The doors that ask a visitor at all: the others never name one (`REACH`).
+  public: {
+    rest: REACH.rest,
+    direct: REACH.direct,
+    website: REACH.website,
+    service: REACH.service,
+    population: REACH.population,
+    system: REACH.system,
+    bulk: REACH.bulk,
+  },
+  // Every door that reads or writes entries of a collection, and population.
+  closed: {
+    rest: REACH.rest,
+    direct: REACH.direct,
+    website: REACH.website,
+    service: REACH.service,
+    entity: REACH.entity,
+    population: REACH.population,
+    lock: REACH.lock,
+    bulk: REACH.bulk,
+  },
+};
+
+/** Whether a door asks a case, so a row is never sent where it cannot be. */
+function asks(door: Door, row: Row): boolean {
+  const reach = REACH_BY_SETUP[row.setup][door];
+  const callers = reach?.callersOf?.[row.target] ?? reach?.callers;
+  if (!reach || !callers?.includes(row.caller)) return false;
+  return reach.targets[row.target]?.includes(row.action) ?? false;
+}
+
+const NO_SERVICE_CALLERS: readonly Caller[] = [
+  "visitor",
+  "user-with",
+  "user-without",
+  "key-role-based",
+];
+const NO_SERVICE_RULES: readonly Rule[] = [
+  "none",
+  "returns-true",
+  "returns-false",
+  "returns-null",
+  // A rule's filter reaches the fallbacks a missing service leaves too, which
+  // judge a rule's answer apart from the service's doors.
+  "returns-filter",
+  "async-filter",
+  "returns-empty-in",
+  "malformed-filter",
+];
+
+/** Every combination of the lists, target first and caller last. */
+function cross(
+  setup: Setup,
+  targets: readonly Target[],
+  rulesOf: (target: Target) => readonly Rule[],
+  actions: readonly Action[],
+  callers: readonly Caller[]
+): Row[] {
+  return targets.flatMap(target =>
+    rulesOf(target).flatMap(rule =>
+      actions.flatMap(action =>
+        callers.map(caller => ({ setup, caller, action, target, rule }))
+      )
+    )
+  );
+}
+
+/** Targets that are not rule collections or Singles, which declare no rule. */
+const RULELESS: readonly Target[] = [
+  "media",
+  "users",
+  "roles",
+  "providers",
+  "deliveries",
+];
+
+/** The system resources declare no code rule, so they are asked once. */
+const rulesOf = (target: Target): readonly Rule[] =>
+  RULELESS.includes(target) ? ["none"] : RULES;
+
+/** The rules asked without the service: one for a system resource. */
+const noServiceRulesOf = (target: Target): readonly Rule[] =>
+  target === "media" || target === "users" ? ["none"] : NO_SERVICE_RULES;
+
+/** Every row the table holds, in a stable order. */
+export function rows(): Row[] {
+  const withService = cross("service", TARGETS, rulesOf, ACTIONS, CALLERS);
+  const withoutService = cross(
+    "no-service",
+    ["collection", "single", "related", "media", "users"],
+    noServiceRulesOf,
+    READ,
+    NO_SERVICE_CALLERS
+  );
+  const bound = cross(
+    "bound",
+    ["related", "media", "users"],
+    rulesOf,
+    READ,
+    CALLERS
+  );
+  // A visitor again, with the Public role holding what it can be granted.
+  const publicRole = cross("public", TARGETS, rulesOf, ACTIONS, ["visitor"]);
+  // Every caller again, of collections closed to super-admin. Last, so every
+  // row already in the answers file keeps its place.
+  const closed = cross(
+    "closed",
+    ["collection", "related"],
+    rulesOf,
+    ACTIONS,
+    CALLERS
+  );
+  // A visitor's create, update and delete are rows like any other: judged by
+  // what the Public role holds, then by a rule naming the write.
+  return [
+    ...withService,
+    ...withoutService,
+    ...bound,
+    ...publicRole,
+    ...closed,
+  ].filter(row => DOORS.some(door => asks(door, row)));
+}
+
+export function doorsAsking(row: Row): Door[] {
+  return DOORS.filter(door => asks(door, row));
+}
+
+export function rowKey(row: Row): string {
+  return `${row.setup} ${row.caller} ${row.action} ${row.target} ${row.rule}`;
+}
+
+// ---------------------------------------------------------------------------
+// The one answer
+// ---------------------------------------------------------------------------
+
+/**
+ * Allowed, refused, or allowed only for the entries a rule's filter matches:
+ * what a list or a count of a collection whose read rule answers a filter
+ * gives.
+ */
+export type Verdict = "allow" | "refuse" | "matching";
+
+/**
+ * What a rule says to a caller for an action: `true` only when it answers
+ * exactly `true`, `filter` when it answers a well-formed filter, and `null`
+ * where it declares nothing for the action.
+ */
+type RuleAnswer = (action: Action, caller: Caller) => boolean | "filter" | null;
+
+const SAYS_TRUE: RuleAnswer = () => true;
+/** `false`, a non-boolean answer and a throw all count as a refusal. */
+const SAYS_NOT_TRUE: RuleAnswer = () => false;
+const SAYS_FILTER: RuleAnswer = () => "filter";
+
+/** What each rule says, one entry per rule so none is decided by a fallback. */
+const RULE_SAYS: Record<Rule, RuleAnswer> = {
+  none: () => null,
+  true: SAYS_TRUE,
+  false: SAYS_NOT_TRUE,
+  "returns-true": SAYS_TRUE,
+  "returns-false": SAYS_NOT_TRUE,
+  "returns-null": SAYS_NOT_TRUE,
+  "returns-undefined": SAYS_NOT_TRUE,
+  "returns-string": SAYS_NOT_TRUE,
+  throws: SAYS_NOT_TRUE,
+  "async-true": SAYS_TRUE,
+  "async-false": SAYS_NOT_TRUE,
+  "async-throws": SAYS_NOT_TRUE,
+  "other-operation": action => (action === "update" ? false : null),
+  "role-name": (_action, caller) => holdsRoleNamedEditor(caller),
+  "permission-spelling": SAYS_NOT_TRUE,
+  "role-screen-spelling": (action, caller) =>
+    HOLDS_ROLES.includes(caller) &&
+    holdsPermission(caller, action, "collection"),
+  "principal-kind": (_action, caller) => caller === "principal",
+  "user-is-key-maker": (_action, caller) => MADE_BY_USER_WITH.includes(caller),
+  "publish-false": action =>
+    action === "publish" || action === "unpublish" ? false : null,
+  // A well-formed filter allows the entries it matches, and one that is not
+  // well formed refuses.
+  "returns-filter": SAYS_FILTER,
+  "async-filter": SAYS_FILTER,
+  "returns-empty-in": SAYS_NOT_TRUE,
+  "malformed-filter": SAYS_NOT_TRUE,
+};
+
+/**
+ * The callers a rule sees with roles and permissions: staff, and the two
+ * callers only a call hands over, which are a staff user and a staff key.
+ */
+const HOLDS_ROLES: readonly Caller[] = [...STAFF, ...HANDED_ONLY];
+
+/**
+ * `user-with` and the keys it made: every key but the super-admin's, and the
+ * role-based key's scope without its rows.
+ */
+const MADE_BY_USER_WITH: readonly Caller[] = [
+  "user-with",
+  ...KEYS.filter(key => !MADE_BY_SUPER_ADMIN.includes(key)),
+  "key-without-rows",
+];
+
+/** The callers whose roles, as a rule sees them, include one named `editor`. */
+function holdsRoleNamedEditor(caller: Caller): boolean {
+  return (
+    caller === "user-with" ||
+    caller === "key-read-only" ||
+    caller === "key-full-access"
+  );
+}
+
+const PARTIAL_ACTIONS: readonly Action[] = ["read", "update", "publish"];
+
+/**
+ * The actions the role screen grants each caller on the rule targets, media,
+ * roles, email providers and email deliveries, where the permission exists. A caller missing
+ * here holds none of them.
+ */
+const GRANTS: Partial<Record<Caller, (action: Action) => boolean>> = {
+  "user-with": () => true,
+  "custom-role": () => true,
+  "key-full-access": () => true,
+  "key-role-based": () => true,
+  "key-role-based-super-admin": () => true,
+  // The role-based key's own grants, without the rows they came from.
+  "key-without-rows": () => true,
+  "key-read-only": action => action === "read",
+  "user-partial": action => PARTIAL_ACTIONS.includes(action),
+  "key-partial": action => PARTIAL_ACTIONS.includes(action),
+};
+
+/**
+ * The permissions an install seeds for each resource that is not an entry.
+ * An action missing here has no permission to tick, so only a super-admin's
+ * own session reaches it, and a key holds only rows that exist.
+ */
+const SEEDED: Partial<Record<Target, readonly Action[]>> = {
+  users: ["create", "read", "update", "delete"],
+  roles: ["create", "read", "update", "delete"],
+  providers: ["create", "read", "update", "delete"],
+  // `read-email-deliveries` reads the Activity. Its one write, a retry, has
+  // no permission of its own: `manage-email-deliveries` grants it
+  // (`MANAGED_WRITES`), and does not count as a read.
+  deliveries: ["read"],
+};
+
+/**
+ * The system resources among the targets whose `manage-` permission still
+ * counts as read, create, update and delete on that same resource, as the
+ * one decision counts it while installs move to plain permissions: media and
+ * email providers here (settings and email templates are not targets; email
+ * deliveries are, but their `manage-` does not include the read). Never
+ * publish or unpublish, and never on a collection. Only the super-admin's
+ * full-access key, which carries the whole catalogue, holds a `manage-`
+ * permission among the callers; the super-admin sessions pass every gate
+ * anyway.
+ */
+const MANAGED: readonly Target[] = ["providers", "media"];
+const MANAGE_COUNTS_AS: readonly Action[] = [
+  "read",
+  "create",
+  "update",
+  "delete",
+];
+
+/**
+ * The writes a resource's `manage-` permission grants without counting as
+ * its read: a queued email's retry, granted by `manage-email-deliveries`
+ * alone. Extend an entry for another write or door.
+ */
+const MANAGED_WRITES: Partial<Record<Target, readonly Action[]>> = {
+  deliveries: ["update"],
+};
+
+const holdsManage = (caller: Caller, action: Action, target: Target) =>
+  caller === "key-super-admin" &&
+  ((MANAGED.includes(target) && MANAGE_COUNTS_AS.includes(action)) ||
+    (MANAGED_WRITES[target]?.includes(action) ?? false));
+
+/** Whether the role screen grants the caller this action on this target. */
+function holdsPermission(caller: Caller, action: Action, target: Target) {
+  if (holdsManage(caller, action, target)) return true;
+  if (!(SEEDED[target]?.includes(action) ?? true)) return false;
+  // A full-access key carries its maker's live permissions, and a
+  // super-admin's are the whole catalogue, users included; their read-only
+  // key carries the catalogue's reads.
+  if (caller === "key-super-admin") return true;
+  if (caller === "key-read-only-super-admin") return action === "read";
+  if (target === "users") return false;
+  return GRANTS[caller]?.(action) ?? false;
+}
+
+/** A list and a count are reads; every other action is judged as itself. */
+const judgedAs = (action: Action): Action =>
+  action === "list" || action === "count" ? "read" : action;
+
+const isLifecycle = (action: Action) =>
+  action === "publish" || action === "unpublish";
+
+/** What the target's rules let through: every entry, those a filter matches, or none. */
+type RulesLet = "all" | "matching" | "none";
+
+/**
+ * What the target's rules let through. Its own rule, where the target
+ * declares one, must answer exactly `true`, or for a collection's read or
+ * delete a well-formed filter, which lets through the entries it matches. A
+ * filter from any other rule refuses: that write's filter is not applied
+ * yet, and a create rule or a Single's rule may not answer one. A publish or
+ * an unpublish is judged by its own rule, as any action is, not the update
+ * rule as well.
+ */
+function rulesLet(
+  rule: Rule,
+  action: Action,
+  caller: Caller,
+  target: Target
+): RulesLet {
+  const says = RULE_SAYS[rule](action, caller);
+  if (says === "filter") {
+    const collection = target !== "single" && target !== "single-pub";
+    const applied = action === "read" || FILTERED_WRITES.has(action);
+    return applied && collection ? "matching" : "none";
+  }
+  if (says !== null && says !== true) return "none";
+  return "all";
+}
+
+/**
+ * A row's answer from what the rules let through. A list or a count of a
+ * filtered read returns the matching entries; any other read asks about the
+ * probe entry, which the filter rule kinds match, so it is allowed.
+ */
+function answerFor(row: Row, lets: RulesLet): Verdict {
+  if (lets === "none") return "refuse";
+  if (lets === "all") return "allow";
+  const many = row.action === "list" || row.action === "count";
+  return many || FILTERED_WRITES.has(row.action) ? "matching" : "allow";
+}
+
+/**
+ * The writes a rule's filter limits to the entries it matches. Each asks an
+ * entry inside the filter and its twin outside it, so its answer can show
+ * that the one was changed and the other refused and left as it was.
+ */
+export const FILTERED_WRITES: ReadonlySet<Action> = new Set<Action>([
+  "update",
+  "delete",
+  "publish",
+  "unpublish",
+]);
+
+/** Whether a rule answers its collection's writes with a filter. */
+export function isFilterRule(rule: Rule): boolean {
+  return RULE_SAYS[rule]("delete", "user-with") === "filter";
+}
+
+/**
+ * Whether a door asks the row's write of an entry outside the rule's filter as
+ * well as of one inside it: a filtered write of a collection whose rule
+ * answers with a filter.
+ */
+export function hasOutsideTwin(row: Row): boolean {
+  return (
+    row.target === "collection" &&
+    FILTERED_WRITES.has(row.action) &&
+    isFilterRule(row.rule)
+  );
+}
+
+/**
+ * What the Public role holds in the `public` setup, on that setup's own
+ * targets: every permission it can be given on the rule collections, the
+ * Singles and the related rows, and `read-media`; never `read-users`, a role
+ * or an email provider or delivery, which boot seeding never grants it. Publish and
+ * unpublish are held too, so the table shows a visitor refused them even
+ * where Public holds them.
+ *
+ * Every read is held, the Singles with a status included though only their
+ * publish and unpublish are asked, because boot seeding grants Public the read
+ * of each of these targets whose read rule answers a visitor `true`: holding
+ * every read, Public holds exactly this whatever boot adds.
+ */
+export const PUBLIC_HOLDS: Partial<Record<Target, readonly Action[]>> = {
+  collection: ["read", "create", "update", "delete", "publish", "unpublish"],
+  single: ["read", "update"],
+  "single-pub": ["read", "publish", "unpublish"],
+  related: ["read"],
+  media: ["read"],
+};
+
+/**
+ * Whether the Public role holds the permission for `action` on a target
+ * declaring `rule`.
+ *
+ * In `public`, it is {@link PUBLIC_HOLDS}. Everywhere else it is what boot
+ * seeding grants: `read-media`, and the read of each rule collection and
+ * Single whose declared read rule answers a visitor exactly `true`, asked as
+ * boot asks it, of a visitor holding no permissions (so `role-screen-spelling`
+ * says `false`); never a write, a user, a role, an email provider or the
+ * email deliveries. No plugin
+ * in the table's world declares a grant for Public.
+ */
+export function publicHolds(
+  setup: Setup,
+  target: Target,
+  rule: Rule,
+  action: Action
+): boolean {
+  if (setup === "public")
+    return PUBLIC_HOLDS[target]?.includes(action) ?? false;
+  if (action !== "read") return false;
+  if (target === "media") return true;
+  return (
+    !RULELESS.includes(target) && RULE_SAYS[rule]("read", "visitor") === true
+  );
+}
+
+/**
+ * A visitor's answer: the Public role's permission, then, where the target
+ * declares a rule for the action, what the rule lets through, as for a
+ * signed-in user: a rule answering exactly `true` every entry, and a
+ * collection's read rule answering a well-formed filter the entries it
+ * matches. A rule that reads the caller's permissions sees the Public role's.
+ * A visitor never publishes or unpublishes, whatever Public holds.
+ */
+function visitorAnswer(row: Row, action: Action): Verdict {
+  const { setup, target, rule } = row;
+  if (isLifecycle(action)) return "refuse";
+  if (!publicHolds(setup, target, rule, action)) return "refuse";
+  // The rule reads the caller's permissions, which are the Public role's,
+  // and Public holds the action.
+  if (rule === "role-screen-spelling") return "allow";
+  const lets = rulesLet(rule, action, "visitor", target);
+  // A visitor is limited by a read rule's filter alone: a write rule's
+  // filter is not applied to a visitor yet, so it refuses.
+  if (lets === "matching" && FILTERED_WRITES.has(action)) return "refuse";
+  return answerFor(row, lets);
+}
+
+/**
+ * The answer the composition in the access design gives a row, the same for
+ * every way in and with or without the access-control service:
+ *
+ * - a visitor's permissions are the Public role's (`visitorAnswer`);
+ * - a super-admin, held directly or through inheritance, passes every
+ *   collection and Single rule, and so does the full-access key a super-admin
+ *   made, which counts as holding every permission. The super-admin's
+ *   read-only and role-based keys keep their types' limits;
+ * - a plugin's signed-in person holds no role, so the target's rule decides
+ *   alone, and a target that declares none refuses. As today, a person never
+ *   publishes or unpublishes, whatever the rule says. A person reads media
+ *   as a visitor does, through the Public role's `read-media`;
+ * - everyone else needs the permission AND, where the target declares a rule
+ *   for the action, a rule that answers exactly `true`. A publish or an
+ *   unpublish is judged by its own permission and its own rule.
+ *   A `list` and a `count` are reads, judged by the read permission and rule.
+ *   A create sent as published is a create and a publish, allowed only where
+ *   both are.
+ * - a collection's read rule may answer a well-formed filter instead of
+ *   `true`, which allows the entries it matches: a list or a count returns
+ *   those alone, and a read of the probe entry, which it matches, is allowed.
+ *   An update, delete, publish or unpublish rule may answer one too: the
+ *   entry inside it is changed and its twin outside it refused. A filter from
+ *   any other rule refuses.
+ */
+export function oneAnswer(row: Row): Verdict {
+  if (row.action === "new-pub") {
+    const both = (["create", "publish"] as const).every(
+      action => oneAnswer({ ...row, action }) === "allow"
+    );
+    return both ? "allow" : "refuse";
+  }
+  const { caller, target, rule } = row;
+  const action = judgedAs(row.action);
+  if (PRINCIPALS.includes(caller) && target === "media") {
+    return visitorAnswer(row, action);
+  }
+  if (PRINCIPALS.includes(caller)) {
+    // Judged by the rule alone, so a target that declares none refuses.
+    if (isLifecycle(action) || RULE_SAYS[rule](action, caller) === null) {
+      return "refuse";
+    }
+    return answerFor(row, rulesLet(rule, action, caller, target));
+  }
+  if (caller === "visitor") return visitorAnswer(row, action);
+  if (
+    caller === "super-admin" ||
+    caller === "super-admin-inherited" ||
+    caller === "key-super-admin"
+  ) {
+    // Past every rule, except on a collection closed to super-admin, which
+    // refuses super-admin authority whatever else the caller holds.
+    return row.setup === "closed" ? "refuse" : "allow";
+  }
+  if (!holdsPermission(caller, action, target)) return "refuse";
+  return answerFor(row, rulesLet(rule, action, caller, target));
+}
+
+/**
+ * The doors that answer yes or no about a collection, not about one entry.
+ * Where the one answer lets the caller read the entries a filter matches,
+ * theirs is yes: the caller may read the collection, those entries. A write
+ * under a filter is no there: the answer names no entry and applies no
+ * filter, so a yes would let the caller act past it.
+ */
+const YES_OR_NO_DOORS: ReadonlySet<Door> = new Set<Door>(["can"]);
+
+/**
+ * The doors that show a hint of what the caller may try, whose request
+ * applies the rule's filter: a capability cell, and a dashboard widget offered
+ * by the permission it requires. Where the one answer lets the caller act on
+ * the entries a filter matches, for any action, theirs is yes.
+ */
+const CELL_DOORS: ReadonlySet<Door> = new Set<Door>(["capabilities", "widget"]);
+
+/**
+ * The one answer as `door` gives it (see {@link YES_OR_NO_DOORS} and
+ * {@link CELL_DOORS}).
+ */
+export function oneAnswerAt(row: Row, door: Door): Verdict {
+  const answer = oneAnswer(row);
+  if (answer !== "matching") return answer;
+  if (CELL_DOORS.has(door)) return "allow";
+  if (YES_OR_NO_DOORS.has(door)) {
+    return judgedAs(row.action) === "read" ? "allow" : "refuse";
+  }
+  return answer;
+}
+
+// ---------------------------------------------------------------------------
+// The answers file
+// ---------------------------------------------------------------------------
+
+/**
+ * One door's answer as the file spells it: `A` allowed, `M` a list or a count
+ * that returned only the entries a rule's filter matches, or a filtered write
+ * that changed the entry inside the filter and refused its twin, `R` refused, an HTTP
+ * status for a refusal or failure that carried one, `E` for a failure without
+ * one, and `.` where the door does not ask the row. `S` is a media row a read
+ * was refused and still populated with its file, its internal columns taken
+ * off: the way a trusted read bounded away from media presents a refusal, so
+ * it counts as one. `=absent` is a capabilities answer that does not name the
+ * target, which the admin offers nothing for, so it counts as a refusal too:
+ * an entity left out where the caller may act on it still disagrees with the
+ * allow expected there.
+ */
+export type Answer = string;
+
+export function verdictOf(answer: Answer): Verdict | "error" {
+  if (answer === "A") return "allow";
+  if (answer === "M") return "matching";
+  if (answer === "R" || answer === "401" || answer === "403") return "refuse";
+  if (answer === "S") return "refuse";
+  if (answer === "404") return "refuse";
+  if (answer === "=absent") return "refuse";
+  return "error";
+}
+
+const COLUMNS = ["setup", "caller", "action", "target", "rule"] as const;
+
+export function renderAnswers(
+  answers: ReadonlyMap<string, ReadonlyMap<Door, Answer>>
+): string {
+  const header = [...COLUMNS, ...DOORS];
+  const lines = rows().map(row => {
+    const byDoor = answers.get(rowKey(row));
+    return [
+      ...COLUMNS.map(column => row[column]),
+      ...DOORS.map(door => byDoor?.get(door) ?? "."),
+    ];
+  });
+  const widths = header.map((title, i) =>
+    Math.max(title.length, ...lines.map(line => line[i].length))
+  );
+  const pad = (cells: string[]) =>
+    cells
+      .map((cell, i) => cell.padEnd(widths[i]))
+      .join("  ")
+      .trimEnd();
+  return `${[pad(header), ...lines.map(pad)].join("\n")}\n`;
+}

@@ -1,0 +1,810 @@
+"use client";
+
+/**
+ * Single Query Hooks
+ *
+ * TanStack Query hooks for Single operations (fetch, create, update, delete).
+ * Follows the established pattern from useCollections.ts with proper
+ * cache invalidation and error handling.
+ *
+ * ## Query Keys
+ *
+ * - `["singles"]` - All Singles list (base key for invalidation)
+ * - `["singles", params]` - Paginated/filtered/sorted Singles list
+ * - `["singles", slug]` - Single detail
+ *
+ * @example
+ * ```ts
+ * // Invalidate all Single queries
+ * queryClient.invalidateQueries({ queryKey: singleKeys.all() });
+ *
+ * // Invalidate specific Single
+ * queryClient.invalidateQueries({ queryKey: singleKeys.detail(slug) });
+ * ```
+ *
+ * @see hooks/queries/useCollections.ts - Reference pattern for query hooks
+ * @module hooks/queries/useSingles
+ */
+
+import type { TableParams, ListResponse } from "@nextlyhq/ui";
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+  type UseQueryOptions,
+  type UseMutationResult,
+  type UseQueryResult,
+} from "@tanstack/react-query";
+
+import { toast } from "@admin/components/ui/toaster";
+import { schemaFileApi } from "@admin/services/schemaFileApi";
+import { singleApi, type SingleDocument } from "@admin/services/singleApi";
+import type { ApiSingle, UpdateSinglePayload } from "@admin/types/entities";
+import type { UseBulkMutationReturn } from "@admin/types/hooks/bulk-mutation";
+
+import { useBulkMutation } from "../useBulkMutation";
+
+import { refreshRemovedFromCodeSchema } from "./removed-from-code-refusal";
+
+/**
+ * Default table parameters for Single queries
+ */
+const defaultParams: TableParams = {
+  pagination: { page: 0, pageSize: 10 },
+  sorting: [],
+  filters: {},
+};
+
+/**
+ * The Singles list the sidebar asks for, and the browser tab's title with it.
+ *
+ * One declaration, so one cache entry: the sidebar loads the list as it draws
+ * its navigation, and the title reads each Single's label from that same entry
+ * rather than requesting the Single again. Mirrors `NAV_COLLECTIONS_PARAMS`.
+ */
+export const NAV_SINGLES_PARAMS: TableParams = {
+  pagination: { page: 0, pageSize: 100 },
+  sorting: [],
+  filters: {},
+};
+
+/**
+ * Query Key Factory for Singles
+ *
+ * Creates stable, hierarchical query keys that prevent cache misses due to
+ * object reference changes. Follows TanStack Query best practices.
+ *
+ * @see https://tanstack.com/query/v5/docs/react/guides/query-keys
+ *
+ * @example
+ * ```ts
+ * singleKeys.all()                  // ["singles"]
+ * singleKeys.lists()                // ["singles", "list"]
+ * singleKeys.list(params)           // ["singles", "list", { page: 0, ... }]
+ * singleKeys.details()              // ["singles", "detail"]
+ * singleKeys.detail("site-settings") // ["singles", "detail", "site-settings"]
+ * ```
+ */
+export const singleKeys = {
+  /** Base key for all Single queries - invalidates everything */
+  all: () => ["singles"] as const,
+
+  /** Base key for Single list queries */
+  lists: (): readonly ["singles", "list"] =>
+    [...singleKeys.all(), "list"] as const,
+
+  /**
+   * Stable query key for paginated/filtered Single lists.
+   * Flattens params to prevent object reference issues.
+   */
+  list: (
+    params: TableParams
+  ): readonly [
+    "singles",
+    "list",
+    {
+      readonly page: number;
+      readonly pageSize: number;
+      readonly search: string;
+      readonly sorting: string;
+    },
+  ] =>
+    [
+      ...singleKeys.lists(),
+      {
+        page: params.pagination.page,
+        pageSize: params.pagination.pageSize,
+        search: params.filters?.search || "",
+        sorting: JSON.stringify(params.sorting),
+      },
+    ] as const,
+
+  /** Base key for Single detail queries */
+  details: (): readonly ["singles", "detail"] =>
+    [...singleKeys.all(), "detail"] as const,
+
+  /** Query key for a single Single by slug */
+  detail: (slug: string): readonly ["singles", "detail", string] =>
+    [...singleKeys.details(), slug] as const,
+
+  /** Base key for Single schema queries */
+  schemas: (): readonly ["singles", "schema"] =>
+    [...singleKeys.all(), "schema"] as const,
+
+  /** Query key for a Single's schema by slug */
+  schema: (slug: string): readonly ["singles", "schema", string] =>
+    [...singleKeys.schemas(), slug] as const,
+};
+
+/**
+ * The most pages of Singles read: past it, a server still saying there is
+ * more is answered with an error rather than read for ever.
+ */
+const MAX_EVERY_SINGLE_PAGES = 50;
+
+/**
+ * Every Single, each page of {@link NAV_SINGLES_PARAMS} in turn until
+ * `meta.hasNext` is false. Each page is the cache entry `useSingles` keeps for
+ * it, so a page already read is not asked for again while it is fresh.
+ */
+async function fetchEverySingle(
+  queryClient: QueryClient
+): Promise<ApiSingle[]> {
+  const items: ApiSingle[] = [];
+  for (let page = 0; page < MAX_EVERY_SINGLE_PAGES; page++) {
+    const params: TableParams = {
+      ...NAV_SINGLES_PARAMS,
+      pagination: { ...NAV_SINGLES_PARAMS.pagination, page },
+    };
+    const response = await queryClient.fetchQuery({
+      queryKey: singleKeys.list(params),
+      queryFn: () => singleApi.fetchSingles(params),
+    });
+    items.push(...response.items);
+    if (response.meta?.hasNext !== true) return items;
+  }
+  throw new Error("Unable to load every Single");
+}
+
+/**
+ * Every Single the reader may read, however many pages that takes, hidden
+ * ones and those in a custom sidebar group included: for the admin's one
+ * "open this document" rule, which reads a Single's fields wherever a link to
+ * it is drawn. Kept under {@link singleKeys.all}, so whatever refreshes the
+ * Singles refreshes it.
+ */
+export function useEverySingle(): UseQueryResult<ApiSingle[], Error> {
+  const queryClient = useQueryClient();
+  return useQuery<ApiSingle[], Error>({
+    queryKey: [...singleKeys.all(), "every"],
+    queryFn: () => fetchEverySingle(queryClient),
+  });
+}
+
+/**
+ * useSingles - Query hook for fetching paginated Single list
+ *
+ * Fetches Singles with pagination, search, and sorting support.
+ * Automatically caches results and provides loading/error states.
+ *
+ * ## Query Key Structure
+ * `["singles", params]` - Hierarchical key for proper cache invalidation
+ *
+ * ## Features
+ * - Automatic caching (5 minute staleTime from QueryClient config)
+ * - Pagination support
+ * - Search support (filters.search)
+ * - Sorting support (sorting array)
+ * - TypeScript type safety
+ * - Optional query options (e.g., enabled for conditional queries)
+ *
+ * @param params - Table parameters for pagination, search, and sorting
+ * @param options - Optional TanStack Query options (enabled, staleTime, etc.)
+ * @returns TanStack Query result with Single data, loading state, and error state
+ *
+ * @example
+ * ```tsx
+ * function SingleList() {
+ *   const { data, isLoading, error } = useSingles({
+ *     pagination: { page: 0, pageSize: 10 },
+ *     filters: { search: 'settings' },
+ *     sorting: [{ field: 'label', direction: 'asc' }],
+ *   });
+ *
+ *   if (isLoading) return <Skeleton />;
+ *   if (error) return <Alert>Error: {error.message}</Alert>;
+ *
+ *   return (
+ *     <div>
+ *       {data.items.map(single => (
+ *         <SingleCard key={single.id} single={single} />
+ *       ))}
+ *       <Pagination meta={data.meta} />
+ *     </div>
+ *   );
+ * }
+ * ```
+ *
+ * @see https://tanstack.com/query/v5/docs/react/reference/useQuery
+ */
+export function useSingles(
+  params?: TableParams,
+  options?: Omit<
+    UseQueryOptions<ListResponse<ApiSingle>, Error>,
+    "queryKey" | "queryFn"
+  >
+): UseQueryResult<ListResponse<ApiSingle>, Error> {
+  const effectiveParams = params || defaultParams;
+  return useQuery<ListResponse<ApiSingle>, Error>({
+    queryKey: singleKeys.list(effectiveParams),
+    queryFn: async () => {
+      return await singleApi.fetchSingles(effectiveParams);
+    },
+    ...options,
+  });
+}
+
+/**
+ * useSingle - Query hook for fetching a single Single by slug
+ *
+ * Fetches a single Single's details by its unique slug.
+ * Only runs when slug is provided.
+ * Automatically caches result for fast navigation.
+ *
+ * ## Query Key Structure
+ * `["singles", slug]` - Hierarchical key for single Single
+ *
+ * @param slug - The unique slug of the Single to fetch (optional)
+ * @returns TanStack Query result with Single data, loading state, and error state
+ *
+ * @example
+ * ```tsx
+ * function SingleDetail({ slug }: { slug?: string }) {
+ *   const { data: single, isLoading, error } = useSingle(slug);
+ *
+ *   if (!slug) return <div>No Single selected</div>;
+ *   if (isLoading) return <Skeleton />;
+ *   if (error) return <Alert>Error: {error.message}</Alert>;
+ *   if (!single) return <div>Single not found</div>;
+ *
+ *   return (
+ *     <div>
+ *       <h1>{single.label}</h1>
+ *       <p>{single.description}</p>
+ *     </div>
+ *   );
+ * }
+ * ```
+ */
+export function useSingle(
+  slug?: string,
+  options?: Omit<UseQueryOptions<ApiSingle, Error>, "queryKey" | "queryFn">
+): UseQueryResult<ApiSingle, Error> {
+  return useQuery<ApiSingle, Error>({
+    queryKey: slug ? singleKeys.detail(slug) : singleKeys.details(),
+    queryFn: async () => {
+      if (!slug) {
+        throw new Error("Single slug is required");
+      }
+      return await singleApi.get(slug);
+    },
+    enabled: !!slug,
+    ...options,
+  });
+}
+
+/**
+ * useCreateSingle - Mutation hook for creating a new Single
+ *
+ * Creates a new Single and automatically invalidates the Singles list cache.
+ *
+ * @returns TanStack Mutation result with mutate function and states
+ *
+ * @example
+ * ```tsx
+ * function CreateSingleForm() {
+ *   const { mutate: createSingle, isPending } = useCreateSingle();
+ *
+ *   const handleSubmit = (data: Partial<ApiSingle>) => {
+ *     createSingle(data, {
+ *       onSuccess: (result) => {
+ *         toast.success(result.message || 'Single created successfully');
+ *       },
+ *       onError: (error) => {
+ *         toast.error(`Failed to create Single: ${error.message}`);
+ *       },
+ *     });
+ *   };
+ * }
+ * ```
+ */
+/**
+ * Forget everything a slug meant, because it now means something else.
+ *
+ * Creating or deleting a Single does not change a document, but it changes
+ * WHICH document — and which schema — a slug names. A slug reused by a
+ * recreated Single otherwise goes on serving its predecessor's, id and fields
+ * and all. That id is a cache scope elsewhere: the version history and its
+ * diffs are keyed on it, so a comparison mounted meanwhile belongs to an
+ * incarnation that no longer exists, and the builder reading a stale schema can
+ * apply the old fields to the new Single with one save.
+ *
+ * Slug-scoped entries are RESET rather than invalidated or removed, and the
+ * three differ in ways that matter here. Invalidation marks a query stale and
+ * KEEPS its data, so the next read is handed the predecessor while a refetch
+ * runs — and a refetch that fails leaves it indefinitely. Removal drops the
+ * data but does not notify an observer already mounted against that key, which
+ * goes on presenting the result it last saw. Reset does both: the data goes and
+ * anything watching is told to fetch again.
+ *
+ * The LIST is only invalidated. It carries no identity, and a briefly stale
+ * list refetches behind the reader at no cost.
+ *
+ * Nothing at all happens for an empty slug list, which is what a wholly failed
+ * bulk delete produces: those Singles still exist, and discarding their caches
+ * would lose valid content during the failure that already inconvenienced the
+ * reader.
+ */
+function clearSingleIdentityCaches(
+  queryClient: QueryClient,
+  slugs: readonly string[]
+): void {
+  if (slugs.length === 0) return;
+  void queryClient.invalidateQueries({ queryKey: singleKeys.lists() });
+  for (const slug of slugs) {
+    void queryClient.resetQueries({ queryKey: singleKeys.detail(slug) });
+    void queryClient.resetQueries({ queryKey: singleKeys.schema(slug) });
+    void queryClient.resetQueries({
+      queryKey: singleDocumentKeys.detail(slug),
+    });
+  }
+}
+
+export function useCreateSingle(): UseMutationResult<
+  {
+    message: string;
+    data: ApiSingle;
+  },
+  Error,
+  UpdateSinglePayload,
+  unknown
+> {
+  const queryClient = useQueryClient();
+
+  return useMutation<
+    { message: string; data: ApiSingle },
+    Error,
+    UpdateSinglePayload
+  >({
+    mutationFn: async (singleData: UpdateSinglePayload) => {
+      return await singleApi.create(singleData);
+    },
+    onSuccess: (created, submitted) => {
+      // The slug the server assigned where it reports one, and the submitted
+      // slug otherwise: a create that adjusted the slug must clear the name it
+      // actually took, not the one that was asked for.
+      const slug = created?.data?.slug ?? submitted.slug;
+      clearSingleIdentityCaches(queryClient, slug ? [slug] : []);
+    },
+  });
+}
+
+/**
+ * useUpdateSingle - Mutation hook for updating an existing Single
+ *
+ * Updates a Single's information and automatically invalidates relevant caches.
+ *
+ * @returns TanStack Mutation result with mutate function and states
+ *
+ * @example
+ * ```tsx
+ * function EditSingleForm({ slug }: { slug: string }) {
+ *   const { mutate: updateSingle, isPending } = useUpdateSingle();
+ *
+ *   const handleSubmit = (updates: Partial<ApiSingle>) => {
+ *     updateSingle(
+ *       { slug, updates },
+ *       {
+ *         onSuccess: () => {
+ *           toast.success('Single updated successfully');
+ *         },
+ *       }
+ *     );
+ *   };
+ * }
+ * ```
+ */
+export function useUpdateSingle(): UseMutationResult<
+  {
+    message: string;
+  },
+  Error,
+  {
+    slug: string;
+    updates: UpdateSinglePayload;
+  },
+  unknown
+> {
+  const queryClient = useQueryClient();
+
+  return useMutation<
+    { message: string },
+    Error,
+    { slug: string; updates: UpdateSinglePayload }
+  >({
+    mutationFn: async ({ slug, updates }) => {
+      return await singleApi.update(slug, updates);
+    },
+    onSuccess: (_, { slug }) => {
+      // Invalidate all Single caches including schema
+      void queryClient.invalidateQueries({ queryKey: singleKeys.all() });
+      void queryClient.invalidateQueries({ queryKey: singleKeys.detail(slug) });
+      void queryClient.invalidateQueries({ queryKey: singleKeys.schema(slug) });
+    },
+  });
+}
+
+/**
+ * useDeleteSingle - Mutation hook for deleting a Single
+ *
+ * Deletes a Single and automatically invalidates the Singles list cache.
+ *
+ * @returns TanStack Mutation result with mutate function and states
+ *
+ * @example
+ * ```tsx
+ * function DeleteSingleButton({ slug }: { slug: string }) {
+ *   const { mutate: deleteSingle, isPending } = useDeleteSingle();
+ *
+ *   const handleDelete = () => {
+ *     deleteSingle(slug, {
+ *       onSuccess: () => {
+ *         toast.success('Single deleted successfully');
+ *       },
+ *     });
+ *   };
+ * }
+ * ```
+ */
+export function useDeleteSingle(): UseMutationResult<
+  void,
+  Error,
+  string,
+  unknown
+> {
+  const queryClient = useQueryClient();
+
+  return useMutation<void, Error, string>({
+    mutationFn: async (slug: string) => {
+      const result = await singleApi.deleteSingle(slug);
+      // D-series: keep ui-schema.json in sync (best-effort, dev-only API).
+      try {
+        await schemaFileApi.deleteSingle(slug);
+      } catch (mirrorError) {
+        // The DB delete succeeded; a stale manifest entry silently diverges
+        // the committed schema from the database, so the failure must be
+        // visible even though it is non-fatal.
+        toast.warning(
+          `Single deleted from the database, but ui-schema.json could not be updated: ${mirrorError instanceof Error ? mirrorError.message : String(mirrorError)}`
+        );
+      }
+      return result;
+    },
+    onSuccess: (_, slug) => {
+      clearSingleIdentityCaches(queryClient, [slug]);
+    },
+    // Disable retry for delete operations - if deletion succeeds on first attempt,
+    // a retry would fail with 404 (already deleted) and incorrectly show an error
+    retry: false,
+  });
+}
+
+/**
+ * useBulkDeleteSingles - Bulk mutation hook for deleting multiple Singles
+ *
+ * Executes parallel delete operations for multiple Singles using Promise.allSettled().
+ *
+ * @returns Bulk mutation interface with mutate function, isPending state, and result
+ *
+ * @example
+ * ```tsx
+ * function SingleListActions() {
+ *   const { mutate: bulkDelete, isPending } = useBulkDeleteSingles();
+ *   const [selectedSlugs, setSelectedSlugs] = useState<string[]>([]);
+ *
+ *   const handleBulkDelete = async () => {
+ *     const result = await bulkDelete(selectedSlugs, undefined);
+ *     if (result.succeeded > 0) {
+ *       toast.success(`${result.succeeded} Singles deleted`);
+ *     }
+ *   };
+ * }
+ * ```
+ */
+export function useBulkDeleteSingles(): UseBulkMutationReturn<
+  string,
+  void,
+  Error,
+  void
+> {
+  const queryClient = useQueryClient();
+
+  return useBulkMutation<string, void, Error, void>({
+    mutationFn: async (slug: string) => {
+      await singleApi.deleteSingle(slug);
+    },
+    defaultOptions: {
+      // `onComplete` runs after every item settles, including when all of them
+      // failed. Clearing then would discard caches for Singles that still
+      // exist, during the very failure that already cost the reader something.
+      onComplete: result => {
+        clearSingleIdentityCaches(queryClient, result.succeededIds);
+      },
+    },
+  });
+}
+
+// ============================================================
+// DOCUMENT HOOKS
+// These operate on Single document data (the actual content),
+// distinct from metadata/schema operations above.
+// ============================================================
+
+/**
+ * Query Key Factory for Single Documents
+ *
+ * Separate key hierarchy for document data to avoid conflicts with
+ * schema/metadata queries.
+ */
+export const singleDocumentKeys = {
+  /** Base key for all Single document queries */
+  all: () => ["single-documents"] as const,
+
+  /** Base key for Single document detail queries */
+  details: (): readonly ["single-documents", "detail"] =>
+    [...singleDocumentKeys.all(), "detail"] as const,
+
+  /** Query key for a Single document by slug */
+  detail: (slug: string): readonly ["single-documents", "detail", string] =>
+    [...singleDocumentKeys.details(), slug] as const,
+};
+
+/**
+ * Single document data type.
+ * Re-export from singleApi for convenience.
+ */
+export type { SingleDocument } from "@admin/services/singleApi";
+
+/**
+ * useSingleDocument - Query hook for fetching a Single's document data
+ *
+ * Fetches the actual content/values of a Single (not the schema).
+ * If the document doesn't exist, it will be auto-created with default values.
+ *
+ * ## Query Key Structure
+ * `["single-documents", "detail", slug]` - Separate from schema queries
+ *
+ * @param slug - The unique slug of the Single
+ * @param options - Optional query options (depth for relationship expansion)
+ * @returns TanStack Query result with document data, loading state, and error state
+ *
+ * @example
+ * ```tsx
+ * function SiteSettingsEditor({ slug }: { slug: string }) {
+ *   const { data: document, isLoading, error } = useSingleDocument(slug);
+ *
+ *   if (isLoading) return <Skeleton />;
+ *   if (error) return <Alert>Error: {error.message}</Alert>;
+ *
+ *   return (
+ *     <form>
+ *       <input defaultValue={document?.siteName} />
+ *       <input defaultValue={document?.tagline} />
+ *     </form>
+ *   );
+ * }
+ * ```
+ */
+export function useSingleDocument(
+  slug?: string,
+  options?: {
+    depth?: number;
+    // i18n: the active content language + fallback control + translation-status opt-in.
+    // Part of the cache key so switching languages refetches (values differ per locale).
+    locale?: string;
+    fallbackLocale?: string;
+    translationStatus?: boolean;
+    /**
+     * Opt into the working-draft overlay. Part of the cache identity below for
+     * the same reason `locale` is: the editor learns `draftsEnabled` only after
+     * the schema loads, flipping this false -> true on a cold load, and without
+     * it in the key the stale-time would keep serving the published document and
+     * hide an existing pending change (and the Changed / Discard affordances).
+     */
+    draft?: boolean;
+    queryOptions?: Omit<
+      UseQueryOptions<SingleDocument, Error>,
+      "queryKey" | "queryFn"
+    >;
+  }
+): UseQueryResult<SingleDocument, Error> {
+  return useQuery<SingleDocument, Error>({
+    // i18n: locale is part of cache identity — switching languages must refetch, not serve the
+    // previous language's values. Mirrors useEntry.
+    queryKey: slug
+      ? [
+          ...singleDocumentKeys.detail(slug),
+          {
+            locale: options?.locale ?? null,
+            fallbackLocale: options?.fallbackLocale ?? null,
+            translationStatus: options?.translationStatus ?? false,
+            draft: options?.draft ?? false,
+          },
+        ]
+      : singleDocumentKeys.details(),
+    queryFn: async () => {
+      if (!slug) {
+        throw new Error("Single slug is required");
+      }
+      return await singleApi.getDocument(slug, {
+        depth: options?.depth,
+        locale: options?.locale,
+        draft: options?.draft,
+        fallbackLocale: options?.fallbackLocale,
+        translationStatus: options?.translationStatus,
+      });
+    },
+    enabled: !!slug,
+    ...options?.queryOptions,
+  });
+}
+
+/**
+ * useSingleSchema - Query hook for fetching a Single's schema/metadata
+ *
+ * Fetches the field definitions and configuration of a Single.
+ * Use this when you need to know the structure of a Single
+ * (e.g., for rendering form fields).
+ *
+ * ## Query Key Structure
+ * `["singles", "schema", slug]`
+ *
+ * @param slug - The unique slug of the Single
+ * @param options - Optional TanStack Query options
+ * @returns TanStack Query result with schema data, loading state, and error state
+ *
+ * @example
+ * ```tsx
+ * function SingleFormFields({ slug }: { slug: string }) {
+ *   const { data: schema, isLoading } = useSingleSchema(slug);
+ *
+ *   if (isLoading) return <Skeleton />;
+ *
+ *   return (
+ *     <div>
+ *       {schema?.fields.map(field => (
+ *         <FieldRenderer key={field.name} field={field} />
+ *       ))}
+ *     </div>
+ *   );
+ * }
+ * ```
+ */
+export function useSingleSchema(
+  slug?: string,
+  options?: Omit<UseQueryOptions<ApiSingle, Error>, "queryKey" | "queryFn">
+): UseQueryResult<ApiSingle, Error> {
+  return useQuery<ApiSingle, Error>({
+    queryKey: slug ? singleKeys.schema(slug) : singleKeys.schemas(),
+    queryFn: async () => {
+      if (!slug) {
+        throw new Error("Single slug is required");
+      }
+      return await singleApi.getSchema(slug);
+    },
+    enabled: !!slug,
+    ...options,
+  });
+}
+
+/**
+ * useUpdateSingleDocument - Mutation hook for updating a Single's document data
+ *
+ * Updates the actual content/values of a Single.
+ * Automatically invalidates the document cache on success.
+ *
+ * @param slug - The slug of the Single to update
+ * @returns TanStack Mutation result with mutate function and states
+ *
+ * @example
+ * ```tsx
+ * function SiteSettingsForm({ slug }: { slug: string }) {
+ *   const { data: document } = useSingleDocument(slug);
+ *   const { mutate: updateDocument, isPending } = useUpdateSingleDocument(slug);
+ *
+ *   const handleSubmit = (data: Record<string, unknown>) => {
+ *     updateDocument(data, {
+ *       onSuccess: () => {
+ *         toast.success('Settings saved successfully');
+ *       },
+ *       onError: (error) => {
+ *         toast.error(`Failed to save: ${error.message}`);
+ *       },
+ *     });
+ *   };
+ * }
+ * ```
+ */
+export function useUpdateSingleDocument(
+  slug: string,
+  locale?: string,
+  options?: {
+    /**
+     * Serialize this mutation against others sharing the id.
+     *
+     * TanStack runs mutations in parallel by default, each with a unique scope.
+     * Several surfaces owning different fields of ONE document is the case that
+     * wants otherwise: two saves in flight against the same record interleave
+     * their success handlers, so a cache update from the first can land after
+     * the second and show a document neither surface is looking at. Giving them
+     * one scope id makes the second wait for the first.
+     *
+     * Absent by default, because a document edited by one form has nothing to
+     * serialize against and would only pay the wait.
+     */
+    scopeId?: string;
+    /**
+     * Asked as each update is sent: `true` sends it with `keepalive`, so the
+     * browser finishes it after the page is hidden or closed. A function
+     * rather than a flag, because whether the page is going away is known
+     * only at that moment. A body over 64 KB is sent as an ordinary request.
+     */
+    keepalive?: () => boolean;
+  }
+): UseMutationResult<SingleDocument, Error, Record<string, unknown>, unknown> {
+  const queryClient = useQueryClient();
+
+  // `Error`, not `ApiError`, because not every rejection is one. `fetcher`
+  // awaits `fetch` without wrapping it, so an offline, DNS or CORS failure
+  // rejects with the native `TypeError` carrying no `status` — and the narrower
+  // type would promise every consumer a number that is absent on exactly the
+  // failures a retry or a reporter most needs to tell apart. `isApiError` and
+  // `validationIssues` recover the refusal payload where there is one, and they
+  // CHECK for it rather than asserting it.
+  return useMutation<SingleDocument, Error, Record<string, unknown>>({
+    // Under the Single's own document key, so a reader of it can ask whether a
+    // save of it is in flight without counting anyone else's.
+    mutationKey: [...singleDocumentKeys.detail(slug), "update"],
+    ...(options?.scopeId === undefined
+      ? {}
+      : { scope: { id: options.scopeId } }),
+    // i18n: route the save to the editor's active language so translatable values land on that
+    // locale's companion row (shared columns still update). Omitted for non-localized singles.
+    mutationFn: async (data: Record<string, unknown>) => {
+      return await singleApi.updateDocument(slug, data, {
+        locale,
+        keepalive: options?.keepalive?.() === true,
+      });
+    },
+    onSuccess: () => {
+      // Invalidate the document cache
+      void queryClient.invalidateQueries({
+        queryKey: singleDocumentKeys.detail(slug),
+      });
+      // Also invalidate the general single documents list
+      void queryClient.invalidateQueries({
+        queryKey: singleDocumentKeys.all(),
+      });
+      // And the dashboard's reads, the Content overview's among them, which
+      // name who edited each Single last and when.
+      void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+    // The editor reports the failure itself. A refusal because the Single was
+    // removed from code also reads its schema again, so an editor opened
+    // before the removal turns read-only.
+    onError: error => {
+      refreshRemovedFromCodeSchema(queryClient, error);
+    },
+  });
+}

@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+/* The families the imported font stylesheets declare, bound to the variables the rules
+   below read. Named here rather than by `next/font`, which used to inject them: the faces
+   now arrive as ordinary stylesheets, so the binding has to be written down somewhere, and
+   the name is load-bearing — the admin theme reads `--font-geist`. Quoted family names, so
+   the two-word values stay one identifier. */
+:root {
+  --font-geist: "Geist Variable";
+  --font-geist-mono: "Geist Mono Variable";
+}
+
+/* Playground frontend theme only. The admin (mounted at /admin) ships its
+ * own scoped design tokens via @nextlyhq/admin/style.css, so this file must
+ * NOT redefine the design-system color tokens (--primary, --card, --muted,
+ * --border, --input, ...) or emit competing color utilities — doing so with
+ * the OKLCH token set produces invalid hsl(oklch()) values and blanks out
+ * admin surfaces. Keep this to the harness's own background/foreground. */
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --radius-none: 0px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+}

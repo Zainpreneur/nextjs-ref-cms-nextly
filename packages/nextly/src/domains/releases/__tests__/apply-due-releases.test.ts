@@ -1,0 +1,1781 @@
+/**
+ * The pass that turns a due release into real published content.
+ *
+ * The cases worth exercising exhaustively are the access boundary and the
+ * partial-failure behaviour: everything else here produces a release that did
+ * not publish, while these produce one that published AS THE WRONG PERSON or
+ * discharged without having happened.
+ *
+ * @module domains/releases/__tests__/apply-due-releases.test
+ */
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { NextlyError } from "../../../errors";
+import {
+  getNextlyLogger,
+  setNextlyLogger,
+  type NextlyLogger,
+} from "../../../observability/logger";
+import { applyDueReleases, settleableComponents } from "../apply-due-releases";
+import type {
+  ApplyDueReleasesDeps,
+  ReleaseMutations,
+} from "../apply-due-releases";
+import type { DrainMemberRow, ReleaseRow } from "../releases-repository";
+
+const NOW = new Date("2026-06-01T00:00:00.000Z");
+const PAST = new Date("2026-01-01T00:00:00.000Z");
+
+function release(over: Partial<ReleaseRow> = {}): ReleaseRow {
+  return {
+    id: "r1",
+    title: "Go live",
+    description: null,
+    scheduledAt: PAST,
+    timezone: "UTC",
+    state: "scheduled",
+    kind: "release",
+    publishedAt: null,
+    createdBy: "author",
+    createdAt: PAST,
+    updatedAt: PAST,
+    revision: 0,
+    ...over,
+  };
+}
+
+let seq = 0;
+function member(over: Partial<DrainMemberRow> = {}): DrainMemberRow {
+  seq += 1;
+  return {
+    id: `m${seq}`,
+    releaseId: "r1",
+    scopeKind: "collection",
+    scopeSlug: "posts",
+    entryId: "e1",
+    locale: null,
+    action: "publish",
+    memberKey: `k${seq}`,
+    singleSlot: null,
+    appliedRevision: null,
+    createdBy: "author",
+    createdAt: PAST,
+    ...over,
+  };
+}
+
+function deps(over: {
+  releases?: ReleaseRow[];
+  members?: DrainMemberRow[];
+  runAs?: Partial<ApplyDueReleasesDeps["runAs"]>;
+  mutations?: Partial<ApplyDueReleasesDeps["mutations"]>;
+  marked?: string[];
+  /** A release cancelled between the drain reading it and acting on it. */
+  cancelled?: string;
+  /** A release POSTPONED after the plan was built: still scheduled, new instant. */
+  rescheduledTo?: Date;
+  /** Make `markReleasesPublished` settle nothing, as its fence does. */
+  markRefuses?: boolean;
+  /**
+   * Each member's mark, by member id: the `applied_revision` column. Shared
+   * across passes by handing the same map to each, as the database is.
+   */
+  marks?: Map<string, number>;
+  /**
+   * Whether a write that resolves leaves its mark. The real write marks its
+   * member, in its own transaction, when it stores the action's status;
+   * `"never"` is a write whose hook changed the status, so it left none. A
+   * write that throws before landing leaves none either way.
+   */
+  marking?: "on-success" | "never";
+}): ApplyDueReleasesDeps {
+  const releases = over.releases ?? [release()];
+  const members = over.members ?? [member()];
+  const marks = over.marks ?? new Map<string, number>();
+  const marking =
+    (
+      write: ReleaseMutations["publish"] | undefined
+    ): ReleaseMutations["publish"] =>
+    async input => {
+      await write?.(input);
+      if (over.marking !== "never") {
+        marks.set(input.receipt.memberId, input.receipt.revision);
+      }
+    };
+  // Answers with the ids it was given, which is what the repository does on a
+  // component that transitioned whole. A stub returning a constant would let a
+  // pass that blocked a DIFFERENT set look identical to a correct one.
+  const blocked = vi.fn(
+    async (entries: readonly { id: string; scheduledAt: Date }[]) =>
+      entries.map(entry => entry.id)
+  );
+  return {
+    // Pinned, so every case below observes a STABLE component order and asserts
+    // about the mechanism it names rather than about which rotation came up.
+    // The starvation case overrides it, because rotating is the thing it tests.
+    random: () => 0,
+    repository: {
+      findDueReleases: async () => releases,
+      // A spy, reached through the port with `vi.mocked` so a case can assert
+      // WHICH releases the pass stopped. A stub returning true would let a pass
+      // that blocked the wrong ones — or every one — look identical to a pass
+      // that blocked exactly the hopeless.
+      blockReleases: blocked,
+      // Flushing is the repository's, best-effort; nothing here reads a page.
+      revalidateReleases: async () => {},
+      listMembersOf: async ids =>
+        members
+          .filter(m => ids.includes(m.releaseId))
+          .map(m => ({ ...m, appliedRevision: marks.get(m.id) ?? null })),
+      isMemberApplied: async (id: string, revision: number) =>
+        marks.get(id) === revision,
+      isStillDueAt: async (id: string, scheduledAt: Date) =>
+        over.cancelled !== id &&
+        (over.rescheduledTo === undefined ||
+          over.rescheduledTo.getTime() === scheduledAt.getTime()),
+      markReleasesPublished: async entries => {
+        for (const entry of entries) over.marked?.push(entry.id);
+        // The fence settles none of a component an overlapping drain already
+        // settled. Overridable so a fixture can build that case.
+        return over.markRefuses === true ? [] : entries.map(entry => entry.id);
+      },
+    },
+    // Default: the write did what it said, and so left its mark. A case that
+    // wants a write NOT to have landed throws from it, or sets `marking`.
+    mutations: {
+      publish: marking(over.mutations?.publish),
+      unpublish: marking(over.mutations?.unpublish),
+    },
+    runAs: {
+      findUser: async id => ({ id, isActive: true }),
+      listRoleSlugs: async () => ["editor"],
+      ...over.runAs,
+    },
+    now: () => NOW,
+  };
+}
+
+describe("applyDueReleases", () => {
+  it("publishes a due member AS ITS AUTHOR, not as a system principal", async () => {
+    // The whole access boundary. Running this as a trusted principal would let
+    // a release publish content its author could not have published by hand —
+    // "schedule this" would become a privilege escalation with a delay on it.
+    // The parameter is DECLARED, not inferred: `vi.fn(async () => ...)`
+    // types `mock.calls` as an empty tuple, so reading `calls[0][0]` is a
+    // type error that only the test-tree pass of `check-types` reports.
+    const publish = vi.fn(
+      async (_input: { ref: unknown; user: unknown }) => {}
+    );
+    const result = await applyDueReleases(
+      deps({ members: [member({ createdBy: "u1" })], mutations: { publish } })
+    );
+
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(publish.mock.calls[0]?.[0]).toMatchObject({
+      user: expect.objectContaining({ id: "u1", roles: ["editor"] }),
+    });
+    expect(result).toMatchObject({ applied: 1, failed: 0, published: 1 });
+  });
+
+  it("REFUSES a member with no recorded author rather than picking one", async () => {
+    // There is nobody to act as, and the only fallback available is exactly
+    // the principal this module exists to refuse.
+    const publish = vi.fn(
+      async (_input: { ref: unknown; user: unknown }) => {}
+    );
+    const marked: string[] = [];
+    const result = await applyDueReleases(
+      deps({
+        members: [member({ createdBy: null })],
+        mutations: { publish },
+        marked,
+      })
+    );
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(result.outcomes[0]?.failure).toBe("NO_RECORDED_AUTHOR");
+    // And the release is held open, not discharged.
+    expect(marked).toEqual([]);
+    expect(result.published).toBe(0);
+  });
+
+  it("REFUSES a member whose author has been deactivated", async () => {
+    // Authority that was withdrawn stays withdrawn; a release scheduled while
+    // somebody still had an account does not resurrect it.
+    const publish = vi.fn(
+      async (_input: { ref: unknown; user: unknown }) => {}
+    );
+    const result = await applyDueReleases(
+      deps({
+        mutations: { publish },
+        runAs: { findUser: async id => ({ id, isActive: false }) },
+      })
+    );
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(result.outcomes[0]?.failure).toBe("AUTHOR_UNAVAILABLE");
+  });
+
+  it("distinguishes a LOOKUP FAILURE from an author who is gone", async () => {
+    // A transient database error is not evidence that anybody was deleted.
+    // Collapsing the two would permanently refuse a release because the RBAC
+    // tables were briefly unreachable.
+    const result = await applyDueReleases(
+      deps({
+        runAs: {
+          findUser: async () => {
+            throw new Error("rbac unreachable");
+          },
+        },
+      })
+    );
+
+    expect(result.outcomes[0]?.failure).toBe("IDENTITY_LOOKUP_FAILED");
+    expect(result.outcomes[0]?.detail).toContain("rbac unreachable");
+  });
+
+  it("holds a release OPEN when any of its members failed", async () => {
+    // Marking it published would discharge a release that did not fully happen:
+    // the read path stops consulting a non-scheduled release, so the unapplied
+    // member would vanish from the content AND the schedule at once.
+    const marked: string[] = [];
+    const result = await applyDueReleases(
+      deps({
+        members: [
+          member({ entryId: "e1", createdBy: "u1" }),
+          member({ entryId: "e2", createdBy: null }),
+        ],
+        marked,
+      })
+    );
+
+    expect(result).toMatchObject({ applied: 1, failed: 1, published: 0 });
+    expect(marked).toEqual([]);
+  });
+
+  it("marks a release published once everything attributed to it succeeded", async () => {
+    // The control for the case above: an implementation that never discharged
+    // a release would satisfy it while leaving every release scheduled forever.
+    const marked: string[] = [];
+    const result = await applyDueReleases(
+      deps({ members: [member(), member({ entryId: "e2" })], marked })
+    );
+
+    expect(marked).toEqual(["r1"]);
+    expect(result.published).toBe(1);
+  });
+
+  it("attempts EVERY action even after one fails", async () => {
+    // One unresolvable author must not stop every other release on the site.
+    // Nobody is watching at 03:00, and "nothing was published" reads exactly
+    // like "nothing was due".
+    const publish = vi.fn(async (input: { ref: { entryId: string } }) => {
+      if (input.ref.entryId === "e1") throw new Error("refused");
+    });
+    const result = await applyDueReleases(
+      deps({
+        members: [
+          member({ entryId: "e1" }),
+          member({ entryId: "e2" }),
+          member({ entryId: "e3" }),
+        ],
+        // The refused write throws before landing, so it leaves no mark; the
+        // other two do.
+        mutations: { publish },
+      })
+    );
+
+    expect(publish).toHaveBeenCalledTimes(3);
+    expect(result).toMatchObject({ applied: 2, failed: 1 });
+    expect(result.outcomes.find(o => o.ref.entryId === "e1")?.failure).toBe(
+      "WRITE_FAILED"
+    );
+  });
+
+  it("records a write the publish gate refuses for approval as held, not as a failed write", async () => {
+    // The approval went between the component's question and this document's write, and the
+    // write's own gate refused it: the hold the question asks about, so not retried as a write.
+    const publish = vi.fn(async () => {
+      throw NextlyError.validation({
+        errors: [
+          { path: "shared", code: "NOT_APPROVED", message: "Not approved." },
+        ],
+      });
+    });
+    const result = await applyDueReleases(
+      deps({ members: [member({ entryId: "e1" })], mutations: { publish } })
+    );
+
+    expect(result.outcomes.map(outcome => outcome.failure)).toEqual([
+      "NOT_APPROVED",
+    ]);
+  });
+
+  it("keeps a gate refusal for anything besides approval a failed write", async () => {
+    // The control: a refusal naming another code is still a write that failed, retried.
+    const publish = vi.fn(async () => {
+      throw NextlyError.validation({
+        errors: [
+          { path: "shared", code: "NOT_APPROVED", message: "Not approved." },
+          { path: "es", code: "REQUIRED", message: "Required." },
+        ],
+      });
+    });
+    const result = await applyDueReleases(
+      deps({ members: [member({ entryId: "e1" })], mutations: { publish } })
+    );
+
+    expect(result.outcomes.map(outcome => outcome.failure)).toEqual([
+      "WRITE_FAILED",
+    ]);
+  });
+
+  it("REFUSES to write for a release cancelled after the pass began", async () => {
+    // The fence on `markReleasePublished` comes too late: it stops the row
+    // being marked published and cannot un-publish the documents. Without a
+    // check before the write, calling a release off while its own drain is
+    // running still puts its content live — permanently.
+    const publish = vi.fn(async () => {});
+    const marked: string[] = [];
+    const result = await applyDueReleases(
+      deps({ mutations: { publish }, cancelled: "r1", marked })
+    );
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(result.outcomes[0]?.failure).toBe("RELEASE_NO_LONGER_SCHEDULED");
+    expect(marked).toEqual([]);
+  });
+
+  it("REFUSES to write for a release POSTPONED after the plan was built", async () => {
+    // A reschedule leaves the release `scheduled`, so a fence that reads only
+    // the STATE sees nothing wrong and the stale plan applies immediately —
+    // publishing content at the very moment somebody moved it away from. The
+    // instant the plan was built against has to be part of the fence.
+    const publish = vi.fn(async () => {});
+    const marked: string[] = [];
+    const result = await applyDueReleases(
+      deps({
+        mutations: { publish },
+        rescheduledTo: new Date("2099-01-01T00:00:00.000Z"),
+        marked,
+      })
+    );
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(result.outcomes[0]?.failure).toBe("RELEASE_NO_LONGER_SCHEDULED");
+    expect(marked).toEqual([]);
+  });
+
+  it("records publishedAt from a FRESH clock, not the pass's start", async () => {
+    // `publishedAt` is defined as the moment materialisation completed, and the
+    // pass's `at` is captured before members are loaded, identities resolved and
+    // every content mutation run. On a slow pass that difference is real.
+    // A clock that advances a minute on every read, rather than a fixed
+    // sequence: asserting a specific tick would pin how many times the pass
+    // happens to ask the time, which is not the property under test.
+    const stamps: Date[] = [];
+    let reads = 0;
+    const clock = (): Date =>
+      new Date(
+        new Date("2026-06-01T00:00:00.000Z").getTime() + reads++ * 60_000
+      );
+
+    const d = deps({});
+    const passStart = new Date("2026-06-01T00:00:00.000Z");
+    await applyDueReleases({
+      ...d,
+      now: clock,
+      repository: {
+        ...d.repository,
+        markReleasesPublished: async (entries, at) => {
+          stamps.push(at);
+          return entries.map(entry => entry.id);
+        },
+      },
+    });
+
+    expect(stamps).toHaveLength(1);
+    // Strictly LATER than the pass began — which is only true if the stamp is
+    // read at the transition rather than carried from the top of the pass.
+    expect(stamps[0]!.getTime()).toBeGreaterThan(passStart.getTime());
+  });
+
+  it("still writes for a release that is STILL scheduled", async () => {
+    // The control. A check that refused everything would satisfy the case above
+    // while making the materialiser inert.
+    const publish = vi.fn(async () => {});
+    await applyDueReleases(deps({ mutations: { publish } }));
+
+    expect(publish).toHaveBeenCalledTimes(1);
+  });
+
+  it("holds an OVERLAPPING release open when its partner failed", async () => {
+    // The reversal this prevents: an earlier release publishes a document and a
+    // later one withdraws it, both due. The later wins and the document is
+    // withdrawn. If the later were then marked published while the earlier
+    // stayed scheduled — held open by an unrelated member's failure — the NEXT
+    // pass would not load the later release at all, so the earlier would win
+    // for that document and republish what was correctly withdrawn.
+    const marked: string[] = [];
+    const result = await applyDueReleases(
+      deps({
+        releases: [
+          release({ id: "r1", scheduledAt: PAST }),
+          release({
+            id: "r2",
+            scheduledAt: new Date("2026-02-01T00:00:00.000Z"),
+          }),
+        ],
+        members: [
+          // The shared document: r2 wins and is applied.
+          member({ releaseId: "r1", entryId: "shared", action: "publish" }),
+          member({ releaseId: "r2", entryId: "shared", action: "unpublish" }),
+          // An unrelated member of r1 that fails, holding r1 open.
+          member({ releaseId: "r1", entryId: "other", createdBy: null }),
+        ],
+        marked,
+      })
+    );
+
+    expect(result.failed).toBe(1);
+    // NEITHER is discharged: r1 failed, and r2 shares a document with it.
+    expect(marked).toEqual([]);
+  });
+
+  describe("a component whose transition cannot be written", () => {
+    const saved = getNextlyLogger();
+    afterEach(() => setNextlyLogger(saved));
+
+    /** The runtime's log, with its warnings kept. */
+    function warnings() {
+      const warn = vi.fn();
+      const logger: NextlyLogger = {
+        error: () => {},
+        warn,
+        info: () => {},
+        debug: () => {},
+      };
+      setNextlyLogger(logger);
+      return warn;
+    }
+
+    it("stays to itself when it cannot be settled, and the others still settle", async () => {
+      // Settling writes the owner's notice and its email job with the move,
+      // so a failure there (or any write of the move) rolls back that
+      // component alone. It stays scheduled for the next pass; the rest of
+      // this pass must not stop with it.
+      const warn = warnings();
+      const d = deps({
+        releases: [
+          release({ id: "r1", scheduledAt: PAST }),
+          release({ id: "r2", scheduledAt: PAST }),
+        ],
+        members: [
+          member({ releaseId: "r1", entryId: "a" }),
+          member({ releaseId: "r2", entryId: "b" }),
+        ],
+      });
+      const settled: string[] = [];
+      const result = await applyDueReleases({
+        ...d,
+        repository: {
+          ...d.repository,
+          markReleasesPublished: async entries => {
+            if (entries.some(entry => entry.id === "r1")) {
+              throw new Error("the notice's email job could not be written");
+            }
+            settled.push(...entries.map(entry => entry.id));
+            return entries.map(entry => entry.id);
+          },
+        },
+      });
+
+      expect(settled).toEqual(["r2"]);
+      expect(result.published).toBe(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "release-component-transition-failed",
+          releaseIds: ["r1"],
+        })
+      );
+    });
+
+    it("stays to itself when it cannot be stopped, and the pass still stops and settles the rest", async () => {
+      const warn = warnings();
+      const d = deps({
+        releases: [
+          release({ id: "r1", scheduledAt: PAST }),
+          release({ id: "r2", scheduledAt: PAST }),
+          release({ id: "r3", scheduledAt: PAST }),
+        ],
+        members: [
+          // Two releases that can never run, each on its own document, and
+          // one that can.
+          member({ releaseId: "r1", entryId: "a", createdBy: null }),
+          member({ releaseId: "r3", entryId: "c", createdBy: null }),
+          member({ releaseId: "r2", entryId: "b" }),
+        ],
+      });
+      const stopped: string[] = [];
+      const result = await applyDueReleases({
+        ...d,
+        repository: {
+          ...d.repository,
+          blockReleases: async entries => {
+            if (entries.some(entry => entry.id === "r1")) {
+              throw new Error("the stop's notice could not be written");
+            }
+            stopped.push(...entries.map(entry => entry.id));
+            return entries.map(entry => entry.id);
+          },
+        },
+      });
+
+      expect(stopped).toEqual(["r3"]);
+      expect(result.blocked).toBe(1);
+      expect(result.published).toBe(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "release-component-transition-failed",
+          releaseIds: ["r1"],
+        })
+      );
+    });
+  });
+
+  it("discharges releases that share NO document independently", async () => {
+    // The control. Holding every release open whenever any release failed
+    // would satisfy the case above while making one bad member stall the whole
+    // schedule indefinitely.
+    const marked: string[] = [];
+    await applyDueReleases(
+      deps({
+        releases: [
+          release({ id: "r1", scheduledAt: PAST }),
+          release({ id: "r2", scheduledAt: PAST }),
+        ],
+        members: [
+          member({ releaseId: "r1", entryId: "a", createdBy: null }),
+          member({ releaseId: "r2", entryId: "b" }),
+        ],
+        marked,
+      })
+    );
+
+    expect(marked).toEqual(["r2"]);
+  });
+
+  it("treats a COMMITTED write whose hook threw as applied, not as failed", async () => {
+    // `updateEntry` commits the row and its outbox event before running
+    // `afterUpdate` hooks, so a hook that throws rejects the promise for a write
+    // that already persisted. Recording that as a failure leaves the release
+    // scheduled, and every later sweep repeats the update, appends another
+    // event and reruns the hooks — indefinitely. The thrown error cannot say
+    // whether the transaction committed; the mark it committed with can.
+    const marked: string[] = [];
+    const marks = new Map<string, number>();
+    const result = await applyDueReleases(
+      deps({
+        mutations: {
+          publish: async ({ receipt }) => {
+            // Committed with its mark, then a hook threw.
+            marks.set(receipt.memberId, receipt.revision);
+            throw new Error("afterUpdate exploded");
+          },
+        },
+        marks,
+        marked,
+      })
+    );
+
+    expect(result).toMatchObject({ applied: 1, failed: 0 });
+    // And the release is discharged, so no later pass repeats it.
+    expect(marked).toEqual(["r1"]);
+  });
+
+  it("still reports a write that genuinely did NOT land", async () => {
+    // The control. Treating every rejection as applied would satisfy the case
+    // above while silently losing every real failure.
+    const result = await applyDueReleases(
+      deps({
+        mutations: {
+          publish: async () => {
+            throw new Error("refused");
+          },
+        },
+      })
+    );
+
+    expect(result.outcomes[0]?.failure).toBe("WRITE_FAILED");
+  });
+
+  it("REFUSES a write that RESOLVED without applying the status", async () => {
+    // A `beforeUpdate`/`beforeChange` hook may remove or rewrite `status`, and
+    // the ordinary mutation then succeeds having done nothing. Reporting that
+    // as complete discharges the release, removes its read-time projection, and
+    // loses the scheduled action permanently — the failure here that leaves no
+    // trace at all. A resolved promise is not proof the action was applied:
+    // the write stored another status, so it left no mark.
+    const marked: string[] = [];
+    const result = await applyDueReleases(
+      deps({
+        mutations: {
+          publish: async () => {}, // resolves, but the hook ate the status
+        },
+        marking: "never",
+        marked,
+      })
+    );
+
+    expect(result).toMatchObject({ applied: 0, failed: 1 });
+    expect(result.outcomes[0]?.failure).toBe("WRITE_FAILED");
+    // Held open, so the next sweep retries rather than the action vanishing.
+    expect(marked).toEqual([]);
+  });
+
+  it("STOPS starting actions once the deadline has passed", async () => {
+    // The handler being written to fit a tick. The jobs runner cannot bound
+    // this: `maxDurationMs` is checked before each CLAIM, so it bounds how many
+    // JOBS a pass starts, not how long one already-running handler takes.
+    const publish = vi.fn(async () => {});
+    // A clock that advances a second per reading, so the deadline is crossed
+    // deterministically rather than by wall time. The deadline sits BELOW the
+    // first in-loop reading on purpose: `at = now()` consumes the first tick
+    // before the loop, so a deadline above it would never be reached and this
+    // case would pass for the wrong reason.
+    let tick = 0;
+    const d = deps({
+      releases: [release({ id: "r1" }), release({ id: "r2" })],
+      members: [
+        member({ id: "a", releaseId: "r1", entryId: "e1" }),
+        member({ id: "b", releaseId: "r2", entryId: "e2" }),
+      ],
+      mutations: { publish },
+    });
+    const result = await applyDueReleases({
+      ...d,
+      now: () => new Date(NOW.getTime() + tick++ * 1000),
+      deadline: new Date(NOW.getTime() + 500),
+    });
+
+    expect(result.deferred).toBe(1);
+    expect(publish).toHaveBeenCalledTimes(1);
+  });
+
+  it("FINISHES a release it has started, even once the deadline has passed", async () => {
+    // The starvation case, and the reason the budget bounds RELEASES rather than
+    // actions. Bounded by action, a release with more actions than fit the
+    // budget replays the same prefix on every tick — repeating its mutations,
+    // hooks and outbox events — and never reaches the suffix, because the plan
+    // is rebuilt from members each time and the order is stable. "One action
+    // runs" is not progress.
+    const publish = vi.fn(async () => {});
+    let tick = 0;
+    const d = deps({
+      releases: [release({ id: "r1" })],
+      members: [
+        member({ id: "a", releaseId: "r1", entryId: "e1" }),
+        member({ id: "b", releaseId: "r1", entryId: "e2" }),
+        member({ id: "c", releaseId: "r1", entryId: "e3" }),
+      ],
+      mutations: { publish },
+    });
+    const result = await applyDueReleases({
+      ...d,
+      now: () => new Date(NOW.getTime() + tick++ * 1000),
+      deadline: new Date(NOW.getTime() + 500),
+    });
+
+    // All three, despite the deadline passing after the first.
+    expect(publish).toHaveBeenCalledTimes(3);
+    expect(result.deferred).toBe(0);
+  });
+
+  it("FINISHES an overlapping component whose budget was spent before it began", async () => {
+    // Two releases sharing a document are one piece the pass cannot divide.
+    // The first piece of a pass is exempt from the deadline, so a component
+    // larger than the budget overruns it in this pass rather than stalling:
+    // every write lands and both releases are settled together.
+    const marked: string[] = [];
+    const publish = vi.fn(async () => {});
+    let tick = 0;
+    const d = deps({
+      releases: [release({ id: "r1" }), release({ id: "r2" })],
+      members: [
+        member({ releaseId: "r1", entryId: "e1" }),
+        member({ releaseId: "r1", entryId: "e2" }),
+        member({ releaseId: "r1", entryId: "e3" }),
+        member({ releaseId: "r2", entryId: "e3" }),
+        member({ releaseId: "r2", entryId: "e4" }),
+      ],
+      mutations: { publish },
+      marked,
+    });
+    const result = await applyDueReleases({
+      ...d,
+      now: () => new Date(NOW.getTime() + tick++ * 1000),
+      deadline: new Date(NOW.getTime() - 60_000),
+    });
+
+    expect(publish).toHaveBeenCalledTimes(4);
+    expect(result.deferred).toBe(0);
+    expect(marked.sort()).toEqual(["r1", "r2"]);
+  });
+
+  it("CONTINUES an overlapping component a pass was killed inside, writing only the rest", async () => {
+    // A host that ends the process part-way (a serverless time limit) leaves
+    // the writes that committed, each with its mark, and settles no release.
+    // The next pass plans the whole component again and finds those members
+    // marked for their releases' current revision, so it writes only the
+    // documents still to go and settles the component. Without the marks it
+    // rewrote the documents already published first, and a pass killed at the
+    // same point every time never reached the tail.
+    const members = [
+      member({ releaseId: "r1", entryId: "e1" }),
+      member({ releaseId: "r1", entryId: "e2" }),
+      member({ releaseId: "r1", entryId: "e3" }),
+      member({ releaseId: "r2", entryId: "e3" }),
+      member({ releaseId: "r2", entryId: "e4" }),
+    ];
+    const marks = new Map<string, number>();
+    const killedAfter = async (writes: number, revision = 0) => {
+      const written: string[] = [];
+      const marked: string[] = [];
+      const d = deps({
+        releases: [
+          release({ id: "r1", revision }),
+          release({ id: "r2", revision }),
+        ],
+        members,
+        marks,
+        marked,
+        mutations: {
+          // The process ends here: the write never returns.
+          publish: ({ ref }) => {
+            if (written.length >= writes) return new Promise(() => {});
+            written.push(ref.entryId);
+            return Promise.resolve();
+          },
+        },
+      });
+      void applyDueReleases({ ...d, deadline: new Date(NOW.getTime() + 1) });
+      for (let n = 0; n < 50; n++) await new Promise(r => setImmediate(r));
+      return { written, marked };
+    };
+
+    const first = await killedAfter(2);
+    expect(first.written).toEqual(["e1", "e2"]);
+    expect(first.marked).toEqual([]);
+
+    const second = await killedAfter(Number.POSITIVE_INFINITY);
+    expect(second.written).toEqual(["e3", "e4"]);
+    expect(second.marked.sort()).toEqual(["r1", "r2"]);
+  });
+
+  it("writes a component AGAIN once its releases have moved since the marks", async () => {
+    // A reschedule, a cancel, an edit or a membership change raises the
+    // release's revision, so marks left by an earlier pass are stale.
+    const members = [
+      member({ id: "a", releaseId: "r1", entryId: "e1" }),
+      member({ id: "b", releaseId: "r1", entryId: "e2" }),
+    ];
+    const marks = new Map([
+      ["a", 0],
+      ["b", 0],
+    ]);
+    const publish = vi.fn(async () => {});
+
+    const moved = await applyDueReleases(
+      deps({
+        releases: [release({ id: "r1", revision: 1 })],
+        members,
+        marks,
+        mutations: { publish },
+      })
+    );
+
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(moved).toMatchObject({ applied: 2, failed: 0, published: 1 });
+    // Marked afresh, for the revision the release now stands at.
+    expect([...marks.values()]).toEqual([1, 1]);
+  });
+
+  it("asks the schedule before accepting a mark, so a POSTPONED release is not reported applied", async () => {
+    // Marked for the revision this pass planned against, but postponed since
+    // the plan was loaded: the mark describes the old schedule.
+    const marked: string[] = [];
+    const publish = vi.fn(async () => {});
+    const result = await applyDueReleases(
+      deps({
+        releases: [release({ id: "r1", revision: 4 })],
+        members: [member({ id: "a", entryId: "e1" })],
+        marks: new Map([["a", 4]]),
+        rescheduledTo: new Date("2099-01-01T00:00:00.000Z"),
+        mutations: { publish },
+        marked,
+      })
+    );
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(result.outcomes[0]?.failure).toBe("RELEASE_NO_LONGER_SCHEDULED");
+    expect(marked).toEqual([]);
+  });
+
+  it("settles a release fenced on the revision and instant the pass PLANNED against", async () => {
+    // The repository refuses the settlement of a release moved since, so the
+    // fence it is handed has to be the plan's, not whatever the row says now.
+    const settle = vi.fn(async (entries: readonly { id: string }[]) =>
+      entries.map(e => e.id)
+    );
+    const d = deps({ releases: [release({ id: "r1", revision: 7 })] });
+    await applyDueReleases({
+      ...d,
+      repository: { ...d.repository, markReleasesPublished: settle },
+    });
+
+    expect(settle).toHaveBeenCalledWith(
+      [{ id: "r1", revision: 7, scheduledAt: PAST }],
+      NOW
+    );
+  });
+
+  it("settles a component WHOLE, in one call, or not at all", async () => {
+    // Two releases sharing a document: an earlier publish and a later
+    // takedown. Settled one at a time, a refusal of the earlier one (renamed
+    // since the plan) would still settle the later, and the next pass would
+    // make the earlier the winner and republish the page.
+    const settle = vi.fn(
+      async (
+        _entries: readonly {
+          id: string;
+          revision: number;
+          scheduledAt: Date;
+        }[],
+        _at: Date
+      ): Promise<readonly string[]> => []
+    );
+    const d = deps({
+      releases: [
+        release({ id: "early", revision: 2 }),
+        release({ id: "late", revision: 5, scheduledAt: NOW }),
+      ],
+      members: [
+        member({ releaseId: "early", entryId: "page", action: "publish" }),
+        member({ releaseId: "late", entryId: "page", action: "unpublish" }),
+      ],
+    });
+    const result = await applyDueReleases({
+      ...d,
+      repository: { ...d.repository, markReleasesPublished: settle },
+    });
+
+    expect(settle).toHaveBeenCalledTimes(1);
+    expect(settle.mock.calls[0]?.[0]).toEqual(
+      expect.arrayContaining([
+        { id: "early", revision: 2, scheduledAt: PAST },
+        { id: "late", revision: 5, scheduledAt: NOW },
+      ])
+    );
+    expect(settle.mock.calls[0]?.[0]).toHaveLength(2);
+    // The repository settled none, so the pass reports none.
+    expect(result.published).toBe(0);
+  });
+
+  it("counts members ALREADY marked for the current revision as applied, without writing", async () => {
+    const marked: string[] = [];
+    const publish = vi.fn(async () => {});
+    const result = await applyDueReleases(
+      deps({
+        releases: [release({ id: "r1", revision: 4 })],
+        members: [member({ id: "a", entryId: "e1" })],
+        marks: new Map([["a", 4]]),
+        mutations: { publish },
+        // An author nobody could resolve: a member marked applied is not
+        // judged again, because its write already was.
+        runAs: { findUser: async () => null },
+        marked,
+      })
+    );
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ applied: 1, failed: 0, published: 1 });
+    expect(marked).toEqual(["r1"]);
+  });
+
+  it("does NOT discharge a release whose actions it never started", async () => {
+    // The trap a naive cap walks into. An unattempted action leaves NO outcome,
+    // and the discharge test reads outcomes — so without holding it open, the
+    // release is marked published, loses its read-time projection, and loses
+    // the members that never ran. A pass that reported success having done half
+    // the work looks exactly like one that had less to do.
+    const marked: string[] = [];
+    let tick = 0;
+    const d = deps({
+      releases: [release({ id: "r1" }), release({ id: "r2" })],
+      members: [
+        member({ id: "a", releaseId: "r1", entryId: "e1" }),
+        member({ id: "b", releaseId: "r2", entryId: "e2" }),
+      ],
+      marked,
+    });
+    await applyDueReleases({
+      ...d,
+      now: () => new Date(NOW.getTime() + tick++ * 1000),
+      deadline: new Date(NOW.getTime() + 500),
+    });
+
+    // r1 was performed and may discharge; r2 was never started and must not.
+    expect(marked).toEqual(["r1"]);
+  });
+
+  it("does not let a failing component starve the healthy ones", async () => {
+    // Head-of-line blocking, and it needs no process kill. The first component
+    // is exempt from the deadline — something must run — so with a stable order
+    // a component whose action FAILS holds itself open and consumes the budget
+    // on every tick, while the healthy releases behind it are deferred forever.
+    // Each pass reports success.
+    //
+    // The passes are a FIXED 60-SECOND CADENCE apart, which is the shape a cron
+    // actually has. A rotation derived from the pass instant repeats forever
+    // whenever the period divides the component count — 30s, 60s and 300s all do
+    // for two components — so a test advancing one second per pass would pass
+    // against a fix that does nothing in production.
+    const publish = vi.fn(async (input: { ref: { entryId: string } }) => {
+      if (input.ref.entryId === "broken") throw new Error("refused");
+    });
+    // Deterministic stand-in for the random source, cycling the rotation.
+    let call = 0;
+    const rotations = [0, 0.5];
+    const seen: string[][] = [];
+    for (let pass = 0; pass < 2; pass += 1) {
+      publish.mockClear();
+      const at = new Date(NOW.getTime() + pass * 60_000);
+      const d = deps({
+        releases: [release({ id: "rBad" }), release({ id: "rGood" })],
+        members: [
+          member({ id: "x", releaseId: "rBad", entryId: "broken" }),
+          member({ id: "y", releaseId: "rGood", entryId: "healthy" }),
+        ],
+        mutations: {
+          // The failed write leaves no mark, so the failure reaches the
+          // outcome and there is something to starve behind.
+          publish:
+            publish as unknown as ApplyDueReleasesDeps["mutations"]["publish"],
+        },
+      });
+      await applyDueReleases({
+        ...d,
+        now: () => at,
+        random: () => rotations[call++ % rotations.length],
+        // Already spent, so only the exempt first component runs.
+        deadline: new Date(at.getTime() - 60_000),
+      });
+      seen.push(publish.mock.calls.map(c => c[0].ref.entryId));
+    }
+
+    // The healthy document is reached on one of the two passes. Pinned to a
+    // single rotation it is reached on neither, forever.
+    expect(seen.flat()).toContain("healthy");
+  });
+
+  it("bounds an INTERLEAVED backlog to one release's work, not all of it", async () => {
+    // The shape this guard is for, and the one it silently failed to bound. The
+    // planner groups by DOCUMENT and emits in first-seen order, so members
+    // alternating across releases yield `[r1, r2, r3, r1, r2, r3, …]`. In that
+    // order starting a release costs ONE action, so every release is started
+    // within the first pass over the documents, every later action belongs to a
+    // started release, and the loop runs the whole remainder.
+    //
+    // The clock advances with WORK DONE, not with clock reads. A per-read clock
+    // ticks once per component boundary either way, so it cannot tell the
+    // grouped order from the interleaved one — which is exactly how the first
+    // version of this test passed against both.
+    const publish = vi.fn(async () => {});
+    const d = deps({
+      releases: [
+        release({ id: "r1" }),
+        release({ id: "r2" }),
+        release({ id: "r3" }),
+      ],
+      members: [
+        member({ id: "a1", releaseId: "r1", entryId: "e1" }),
+        member({ id: "b1", releaseId: "r2", entryId: "e4" }),
+        member({ id: "c1", releaseId: "r3", entryId: "e7" }),
+        member({ id: "a2", releaseId: "r1", entryId: "e2" }),
+        member({ id: "b2", releaseId: "r2", entryId: "e5" }),
+        member({ id: "c2", releaseId: "r3", entryId: "e8" }),
+        member({ id: "a3", releaseId: "r1", entryId: "e3" }),
+        member({ id: "b3", releaseId: "r2", entryId: "e6" }),
+        member({ id: "c3", releaseId: "r3", entryId: "e9" }),
+      ],
+      mutations: { publish },
+    });
+    const result = await applyDueReleases({
+      ...d,
+      now: () => new Date(NOW.getTime() + publish.mock.calls.length * 1000),
+      deadline: new Date(NOW.getTime() + 2500),
+    });
+
+    // r1's three actions and nothing else. Ungrouped, all three releases would
+    // have started inside the budget and the loop would have run all nine.
+    expect(publish).toHaveBeenCalledTimes(3);
+    expect(result.deferred).toBe(6);
+  });
+
+  it("finishes a started release whose actions are NOT contiguous", async () => {
+    // The planner groups by DOCUMENT and emits in first-seen document order, so
+    // one release's actions can be interleaved with another's: `[r1, r2, r1]`.
+    // A guard that BREAKS at the first unstarted release would defer the
+    // trailing r1 too — leaving a release both started and unfinished, so the
+    // next tick rebuilds the same plan, repeats the first r1 write, and stops in
+    // the same place forever.
+    const publish = vi.fn(async () => {});
+    let tick = 0;
+    const d = deps({
+      releases: [release({ id: "r1" }), release({ id: "r2" })],
+      members: [
+        member({ id: "a", releaseId: "r1", entryId: "e1" }),
+        member({ id: "b", releaseId: "r2", entryId: "e2" }),
+        member({ id: "c", releaseId: "r1", entryId: "e3" }),
+      ],
+      mutations: { publish },
+    });
+    const result = await applyDueReleases({
+      ...d,
+      now: () => new Date(NOW.getTime() + tick++ * 1000),
+      deadline: new Date(NOW.getTime() + 500),
+    });
+
+    // BOTH of r1's actions ran; only r2 was deferred.
+    expect(publish).toHaveBeenCalledTimes(2);
+    expect(result.deferred).toBe(1);
+  });
+
+  it("reaches an applied component sitting BEHIND untouched ones", async () => {
+    // The exemption for applied components is only reached when a group is. So
+    // breaking out of finalization strands every applied component behind an
+    // untouched one — and a stranded applied component is the replay the
+    // exemption exists to prevent: its mutations, hooks and outbox writes all
+    // run again on the next tick, while `deferred` reports zero.
+    //
+    // Two empty releases first, then the one this pass actually performed.
+    const marked: string[] = [];
+    let tick = 0;
+    const d = deps({
+      releases: [
+        release({ id: "empty1" }),
+        release({ id: "empty2" }),
+        release({ id: "rApplied" }),
+      ],
+      members: [member({ id: "a", releaseId: "rApplied", entryId: "e1" })],
+      marked,
+    });
+    const result = await applyDueReleases({
+      ...d,
+      now: () => new Date(NOW.getTime() + tick++ * 1000),
+      deadline: new Date(NOW.getTime() + 1500),
+    });
+
+    // Reached despite the budget being spent on the empty ones before it.
+    expect(marked).toContain("rApplied");
+    // And what WAS skipped is reported — `deferred` cannot show it, because no
+    // action was omitted.
+    expect(result.deferred).toBe(0);
+    expect(result.undischarged).toBeGreaterThan(0);
+  });
+
+  it("bounds discharging of releases it did NOT apply", async () => {
+    // `plan.releaseIds` carries every due release "whether or not it contributed
+    // a winner", so a release with no due members reaches finalization having
+    // had no work done for it. A backlog of those is one serial write each, and
+    // it is what the budget is for now that applied components are exempt.
+    //
+    // Counted by ATTEMPT, not success: `markReleasePublished` answers `false`
+    // for a release an overlapping drain already settled, so gating on successes
+    // leaves the counter at zero and the check never fires.
+    const marked: string[] = [];
+    let tick = 0;
+    const d = deps({
+      releases: [
+        release({ id: "r1" }),
+        release({ id: "empty1" }),
+        release({ id: "empty2" }),
+        release({ id: "empty3" }),
+      ],
+      // Only r1 has a due member; the rest contribute no action at all.
+      members: [member({ id: "a", releaseId: "r1", entryId: "e1" })],
+      marked,
+      markRefuses: true,
+    });
+    await applyDueReleases({
+      ...d,
+      now: () => new Date(NOW.getTime() + tick++ * 1000),
+      deadline: new Date(NOW.getTime() + 1500),
+    });
+
+    // r1 was applied so it is discharged regardless; the empty ones are bounded.
+    expect(marked).toContain("r1");
+    expect(marked.length).toBeLessThan(4);
+  });
+
+  it("ALWAYS discharges every component it applied, even past the deadline", async () => {
+    // TWO applied components, because one cannot discriminate: the first is
+    // always discharged whatever the clock says, so a single-component fixture
+    // passes with or without the exemption.
+    //
+    // Leaving the second scheduled because the clock ran out makes the next tick
+    // plan and perform its content mutation AGAIN — rerunning hooks and
+    // appending outbox events for a write that already landed — while `deferred`
+    // reports zero, because nothing was skipped. A truncated pass would look
+    // clean and do the expensive half twice.
+    //
+    // The deadline sits between the action loop's clock read and finalization's
+    // second, so both components are applied and the second would be dropped
+    // without the exemption.
+    const marked: string[] = [];
+    let tick = 0;
+    const d = deps({
+      releases: [release({ id: "r1" }), release({ id: "r2" })],
+      members: [
+        member({ id: "a", releaseId: "r1", entryId: "e1" }),
+        member({ id: "b", releaseId: "r2", entryId: "e2" }),
+      ],
+      marked,
+    });
+    await applyDueReleases({
+      ...d,
+      now: () => new Date(NOW.getTime() + tick++ * 1000),
+      deadline: new Date(NOW.getTime() + 2500),
+    });
+
+    expect(marked).toEqual(["r1", "r2"]);
+  });
+
+  it("makes progress even when the budget is already spent", async () => {
+    // A budget too small for a single action must still move, or a backlog
+    // stalls forever while every pass reports success.
+    const publish = vi.fn(async () => {});
+    const d = deps({ mutations: { publish } });
+    const result = await applyDueReleases({
+      ...d,
+      now: () => NOW,
+      deadline: new Date(NOW.getTime() - 60_000),
+    });
+
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(result.deferred).toBe(0);
+  });
+
+  it("defers nothing when no deadline is set — the control", async () => {
+    // Absent means unbounded, which is right for a CLI and a test. A deadline
+    // that applied by default would make every case above pass while silently
+    // truncating ordinary passes.
+    const publish = vi.fn(async () => {});
+    const d = deps({
+      releases: [release({ id: "r1" }), release({ id: "r2" })],
+      members: [
+        member({ id: "a", releaseId: "r1", entryId: "e1" }),
+        member({ id: "b", releaseId: "r2", entryId: "e2" }),
+      ],
+      mutations: { publish },
+    });
+    const result = await applyDueReleases(d);
+
+    expect(result.deferred).toBe(0);
+    expect(publish).toHaveBeenCalledTimes(2);
+  });
+
+  it("asks nothing of the database when no release is due", async () => {
+    const listMembersOf = vi.fn(async () => []);
+    const d = deps({ releases: [] });
+    const result = await applyDueReleases({
+      ...d,
+      repository: { ...d.repository, listMembersOf },
+    });
+
+    expect(listMembersOf).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ due: 0, published: 0, applied: 0 });
+  });
+
+  it("loads the members of EVERY due release in one query", async () => {
+    // The regression this guards is latency, not an answer: asking per release
+    // put one serial round trip per due release in front of the first content
+    // mutation. Counting the calls is the only way to observe that, because
+    // both shapes return the same members and every later assertion passes
+    // either way.
+    const listMembersOf = vi.fn(async (ids: string[]) =>
+      // DISTINCT documents. Two members of one document collapse to a single
+      // winning action, and the count assertion below would then pass on an
+      // implementation that had loaded only one release's members.
+      [
+        member({ releaseId: "r1", entryId: "e1" }),
+        member({ releaseId: "r2", entryId: "e2" }),
+      ].filter(m => ids.includes(m.releaseId))
+    );
+    const d = deps({
+      releases: [release({ id: "r1" }), release({ id: "r2" })],
+    });
+    const result = await applyDueReleases({
+      ...d,
+      repository: { ...d.repository, listMembersOf },
+    });
+
+    expect(listMembersOf).toHaveBeenCalledTimes(1);
+    expect(listMembersOf).toHaveBeenCalledWith(["r1", "r2"]);
+    expect(result).toMatchObject({ due: 2, applied: 2, failed: 0 });
+  });
+
+  it("records a failed schedule check and STILL applies the other actions", async () => {
+    // The per-action "is this still scheduled?" read is an ordinary database
+    // read on the ordinary path. Unwrapped, one transient failure on the first
+    // action aborted the whole pass — every later action and every unrelated
+    // due release skipped, which reads exactly like nothing having been due.
+    const publish = vi.fn(async () => {});
+    const d = deps({
+      releases: [release({ id: "r1" }), release({ id: "r2" })],
+      members: [
+        member({ id: "bad", releaseId: "r1", entryId: "e1" }),
+        member({ id: "good", releaseId: "r2", entryId: "e2" }),
+      ],
+      mutations: { publish },
+    });
+    const result = await applyDueReleases({
+      ...d,
+      repository: {
+        ...d.repository,
+        isStillDueAt: async (id: string) => {
+          if (id === "r1") throw new Error("connection reset");
+          return true;
+        },
+      },
+    });
+
+    expect(result).toMatchObject({ due: 2, applied: 1, failed: 1 });
+    expect(result.outcomes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          memberId: "bad",
+          failure: "SCHEDULE_CHECK_FAILED",
+          detail: "connection reset",
+        }),
+        expect.objectContaining({ memberId: "good", failure: null }),
+      ])
+    );
+    // The action that could not be checked is not evidence of cancellation, so
+    // its release is held open for the next pass.
+    expect(publish).toHaveBeenCalledTimes(1);
+  });
+
+  it("applies the WINNER when a document sits in two due releases", async () => {
+    // Publish then unpublish, both due. The pass must reach one final state,
+    // and it must be the same one the read path reports.
+    const publish = vi.fn(
+      async (_input: { ref: unknown; user: unknown }) => {}
+    );
+    const unpublish = vi.fn(async () => {});
+    await applyDueReleases(
+      deps({
+        releases: [
+          release({ id: "r1", scheduledAt: PAST }),
+          release({
+            id: "r2",
+            scheduledAt: new Date("2026-02-01T00:00:00.000Z"),
+          }),
+        ],
+        members: [
+          member({ releaseId: "r1", action: "publish" }),
+          member({ releaseId: "r2", action: "unpublish" }),
+        ],
+        mutations: { publish, unpublish },
+      })
+    );
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(unpublish).toHaveBeenCalledTimes(1);
+  });
+  it("REFUSES a locale-scoped member instead of half-performing it", async () => {
+    // The read seam answers document-wide members only: `findDueDecisions`
+    // filters `locale IS NULL`, because per-locale lifecycle lives on the
+    // companion's `_status` and the main row it filters cannot express it.
+    //
+    // Performing the write anyway would apply an effect the read path refuses
+    // to project, AND the success check could not observe it: a read at a
+    // locale returns the MAIN row's status, so a per-locale unpublish that
+    // COMMITTED reads back unchanged, is reported WRITE_FAILED, and replays its
+    // hooks and outbox events on every drain forever.
+    const publish = vi.fn(async () => {});
+    const unpublish = vi.fn(async () => {});
+
+    const result = await applyDueReleases(
+      deps({
+        members: [member({ locale: "de", action: "publish" })],
+        mutations: { publish, unpublish },
+      })
+    );
+
+    expect(result.outcomes).toMatchObject([
+      { failure: "LOCALE_SCOPE_UNSUPPORTED" },
+    ]);
+    // Refused, not attempted: a write nothing can verify must not happen.
+    expect(publish).not.toHaveBeenCalled();
+    expect(unpublish).not.toHaveBeenCalled();
+  });
+
+  it("still performs a DOCUMENT-WIDE member on the same pass", async () => {
+    // The control. A guard that refused everything would satisfy the case
+    // above while disabling materialisation entirely.
+    const publish = vi.fn(async () => {});
+
+    const result = await applyDueReleases(
+      deps({
+        members: [member({ locale: null, action: "publish" })],
+        mutations: { publish },
+      })
+    );
+
+    expect(result).toMatchObject({ applied: 1, failed: 0 });
+    expect(publish).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("deciding which due releases a pass may settle", () => {
+  /** Due releases with nothing shared, each a component of its own. */
+  const backlog = (size: number): string[] =>
+    Array.from({ length: size }, (_, i) => `r${i}`);
+
+  it("does work linear in the due releases, not their square", () => {
+    // Counts every read of the due list, the decision's unit of work, rather
+    // than timing it: wall-clock time at one size varies between runs by more
+    // than a linear bound can tell apart.
+    const reads = (size: number): number => {
+      let count = 0;
+      const ids = backlog(size);
+      const releaseIds = new Proxy(ids, {
+        get(target, key, receiver) {
+          if (typeof key === "string" && /^\d+$/.test(key)) count += 1;
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      settleableComponents(
+        { releaseIds, overlappingReleases: ids.map(id => [id]) },
+        new Set()
+      );
+      return count;
+    };
+    expect(reads(8_000)).toBeLessThanOrEqual(4 * reads(2_000));
+  });
+
+  it("keeps a held-open release out, and every component in the planner's order", () => {
+    const plan = {
+      releaseIds: ["r1", "r2", "r3", "r4"],
+      overlappingReleases: [["r3", "r1"], ["r2"], ["r4"]],
+    };
+    expect(settleableComponents(plan, new Set(["r2"]))).toEqual([
+      ["r3", "r1"],
+      [],
+      ["r4"],
+    ]);
+  });
+
+  it("settles a large backlog of empty releases within one pass's deadline, in order", async () => {
+    // Twenty thousand due releases with nothing to apply, against a real clock
+    // and the two seconds a drain can be left with when another job has used
+    // most of the tick. The linear decision settles them in about a tenth of
+    // that, so a loaded worker still finishes; a decision that scanned the due
+    // list for each release grows with the square of the backlog and stops the
+    // pass partway through it. The test above proves the growth by counting
+    // work, without a clock.
+    const ids = Array.from({ length: 20_000 }, () => crypto.randomUUID());
+    const marked: string[] = [];
+    await applyDueReleases({
+      ...deps({
+        releases: ids.map(id => release({ id })),
+        members: [],
+        marked,
+      }),
+      now: () => new Date(),
+      deadline: new Date(Date.now() + 2_000),
+    });
+    expect(marked).toEqual(ids);
+  });
+});
+
+describe("a release nothing about retrying could fix is STOPPED", () => {
+  /** The releases this pass moved to `blocked`. */
+  function blockedBy(d: ReturnType<typeof deps>): string[] {
+    return vi
+      .mocked(d.repository.blockReleases)
+      .mock.calls.flatMap(call => call[0].map(entry => entry.id));
+  }
+
+  it("blocks a member whose author was never recorded", async () => {
+    // Left scheduled it is replanned every tick forever, and reads as healthy
+    // the whole time — the operator learns nothing until the launch does not
+    // happen.
+    const d = deps({ members: [member({ createdBy: null })] });
+    const result = await applyDueReleases(d);
+    expect(blockedBy(d)).toEqual(["r1"]);
+    expect(result.blocked).toBe(1);
+  });
+
+  it("blocks a member whose author has been DEACTIVATED", async () => {
+    // Found by breaking the classifier: with `AUTHOR_UNAVAILABLE` reclassified
+    // as retryable, the whole suite stayed green — so the commonest permanent
+    // failure of the three had no coverage at all. A departed colleague is the
+    // ordinary way a release becomes unrunnable.
+    const d = deps({
+      runAs: { findUser: async id => ({ id, isActive: false }) },
+    });
+    const result = await applyDueReleases(d);
+    expect(blockedBy(d)).toEqual(["r1"]);
+    expect(result.blocked).toBe(1);
+  });
+
+  it("blocks a locale-scoped member", async () => {
+    const d = deps({ members: [member({ locale: "de" })] });
+    await applyDueReleases(d);
+    expect(blockedBy(d)).toEqual(["r1"]);
+  });
+
+  it("does NOT block when the write merely failed", async () => {
+    // The control that carries the whole design. "Refused or errored" covers a
+    // dropped connection as well as a permission nobody will ever gain, and the
+    // two are indistinguishable here — so a momentary blip must not permanently
+    // halt a launch the next pass would have completed.
+    // The fixture's own way to say the write did not land, per its comment.
+    const d = deps({ marking: "never" });
+    const result = await applyDueReleases(d);
+    // It still FAILED — the release is held open and retried, which is the
+    // point. It is simply not stopped.
+    expect(result.failed).toBeGreaterThan(0);
+    expect(blockedBy(d)).toEqual([]);
+    expect(result.blocked).toBe(0);
+  });
+
+  it("fences the block on the instant the pass PLANNED against", async () => {
+    // An editor who postpones a due release between the plan and this write
+    // leaves the row in `scheduled`, so a state-only predicate would match and
+    // replace the schedule they just chose with `blocked`. The release would
+    // then never run at the replacement instant, and nothing would say why.
+    const d = deps({ members: [member({ createdBy: null })] });
+    await applyDueReleases(d);
+    const entry = vi.mocked(d.repository.blockReleases).mock.calls[0]?.[0]?.[0];
+    expect(entry?.scheduledAt).toBeInstanceOf(Date);
+    expect(entry?.scheduledAt.getTime()).toBe(release().scheduledAt?.getTime());
+  });
+
+  it("hands a whole overlapping COMPONENT over in ONE call", async () => {
+    // The structural property atomicity rests on. Two releases sharing a
+    // document are discharged together or not at all, so the repository has to
+    // receive them as one set — issued as two calls there is no transaction
+    // that could cover both, whatever the repository does internally.
+    //
+    // TIED INSTANTS deliberately, because that is the case no ordering can
+    // rescue: the engine breaks a tie on the MEMBER's creation time, per
+    // document, so each of these releases can win a different document and
+    // blocking either one first corrupts the other.
+    const d = deps({
+      releases: [release({ id: "r1" }), release({ id: "r2" })],
+      members: [
+        // Both name the SAME document, so only the winner acts — and on a tied
+        // instant and a tied creation time the winner is the higher member id,
+        // which is the one constructed second. So the broken member has to be
+        // that one, or the pass never reaches a permanent failure at all.
+        member({ releaseId: "r1", entryId: "e1" }),
+        member({ releaseId: "r2", entryId: "e1", createdBy: null }),
+      ],
+    });
+    await applyDueReleases(d);
+
+    const calls = vi.mocked(d.repository.blockReleases).mock.calls;
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.[0].map(entry => entry.id).sort()).toEqual(["r1", "r2"]);
+  });
+
+  it("skips a component it cannot fence COMPLETELY", async () => {
+    // A release with no planned instant cannot be fenced, so it cannot be
+    // blocked — and blocking the rest of its component is exactly the split
+    // this pass exists to prevent. Nothing moves, and the next pass re-plans
+    // against a set it can fence whole.
+    //
+    // `scheduledAt: null` is how a release reaches the pass without one.
+    const d = deps({
+      releases: [
+        release({ id: "r1" }),
+        release({ id: "r2", scheduledAt: null }),
+      ],
+      members: [
+        member({ releaseId: "r1", entryId: "e1" }),
+        // The winner, and unrunnable — see the note in the case above.
+        member({ releaseId: "r2", entryId: "e1", createdBy: null }),
+      ],
+    });
+    const result = await applyDueReleases(d);
+
+    expect(blockedBy(d)).toEqual([]);
+    expect(result.blocked).toBe(0);
+  });
+
+  it("blocks nothing when every member applies", async () => {
+    // The other control: without it, a pass that blocked everything it touched
+    // would satisfy the two positive cases above.
+    const d = deps({});
+    const result = await applyDueReleases(d);
+    expect(blockedBy(d)).toEqual([]);
+    expect(result.blocked).toBe(0);
+  });
+});
+
+describe("applyDueReleases asks whether each document going live is held back", () => {
+  const blockedIn = (d: ApplyDueReleasesDeps): string[] =>
+    vi
+      .mocked(d.repository.blockReleases)
+      .mock.calls.flatMap(call => call[0].map(entry => entry.id));
+
+  it("flushes a begun component whose approval question fails, as it flushes one held back", async () => {
+    // An earlier pass wrote one member; the question about the rest fails. Kept scheduled, the
+    // component shows a reader nothing more, so its pages are flushed as for any hold.
+    const done = member({ id: "m-done", entryId: "e1" });
+    const waiting = member({ id: "m-wait", entryId: "e2" });
+    const base = deps({
+      members: [done, waiting],
+      marks: new Map([["m-done", 0]]),
+    });
+    const revalidateReleases = vi.fn(async (_ids: readonly string[]) => {});
+    const d: ApplyDueReleasesDeps = {
+      ...base,
+      repository: { ...base.repository, revalidateReleases },
+      notApproved: async () => {
+        throw new Error("connection reset");
+      },
+    };
+
+    const result = await applyDueReleases(d);
+
+    expect(result.outcomes.map(outcome => outcome.failure)).toContain(
+      "APPROVAL_CHECK_FAILED"
+    );
+    expect(blockedIn(d)).toEqual([]);
+    expect(revalidateReleases.mock.calls.flatMap(([ids]) => ids)).toEqual([
+      "r1",
+    ]);
+  });
+
+  it("refuses a held publish without writing it, and stops its release rather than retrying it", async () => {
+    const publish = vi.fn(async () => {});
+    const held = member({ entryId: "e1" });
+    const d: ApplyDueReleasesDeps = {
+      ...deps({ members: [held], mutations: { publish } }),
+      notApproved: async documents =>
+        new Set(documents.map(document => document.id)),
+    };
+
+    const result = await applyDueReleases(d);
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(result.outcomes.map(outcome => outcome.failure)).toEqual([
+      "NOT_APPROVED",
+    ]);
+    expect(blockedIn(d)).toEqual(["r1"]);
+    expect(result).toMatchObject({ applied: 0, blocked: 1, published: 0 });
+  });
+
+  it("asks about every publish of a release before writing any, so a held later member leaves none of it live", async () => {
+    const publish = vi.fn(async () => {});
+    const unpublish = vi.fn(async () => {});
+    const first = member({ id: "m-first", entryId: "e1" });
+    const coming = member({
+      id: "m-down",
+      entryId: "e2",
+      action: "unpublish",
+    });
+    const later = member({ id: "m-later", entryId: "e3" });
+    const asked = vi.fn(
+      async (documents: readonly { id: string }[]) =>
+        new Set(
+          documents.map(document => document.id).filter(id => id === "m-later")
+        )
+    );
+    const d: ApplyDueReleasesDeps = {
+      ...deps({
+        members: [first, coming, later],
+        mutations: { publish, unpublish },
+      }),
+      notApproved: asked,
+    };
+
+    const result = await applyDueReleases(d);
+
+    // One question for the release's publishes, asked before its first write.
+    expect(asked.mock.calls.map(call => call[0].map(doc => doc.id))).toEqual([
+      ["m-first", "m-later"],
+    ]);
+    expect(publish).not.toHaveBeenCalled();
+    expect(unpublish).not.toHaveBeenCalled();
+    expect(
+      result.outcomes.map(outcome => [outcome.memberId, outcome.failure])
+    ).toEqual([
+      ["m-first", "NOT_APPROVED"],
+      ["m-down", "NOT_APPROVED"],
+      ["m-later", "NOT_APPROVED"],
+    ]);
+    // Only the held member is named as held; the others say what they wait for.
+    expect(
+      result.outcomes.find(outcome => outcome.memberId === "m-later")?.detail
+    ).toBeUndefined();
+    expect(
+      result.outcomes.find(outcome => outcome.memberId === "m-first")?.detail
+    ).toContain("m-later");
+    expect(blockedIn(d)).toEqual(["r1"]);
+    expect(result).toMatchObject({ applied: 0, blocked: 1, published: 0 });
+  });
+
+  it("keeps a release an earlier pass began scheduled when a later member is held, and finishes it once approved", async () => {
+    // Stopped, it would stay half live for good: the first document went live on a pass that was
+    // cut off, and nothing would ever write the second.
+    const publish = vi.fn(async () => {});
+    const done = member({ id: "m-done", entryId: "e1" });
+    const rest = member({ id: "m-rest", entryId: "e2" });
+    const notApproved = vi
+      .fn<NonNullable<ApplyDueReleasesDeps["notApproved"]>>()
+      .mockResolvedValueOnce(new Set(["m-rest"]))
+      .mockResolvedValue(new Set<string>());
+    const d: ApplyDueReleasesDeps = {
+      // The first member's mark, left by the pass that wrote it, for the release's revision.
+      ...deps({
+        members: [done, rest],
+        mutations: { publish },
+        marks: new Map([["m-done", 0]]),
+      }),
+      notApproved,
+    };
+
+    const first = await applyDueReleases(d);
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(
+      first.outcomes.find(outcome => outcome.memberId === "m-rest")?.failure
+    ).toBe("NOT_APPROVED");
+    expect(blockedIn(d)).toEqual([]);
+    expect(first).toMatchObject({ blocked: 0, published: 0 });
+
+    const second = await applyDueReleases(d);
+
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(second).toMatchObject({ blocked: 0, published: 1 });
+  });
+
+  it("counts a release as begun from a receipt the planner drops, a losing publish's included", async () => {
+    // r1 published e1 on a pass that was cut off; r2, due since, takes e1 down and wins it, so
+    // the plan holds r2's takedown and not r1's applied publish. r1's other document is held.
+    const unpublish = vi.fn(async () => {});
+    const d: ApplyDueReleasesDeps = {
+      ...deps({
+        releases: [
+          release(),
+          release({
+            id: "r2",
+            scheduledAt: new Date("2026-03-01T00:00:00.000Z"),
+          }),
+        ],
+        members: [
+          member({ id: "m-pub", releaseId: "r1", entryId: "e1" }),
+          member({ id: "m-held", releaseId: "r1", entryId: "e2" }),
+          member({
+            id: "m-down",
+            releaseId: "r2",
+            entryId: "e1",
+            action: "unpublish",
+          }),
+        ],
+        mutations: { unpublish },
+        marks: new Map([["m-pub", 0]]),
+      }),
+      notApproved: async documents =>
+        new Set(
+          documents.map(document => document.id).filter(id => id === "m-held")
+        ),
+    };
+
+    const result = await applyDueReleases(d);
+
+    expect(unpublish).not.toHaveBeenCalled();
+    expect(blockedIn(d)).toEqual([]);
+    expect(result).toMatchObject({ blocked: 0, published: 0 });
+  });
+
+  it("asks about the member it is about to publish, by its id and document", async () => {
+    const asked = vi.fn(
+      async (_documents: readonly { id: string; entryId: string }[]) =>
+        new Set<string>()
+    );
+    const d: ApplyDueReleasesDeps = {
+      ...deps({ members: [member({ id: "m-pub", entryId: "e7" })] }),
+      notApproved: asked,
+    };
+
+    const result = await applyDueReleases(d);
+
+    expect(asked.mock.calls.map(call => call[0])).toEqual([
+      [
+        {
+          id: "m-pub",
+          scopeKind: "collection",
+          scopeSlug: "posts",
+          entryId: "e7",
+        },
+      ],
+    ]);
+    expect(result).toMatchObject({ applied: 1, published: 1 });
+  });
+
+  it("never asks about a document coming down", async () => {
+    const asked = vi.fn(async () => new Set(["anything"]));
+    const unpublish = vi.fn(async () => {});
+    const d: ApplyDueReleasesDeps = {
+      ...deps({
+        members: [member({ action: "unpublish" })],
+        mutations: { unpublish },
+      }),
+      notApproved: asked,
+    };
+
+    const result = await applyDueReleases(d);
+
+    expect(asked).not.toHaveBeenCalled();
+    expect(unpublish).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ applied: 1, blocked: 0, published: 1 });
+  });
+
+  it("writes nothing and retries when the question itself fails, without stopping the release", async () => {
+    const publish = vi.fn(async () => {});
+    const notApproved = vi
+      .fn<NonNullable<ApplyDueReleasesDeps["notApproved"]>>()
+      .mockRejectedValueOnce(new Error("connection reset"))
+      .mockResolvedValue(new Set<string>());
+    const d: ApplyDueReleasesDeps = {
+      ...deps({ mutations: { publish } }),
+      notApproved,
+    };
+
+    const result = await applyDueReleases(d);
+
+    expect(publish).not.toHaveBeenCalled();
+    expect(result.outcomes[0]).toMatchObject({
+      failure: "APPROVAL_CHECK_FAILED",
+      detail: "connection reset",
+    });
+    expect(blockedIn(d)).toEqual([]);
+    expect(result).toMatchObject({ blocked: 0, published: 0 });
+
+    // The next pass, the question answered, writes the member and settles its release.
+    const retried = await applyDueReleases(d);
+
+    // Asked again about the same member, not published on the strength of nothing.
+    expect(
+      notApproved.mock.calls.map(call => call[0].map(doc => doc.entryId))
+    ).toEqual([["e1"], ["e1"]]);
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(retried).toMatchObject({ applied: 1, blocked: 0, published: 1 });
+  });
+});

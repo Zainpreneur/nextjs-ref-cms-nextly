@@ -1,0 +1,262 @@
+/**
+ * What a template mutation writes to the activity log, and what it must not.
+ *
+ * A template decides what Nextly's own password-reset and verification mail
+ * says, and `fromOverride` decides who it appears to come from. The trail is
+ * read by more people than the templates themselves, so its value depends on it
+ * naming what changed without carrying any of it.
+ */
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import Database from "better-sqlite3";
+import { drizzle } from "drizzle-orm/better-sqlite3";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+import { container } from "../../../di/container";
+import { getCoreSchema } from "../../../schemas";
+import type { LogActivityInput } from "../../../services/dashboard/activity-log-service";
+import type { Logger } from "../../../services/shared";
+import { SYSTEM_CONTEXT } from "../../../shared/types";
+import { createTableBody } from "../../schema/pipeline/sql-templates/create-table-body";
+import { EmailTemplateService } from "../services/email-template-service";
+import { EMAIL_TEMPLATE_ACTIVITY_COLLECTION } from "../template-activity";
+
+const ACTOR = { type: "user" as const, id: "user-1" };
+
+const logger: Logger = {
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+};
+
+const logged: LogActivityInput[] = [];
+
+function makeAdapter(db: ReturnType<typeof drizzle>): DrizzleAdapter {
+  return {
+    dialect: "sqlite" as const,
+    getDrizzle: () => db,
+    getCapabilities: () => ({ dialect: "sqlite" as const }),
+    connect: async () => {},
+    disconnect: async () => {},
+    executeQuery: async () => [],
+    transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(db),
+  } as unknown as DrizzleAdapter;
+}
+
+/** Rendered from the shipped core schema, never hand-copied DDL. */
+function createEmailTemplatesTable(sqlite: Database.Database): void {
+  const { tables } = getCoreSchema("sqlite");
+  const spec = tables.find(table => table.name === "email_templates");
+  if (!spec) {
+    expect.fail(
+      "email_templates is absent from the core schema — this fixture can no longer be derived from it."
+    );
+  }
+  sqlite.exec(
+    `CREATE TABLE "email_templates" (\n${createTableBody(spec, (id: string) => `"${id}"`)}\n)`
+  );
+}
+
+const INPUT = {
+  name: "Password reset",
+  slug: "password-reset",
+  subject: "Reset your password",
+  htmlContent: "<p>Hello {{name}}</p>",
+};
+
+describe("email template activity", () => {
+  let sqlite: Database.Database;
+  let service: EmailTemplateService;
+
+  beforeEach(() => {
+    sqlite = new Database(":memory:");
+    createEmailTemplatesTable(sqlite);
+    service = new EmailTemplateService(
+      makeAdapter(drizzle({ client: sqlite })),
+      logger
+    );
+
+    logged.length = 0;
+    vi.mocked(logger.error).mockClear();
+    container.register("activityLogService", () => ({
+      logActivity: (input: LogActivityInput) => {
+        logged.push(input);
+        return Promise.resolve();
+      },
+    }));
+  });
+
+  afterEach(() => {
+    sqlite.close();
+    container.clear();
+  });
+
+  it("records a create under its own collection", async () => {
+    const created = await service.createTemplate(INPUT, ACTOR);
+
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({
+      action: "create",
+      collection: EMAIL_TEMPLATE_ACTIVITY_COLLECTION,
+      entryId: created.id,
+      entryTitle: "Password reset",
+      userId: ACTOR.id,
+    });
+    // Filed apart from providers on purpose: one is a credential change and the
+    // other is a wording change, and the feed groups by this column.
+    expect(logged[0]?.collection).not.toBe("email-providers");
+  });
+
+  it("names the fields an update touched and carries none of their values", async () => {
+    const created = await service.createTemplate(INPUT, ACTOR);
+    logged.length = 0;
+
+    await service.updateTemplate(
+      created.id,
+      {
+        subject: "A completely different subject line",
+        fromOverride: "security@attacker.example",
+      },
+      ACTOR
+    );
+
+    expect(logged).toHaveLength(1);
+    const changed = (logged[0]?.metadata as { changedFields?: string[] })
+      ?.changedFields;
+    expect(changed).toEqual(
+      expect.arrayContaining(["subject", "fromOverride"])
+    );
+
+    // The whole entry, serialised. A value reaching ANY field of the row is the
+    // failure this guards, so the assertion is made against the row rather than
+    // against the one key it was expected to arrive in.
+    const serialised = JSON.stringify(logged[0]);
+    expect(serialised).not.toContain("A completely different subject line");
+    expect(serialised).not.toContain("security@attacker.example");
+  });
+
+  it("names cc, bcc and the description when they change, and carries none of their values", async () => {
+    // A site template: core's `password-reset` carries a secret and takes no
+    // copies at all.
+    const created = await service.createTemplate(
+      { ...INPUT, slug: "order-shipped", cc: ["kept@shop.example"] },
+      ACTOR
+    );
+    logged.length = 0;
+
+    await service.updateTemplate(
+      created.id,
+      {
+        cc: ["watcher@shop.example"],
+        bcc: ["silent@shop.example"],
+        description: "Sent when the parcel leaves the warehouse.",
+      },
+      ACTOR
+    );
+
+    expect(logged).toHaveLength(1);
+    const changed = (logged[0]?.metadata as { changedFields?: string[] })
+      ?.changedFields;
+    expect(changed).toEqual(
+      expect.arrayContaining(["cc", "bcc", "description"])
+    );
+    const serialised = JSON.stringify(logged[0]);
+    for (const value of [
+      "watcher@shop.example",
+      "silent@shop.example",
+      "kept@shop.example",
+      "Sent when the parcel leaves the warehouse.",
+    ]) {
+      expect(serialised).not.toContain(value);
+    }
+
+    // Clearing a list is a change too, and is named the same way.
+    logged.length = 0;
+    await service.updateTemplate(created.id, { bcc: null }, ACTOR);
+    expect(
+      (logged[0]?.metadata as { changedFields?: string[] })?.changedFields
+    ).toEqual(["bcc"]);
+  });
+
+  it("records nothing for an update that moved nothing", async () => {
+    const created = await service.createTemplate(INPUT, ACTOR);
+    logged.length = 0;
+
+    // The form submits every field whether or not the operator touched one.
+    await service.updateTemplate(
+      created.id,
+      { subject: INPUT.subject, htmlContent: INPUT.htmlContent },
+      ACTOR
+    );
+
+    expect(logged).toHaveLength(0);
+  });
+
+  it("records a delete with the name the row had", async () => {
+    const created = await service.createTemplate(INPUT, ACTOR);
+    logged.length = 0;
+
+    await service.deleteTemplate(created.id, ACTOR);
+
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({
+      action: "delete",
+      entryId: created.id,
+      // Read before the row went: after the delete there is nothing left to
+      // label the entry with.
+      entryTitle: "Password reset",
+    });
+  });
+
+  it("records nothing for a write with no signed-in actor", async () => {
+    await service.createTemplate(INPUT, null);
+    expect(logged).toHaveLength(0);
+  });
+
+  it("does not fail the mutation when the trail cannot be written", async () => {
+    // The write has already committed by the time recording runs, so reporting
+    // a failure here would tell the caller the opposite of the truth.
+    container.register("activityLogService", () => ({
+      logActivity: () => Promise.reject(new Error("activity log is down")),
+    }));
+
+    const created = await service.createTemplate(INPUT, ACTOR);
+    expect(created.name).toBe("Password reset");
+
+    // Not silent, though. A trail that stops being written must be visible
+    // somewhere, or it is indistinguishable from a system nobody is changing.
+    expect(logger.error).toHaveBeenCalledWith(
+      "Failed to record email template activity",
+      expect.objectContaining({ action: "create" })
+    );
+  });
+
+  it("records an API-key actor AS a key", async () => {
+    // Reachable in production: an API-key request produces `{ type: "apiKey" }`.
+    // This used to record nothing, because the row's only identity column was
+    // read as a user reference and a key's own id finds no account — so the
+    // write was dropped rather than filed as an already-erased person. The kind
+    // is on the row now, so the key is recorded as what it is.
+    await service.createTemplate(INPUT, { type: "apiKey", id: "key-1" });
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({ actorType: "apiKey", userId: "key-1" });
+  });
+
+  it("records nothing for the system actor", async () => {
+    // Boot-time seeding resolves to a USER actor carrying the reserved id, and
+    // no account owns it. Recording it as a user would attribute an internal
+    // write to a person who does not exist, so the kind is rewritten rather
+    // than the write refused.
+    const system = SYSTEM_CONTEXT.user;
+    if (!system) expect.fail("SYSTEM_CONTEXT carries no user to test against");
+    await service.createTemplate(INPUT, {
+      type: "user" as const,
+      id: system.id,
+    });
+    // Refused on ordering grounds: a plugin `init()` hook writes before
+    // pending migrations run, so on an upgraded database the insert would name
+    // a column `activity_log` does not have yet and fail the boot.
+    expect(logged).toHaveLength(0);
+  });
+});

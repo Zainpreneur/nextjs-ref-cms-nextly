@@ -1,0 +1,239 @@
+/**
+ * The dashboard knows which cards a person has before it draws or fetches any.
+ *
+ * The declared widgets are known from the workspace payload the moment the
+ * page mounts; the person's arrangement arrives with the layout read after.
+ * Drawing the declared cards in the meantime, and asking for their data, drew
+ * a dashboard the person may not have -- in another order, at other sizes,
+ * with cards they removed -- and then redrew it, which is the jump a reader
+ * sees and the layout shift that measures it.
+ */
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { DASHBOARD_LAYOUT_KEY } from "@admin/hooks/queries/useDashboardLayout";
+import { protectedApi } from "@admin/lib/api/protectedApi";
+import type { AdminBranding } from "@admin/types/branding";
+import type { DashboardLayoutResponse } from "@admin/types/dashboard/widgets";
+
+import { WidgetGrid } from "../WidgetGrid";
+
+import { stubDashboardWidth, unstubDashboardWidth } from "./dashboard-width";
+
+vi.mock("@admin/context/providers/BrandingProvider", () => ({
+  useBranding: () => branding,
+  useBrandingStatus: () => ({
+    isPending: false,
+    isUnavailable: false,
+    isBrandingUnavailable: false,
+  }),
+}));
+vi.mock("@admin/hooks/useCurrentUserPermissions", () => ({
+  useCurrentUserPermissions: () => ({ hasPermission: () => true }),
+}));
+vi.mock("@admin/lib/api/protectedApi", () => ({
+  protectedApi: { get: vi.fn(), post: vi.fn(), put: vi.fn(), delete: vi.fn() },
+}));
+// The batch answered as the `protectedApi.post` mock above describes it; see `batch-over-post`.
+vi.mock("@admin/hooks/queries/widget-query-stream", async () =>
+  (
+    await import("@admin/hooks/queries/__tests__/batch-over-post")
+  ).streamOverPost()
+);
+
+const api = vi.mocked(protectedApi);
+
+/** Two declared count widgets, each card asked for by its id. */
+const branding = {
+  widgets: ["posts", "orders"]
+    .map(name => ({
+      id: `acme/${name}`,
+      title: `${name} count`,
+      archetype: "metric",
+      size: { default: { w: 3, h: 3 } },
+    }))
+    .concat([
+      {
+        // Declared six columns wide, so a card sized from its declaration and one
+        // sized from an arrangement that widens it are asked at different sizes.
+        id: "acme/recent",
+        title: "recent list",
+        archetype: "list",
+        size: { default: { w: 6, h: 3 }, max: { w: 12, h: 6 } },
+      } as never,
+    ]),
+} as unknown as AdminBranding;
+
+/** This person's arrangement: only the orders card. */
+const arrangement: DashboardLayoutResponse = {
+  placements: [
+    { id: "p-orders", widgetId: "acme/orders", w: 4, h: 3, removed: false },
+  ],
+  widgets: {
+    "acme/orders": {
+      allowsSeveral: false,
+    },
+  },
+  available: ["acme/posts"],
+  defaultPlacements: [],
+  version: 2,
+  source: "own",
+  // A row of dismissals at most: the reader still follows the default.
+  arranged: false,
+  scope: "tok",
+  audience: "aud",
+};
+
+/** The widgets every card asked for so far belongs to, across every batch. */
+function askedWidgets(): string[] {
+  return api.post.mock.calls.flatMap(([, body]) =>
+    ((body as { queries?: { widget: string }[] }).queries ?? []).map(
+      query => query.widget
+    )
+  );
+}
+
+function renderGrid(client: QueryClient) {
+  const Wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  );
+  return render(<WidgetGrid />, { wrapper: Wrapper });
+}
+
+function newClient() {
+  return new QueryClient({
+    defaultOptions: { queries: { retry: false, retryDelay: 0, gcTime: 0 } },
+  });
+}
+
+beforeEach(() => {
+  // A measured dashboard, so a card's first query is not held for a width.
+  stubDashboardWidth(1200);
+  vi.clearAllMocks();
+  api.post.mockResolvedValue({
+    results: [{ ok: true, result: { op: "count", total: 7 } }],
+  });
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  unstubDashboardWidth();
+});
+
+describe("before the arrangement is known", () => {
+  it("draws no card and asks for no card's data", async () => {
+    // A layout read that has not answered.
+    api.get.mockReturnValue(new Promise(() => undefined));
+    renderGrid(newClient());
+    // The dashboard's outline holds the grid's place while the arrangement
+    // is out.
+    expect(
+      await screen.findByTestId("widget-grid-loading")
+    ).toBeInTheDocument();
+    // 🔴 The separating case: both widgets are declared and could be drawn,
+    // and drawing the declared set is exactly what a page that did not wait
+    // would do.
+    expect(screen.queryByTestId(/^widget-cell-/)).toBeNull();
+    expect(api.post).not.toHaveBeenCalled();
+  });
+
+  it("draws and fetches only the person's own cards once it arrives", async () => {
+    let answer: (value: DashboardLayoutResponse) => void = () => undefined;
+    api.get.mockReturnValue(
+      new Promise<DashboardLayoutResponse>(resolve => {
+        answer = resolve;
+      })
+    );
+    renderGrid(newClient());
+    await screen.findByTestId("widget-grid-loading");
+    answer(arrangement);
+    expect(
+      await screen.findByTestId("widget-cell-acme/orders")
+    ).toBeInTheDocument();
+    await waitFor(() => expect(api.post).toHaveBeenCalled());
+    // The declared posts card is not in this arrangement: never drawn, never
+    // asked about.
+    expect(screen.queryByTestId("widget-cell-acme/posts")).toBeNull();
+    expect(askedWidgets()).toEqual(["acme/orders"]);
+    expect(
+      screen.queryByRole("status", { name: /loading your dashboard/i })
+    ).toBeNull();
+  });
+});
+
+describe("a return visit in the same session", () => {
+  it("draws the cached arrangement at once, while it is read again behind it", async () => {
+    const client = newClient();
+    client.setQueryData(DASHBOARD_LAYOUT_KEY, arrangement);
+    // Marked stale, so mounting reads the layout again; that read never
+    // answers here, and the cards must not wait for it.
+    await client.invalidateQueries({ queryKey: DASHBOARD_LAYOUT_KEY });
+    api.get.mockReturnValue(new Promise(() => undefined));
+    renderGrid(client);
+    expect(screen.getByTestId("widget-cell-acme/orders")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: /loading your dashboard/i })
+    ).toBeNull();
+    await waitFor(() => expect(askedWidgets()).toEqual(["acme/orders"]));
+  });
+});
+
+describe("when the arrangement cannot be read", () => {
+  it("draws the declared default rather than nothing", async () => {
+    api.get.mockRejectedValue(new Error("layout unavailable"));
+    renderGrid(newClient());
+    expect(
+      await screen.findByTestId("widget-cell-acme/posts")
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("widget-cell-acme/orders")).toBeInTheDocument();
+  });
+});
+
+describe("the first request a card makes", () => {
+  it("is sized for the width its arrangement gives it, not its declared one", async () => {
+    // As declared, the card is six columns by three rows. This person's arrangement draws it
+    // twelve by six, and its widget's `load` is handed the size it is drawn at.
+    // 🔴 A grid that sized from the declaration while the arrangement was on its way would ask
+    // at six by three first. The declared fallback (a FAILED read) cannot tell the two apart, so
+    // this is the case that does.
+    unstubDashboardWidth();
+    stubDashboardWidth(680);
+    api.get.mockResolvedValue({
+      ...arrangement,
+      placements: [
+        {
+          id: "p-recent",
+          widgetId: "acme/recent",
+          w: 12,
+          h: 6,
+          removed: false,
+        },
+      ],
+      widgets: {
+        "acme/recent": {
+          allowsSeveral: false,
+        },
+      },
+      available: [],
+    });
+    api.post.mockImplementation((_url, body) =>
+      Promise.resolve({
+        results: (body as { queries: unknown[] }).queries.map(() => ({
+          ok: true,
+          result: { op: "list", items: [] },
+        })),
+      })
+    );
+    renderGrid(newClient());
+    await waitFor(() => expect(api.post).toHaveBeenCalled());
+    const [, firstBody] = api.post.mock.calls[0];
+    const first = (
+      firstBody as {
+        queries: { widget: string; size?: { w: number; h: number } }[];
+      }
+    ).queries.find(query => query.widget === "acme/recent");
+    expect(first?.size).toMatchObject({ w: 12, h: 6 });
+  });
+});

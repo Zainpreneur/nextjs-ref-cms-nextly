@@ -1,0 +1,600 @@
+/**
+ * The editor's commit to the entry form it covers.
+ *
+ * The form owns the field's value and its dirty flag; the editor owns the
+ * document and its history until the author leaves. What crosses between them
+ * while the editor is open is here: the recovery point, the report that the
+ * editor holds unsaved work, the open passage finished before the document is
+ * stored, the exit that hands the document back, and the request that the
+ * admin's chrome step aside.
+ *
+ * @module @nextlyhq/plugin-page-builder/admin/editor/use-host-commit
+ */
+import type { BlockDocument } from "@nextlyhq/blocks-engine";
+import {
+  documentAfter,
+  endTypingRuns,
+  finishFieldEdit,
+  useFieldDraftHeld,
+  type InlineEditOutcome,
+} from "@nextlyhq/builder/shell";
+import {
+  useBeforeDocumentAction,
+  useDocumentActions,
+  useDocumentCheckpoint,
+  useReportUnsavedWork,
+  useSuppressAdminChrome,
+} from "@nextlyhq/plugin-sdk/admin";
+import { toast } from "@nextlyhq/ui";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type JSX,
+} from "react";
+import {
+  useFormState,
+  useWatch,
+  type Control,
+  type FieldValues,
+  type Path,
+} from "react-hook-form";
+
+import { usePageLayoutAsk } from "../page-layout";
+import { usePublishOffer } from "../publish-offer";
+import { useRemovalHold } from "../removal-hold-client";
+import { withValueAtPath } from "../snapshot-merge";
+
+import { RowCommitRefused } from "./row-commit";
+
+/**
+ * Record the LIVE document as this author's recovery point while the editor is
+ * open.
+ *
+ * The form cannot do this for itself. Its own recording writes the values it
+ * holds, and this field's value is deliberately not among them until the editor
+ * exits — so an author who spends twenty minutes laying out a page and then
+ * loses the tab has, from the form's point of view, changed nothing at all. The
+ * recording is what closes that gap; the commit-on-exit rule above is what
+ * makes it necessary, and neither is a workaround for the other.
+ *
+ * Recorded as the WHOLE document rather than as this field alone, because
+ * restoring a recovery point replaces the form's values wholesale: a snapshot
+ * carrying only the layout would restore cleanly and blank the title beside it.
+ *
+ * The very document the editor opened with is deliberately not recorded. It is
+ * what the server already holds, and storing it would offer the author their
+ * own unmodified page back as "unsaved changes from a moment ago".
+ */
+function useCheckpoints<TFieldValues extends FieldValues>({
+  name,
+  control,
+  document,
+}: {
+  name: Path<TFieldValues>;
+  control: Control<TFieldValues>;
+  document: BlockDocument;
+}): void {
+  const values = useWatch({ control });
+  const snapshot = useMemo(
+    () => withValueAtPath(values as Record<string, unknown>, name, document),
+    [values, name, document]
+  );
+
+  const { schedule } = useDocumentCheckpoint({ snapshot });
+
+  /*
+   * A new document object is what an edit produces — the editor's state is
+   * replaced rather than mutated — so reference inequality is the signal, and
+   * a render caused by anything else asks for nothing.
+   */
+  const openedWith = useRef(document);
+  useEffect(() => {
+    if (document === openedWith.current) return;
+    schedule();
+  }, [document, schedule]);
+}
+
+/**
+ * Whether anything in the editor is work the author has not saved.
+ *
+ * An OPEN inline edit counts, on top of the document's own history. Inline
+ * editing does not touch the document until an edit finishes, so `undoDepth` is
+ * still zero while an author is typing into a block — and a navigation or an
+ * access-driven removal at that moment tears the canvas down without a blur,
+ * leaving the guard as the only thing that could have asked first.
+ *
+ * Reported for an edit that is merely OPEN rather than one known to have
+ * changed something, because nothing here can tell those apart until the write
+ * happens. A prompt an author dismisses costs a click; the other direction
+ * costs the paragraph they were writing.
+ */
+export function hasUnsavedWork(
+  editor: { undoDepth: number },
+  inline: { editing: unknown; editingRich: unknown; inspecting?: boolean },
+  savedAt: SavedAt = 0
+): boolean {
+  return (
+    savedAt === "unreachable" ||
+    editor.undoDepth !== savedAt ||
+    inline.editing !== null ||
+    inline.editingRich !== null ||
+    // A passage open in an inspector field, whose words are in the shared
+    // editor alone until it is finished.
+    inline.inspecting === true
+  );
+}
+
+/**
+ * Where the editor's history stood when its document was last stored: an undo
+ * depth, or `"unreachable"` once an undo went below it. The document the editor
+ * opened with is the stored one, so it starts at 0.
+ */
+export type SavedAt = number | "unreachable";
+
+/**
+ * The editor's save point, moved by every store of the document it holds.
+ *
+ * The editor's history is its own, and a save does not touch it: measured
+ * from the opening document alone, an author who saved was still told the
+ * page held unsaved work, Save stayed offered, and leaving still warned. So
+ * the depth the history stood at when its document was stored is kept, and
+ * work is what lies away from it. An undo below that point takes the history
+ * somewhere no store has been, so the point is lost until the next store,
+ * and the work counts as unsaved meanwhile: a redo back to it reads as work
+ * that is in fact stored, which costs a prompt and never a page.
+ *
+ * A store counts only when the document committed to it is still the one on
+ * screen. An edit made while it was in flight is not in what it stored.
+ */
+export function useSavePoint(editor: {
+  document: BlockDocument;
+  undoDepth: number;
+}): { savedAt: SavedAt; committing: (document: BlockDocument) => void } {
+  const [savedAt, setSavedAt] = useState<SavedAt>(0);
+  if (typeof savedAt === "number" && editor.undoDepth < savedAt) {
+    setSavedAt("unreachable");
+  }
+  const committed = useRef<BlockDocument | null>(null);
+  const storedAt = useDocumentActions()?.storedAt ?? null;
+  const seen = useRef(storedAt);
+  useEffect(() => {
+    if (storedAt === seen.current) return;
+    seen.current = storedAt;
+    if (storedAt !== null && committed.current === editor.document) {
+      setSavedAt(editor.undoDepth);
+    }
+  }, [storedAt, editor.document, editor.undoDepth]);
+  const committing = useCallback((document: BlockDocument) => {
+    committed.current = document;
+  }, []);
+  return { savedAt, committing };
+}
+
+/**
+ * Finish whatever inline edit was open, and say what the host may now do.
+ *
+ * An inline edit lives in the element until it ends — that is what keeps the
+ * caret still while an author types — so the document a caller is holding is
+ * the one from before it, and committing that would save a page missing the
+ * words they were in the middle of writing.
+ *
+ * Says nothing to the author: the surface reports every finished edit through
+ * one callback, including the ones started here, so reporting again from this
+ * return value would announce the same edit twice.
+ *
+ * `mayClose` is separate from the document because the two answers differ: a
+ * refused passage changed nothing, so there is a perfectly good document to
+ * save, and the only thing that must not happen is unmounting the editor still
+ * holding the words.
+ */
+export function finishInlineEdit(
+  inline: { commit: () => InlineEditOutcome },
+  held: BlockDocument
+): { document: BlockDocument; mayClose: boolean } {
+  const outcome = inline.commit();
+  return {
+    document: documentAfter(outcome, held),
+    mayClose: outcome.status !== "refused",
+  };
+}
+
+/**
+ * The document a store takes: the one the edits Settings tabs hold make
+ * (`flushHeld`), else the one held, with any open passage finished on it.
+ */
+export function documentToStore(
+  inline: { commit: () => InlineEditOutcome },
+  held: BlockDocument,
+  flushHeld: (() => BlockDocument | null) | undefined
+): BlockDocument {
+  // A store ends every run of typing: a field still being typed in when the
+  // page is saved writes on into a new step, so the save point and the step
+  // it stored are one, and undo after the save takes back only what followed.
+  endTypingRuns();
+  return finishInlineEdit(inline, flushHeld?.() ?? held).document;
+}
+
+/**
+ * Whether this document holds unsaved work, from EITHER surface that writes it.
+ *
+ * Read by the Pages panel, which asks before leaving a page with unsaved work.
+ * The editor's `undoDepth` alone is its own history and says nothing about the
+ * form — so an author who renamed the page and touched no block would be told
+ * there was nothing to lose. Two surfaces write to one document, and this has
+ * to answer for both. (The page status pill does not read it: it reports the
+ * saved page, and the save chip reports unsaved work.)
+ *
+ * The blocks field is COUNTED here, and an earlier version excluded it. The
+ * reasoning for excluding it was that the editor owns that field and reports
+ * its own history, so counting it would double the undo depth or report saved
+ * work. Both halves were wrong. Double-counting cannot matter to a boolean, and
+ * the form's baseline advances on a successful submit — `useEntryForm` resets
+ * it — so a dirty blocks field means genuinely unsaved blocks.
+ *
+ * Excluding it lost the one case that has no other witness: an author who edits
+ * blocks, leaves the editor, and opens it again before saving. Leaving commits
+ * the document into the form, so the field is dirty; reopening builds a fresh
+ * editor whose `undoDepth` is zero. With the field excluded, nothing was left
+ * to say the document had unsaved work, and it read clean over blocks that
+ * had never been saved.
+ *
+ * The editor's own history is taken as an argument rather than combined at the
+ * call site, so "is this document dirty" is answered in one place. It is also
+ * one fewer branch inside the largest component in this package, which the
+ * complexity gate refuses to let grow.
+ *
+ * A draft still held in a block settings field counts too, from its first
+ * keystroke: it is in neither the history nor the form until the field is
+ * left, and the page shows its work as unsaved meanwhile.
+ */
+export function useDocumentDirty<TFieldValues extends FieldValues>(
+  control: Control<TFieldValues>,
+  editorDirty: boolean
+): boolean {
+  const { dirtyFields } = useFormState({ control });
+  const draftHeld = useFieldDraftHeld();
+  return editorDirty || draftHeld || Object.keys(dirtyFields).length > 0;
+}
+
+/**
+ * The document an editor going away hands the form: with the edits Settings
+ * tabs hold made first, since a tab's own cleanup runs only after this
+ * handover; nothing where nothing is unsaved and no tab held an edit.
+ */
+export function documentToHandOver(
+  editor: { document: BlockDocument; undoDepth: number },
+  inline: {
+    commit: () => InlineEditOutcome;
+    editing: unknown;
+    editingRich: unknown;
+  },
+  savedAt: SavedAt,
+  flushHeld: (() => BlockDocument | null) | undefined
+): BlockDocument | null {
+  const flushed = flushHeld?.() ?? null;
+  if (flushed === null && !hasUnsavedWork(editor, inline, savedAt)) {
+    return null;
+  }
+  return finishInlineEdit(inline, flushed ?? editor.document).document;
+}
+
+/**
+ * Hand unsaved work to the form when the editor goes without leaving.
+ *
+ * The editor can be unmounted from outside: a colleague takes the document
+ * over and the view turns read-only, and the lock's banner then promises the
+ * author their unsaved changes are still here. The editor holding them is
+ * gone, so the form has to hold them — committed into this browser's form
+ * only, which saves nothing, and from which the editor reopens when the author
+ * takes the document back.
+ *
+ * Only when there is work, and only once: a remount (React's strict mode
+ * runs one) finds nothing of its own to commit, and an exit that already
+ * handed the document over marks it so the unmount after it does nothing.
+ *
+ * An open passage is written first, as leaving writes it: its words are in the
+ * passage and not yet in `editor.document`, and handing over the document
+ * alone would drop the very text the banner says is still here. A LAYOUT
+ * effect's cleanup, because it runs while the canvas is still in the page and
+ * the passage can still answer; a passive one runs after the elements are gone.
+ * A refused write cannot keep the editor open here, as it can on leaving, so
+ * what is handed over is the document as it stands.
+ *
+ * @returns marks the current work as handed over
+ */
+function useCommitOnUnmount(
+  editor: { document: BlockDocument; undoDepth: number },
+  inline: {
+    commit: () => InlineEditOutcome;
+    editing: unknown;
+    editingRich: unknown;
+  },
+  onCommit: (value: BlockDocument) => void,
+  savedAt: SavedAt,
+  flushHeld: (() => BlockDocument | null) | undefined
+): () => void {
+  const latest = useRef({ editor, inline, onCommit, savedAt, flushHeld });
+  latest.current = { editor, inline, onCommit, savedAt, flushHeld };
+  const committed = useRef(false);
+  useLayoutEffect(
+    () => () => {
+      if (committed.current) return;
+      const held = latest.current;
+      const handing = documentToHandOver(
+        held.editor,
+        held.inline,
+        held.savedAt,
+        held.flushHeld
+      );
+      if (handing === null) return;
+      committed.current = true;
+      try {
+        held.onCommit(handing);
+      } catch (error) {
+        // The repeater row this field sits in is not where the editor was
+        // bound, so the write was refused rather than put in another row.
+        // Nothing can stay open to keep the work now; the recovery point
+        // recorded while editing still holds it. Anything else is not this
+        // refusal and is not swallowed.
+        if (!(error instanceof RowCommitRefused)) throw error;
+      }
+    },
+    []
+  );
+  return useCallback(() => {
+    committed.current = true;
+  }, []);
+}
+
+/**
+ * Tell the form this editor holds work its values do not contain, so the
+ * navigation guard warns and the save shortcut works while the canvas is
+ * open. `undoDepth` rather than comparing documents: an edit and its undo
+ * leave a document equal to the original but not identical to it, so a
+ * reference comparison would report work that was taken back.
+ *
+ * Retracted when the editor unmounts, which is the same moment `done`
+ * commits the document and makes the form dirty for real.
+ *
+ * Reported under the field's address, not its form path: inside a
+ * repeater's row the path changes when the row moves under the open editor,
+ * and a report under the old path would stay behind with nothing left to
+ * retract it, keeping the document marked unsaved after a save or exit.
+ *
+ * A draft held in a block settings field is reported too, so the save
+ * shortcut works and leaving warns from its first keystroke.
+ */
+function useUnsavedWorkReport(
+  address: string,
+  editor: { undoDepth: number },
+  inline: { editing: unknown; editingRich: unknown },
+  savedAt: SavedAt,
+  otherUnsavedWork: boolean
+): void {
+  const draftHeld = useFieldDraftHeld();
+  useReportUnsavedWork(
+    `blocks:${address}`,
+    hasUnsavedWork(editor, inline, savedAt) || otherUnsavedWork || draftHeld
+  );
+}
+
+/**
+ * Everything the open editor tells the form, in the order it tells it.
+ *
+ * One hook so the four channels below keep their order relative to one
+ * another: each subscribes to or reports into the form, and they are read
+ * together on the way out.
+ *
+ * The editor is taken by the two facts read from it, and the inline surface
+ * by the three, so this module needs nothing from the one that builds them.
+ */
+export function useHostCommit<TFieldValues extends FieldValues>({
+  name,
+  address,
+  control,
+  editor,
+  inline,
+  onCommit,
+  onClose,
+  savePoint,
+  removalReach,
+  flushHeld,
+  otherUnsavedWork = false,
+}: {
+  name: Path<TFieldValues>;
+  /**
+   * The field's address, which stays the same while `name` follows a
+   * repeater's row to a new position: what unsaved work is reported under.
+   */
+  address: string;
+  control: Control<TFieldValues>;
+  editor: { document: BlockDocument; undoDepth: number };
+  inline: {
+    commit: () => InlineEditOutcome;
+    editing: unknown;
+    editingRich: unknown;
+  };
+  onCommit: (value: BlockDocument) => void;
+  onClose: () => void;
+  /** Where the history stood at the last store; see `useSavePoint`. */
+  savePoint: ReturnType<typeof useSavePoint>;
+  /**
+   * For a component, how many documents placing it the removal dialog says
+   * now. The hold keeps the number as it stood when each field was removed:
+   * the count a publish removing fields confirms (see `useRemovalHold`).
+   */
+  removalReach?: () =>
+    | { readonly count: number; readonly complete: boolean }
+    | undefined;
+  /** The edits Settings tabs hold, made before a store (`SettingsPlace`). */
+  flushHeld?: () => BlockDocument | null;
+  /**
+   * Work the editor holds in another document than the field's (a header
+   * edited in place), reported with the field's so the leave guard asks.
+   */
+  otherUnsavedWork?: boolean;
+}): {
+  done: () => void;
+  /**
+   * The question asked before every publish (see `usePublishOffer`), to be
+   * rendered anywhere inside the editor.
+   */
+  publishOffer: JSX.Element;
+  /** The question asked again when a removal's count grew, rendered likewise. */
+  removalHold: JSX.Element;
+} {
+  useCheckpoints({ name, control, document: editor.document });
+
+  useUnsavedWorkReport(
+    address,
+    editor,
+    inline,
+    savePoint.savedAt,
+    otherUnsavedWork
+  );
+
+  /*
+   * Finish an open passage before the document is stored.
+   *
+   * An inline edit lives in the element until it ends, so the field still holds
+   * the value from before it, and a save taken while a passage is open would
+   * send the previous value and report success. The editor that hosts this asks
+   * every action that stores the document to wait for this first — the save
+   * shortcut, the Save and Publish buttons, a menu item — so no way of saving
+   * can leave a passage behind.
+   *
+   * Saved even when the passage was refused, and NOT closed either way. The
+   * document is right and complete for everything except the passage still
+   * open, so withholding the save would lose the rest of their work to protect
+   * a paragraph that is not going anywhere: it stays in the editor, on screen,
+   * and the message is what tells them it is still there.
+   *
+   * A draft still held in a block settings field is written first, as
+   * leaving the field would write it, with focus left where it is: Save from
+   * the keyboard is pressed from inside the field. The document is read after
+   * that, so it holds the draft.
+   */
+  // What the latest commit before a store handed the form, for a later
+  // handler in the same action that asks what is being stored.
+  const lastCommitted = useRef<BlockDocument | null>(null);
+  const latestDocument = useRef(editor.document);
+  useEffect(() => {
+    latestDocument.current = editor.document;
+  });
+  useBeforeDocumentAction(() => {
+    finishFieldEdit();
+    const committing = documentToStore(
+      inline,
+      latestDocument.current,
+      flushHeld
+    );
+    savePoint.committing(committing);
+    onCommit(committing);
+    lastCommitted.current = committing;
+  });
+  const storing = useCallback(
+    () => lastCommitted.current ?? latestDocument.current,
+    []
+  );
+
+  /*
+   * Asked before every publish: the components and Layout the document needs
+   * that are not live, with the offer to publish them too. Registered after
+   * the commit above, so it runs after it and judges the document it stored.
+   */
+  const publishOffer = usePublishOffer({
+    documents: () => [storing()],
+    ...usePageLayoutAsk(control),
+    subject: editor.document.kind === "component" ? "component" : "page",
+  });
+  /*
+   * A publish removing a component's fields, held at the count the designer
+   * confirmed. Registered last, so it runs after the questions above: a
+   * publish they call off takes no hold.
+   */
+  const removalHold = useRemovalHold({
+    document: storing,
+    editing: editor.document,
+    reach: () => removalReach?.(),
+  });
+
+  /*
+   * Writing back on the way out rather than on every keystroke.
+   *
+   * The form owns the value and its dirty flag; the editor owns the document
+   * and its history. Committing on each change would mark the entry dirty for
+   * an edit the author then undoes, and would make the form's undo and the
+   * editor's undo two answers to one question.
+   */
+  const markCommitted = useCommitOnUnmount(
+    editor,
+    inline,
+    onCommit,
+    savePoint.savedAt,
+    flushHeld
+  );
+  const done = useCallback(() => {
+    /*
+     * The open inline edit is finished FIRST, and the document it produced is
+     * the one handed over.
+     *
+     * An inline edit lives in the element until it ends — that is what keeps
+     * the caret still while an author types — so `editor.document` here is the
+     * one from before it. Committing that would hand the form a document
+     * missing the words the author was in the middle of writing, and the exit
+     * gesture is the most common way to leave a passage open. A draft still
+     * held in a block settings field is written before that, as a store
+     * writes it, and the document is read after it.
+     */
+    finishFieldEdit();
+    const finished = finishInlineEdit(inline, latestDocument.current);
+    /*
+     * A REFUSED commit kept the passage open because the author's words are in
+     * it and nowhere else. Closing unmounts the canvas and takes the editor
+     * with it, so leaving is declined until they deal with it — they have been
+     * told what happened, and their text is still where they left it.
+     */
+    if (!finished.mayClose) return;
+    try {
+      onCommit(finished.document);
+    } catch (error) {
+      // The row this field sits in is gone, or not where the editor was
+      // bound: nothing was written, so the editor stays open with the work in
+      // it, and the author is told why rather than left at a silent button.
+      if (!(error instanceof RowCommitRefused)) throw error;
+      toast.error(error.message);
+      return;
+    }
+    markCommitted();
+    onClose();
+  }, [inline, onCommit, onClose, markCommitted]);
+
+  /*
+   * The editor takes the window: the shell draws its own rail, panels, top bar
+   * and bottom bar, so admin chrome around it is a second set of the same
+   * furniture, and the canvas is the one surface whose purpose is the space it
+   * is given.
+   *
+   * `canExit` is derived from the handler passed to the shell as `onExit`, which
+   * is what decides whether a way back is rendered at all. The admin withholds
+   * the navigation rail from any surface that cannot be left, so a mount that
+   * ever stops rendering an exit keeps its rail automatically instead of
+   * stranding an author inside a full-screen editor.
+   */
+  useSuppressAdminChrome({
+    layers: [
+      "primaryRail",
+      "subSidebar",
+      "documentSidebar",
+      "header",
+      "pageFrame",
+    ],
+    canExit: true,
+  });
+
+  return { done, publishOffer, removalHold };
+}

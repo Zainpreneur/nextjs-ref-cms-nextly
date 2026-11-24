@@ -1,0 +1,53 @@
+/**
+ * What the widget declaration publishes, gathered for the package root.
+ *
+ * One list, so the root's export block names a module rather than five, and a
+ * reader finds the whole public surface of declared widgets in one place.
+ * Everything here is `@experimental`.
+ *
+ * @module domains/widgets/declaration/public
+ */
+
+export {
+  defineWidget,
+  type AnyWidget,
+  type WidgetAccess,
+  type WidgetAccessGate,
+  type WidgetCollectionDescription,
+  type WidgetCollectionField,
+  type WidgetComponentMap,
+  type WidgetCountWindow,
+  type WidgetData,
+  type WidgetDataInput,
+  type WidgetEmpty,
+  type WidgetInterval,
+  // The size a card's `load` is handed, beside the input it arrives in.
+  type WidgetLoadSize,
+  type WidgetPreviewCase,
+  type WidgetProps,
+  type WidgetRange,
+  type WidgetReadServices,
+  type WidgetRenderSize,
+  type WidgetSkeleton,
+  type WidgetSummary,
+  type WidgetSummaryCount,
+} from "./define-widget";
+export {
+  defineAttentionItem,
+  MAX_ATTENTION_ITEMS_PER_PLUGIN,
+  type AdminDashboardConfig,
+  type AttentionCount,
+  type AttentionItem,
+  type CoreWidgetId,
+  type DashboardContribution,
+  type DefaultLayoutCard,
+  type WidgetOverride,
+  type WidgetRef,
+} from "./dashboard";
+export type { CoreView, WidgetView } from "./displays";
+export {
+  setting,
+  type ChartStyle,
+  type DateRange,
+  type WidgetFilter,
+} from "./setting-builders";

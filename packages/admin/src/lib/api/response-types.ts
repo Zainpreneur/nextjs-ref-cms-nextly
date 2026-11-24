@@ -1,0 +1,150 @@
+import type { HookWarning } from "@admin/lib/mutation-warnings";
+
+/**
+ * Canonical response shape types for admin consumers.
+ *
+ * Mirrors `packages/nextly/src/api/response-shapes.ts` on the server
+ * so service modules and hooks can type their fetcher returns
+ * directly:
+ *
+ *   const result = await fetcher<ListResponse<User>>("/users");
+ *   const users = result.items;
+ *   const totalPages = result.meta.totalPages;
+ *
+ * For findByID and non-CRUD reads, the response is a bare `T` — no
+ * wrapper type needed. Just `fetcher<User>(...)` or
+ * `fetcher<{ permissions, ... }>(...)`.
+ */
+
+export type PaginationMeta = {
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+  hasNext: boolean;
+  hasPrev: boolean;
+  /**
+   * Set when the list counted no further than a cap because more entries
+   * match: `total` is then the cap, a lower bound shown as "1000+", and the
+   * paging fields still allow moving past it. Sent only to a list that asked
+   * for a capped count.
+   */
+  totalCapped?: true;
+  /**
+   * For a list walked by cursor: the `before` that reads the next page, when
+   * there is one. Lists paged by number never send it.
+   */
+  nextBefore?: string;
+};
+
+/** Paginated list response. Matches server's `respondList(items, meta)`. */
+export type ListResponse<T> = {
+  items: T[];
+  meta: PaginationMeta;
+};
+
+/** Mutation response. Matches server's `respondMutation(message, item)`. */
+export type MutationResponse<T> = {
+  message: string;
+  item: T;
+};
+
+/**
+ * Action / non-CRUD-mutation response. Matches server's
+ * `respondAction(message, result)`. Generic over `R` to capture
+ * endpoint-specific extras (login tokens, seed counts, etc.).
+ */
+export type ActionResponse<R = Record<string, unknown>> = {
+  message: string;
+} & R;
+
+/** Count response. Matches server's `respondCount(total)`. */
+export type CountResponse = {
+  total: number;
+};
+
+/**
+ * Per-item failure entry inside a `BulkResponse<T>`.
+ *
+ * `code` is a canonical NextlyErrorCode value (`NOT_FOUND`, `FORBIDDEN`,
+ * `VALIDATION_ERROR`, `CONFLICT`, `INTERNAL_ERROR`, etc.) so the admin
+ * UI can branch on it the same way it does for single-item errors.
+ * `message` is the public-safe NextlyError.publicMessage (no identifier
+ * echo; specifics live on the server in `logContext`).
+ */
+export type PerItemError = {
+  id: string;
+  code: string;
+  message: string;
+};
+
+/**
+ * Per-item failure entry inside a `BulkUploadResponse<T>`.
+ *
+ * Distinct from `PerItemError` because failed uploads do not have an id
+ * (the record was never created). The canonical key is `index`, the
+ * positional offset in the input array; `filename` is included for UX
+ * so the admin can render "couldn't upload <filename>" without lookup.
+ */
+export type BulkUploadError = {
+  index: number;
+  filename: string;
+  code: string;
+  message: string;
+};
+
+/**
+ * Bulk response for operations on existing records keyed by id.
+ *
+ * Matches server's `respondBulk(message, items, errors)`. Status is
+ * always 200 even on partial success: per-item failures are first-class
+ * data in `errors[]`, not server errors. Generic over `T` because the
+ * delete path returns `T = { id: string }` (no point materializing the
+ * full record after delete) while update/create return the full record
+ * (so the admin can refresh local state without a re-fetch).
+ */
+export type BulkResponse<T> = {
+  message: string;
+  items: T[];
+  errors: PerItemError[];
+  /**
+   * What the server has to say about the write beyond whether it succeeded.
+   *
+   * `respondBulk` already emits these — a post-commit hook failure, or an
+   * advisory about the state the write left behind — and the admin dropped them
+   * here, so an author publishing ten pages at once was told nothing that an
+   * author publishing one of them would have been told. Distinct from `errors`,
+   * which are per-ITEM failures that stopped a write: these describe writes that
+   * happened.
+   */
+  warnings?: HookWarning[];
+};
+
+/**
+ * Bulk response for upload-style operations creating new records from
+ * positional input. Matches server's `respondBulkUpload(message, items, errors)`.
+ *
+ * Distinct from `BulkResponse<T>` because failure entries are keyed by
+ * `index` + `filename`, not `id` (the record never got created). Same
+ * partial-success semantics: HTTP 200 with `errors[]` carrying failures.
+ */
+export type BulkUploadResponse<T> = {
+  message: string;
+  items: T[];
+  errors: BulkUploadError[];
+};
+
+/**
+ * Error response shape (canonical §10.1). Both `withErrorHandler`
+ * and the dispatcher path emit this shape; the admin client's
+ * `parseApiError.ts` reads it directly.
+ */
+export type ErrorResponse = {
+  error: {
+    code: string;
+    message: string;
+    messageKey?: string;
+    data?: Record<string, unknown>;
+    requestId: string;
+  };
+};

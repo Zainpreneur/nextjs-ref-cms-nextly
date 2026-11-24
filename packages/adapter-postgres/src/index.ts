@@ -1,0 +1,1718 @@
+/**
+ * @nextlyhq/adapter-postgres
+ *
+ * PostgreSQL database adapter for Nextly.
+ * Extends the base DrizzleAdapter from @nextlyhq/adapter-drizzle to provide
+ * PostgreSQL-specific functionality.
+ *
+ * @remarks
+ * This adapter uses the `pg` (node-postgres) driver for database connections
+ * and integrates with Drizzle ORM for type-safe queries.
+ *
+ * Features:
+ * - Connection pooling via pg.Pool
+ * - Full transaction support with savepoints
+ * - RETURNING clause support for all CRUD operations
+ * - PostgreSQL-specific error classification
+ * - JSONB support
+ * - Full-text search capabilities
+ * - Automatic retry for serialization failures and deadlocks
+ *
+ * @example
+ * Simple usage with connection string:
+ * ```typescript
+ * import { createPostgresAdapter } from '@nextlyhq/adapter-postgres';
+ *
+ * const adapter = createPostgresAdapter({
+ *   url: process.env.DATABASE_URL!,
+ * });
+ *
+ * await adapter.connect();
+ * ```
+ *
+ * @example
+ * Full configuration:
+ * ```typescript
+ * import { createPostgresAdapter } from '@nextlyhq/adapter-postgres';
+ *
+ * const adapter = createPostgresAdapter({
+ *   url: process.env.DATABASE_URL!,
+ *   pool: {
+ *     min: 2,
+ *     max: 20,
+ *     idleTimeoutMs: 30000,
+ *   },
+ *   ssl: {
+ *     rejectUnauthorized: true,
+ *   },
+ *   applicationName: 'my-nextly-app',
+ * });
+ * ```
+ *
+ * @example
+ * Using the adapter class directly:
+ * ```typescript
+ * import { PostgresAdapter } from '@nextlyhq/adapter-postgres';
+ * import type { PostgresAdapterConfig } from '@nextlyhq/adapter-postgres';
+ *
+ * const config: PostgresAdapterConfig = {
+ *   url: process.env.DATABASE_URL!,
+ * };
+ *
+ * const adapter = new PostgresAdapter(config);
+ * await adapter.connect();
+ * ```
+ *
+ * @packageDocumentation
+ */
+
+import * as net from "node:net";
+
+import { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+// F17: connect-time DB version check shared across all adapters.
+import { isNextBuildPhase } from "@nextlyhq/adapter-drizzle/build-phase";
+import { assertSchemaName } from "@nextlyhq/adapter-drizzle/schema-name";
+import {
+  isVercelFunction,
+  loadVercelPoolAttacher,
+} from "@nextlyhq/adapter-drizzle/serverless";
+import type {
+  PostgresAdapterConfig,
+  ConnectionInspection,
+  DatabaseCapabilities,
+  PoolStats,
+  TransactionBounds,
+  TransactionContext,
+  TransactionOptions,
+  SessionOptions,
+  StatementSession,
+  SqlParam,
+  InsertOptions,
+  DatabaseError,
+  DatabaseErrorKind,
+} from "@nextlyhq/adapter-drizzle/types";
+import {
+  createDatabaseError,
+  isDatabaseError,
+} from "@nextlyhq/adapter-drizzle/types";
+import { checkDialectVersion } from "@nextlyhq/adapter-drizzle/version-check";
+import type { AnyRelations, SQL } from "drizzle-orm";
+import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
+import {
+  getTableConfig,
+  pgTable,
+  timestamp,
+  type PgTable,
+} from "drizzle-orm/pg-core";
+import type { PoolClient, PoolConfig } from "pg";
+import { Pool } from "pg";
+
+import { reportPoolWaitTimeout } from "./pool-wait";
+import {
+  detectPostgresProvider,
+  getProviderDefaults,
+  type PostgresProvider,
+  type ProviderDefaults,
+} from "./provider";
+
+// Re-export types from @nextlyhq/adapter-drizzle for convenience
+export type {
+  PostgresAdapterConfig,
+  DatabaseCapabilities,
+  PoolStats,
+  TransactionContext,
+  TransactionOptions,
+  SqlParam,
+  // Additional types users might need
+  BaseAdapterConfig,
+  AdapterLogger,
+  PoolConfig as AdapterPoolConfig,
+  SslConfig,
+  WhereClause,
+  WhereCondition,
+  WhereOperator,
+  SelectOptions,
+  InsertOptions,
+  UpdateOptions,
+  DeleteOptions,
+  UpsertOptions,
+  OrderBySpec,
+  JoinSpec,
+  DatabaseError,
+  DatabaseErrorKind,
+} from "@nextlyhq/adapter-drizzle/types";
+
+/**
+ * A date field's column as the schema generator declares it on PostgreSQL:
+ * `timestamp`, without a time zone. Its encoder writes the UTC wall clock,
+ * which is what a `Date` bound to an undeclared key is spelled as.
+ */
+const DATE_FIELD_COLUMN = pgTable("nextly_date_field", {
+  at: timestamp("at"),
+}).at;
+
+/**
+ * Package version.
+ */
+export const VERSION = "0.1.0";
+
+/**
+ * Default pool configuration values.
+ *
+ * min: 0  – Never eagerly create background connections.  This is critical
+ *            for cold-start recovery (e.g. Neon auto-suspend): after the
+ *            initial smoke-test connection, the pool won't immediately try
+ *            to create additional connections that might still fail while
+ *            the DB is waking up.
+ *
+ * max: 5  – Conservative default to avoid overwhelming cloud databases
+ *            (Neon free-tier limit is ~25-30 simultaneous connections).
+ *            With Next.js spawning up to 7 build workers this keeps the
+ *            total connection count safely under typical limits.
+ */
+const DEFAULT_POOL_CONFIG = {
+  min: 0,
+  max: 5,
+  idleTimeoutMs: 30000,
+  connectionTimeoutMs: 15000,
+};
+
+/**
+ * PostgreSQL error codes mapping to DatabaseErrorKind.
+ *
+ * @see https://www.postgresql.org/docs/current/errcodes-appendix.html
+ */
+const PG_ERROR_CODES: Record<string, DatabaseErrorKind> = {
+  // Class 08 - Connection Exception
+  "08000": "connection",
+  "08003": "connection",
+  "08006": "connection",
+  "08001": "connection",
+  "08004": "connection",
+  "08007": "connection",
+  "08P01": "connection",
+
+  // Class 23 - Integrity Constraint Violation
+  "23000": "constraint",
+  "23001": "constraint",
+  "23502": "not_null_violation",
+  "23503": "foreign_key_violation",
+  "23505": "unique_violation",
+  "23514": "check_violation",
+  "23P01": "constraint",
+
+  // Class 40 - Transaction Rollback
+  "40000": "query",
+  "40001": "serialization_failure",
+  "40002": "constraint",
+  "40003": "query",
+  "40P01": "deadlock",
+
+  // Class 53 - Insufficient Resources: too_many_connections. The server has
+  // no connection to give, so the connect fails; retrying it at once would
+  // only ask again for what is not there, and the connect does not retry it.
+  "53300": "connection",
+
+  // Class 57 - Operator Intervention
+  "57014": "timeout",
+  "57P01": "connection",
+  "57P02": "connection",
+  "57P03": "connection",
+  // idle_session_timeout (PostgreSQL 14+): the server closed a connection the
+  // pool held idle past the server's limit.
+  "57P05": "connection",
+};
+
+/**
+ * Create the configured schema when the database does not have it yet.
+ *
+ * Looked up before it is created, because `CREATE SCHEMA IF NOT EXISTS` is not
+ * a no-op for a schema that exists: PostgreSQL checks the database-level
+ * `CREATE` privilege before it checks for the schema, so a role that may use
+ * and create objects in `public` but may not create schemas would fail to
+ * connect over a schema that is already there. Reading `pg_namespace` needs no
+ * privilege, so only a schema that is genuinely missing asks for one.
+ *
+ * Created inside a transaction holding an advisory lock on the schema's name,
+ * and looked up again once the lock is held. `IF NOT EXISTS` alone is not safe
+ * against itself: two processes connecting at the same moment can both pass its
+ * check, and the second to commit fails with a unique violation on
+ * `pg_namespace_nspname_index`, which fails its connect. The transaction-scoped
+ * lock makes the second wait for the first to commit, and its lookup, a new
+ * statement with a new snapshot, then finds the schema. The transaction is
+ * read committed whatever the database's or role's default: at repeatable
+ * read or serializable the snapshot is fixed by the first statement, the lock
+ * wait, so the lookup would miss the schema and the CREATE that followed would
+ * ask for the database privilege the first paragraph avoids. Released by the commit
+ * or rollback, so it never outlives this one connection's transaction, and a
+ * transaction-mode pooler keeps all of it on one server connection.
+ */
+async function ensureSchemaExists(
+  client: PoolClient,
+  schema: string
+): Promise<void> {
+  const name = assertSchemaName(schema);
+  if (await schemaExists(client, name)) return;
+  await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+  try {
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtext('nextly:create-schema'), hashtext($1))",
+      [name]
+    );
+    if (!(await schemaExists(client, name))) {
+      // Still `IF NOT EXISTS`: a process of an earlier version takes no lock.
+      await client.query(`CREATE SCHEMA IF NOT EXISTS ${name}`);
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  }
+}
+
+/** PostgreSQL's code for a schema that does not exist. */
+const INVALID_SCHEMA_NAME = "3F000";
+
+/**
+ * Fails, without creating it, when the database has no schema of this name:
+ * a read-only connect must not change the database, and a `search_path` that
+ * names a missing schema would quietly fall through to `public`.
+ */
+async function assertSchemaExists(
+  client: PoolClient,
+  schema: string,
+  /** What to do about it, where the caller knows: said after the fact. */
+  remedy?: string
+): Promise<void> {
+  const name = assertSchemaName(schema);
+  if (await schemaExists(client, name)) return;
+  throw createDatabaseError({
+    kind: "connection",
+    message:
+      remedy === undefined
+        ? `schema "${name}" does not exist`
+        : `schema "${name}" does not exist. ${remedy}`,
+    code: INVALID_SCHEMA_NAME,
+  });
+}
+
+/** Whether the database has a schema of this name. Needs no privilege. */
+async function schemaExists(
+  client: PoolClient,
+  name: string
+): Promise<boolean> {
+  const existing = await client.query(
+    "SELECT 1 FROM pg_namespace WHERE nspname = $1",
+    [name]
+  );
+  return existing.rows.length > 0;
+}
+
+/**
+ * The SQLSTATE an error carries: its own, or that of the driver error it
+ * wraps, as a Drizzle query error does.
+ */
+function sqlStateOf(error: unknown): string | undefined {
+  for (let at: unknown = error, hops = 0; hops < 4; hops++) {
+    if (typeof at !== "object" || at === null) return undefined;
+    const code: unknown = Reflect.get(at, "code");
+    if (typeof code === "string" && /^[0-9A-Z]{5}$/.test(code)) return code;
+    at = Reflect.get(at, "cause");
+  }
+  return undefined;
+}
+
+/**
+ * A serialization failure or a deadlock: the transaction lost a race, and
+ * running it again may succeed.
+ */
+function isSerializationFailure(error: unknown): boolean {
+  const code = sqlStateOf(error);
+  return code === "40001" || code === "40P01";
+}
+
+/**
+ * `@vercel/functions`' pool attaching, imported only on Vercel, at connect.
+ *
+ * An optional peer: an app outside Vercel never installs it, so the import is
+ * dynamic and its failure is a warning (`loadVercelPoolAttacher`), never a
+ * module that fails to load. The adapter is a server external package
+ * (`withNextly`'s `serverExternalPackages`), so Node resolves this at run time;
+ * the comments keep a bundler that bundles the adapter anyway from requiring
+ * the package at build time. The `db-connections` subpath loads the attaching
+ * alone, not the package's other helpers.
+ */
+function loadVercelDbConnections(): Promise<unknown> {
+  return import(
+    /* webpackIgnore: true */ /* turbopackIgnore: true */ "@vercel/functions/db-connections"
+  );
+}
+
+/**
+ * Delay helper for retry logic.
+ */
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Node 20+ defaults the Happy Eyeballs per-address connection-attempt timeout
+// to 250ms. For consumers connecting from a region with RTT > 250ms to their
+// database (typical transcontinental: Pakistan→Singapore is ~310ms),
+// every TCP attempt is killed mid-handshake and the pg driver reports
+// ETIMEDOUT after exhausting all DNS-resolved addresses — even though the
+// network is fine.
+//
+// We bump the timeout to 5000ms on first adapter connect. This is process-
+// global state but the change is purely permissive (only increases the
+// per-address budget; cannot break anything that worked at 250ms). If the
+// process has already set a higher value, we leave it alone.
+//
+// References:
+//   https://nodejs.org/api/net.html#netsetdefaultautoselectfamilyattempttimeoutvalue
+//   https://www.rfc-editor.org/rfc/rfc8305
+const HAPPY_EYEBALLS_MIN_TIMEOUT_MS = 5000;
+let happyEyeballsTimeoutApplied = false;
+function applyHappyEyeballsTimeoutOnce(): void {
+  if (happyEyeballsTimeoutApplied) return;
+  happyEyeballsTimeoutApplied = true;
+  try {
+    const current =
+      typeof net.getDefaultAutoSelectFamilyAttemptTimeout === "function"
+        ? net.getDefaultAutoSelectFamilyAttemptTimeout()
+        : 0;
+    if (current < HAPPY_EYEBALLS_MIN_TIMEOUT_MS) {
+      net.setDefaultAutoSelectFamilyAttemptTimeout(
+        HAPPY_EYEBALLS_MIN_TIMEOUT_MS
+      );
+    }
+  } catch {
+    // Older Node versions (< 20) don't have these APIs. Swallow — the
+    // 250ms default they have predates Happy Eyeballs anyway, so they
+    // don't suffer this bug.
+  }
+}
+
+/**
+ * How a date column's wall clock is spelled out when a write reads its row
+ * back: the stored value to the millisecond, with no zone for the driver to
+ * shift.
+ */
+const PG_WALL_CLOCK_FORMAT = 'YYYY-MM-DD"T"HH24:MI:SS.MS';
+
+/**
+ * The host a pooled client connected to, as node-postgres resolved it from its
+ * options, the connection string, `PGHOST` and its default; `undefined` when
+ * the client does not hold one.
+ */
+function resolvedHost(client: object): string | undefined {
+  return "host" in client &&
+    typeof client.host === "string" &&
+    client.host !== ""
+    ? client.host
+    : undefined;
+}
+
+/**
+ * PostgreSQL database adapter for Nextly.
+ *
+ * @remarks
+ * This class extends the base DrizzleAdapter to provide PostgreSQL-specific
+ * functionality including:
+ *
+ * - Connection pooling with pg.Pool
+ * - Transaction support with savepoints
+ * - PostgreSQL-specific error codes
+ * - JSONB and array type support
+ * - Full-text search
+ * - Automatic retry for serialization failures and deadlocks
+ *
+ * For most use cases, use the `createPostgresAdapter` factory function
+ * instead of instantiating this class directly.
+ *
+ * @example
+ * ```typescript
+ * import { PostgresAdapter } from '@nextlyhq/adapter-postgres';
+ *
+ * const adapter = new PostgresAdapter({
+ *   url: 'postgres://user:pass@localhost:5432/mydb',
+ * });
+ *
+ * await adapter.connect();
+ *
+ * // Use the adapter
+ * const users = await adapter.select('users', {
+ *   where: { and: [{ column: 'status', op: '=', value: 'active' }] },
+ * });
+ *
+ * await adapter.disconnect();
+ * ```
+ *
+ * @public
+ */
+export class PostgresAdapter extends DrizzleAdapter {
+  // getDrizzle memoization: drizzle v1's constructor builds a relational
+  // query builder per table in the relations config (~40 tables), and the
+  // service layer resolves an instance on every db access — construct once
+  // per relations object (identity-stable: the schema registry caches it
+  // and hands out a NEW object on invalidation, which naturally misses
+  // this cache and produces a fresh instance).
+  private drizzleByRelations = new WeakMap<AnyRelations, unknown>();
+  private drizzleBare: unknown;
+
+  /**
+   * The database dialect - always 'postgresql' for this adapter.
+   */
+  public readonly dialect = "postgresql" as const;
+
+  /**
+   * Adapter configuration.
+   */
+  protected readonly config: PostgresAdapterConfig;
+
+  /**
+   * Connection pool instance.
+   */
+  private pool: Pool | null = null;
+
+  /**
+   * Connection state flag.
+   */
+  private connected = false;
+
+  /**
+   * Auto-detected provider (Neon, Supabase, or standard).
+   * Set during connect() from DATABASE_URL pattern or DB_PROVIDER env var.
+   */
+  private detectedProvider: PostgresProvider = "standard";
+
+  /**
+   * Provider-specific connection defaults. Applied as fallbacks when
+   * user config doesn't specify a value.
+   */
+  private providerDefaults: ProviderDefaults = getProviderDefaults("standard");
+
+  /**
+   * Creates a new PostgreSQL adapter instance.
+   *
+   * @param config - Adapter configuration
+   */
+  constructor(config: PostgresAdapterConfig) {
+    super();
+    this.config = config;
+  }
+
+  /**
+   * Establishes a connection to the PostgreSQL database.
+   *
+   * @remarks
+   * This method initializes the connection pool and verifies connectivity
+   * by executing a simple query. It is idempotent - calling it multiple
+   * times will not create multiple pools.
+   *
+   * @throws {DatabaseError} If connection fails
+   */
+  async connect(): Promise<void> {
+    // Fix Node 20+ Happy Eyeballs default before constructing the pool —
+    // see applyHappyEyeballsTimeoutOnce above.
+    applyHappyEyeballsTimeoutOnce();
+
+    if (this.connected && this.pool) {
+      return;
+    }
+
+    // Auto-detect provider from URL and apply defaults. Inside Vercel
+    // functions the pool size and idle timeout are the serverless ones
+    // (`getProviderDefaults`), which the config still overrides field by field
+    // in `buildPoolConfig`.
+    const url = this.config.url || "";
+    const serverless = isVercelFunction();
+    this.detectedProvider = detectPostgresProvider(
+      url,
+      process.env.DB_PROVIDER
+    );
+    this.providerDefaults = getProviderDefaults(this.detectedProvider, {
+      serverless,
+    });
+
+    // Log detected provider for developer awareness
+    if (this.config.logger?.info) {
+      const source = process.env.DB_PROVIDER ? "(explicit)" : "(auto-detected)";
+      const pool = serverless ? ", Vercel pool defaults" : "";
+      this.config.logger.info(
+        `PostgreSQL provider: ${this.detectedProvider} ${source}${pool}`,
+        {}
+      );
+    }
+
+    // On Vercel, what hands each pool built below to `attachDatabasePool`;
+    // loaded once here, so a connect that retries warns at most once.
+    const attachPool = await loadVercelPoolAttacher({
+      load: loadVercelDbConnections,
+      dialect: "PostgreSQL",
+      logger: this.config.logger,
+    });
+
+    // Node.js network error codes that are safe to retry (transient failures).
+    // These cover cloud databases (e.g. Neon) waking from auto-suspend, brief
+    // network hiccups, and DNS resolution races during build parallelism.
+    const retryableNodeCodes = new Set([
+      "ETIMEDOUT",
+      "ECONNREFUSED",
+      "ECONNRESET",
+      "ENOTFOUND",
+      "EAI_AGAIN",
+    ]);
+
+    // Use provider-specific retry count (Neon needs more for cold starts)
+    const maxAttempts = this.providerDefaults.retryAttempts;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const poolConfig = this.buildPoolConfig();
+        // A request that waits out connectionTimeoutMillis for a connection
+        // fails as busy, not as an unexplained driver error.
+        this.pool = reportPoolWaitTimeout(
+          new Pool(poolConfig),
+          poolConfig.connectionTimeoutMillis
+        );
+
+        // Handle pool errors (background errors on idle clients)
+        this.pool.on("error", (err: Error) => {
+          // Log through adapter logger if configured
+          if (this.config.logger?.error) {
+            this.config.logger.error(err, {
+              context: "pool_error",
+              message: "Unexpected error on idle client",
+            });
+          }
+          // Client is automatically removed from pool, no action needed
+        });
+
+        // Attached as soon as it exists, as Vercel's docs say, so the smoke
+        // test's own connection is one `@vercel/functions` waits on as well:
+        // attached after it, that connection would sit idle untracked, and an
+        // instance suspended right after connecting would keep it open.
+        attachPool?.(this.pool);
+
+        // Verify connection with smoke test, then check dialect version.
+        // Why: F17 hard-fails at connect on unsupported PG versions (<15.0)
+        // so users see a clear upgrade pointer instead of cryptic errors
+        // mid-apply later. The version query runs inside the existing retry
+        // loop's try block, so transient network failures (Neon cold start,
+        // EAI_AGAIN) continue to retry; only confirmed version mismatch
+        // surfaces as UnsupportedDialectVersionError and exits the loop.
+        const client = await this.pool.connect();
+        try {
+          await client.query("SELECT 1");
+          // Before anything writes. `search_path` naming a schema that is not
+          // there does not fail — it falls through to whatever else is on the
+          // path — so the first migration would create its tables in `public`
+          // and the setting would appear to do nothing. A read-only
+          // connection and `next build`, which writes nothing to the
+          // database, only check that it is there.
+          if (this.config.schema && isNextBuildPhase()) {
+            // A schema the build does not find is a database the deploy has
+            // not migrated, which the message says how to fix.
+            await assertSchemaExists(
+              client,
+              this.config.schema,
+              "Run `nextly migrate` before `next build`."
+            );
+          } else if (this.config.schema && this.config.readOnly) {
+            await assertSchemaExists(client, this.config.schema);
+          } else if (this.config.schema) {
+            await ensureSchemaExists(client, this.config.schema);
+          }
+          await checkDialectVersion(client, "postgresql", {
+            // Why: route any future variant warnings through the adapter's
+            // logger. PG has no recognized variants today, but this keeps
+            // the integration symmetric with MySQL.
+            onWarning: msg => this.config.logger?.warn?.(msg),
+          });
+          this.connected = true;
+
+          if (this.config.logger?.info) {
+            this.config.logger.info("PostgreSQL connection established", {
+              host: this.config.host ?? "from URL",
+              database: this.config.database ?? "from URL",
+            });
+          }
+
+          return; // Success — exit retry loop
+        } finally {
+          client.release();
+        }
+      } catch (error) {
+        // Clean up the failed pool before deciding whether to retry
+        if (this.pool) {
+          await this.pool.end().catch(() => {});
+          this.pool = null;
+        }
+
+        const nodeError = error as { code?: string };
+        const isRetryable =
+          nodeError.code != null && retryableNodeCodes.has(nodeError.code);
+
+        if (isRetryable && attempt < maxAttempts) {
+          // Exponential back-off with jitter: ~1 s, ~2 s, ~3 s, ~4 s
+          const waitMs = 1000 * attempt;
+          const msg = `PostgreSQL connection attempt ${attempt}/${maxAttempts} failed with ${nodeError.code}, retrying in ${waitMs}ms...`;
+          if (this.config.logger?.warn) {
+            this.config.logger.warn(msg);
+          } else {
+            console.warn(`[PostgresAdapter] ${msg}`);
+          }
+          await delay(waitMs);
+          continue;
+        }
+
+        // Non-retryable error or exhausted retries — surface to caller
+        throw this.classifyError(error);
+      }
+    }
+  }
+
+  /**
+   * Closes the database connection and releases all pool resources.
+   *
+   * @remarks
+   * This method is idempotent - calling it multiple times is safe.
+   * It waits for all checked-out clients to be returned before shutting down.
+   */
+  async disconnect(): Promise<void> {
+    // Detach the pool FIRST, then drop the memoized drizzle instances —
+    // this closes the repopulation window where a concurrent getDrizzle()
+    // call during the (async) pool.end() could cache an instance wrapping
+    // the closing pool.
+    const pool = this.pool;
+    this.pool = null;
+    this.drizzleBare = undefined;
+    this.drizzleByRelations = new WeakMap();
+    if (!pool) {
+      return;
+    }
+
+    try {
+      await pool.end();
+
+      if (this.config.logger?.info) {
+        this.config.logger.info("PostgreSQL connection closed");
+      }
+    } finally {
+      this.connected = false;
+    }
+  }
+
+  /**
+   * Checks if the adapter is currently connected.
+   *
+   * @returns True if connected and pool is available
+   */
+  override isConnected(): boolean {
+    return this.connected && this.pool !== null;
+  }
+
+  /**
+   * Runs `work` on one client taken from the pool, outside a transaction,
+   * each statement committing as it runs, so connection-scoped state a
+   * statement sets (a temporary table, a session setting, an advisory lock)
+   * is still there for the next. The client is closed afterwards, whether
+   * `work` finished or threw, never handed back to the pool: that state ends
+   * with it instead of reaching a later caller. No `SessionOptions` field
+   * changes anything on PostgreSQL: strict mode is MySQL's, and PostgreSQL
+   * refuses an overlong value already.
+   */
+  override async withSession<T>(
+    work: (session: StatementSession) => Promise<T>,
+    _options?: SessionOptions
+  ): Promise<T> {
+    // A precondition: before any connection is taken.
+    this.refuseSessionInTransaction();
+    const pool = this.ensurePool();
+    // A checkout, taken from the pool like `executeQuery`'s queries are.
+    this.notePoolAccess();
+    let client: PoolClient;
+    try {
+      client = await pool.connect();
+    } catch (error) {
+      throw this.classifyError(error);
+    }
+    try {
+      return await work({
+        execute: async <R = unknown>(
+          statement: string,
+          params: SqlParam[] = []
+        ): Promise<R[]> => {
+          const startTime = Date.now();
+          try {
+            const result = await client.query(statement, params as unknown[]);
+            if (this.config.logger?.query) {
+              this.config.logger.query(
+                statement,
+                params,
+                Date.now() - startTime
+              );
+            }
+            return result.rows as R[];
+          } catch (error) {
+            throw this.classifyError(error, statement);
+          }
+        },
+      });
+    } finally {
+      client.release(true);
+    }
+  }
+
+  /**
+   * Executes a raw SQL query.
+   *
+   * @param sql - SQL statement with $1, $2, ... placeholders
+   * @param params - Query parameters
+   * @returns Array of result rows
+   *
+   * @throws {DatabaseError} If query execution fails
+   */
+  async executeQuery<T = unknown>(
+    sql: string,
+    params: SqlParam[] = []
+  ): Promise<T[]> {
+    const pool = this.ensurePool();
+    const startTime = Date.now();
+
+    // Transient network errors that are safe to retry at the query level.
+    // These occur when Neon auto-suspends between the pool smoke-test and the
+    // actual query, or when multiple build workers compete for cold-start.
+    const retryableNodeCodes = new Set([
+      "ETIMEDOUT",
+      "ECONNRESET",
+      "ECONNREFUSED",
+    ]);
+    const maxQueryAttempts = 3;
+
+    for (let attempt = 1; attempt <= maxQueryAttempts; attempt++) {
+      try {
+        // Outside the calling flow's transaction, if it has one (`notePoolAccess`).
+        this.notePoolAccess(sql);
+        const result = await pool.query(sql, params as unknown[]);
+
+        // Log query if logger configured
+        if (this.config.logger?.query) {
+          const durationMs = Date.now() - startTime;
+          this.config.logger.query(sql, params, durationMs);
+        }
+
+        return result.rows as T[];
+      } catch (error) {
+        const nodeError = error as { code?: string };
+        const isRetryable =
+          nodeError.code != null && retryableNodeCodes.has(nodeError.code);
+
+        if (isRetryable && attempt < maxQueryAttempts) {
+          const waitMs = 500 * attempt;
+          console.warn(
+            `[PostgresAdapter] Query attempt ${attempt}/${maxQueryAttempts} failed with ${nodeError.code}, retrying in ${waitMs}ms...`
+          );
+          await delay(waitMs);
+          continue;
+        }
+
+        throw this.classifyError(error, sql);
+      }
+    }
+
+    // Unreachable — loop always returns or throws
+    throw this.classifyError(new Error("executeQuery: exhausted retries"));
+  }
+
+  /**
+   * Executes a callback within a database transaction.
+   *
+   * @remarks
+   * PostgreSQL supports full ACID transactions with savepoints.
+   * If the callback throws, the transaction is rolled back.
+   *
+   * Supports automatic retry for serialization failures (40001) and
+   * deadlocks (40P01) when `retryCount` is specified in options.
+   *
+   * An error carrying the Nextly application brand is not classified: it is the
+   * application refusing the write, so it arrives at the caller as it was
+   * thrown. It is retried only when `retryWhen` accepts it, which is asked
+   * first, of every error; a refusal re-run is otherwise the same refusal.
+   * Every other error, including an unbranded one raised by the callback, is
+   * retried when it is a serialization failure or deadlock and classified on
+   * the way out.
+   *
+   * A call made inside another transaction's work joins it, on its client,
+   * as a savepoint: released when the callback resolves, rolled back to when
+   * it throws, so its failure undoes only its own part. A serialization
+   * failure or deadlock inside a joined part fails the whole transaction,
+   * which only a retry of the outermost one can answer. A joined call keeps
+   * the outer's options and is never retried itself.
+   *
+   * @param callback - Function to execute within the transaction
+   * @param options - Transaction options (isolation level, timeout, retry)
+   * @returns The result of the callback
+   *
+   * @throws {DatabaseError} If the transaction itself fails after all retries,
+   * or if the callback threw an error that does not carry the application brand
+   * @throws The callback's own error, unchanged, when it carries that brand
+   */
+  transaction<T>(
+    callback: (ctx: TransactionContext) => Promise<T>,
+    options?: TransactionOptions
+  ): Promise<T> {
+    return this.openOrJoin(callback, options, {
+      run: (_attempt, openedAt) => this.runAttempt(callback, options, openedAt),
+      retryable: isSerializationFailure,
+      describe: error => {
+        const code = sqlStateOf(error);
+        return { label: code ?? "a retryable error", detail: { code } };
+      },
+      logger: this.config.logger,
+    });
+  }
+
+  /** One attempt at an outermost transaction, on a client of its own. */
+  private async runAttempt<T>(
+    callback: (ctx: TransactionContext) => Promise<T>,
+    options: TransactionOptions | undefined,
+    openedAt: string | undefined
+  ) {
+    const pool = this.ensurePool();
+    // A checkout, taken from the pool like `executeQuery`'s queries are.
+    this.notePoolAccess();
+    // Read before the checkout, in the calling flow (`withTransactionBounds`).
+    const bounds = this.transactionBounds();
+    const client = await pool.connect();
+    // Set when the ROLLBACK failed. The client may then still be inside the
+    // transaction, so it is destroyed rather than pooled: the next request
+    // handed it would otherwise write into a transaction nobody commits.
+    let discard: Error | true | undefined;
+    // A bounded transaction's session may be ended by the server while no
+    // statement runs on it (`idle_in_transaction_session_timeout`), and
+    // node-postgres reports that as an `error` event on the checked-out
+    // client, which has no listener while checked out: unheard, it would end
+    // the process. Heard here, the transaction's next statement fails, and
+    // the client is destroyed rather than pooled.
+    const sessionEnded = (error: Error) => {
+      discard = error;
+    };
+    if (bounds?.idleMs !== undefined) client.on("error", sessionEnded);
+    const settled = await this.settleOutermost(
+      {
+        context: this.createTransactionContext(client),
+        join: this.joinSteps(client),
+        openedAt,
+        begin: () => this.beginTransaction(client, options, bounds),
+        // A transaction a failed statement aborted is not refused at COMMIT:
+        // PostgreSQL rolls it back and answers with the ROLLBACK command tag,
+        // raising nothing. A callback that caught its failed statement and
+        // returned would otherwise be told its writes committed when none of
+        // them were kept, so that answer is an error.
+        commit: async () => {
+          const committed = await client.query("COMMIT");
+          if (committed?.command === "ROLLBACK") {
+            throw createDatabaseError({
+              kind: "query",
+              code: "25P02",
+              message:
+                "The transaction was rolled back, not committed: a statement in it failed, and PostgreSQL ends such a transaction with a rollback when asked to commit.",
+            });
+          }
+        },
+        // A failure is recorded for the release and rethrown, so the base
+        // knows the ROLLBACK is unconfirmed.
+        rollback: async () => {
+          await client.query("ROLLBACK").catch((rollbackError: unknown) => {
+            discard = rollbackError instanceof Error ? rollbackError : true;
+            throw rollbackError;
+          });
+        },
+      },
+      callback,
+      options
+    );
+    if (bounds?.idleMs !== undefined) {
+      client.removeListener("error", sessionEnded);
+    }
+    // node-postgres destroys a client released with an error or `true`, and
+    // pools one released with nothing. Released before anything held runs,
+    // so an effect that opens a transaction takes one client, not two.
+    client.release(discard);
+    return settled;
+  }
+
+  /**
+   * How a call made inside a transaction on `client` joins it: a savepoint
+   * each, on `client`, named for its depth.
+   */
+  private joinSteps(client: PoolClient) {
+    return this.joinStepsOn(
+      () => this.createTransactionContext(client),
+      relations =>
+        relations ? drizzle({ client, relations }) : drizzle({ client }),
+      (context, depth) => {
+        const name = this.escapeIdentifier(`nextly_sp_${depth}`);
+        return {
+          context,
+          begin: async () => {
+            await client.query(`SAVEPOINT ${name}`);
+          },
+          commit: async () => {
+            await client.query(`RELEASE SAVEPOINT ${name}`);
+          },
+          rollback: async () => {
+            await client.query(`ROLLBACK TO SAVEPOINT ${name}`);
+            await client.query(`RELEASE SAVEPOINT ${name}`);
+          },
+          // Only a retry of the outermost transaction can answer these.
+          dooms: isSerializationFailure,
+        };
+      }
+    );
+  }
+
+  /**
+   * Returns the database capabilities for PostgreSQL.
+   *
+   * @remarks
+   * PostgreSQL has the most comprehensive feature set of all supported
+   * databases, including JSONB, arrays, full-text search, and more.
+   */
+  getCapabilities(): DatabaseCapabilities {
+    return {
+      dialect: "postgresql",
+      supportsJsonb: true,
+      supportsJson: true,
+      supportsArrays: true,
+      supportsGeneratedColumns: true,
+      supportsFts: true,
+      supportsIlike: true,
+      supportsReturning: true,
+      supportsSavepoints: true,
+      supportsOnConflict: true,
+      maxParamsPerQuery: 65535, // PostgreSQL limit
+      maxIdentifierLength: 63, // PostgreSQL default
+    };
+  }
+
+  /**
+   * The schema set as `search_path` on every pooled connection.
+   *
+   * @remarks
+   * Answers with the same test `buildPoolConfig` applies, so an empty string
+   * reports `undefined` exactly as it sets no `search_path`: the value
+   * reported is the one the connections actually use.
+   *
+   * @returns The configured schema, or `undefined` when the server's default
+   *   `search_path` applies
+   */
+  getConfiguredSchema(): string | undefined {
+    return this.config.schema ? this.config.schema : undefined;
+  }
+
+  /**
+   * Returns connection pool statistics.
+   *
+   * @returns Pool stats or null if not connected
+   */
+  override getPoolStats(): PoolStats | null {
+    if (!this.pool) {
+      return null;
+    }
+
+    return {
+      total: this.pool.totalCount,
+      idle: this.pool.idleCount,
+      waiting: this.pool.waitingCount,
+      active: this.pool.totalCount - this.pool.idleCount,
+    };
+  }
+
+  /**
+   * The connection as a health check reads it, on one pooled client: the
+   * server's version, and that client's own row in `pg_stat_ssl`, which says
+   * whether the session's connection is encrypted. The query is timed for the
+   * round trip.
+   *
+   * @remarks
+   * The row and the client's own socket are weighed by `encryptionOf`: behind
+   * a connection pooler such as PgBouncer the row describes the pooler's own
+   * connection to the server, which can be plain inside the provider's
+   * network while this client's socket is TLS. The socket is read as it is,
+   * never inferred from the `ssl` setting.
+   *
+   * Whether the database is on this machine is judged from the host the
+   * client connected to, as node-postgres resolved it (its options, the
+   * connection string, `PGHOST`, its default); before a client is had, from
+   * the configured address alone. The address never leaves this method. Any
+   * failure answers `"unknown"`.
+   */
+  override async inspectConnection(): Promise<ConnectionInspection> {
+    let local = this.isLocalHost(this.configuredHost());
+    let client: PoolClient | undefined;
+    try {
+      client = await this.ensurePool().connect();
+      local = this.isLocalHost(resolvedHost(client) ?? this.configuredHost());
+      const started = performance.now();
+      const result = await client.query<{
+        version: string | null;
+        ssl: boolean | null;
+      }>(
+        "SELECT current_setting('server_version') AS version, " +
+          "(SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()) AS ssl"
+      );
+      const roundTripMs = Math.max(0, Math.round(performance.now() - started));
+      const row = result.rows[0];
+      const version = row?.version?.split(" ")[0];
+      return {
+        encryption: this.encryptionOf({
+          session: typeof row?.ssl === "boolean" ? row.ssl : undefined,
+          ownSocketTls: this.ownSocketIsTls(client),
+        }),
+        local,
+        roundTripMs,
+        ...(version ? { serverVersion: version } : {}),
+      };
+    } catch {
+      return { encryption: "unknown", local };
+    } finally {
+      client?.release();
+    }
+  }
+
+  /**
+   * The host this adapter is configured with: the connection string's when one
+   * is set, else the `host` option. `undefined` when it names none, which is
+   * judged remote, or when the connection string cannot be read.
+   */
+  private configuredHost(): string | undefined {
+    const configured = this.config.url
+      ? this.hostOfUrl(this.config.url)
+      : (this.config.host ?? "");
+    return configured === "" ? undefined : configured;
+  }
+
+  /**
+   * Override insertMany for bulk insert optimization.
+   *
+   * @remarks
+   * Uses a single multi-row INSERT statement for better performance
+   * when inserting multiple records.
+   */
+  override async insertMany<T = unknown>(
+    table: string,
+    data: Record<string, unknown>[],
+    options?: InsertOptions
+  ): Promise<T[]> {
+    if (data.length === 0) {
+      return [];
+    }
+
+    // For single record, use parent implementation
+    if (data.length === 1) {
+      const result = await this.insert<T>(table, data[0], options);
+      return [result];
+    }
+
+    // Refused as the single-row insert is: a table this instance never
+    // registered may not match what its code would write.
+    this.resolvedTableObject(table);
+
+    // Build multi-row INSERT
+    const columns = Object.keys(data[0]);
+    const params: SqlParam[] = [];
+    const valuesClauses: string[] = [];
+
+    for (let i = 0; i < data.length; i++) {
+      const record = data[i];
+      const placeholders: string[] = [];
+
+      for (const col of columns) {
+        params.push(record[col] as SqlParam);
+        placeholders.push(`$${params.length}`);
+      }
+
+      valuesClauses.push(`(${placeholders.join(", ")})`);
+    }
+
+    const columnList = columns
+      .map(col => this.escapeIdentifier(col))
+      .join(", ");
+    let sql = `INSERT INTO ${this.escapeIdentifier(table)} (${columnList}) VALUES ${valuesClauses.join(", ")}`;
+
+    // Add RETURNING clause
+    if (options?.returning) {
+      const returning =
+        options.returning === "*"
+          ? "*"
+          : options.returning.map(col => this.escapeIdentifier(col)).join(", ");
+      sql += ` RETURNING ${returning}`;
+    }
+
+    try {
+      return await this.executeQuery<T>(sql, params);
+    } catch (error) {
+      throw this.handleQueryError(error, "insertMany", table);
+    }
+  }
+
+  // ============================================================
+  // Protected Helper Methods
+  // ============================================================
+
+  /**
+   * Ensures pool is connected and returns it.
+   *
+   * @throws {DatabaseError} If not connected
+   */
+  private ensurePool(): Pool {
+    if (!this.pool) {
+      throw createDatabaseError({
+        kind: "connection",
+        message: "PostgresAdapter is not connected. Call connect() first.",
+      });
+    }
+    return this.pool;
+  }
+
+  /**
+   * Return the typed Drizzle instance for PostgreSQL.
+   * Guarded for server-only usage and requires an active connection.
+   *
+   * @param schema - Optional schema for relational queries (db.query.*)
+   * @returns Drizzle ORM instance wrapping the pg pool connection
+   * @throws {Error} If called in browser or not connected
+   */
+  getDrizzle<T = NodePgDatabase<AnyRelations>>(relations?: AnyRelations): T {
+    if (typeof window !== "undefined") {
+      throw new Error("getDrizzle() is server-only");
+    }
+    const pool = this.ensurePool();
+    // drizzle v1 removed the positional (client, config) form — the object
+    // form is REQUIRED (positional silently treats the client as config).
+    // `relations` (defineRelations output, assembled by Nextly's schema
+    // registry) is what powers db.query in v1; a bare instance serves the
+    // select-builder CRUD paths.
+    if (!relations) {
+      this.drizzleBare ??= this.poolDrizzle(pool);
+      return this.drizzleBare as T;
+    }
+    let cached = this.drizzleByRelations.get(relations);
+    if (!cached) {
+      cached = this.poolDrizzle(pool, relations);
+      this.drizzleByRelations.set(relations, cached);
+    }
+    return cached as T;
+  }
+
+  /**
+   * A Drizzle handle on the pool, for `getDrizzle`.
+   *
+   * Its `transaction` runs on a client this adapter checks out and returns
+   * itself (`pinDrizzleTransactions`): node-postgres destroys a client
+   * released with `true`, which is what happens when no ROLLBACK could be
+   * confirmed on it. And it counts for `transactionOpenInFlow`, as the
+   * adapter's does.
+   */
+  private poolDrizzle(pool: Pool, relations?: AnyRelations) {
+    const onClient = (client: Pool | PoolClient) =>
+      relations ? drizzle({ client, relations }) : drizzle({ client });
+    // The handle's own queries go to the pool, so it is handed a view of the
+    // pool that reports them (`observedPool`).
+    const reported = this.observedPool(pool, ["query"]);
+    // Its transactions join the one the calling flow is inside, as the
+    // adapter's `transaction()` does, and open one of this adapter's
+    // otherwise (`joiningHandle`).
+    return this.joiningHandle(
+      onClient(reported),
+      async () => {
+        const client = await pool.connect();
+        return {
+          drizzle: onClient(client),
+          rollback: () => client.query("ROLLBACK"),
+          release: dirty => client.release(dirty),
+          join: this.joinSteps(client),
+        };
+      },
+      relations
+    );
+  }
+
+  /**
+   * Builds pg Pool configuration from adapter config.
+   */
+  private buildPoolConfig(): PoolConfig {
+    const config: PoolConfig = {};
+
+    // Connection string or explicit options
+    if (this.config.url) {
+      config.connectionString = this.config.url;
+    } else {
+      if (this.config.host) config.host = this.config.host;
+      if (this.config.port) config.port = this.config.port;
+      if (this.config.database) config.database = this.config.database;
+      if (this.config.user) config.user = this.config.user;
+      if (this.config.password) config.password = this.config.password;
+    }
+
+    // Pool settings (user config > provider defaults > hardcoded defaults)
+    config.min =
+      this.config.pool?.min ??
+      this.providerDefaults.poolMin ??
+      DEFAULT_POOL_CONFIG.min;
+    config.max =
+      this.config.pool?.max ??
+      this.providerDefaults.poolMax ??
+      DEFAULT_POOL_CONFIG.max;
+    config.idleTimeoutMillis =
+      this.config.pool?.idleTimeoutMs ??
+      this.providerDefaults.idleTimeoutMs ??
+      DEFAULT_POOL_CONFIG.idleTimeoutMs;
+    config.connectionTimeoutMillis =
+      this.config.pool?.connectionTimeoutMs ??
+      this.providerDefaults.connectionTimeoutMs ??
+      DEFAULT_POOL_CONFIG.connectionTimeoutMs;
+
+    // TCP keepalive - prevents cloud databases (e.g. Neon) from silently
+    // dropping idle connections between the pool smoke-test and the first
+    // real query, which manifests as ETIMEDOUT on the query itself.
+    config.keepAlive = true;
+    config.keepAliveInitialDelayMillis = 10000;
+
+    // SSL configuration (user config > provider default)
+    if (this.config.ssl) {
+      if (typeof this.config.ssl === "boolean") {
+        config.ssl = this.config.ssl;
+      } else {
+        if (this.config.ssl.rejectUnauthorized === false) {
+          console.warn(
+            "[nextly/adapter-postgres] ssl.rejectUnauthorized is set to false — " +
+              "TLS certificates will not be validated. This is unsafe on untrusted networks. " +
+              "Provide a trusted `ca` cert instead, or remove the rejectUnauthorized override."
+          );
+        }
+        config.ssl = {
+          rejectUnauthorized: this.config.ssl.rejectUnauthorized,
+          ca: this.config.ssl.ca,
+          cert: this.config.ssl.cert,
+          key: this.config.ssl.key,
+        };
+      }
+    } else if (this.providerDefaults.ssl) {
+      // Provider requires SSL but user didn't explicitly configure it.
+      // Default to validating certs; the user can opt out by setting
+      // `ssl: { rejectUnauthorized: false }` explicitly (which logs a warning above).
+      config.ssl = { rejectUnauthorized: true };
+    }
+
+    // PostgreSQL-specific options
+    if (this.config.applicationName) {
+      config.application_name = this.config.applicationName;
+    }
+
+    // The schema every unqualified name resolves in, set as a STARTUP option
+    // rather than by issuing `SET search_path`. A SET belongs to whichever
+    // pooled connection ran it, so the next checkout would see the default
+    // again — and the query that noticed would be whichever one happened to
+    // land on a fresh connection, which is the least reproducible failure
+    // this setting could have.
+    //
+    // Validated before it gets here: the value is interpolated, and a startup
+    // option is not a place to discover that it needed quoting.
+    if (this.config.schema) {
+      config.options = `-c search_path=${assertSchemaName(this.config.schema)}`;
+    }
+
+    // User config beats provider default; both beat "unset".
+    // Why: provider.ts:58 declared a Neon statementTimeoutMs default but the
+    // adapter previously ignored it, leaving stuck queries to pin pool slots
+    // indefinitely. Wire the fallback chain here so the declared defaults
+    // actually fire.
+    const effectiveStatementTimeout =
+      this.config.statementTimeout ?? this.providerDefaults.statementTimeoutMs;
+    if (effectiveStatementTimeout !== undefined) {
+      config.statement_timeout = effectiveStatementTimeout;
+    }
+
+    if (this.config.queryTimeout) {
+      config.query_timeout = this.config.queryTimeout;
+    }
+
+    return config;
+  }
+
+  /**
+   * Begins a transaction with the specified options.
+   */
+  private async beginTransaction(
+    client: PoolClient,
+    options?: TransactionOptions,
+    bounds?: TransactionBounds
+  ): Promise<void> {
+    let beginSql = "BEGIN";
+
+    // Add isolation level if specified
+    if (options?.isolationLevel) {
+      const isolationMap: Record<string, string> = {
+        "read uncommitted": "READ UNCOMMITTED",
+        "read committed": "READ COMMITTED",
+        "repeatable read": "REPEATABLE READ",
+        serializable: "SERIALIZABLE",
+      };
+      const level = isolationMap[options.isolationLevel];
+      if (level) {
+        beginSql += ` ISOLATION LEVEL ${level}`;
+      }
+    }
+
+    // Add read-only mode if specified
+    if (options?.readOnly) {
+      beginSql += " READ ONLY";
+    }
+
+    await client.query(beginSql);
+
+    // Set statement timeout if specified
+    if (options?.timeoutMs) {
+      await client.query(`SET LOCAL statement_timeout = ${options.timeoutMs}`);
+    }
+
+    // The scope's bounds (`withTransactionBounds`), for this transaction
+    // alone: SET LOCAL ends with it, so the pooled session keeps its own
+    // settings. Whole milliseconds, checked when the scope was entered.
+    if (bounds?.lockWaitMs !== undefined) {
+      await client.query(`SET LOCAL lock_timeout = ${bounds.lockWaitMs}`);
+    }
+    if (bounds?.idleMs !== undefined) {
+      await client.query(
+        `SET LOCAL idle_in_transaction_session_timeout = ${bounds.idleMs}`
+      );
+    }
+  }
+
+  /**
+   * Creates a TransactionContext for the given client.
+   */
+  /**
+   * The RETURNING entries that spell each date column's wall clock out as
+   * text, one per alias `dateWallClockAliases` chose. `to_char` renders the
+   * stored value without a zone, which is the only form node-postgres cannot
+   * shift on the way back.
+   */
+  private wallClockSpelling(
+    aliases: ReadonlyArray<{ sqlName: string; alias: string }>
+  ): string {
+    return aliases
+      .map(
+        a =>
+          `to_char(${this.escapeIdentifier(a.sqlName)}, '${PG_WALL_CLOCK_FORMAT}') AS ${this.escapeIdentifier(a.alias)}`
+      )
+      .join(", ");
+  }
+
+  /** A `Date` on an undeclared key is spelled as a date field's column spells it. */
+  protected override undeclaredDateColumn(): {
+    mapToDriverValue(value: unknown): unknown;
+  } {
+    return DATE_FIELD_COLUMN;
+  }
+
+  /** A table-level `primaryKey({ columns })`, read through the PostgreSQL table config. */
+  protected override compositePrimaryKey(
+    tableObj: Record<string, unknown>
+  ): object[] {
+    return getTableConfig(tableObj as unknown as PgTable).primaryKeys.flatMap(
+      key => key.columns
+    );
+  }
+
+  private createTransactionContext(client: PoolClient): TransactionContext {
+    // Bind a Drizzle instance to this transaction's checked-out client so the
+    // delegated CRUD methods run inside the transaction and see its uncommitted
+    // rows. getDrizzle() wraps the pool, which would use a different connection.
+    // Built lazily and memoized: transactions that use only raw execute/insert
+    // never construct it.
+    const txHandles = this.transactionDrizzleHandles(relations =>
+      relations ? drizzle({ client, relations }) : drizzle({ client })
+    );
+    const txDb = txHandles.bare;
+    return {
+      drizzleWithRelations: txHandles.withRelations,
+
+      execute: async <T = unknown>(
+        sql: string,
+        params: SqlParam[] = []
+      ): Promise<T[]> => {
+        const result = await client.query(sql, params as unknown[]);
+        return result.rows as T[];
+      },
+
+      // Run on the transaction-bound Drizzle instance rather than the pool, so
+      // the statement is part of this transaction and sees its uncommitted rows.
+      runStatement: async (statement: SQL): Promise<void> => {
+        await txDb().execute(statement);
+      },
+
+      // node-postgres answers `{ rows }`; the transaction-bound instance keeps
+      // the read inside this transaction so it sees its uncommitted writes.
+      queryStatement: async <T = Record<string, unknown>>(
+        statement: SQL
+      ): Promise<T[]> => {
+        const result = await txDb().execute(statement);
+        return result.rows as T[];
+      },
+
+      lockRow: async (table: string, id: SqlParam): Promise<void> => {
+        const idColumn = this.escapeIdentifier("id");
+        await client.query(
+          `SELECT ${idColumn} FROM ${this.escapeIdentifier(table)} ` +
+            `WHERE ${idColumn} = $1 FOR UPDATE`,
+          [id] as unknown[]
+        );
+      },
+
+      insert: async <T = unknown>(
+        table: string,
+        data: Record<string, unknown>,
+        options?: InsertOptions
+      ): Promise<T> => {
+        // Refused before any statement, as the pooled insert is: a rejected
+        // statement would abort the caller's whole transaction.
+        const tableObj = this.resolvedTableObject(table);
+        const mapped = this.mapRowToRawSql(tableObj, data);
+        const columns = Object.keys(mapped);
+        const values = Object.values(mapped);
+        const placeholders = values.map((_, i) => `$${i + 1}`).join(", ");
+
+        let sql = `INSERT INTO ${this.escapeIdentifier(table)} (${columns.map(c => this.escapeIdentifier(c)).join(", ")}) VALUES (${placeholders})`;
+
+        const ret = options?.returning;
+        const returningEmpty = Array.isArray(ret) && ret.length === 0;
+        // Each returned timestamp's wall clock, spelled out by the database.
+        // node-postgres turns one into a `Date` in the LOCAL zone before this
+        // code sees it, and that conversion cannot be undone: a wall clock
+        // inside a daylight-saving gap is normalized away.
+        const aliases = returningEmpty
+          ? []
+          : this.dateWallClockAliases(tableObj, ret ?? "*");
+        if (!returningEmpty) {
+          const returning =
+            !ret || ret === "*"
+              ? "*"
+              : this.mapColumnNamesToSql(tableObj, ret)
+                  .map(col => this.escapeIdentifier(col))
+                  .join(", ");
+          const spelled = this.wallClockSpelling(aliases);
+          sql += ` RETURNING ${returning}${spelled ? `, ${spelled}` : ""}`;
+        }
+
+        const result = await client.query(sql, values);
+        // Return JS property-named keys AND dates read as the UTC the statement
+        // wrote, to match the non-transactional insert.
+        return this.mapRowFromRawSql(tableObj, result.rows[0] as T, aliases);
+      },
+
+      insertMany: async <T = unknown>(
+        table: string,
+        data: Record<string, unknown>[],
+        options?: InsertOptions
+      ): Promise<T[]> => {
+        if (data.length === 0) return [];
+
+        // Refused before any statement, as `insert` above is.
+        const tableObj = this.resolvedTableObject(table);
+        const mappedRecords = data.map(r => this.mapRowToRawSql(tableObj, r));
+        const columns = Object.keys(mappedRecords[0]);
+        const params: unknown[] = [];
+        const valuesClauses: string[] = [];
+
+        for (const record of mappedRecords) {
+          const placeholders: string[] = [];
+          for (const col of columns) {
+            params.push(record[col]);
+            placeholders.push(`$${params.length}`);
+          }
+          valuesClauses.push(`(${placeholders.join(", ")})`);
+        }
+
+        let sql = `INSERT INTO ${this.escapeIdentifier(table)} (${columns.map(c => this.escapeIdentifier(c)).join(", ")}) VALUES ${valuesClauses.join(", ")}`;
+
+        const ret = options?.returning;
+        const returningEmpty = Array.isArray(ret) && ret.length === 0;
+        const aliases = returningEmpty
+          ? []
+          : this.dateWallClockAliases(tableObj, ret ?? "*");
+        if (!returningEmpty) {
+          const returning =
+            !ret || ret === "*"
+              ? "*"
+              : this.mapColumnNamesToSql(tableObj, ret)
+                  .map(col => this.escapeIdentifier(col))
+                  .join(", ");
+          const spelled = this.wallClockSpelling(aliases);
+          sql += ` RETURNING ${returning}${spelled ? `, ${spelled}` : ""}`;
+        }
+
+        const result = await client.query(sql, params);
+        return (result.rows as T[]).map(r =>
+          this.mapRowFromRawSql(tableObj, r, aliases)
+        );
+      },
+
+      // Adapter-built, as `insert` above is; `transactionUpdate` says why.
+      // A column the model does not declare binds natively, except a `Date`,
+      // spelled as a date field's column spells it (as this path's insert
+      // spells one), and a structured value, sent as JSON
+      // (`bindUnmodeledStructuredAsJson`).
+      update: this.transactionUpdate(
+        txDb,
+        async statement => (await txDb().execute(statement)).rows,
+        // Structured values as JSON text: node-postgres would spell an array
+        // as a PostgreSQL array literal, which no JSON column accepts.
+        value => this.bindUnmodeledStructuredAsJson(value)
+      ),
+
+      ...this.createTransactionForwarders(txDb),
+
+      // Savepoints on this transaction's connection, the effects held for the
+      // transaction scoped to each (`contextSavepointMethods`).
+      ...this.contextSavepointMethods(async statement => {
+        await client.query(statement);
+      }),
+    };
+  }
+
+  /**
+   * Classifies a PostgreSQL error into a DatabaseError.
+   *
+   * @param error - Original error from pg
+   * @param sql - SQL statement that caused the error (optional)
+   * @returns DatabaseError with proper classification
+   */
+  protected override classifyError(
+    error: unknown,
+    sql?: string
+  ): DatabaseError {
+    // Why short-circuit on existing DatabaseError: F17's
+    // UnsupportedDialectVersionError is already a typed DatabaseError with
+    // kind: "unsupported_version" plus detectedVersion/requiredVersion
+    // fields. Re-wrapping it here would erase those fields and re-tag it
+    // as kind: "unknown".
+    if (isDatabaseError(error)) return error;
+
+    // Classified from node-postgres's own error, which Drizzle puts on `cause`
+    // when it wraps a failed query (`driverErrorIn`); it is the one carrying
+    // the SQLSTATE `code`.
+    const pgError = this.driverErrorIn<{
+      code?: string;
+      message?: string;
+      constraint?: string;
+      table?: string;
+      column?: string;
+      detail?: string;
+      hint?: string;
+      severity?: string;
+      cause?: unknown;
+    }>(
+      error,
+      candidate => typeof candidate.code === "string" && candidate.code !== ""
+    );
+
+    // Determine error kind from PostgreSQL error code
+    const kind: DatabaseErrorKind =
+      (pgError.code && PG_ERROR_CODES[pgError.code]) || "unknown";
+
+    // Build error message
+    let message = pgError.message ?? String(error);
+    if (sql && kind === "query") {
+      message = `Query failed: ${message}`;
+    }
+
+    return createDatabaseError({
+      kind,
+      message,
+      code: pgError.code,
+      constraint: pgError.constraint,
+      table: pgError.table,
+      column: pgError.column,
+      detail: pgError.detail,
+      hint: pgError.hint,
+      cause: error instanceof Error ? error : undefined,
+    });
+  }
+}
+
+/**
+ * Creates a PostgreSQL database adapter instance.
+ *
+ * @remarks
+ * This is the recommended way to create a PostgreSQL adapter.
+ * The adapter is not connected after creation - call `connect()` to
+ * establish the database connection.
+ *
+ * @param config - Adapter configuration
+ * @returns A new PostgresAdapter instance
+ *
+ * @example
+ * Simple usage:
+ * ```typescript
+ * import { createPostgresAdapter } from '@nextlyhq/adapter-postgres';
+ *
+ * const adapter = createPostgresAdapter({
+ *   url: process.env.DATABASE_URL!,
+ * });
+ *
+ * await adapter.connect();
+ * ```
+ *
+ * @example
+ * With full configuration:
+ * ```typescript
+ * const adapter = createPostgresAdapter({
+ *   url: process.env.DATABASE_URL!,
+ *   pool: {
+ *     min: 5,
+ *     max: 20,
+ *     idleTimeoutMs: 30000,
+ *     connectionTimeoutMs: 10000,
+ *   },
+ *   ssl: {
+ *     rejectUnauthorized: true,
+ *     ca: process.env.CA_CERT,
+ *   },
+ *   applicationName: 'my-app',
+ *   statementTimeout: 30000,
+ * });
+ * ```
+ *
+ * @public
+ */
+export function createPostgresAdapter(
+  config: PostgresAdapterConfig
+): PostgresAdapter {
+  return new PostgresAdapter(config);
+}
+
+/**
+ * Type guard to check if a value is a PostgresAdapter instance.
+ *
+ * @param value - Value to check
+ * @returns True if value is a PostgresAdapter
+ *
+ * @example
+ * ```typescript
+ * import { isPostgresAdapter } from '@nextlyhq/adapter-postgres';
+ *
+ * if (isPostgresAdapter(adapter)) {
+ *   // TypeScript knows adapter is PostgresAdapter
+ *   console.log(adapter.dialect); // 'postgresql'
+ * }
+ * ```
+ *
+ * @public
+ */
+export function isPostgresAdapter(value: unknown): value is PostgresAdapter {
+  return value instanceof PostgresAdapter;
+}

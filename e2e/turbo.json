@@ -1,0 +1,39 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "check-types": {
+      // The suite asks the playground how it was built through the
+      // playground's own rule (`tests/support/cache-components.ts` imports
+      // `apps/playground/cache-components.ts`), so that file is in this
+      // package's program. Inputs are package-scoped, so it is named here:
+      // without it, editing the rule would leave this hash unchanged. The
+      // blog template's two library files the post-page specs import are
+      // named for the same reason.
+      "inputs": [
+        "$TURBO_EXTENDS$",
+        "$TURBO_ROOT$/apps/playground/cache-components.ts",
+        "$TURBO_ROOT$/templates/blog/src/lib/extract-toc.ts",
+        "$TURBO_ROOT$/templates/blog/src/lib/format-date.ts"
+      ]
+    },
+    // The page builder's speed runs, against a production build: where it is
+    // served and who it signs in as. Never cached, since each run measures.
+    "test:builder-speed": {
+      "cache": false,
+      "env": [
+        "BUILDER_SPEED_EMAIL",
+        "BUILDER_SPEED_PASSWORD",
+        "BUILDER_SPEED_PORT"
+      ]
+    },
+    "test:builder-long-session": {
+      "cache": false,
+      "env": [
+        "BUILDER_SPEED_EMAIL",
+        "BUILDER_SPEED_PASSWORD",
+        "BUILDER_SPEED_PORT"
+      ]
+    }
+  }
+}

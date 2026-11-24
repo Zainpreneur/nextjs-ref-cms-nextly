@@ -1,0 +1,586 @@
+"use client";
+
+/**
+ * The recording machinery behind autosave, with no opinion about what is being
+ * recorded.
+ *
+ * Debounce, coalescing, the in-flight guard, the mounted guard, the latch that
+ * stops asking once the server has refused, and the status an indicator reads:
+ * all of it is the same whether the thing being recorded is a form's values or
+ * a block document, and none of it needs to know which.
+ * Splitting it out is what lets a second editor record recovery points without
+ * a second implementation of the timing — and two implementations of a debounce
+ * that must agree with a status vocabulary is exactly the pair that drifts.
+ *
+ * ## What this does NOT decide
+ *
+ * **What a snapshot is, and where it goes.** The caller supplies `save`, so the
+ * API surface, the payload shape and the locale all stay with whoever owns
+ * them. This module never imports an API client.
+ *
+ * **When there is something worth recording.** The caller calls `schedule()`.
+ * A form knows that from its dirty flag; an editor knows it from its own
+ * history. Guessing here would mean a rule that is right for one of them.
+ *
+ * ## The identity is OPAQUE, deliberately
+ *
+ * `identity` is compared for change and otherwise never read. It is not a
+ * document id, because it is not always one: recovery rows are keyed per
+ * document and per author today, and pending changes are becoming per-document
+ * and per-LANGUAGE. A core that assumed "one recording per document" would have
+ * to be reopened to express that, so it assumes only "one recording per
+ * whatever the caller says", which both fit inside.
+ *
+ * @module hooks/useSnapshotAutosave
+ */
+
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MutableRefObject,
+} from "react";
+
+/**
+ * A refusal the server will give again, told apart from a failure that may not.
+ *
+ * Recording is opt-in per entity and enforced on the server, so an entity whose
+ * owner has not enabled it answers every request the same way. Asking again on
+ * the next debounce produces one rejected request every couple of seconds for
+ * as long as the editor is open, which is the shape this predicate exists to
+ * stop — and the same is true of a caller who simply may not write this
+ * document.
+ *
+ * Keyed on the status rather than on a reason string. The reason the server
+ * logs (`autosave-not-enabled`) stays in its log context and never reaches the
+ * client, and a client that pattern-matched a message would be reading prose
+ * that is free to change.
+ *
+ * The 4xx class carries the distinction that matters — a 4xx is an answer about
+ * this request, while a 5xx or a dropped connection is not an answer at all —
+ * minus the four statuses that HTTP defines as answers which can change on
+ * their own. Those are not exceptions to the rule; they are the part of the
+ * class that fails the test the rule is made of.
+ */
+const RETRYABLE_CLIENT_STATUSES = new Set([
+  /*
+   * The admin refreshes an expired access token and retries underneath this
+   * module, so a 401 usually never surfaces at all. It surfaces when the
+   * REFRESH itself fails for a non-auth reason — a 5xx, a dropped connection —
+   * and the original 401 propagates. Latching there would stop recording for
+   * the rest of a session whose credentials were never actually rejected.
+   */
+  401,
+  // A timeout, an early send and a rate limit are all "not now" rather than
+  // "no", and the next debounce is exactly the later moment they ask for.
+  408, 425, 429,
+]);
+
+function isRefusal(error: unknown): boolean {
+  const status = (error as { status?: unknown } | null)?.status;
+  if (typeof status !== "number") return false;
+  return (
+    status >= 400 && status < 500 && !RETRYABLE_CLIENT_STATUSES.has(status)
+  );
+}
+
+/** How long to wait after the last change before recording. */
+export const DEFAULT_AUTOSAVE_DEBOUNCE_MS = 2000;
+
+/** Where a recording has got to, for an indicator to read. */
+export type AutosaveStatus = "idle" | "saving" | "saved" | "error";
+
+/** What a completed recording reports back. */
+export interface SnapshotSaveResult {
+  /**
+   * When the server stored it, by the SERVER's clock.
+   *
+   * Taken from the response rather than from `Date.now()`, so a "saved 2
+   * minutes ago" reading cannot drift with an unsynchronised browser clock.
+   */
+  updatedAt: string;
+}
+
+/**
+ * The recordings on their way to the server, by the document they belong to,
+ * from every recorder in this tab: an editor's form and a field recording its
+ * own state alike.
+ */
+const recordingsInFlight = new Map<string, Set<Promise<unknown>>>();
+
+/**
+ * Each document's recordings in the order this tab sent them, from every
+ * recorder: how many were sent, and the number of the latest one, in that
+ * order, that the server stored.
+ */
+const recordingLog = new Map<string, { sent: number; stored: number }>();
+
+/**
+ * How many recordings of `document` this tab has sent so far, every recorder's
+ * together. Each recording's number is the count once it was sent.
+ */
+export function recordingsSent(document: string): number {
+  return recordingLog.get(document)?.sent ?? 0;
+}
+
+/**
+ * The number of the latest recording of `document`, in the order this tab
+ * sent them, that the server stored; 0 when none was. It says whose snapshot
+ * the author's recovery point holds now, as far as this tab knows: a recorder
+ * whose own recording is that one wrote what is there. One that failed did
+ * not, and is never taken for having done so.
+ */
+export function lastStoredRecording(document: string): number {
+  return recordingLog.get(document)?.stored ?? 0;
+}
+
+/**
+ * Note a recording on its way, and take it off once it has landed.
+ *
+ * @returns the recording's number: see `recordingsSent`
+ */
+function trackRecording(document: string, saving: Promise<unknown>): number {
+  const log = recordingLog.get(document) ?? { sent: 0, stored: 0 };
+  log.sent += 1;
+  const number = log.sent;
+  recordingLog.set(document, log);
+  void saving.then(
+    () => {
+      log.stored = Math.max(log.stored, number);
+    },
+    () => {}
+  );
+  const inFlight = recordingsInFlight.get(document) ?? new Set();
+  inFlight.add(saving);
+  recordingsInFlight.set(document, inFlight);
+  const landed = () => {
+    inFlight.delete(saving);
+    if (inFlight.size === 0 && recordingsInFlight.get(document) === inFlight) {
+      recordingsInFlight.delete(document);
+    }
+  };
+  void saving.then(landed, landed);
+  return number;
+}
+
+/** How long a save waits for recordings in flight: see `recordingsSettled`. */
+const RECORDINGS_WAIT_MS = 5000;
+
+/**
+ * Resolves once no recovery point for `document` is on its way to the server.
+ *
+ * A real save waits for this before it writes. The save deletes the author's
+ * recovery point, and a recording already sent could otherwise land after it:
+ * an older snapshot stored as if made from the saved document, which the
+ * editor would then offer as current work and a restore would revert the save
+ * with. Turning recording off for the save stops new recordings, not one
+ * already sent. Every recorder's, not one editor's, since a field recording
+ * its own state writes the same point; and only this document's, since
+ * another's cannot recreate the point this save deletes. Checked again after
+ * each wait, because a recording asked for meanwhile follows the one that
+ * finished.
+ *
+ * Waits `atMostMs` at most: a recording that never answers must not hold the
+ * author's save, which matters more than the point it would leave behind.
+ */
+export async function recordingsSettled(
+  document: string | null,
+  atMostMs: number = RECORDINGS_WAIT_MS
+): Promise<void> {
+  if (document === null) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  const deadline = new Promise<void>(resolve => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      resolve();
+    }, atMostMs);
+  });
+  try {
+    for (
+      let inFlight = recordingsInFlight.get(document);
+      inFlight !== undefined && !timedOut;
+      inFlight = recordingsInFlight.get(document)
+    ) {
+      await Promise.race([Promise.allSettled([...inFlight]), deadline]);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Run a write of a document once its recordings in flight have landed, for a
+ * write that does not go through a save: publishing every language. It must
+ * not be overtaken by a recording sent before it either: see
+ * `recordingsSettled`.
+ *
+ * `pending` is true from the ask until the write has finished (`writing`,
+ * the write's own pending state, covers the second half), so the action shows
+ * busy throughout, and a second ask while it waits is dropped: two would both
+ * run once the recordings land.
+ */
+export function useAfterRecordings(
+  document: string | null,
+  writing: boolean
+): {
+  run: (write: () => void) => void;
+  pending: boolean;
+} {
+  const [waiting, setWaiting] = useState(false);
+  // The latch itself, read synchronously: two asks inside one render both
+  // see the state as it was before either.
+  const waitingRef = useRef(false);
+  const run = useCallback(
+    (write: () => void) => {
+      if (waitingRef.current) return;
+      waitingRef.current = true;
+      setWaiting(true);
+      void recordingsSettled(document).then(() => {
+        waitingRef.current = false;
+        setWaiting(false);
+        write();
+      });
+    },
+    [document]
+  );
+  return { run, pending: waiting || writing };
+}
+
+/**
+ * Whether a recording must NOT be made.
+ *
+ * One question with one implementation, asked at flush and only there. Checking
+ * any of these at scheduling time as well reads as defensive and is worse than
+ * redundant: `enabled` moves while a timer is already pending — it goes false
+ * the moment a real save starts — so the answer then is not the answer that
+ * matters, and two copies of the rule would eventually disagree about a
+ * recording one of them had already allowed.
+ */
+function recordingBlocked(state: {
+  identity: string | null;
+  enabled: boolean;
+  refused: boolean;
+  /** Whether the work is still unsaved, when the caller can say. */
+  stillWanted: (() => boolean) | undefined;
+}): boolean {
+  return (
+    state.identity === null ||
+    !state.enabled ||
+    state.refused ||
+    state.stillWanted?.() === false
+  );
+}
+
+/** Stop a recording that has been asked for and not yet made. */
+function clearTimer(
+  timerRef: MutableRefObject<ReturnType<typeof setTimeout> | null>
+): void {
+  if (timerRef.current) {
+    clearTimeout(timerRef.current);
+    timerRef.current = null;
+  }
+}
+
+/**
+ * Drop a recording asked for and not yet made, and one queued behind a
+ * recording in flight: the work they would record is no longer at risk.
+ */
+function dropRecording(
+  timerRef: MutableRefObject<ReturnType<typeof setTimeout> | null>,
+  pendingRef: MutableRefObject<boolean>
+): void {
+  clearTimer(timerRef);
+  pendingRef.current = false;
+}
+
+/**
+ * What a failed attempt means: whether the server has settled the question, and
+ * what an indicator should show for it.
+ *
+ * A refusal shows as `idle` rather than `error`, because an entity whose owner
+ * never turned recording on has not failed at anything. An indicator stuck on
+ * "Couldn't save" would report a policy as a fault, over an editor whose work
+ * is not at risk in the way that reads.
+ */
+function outcomeOfFailure(error: unknown): {
+  refused: boolean;
+  status: AutosaveStatus;
+} {
+  return isRefusal(error)
+    ? { refused: true, status: "idle" }
+    : { refused: false, status: "error" };
+}
+
+/**
+ * The parts of one pending recording: asking for it, dropping it once the
+ * work it would record is no longer at risk, and making it at once.
+ */
+function pendingRecording(
+  refs: {
+    timerRef: MutableRefObject<ReturnType<typeof setTimeout> | null>;
+    pendingRef: MutableRefObject<boolean>;
+    heldRef: MutableRefObject<string | null>;
+  },
+  flush: () => Promise<void>,
+  debounceMs: number
+): Pick<UseSnapshotAutosaveResult, "schedule" | "cancel" | "flushPending"> {
+  const { timerRef, pendingRef, heldRef } = refs;
+  return {
+    schedule: () => {
+      clearTimer(timerRef);
+      timerRef.current = setTimeout(() => {
+        void flush();
+      }, debounceMs);
+    },
+    cancel: () => {
+      dropRecording(timerRef, pendingRef);
+      heldRef.current = null;
+    },
+    flushPending: () => {
+      if (timerRef.current === null) return;
+      clearTimer(timerRef);
+      void flush();
+    },
+  };
+}
+
+export interface UseSnapshotAutosaveOptions {
+  /**
+   * What this recording is keyed by, or `null` when recording must stay off.
+   *
+   * Compared for change and never inspected. `null` disables recording rather
+   * than inventing an address — a document that has never been saved has
+   * nothing for the endpoint to write against.
+   */
+  identity: string | null;
+
+  /**
+   * The document the recordings belong to, which a real save of it waits on:
+   * see `recordingsSettled`. Absent, the recordings are not waited for.
+   */
+  document?: string | null;
+
+  /**
+   * Persist the current snapshot.
+   *
+   * Called AT flush time, not when it is handed over, so it must read the
+   * current value rather than close over one captured earlier. That is the
+   * whole reason it is a callback: the caller keeps the freshest copy and this
+   * module keeps the timing.
+   */
+  save: () => Promise<SnapshotSaveResult>;
+
+  /** Milliseconds of quiet before a recording is made. */
+  debounceMs?: number;
+
+  /**
+   * Turns recording off without unmounting. Used while a real save is in
+   * flight: the document is about to change underneath the snapshot, so a
+   * recovery point written now would describe a state that never existed.
+   */
+  enabled?: boolean;
+
+  /**
+   * Whether the work is still worth recording, asked when the timer fires.
+   *
+   * The edit that scheduled a recording may have been saved for real while
+   * the timer waited: the work is then no longer at risk, and recording it
+   * would write a copy of what the save just stored.
+   */
+  stillWanted?: () => boolean;
+}
+
+export interface UseSnapshotAutosaveResult {
+  status: AutosaveStatus;
+  lastSavedAt: Date | null;
+  /**
+   * Ask for a recording once the debounce has elapsed.
+   *
+   * Repeated calls restart the wait rather than queueing, so a burst of typing
+   * records once at the end of it.
+   */
+  schedule: () => void;
+  /**
+   * Drop a recording that has been asked for and not yet made: the work it
+   * would record has been saved, or undone, since.
+   */
+  cancel: () => void;
+  /**
+   * Make a recording asked for and not yet made now, rather than once the
+   * debounce has elapsed: for a recorder going away with work it was asked
+   * to record, whose timer would otherwise be cleared with it. Nothing is
+   * made when none was asked for, and the same rules apply as at the end of
+   * the wait.
+   */
+  flushPending: () => void;
+  /**
+   * The number of this recorder's own latest recording (see
+   * `recordingsSent`), or null before it has sent one: with
+   * `lastStoredRecording`, whether the point holds what it recorded.
+   */
+  lastSent: () => number | null;
+}
+
+/**
+ * @param options - what to key on, how to persist, and how long to wait
+ * @returns the current status, when the last recording landed, and the trigger
+ */
+export function useSnapshotAutosave({
+  identity,
+  document,
+  save,
+  debounceMs = DEFAULT_AUTOSAVE_DEBOUNCE_MS,
+  enabled = true,
+  stillWanted,
+}: UseSnapshotAutosaveOptions): UseSnapshotAutosaveResult {
+  const [status, setStatus] = useState<AutosaveStatus>("idle");
+  const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null);
+
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // This recorder's own latest recording: see `lastSent`.
+  const lastSentRef = useRef<number | null>(null);
+  const inFlightRef = useRef(false);
+  /*
+   * Set when a change arrives while a recording is still in flight. Those
+   * values would otherwise be lost: the timer for them has already fired, and
+   * no further change is guaranteed to arrive to schedule another.
+   */
+  const pendingRef = useRef(false);
+  const mountedRef = useRef(true);
+  /*
+   * Set once the server has refused, and cleared only by a change of identity.
+   * A ref rather than state because nothing renders differently for it: the
+   * status it leaves behind is `idle`, which is what an editor with no
+   * recording available should show.
+   */
+  const refusedRef = useRef(false);
+
+  /*
+   * Read through refs inside the debounced callback rather than captured as
+   * dependencies. The callback is created once per subscription, and closing
+   * over these would pin the values they held when it was set up.
+   */
+  const latestRef = useRef({ identity, document, enabled, save, stillWanted });
+  latestRef.current = { identity, document, enabled, save, stillWanted };
+  /*
+   * The identity a recording was held for: one that came due while recording
+   * was off, and so was not made. `null` when none is held. Turning recording
+   * back on asks for that one again, and only under the same identity; it is
+   * the only thing that may, because being re-enabled is not itself a reason
+   * to write (an editor also turns recording off to show a past version).
+   */
+  const heldRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const flush = useCallback(async () => {
+    const latest = latestRef.current;
+    // Off when it came due: held for this identity, to be asked for again once
+    // recording is on.
+    heldRef.current = latest.enabled ? null : latest.identity;
+    if (
+      recordingBlocked({
+        identity: latest.identity,
+        enabled: latest.enabled,
+        refused: refusedRef.current,
+        // Saved or undone while the timer waited: nothing is at risk any more.
+        stillWanted: latest.stillWanted,
+      })
+    )
+      return;
+
+    if (inFlightRef.current) {
+      pendingRef.current = true;
+      return;
+    }
+
+    inFlightRef.current = true;
+    if (mountedRef.current) setStatus("saving");
+
+    const saving = latest.save();
+    if (latest.document != null) {
+      lastSentRef.current = trackRecording(latest.document, saving);
+    }
+    try {
+      const result = await saving;
+      if (mountedRef.current) {
+        setLastSavedAt(new Date(result.updatedAt));
+        setStatus("saved");
+      }
+    } catch (error) {
+      /*
+       * Swallowed deliberately, and reported through `status` rather than
+       * thrown. A recovery point nobody asked for must not surface an error
+       * over the editor or interrupt typing; the next debounce tries again —
+       * unless the server refused, and then there is nothing to try again.
+       *
+       * A refusal shows as `idle` rather than `error`, because an entity whose
+       * owner never turned recording on has not failed at anything. An
+       * indicator stuck on "Couldn't save" would report a policy as a fault,
+       * over an editor whose work is not at risk in the way that reads.
+       */
+      const outcome = outcomeOfFailure(error);
+      refusedRef.current = outcome.refused;
+      if (mountedRef.current) setStatus(outcome.status);
+    } finally {
+      inFlightRef.current = false;
+      if (pendingRef.current) {
+        pendingRef.current = false;
+        void flush();
+      }
+    }
+  }, []);
+
+  /*
+   * Whether to record is decided at FLUSH, and only there.
+   *
+   * Checking it here as well reads as defensive and is worse than redundant:
+   * `enabled` moves while a timer is already pending — it goes false the moment
+   * a real save starts — so the answer at scheduling time is not the answer
+   * that matters, and two copies of the rule would eventually disagree about a
+   * recording one of them had already allowed. Scheduling a timer that flush
+   * then declines costs a cleared timeout.
+   */
+  // Built together, as the parts of one pending recording: see
+  // `pendingRecording`.
+  const { schedule, cancel, flushPending } = useMemo(
+    () =>
+      pendingRecording({ timerRef, pendingRef, heldRef }, flush, debounceMs),
+    [flush, debounceMs]
+  );
+
+  // Back on: the recording that came due while recording was off is asked for
+  // again. Nothing else is, so a recovery point already made is not repeated,
+  // and one held for another identity (recording back on in the same render
+  // as a new document) is dropped rather than made under the new one.
+  useEffect(() => {
+    const heldFor = heldRef.current;
+    if (!enabled || heldFor === null) return;
+    heldRef.current = null;
+    if (heldFor === identity) schedule();
+  }, [enabled, identity, schedule]);
+
+  // A pending recording belongs to the identity that scheduled it. Left
+  // running across a change it would write one document's snapshot against
+  // another's key, which is the one failure this module can cause that the
+  // caller cannot see.
+  useEffect(() => {
+    // A refusal belongs to the document it was given for. Another document is
+    // another entity with its own setting and its own access, so the answer is
+    // asked again rather than inherited.
+    refusedRef.current = false;
+    heldRef.current = null;
+    return () => clearTimer(timerRef);
+  }, [identity]);
+
+  const lastSent = useCallback(() => lastSentRef.current, []);
+  return { status, lastSavedAt, schedule, cancel, flushPending, lastSent };
+}

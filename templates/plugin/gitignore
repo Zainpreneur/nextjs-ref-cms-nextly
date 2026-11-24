@@ -1,0 +1,16 @@
+node_modules
+dist
+*.log
+
+# Embedded dev playground — never published, never committed build output
+dev/.next
+# SQLite files, and the journal and WAL files beside them, wherever they land.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.env
+.env.local
+
+# nextly: runtime files the app writes for this machine (logs, a save in progress)
+/.nextly/

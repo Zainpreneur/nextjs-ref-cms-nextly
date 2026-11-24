@@ -1,0 +1,371 @@
+/**
+ * Job types: declaring one, and looking one up.
+ *
+ * A job row stores a `slug` and an opaque `input`; this is what turns that pair
+ * back into code to run. Keeping the registry separate from the runner is what
+ * lets a job type be declared where it MEANS something — releases declares
+ * `releases:apply`, webhooks declares `webhooks:drain` — while one runner
+ * executes all of them.
+ *
+ * ## The shape, and one deliberate divergence
+ *
+ * `defineJob({ slug, handler, retry })` and `queue({ task, input, runAt })`
+ * follow Payload's jobs API, because a large share of the people evaluating
+ * Nextly arrive from it and the concepts should transfer without re-learning.
+ *
+ * The divergence is `runAt` where Payload spells it `waitUntil`. `waitUntil`
+ * reads as a deadline — the point by which something must have happened —
+ * when the field is the opposite, the earliest instant at which it may start.
+ * Choosing the clearer name is worth a small break from familiarity while the
+ * API is still cheap to change.
+ *
+ * @module domains/jobs/job-registry
+ */
+
+import type { JobInput } from "../../direct-api/types/jobs";
+import { NextlyError } from "../../errors";
+import type { UserContext } from "../collections/services/collection-types";
+
+import type { JobContentApi } from "./job-content-api";
+import { MAX_PORTABLE_KEY_LENGTH, MAX_SWEEP_SLUG_LENGTH } from "./portable-key";
+
+/** Attempts a job gets before it is given up on. */
+export const DEFAULT_MAX_ATTEMPTS = 5;
+
+/**
+ * The longest slug every supported dialect can store.
+ *
+ * MySQL holds the slug in `varchar(191)` — the widest utf8mb4 value it will
+ * index — while PostgreSQL and SQLite use unbounded text. Validating here means
+ * a slug that is too long is refused when the job type is DEFINED, on every
+ * dialect, rather than accepted at definition and failing only at enqueue time
+ * and only on MySQL.
+ */
+export const MAX_JOB_SLUG_LENGTH = MAX_PORTABLE_KEY_LENGTH;
+
+export { SWEEP_KEY_PREFIX, MAX_SWEEP_SLUG_LENGTH } from "./portable-key";
+
+/** What a handler is told about the run it is in. */
+export interface JobContext {
+  /**
+   * This job's row id, the same on every attempt at it.
+   *
+   * The idempotency key to hand anything OUTSIDE the database. Delivery is
+   * at-least-once, so one queued job can reach a handler more than once, and
+   * the fence that protects the jobs table cannot reach an email already sent
+   * or a charge already made. Passing this id to something that de-duplicates
+   * on a key of its own (a payment provider's idempotency header, a unique
+   * column an upsert targets) is what turns "ran twice" into "happened once".
+   *
+   * Deriving a key from `input` instead works only for as long as the input is
+   * unique, which is a property of the caller rather than of the queue: the
+   * same payload queued twice is two jobs and two ids.
+   *
+   * One key per SIDE EFFECT, not one per job. A handler that charges a card and
+   * then writes a ledger row must not send this same value to both where they
+   * share a uniqueness namespace, or the second is refused as a duplicate of
+   * the first. Derive one per operation, `${jobId}:charge` and so on.
+   */
+  jobId: string;
+  /**
+   * Which attempt this is, counting from 1.
+   *
+   * Written to the row BEFORE the handler starts, so a handler that dies
+   * part-way still leaves the count advanced and the next run is numbered
+   * higher. Reliable for behaviour that should change on a retry: logging
+   * louder, or abandoning an optimisation that failed last time.
+   *
+   * 🔴 Still not a substitute for `jobId` when deciding whether work already
+   * happened. `attempt > 1` says an earlier run BEGAN, not what it finished,
+   * and nothing in this process can know what a provider did with a request it
+   * never answered. That question is answered by asking the provider, which is
+   * what handing it `jobId` does.
+   */
+  attempt: number;
+  /**
+   * The identity this job runs AS, or `null` when it genuinely acts as nobody.
+   *
+   * `null` does NOT mean "as the system". A job whose stored identity no longer
+   * resolves never reaches a handler at all — it fails terminally — so a
+   * handler that receives `null` can rely on it meaning the job was queued
+   * without an identity in the first place.
+   */
+  user: UserContext | null;
+  /** The instant the runner is treating as now. Injected so a job is testable. */
+  now: Date;
+  /**
+   * Content operations, already bound to `user`.
+   *
+   * Handed to the handler rather than left for it to construct, because the
+   * Direct API defaults to `overrideAccess: true` — so a handler importing
+   * `nextly` directly runs with trusted-system authority and the resolved
+   * identity above does nothing. Using this is how a job actually acts as the
+   * person who queued it.
+   *
+   * A job that genuinely needs trusted access still imports `nextly` itself.
+   * That is then one visible line in the handler instead of an invisible
+   * default.
+   */
+  content: JobContentApi;
+  /**
+   * The instant the pass running this job intends to stop.
+   *
+   * The runner cannot enforce it. `maxDurationMs` is checked before each CLAIM,
+   * so it bounds how many jobs a pass STARTS and nothing more: once a handler is
+   * running, nothing here can interrupt a promise mid-flight, and a cancellation
+   * the handler did not cooperate with would abandon whatever it had half-done
+   * outside the database.
+   *
+   * So `run-jobs` names two things that bound a running handler — the lease, and
+   * "the handler itself being written to fit a tick". This is what makes the
+   * second one possible. Without it the runner asks handlers to fit a budget it
+   * never tells them, and every handler that wants to comply has to be handed
+   * one out of band, which is a second description of the same number.
+   *
+   * A handler that ignores it is not wrong; most jobs are short. A handler that
+   * walks an unbounded set — every due release, every stale entry — should stop
+   * when this passes and leave the rest, because the queue is durable and the
+   * next tick continues. **Stopping early must DEFER the remainder, never
+   * discharge it:** work that was never attempted produces no failure, and an
+   * absent failure reads as success.
+   */
+  deadline: Date;
+}
+
+export interface JobRetryPolicy {
+  maxAttempts: number;
+}
+
+export interface JobDefinition<TInput extends JobInput = JobInput> {
+  slug: string;
+  handler: (input: TInput, context: JobContext) => Promise<void>;
+  retry: JobRetryPolicy;
+  /**
+   * Whether a trigger should keep one of these queued at all times.
+   *
+   * A job type is normally queued by whoever wants the work: something happens,
+   * a row is written, a pass runs it. A SWEEP has no such moment — it asks a
+   * question of the database ("which releases have come due?") at an instant
+   * with no request attached, so nothing is ever in a position to enqueue it,
+   * and a handler that nothing enqueues is a handler that never runs.
+   */
+  sweep: boolean;
+}
+
+/**
+ * Any job type, whatever input its handler takes: what a list of jobs holds,
+ * the config's `jobs` and a plugin's `contributes.jobs`.
+ *
+ * `handler` is declared as a method, so its input is compared bivariantly
+ * here and nowhere else: a `defineJob<{ cursor: string }>(...)` result fits
+ * without a cast, and a job written inline gets `JobInput` for its handler's
+ * input, as it did before typed jobs fit. `JobDefinition` itself keeps a
+ * contravariant handler, so a typed job still cannot be widened to the
+ * default and handed another job's input. Only the runner calls a listed
+ * handler, with the input stored for it.
+ */
+export interface AnyJobDefinition extends Omit<JobDefinition, "handler"> {
+  handler(input: JobInput, context: JobContext): Promise<void>;
+}
+
+export interface JobDefinitionInput<TInput extends JobInput = JobInput> {
+  slug: string;
+  handler: (input: TInput, context: JobContext) => Promise<void>;
+  /** Defaults to {@link DEFAULT_MAX_ATTEMPTS} attempts. */
+  retry?: Partial<JobRetryPolicy>;
+  /**
+   * Keep one queued at all times; see {@link JobDefinition.sweep}.
+   *
+   * Available only when the handler accepts `null`. A trigger queues a sweep on
+   * its own initiative and has nothing to construct an input from, so it records
+   * `input: null` — and a handler declared to receive `{ cursor: string }` would
+   * be invoked with `null` on every tick, fail, retry and eventually give up. The
+   * conditional type turns that into a compile error at the definition instead of
+   * a job that quietly never succeeds.
+   */
+  sweep?: null extends TInput ? boolean : false;
+}
+
+/**
+ * Declare a job type.
+ *
+ * The retry budget is resolved HERE rather than in the runner so that every
+ * definition carries a bounded one. A definition that left it undefined would
+ * put the runner in the position of inventing a policy the author never chose,
+ * and the natural reading of "no budget" — retry forever — turns a permanently
+ * failing job into an infinite loop.
+ */
+/**
+ * The one place a job slug is checked, for every path that writes one.
+ *
+ * `defineJob` and `JobsRepository.enqueue` both accept a slug and had drifted:
+ * the definition trimmed and refused an empty one, while the enqueue checked
+ * only the maximum length. So `queue({ task: "" })` wrote a row that no registry
+ * lookup could ever match, and every drain deferred it forever — a queue growing
+ * rows that look pending and are unrunnable.
+ *
+ * Returns the normalised slug rather than a boolean, so a caller cannot validate
+ * one string and then store a different one.
+ */
+export function normalizeJobSlug(slug: string): string {
+  const normalized = slug.trim();
+  if (normalized.length === 0) {
+    // The slug is the join between a stored row and the code that runs it, so a
+    // blank one stores rows nothing can ever claim.
+    throw NextlyError.invalidInput({
+      message: "A job type needs a non-empty slug.",
+    });
+  }
+  if (normalized.length > MAX_JOB_SLUG_LENGTH) {
+    throw NextlyError.invalidInput({
+      message: `A job slug may be at most ${MAX_JOB_SLUG_LENGTH} characters.`,
+      logContext: { slug: normalized, length: normalized.length },
+    });
+  }
+  return normalized;
+}
+
+export function defineJob<TInput extends JobInput = JobInput>(
+  input: JobDefinitionInput<TInput>
+): JobDefinition<TInput> {
+  const slug = normalizeJobSlug(input.slug);
+
+  // A sweep is charged for its own dedupe key here, where the slug is refused
+  // with a message naming the real budget — rather than at enqueue, which runs
+  // on a scheduler tick with nobody watching.
+  if (input.sweep && slug.length > MAX_SWEEP_SLUG_LENGTH) {
+    throw NextlyError.invalidInput({
+      message: `A sweep's slug may be at most ${MAX_SWEEP_SLUG_LENGTH} characters, because its dedupe key is derived from it.`,
+      logContext: { slug, length: slug.length },
+    });
+  }
+
+  const maxAttempts = input.retry?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+    // Zero attempts is not "do not retry", it is "never run" — which is
+    // indistinguishable from a job nobody enqueued.
+    throw NextlyError.invalidInput({
+      message: "A job type must allow at least one attempt.",
+      logContext: { slug, maxAttempts },
+    });
+  }
+
+  return {
+    slug,
+    handler: input.handler,
+    retry: { maxAttempts },
+    sweep: input.sweep ?? false,
+  };
+}
+
+/**
+ * The job types this instance knows how to run.
+ *
+ * Registration REFUSES a duplicate slug rather than replacing the incumbent.
+ * Replacing would make which handler runs depend on plugin load order, and the
+ * losing handler would simply never run with nothing anywhere to say so.
+ */
+export class JobRegistry {
+  private readonly definitions = new Map<string, JobDefinition<never>>();
+  /** The plugin that declared each job, by slug; none for core's or the app's. */
+  private readonly plugins = new Map<string, string>();
+
+  /**
+   * Register a job type, and the plugin that declared it when one did, so
+   * what a plugin may run as its own is the registry's answer, not a second
+   * reading of its manifest.
+   */
+  register<TInput extends JobInput>(
+    definition: JobDefinition<TInput>,
+    declaredBy?: { readonly plugin: string | undefined }
+  ): void {
+    // Keyed by the NORMALISED slug. `JobDefinition` is structural, so a
+    // definition can arrive without having passed through `defineJob`; keying it
+    // verbatim would admit `" acme:export "` under a key no enqueue — which
+    // normalises — could ever look up.
+    const slug = normalizeJobSlug(definition.slug);
+    // Copied only when normalisation actually changed the slug, so a
+    // well-formed definition is stored as the very object handed in and
+    // `get(slug)` returns it unchanged.
+    if (slug !== definition.slug) definition = { ...definition, slug };
+    if (this.definitions.has(definition.slug)) {
+      throw NextlyError.invalidInput({
+        message: `A job type is already registered for "${definition.slug}".`,
+        logContext: { slug: definition.slug },
+      });
+    }
+    // No cast: a handler declared for a specific input accepts `never`, so a
+    // JobDefinition<TInput> is already a JobDefinition<never>. Storing them
+    // under that type is what lets one registry hold job types with unrelated
+    // input shapes while the runner still calls them uniformly.
+    this.definitions.set(definition.slug, definition);
+    if (declaredBy?.plugin !== undefined) {
+      this.plugins.set(definition.slug, declaredBy.plugin);
+    }
+  }
+
+  get(slug: string): JobDefinition<never> | undefined {
+    return this.definitions.get(slug);
+  }
+
+  /**
+   * The plugin that declared a registered job, or `undefined` for one core
+   * or the app declared, and for a slug nothing registered. Asked by the
+   * slug as the registry keys it.
+   */
+  pluginOf(slug: string): string | undefined {
+    return this.plugins.get(normalizeJobSlug(slug));
+  }
+
+  /**
+   * Every registered slug, sorted.
+   *
+   * Exists so a runner can tell an ORPHANED row — one whose slug was deleted
+   * from the code while rows were still queued — from a row it simply has not
+   * reached. Without it such a row is skipped on every pass forever, and a
+   * queue that quietly never drains looks exactly like an empty one.
+   */
+  slugs(): string[] {
+    return [...this.definitions.keys()].sort();
+  }
+
+  /**
+   * Every job type that must be kept queued, sorted.
+   *
+   * Read by a trigger before it drains, so the pass finds the sweep it is about
+   * to run. Derived from the definitions rather than listed separately: a
+   * second list is a second place to forget a job type, and forgetting it here
+   * is invisible — the queue simply stays empty.
+   */
+  sweeps(): JobDefinition<never>[] {
+    return [...this.definitions.values()]
+      .filter(definition => definition.sweep)
+      .sort((a, b) => a.slug.localeCompare(b.slug));
+  }
+
+  /**
+   * Hand over what enqueues the plugins' schedules, once per window, and
+   * prunes their old windows. Given by the registration that holds the
+   * database; a registry built without one has no schedules to run.
+   */
+  useSchedules(schedules: JobSchedules): void {
+    this.scheduled = schedules;
+  }
+
+  /** What enqueues the plugins' schedules, when the installation has any. */
+  schedules(): JobSchedules | undefined {
+    return this.scheduled;
+  }
+
+  private scheduled: JobSchedules | undefined;
+}
+
+/**
+ * The plugins' schedules, as a jobs pass asks them: enqueue each schedule's
+ * latest window that has opened, once, and prune windows past keeping.
+ */
+export interface JobSchedules {
+  /** Sweep at `now`, stopping once the wall clock reaches `deadline` (epoch ms). */
+  sweep(now: Date, deadline?: number): Promise<void>;
+  prune(before: Date, limit: number): Promise<number>;
+}

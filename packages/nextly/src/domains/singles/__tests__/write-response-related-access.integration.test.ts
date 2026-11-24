@@ -1,0 +1,246 @@
+/**
+ * A write response is a read of the rows it expands.
+ *
+ * Updating a Single returns the document, relationships expanded. Those related
+ * rows belong to another collection and carry that collection's own field-level
+ * `access.read` rules. A read evaluates them; this response did not, because it
+ * forwarded no caller for them to be evaluated against.
+ *
+ * The writer supplied a relationship id, not the related row's protected
+ * fields, so "they just wrote it" does not cover them. Leaving the response
+ * unredacted makes the write path a way around the rule: write anything, read
+ * the response, see what a GET would refuse.
+ */
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import { userWhoMay } from "../../../__tests__/fixtures/permission-holders";
+import { grantPublic } from "../../../__tests__/helpers/public-role";
+import {
+  checkbox,
+  defineCollection,
+  defineSingle,
+  relationship,
+  text,
+} from "../../../config";
+import {
+  createTestNextly,
+  type TestNextly,
+} from "../../../plugins/test-nextly";
+import type { CollectionsHandler } from "../../../services/collections-handler";
+import type { SingleEntryService } from "../services/single-entry-service";
+
+let current: TestNextly | undefined;
+afterEach(async () => {
+  await current?.destroy();
+  current = undefined;
+});
+
+/** A Single pointing at a collection that hides one of its fields. */
+async function boot(): Promise<{
+  entry: SingleEntryService;
+  authorId: string;
+}> {
+  current = await createTestNextly({
+    collections: [
+      defineCollection({
+        slug: "authors",
+        // Any caller may read the row, so what the response withholds is the
+        // protected FIELD alone. Without a rule a caller holding no grant on
+        // `authors` is refused the whole row, which leaves no field to redact.
+        access: { read: () => true },
+        fields: [
+          text({ name: "name" }),
+          checkbox({ name: "suspended", access: { read: () => false } }),
+        ],
+      }),
+    ],
+    singles: [
+      defineSingle({
+        slug: "branding",
+        fields: [
+          text({ name: "siteName" }),
+          relationship({ name: "author", relationTo: "authors" }),
+        ],
+      }),
+    ],
+  });
+  // The signed-in writer `writer-1`. A rule only narrows a permission, so the
+  // writer holds `read-authors`, and the collection's rules decide the rest.
+  await userWhoMay(current, "writer-1", "read", ["authors"]);
+
+  const handler = current.getService<CollectionsHandler>("collectionsHandler");
+  const author = await handler.createEntry(
+    { collectionName: "authors", overrideAccess: true },
+    { name: "Ada", suspended: true }
+  );
+  return {
+    entry: current.getService<SingleEntryService>("singleEntryService"),
+    authorId: (author.data as { id: string }).id,
+  };
+}
+
+describe("single write response — related-row field access (integration)", () => {
+  it("withholds a related field the writer may not read", async () => {
+    const { entry, authorId } = await boot();
+
+    const result = await entry.update(
+      "branding",
+      { siteName: "Acme", author: authorId, _overwrite: true },
+      { user: { id: "writer-1" }, routeAuthorized: true }
+    );
+
+    expect(result.success).toBe(true);
+    const author = (result.data as { author?: Record<string, unknown> })
+      ?.author;
+    // The relationship is still expanded — only the protected field is gone.
+    expect(author).toMatchObject({ name: "Ada" });
+    expect(author).not.toHaveProperty("suspended");
+  });
+
+  it("withholds a protected field a hop further out", async () => {
+    // Nested expansion reaches the related row's own relationships, so the
+    // rules of the collection at the far end apply too. Threading the caller
+    // into the first hop is only half the answer if it stops there.
+    current = await createTestNextly({
+      collections: [
+        // Both hops declare a rule any caller passes, so each row is readable
+        // and only the protected field at the far end is withheld.
+        defineCollection({
+          slug: "orgs",
+          access: { read: () => true },
+          fields: [
+            text({ name: "name" }),
+            checkbox({ name: "blocked", access: { read: () => false } }),
+          ],
+        }),
+        defineCollection({
+          slug: "authors",
+          access: { read: () => true },
+          fields: [
+            text({ name: "name" }),
+            relationship({ name: "org", relationTo: "orgs" }),
+          ],
+        }),
+      ],
+      singles: [
+        defineSingle({
+          slug: "branding",
+          fields: [
+            text({ name: "siteName" }),
+            relationship({ name: "author", relationTo: "authors" }),
+          ],
+        }),
+      ],
+    });
+    // The writer holds read on both hops, and their rules decide the rest.
+    await userWhoMay(current, "writer-1", "read", ["orgs", "authors"]);
+    const handler =
+      current.getService<CollectionsHandler>("collectionsHandler");
+    const org = await handler.createEntry(
+      { collectionName: "orgs", overrideAccess: true },
+      { name: "Acme", blocked: true }
+    );
+    const author = await handler.createEntry(
+      { collectionName: "authors", overrideAccess: true },
+      { name: "Ada", org: (org.data as { id: string }).id }
+    );
+    const entry = current.getService<SingleEntryService>("singleEntryService");
+
+    const result = await entry.update(
+      "branding",
+      {
+        siteName: "Acme",
+        author: (author.data as { id: string }).id,
+        _overwrite: true,
+      },
+      { user: { id: "writer-1" }, routeAuthorized: true }
+    );
+
+    expect(result.success).toBe(true);
+    const nested = (
+      result.data as { author?: { org?: Record<string, unknown> } }
+    )?.author?.org;
+    expect(nested).toMatchObject({ name: "Acme" });
+    expect(nested).not.toHaveProperty("blocked");
+  });
+
+  it("withholds the field from a caller with no identity too", async () => {
+    // A Single whose update rule admits anyone still returns related rows, and
+    // an anonymous caller's read strips the protected field — so the write
+    // response cannot be the one place it survives. Absence of a user is not
+    // trust; `overrideAccess` is.
+    current = await createTestNextly({
+      // The boot's seeding, which makes the Public role the caller with no
+      // identity is judged by.
+      seedPublic: true,
+      collections: [
+        defineCollection({
+          slug: "authors",
+          // Any visitor may read the row, so boot grants Public its read and
+          // what the response withholds is the protected FIELD alone. With no
+          // rule a visitor is refused the whole row, leaving no field to redact.
+          access: { read: () => true },
+          fields: [
+            text({ name: "name" }),
+            checkbox({ name: "suspended", access: { read: () => false } }),
+          ],
+        }),
+      ],
+      singles: [
+        defineSingle({
+          slug: "branding",
+          access: { update: () => true },
+          fields: [
+            text({ name: "siteName" }),
+            relationship({ name: "author", relationTo: "authors" }),
+          ],
+        }),
+      ],
+    });
+    // The Single's rule only narrows the update permission, so Public holds
+    // it, as a site admin would grant it, and the write is allowed.
+    await grantPublic(current, ["update-branding"]);
+    const handler =
+      current.getService<CollectionsHandler>("collectionsHandler");
+    const author = await handler.createEntry(
+      { collectionName: "authors", overrideAccess: true },
+      { name: "Ada", suspended: true }
+    );
+    const entry = current.getService<SingleEntryService>("singleEntryService");
+
+    const result = await entry.update(
+      "branding",
+      {
+        siteName: "Acme",
+        author: (author.data as { id: string }).id,
+        _overwrite: true,
+      },
+      { routeAuthorized: true }
+    );
+
+    expect(result.success).toBe(true);
+    const related = (result.data as { author?: Record<string, unknown> })
+      ?.author;
+    expect(related).toMatchObject({ name: "Ada" });
+    expect(related).not.toHaveProperty("suspended");
+  });
+
+  it("leaves a trusted write's response whole", async () => {
+    // The mirror, and the reason enforcement is not simply switched on
+    // everywhere: a trusted write supplies no caller to judge, and stripping
+    // there would hide fields from an internal writer that nothing denied.
+    const { entry, authorId } = await boot();
+
+    const result = await entry.update(
+      "branding",
+      { siteName: "Acme", author: authorId, _overwrite: true },
+      { overrideAccess: true }
+    );
+
+    expect(result.success).toBe(true);
+    const author = (result.data as { author?: Record<string, unknown> })
+      ?.author;
+    expect(author).toMatchObject({ name: "Ada", suspended: true });
+  });
+});

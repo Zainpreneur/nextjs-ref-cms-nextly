@@ -1,0 +1,100 @@
+/**
+ * Public types for the service dispatcher.
+ *
+ * The dispatcher routes API requests to the appropriate service method,
+ * normalizes responses, and maps error messages to HTTP status codes.
+ * Consumers (route handlers) import `ServiceDispatcher` plus these
+ * types to build and interpret dispatch requests.
+ */
+
+import type { NextlyError } from "../errors/nextly-error";
+
+export type ServiceType =
+  | "users"
+  | "releases"
+  // Review state, steps and assignments under a workflow (@experimental).
+  | "workflows"
+  | "rbac"
+  | "auth"
+  | "posts"
+  | "collections"
+  | "singles"
+  | "field-groups"
+  | "userFields"
+  | "emailProviders"
+  | "emailTemplates"
+  | "apiKeys"
+  | "webhooks"
+  | "jobs"
+  | "generalSettings"
+  | "languages"
+  | "pluginSettings"
+  | "previewLinks"
+  | "previewUrl"
+  | "dashboard"
+  | "documentLock"
+  // A collection's private files: upload start and confirm (@experimental).
+  | "files"
+  | "translations"
+  | "notices"
+  | "email"
+  | "schema"
+  // A subject's content events read by subject; its handler owns its auth.
+  | "contentEvents"
+  // A user's own external identities, listed and unlinked; gated by the
+  // user-management permissions the route gate asks.
+  | "identities"
+  // What the roles screen shows for each collection and Single; its handler
+  // owns its auth.
+  | "rolesScreen";
+
+export type OperationType =
+  | "single"
+  | "list"
+  | "create"
+  | "update"
+  | "delete"
+  | "count";
+
+export interface DispatchRequest {
+  service: ServiceType;
+  operation: OperationType;
+  method: string;
+  params?: Record<string, unknown>;
+  body?: unknown;
+  userId?: string;
+  /** Optional request object for accessing headers. */
+  request?: Request;
+}
+
+export interface DispatchResult {
+  success: boolean;
+  data?: unknown;
+  /**
+   * Carries the original NextlyError (not a stringified message) so the
+   * route wrapper can rebuild the response with correct statusCode, code,
+   * publicData, and headers (Retry-After for rate limits, etc.). See spec
+   * §6.4.
+   */
+  error?: NextlyError;
+  status: number;
+  message?: string;
+  meta?: unknown;
+}
+
+/** Type-safe params record shared by every handler. */
+export type Params = Record<string, string>;
+
+/**
+ * Method handler contract used by every domain dispatcher's method map.
+ * `TService` is the concrete type of the service object passed at runtime
+ * (e.g. `UsersService`, `CollectionsHandler`).
+ */
+export interface MethodHandler<TService> {
+  execute: (
+    service: TService,
+    params: Params,
+    body: unknown,
+    request?: Request
+  ) => Promise<unknown>;
+}

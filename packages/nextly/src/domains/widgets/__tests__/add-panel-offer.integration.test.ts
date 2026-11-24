@@ -1,0 +1,191 @@
+/**
+ * What the add panel is offered, through the real layout read, on every
+ * configured dialect.
+ *
+ * The read names each widget the reader may add, in the panel's order, which
+ * the groups core assigns decide. A widget the reader may not see is not named
+ * at all, and no widget is named after a collection: a card about one is a
+ * Content widget set to it.
+ */
+
+// Must be set before the harness boots (env validation) and to sign tokens.
+process.env.NEXTLY_SECRET =
+  process.env.NEXTLY_SECRET ??
+  "test-secret-must-be-at-least-32-characters-long!!";
+
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+
+import { buildClaims } from "../../../auth/jwt/claims";
+import { signAccessToken } from "../../../auth/jwt/sign";
+import { defineCollection, text } from "../../../config";
+import { describeEachDialect } from "../../../plugins/__tests__/helpers/dialect-matrix";
+import {
+  createTestNextly,
+  type TestNextly,
+} from "../../../plugins/test-nextly";
+import { createDynamicHandlers } from "../../../routeHandler";
+import { refreshContentSources } from "../content-sources";
+import { clearSources } from "../sources";
+
+// Each case makes real requests through the whole handler. Set
+// NEXTLY_TEST_SLOW_DB=1 when the database is across a network; CI keeps the
+// package default, so a slow query there still fails.
+if (process.env.NEXTLY_TEST_SLOW_DB === "1") {
+  vi.setConfig({ testTimeout: 90_000, hookTimeout: 120_000 });
+}
+
+/** Shown content. */
+const POSTS = "posts";
+/** Internal, and hidden from the admin: kept off the dashboard. */
+const INTERNAL = "nx_usage_index";
+const HIDDEN = "patterns";
+
+/**
+ * A built-in gated on reading releases: a reader without the grant may not see
+ * it. It is also offered only once a release exists (`releases:present`), so
+ * each test starts with one.
+ */
+const GATED = "core/upcoming-releases";
+
+interface LayoutRead {
+  placements: { widgetId: string }[];
+  available: string[];
+  widgets: Record<string, { allowsSeveral?: boolean; perCollection?: true }>;
+}
+
+describeEachDialect("what the add panel is offered", dialect => {
+  let handle: TestNextly | undefined;
+  /** The first account, which core makes super-admin. */
+  let admin: string;
+  /** A second account with no role, so no grant. */
+  let reader: string;
+
+  async function account(email: string): Promise<string> {
+    const nextly = handle!.nextly as unknown as {
+      users: {
+        create: (a: { data: Record<string, unknown> }) => Promise<{
+          item: { id: string };
+        }>;
+      };
+    };
+    const created = await nextly.users.create({
+      data: { email, password: "Password123!", name: email, isActive: true },
+    });
+    return created.item.id;
+  }
+
+  async function read(userId: string): Promise<LayoutRead> {
+    const token = await signAccessToken(
+      buildClaims({
+        userId,
+        email: `${userId}@example.com`,
+        name: userId,
+        image: null,
+        roleIds: [],
+        sessionEpoch: 0,
+      }),
+      process.env.NEXTLY_SECRET!
+    );
+    const res = await createDynamicHandlers().GET(
+      new Request("http://localhost/api/dashboard/layout", {
+        headers: { cookie: `nextly_session=${token}` },
+      }),
+      { params: Promise.resolve({ params: ["dashboard", "layout"] }) }
+    );
+    expect(res.status).toBe(200);
+    return (await res.json()) as LayoutRead;
+  }
+
+  /** Every widget the read names, placed or offered. */
+  const named = (layout: LayoutRead) =>
+    new Set([
+      ...layout.placements.map(placement => placement.widgetId),
+      ...layout.available,
+    ]);
+
+  beforeEach(async () => {
+    handle = await createTestNextly({
+      dialect,
+      collections: [
+        defineCollection({ slug: POSTS, fields: [text({ name: "title" })] }),
+        defineCollection({
+          slug: INTERNAL,
+          internal: true,
+          fields: [text({ name: "name" })],
+        }),
+        defineCollection({
+          slug: HIDDEN,
+          admin: { useAsTitle: "title", hidden: true },
+          fields: [text({ name: "title" })],
+        }),
+      ],
+    });
+    admin = await account("admin@example.com");
+    reader = await account("reader@example.com");
+    // A release, so Upcoming releases' condition holds and its gate alone
+    // decides who is offered it.
+    const nextly = handle!.nextly as unknown as {
+      releases: { create: (a: { title: string }) => Promise<unknown> };
+    };
+    await nextly.releases.create({ title: "Launch" });
+    // A cold process: the sources the read offers are the refresh's own work.
+    clearSources();
+    await refreshContentSources();
+  });
+
+  afterEach(async () => {
+    clearSources();
+    await handle?.destroy();
+    handle = undefined;
+  });
+
+  it("names a widget the reader may see, ordered by the group core assigns it", async () => {
+    const layout = await read(admin);
+    expect(named(layout).has(GATED)).toBe(true);
+    // Overview's widgets come before Team's: the panel's order is `available`'s.
+    const at = (id: string) => layout.available.indexOf(id);
+    const offered = [GATED, "core/team", "core/team-activity"].filter(
+      id => at(id) !== -1
+    );
+    expect(offered.map(at)).toEqual([...offered.map(at)].sort((a, b) => a - b));
+    // The facts beside a widget say nothing of where it is listed.
+    expect(layout.widgets[GATED]).not.toHaveProperty("group");
+  });
+
+  it("does not name a widget the reader may not see", async () => {
+    const layout = await read(reader);
+    expect(named(layout).has(GATED)).toBe(false);
+    expect(layout.widgets).not.toHaveProperty(GATED);
+    // The control: the same read names a built-in this reader may see. Note,
+    // which has no gate and no condition. Not Team: it is offered only to
+    // someone who may read people and add or change them, which this reader,
+    // holding no grants, may not; nor Team activity, offered only to a reader
+    // of some content.
+    expect(named(layout).has("core/note")).toBe(true);
+    expect(named(layout).has("core/team-activity")).toBe(false);
+  });
+
+  it("names no widget per collection: a collection is reached through a Content widget", async () => {
+    const layout = await read(admin);
+    // 🔴 No id in a per-collection or per-Single namespace, and none spelled
+    // from any collection this install has, shown or kept off the dashboard.
+    const ids = Object.keys(layout.widgets);
+    expect(
+      ids.filter(id => id.startsWith("collection/") || id.startsWith("single/"))
+    ).toEqual([]);
+    for (const slug of [POSTS, INTERNAL, HIDDEN]) {
+      expect(
+        ids.filter(id => id.includes(slug)),
+        slug
+      ).toEqual([]);
+    }
+    // The control: the Content widget a collection is reached through IS
+    // named, offered once per collection, so the absence above is not an
+    // empty read.
+    expect(layout.widgets["core/count"]?.perCollection).toBe(true);
+    // Everything that IS offered is described beside it.
+    for (const id of layout.available) {
+      expect(layout.widgets[id], id).toBeDefined();
+    }
+  });
+});

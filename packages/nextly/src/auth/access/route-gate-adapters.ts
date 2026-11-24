@@ -1,0 +1,1246 @@
+/**
+ * The REST route gates' answers, and the caller checks beside them, asked of
+ * the one decision.
+ *
+ * A route gate judges the caller a request authenticated, a session or an API
+ * key, against one permission (`requirePermission`, `requireCollectionAccess`,
+ * a plugin route's `requiredPermission`) or any of several
+ * (`requireAnyPermission`). The caller checks ask a gate's question from
+ * inside the work: `ctx.caller.can` in a plugin route, a held permission for a
+ * dashboard widget or a document lock, and the schema builder's collection
+ * list. Each keeps the answer it has always given: where that differs from the
+ * decision's, it is kept through a named deviation (`./deviations`), so no
+ * answer changes and every difference that remains is one of those names.
+ *
+ * One permission on an access operation is the collection gate's question
+ * asked of the route's caller, so it is answered by the collection gate's
+ * adapter: the two have always run the same steps for a session and a key.
+ * A plugin's person never reaches a route gate, so none is asked here.
+ */
+import { parsePermissionSlug } from "../../plugins/routes/permission-slug";
+import { permissionSlug } from "../../schemas/_zod/rbac";
+import {
+  ACCESS_OPERATIONS,
+  type AccessOperation,
+} from "../../services/access/types";
+import {
+  hasAnyPermission,
+  hasPermission,
+} from "../../services/lib/permissions";
+import {
+  apiKeyScopeFrom,
+  scopeHoldsSuperAdmin,
+  type AuthenticatedScope,
+} from "../authenticated-scope";
+import { getRBACService, type ReadAccessCaller } from "../code-access";
+import type { AuthContext } from "../middleware";
+
+import { isSuperAdmin, type Actor, type KeyActor } from "./actor";
+import { storedSlugHolds } from "./answering-permissions";
+import { decide, decidePermission, type AccessTarget } from "./decide";
+import { declaredTarget } from "./declared-rules";
+import { aboutSubject, deviate } from "./deviations";
+import {
+  collectionGateVerdict,
+  type CollectionQuestion,
+  type GateVerdict,
+} from "./gate-adapters";
+import {
+  actorForKey,
+  actorForUser,
+  actorForUserFailingClosed,
+  userHoldsPermission,
+  userIsSuperAdmin,
+  withHeldPermissions,
+} from "./resolve-actor";
+import {
+  RETIRED_MANAGE_PLAIN_ACTIONS,
+  isPlainOfRetiredManage,
+  isRetiredManage,
+} from "./retired-manage-permissions";
+import { allowsSome } from "./rule-answer";
+import {
+  askEachLanguage,
+  withRuleLanguage,
+  type RuleLanguage,
+} from "./rule-language";
+
+/** Where a route gate reads the rules apps declare; absent without the service. */
+export type RouteRules = CollectionQuestion["rules"];
+
+/** One permission a route accepts, as `requireAnyPermission` lists them. */
+export interface RoutePermission {
+  readonly action: string;
+  readonly resource: string;
+}
+
+/**
+ * Who a gate judges: the user the request names and, when a key made the
+ * request, the key's own scope and id.
+ */
+export interface GateCaller {
+  readonly userId: string;
+  /** The key's scope; absent for a session. */
+  readonly key?: AuthenticatedScope;
+  readonly keyId?: string;
+  /** The user's role slugs, which a key's rule falls back to without its own. */
+  readonly roles?: readonly string[];
+}
+
+const ALLOWED: GateVerdict = Object.freeze({ allowed: true });
+const INSUFFICIENT: GateVerdict = Object.freeze({
+  allowed: false,
+  refusal: "insufficient",
+});
+
+const verdictOf = (allowed: boolean): GateVerdict =>
+  allowed ? ALLOWED : INSUFFICIENT;
+
+/** Whether an action names an operation an entity's rule can declare. */
+function isAccessOperation(action: string): action is AccessOperation {
+  return ACCESS_OPERATIONS.some(operation => operation === action);
+}
+
+/**
+ * Whether one permission is an entity's operation, asked of the target with
+ * its rules, rather than a permission alone. A route naming no resource
+ * (`requiredPermission: "manage"`) asks about nothing a rule or a permission
+ * row can name. A system resource whose `manage-` permission is retired
+ * declares no rule, so its plain actions are a permission alone, unless an entity registered
+ * rules under its name: those rules are read whatever the name.
+ */
+function asksTheEntity(
+  action: string,
+  resource: string,
+  target: AccessTarget | undefined
+): boolean {
+  return (
+    isAccessOperation(action) &&
+    resource !== "" &&
+    (target !== undefined || !isPlainOfRetiredManage(action, resource))
+  );
+}
+
+/** The caller the route authenticated. */
+function callerOf(auth: AuthContext): GateCaller {
+  return auth.authMethod === "api-key"
+    ? {
+        userId: auth.userId,
+        key: apiKeyScopeFrom(auth),
+        ...(auth.apiKeyId === undefined ? {} : { keyId: auth.apiKeyId }),
+      }
+    : { userId: auth.userId };
+}
+
+/**
+ * The key's actor, from what authentication resolved; it makes no query. Its
+ * super-admin authority is the scope's, which only authentication gives.
+ */
+function keyActorOf(caller: GateCaller, key: AuthenticatedScope): KeyActor {
+  return actorForKey({
+    keyId: caller.keyId ?? "",
+    userId: caller.userId,
+    grants: key.grants ?? [],
+    roles: key.roles ?? caller.roles ?? [],
+    superAdmin: scopeHoldsSuperAdmin(key),
+  });
+}
+
+/**
+ * Whether a key holds every permission by its maker's super-admin authority,
+ * as a super-admin's session does, whatever its stored list names. Asked
+ * first by the single-permission gate and the any-of gate alike, so a key the
+ * one lets through the other does not refuse on a list that lags the
+ * catalogue.
+ */
+function keyHoldsEveryPermission(actor: KeyActor): boolean {
+  return isSuperAdmin(actor);
+}
+
+/** The caller's actor: a key's from its scope, a user's looked up. */
+function actorOf(caller: GateCaller): Promise<Actor> {
+  return caller.key
+    ? Promise.resolve(keyActorOf(caller, caller.key))
+    : actorForUser(caller.userId);
+}
+
+/**
+ * The verdict for one permission, `action` on `resource`, for the caller the
+ * route authenticated.
+ */
+export function routeGateVerdict(
+  auth: AuthContext,
+  action: string,
+  resource: string,
+  rules: RouteRules,
+  /**
+   * The route's handler applies a collection read rule's filter to what it
+   * reads, so the filter is handed back rather than refused. Only the
+   * entry list and count routes do.
+   */
+  appliesFilter = false
+): Promise<GateVerdict> {
+  return gateVerdict(
+    callerOf(auth),
+    action,
+    resource,
+    rules,
+    () => hasPermission(auth.userId, action, resource),
+    appliesFilter ? "applied" : "refused"
+  );
+}
+
+/**
+ * The verdict for one permission by the grant alone, no rule read: what a
+ * route asks of a publish or an unpublish of every language, whose rule the
+ * service asks once in each language the change puts live, which the route
+ * cannot know. Told every language here, a rule refusing a language that
+ * does not go live would refuse what the service allows.
+ */
+export function routeGrantVerdict(
+  auth: AuthContext,
+  action: string,
+  resource: string,
+  rules: RouteRules
+): Promise<GateVerdict> {
+  return permissionVerdict(callerOf(auth), action, resource, rules);
+}
+
+const UNAUTHENTICATED: GateVerdict = Object.freeze({
+  allowed: false,
+  refusal: "unauthenticated",
+});
+
+/**
+ * The verdict for a visitor, a request carrying no credential, on an action
+ * of the collection or Single a route names: the one decision with the
+ * Public role's grants, exactly as a checked call with no user is judged
+ * (`collectionGateVerdict` with no user). Anything that is not an entity's
+ * operation needs a signed-in caller: a visitor holds no permission but what
+ * the Public role grants on entities.
+ */
+export function routeVisitorVerdict(
+  action: string,
+  resource: string,
+  rules: RouteRules,
+  // Whether the route's handler applies a read rule's filter, so a filter is
+  // answered as the entries it matches rather than refused.
+  appliesFilter = false
+): Promise<GateVerdict> {
+  const registered =
+    resource === "" ? undefined : rules?.getRegisteredTarget(resource);
+  if (!asksTheEntity(action, resource, registered)) {
+    return Promise.resolve(UNAUTHENTICATED);
+  }
+  return collectionGateVerdict({
+    slug: resource,
+    action: action as AccessOperation,
+    principal: null,
+    rules,
+    appliesFilter,
+    // Never read for a caller with no user: the visitor's answer is the
+    // Public role's grants, read whether or not the service is there.
+    permissionWithoutService: () => Promise.resolve(false),
+  });
+}
+
+/**
+ * The actions a collection's capabilities answer: every access operation, so
+ * an operation the gates gain is answered here without an edit.
+ */
+export const COLLECTION_ACTIONS = ACCESS_OPERATIONS;
+
+/** The operations a Single does not have: it is never created or deleted. */
+const NOT_ON_A_SINGLE = ["create", "delete"] as const;
+
+/** An action a Single's capabilities answer. */
+type SingleAction = Exclude<
+  (typeof ACCESS_OPERATIONS)[number],
+  (typeof NOT_ON_A_SINGLE)[number]
+>;
+
+/** The actions a Single's capabilities answer: the rest of the operations. */
+export const SINGLE_ACTIONS: readonly SingleAction[] = ACCESS_OPERATIONS.filter(
+  (operation): operation is SingleAction =>
+    !NOT_ON_A_SINGLE.some(missing => missing === operation)
+);
+
+/**
+ * The requests the admin sends whose languages differ from their action's
+ * own cell, each answered as a cell of its own:
+ * - `readTranslations`: a read that also reads every language's translation
+ *   state (a localized list or a document with `translation-status`);
+ * - `readHistory`: the version history of every language, unfiltered;
+ * - `publishEveryLanguage`: publishing every language at once;
+ * - `createInDefaultLanguage`, `updateInDefaultLanguage`: a create or an
+ *   update sent with no language, which writes the default one;
+ * - `duplicate`: a copy of a published entry, written in the default
+ *   language from what a read of the source shows there, its fallbacks
+ *   included. The route reads a copy's source as published only, so a draft
+ *   never published cannot be copied by anyone, and the cell does not answer
+ *   for it: an editor offers a copy only of an entry with a published
+ *   version.
+ *
+ * A cell answers for every document of its collection, while two of these
+ * requests depend on the document: publishing every language asks the
+ * publish rule only for the languages going live, and a copy of a published
+ * entry is created published where the collection has a lifecycle. Both cells
+ * take the strict side, so the answer
+ * never offers what the route might refuse for some document:
+ * `publishEveryLanguage` asks every configured language, and `duplicate` asks
+ * publish as well wherever the collection has a Draft/Published lifecycle.
+ */
+type CollectionOperationCell =
+  | "readTranslations"
+  | "readHistory"
+  | "publishEveryLanguage"
+  | "createInDefaultLanguage"
+  | "updateInDefaultLanguage"
+  | "duplicate";
+
+/** A Single is never created or copied, so it has neither cell. */
+type SingleOperationCell = Exclude<
+  CollectionOperationCell,
+  "createInDefaultLanguage" | "duplicate"
+>;
+
+/** What the caller may do with one collection or Single. */
+export type EntityCapabilities =
+  | ({ readonly kind: "collection" } & Readonly<
+      Record<
+        (typeof COLLECTION_ACTIONS)[number] | CollectionOperationCell,
+        boolean
+      >
+    >)
+  | ({ readonly kind: "single" } & Readonly<
+      Record<SingleAction | SingleOperationCell, boolean>
+    >);
+
+/**
+ * What the caller may do with each collection and Single. System resources
+ * are not answered here: their routes accept permissions of their own, which
+ * the caller's permission list already states.
+ */
+export interface RouteCapabilities {
+  /**
+   * Whether the caller holds super-admin authority, from the same read the
+   * cells were answered from. A key never does.
+   */
+  readonly isSuperAdmin: boolean;
+  readonly entities: Readonly<Record<string, EntityCapabilities>>;
+}
+
+/**
+ * The REST operation that performs each action on a collection or a Single,
+ * whose languages a rule is told when that request asks the gate.
+ */
+const OPERATION_OF: Record<"collection" | "single", Record<string, string>> = {
+  collection: {
+    create: "createEntry",
+    read: "getEntry",
+    update: "updateEntry",
+    delete: "deleteEntry",
+    publish: "updateEntry",
+    unpublish: "updateEntry",
+  },
+  single: {
+    read: "getSingleDocument",
+    update: "updateSingleDocument",
+    publish: "updateSingleDocument",
+    unpublish: "updateSingleDocument",
+  },
+};
+
+/**
+ * What a cell's request sends about its languages: the language the answer
+ * was asked in (`as-asked`), that language with every language's translation
+ * state (`with-states`), or no language at all (`none`).
+ */
+export type SentLanguage = "as-asked" | "with-states" | "none";
+
+/**
+ * The route parameters a request sending `sent` carries, for a caller asking
+ * in `locale`, so a cell is framed by exactly what its request sends.
+ */
+export function sentParams(
+  sent: SentLanguage,
+  locale: string
+): Record<string, string> {
+  if (sent === "none") return {};
+  if (sent === "with-states") return { locale, "translation-status": "1" };
+  return { locale };
+}
+
+/** A request answered as a cell of its own, by the action its route asks. */
+interface OperationCell {
+  readonly action: AccessOperation;
+  readonly operation: string;
+  readonly sent: SentLanguage;
+}
+
+/**
+ * Each request answered as a cell of its own, other than publishing every
+ * language, and the REST operation and parameters it is sent with. A list
+ * and a document read their translation states in the same languages, so one
+ * cell answers both.
+ */
+const OPERATION_CELLS: {
+  readonly collection: Readonly<
+    Record<
+      Exclude<CollectionOperationCell, "publishEveryLanguage" | "duplicate">,
+      OperationCell
+    >
+  >;
+  readonly single: Readonly<
+    Record<Exclude<SingleOperationCell, "publishEveryLanguage">, OperationCell>
+  >;
+} = {
+  collection: {
+    readTranslations: {
+      action: "read",
+      operation: "listEntries",
+      sent: "with-states",
+    },
+    readHistory: {
+      action: "read",
+      operation: "listEntryVersions",
+      sent: "none",
+    },
+    createInDefaultLanguage: {
+      action: "create",
+      operation: "createEntry",
+      sent: "none",
+    },
+    updateInDefaultLanguage: {
+      action: "update",
+      operation: "updateEntry",
+      sent: "none",
+    },
+  },
+  single: {
+    readTranslations: {
+      action: "read",
+      operation: "getSingleDocument",
+      sent: "with-states",
+    },
+    readHistory: {
+      action: "read",
+      operation: "listSingleVersions",
+      sent: "none",
+    },
+    updateInDefaultLanguage: {
+      action: "update",
+      operation: "updateSingleDocument",
+      sent: "none",
+    },
+  },
+};
+
+/** The REST operation that publishes every language of an entry or a Single. */
+const PUBLISH_EVERY_LANGUAGE: Record<"collection" | "single", string> = {
+  collection: "publishAllLocales",
+  single: "publishAllSingleLocales",
+};
+
+/**
+ * What `caller` may do with each of `entities`: the route gate's answer for
+ * every action, as a REST request asking it would get, so the admin offers
+ * what the server allows and nothing else. A publish or an unpublish is
+ * answered by its own permission and rule: it is what a request changing
+ * only the status needs, while one that also edits fields needs update too.
+ * `languageOf` gives the languages the REST operation behind an action is
+ * told when its request sends what `sent` names, so a rule hears the
+ * languages that request would.
+ *
+ * The caller is read once for the whole answer: a key from its scope, and a
+ * signed-in user's permissions held for every cell, so an added entity adds
+ * no question about the caller, and the super-admin flag comes from that same
+ * read. A lookup that fails throws, as it does at the route gate, rather than
+ * being answered as a refusal or asked again cell by cell.
+ */
+export async function routeGateCapabilities(
+  caller: GateCaller,
+  entities: ReadonlyMap<string, "collection" | "single">,
+  rules: RouteRules,
+  languageOf: LanguageOf,
+  /** Whether a collection has a Draft/Published lifecycle. */
+  hasLifecycle: (slug: string) => boolean
+): Promise<RouteCapabilities> {
+  const answer = () =>
+    entityCapabilities(caller, entities, rules, languageOf, hasLifecycle);
+  // A key carries super-admin authority only as authentication gave it: a
+  // full-access key whose maker is an active super-admin.
+  if (caller.key) {
+    return {
+      isSuperAdmin: scopeHoldsSuperAdmin(caller.key),
+      entities: await answer(),
+    };
+  }
+  return withHeldPermissions(caller.userId, async held => ({
+    isSuperAdmin: held.superAdmin,
+    entities: await answer(),
+  }));
+}
+
+/** The languages a REST operation is told when its request sends `sent`. */
+export type LanguageOf = (
+  operation: string,
+  sent: SentLanguage
+) => RuleLanguage;
+
+async function entityCapabilities(
+  caller: GateCaller,
+  entities: ReadonlyMap<string, "collection" | "single">,
+  rules: RouteRules,
+  languageOf: LanguageOf,
+  hasLifecycle: (slug: string) => boolean
+): Promise<RouteCapabilities["entities"]> {
+  const byEntity: Record<string, EntityCapabilities> = {};
+  for (const [slug, kind] of entities) {
+    const actions = kind === "single" ? SINGLE_ACTIONS : COLLECTION_ACTIONS;
+    const answered: Record<string, boolean> = {};
+    for (const action of actions) {
+      // A collection's delete is answered once, below, in each language.
+      if (kind === "collection" && action === "delete") continue;
+      answered[action] = await withRuleLanguage(
+        languageOf(OPERATION_OF[kind][action] ?? action, "as-asked"),
+        () => capability(caller, action, slug, rules)
+      );
+    }
+    // Each request whose languages differ from its action's own cell is
+    // asked by the same gate, framed by what that request sends.
+    for (const [cell, asked] of Object.entries(OPERATION_CELLS[kind])) {
+      answered[cell] = await operationCell(
+        caller,
+        asked,
+        slug,
+        rules,
+        languageOf
+      );
+    }
+    answered.publishEveryLanguage = await publishesEveryLanguage(
+      caller,
+      slug,
+      rules,
+      languageOf(PUBLISH_EVERY_LANGUAGE[kind], "none"),
+      kind === "single" || !hasLifecycle(slug)
+    );
+    if (kind === "collection") {
+      answered.delete = await deletesInSomeLanguage(
+        caller,
+        slug,
+        rules,
+        languageOf("deleteEntry", "none")
+      );
+      answered.duplicate = await duplicates(
+        caller,
+        slug,
+        rules,
+        languageOf("duplicateEntry", "none"),
+        hasLifecycle(slug)
+      );
+    }
+    byEntity[slug] = { kind, ...answered } as EntityCapabilities;
+  }
+  return byEntity;
+}
+
+/**
+ * Whether `caller` may delete some entry of `resource`, as a hint: a delete
+ * is asked in each language its entry holds, which a collection's cell
+ * cannot know, so it answers yes where the rule allows a delete in any of
+ * `everyLanguage`, each asked as that one. The delete itself is judged entry
+ * by entry. With no language, asked once, as a delete is.
+ */
+async function deletesInSomeLanguage(
+  caller: GateCaller,
+  resource: string,
+  rules: RouteRules,
+  everyLanguage: RuleLanguage
+): Promise<boolean> {
+  const ask = () => capability(caller, "delete", resource, rules);
+  if (everyLanguage.locales.length === 0) {
+    return withRuleLanguage(everyLanguage, ask);
+  }
+  for (const locale of everyLanguage.locales) {
+    const allowed = await withRuleLanguage(
+      { locale, locales: everyLanguage.locales },
+      ask
+    );
+    if (allowed) return true;
+  }
+  return false;
+}
+
+/**
+ * One request answered as a cell of its own: its action asked by the gate, in
+ * the languages that request is told.
+ */
+function operationCell(
+  caller: GateCaller,
+  asked: OperationCell,
+  resource: string,
+  rules: RouteRules,
+  languageOf: LanguageOf
+): Promise<boolean> {
+  return withRuleLanguage(languageOf(asked.operation, asked.sent), () =>
+    capability(caller, asked.action, resource, rules)
+  );
+}
+
+/**
+ * Whether `caller` may create an entry of the collection `resource` with a
+ * request that names no language, which writes the default one: the
+ * `createInDefaultLanguage` cell of {@link routeGateCapabilities}, asked of
+ * one collection. A door that offers a create by that request asks this, so
+ * it and the admin's capability give one answer, a rule that answers by
+ * language included.
+ */
+export function createsInDefaultLanguage(
+  caller: GateCaller,
+  resource: string,
+  rules: RouteRules,
+  languageOf: LanguageOf
+): Promise<boolean> {
+  return operationCell(
+    caller,
+    OPERATION_CELLS.collection.createInDefaultLanguage,
+    resource,
+    rules,
+    languageOf
+  );
+}
+
+/**
+ * Whether `caller` may copy a published entry of `resource`, as that request
+ * is judged: a read of the source and a create, both in the default language
+ * and its fallbacks. Where the collection has a lifecycle the copy is created
+ * published, so the publish check is asked too.
+ */
+async function duplicates(
+  caller: GateCaller,
+  resource: string,
+  rules: RouteRules,
+  language: RuleLanguage,
+  hasLifecycle: boolean
+): Promise<boolean> {
+  return withRuleLanguage(language, async () => {
+    for (const action of ["read", "create"] as const) {
+      if (!(await capability(caller, action, resource, rules))) return false;
+    }
+    return !hasLifecycle || capability(caller, "publish", resource, rules);
+  });
+}
+
+/**
+ * Whether `caller` may publish every language of `resource` at once, on the
+ * strict side of how that request is judged: the publish check once for each
+ * configured language, with its rules told that one and all of them. The
+ * request asks only the languages it puts live, which depend on the document,
+ * so asking every configured language never allows what it would refuse.
+ *
+ * On a collection with a lifecycle the request changes only each language's
+ * status, which publish alone judges, so a caller holding publish without
+ * update may make it. A Single, and a collection without a lifecycle, ask
+ * update in every language first (`asksUpdate`).
+ */
+async function publishesEveryLanguage(
+  caller: GateCaller,
+  resource: string,
+  rules: RouteRules,
+  everyLanguage: RuleLanguage,
+  asksUpdate: boolean
+): Promise<boolean> {
+  return withRuleLanguage(everyLanguage, async () => {
+    if (asksUpdate && !(await capability(caller, "update", resource, rules))) {
+      return false;
+    }
+    const refused = await askEachLanguage(everyLanguage.locales, async () =>
+      (await capability(caller, "publish", resource, rules))
+        ? undefined
+        : "refused"
+    );
+    return refused === undefined;
+  });
+}
+
+/** The route gate's answer for one action, decided as its own subject. */
+async function capability(
+  caller: GateCaller,
+  action: string,
+  resource: string,
+  rules: RouteRules
+): Promise<boolean> {
+  const verdict = await aboutSubject(permissionSlug(action, resource), () =>
+    gateVerdict(
+      caller,
+      action,
+      resource,
+      rules,
+      () => userHoldsPermission(caller.userId, action, resource),
+      // A cell is a hint of what the caller may try, and the write it offers
+      // applies the rule's filter, so a cell answers yes under a filter for
+      // every action.
+      "cell"
+    )
+  );
+  if (!verdict.allowed && verdict.refusal === "failed") throw verdict.error;
+  return verdict.allowed;
+}
+
+/**
+ * The route gate's verdict for one permission. An entity's operation is the
+ * collection gate's question; anything else only the permission path answers,
+ * as the gate always has, a super-admin first, so the one difference the
+ * decision makes there is named.
+ */
+function gateVerdict(
+  caller: GateCaller,
+  action: string,
+  resource: string,
+  rules: RouteRules,
+  permissionWithoutService: () => Promise<boolean>,
+  readFilter: ReadFilterUse = "refused",
+  /**
+   * The caller's transaction, when the question is asked inside one: the
+   * reads it makes run on it, not on a second connection from the pool.
+   */
+  executor?: unknown
+): Promise<GateVerdict> {
+  const registered =
+    resource === "" ? undefined : rules?.getRegisteredTarget(resource);
+  if (!asksTheEntity(action, resource, registered)) {
+    return permissionVerdict(caller, action, resource, rules, executor);
+  }
+  return collectionGateVerdict({
+    slug: resource,
+    action: action as AccessOperation,
+    // A key's rule falls back to the user's roles without its own; a
+    // session's roles are looked up, never taken as handed.
+    user: caller.key
+      ? {
+          id: caller.userId,
+          ...(caller.roles ? { roles: [...caller.roles] } : {}),
+        }
+      : { id: caller.userId },
+    scope: caller.key,
+    principal: null,
+    rules,
+    permissionWithoutService,
+    appliesFilter: readFilter === "applied",
+    // A yes or no answers yes under a filter for a read alone: the caller may
+    // read the entries the filter matches. A write under a filter names no
+    // entry and applies no filter here, so its yes would let the caller act
+    // past the filter.
+    asksSomeEntries:
+      readFilter === "cell" ||
+      (readFilter === "some-entries" && action === "read"),
+    ...(executor === undefined ? {} : { executor }),
+  });
+}
+
+/**
+ * What an asker does with a collection rule's filter: applies it to the
+ * entries it reads (`applied`); asks only a yes or no, which a read's filter
+ * answers yes and a write's no (`some-entries`); shows a capability cell,
+ * which any action's filter answers yes, as the request it offers applies the
+ * filter (`cell`); or neither, and refuses it (`refused`).
+ */
+type ReadFilterUse = "applied" | "some-entries" | "cell" | "refused";
+
+/**
+ * The verdict for an action no rule can name. A key holds it by its stored
+ * slug; a session, with the access-control service, by super-admin authority
+ * and then the permission, and without it by the permission alone.
+ */
+async function permissionVerdict(
+  caller: GateCaller,
+  action: string,
+  resource: string,
+  rules: RouteRules,
+  /** The caller's transaction, as {@link gateVerdict} is handed it. */
+  executor?: unknown
+): Promise<GateVerdict> {
+  // A retired `manage-` permission, asked by a gate written before it was
+  // retired, is held only by holding all four plain permissions it stood
+  // for, each asked here as any other: the decision answers it the same way.
+  if (isRetiredManage(action, resource)) {
+    for (const plain of RETIRED_MANAGE_PLAIN_ACTIONS) {
+      if (
+        !(await permissionVerdict(caller, plain, resource, rules, executor))
+          .allowed
+      ) {
+        return verdictOf(false);
+      }
+    }
+    return verdictOf(true);
+  }
+  if (caller.key) {
+    const actor = keyActorOf(caller, caller.key);
+    if (keyHoldsEveryPermission(actor)) return verdictOf(true);
+    const today = storedSlugHolds(caller.key.permissions, action, resource);
+    // The decision reads the grant's action and resource, which agree with
+    // the stored slug unless a grant was stored under a slug of its own.
+    await deviate(
+      "key-slug-string-match",
+      today,
+      () => decidePermission(actor, action, resource).allowed
+    );
+    return verdictOf(today);
+  }
+  // On the caller's transaction where it is asked inside one.
+  const on = executor === undefined ? {} : { executor };
+  return verdictOf(
+    (rules !== undefined && (await userIsSuperAdmin(caller.userId, on))) ||
+      (await userHoldsPermission(caller.userId, action, resource, on))
+  );
+}
+
+/**
+ * The verdict when any one of several permissions will do. Today a key holds
+ * one by its stored slug and a session by its database permissions, and no
+ * rule is read for either. A retired `manage-` permission among them is held
+ * as {@link permissionVerdict} holds it.
+ */
+export function anyPermissionVerdict(
+  auth: AuthContext,
+  permissions: readonly RoutePermission[],
+  rules: RouteRules
+): Promise<GateVerdict> {
+  return anyPermissionVerdictOf(callerOf(auth), permissions, rules);
+}
+
+/** {@link anyPermissionVerdict}, for the caller a gate judges. */
+async function anyPermissionVerdictOf(
+  caller: GateCaller,
+  permissions: readonly RoutePermission[],
+  rules: RouteRules
+): Promise<GateVerdict> {
+  // A retired `manage-` permission in the list is asked as the single gate
+  // asks it, held only by the four plain permissions it stood for, never by
+  // its own stored row; the rest are asked together, any one of them doing.
+  const retired = permissions.filter(({ action, resource }) =>
+    isRetiredManage(action, resource)
+  );
+  if (retired.length > 0) {
+    for (const { action, resource } of retired) {
+      if ((await permissionVerdict(caller, action, resource, rules)).allowed) {
+        return verdictOf(true);
+      }
+    }
+    const rest = permissions.filter(
+      ({ action, resource }) => !isRetiredManage(action, resource)
+    );
+    return rest.length > 0
+      ? anyPermissionVerdictOf(caller, rest, rules)
+      : verdictOf(false);
+  }
+  if (caller.key) {
+    const key = caller.key;
+    const actor = keyActorOf(caller, key);
+    if (keyHoldsEveryPermission(actor)) return verdictOf(true);
+    const today = permissions.some(({ action, resource }) =>
+      storedSlugHolds(key.permissions, action, resource)
+    );
+    // Two steps from today's answer to the decision's, each named apart: the
+    // grants rather than the stored slugs, then the targets' rules read.
+    const byPermission = permissions.some(
+      ({ action, resource }) =>
+        decidePermission(actor, action, resource).allowed
+    );
+    await deviate("key-slug-string-match", today, () => byPermission);
+    await deviate("any-of-skips-rules", byPermission, () =>
+      anyDecided(actor, permissions, rules)
+    );
+    return verdictOf(today);
+  }
+  const today = await hasAnyPermission(caller.userId, [...permissions]);
+  // The user's actor is resolved only while a test listens, and once.
+  let actor: Promise<Actor> | undefined;
+  const userActor = () => (actor ??= actorForUser(caller.userId));
+  const byPermission = async () => {
+    const resolved = await userActor();
+    return permissions.some(
+      ({ action, resource }) =>
+        decidePermission(resolved, action, resource).allowed
+    );
+  };
+  // Named only where reading the rules moves the answer past the permissions:
+  // the comparison is made against today's answer, so a difference the
+  // permissions alone explain is reported as "agrees" here.
+  await deviate("any-of-skips-rules", today, async () => {
+    const decided = await anyDecided(await userActor(), permissions, rules);
+    return decided === (await byPermission()) ? today : decided;
+  });
+  return verdictOf(today);
+}
+
+/** Whether the decision allows any one of the permissions. */
+async function anyDecided(
+  actor: Actor,
+  permissions: readonly RoutePermission[],
+  rules: RouteRules
+): Promise<boolean> {
+  for (const { action, resource } of permissions) {
+    if (await decidedOne(actor, action, resource, rules)) return true;
+  }
+  return false;
+}
+
+/**
+ * The decision's answer for one permission: an entity's operation asked of
+ * the target with the rules it declares, whether or not the access-control
+ * service is there to read them, and anything else of the permission alone,
+ * as {@link gateVerdict} routes them.
+ */
+async function decidedOne(
+  actor: Actor,
+  action: string,
+  resource: string,
+  rules: RouteRules
+): Promise<boolean> {
+  const declared =
+    resource === ""
+      ? undefined
+      : (declaredTarget(resource) ?? rules?.getRegisteredTarget(resource));
+  if (!asksTheEntity(action, resource, declared)) {
+    return decidePermission(actor, action, resource).allowed;
+  }
+  const target: AccessTarget = declared ?? {
+    kind: "collection",
+    slug: resource,
+  };
+  return allowsSome(
+    await decide(actor, action as AccessOperation, target),
+    action
+  );
+}
+
+/**
+ * Whether this caller may perform `action` on `resource`, whichever way they
+ * authenticated: a plugin route's `ctx.caller.can(action, resource)`, and the
+ * dashboard's checks of a widget's reader.
+ *
+ * The route gate's question asked of the caller, `scope` when a key made the
+ * request: a key is judged on its own scope, never its owner's grants, and a
+ * super-admin does not bypass that scope. Three answers it has always given
+ * apart from the gate are kept through named deviations: an empty action or
+ * resource refused, a signed-in user refused without the access-control
+ * service, and a rule's own answer handed back as it came.
+ *
+ * `action` is a plain string rather than the operation union, because a
+ * permission's action is not bounded by those six: `export-submissions` and
+ * `manage-background-jobs` are both real grants.
+ *
+ * `options.anyEntry` asks whether the caller may perform `action` on any
+ * entry at all: the same decision, with a rule's filter counting as yes for a
+ * write as well as a read. It decides nothing about an entry, so it applies
+ * and bypasses no rule; the write itself is still judged on its entry.
+ */
+export async function callerMayPerform(
+  scope: AuthenticatedScope | undefined,
+  action: string,
+  resource: string,
+  user: { id: string; roles?: readonly string[] },
+  options: {
+    readonly anyEntry?: boolean;
+    /**
+     * The caller's transaction, when it is asked inside one (a write's field
+     * validator): the decision reads on it, rather than waiting on the pool
+     * for the connection the transaction holds.
+     */
+    readonly executor?: unknown;
+  } = {}
+): Promise<boolean> {
+  if (!user.id) return false;
+  const rules = getRBACService();
+  const caller = probedCaller(scope, user);
+  if (!action || !resource) return refusedEmpty(caller, action, resource);
+  // `anyEntry` asks the type-level question a capability cell asks: a rule's
+  // filter counts as yes for any action, since the caller may act on the
+  // entries it matches. Otherwise a filter answers yes for a read alone, as a
+  // yes-or-no with no entry to apply it to must.
+  const readFilter = options.anyEntry === true ? "cell" : "some-entries";
+  if (!caller.key) {
+    return sessionAnswer(
+      caller.userId,
+      action,
+      resource,
+      rules,
+      readFilter,
+      options.executor
+    );
+  }
+  // A key is judged on its own scope, the route gate's way, with or without
+  // the service.
+  return (
+    await gateVerdict(
+      caller,
+      action,
+      resource,
+      rules,
+      () => Promise.resolve(false),
+      readFilter,
+      options.executor
+    )
+  ).allowed;
+}
+
+/** The caller a probe judges: a key on its own scope, else the user. */
+function probedCaller(
+  scope: AuthenticatedScope | undefined,
+  user: { id: string; roles?: readonly string[] }
+): GateCaller {
+  return scope?.actorType === "apiKey"
+    ? {
+        userId: user.id,
+        key: scope,
+        ...(user.roles ? { roles: user.roles } : {}),
+      }
+    : { userId: user.id };
+}
+
+/**
+ * Whether the caller holds any one of `permissions`, as the REST any-of
+ * gates ask it ({@link anyPermissionVerdict}): by grant, no entity's rule
+ * read. For a probe deciding whether to offer what such a gate guards.
+ */
+export async function callerHoldsAny(
+  scope: AuthenticatedScope | undefined,
+  permissions: readonly RoutePermission[],
+  user: { id: string; roles?: readonly string[] }
+): Promise<boolean> {
+  if (!user.id) return false;
+  const verdict = await anyPermissionVerdictOf(
+    probedCaller(scope, user),
+    permissions,
+    getRBACService()
+  );
+  return verdict.allowed;
+}
+
+/**
+ * Whether the caller holds the permission a slug names, as a dashboard
+ * widget's `requiredPermission` and a document lock's release ask it. A key
+ * holds it by the stored slug alone; a signed-in user is asked as a
+ * capability cell asks one, a rule's filter counting as the permission held.
+ */
+export function holdsPermissionAnswer(
+  slug: string,
+  caller: ReadAccessCaller,
+  rules: RouteRules
+): Promise<boolean> {
+  // The slug is the subject, so a dashboard deciding many widgets at once
+  // still says what deviated in deciding each.
+  return aboutSubject(slug, () => heldPermission(slug, caller, rules));
+}
+
+async function heldPermission(
+  slug: string,
+  caller: ReadAccessCaller,
+  rules: RouteRules
+): Promise<boolean> {
+  if (!caller.userId || !slug) return false;
+  const { action, resource } = parsePermissionSlug(slug);
+  if (caller.authMethod === "api-key") {
+    const actor = actorForKey({
+      keyId: "",
+      userId: caller.userId,
+      grants: caller.grants ?? [],
+      roles: caller.roles,
+      superAdmin: caller.keyHoldsSuperAdmin === true,
+    });
+    // A key carrying its maker's super-admin authority holds every
+    // permission, as a super-admin's session does.
+    if (isSuperAdmin(actor)) return true;
+    // A retired `manage-` permission is held as the route gate holds it: by
+    // all four plain permissions it stood for, each by its stored slug.
+    const today = isRetiredManage(action, resource)
+      ? RETIRED_MANAGE_PLAIN_ACTIONS.every(plain =>
+          storedSlugHolds(caller.permissions, plain, resource)
+        )
+      : storedSlugHolds(caller.permissions, action, resource);
+    // Two steps from today's answer to the decision's, each named apart: the
+    // grant rather than the stored slug, then the target's rules read.
+    const byPermission = decidePermission(actor, action, resource).allowed;
+    await deviate("key-slug-string-match", today, () => byPermission);
+    await deviate("holds-permission-key-skips-rules", byPermission, () =>
+      decidedOne(actor, action, resource, rules)
+    );
+    return today;
+  }
+  const user: GateCaller = { userId: caller.userId };
+  // Refused without the service before the slug is read, as it always was.
+  if (!rules) return refusedWithoutService(user, action, resource);
+  if (!action || !resource) return refusedEmpty(user, action, resource);
+  // Holding a permission is a hint of what the caller may do, as a capability
+  // cell is: a lock's release and the dashboard's offers read a filter as the
+  // permission held, and the write itself applies the filter.
+  return sessionAnswer(caller.userId, action, resource, rules, "cell");
+}
+
+/**
+ * A signed-in user's answer to a caller check: the route gate's, a yes or a
+ * no, and refused without the access-control service. A lookup that failed
+ * fails the check, as it always has, rather than answering no. `readFilter`
+ * says what a rule's filter answers: a yes or no (`some-entries`), or a hint
+ * of what the caller holds (`cell`).
+ */
+async function sessionAnswer(
+  userId: string,
+  action: string,
+  resource: string,
+  rules: RouteRules,
+  readFilter: "some-entries" | "cell",
+  /** The caller's transaction, as {@link gateVerdict} is handed it. */
+  executor?: unknown
+): Promise<boolean> {
+  const caller: GateCaller = { userId };
+  if (!rules) return refusedWithoutService(caller, action, resource);
+  const verdict = await gateVerdict(
+    caller,
+    action,
+    resource,
+    rules,
+    () => Promise.resolve(false),
+    readFilter,
+    executor
+  );
+  if (!verdict.allowed && verdict.refusal === "failed") throw verdict.error;
+  return verdict.allowed;
+}
+
+/**
+ * Whether the signed-in user `userId` may perform `action` on `resource`, as
+ * the route gate decides it for that user's session, with the rules `rules`
+ * holds now: a read a rule's filter limits answers yes, since the user may
+ * read the entries it matches (`nextly.access.check`). A lookup that fails
+ * throws, as the gate's does.
+ */
+export async function sessionMayPerform(
+  userId: string,
+  action: string,
+  resource: string,
+  rules: RouteRules
+): Promise<boolean> {
+  const verdict = await gateVerdict(
+    { userId },
+    action,
+    resource,
+    rules,
+    () => Promise.resolve(false),
+    "some-entries"
+  );
+  if (!verdict.allowed && verdict.refusal === "failed") throw verdict.error;
+  return verdict.allowed;
+}
+
+/** An empty action or resource, refused whoever asks. */
+function refusedEmpty(
+  caller: GateCaller,
+  action: string,
+  resource: string
+): Promise<boolean> {
+  return deviate("can-refuses-empty-action-or-resource", false, async () =>
+    decidedOne(await actorOf(caller), action, resource, undefined)
+  );
+}
+
+/** A signed-in user refused for want of the access-control service. */
+function refusedWithoutService(
+  caller: GateCaller,
+  action: string,
+  resource: string
+): Promise<boolean> {
+  return deviate("can-no-service-refuses-people", false, async () =>
+    decidedOne(await actorOf(caller), action, resource, undefined)
+  );
+}
+
+/** A collection the schema list may show, by its slug. */
+export interface ListedCollection {
+  readonly slug: string;
+}
+
+/**
+ * The collections among `collections` the schema list shows the caller the
+ * route authenticated: those it may read by its permission, in the order
+ * given. A key holds the permission by its stored slug and a session by its
+ * permissions, a super-admin every one, and no collection's read rule is read.
+ *
+ * The caller is read once for the whole list, not once per collection: a
+ * super-admin by the one cached check, anyone else by their roles and grants.
+ */
+export async function schemaListed<T extends ListedCollection>(
+  auth: AuthContext,
+  collections: readonly T[],
+  rules: RouteRules
+): Promise<T[]> {
+  const caller = callerOf(auth);
+  if (caller.key) {
+    const key = caller.key;
+    const actor = keyActorOf(caller, key);
+    // A key carrying its maker's super-admin authority is shown every one,
+    // as a super-admin's session is.
+    if (isSuperAdmin(actor)) return [...collections];
+    return keptWhere(collections, slug =>
+      readByPermission(
+        actor,
+        slug,
+        rules,
+        storedSlugHolds(key.permissions, "read", slug)
+      )
+    );
+  }
+  if (await userIsSuperAdmin(caller.userId)) return [...collections];
+  // A lookup that fails counts as holding nothing of its kind, so a failed
+  // role read keeps the grants that were read, as each collection's own
+  // permission check did when it failed closed.
+  const actor = await actorForUserFailingClosed(caller.userId);
+  // The super-admin authority the actor's roles carry counts too: it is what
+  // each collection's permission check passed first, and it holds when the
+  // cached check above failed but the roles were read.
+  return keptWhere(collections, slug =>
+    readByPermission(
+      actor,
+      slug,
+      rules,
+      decidePermission(actor, "read", slug).allowed
+    )
+  );
+}
+
+async function keptWhere<T extends ListedCollection>(
+  collections: readonly T[],
+  shown: (slug: string) => Promise<boolean>
+): Promise<T[]> {
+  const kept: T[] = [];
+  for (const collection of collections) {
+    // Each collection's decision is its own subject, so what deviated in
+    // deciding it can be told apart from the rest of the list.
+    const slug = collection.slug;
+    if (await aboutSubject(slug, () => shown(slug))) kept.push(collection);
+  }
+  return kept;
+}
+
+/**
+ * Whether the list shows one collection: today's answer from the permission,
+ * with each step to the decision's named apart: the grant rather than a key's
+ * stored slug, then the read rule.
+ */
+async function readByPermission(
+  actor: Actor,
+  slug: string,
+  rules: RouteRules,
+  today: boolean
+): Promise<boolean> {
+  const byPermission = decidePermission(actor, "read", slug).allowed;
+  if (actor.kind === "key") {
+    await deviate("key-slug-string-match", today, () => byPermission);
+  }
+  await deviate("schema-list-ignores-rules", byPermission, () =>
+    decidedOne(actor, "read", slug, rules)
+  );
+  return today;
+}

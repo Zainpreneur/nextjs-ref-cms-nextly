@@ -1,0 +1,457 @@
+/**
+ * Reading stored props safely.
+ *
+ * A prop schema describes what an EDITOR offers, not what a document holds. The
+ * engine validates props as an object and nothing more, so a stored node can
+ * carry a number where a string was declared, a missing field, or a value a
+ * migration left behind. Every block in this library reads through these rather
+ * than trusting the declared type, for the same reason the renderer sanitizes
+ * the tree: the input is a database row.
+ *
+ * @module blocks/props
+ */
+import {
+  authoredText,
+  isAuthoredText,
+  isFetchableUrl,
+  isLinkableUrl,
+} from "@nextlyhq/blocks-engine";
+import type { BoundValue, RemotePatternInput } from "@nextlyhq/blocks-engine";
+import { createElement, type ReactNode } from "react";
+
+import type { ReadClaim } from "../context";
+
+/**
+ * Whether a stored value is text an author actually put there.
+ *
+ * Re-exported from the engine rather than declared here, because link
+ * eligibility is not the only decision this renderer shares with the plain-text
+ * projections taken from the same document: what a page DRAWS and what a
+ * description SAYS about it have to answer this identically, and a copy here
+ * agreed on the day it was written and then drifted.
+ *
+ * Separate from {@link text} because a few props need to tell a MISSING value
+ * from an empty one, and `text()` maps both to `""`. An image's `alt` is the
+ * case that matters: absent means "nobody said", while an explicit `""` is the
+ * documented way to mark an image decorative, and those call for opposite
+ * behaviour.
+ */
+export { isAuthoredText };
+
+/** A string prop, or the fallback when the stored value is not usable text. */
+export function text(value: unknown, fallback = ""): string {
+  return authoredText(value, fallback);
+}
+
+/**
+ * A text prop's words, marked up as a date when its binding filled it with one.
+ *
+ * A bound date reaches a text prop already formatted for the reader, and the
+ * machine-readable value travels beside it in the block's `bound` argument.
+ * Wrapped in `<time datetime>` here, inside the element the block draws, so a
+ * crawler or an assistive tool reads the date a reader sees. Anything else is
+ * the text as it is.
+ */
+export function boundText(
+  label: string,
+  bound: BoundValue | undefined
+): ReactNode {
+  if (bound?.kind !== "date" || label === "") return label;
+  return createElement("time", { dateTime: bound.datetime }, label);
+}
+
+/** A stored value constrained to one of a fixed set, or the fallback. */
+export function oneOf<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  fallback: T
+): T {
+  return allowed.includes(value as T) ? (value as T) : fallback;
+}
+
+/** A boolean prop. Only a real boolean counts; a stored `"false"` is not one. */
+export function flag(value: unknown, fallback = false): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+/** A bound image prop's value: what it holds, and its binding's fallback. */
+export type BoundImage = Extract<BoundValue, { readonly kind: "image" }>;
+
+/**
+ * An image prop's bound value, when its binding filled it: whether the prop
+ * now holds a media id or an image address, and the fallback to draw when
+ * the host finds no record for the id. Nothing for a prop showing its own
+ * value, which the block reads as it always has.
+ */
+export function boundImage(
+  bound: BoundValue | undefined
+): BoundImage | undefined {
+  return bound?.kind === "image" ? bound : undefined;
+}
+
+/** A finite number within bounds, or the fallback. */
+export function number(
+  value: unknown,
+  { min, max, fallback }: { min: number; max: number; fallback: number }
+): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, value));
+}
+
+/**
+ * Schemes that execute rather than navigate.
+ *
+ * An ALLOWLIST, not a list of schemes to refuse.
+ *
+ * The refusing shape was tried first and is the wrong one here for the same
+ * reason it is wrong in the style compiler: a blocklist has to predict every
+ * dangerous scheme and misses the next one. `javascript:`, `vbscript:` and
+ * `data:` were named, so `blob:` was not — and a `blob:` document runs in the
+ * origin that created it, which is the page's own. Nor were `filesystem:`,
+ * `about:`, or whatever a browser ships next.
+ *
+ * These four are what an author actually writes in a link or a source:
+ * `http`/`https` for a destination, `mailto`/`tel` for the two that open an
+ * app rather than a page and are the ordinary content of a contact button.
+ * A stored URL reaches an `href` or an `src`, so this is the one prop type
+ * where a bad value is code execution rather than a broken link.
+ *
+ * The SAME four the rich-text sanitizer allows, deliberately. That module
+ * answers this identical question for stored rich text, and two surfaces of one
+ * product disagreeing about which schemes are safe is how a value refused in a
+ * link body becomes acceptable in a button beside it. The admin's link editor
+ * accepts a wider set for what an author may TYPE; that is an input affordance
+ * and not the boundary, which is here.
+ */
+/**
+ * Any leading `scheme:`, which is what decides whether the list above applies.
+ *
+ * A value with NO scheme is left alone: `/about`, `a.png` and `#top` resolve
+ * against the page's own origin and name no destination of their own. So does
+ * `//host/x`, which carries no scheme and still reaches another host — bounding
+ * WHICH hosts may be reached is a separate question, asked of the host policy
+ * by the blocks that fetch, not of this list.
+ */
+/**
+ * Whether a string still holds a control character.
+ *
+ * Scanned by code point rather than matched by a regular expression: a pattern
+ * for these needs a lint suppression, and the rule it would suppress is there
+ * because a literal control character in a pattern is invisible to whoever reads
+ * it next. `0x20` is deliberately excluded — a space is not a control character,
+ * and an interior one belongs to the path.
+ */
+/**
+ * A URL safe to place in an attribute, or `undefined`.
+ *
+ * The scheme is read from the value as the BROWSER's parser will read it, using
+ * the engine's own normalisation rather than a second copy of the rules — the
+ * two disagreeing is how a scheme hides from one check while still navigating.
+ * That removes tab, LF and CR wherever they appear, because the parser does,
+ * and trims leading control characters and spaces, because the parser does.
+ *
+ * It deliberately does NOT remove an interior space. The parser does not either:
+ * it percent-encodes one. Removing it invents a scheme that was never written —
+ * `hero image:1.png` is an ordinary relative path to a file whose name has a
+ * space, and collapsing it to `heroimage:1.png` would refuse it as an unknown
+ * scheme.
+ *
+ * A control character left INSIDE after that normalisation refuses the value
+ * outright. One never appears in a URL anybody meant, since it has to be
+ * percent-encoded to survive, and its only use here is to break a scheme apart
+ * so a reader sees no scheme where a browser may still see one. Refusing is the
+ * answer that does not depend on which of those two a given browser does.
+ *
+ * The value RETURNED is the original trimmed string, not the normalised one, so
+ * a legitimate URL is never silently rewritten.
+ */
+export function url(value: unknown): string | undefined {
+  // The DECISION belongs to the engine, which owns what the stored format can
+  // express — otherwise a renderer that draws nothing for an unusable link and
+  // a flattener that still reports its label describe different pages. What
+  // stays here is the return value: the original trimmed string, so a
+  // legitimate URL is never silently rewritten into its normalised form.
+  if (!isLinkableUrl(value)) return undefined;
+  return typeof value === "string" ? value.trim() : undefined;
+}
+
+/**
+ * `rel` for a link, given its target.
+ *
+ * A `target="_blank"` link hands the opened page a `window.opener` reference
+ * unless told otherwise. Modern browsers imply `noopener`, but the peer range
+ * covers what a visitor's browser does rather than what the newest one does,
+ * and `noreferrer` is a privacy choice the implied default does not make.
+ * A caller-supplied `rel` is kept and merged rather than replaced.
+ */
+export function relFor(
+  target: string | undefined,
+  supplied: unknown
+): string | undefined {
+  const parts = new Set(text(supplied).split(/\s+/).filter(Boolean));
+  if (target === "_blank") {
+    parts.add("noopener");
+    parts.add("noreferrer");
+  }
+  return parts.size > 0 ? [...parts].join(" ") : undefined;
+}
+
+/** The props a block links with: an address or an entry, and how it opens. */
+export interface LinkProps {
+  href?: string;
+  entryCollection?: string;
+  entryId?: string;
+  target?: "_self" | "_blank";
+  rel?: string;
+}
+
+/**
+ * The link props a block declares, by the names the inspector's link control
+ * groups and {@link linkFor} follows: one declaration, so a button and a
+ * linked image cannot drift apart in what they store.
+ */
+export const LINK_PROPS = {
+  href: { label: "Link", role: "content", type: "url" },
+  entryCollection: {
+    label: "Linked collection",
+    role: "content",
+    type: "text",
+  },
+  entryId: { label: "Linked entry", role: "content", type: "text" },
+  // Drawn as one switch, "Open in a new tab", by the inspector's link
+  // control; the options stay the values stored.
+  target: {
+    label: "Open in a new tab",
+    optionLabels: { _self: "This tab", _blank: "New tab" },
+    type: "select",
+    options: ["_self", "_blank"],
+  },
+  // How the page relates to where it links: an HTML-level detail, so in
+  // Advanced › HTML with the block's other HTML settings.
+  rel: { label: "Link relationship", type: "text", group: "advanced" },
+} as const;
+
+/**
+ * What a click on a picture can do: nothing, follow its link, or show it
+ * full size. Stored as the author chose it; unset, it is read by
+ * {@link whenClickedOf}.
+ */
+export const WHEN_CLICKED = ["nothing", "link", "enlarge"] as const;
+
+/** One of the things a click on a picture can do. @experimental */
+export type WhenClicked = (typeof WHEN_CLICKED)[number];
+
+/**
+ * What a click on a picture does, read from its props: the stored choice
+ * where it is one, else Link while a link is set (an address the page would
+ * follow, or an entry), else `followed`, the choice of the gallery the
+ * picture sits in, else Nothing.
+ *
+ * The one reading the Image's render, its content model and the editor's
+ * panel ask, so the three cannot disagree. Unset is how every Image stored
+ * before the choice existed reads, and how a new one is placed, so a linked
+ * one still links, one in a gallery does what the gallery says, and any
+ * other waits for the author's choice.
+ *
+ * @experimental
+ */
+export function whenClickedOf(
+  props: Readonly<LinkProps & { whenClicked?: unknown }>,
+  followed?: WhenClicked
+): WhenClicked {
+  const stored = WHEN_CLICKED.find(choice => choice === props.whenClicked);
+  if (stored !== undefined) return stored;
+  if (canLink(props)) return "link";
+  return followed ?? "nothing";
+}
+
+/**
+ * The claim a block's own reads are made with, naming it, so a page past its
+ * allowance names the block among those drawn without their data. A block
+ * drawn from inside a placed component is named by that placement
+ * (`instanceOf`), the block an author placed and can select; its own id is
+ * minted for the draw and is in no stored page. Nothing for a block drawn
+ * outside a page (a host or a test calling its render directly), whose
+ * reads are then claimed unnamed.
+ */
+export function readClaimOf(
+  node: { readonly id: string; readonly instanceOf?: string } | undefined
+): ReadClaim | undefined {
+  return node === undefined
+    ? undefined
+    : { nodeId: node.instanceOf ?? node.id };
+}
+
+/** Whether a block's prop holds text, for its draw checks. */
+export function isPresent(props: object, prop: string): boolean {
+  const value: unknown = Object.hasOwn(props, prop)
+    ? Reflect.get(props, prop)
+    : undefined;
+  return text(value) !== "";
+}
+
+/** A link's attributes, ready to spread onto an `<a>`. */
+export interface LinkAttributes {
+  readonly href: string;
+  readonly target?: "_blank";
+  readonly rel?: string;
+}
+
+/**
+ * Whether props name a destination `linkFor` could follow: an address it
+ * would draw, or an entry. Synchronous, for a content model, which cannot
+ * wait for an entry's path; an entry that then fails to resolve draws no link
+ * where interactive content was allowed, which refuses nothing it should not.
+ */
+export function canLink(props: LinkProps): boolean {
+  return url(props.href) !== undefined || linksToEntry(props);
+}
+
+/**
+ * Whether props link to an entry, which only `linkFor` can follow, since its
+ * path is a read. A block without one draws its link with `addressLinkFor`,
+ * at once, and waits for nothing.
+ */
+export function linksToEntry(props: LinkProps): boolean {
+  return text(props.entryCollection) !== "" && text(props.entryId) !== "";
+}
+
+/**
+ * Where a block links, or `undefined` for nowhere: every block that links
+ * reads its destination here, so a button and a linked image follow the same
+ * address for the same props.
+ *
+ * An entry reference beats a typed URL: it survives the entry being renamed,
+ * which a pasted path does not. Resolution is a read, so it can fail, and a
+ * failure means "no destination" rather than a lost page. Either address must
+ * be one `url` follows, so a `javascript:` link draws no link at all.
+ */
+export async function linkFor(
+  props: LinkProps,
+  resolveEntryPath: (collection: string, id: string) => Promise<string | null>
+): Promise<LinkAttributes | undefined> {
+  const resolvedPath = linksToEntry(props)
+    ? await resolveEntryPath(
+        text(props.entryCollection),
+        text(props.entryId)
+      ).catch(() => null)
+    : null;
+  return linkTo(url(resolvedPath ?? undefined) ?? url(props.href), props);
+}
+
+/**
+ * A typed address's link, for props that link to no entry: what `linkFor`
+ * gives them, without waiting, so a block linking by address renders at once.
+ */
+export function addressLinkFor(props: LinkProps): LinkAttributes | undefined {
+  return linkTo(url(props.href), props);
+}
+
+/** The attributes of a link to `href`, opened as the props say. */
+function linkTo(
+  href: string | undefined,
+  props: LinkProps
+): LinkAttributes | undefined {
+  if (href === undefined) return undefined;
+  const rel = relFor(props.target, props.rel);
+  return {
+    href,
+    ...(props.target === "_blank" ? { target: "_blank" as const } : {}),
+    ...(rel === undefined ? {} : { rel }),
+  };
+}
+
+/**
+ * Whether a URL's origin is one the host named as trusted.
+ *
+ * Compared as ORIGINS via the URL parser rather than by string prefix. A prefix
+ * test on `https://player.example.com` also admits
+ * `https://player.example.com.evil.test`, and a host-only test ignores the
+ * scheme, so `http://` would pass a list that named `https://`. `URL.origin`
+ * settles scheme, host and port together and lowercases the host, which is the
+ * comparison the browser itself makes.
+ *
+ * A value that will not parse answers false. That covers a relative URL, which
+ * has no origin of its own: it resolves to the page's own origin, and admitting
+ * it here would be the one grant that lets a frame reach the document around
+ * it. A host that genuinely wants that has to name the origin.
+ *
+ * An unparseable ENTRY is skipped rather than throwing, so one typo in a
+ * configuration list cannot take down every page that renders an embed.
+ */
+export function isTrustedOrigin(
+  value: string,
+  trusted: readonly string[] | undefined
+): boolean {
+  if (trusted === undefined || trusted.length === 0) return false;
+  const origin = originOf(value);
+  if (origin === undefined) return false;
+  return trusted.some(entry => originOf(entry) === origin);
+}
+
+/**
+ * An explicit scheme followed by `//`, which is what makes a URL absolute to a
+ * browser and not merely parseable by `new URL`.
+ *
+ * The two disagree, and the disagreement is exploitable. `new URL(x)` with no
+ * base reads `https:player.example.com` as `https://player.example.com/`, while
+ * an `iframe src` resolves it against the DOCUMENT — same scheme means relative
+ * — producing `https://site.example/pages/player.example.com`. Comparing the
+ * parser's answer would then match the allowlist while the browser loaded the
+ * host's OWN origin, which is the one grant that lets a frame script the page
+ * around it. `https:/player.example.com`, with one slash, does the same.
+ *
+ * So the authority has to be written out. This is the same refusal the relative
+ * case already gets, applied to the forms that only LOOK absolute.
+ */
+const EXPLICIT_AUTHORITY = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+/** A URL's origin, or nothing when it has none this comparison can use. */
+function originOf(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  // Trimmed for the allowlist's sake: entries are typed into configuration by
+  // hand. The src arrives already trimmed by `url()`.
+  const candidate = value.trim();
+  if (!EXPLICIT_AUTHORITY.test(candidate)) return undefined;
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return undefined;
+  }
+  // "null" is what an opaque origin serialises to — a `data:` or `blob:` URL
+  // among others. Treating that as a matchable value would let two unrelated
+  // opaque origins compare equal.
+  return parsed.origin === "null" ? undefined : parsed.origin;
+}
+
+/**
+ * A stored URL this page is willing to turn into a REQUEST.
+ *
+ * TWO filters, both asked, in this order. `url()` refuses a scheme that could
+ * execute and applies whether or not an operator configured anything, because a
+ * `javascript:` value is not a site setting. `remotePatterns` is the site's own
+ * list of hosts it will fetch from, and an ABSENT list means unasked rather than
+ * allowed-nothing — the semantics {@link BlockHostPolicy} states for the field,
+ * and the reason an existing site does not lose its images the day it upgrades.
+ *
+ * ONE implementation, because three surfaces ask it: an image block, an embed,
+ * and the rich-text renderer's media. Each had its own copy, and a copy is not a
+ * policy — a change to the accepted schemes, to normalisation, or to the order
+ * the two filters run in would have moved one and left the others agreeing with
+ * a rule that no longer existed, with every local version still looking correct.
+ *
+ * `undefined` where either filter refuses, so a caller decides what to draw in
+ * its place rather than being handed a URL it must not request.
+ *
+ * @experimental Settles with the editor's binding controls.
+ */
+export function fetchableUrl(
+  value: unknown,
+  patterns: readonly RemotePatternInput[] | undefined
+): string | undefined {
+  const safe = url(value);
+  if (safe === undefined) return undefined;
+  if (patterns === undefined) return safe;
+  return isFetchableUrl(safe, patterns) ? safe : undefined;
+}

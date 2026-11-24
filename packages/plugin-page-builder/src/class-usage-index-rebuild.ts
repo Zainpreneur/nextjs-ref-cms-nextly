@@ -1,0 +1,749 @@
+/**
+ * Recomputing the class-usage index from the documents it describes.
+ *
+ * The index is a CACHE of something derivable, and that is the only reason it
+ * is allowed to exist: the answer is always recoverable by walking the
+ * documents again. This is that walk. Without it the index would be a second
+ * source of truth with no way back to the first, which is a number nobody can
+ * check.
+ *
+ * ## What it is for
+ *
+ * Documents written before the index existed have no rows at all. A write that
+ * bypassed maintenance — a direct database edit, a restore, an import — leaves
+ * rows that disagree with the document they claim to describe. And maintenance
+ * runs after the document commits, so a failure there leaves the document saved
+ * and its rows stale. None of those is visible from the rows themselves, which
+ * is precisely why the repair has to exist rather than be inferred.
+ *
+ * ## Why a rebuild is not subject to the write path's race
+ *
+ * Reconciliation is only sound when its caller serialises per subject, because
+ * two concurrent writers can each plan to remove the other's rows. A rebuild
+ * visits each subject once, in one pass, so no second writer exists within it —
+ * the property the write path will have to arrange is one this caller has for
+ * free. It is worth stating rather than leaving to be noticed, because it is
+ * the reason the same reconciliation is safe here and not there.
+ *
+ * ## Why it stops at the first failure
+ *
+ * Swallowing a failure and continuing would report a completed rebuild that
+ * repaired nothing, which is the report that stops anyone looking. Stopping is
+ * affordable BECAUSE reconciliation is idempotent: a rerun writes the same
+ * rows, so a run that stopped halfway costs a rerun and nothing else.
+ *
+ * @module class-usage-index-rebuild
+ */
+import type { DocumentLimits } from "@nextlyhq/blocks-engine";
+import { isPlainRecord } from "@nextlyhq/blocks-engine";
+
+import type { ClassUsageIndexStore } from "./class-usage-maintenance";
+import { classUsageIndex } from "./class-usage-reconcile";
+import { usageTarget, type UsageTarget } from "./class-usage-write";
+import type { ClassUsageVariant } from "./collections/class-usage-index";
+import { componentUsageIndex } from "./component-usage";
+import { walkPages } from "./paged-walk";
+import { tokenUsageIndex } from "./token-usage";
+import { isSupersededRun } from "./usage-bookkeeping";
+import type { UsageScope } from "./usage-index";
+
+/** How many documents one query asks for. */
+const PAGE_SIZE = 100;
+
+/**
+ * A guard against a store whose paging never reports an end.
+ *
+ * Sized so that reaching it means the response is wrong rather than the site is
+ * large, and counted in PAGES REQUESTED rather than documents read: a store
+ * answering `hasNext` forever with an empty page never grows the count, so a
+ * document-count bound would spin without end.
+ */
+const MAX_PAGES = 10_000;
+
+/**
+ * Reading the documents to rebuild from.
+ *
+ * Declared structurally rather than as the generated Direct API types, for the
+ * reason `ClassUsageIndexStore` is: those describe the HOST app's collections,
+ * which may not have been generated when this plugin is wired.
+ */
+export interface ClassUsageDocumentStore {
+  find(args: {
+    collection: string;
+    limit: number;
+    page: number;
+    sort: string;
+    /**
+     * Which locale's values to resolve, when the field is localized.
+     *
+     * Required on the contract rather than optional, because omitting it is not
+     * neutral: the read resolves the DEFAULT locale and the rows are then filed
+     * under whichever locale was asked for. That records one translation's
+     * classes as another's, and removes the rows for classes only the real
+     * translation uses — the under-count that permits deleting a class a page
+     * still renders.
+     */
+    locale: string;
+    /**
+     * Which of the document's two stored forms to read.
+     *
+     * On the contract rather than left to the store to decide, because a store
+     * that cannot be told is a store that answers both passes the same way.
+     * Rows are filed under the variant the caller asked for, so an
+     * implementation reading live content during the draft pass records the
+     * published classes as the draft's and omits the ones only the draft
+     * applies — which makes a class a pending draft still uses read as safe to
+     * delete.
+     *
+     * A store may legitimately serve a collection that has no drafts, where
+     * both variants resolve to the same document. That is a fact about the
+     * collection, and the difference is that it is then answered rather than
+     * never asked.
+     */
+    variant: ClassUsageVariant;
+    /**
+     * Resume after this document id, on the first page of a walk an earlier
+     * tick stopped. A store that pages by id starts its window there; absent,
+     * the walk starts at the beginning.
+     */
+    after?: string;
+  }): Promise<{ items: unknown[]; meta: { hasNext: boolean } }>;
+  /**
+   * Whether one document still exists, asked by id.
+   *
+   * Needed because the walk pages by OFFSET over a collection that other
+   * writers can change underneath it. Deleting an already-scanned document
+   * shifts a later one behind the next offset, and a document created after
+   * its position was passed is never reached — so a LIVE document can be
+   * missing from the visited set through no fault of its own.
+   *
+   * Without this check the sweep would read that absence as an orphan and
+   * delete the rows of a document the site still serves, which under-counts
+   * and permits deleting a class that document renders. The read costs one
+   * query per suspected orphan, which is proportional to the damage rather
+   * than to the site.
+   *
+   * Scoped to the SAME locale and variant as the rows it decides the fate of,
+   * because that is the question the sweep is actually asking: not "is there a
+   * document with this id" but "does the thing these rows describe still
+   * exist". A document has a published form and a draft form and they come and
+   * go independently — discarding a working draft leaves the published
+   * document untouched — so an unscoped check answers `true` for a draft that
+   * is gone, and its rows survive every future pass. Nothing else can remove
+   * them, because the sweep is the only mechanism that could and it is the one
+   * that cannot see the difference.
+   *
+   * Scoping does not weaken the bias towards keeping rows. A document that
+   * exists only as an unpublished draft answers `true` when asked about the
+   * draft variant, which is the answer that keeps its rows, and the published
+   * pass has no rows for it to lose.
+   */
+  exists(args: {
+    collection: string;
+    id: string;
+    locale: string;
+    variant: ClassUsageVariant;
+  }): Promise<boolean>;
+}
+
+/** What a rebuild did, in numbers that mean different things. */
+export interface ClassUsageRebuildReport {
+  /** Documents read. Zero means the walk found none, NOT that none needed repair. */
+  scanned: number;
+  /** Documents whose rows disagreed with them and were rewritten. */
+  repaired: number;
+  /**
+   * Rows dropped because the document they described no longer exists.
+   *
+   * Counted apart from `repaired`, which is about documents this walk SAW. A
+   * document deleted through a path that bypassed maintenance is never seen,
+   * and its surviving rows are the damage a rebuild exists to repair.
+   */
+  orphansRemoved: number;
+  /**
+   * Documents that could not be read whole, and whose count is therefore not
+   * trustworthy.
+   *
+   * Reported separately rather than folded into `scanned`, because the two mean
+   * opposite things to a caller deciding whether a class is safe to delete: a
+   * scanned document answered, and one of these did not.
+   */
+  undetermined: number;
+  /**
+   * Documents for which at least one index could not be brought into agreement.
+   *
+   * Separate from `undetermined`, which is a document this walk could not read
+   * WHOLE. Both make a count untrustworthy and they have different causes and
+   * different remedies, so folding them together would report an unavailable
+   * index store as a collection full of unreadable documents.
+   */
+  unrepaired: number;
+  /**
+   * The first failure this rebuild met, or absent when it met none.
+   *
+   * PRESENT means the rebuild did not repair everything it walked, so the index
+   * must not be read as exact until one returns without it. `unrepaired` gives
+   * the scale; a sweep that could not run leaves orphan rows behind without
+   * moving that count at all, which is why this field rather than the count is
+   * the one to check.
+   *
+   * The FIRST rather than every one: a store that is unavailable fails
+   * identically for every document it is asked about, so keeping them all would
+   * grow with the collection while saying one thing many times. A caller needs
+   * one cause to act on and a number for how far it spread.
+   */
+  failure?: unknown;
+}
+
+/** Whether a stored item is something a document can be read out of. */
+function isStoredDocument(
+  value: unknown
+): value is Record<string, unknown> & { id: string } {
+  return (
+    isPlainRecord(value) && typeof (value as { id?: unknown }).id === "string"
+  );
+}
+
+/** What one query's worth of documents contributed. */
+interface PageTally {
+  scanned: number;
+  repaired: number;
+  undetermined: number;
+  unrepaired: number;
+  failure?: unknown;
+  /** The id of the last document this page finished, if it finished any. */
+  last?: string;
+  /** Whether the budget stopped the page before its end. */
+  stopped?: boolean;
+}
+
+/**
+ * The `entityKey` a walked document's rows are filed under: its id for a
+ * collection entry, and empty for a Single, which has one document and is
+ * addressed by its slug alone.
+ */
+function entityKeyOf(
+  args: { scope?: UsageScope },
+  item: { id: string }
+): string {
+  return args.scope === "single" ? "" : item.id;
+}
+
+/**
+ * Bring ONE document's rows into agreement, across every index.
+ *
+ * Its own function rather than a loop inside the page walk. The walk COUNTS and
+ * this REPAIRS, and folding both into one body put that function over the
+ * complexity gate — which is the gate reporting, correctly, that a reader now
+ * had to hold two jobs at once to follow it.
+ *
+ * A rebuild that repaired only some indexes is the shape this whole slice
+ * exists to avoid: an unrepaired index answers "references nothing" for every
+ * document the walk visited, and that is the answer a delete check acts on.
+ */
+async function repairOneDocument(
+  args: {
+    targets: readonly UsageTarget[];
+    scope?: UsageScope;
+    collection: string;
+    field: string;
+    locale: string;
+    variant: ClassUsageVariant;
+    limits: DocumentLimits;
+  },
+  item: { id: string } & Record<string, unknown>
+): Promise<{ changed: boolean; unread: boolean; failure?: unknown }> {
+  const subject = {
+    scope: args.scope ?? "collection",
+    entity: args.collection,
+    entityKey: entityKeyOf(args, item),
+    field: args.field,
+    locale: args.locale,
+    variant: args.variant,
+  };
+
+  let changed = false;
+  let unread = false;
+  let failure: unknown;
+  for (const target of args.targets) {
+    // Each index on its own. A rejection here used to leave the walk entirely,
+    // so one unavailable store abandoned the repair of every OTHER index and
+    // every document after this one — turning the routine that exists to fix a
+    // stale index into one that stops at the first sign that it is stale.
+    //
+    // Continuing is safe for the sweep that follows: this document is marked
+    // visited before the repair is attempted, so its rows are never mistaken
+    // for a deleted document's and removed.
+    try {
+      const report = await target.maintain({
+        subject,
+        document: item[args.field],
+        limits: args.limits,
+      });
+      if (report.undetermined) unread = true;
+      if (report.inserted > 0 || report.removed > 0) changed = true;
+    } catch (thrown) {
+      // A run that has been replaced stops here rather than walking on: every
+      // later write would be refused too, and the newer run redoes them all.
+      if (isSupersededRun(thrown)) throw thrown;
+      failure ??= thrown;
+    }
+  }
+  return failure === undefined
+    ? { changed, unread }
+    : { changed, unread, failure };
+}
+
+/**
+ * Bring one query's worth of documents into agreement with their rows.
+ *
+ * An item this cannot read an id out of is SKIPPED rather than counted.
+ * Persisted data arrives unvalidated, and losing the whole rebuild over one
+ * unreadable row would leave every later document stale — and the later ones
+ * are the ones nobody knows to look at.
+ */
+async function rebuildOnePage(
+  args: {
+    targets: readonly UsageTarget[];
+    scope?: UsageScope;
+    collection: string;
+    field: string;
+    locale: string;
+    variant: ClassUsageVariant;
+    limits: DocumentLimits;
+  },
+  items: readonly unknown[],
+  visited: Set<string>,
+  /** Asked after each document; true ends the page there. */
+  stop: () => boolean
+): Promise<PageTally> {
+  const tally: PageTally = {
+    scanned: 0,
+    repaired: 0,
+    undetermined: 0,
+    unrepaired: 0,
+  };
+
+  for (const item of items) {
+    if (!isStoredDocument(item)) continue;
+    visited.add(entityKeyOf(args, item));
+    count(tally, await repairOneDocument(args, item));
+    tally.last = item.id;
+    // After the document, never before it: a walk stopped before its first
+    // document would resume at the same place on every tick and never move.
+    if (stop()) {
+      tally.stopped = true;
+      break;
+    }
+  }
+
+  return tally;
+}
+
+/** Add one document's outcome to a page's tally. */
+function count(
+  tally: PageTally,
+  outcome: { changed: boolean; unread: boolean; failure?: unknown }
+): void {
+  tally.scanned += 1;
+  if (outcome.failure !== undefined) {
+    tally.unrepaired += 1;
+    tally.failure ??= outcome.failure;
+  }
+  if (outcome.unread) tally.undetermined += 1;
+  // Repaired means the rows CHANGED, which is a different question from
+  // whether the document was read. A document already in agreement issues no
+  // writes and is scanned without being repaired.
+  if (outcome.changed) tally.repaired += 1;
+}
+
+/**
+ * How a walk resumes, and how it reports where it got to, when it is one tick
+ * of a backfill rather than a whole repair.
+ */
+export interface UsageWalkResume {
+  /** Start after this document id; absent, at the beginning. */
+  after?: string;
+  /**
+   * Record that every document up to and including `cursor` is done. Called
+   * at each page's end, and where the budget stopped the walk, but never past
+   * a document that could not be repaired: the next tick resumes at the last
+   * cursor recorded, so it retries that document rather than leaving it.
+   */
+  checkpoint(cursor: string): Promise<void>;
+  /** Whether the tick's budget is spent, asked after each document. */
+  stop(): boolean;
+}
+
+/**
+ * Rebuild the index for one collection's blocks field.
+ *
+ * Ordered by `id` rather than by anything this walk can change. Offset paging
+ * reads position N of an ordered set, so ordering by a MUTABLE key while
+ * writing during the walk reshuffles rows between queries and skips some —
+ * and `updatedAt`, the obvious ordering for a maintenance pass, is exactly the
+ * key a write moves. An id is stable under the writes this makes.
+ *
+ * A document created or deleted by somebody else DURING the walk can still
+ * shift one, and that is accepted rather than locked against: reconciliation is
+ * idempotent, so a document missed by one rebuild is corrected by its next save
+ * or its next rebuild, and holding every document still would cost more than
+ * the thing it prevents.
+ */
+export async function rebuildUsageIndexes(
+  args: UsageRebuildArgs
+): Promise<ClassUsageRebuildReport> {
+  return (await walkUsageIndexes(args)).report;
+}
+
+/** What {@link rebuildUsageIndexes} is asked to repair. */
+export interface UsageRebuildArgs {
+  documents: ClassUsageDocumentStore;
+  /**
+   * Every index to repair from this one walk.
+   *
+   * Required, and a list rather than one store, because that is what makes
+   * leaving an index out a DECISION rather than an omission. An index absent
+   * from a rebuild is not merely unrepaired: for every document the walk
+   * visited it answers "references nothing", which cannot be told from a
+   * document that genuinely references none — and that is the answer a delete
+   * check acts on.
+   */
+  targets: readonly UsageTarget[];
+  /**
+   * Whether `collection` names a collection or a Single; a collection when
+   * absent. A Single's rows are filed with an empty `entityKey`, and its
+   * document store answers with its one document.
+   */
+  scope?: UsageScope;
+  /** The collection whose documents are walked, or the Single. */
+  collection: string;
+  /** The blocks field on those documents. */
+  field: string;
+  /**
+   * Which locale to rebuild, or the empty string when the field is NOT
+   * localized.
+   *
+   * Required rather than optional, because the two sides read an omitted value
+   * differently and the disagreement is silent. `resolveRequestedLocale` treats
+   * `""` as the configured DEFAULT locale, so a localized field rebuilt without
+   * one reads the default translation — while the rows are filed under `""`,
+   * which this index uses to mean "not localized at all". A later rebuild
+   * naming a real locale then cannot see those rows to reconcile or sweep them,
+   * and they stay for ever.
+   *
+   * Making it required does not stop a caller passing `""` for a localized
+   * field, and nothing here can: only the caller knows whether the field is
+   * localized. What it does is force that to be a decision rather than an
+   * omission.
+   */
+  locale: string;
+  /**
+   * Which stored variant is being rebuilt — `"published"` or `"draft"`.
+   *
+   * The caller's to know, because the query its document store makes is what
+   * decides which of the two comes back. A collection with drafts holds two
+   * documents under one id and they can apply different classes: a pure draft
+   * edit leaves the live row untouched, so the published page and the pending
+   * draft disagree until somebody publishes.
+   *
+   * Rebuilding one variant leaves the other's rows untouched, which is what
+   * makes running this once per variant safe rather than destructive. Under a
+   * shared subject, rebuilding either would have removed the rows the other
+   * justifies — and a class the published page still renders would read as
+   * unused because a draft had dropped it.
+   *
+   * Reaches the DOCUMENT QUERY as well as the rows it files. A variant that
+   * only labelled the rows would let one store answer both passes identically,
+   * recording one form's classes under the other's name.
+   */
+  variant: ClassUsageVariant;
+  /**
+   * The bounds the documents are rendered under — the SAME value the plugin and
+   * the renderer are given.
+   *
+   * Required rather than optional, because omitting it is not neutral and the
+   * disagreement is silent. An omitted value derives under the engine defaults
+   * while the host may have configured others, and the two directions fail
+   * differently: raised bounds mean a document the renderer draws whole is
+   * recorded as a marker instead of its classes, and lowered bounds mean
+   * classes on nodes the page never draws are counted as used.
+   *
+   * Making it required does not stop a caller passing bounds that differ from
+   * the renderer's, and nothing here can — only the caller knows what the
+   * renderer was given. What it does is force that to be a decision rather than
+   * an omission. Pass `DEFAULT_LIMITS` explicitly when the host configured
+   * none.
+   */
+  limits: DocumentLimits;
+}
+
+/**
+ * Walk one scope, from where an earlier tick stopped when `resume` says so.
+ *
+ * A resumed walk SEES only the documents after its cursor, so the documents an
+ * earlier tick finished are missing from `visited`. The orphan sweep treats
+ * `visited` as a shortcut and nothing more: a row whose document the walk did
+ * not see is kept unless an existence check confirms the document is gone, so
+ * the earlier ticks' documents keep their rows. The sweep runs only once the
+ * walk reaches the scope's end, never on a tick the budget stopped.
+ */
+export async function walkUsageIndexes(
+  args: UsageRebuildArgs,
+  resume?: UsageWalkResume
+): Promise<{ report: ClassUsageRebuildReport; finished: boolean }> {
+  let scanned = 0;
+  let repaired = 0;
+  let undetermined = 0;
+  let unrepaired = 0;
+  let failure: unknown;
+  // Collected during the SAME walk that reconciles, rather than by reading the
+  // documents again. Two reads would let a document created between them be
+  // read as absent, and lose rows it should keep.
+  // Resolved ONCE. A default that allocated per page would build a target for
+  // every page of the walk, and a caller's own list would be re-read as often.
+  const resolvedTargets = args.targets;
+  const visited = new Set<string>();
+  const stop = resume === undefined ? () => false : () => resume.stop();
+  // Moves only while every document so far was repaired; see `checkpoint`.
+  let checkpointing = resume !== undefined;
+
+  const finished = await walkPages({
+    maxPages: MAX_PAGES,
+    describe: `${args.collection}.${args.field}`,
+    fetchPage: page =>
+      args.documents.find({
+        collection: args.collection,
+        limit: PAGE_SIZE,
+        page,
+        sort: "id",
+        // The SAME locale and variant the rows are filed under. Reading one
+        // and filing it as another is the whole of the defect this closes, and
+        // it is the same defect in both dimensions: the subject records what
+        // was asked for, so the query has to be what was asked for too.
+        locale: args.locale,
+        variant: args.variant,
+        // Only the first page resumes from the cursor; the store keeps its
+        // own position after that.
+        ...(page === 1 && resume?.after !== undefined
+          ? { after: resume.after }
+          : {}),
+      }),
+    onPage: async items => {
+      const tally = await rebuildOnePage(
+        { ...args, targets: resolvedTargets },
+        items,
+        visited,
+        stop
+      );
+      scanned += tally.scanned;
+      repaired += tally.repaired;
+      undetermined += tally.undetermined;
+      unrepaired += tally.unrepaired;
+      failure ??= tally.failure;
+      if (tally.failure !== undefined) checkpointing = false;
+      if (checkpointing && resume !== undefined && tally.last !== undefined) {
+        await resume.checkpoint(tally.last);
+      }
+      return tally.stopped === true ? "stop" : undefined;
+    },
+  });
+
+  if (!finished) {
+    const report: ClassUsageRebuildReport = {
+      scanned,
+      repaired,
+      undetermined,
+      unrepaired,
+      orphansRemoved: 0,
+    };
+    if (failure !== undefined) report.failure = failure;
+    return { report, finished: false };
+  }
+
+  // AFTER the walk, and only after it completed: the sweep decides absence from
+  // the set of documents actually seen, so running it against a partial walk
+  // would delete the rows of every document the walk had not reached yet.
+  // EVERY index, for the reason the maintenance loop covers every index: a
+  // sweep that skipped one leaves rows naming documents that no longer exist,
+  // and nothing later reconciles a row whose document is gone.
+  let removed = 0;
+  for (const target of resolvedTargets) {
+    // Each index's sweep on its own, for the reason the repair loop above is:
+    // one store that cannot answer would otherwise leave every OTHER index
+    // holding rows for documents that no longer exist, and nothing later
+    // reconciles a row whose document is gone.
+    try {
+      const swept = await target.forgetAbsent({
+        scope: args.scope ?? "collection",
+        entity: args.collection,
+        field: args.field,
+        locale: args.locale,
+        variant: args.variant,
+        visited,
+        // Asked only about a document the walk did not see, so a stable collection
+        // costs nothing. A row survives unless the document is confirmed GONE —
+        // failing towards keeping a row, because a kept stale row over-counts and
+        // blocks a delete, while a wrongly removed one under-counts and permits
+        // deleting a class the live document still renders.
+        stillExists: id =>
+          args.documents.exists({
+            collection: args.collection,
+            id,
+            // The subject's own coordinates, not the document's id alone. A row
+            // is filed under all of them, so the question that decides whether
+            // to remove it has to be asked in all of them.
+            locale: args.locale,
+            variant: args.variant,
+          }),
+      });
+      removed += swept.removed;
+    } catch (thrown) {
+      if (isSupersededRun(thrown)) throw thrown;
+      // Not counted in `unrepaired`, which counts DOCUMENTS. A sweep failure
+      // leaves orphan rows rather than a document unreconciled, which is why
+      // `failure` and not the count is the field that says a rebuild was
+      // incomplete.
+      failure ??= thrown;
+    }
+  }
+
+  const report: ClassUsageRebuildReport = {
+    scanned,
+    repaired,
+    undetermined,
+    unrepaired,
+    orphansRemoved: removed,
+  };
+  if (failure !== undefined) report.failure = failure;
+  return { report, finished: true };
+}
+
+/**
+ * Repair EVERY usage index this plugin maintains, from one walk.
+ *
+ * The entry point a host reaches for. It names the stores rather than the
+ * targets, because the set of indexes is the PLUGIN's to know: a caller asked
+ * to list them can only list the ones that existed when its code was written,
+ * so an index added in a later version would go unrepaired on every upgraded
+ * site — and an index that is never repaired answers "references nothing" for
+ * every document, which is the answer a delete check acts on.
+ *
+ * That is the same reasoning `rebuildUsageIndexes` applies from the other side.
+ * There the list is required so that omitting one is a decision; here the
+ * decision has already been taken, by the code that knows the whole set.
+ *
+ * Both stores are required for the same reason. A host holding one of them and
+ * not the other is repairing half its derived state, and the half it skips is
+ * indistinguishable afterwards from one that genuinely records nothing.
+ */
+export async function rebuildPageBuilderUsageIndexes(
+  args: PageBuilderRebuildArgs
+): Promise<ClassUsageRebuildReport> {
+  return (await walkPageBuilderUsageIndexes(args)).report;
+}
+
+/** What {@link rebuildPageBuilderUsageIndexes} is asked to repair. */
+export interface PageBuilderRebuildArgs {
+  documents: ClassUsageDocumentStore;
+  /** Where the CLASS index's rows live. */
+  classIndex: ClassUsageIndexStore;
+  /** Where the COMPONENT index's rows live. */
+  componentIndex: ClassUsageIndexStore;
+  /**
+   * Where the VARIABLE index's rows live. Required for the reason the other
+   * two are: a repair that skipped it would leave every variable reading as
+   * used by nothing.
+   */
+  tokenIndex: ClassUsageIndexStore;
+  /**
+   * Whether `collection` names a collection or a Single; a collection when
+   * absent. A Single's rows are filed with an empty `entityKey`, and its
+   * document store answers with its one document.
+   */
+  scope?: UsageScope;
+  /** The collection whose documents are walked, or the Single. */
+  collection: string;
+  /** The blocks field on those documents. */
+  field: string;
+  /** The locale being rebuilt, or `""` when the field is not localized. */
+  locale: string;
+  /** Which stored variant is being rebuilt. */
+  variant: ClassUsageVariant;
+  /** The bounds the documents are rendered under. */
+  limits: DocumentLimits;
+}
+
+/**
+ * {@link rebuildPageBuilderUsageIndexes} as one tick of a backfill: resumed
+ * from a cursor and stopped by a budget (see {@link walkUsageIndexes}).
+ */
+export async function walkPageBuilderUsageIndexes(
+  args: PageBuilderRebuildArgs,
+  resume?: UsageWalkResume
+): Promise<{ report: ClassUsageRebuildReport; finished: boolean }> {
+  const { classIndex, componentIndex, tokenIndex, ...rest } = args;
+  return walkUsageIndexes(
+    {
+      ...rest,
+      targets: [
+        usageTarget(classUsageIndex, classIndex),
+        usageTarget(componentUsageIndex, componentIndex),
+        usageTarget(tokenUsageIndex, tokenIndex),
+      ],
+    },
+    resume
+  );
+}
+
+/**
+ * Repair the class index alone.
+ *
+ * @deprecated Use {@link rebuildPageBuilderUsageIndexes}, which repairs every
+ * index the plugin maintains. Kept for one release because the name is
+ * published, and it keeps exactly the behaviour it had: a repair of the CLASS
+ * index and no other.
+ *
+ * That narrowness is the reason for the rename rather than an accident of it.
+ * A site that upgraded and ran this would have left its component index empty,
+ * and an empty index answers "references nothing" for every document — which
+ * is the answer a delete check acts on.
+ *
+ * It also RAISES a failure rather than reporting one, which the walk behind it
+ * no longer does. That difference is the point of this wrapper rather than an
+ * oversight: code written against the published signature puts the call in a
+ * `try` and cannot inspect a field that did not exist when it was written, so
+ * reporting instead of raising would turn a failed repair into a silent
+ * success for every existing caller. A caller that wants the partial report
+ * moves to the new entry point, where the field is part of the contract.
+ */
+export async function rebuildClassUsageIndex(args: {
+  documents: ClassUsageDocumentStore;
+  index: ClassUsageIndexStore;
+  collection: string;
+  field: string;
+  locale: string;
+  variant: ClassUsageVariant;
+  limits: DocumentLimits;
+}): Promise<ClassUsageRebuildReport> {
+  const { index, ...rest } = args;
+  const report = await rebuildUsageIndexes({
+    ...rest,
+    targets: [usageTarget(classUsageIndex, index)],
+  });
+  if (report.failure !== undefined) {
+    // The ORIGINAL value where it is one, so a caller's existing `catch` sees
+    // what it always saw. A store that rejects with something other than an
+    // error is wrapped rather than rethrown, because a non-error rejection
+    // reaching a caller is what makes a failure unreadable at the point it is
+    // finally logged.
+    throw report.failure instanceof Error
+      ? report.failure
+      : new Error(
+          "[page-builder] the class-usage rebuild failed, and the store " +
+            "rejected with a value that is not an error",
+          { cause: report.failure }
+        );
+  }
+  return report;
+}

@@ -1,0 +1,389 @@
+"use client";
+
+/**
+ * Repeater Input Component
+ *
+ * A repeater field component for managing lists of structured data.
+ * Supports add, remove, and drag-and-drop reordering of items.
+ *
+ * @module components/entries/fields/structured/RepeaterInput
+ * @since 1.0.0
+ */
+
+import {
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@nextlyhq/ui";
+import type { RepeaterFieldConfig, FieldConfig } from "nextly/config";
+import { declaresOwnId } from "nextly/field-catalog";
+import type { JSX } from "react";
+import { useCallback, useMemo, useState } from "react";
+import {
+  useFieldArray,
+  useFormContext,
+  type Control,
+  type FieldValues,
+  type FieldArrayPath,
+} from "react-hook-form";
+
+import { Plus, ChevronDown, ChevronRight } from "@admin/components/icons";
+import { freshId } from "@admin/lib/fresh-id";
+import { cn } from "@admin/lib/utils";
+
+import {
+  useSortableFieldArray,
+  getFieldArrayConstraints,
+  SortableFieldArrayContainer,
+  RowLimitNotice,
+} from "./field-array-helpers";
+import { createDefaultFieldValues } from "./nested-field-defaults";
+import { RepeaterRow, type RenderFieldFunction } from "./RepeaterRow";
+
+// ============================================================
+// Types
+// ============================================================
+
+export interface RepeaterInputProps<
+  TFieldValues extends FieldValues = FieldValues,
+> {
+  /**
+   * Field path for React Hook Form registration.
+   * Must be a valid repeater field path.
+   */
+  name: FieldArrayPath<TFieldValues>;
+
+  /**
+   * Repeater field configuration from collection schema.
+   */
+  field: RepeaterFieldConfig;
+
+  /**
+   * React Hook Form control object.
+   * If not provided, will attempt to get from FormContext.
+   */
+  control?: Control<TFieldValues>;
+
+  /**
+   * Whether the entire field is disabled.
+   * @default false
+   */
+  disabled?: boolean;
+
+  /**
+   * Whether the field is read-only.
+   * @default false
+   */
+  readOnly?: boolean;
+
+  /**
+   * Additional CSS classes for the container.
+   */
+  className?: string;
+
+  /**
+   * Optional function to render sub-fields within each row.
+   * When provided, enables full field rendering inside array rows.
+   * When not provided, rows show a placeholder with field information.
+   *
+   * @example
+   * ```tsx
+   * renderField={(field, basePath, control, options) => (
+   *   <FieldRenderer
+   *     field={field}
+   *     basePath={basePath}
+   *     control={control}
+   *     {...options}
+   *   />
+   * )}
+   * ```
+   */
+  renderField?: RenderFieldFunction<TFieldValues>;
+}
+
+/**
+ * Collapsible header for the repeater card container displaying title, count, and chevron toggle.
+ */
+function RepeaterHeader({
+  isOpen,
+  title,
+  count,
+}: {
+  isOpen: boolean;
+  title: string;
+  count: number;
+}) {
+  return (
+    <CardHeader
+      className="bg-primary/5 border-b border-border dark:border-border p-0"
+      noBorder
+    >
+      <CollapsibleTrigger asChild>
+        <button
+          type="button"
+          className={cn(
+            "flex items-center gap-2 w-full text-left cursor-pointer",
+            "rounded-md p-4",
+            "hover-unified focus:outline-none"
+          )}
+          aria-expanded={isOpen}
+        >
+          {isOpen ? (
+            <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+          ) : (
+            <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+          )}
+          <span className="text-sm font-semibold text-foreground dark:text-muted-foreground">
+            {title}
+          </span>
+          <span className="text-xs text-muted-foreground ml-1">({count})</span>
+        </button>
+      </CollapsibleTrigger>
+    </CardHeader>
+  );
+}
+
+function RepeaterEmptyState({
+  pluralLabel,
+  canAdd,
+}: {
+  pluralLabel: string;
+  canAdd: boolean;
+}) {
+  return (
+    <div className="text-center py-8 text-muted-foreground border border-border border-dashed rounded-md bg-primary/5">
+      <p className="mb-1">No {pluralLabel.toLowerCase()} yet.</p>
+      {canAdd && <p className="text-sm">Click the button below to add one.</p>}
+    </div>
+  );
+}
+
+function RepeaterAddButton({
+  singularLabel,
+  disabled,
+  onAdd,
+}: {
+  singularLabel: string;
+  disabled?: boolean;
+  onAdd: () => void;
+}) {
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      onClick={onAdd}
+      className="w-full"
+      disabled={disabled}
+    >
+      <Plus className="h-4 w-4" />
+      Add {singularLabel}
+    </Button>
+  );
+}
+
+/**
+ * Where the field array keeps each row's render key. A dot splits a form
+ * path, so no field that works in a form can be named this, and the key can
+ * never hide an authored value. The row's own `id` is its saved identity,
+ * which the default key name, `id`, would hide.
+ */
+const RENDER_KEY = "nx.renderKey";
+
+/**
+ * A repeater's rows as a field array: their render keys, drag-and-drop, and
+ * adding a row, which carries its saved id from the start, so the server
+ * keeps it rather than matching the row against stored ones.
+ */
+function useRepeaterRows<TFieldValues extends FieldValues>(
+  control: Control<TFieldValues>,
+  name: FieldArrayPath<TFieldValues>,
+  fields: FieldConfig[]
+) {
+  const {
+    fields: items,
+    append,
+    remove,
+    move,
+  } = useFieldArray({
+    control,
+    name,
+    keyName: RENDER_KEY,
+  });
+
+  // The drag-and-drop list identifies rows by their render key, which every
+  // row has, where a row's saved id is absent until it is first saved.
+  const sortableItems = useMemo(
+    () => items.map(item => ({ id: item[RENDER_KEY] })),
+    [items]
+  );
+
+  const { sensors, handleDragEnd } = useSortableFieldArray(sortableItems, move);
+
+  // Rows whose schema declares its own `id` field hold the author's value
+  // there, so they are given none, as the server gives them none.
+  const ownId = useMemo(() => declaresOwnId(fields), [fields]);
+  const handleAdd = useCallback(() => {
+    const defaults = createDefaultFieldValues(fields);
+    append(
+      (ownId
+        ? defaults
+        : {
+            id: freshId("row"),
+            ...defaults,
+          }) as TFieldValues[FieldArrayPath<TFieldValues>][number]
+    );
+  }, [append, fields, ownId]);
+
+  return { items, remove, sortableItems, sensors, handleDragEnd, handleAdd };
+}
+
+/**
+ * RepeaterInput provides a repeater field for managing lists of structured data.
+ *
+ * Features:
+ * - Add/remove rows with min/max constraints
+ * - Drag-and-drop reordering via @dnd-kit
+ * - Keyboard-accessible drag operations
+ * - Collapsible rows for complex structures
+ * - Custom row labels based on content
+ * - Integration with React Hook Form
+ *
+ * @example Basic usage
+ * ```tsx
+ * <FieldWrapper field={socialLinksField} error={errors.socialLinks?.message}>
+ *   <RepeaterInput
+ *     name="socialLinks"
+ *     field={socialLinksField}
+ *     control={control}
+ *   />
+ * </FieldWrapper>
+ * ```
+ *
+ * @example With custom field rendering
+ * ```tsx
+ * <RepeaterInput
+ *   name="faq"
+ *   field={faqField}
+ *   control={control}
+ *   renderField={(field, basePath, control, options) => (
+ *     <FieldRenderer field={field} basePath={basePath} control={control} {...options} />
+ *   )}
+ * />
+ * ```
+ *
+ * @example With FormProvider (no control prop needed)
+ * ```tsx
+ * <FormProvider {...methods}>
+ *   <RepeaterInput name="items" field={itemsField} />
+ * </FormProvider>
+ * ```
+ */
+export function RepeaterInput<TFieldValues extends FieldValues = FieldValues>({
+  name,
+  field,
+  control: controlProp,
+  disabled = false,
+  readOnly = false,
+  className,
+  renderField,
+}: RepeaterInputProps<TFieldValues>): JSX.Element {
+  const formContext = useFormContext<TFieldValues>();
+  const control = controlProp ?? formContext?.control;
+
+  if (!control) {
+    throw new Error(
+      "RepeaterInput requires either a `control` prop or to be wrapped in a FormProvider."
+    );
+  }
+
+  const { items, remove, sortableItems, sensors, handleDragEnd, handleAdd } =
+    useRepeaterRows(control, name, field.fields as FieldConfig[]);
+
+  const { canAdd, canRemove, isSortable } = getFieldArrayConstraints({
+    count: items.length,
+    minRows: field.minRows,
+    maxRows: field.maxRows,
+    isSortable: field.admin?.isSortable,
+    disabled,
+    readOnly,
+  });
+
+  const singularLabel = field.labels?.singular || "Item";
+  const pluralLabel = field.labels?.plural || "Items";
+  const title = field.label || pluralLabel;
+
+  const [isOpen, setIsOpen] = useState(!field.admin?.initCollapsed);
+
+  return (
+    <Card
+      className={cn(
+        "shadow-none border border-border dark:border-border overflow-hidden",
+        className
+      )}
+    >
+      <Collapsible open={isOpen} onOpenChange={setIsOpen}>
+        <RepeaterHeader isOpen={isOpen} title={title} count={items.length} />
+
+        <CollapsibleContent>
+          <CardContent className="p-3 space-y-3">
+            <SortableFieldArrayContainer
+              items={sortableItems}
+              // The words each row's handle is named with.
+              describeItem={(_, index) => `${singularLabel} ${index + 1}`}
+              sensors={sensors}
+              handleDragEnd={handleDragEnd}
+              isSortable={isSortable}
+              disabled={disabled}
+              readOnly={readOnly}
+            >
+              {items.map((item, index) => (
+                <RepeaterRow
+                  key={item[RENDER_KEY]}
+                  id={item[RENDER_KEY]}
+                  index={index}
+                  field={field}
+                  basePath={`${name}.${index}`}
+                  data={item as Record<string, unknown>}
+                  control={control}
+                  onRemove={() => remove(index)}
+                  canRemove={canRemove}
+                  disabled={disabled}
+                  readOnly={readOnly}
+                  renderField={renderField}
+                  isSortable={isSortable}
+                />
+              ))}
+            </SortableFieldArrayContainer>
+
+            {items.length === 0 && (
+              <RepeaterEmptyState pluralLabel={pluralLabel} canAdd={canAdd} />
+            )}
+
+            {canAdd && (
+              <RepeaterAddButton
+                singularLabel={singularLabel}
+                disabled={disabled}
+                onAdd={handleAdd}
+              />
+            )}
+
+            <RowLimitNotice
+              count={items.length}
+              minRows={field.minRows}
+              maxRows={field.maxRows}
+              label={pluralLabel}
+            />
+          </CardContent>
+        </CollapsibleContent>
+      </Collapsible>
+    </Card>
+  );
+}
+
+// ============================================================
+// Exports
+// ============================================================

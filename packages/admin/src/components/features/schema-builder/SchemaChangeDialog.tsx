@@ -1,0 +1,776 @@
+"use client";
+
+// Confirmation dialog for schema changes in the visual schema builder.
+// Shows a preview of added/removed/changed fields with row-count impact
+// and interactive prompts for fields that need user input.
+"use client";
+
+import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  Badge,
+  Input,
+  Label,
+} from "@nextlyhq/ui";
+import { AlertTriangle } from "lucide-react";
+import type { JSX } from "react";
+import { useId, useMemo, useState } from "react";
+
+import {
+  broughtUpToDateLines,
+  lossLinesOf,
+} from "@admin/lib/builder/brought-up-to-date";
+import { movePath, type DraftMove } from "@admin/lib/builder/draft-moves";
+import { useFieldTypeLabel } from "@admin/lib/builder/field-type-label";
+import {
+  changedRowDeletesData,
+  reviewDeletesData,
+} from "@admin/lib/builder/review-deletes-data";
+import type { SettingChange } from "@admin/lib/builder/settings-changes";
+import type {
+  SchemaPreviewChange,
+  SchemaPreviewConversion,
+  SchemaPreviewJoiningTranslation,
+  SchemaPreviewLeavingTranslation,
+  SchemaPreviewRenameCandidate,
+  SchemaRenameResolution,
+  InteractiveField,
+  FieldResolution,
+} from "@admin/services/schemaApi";
+
+import { BUILDER_KIND_NOUN, type BuilderKind } from "./builder-config";
+import {
+  FieldGroupCreatesList,
+  type FieldGroupCreate,
+} from "./FieldGroupCreatesList";
+import {
+  JoiningTranslationNotice,
+  LeavingTranslationNotice,
+} from "./LeavingTranslationNotice";
+import { SettingChangesList } from "./SettingChangesList";
+
+interface SchemaChangeDialogProps {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  /** The kind being saved, named in the title and the description. */
+  kind: BuilderKind;
+  /** Slug of the entity being saved. */
+  entityName: string;
+  hasDestructiveChanges: boolean;
+  classification: "safe" | "destructive" | "interactive";
+  changes: SchemaPreviewChange;
+  // F4 Option E PR 5: rename candidates from the preview endpoint.
+  // Empty array (or undefined) = no candidates, no rename UI rendered.
+  renamed?: SchemaPreviewRenameCandidate[];
+  /**
+   * Renames the Builder decided itself, from what to what: shown as renames whose values are kept,
+   * not asked.
+   */
+  decidedRenames?: readonly KeptRename[];
+  /** The fields the save moves into or out of a group: shown as moves whose values are kept. */
+  moves?: readonly DraftMove[];
+  /**
+   * The save's own review lines (`notices`), for a save that moves a field: each move with the
+   * column properties it does not carry, in the server's words.
+   */
+  notices?: readonly string[];
+  warnings: string[];
+  interactiveFields: InteractiveField[];
+  // Fields that stop being translated: what moves to the archive, or why the change is refused.
+  leavingTranslation?: SchemaPreviewLeavingTranslation[];
+  // Fields that become translated: how many values become the default language's.
+  joiningTranslation?: SchemaPreviewJoiningTranslation[];
+  // What the save brings up to date in a table an earlier version made; Save confirms each.
+  conversions?: SchemaPreviewConversion[];
+  /** The entity's settings saved with the fields, each listed. */
+  settingChanges?: readonly SettingChange[];
+  /** The field groups not saved yet that this save creates first, listed before all else. */
+  fieldGroupCreates?: readonly FieldGroupCreate[];
+  onConfirm: (
+    resolutions: Record<string, FieldResolution>,
+    renameResolutions: SchemaRenameResolution[]
+  ) => void;
+  isApplying: boolean;
+}
+
+export function SchemaChangeDialog({
+  open,
+  onOpenChange,
+  kind,
+  entityName,
+  hasDestructiveChanges,
+  classification,
+  changes,
+  renamed,
+  decidedRenames = [],
+  moves = [],
+  notices = [],
+  warnings,
+  interactiveFields,
+  leavingTranslation = [],
+  joiningTranslation = [],
+  conversions = [],
+  settingChanges = [],
+  fieldGroupCreates = [],
+  onConfirm,
+  isApplying,
+}: SchemaChangeDialogProps): JSX.Element {
+  // Rows name a field's type by its plain name, never its internal id.
+  const typeLabel = useFieldTypeLabel();
+
+  // Track user resolutions for interactive fields
+  const [resolutions, setResolutions] = useState<
+    Record<string, FieldResolution>
+  >({});
+
+  // F4 Option E PR 5: rename selections, keyed by `${table}::${fromColumn}`.
+  // Value is the chosen `toColumn` for "rename", or null for "drop and add".
+  // Default each drop to the first type-compatible candidate (so the user's
+  // common case is one click); falls back to "drop_and_add" otherwise.
+  const candidatesByDrop = useMemo(() => {
+    const map = new Map<string, SchemaPreviewRenameCandidate[]>();
+    for (const c of renamed ?? []) {
+      const key = `${c.table}::${c.from}`;
+      const list = map.get(key) ?? [];
+      list.push(c);
+      map.set(key, list);
+    }
+    return map;
+  }, [renamed]);
+
+  const [renameSelections, setRenameSelections] = useState<
+    Record<string, string | null>
+  >(() => {
+    const out: Record<string, string | null> = {};
+    for (const [key, group] of candidatesByDrop) {
+      // A preserving rename before one that merely fits: pre-selecting a
+      // conversion that rewrites every row decides for the author.
+      const compatible =
+        group.find(c => c.typesCompatible && c.preservesValues) ??
+        group.find(c => c.typesCompatible);
+      out[key] = compatible ? compatible.to : null;
+    }
+    return out;
+  });
+
+  const hasChanges =
+    changes.added.length > 0 ||
+    changes.removed.length > 0 ||
+    changes.changed.length > 0;
+
+  // A field that cannot leave translation in one change is refused by the server, so the dialog
+  // does not offer Apply, and any prompt the same field raises (a default for its new shared
+  // column, say) is moot: the change that would need the answer will not run.
+  // Matched by column: the classifier's prompts name a field by its column (`meta_title`), the
+  // notice by its name (`metaTitle`).
+  const refusedColumns = new Set(
+    leavingTranslation.filter(field => field.refusal).map(field => field.column)
+  );
+  const refused = refusedColumns.size > 0;
+  // Whether saving deletes stored values, answered once from the preview's
+  // rows and read by both the confirm's colour and the data-loss notice, so the
+  // two cannot disagree. A refused save applies nothing, so it deletes nothing.
+  // What bringing an older table up to date deletes: a column or table it removes, with its values.
+  const conversionLosses = lossLinesOf(conversions);
+  const fieldsDeleteData = reviewDeletesData(changes);
+  const deletesData =
+    (fieldsDeleteData || conversionLosses.length > 0) && !refused;
+  const promptedFields = interactiveFields.filter(
+    f => !refusedColumns.has(f.name)
+  );
+
+  // Check if all interactive fields have been resolved with valid values.
+  // "provide_default" requires a non-empty value; "mark_nullable" is always valid.
+  const allResolved = promptedFields.every(f => {
+    const res = resolutions[f.name];
+    if (!res?.action) return false;
+    if (res.action === "provide_default") return !!res.value?.trim();
+    return true;
+  });
+  const canApply =
+    (classification !== "interactive" || allResolved) && !refused;
+  // When nothing in the change could be saved, there is no Save to disable: the dialog offers
+  // only Close. When something could, Save stays (disabled) with what to fix beside it.
+  const nothingSaveable =
+    refused &&
+    !hasChanges &&
+    candidatesByDrop.size === 0 &&
+    promptedFields.length === 0 &&
+    leavingTranslation.every(field => field.refusal);
+
+  const updateResolution = (fieldName: string, resolution: FieldResolution) => {
+    setResolutions(prev => ({ ...prev, [fieldName]: resolution }));
+  };
+
+  const updateRename = (dropKey: string, target: string | null) => {
+    setRenameSelections(prev => ({ ...prev, [dropKey]: target }));
+  };
+
+  // Attach an explicit confirm_drop for every removed field the user just
+  // reviewed above. Removing a field drops its column and destroys the data
+  // in it, and the server's schema pipeline now refuses any destructive drop
+  // it was not told to make. Renames (a drop paired with an add) are carried
+  // by the rename resolutions and filtered server-side, so a confirm_drop for
+  // one of those is a harmless no-op. Interactive resolutions (NOT NULL /
+  // default) win on a name collision.
+  // A changed field the preview classed destructive, such as a relationship whose links move
+  // into or out of a link table, loses values the person was warned of above, so it is confirmed
+  // by name too: the server refuses such a drop it was not told to make.
+  const buildResolutions = (): Record<string, FieldResolution> => {
+    const confirmed: Record<string, FieldResolution> = {};
+    for (const field of changes.removed) {
+      confirmed[field.name] = { action: "confirm_drop" };
+    }
+    for (const field of changes.changed) {
+      if (changedRowDeletesData(field)) {
+        confirmed[field.name] = { action: "confirm_drop" };
+      }
+    }
+    return { ...confirmed, ...resolutions };
+  };
+
+  // Translate per-drop selections into one resolution per candidate (the
+  // shape the apply endpoint expects). For each candidate, "rename" only
+  // when its target matches the drop's selection; otherwise "drop_and_add".
+  const buildRenameResolutions = (): SchemaRenameResolution[] => {
+    const out: SchemaRenameResolution[] = [];
+    for (const c of renamed ?? []) {
+      const dropKey = `${c.table}::${c.from}`;
+      const target = renameSelections[dropKey];
+      out.push({
+        tableName: c.table,
+        fromColumn: c.from,
+        toColumn: c.to,
+        choice: target === c.to ? "rename" : "drop_and_add",
+      });
+    }
+    return out;
+  };
+
+  return (
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      <AlertDialogContent className="max-w-lg">
+        <SchemaChangeDialogHeader
+          kind={kind}
+          entityName={entityName}
+          title={dialogTitle(
+            kind,
+            refused,
+            classification,
+            hasDestructiveChanges
+          )}
+          refused={refused}
+        />
+
+        <FieldGroupCreatesList groups={fieldGroupCreates} />
+
+        {/* Changes list */}
+        {hasChanges && (
+          <div className="max-h-64 overflow-y-auto rounded-md  border border-border bg-primary/5 p-3">
+            {changes.added.map(field => (
+              <div
+                key={`add-${field.name}`}
+                className="flex items-center gap-2.5 py-1.5 text-sm [&+&]:border-t border-border [&+&]:border-border"
+              >
+                <Badge variant="success">added</Badge>
+                <span>
+                  <strong>{field.name}</strong>{" "}
+                  <span className="text-muted-foreground">
+                    ({typeLabel(field.type)})
+                  </span>
+                </span>
+              </div>
+            ))}
+
+            {changes.removed.map(field => (
+              <div
+                key={`rm-${field.name}`}
+                className="flex flex-col gap-1 py-1.5 text-sm [&+&]:border-t border-border [&+&]:border-border"
+              >
+                <div className="flex items-center gap-2.5">
+                  <Badge variant="destructive">removed</Badge>
+                  <span>
+                    <strong>{field.name}</strong>{" "}
+                    <span className="text-muted-foreground">
+                      ({typeLabel(field.type)})
+                    </span>
+                  </span>
+                </div>
+                {field.rowCount > 0 && (
+                  <span className="ml-16 text-xs text-destructive">
+                    {field.rowCount.toLocaleString()} rows have non-null data
+                  </span>
+                )}
+              </div>
+            ))}
+
+            {changes.changed.map(field => (
+              <div
+                key={`ch-${field.name}`}
+                className="flex flex-col gap-1 py-1.5 text-sm [&+&]:border-t border-border [&+&]:border-border"
+              >
+                <div className="flex items-center gap-2.5">
+                  <Badge variant="warning">changed</Badge>
+                  <span>
+                    <strong>{field.name}</strong>{" "}
+                    <span className="text-muted-foreground">
+                      {typeLabel(field.from)} &rarr; {typeLabel(field.to)}
+                    </span>
+                  </span>
+                </div>
+                {field.rowCount > 0 && (
+                  <span className="ml-16 text-xs text-warning-text">
+                    {field.rowCount.toLocaleString()} rows may be affected
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        <DecidedRenames renames={decidedRenames} />
+        <KeptMoves moves={moves} notices={notices} conversions={conversions} />
+        <LeavingTranslationNotice fields={leavingTranslation} />
+        <JoiningTranslationNotice fields={joiningTranslation} />
+        <BroughtUpToDate conversions={conversions} />
+        {/* The settings saved with these fields, translation turned off
+            among them beside what leaving it moves. */}
+        <SettingChangesList changes={settingChanges} />
+
+        {/* Rename candidates - one section per dropped column with a list
+            of "rename to X" radios + a "drop and add new" option.
+            We deliberately don't enforce one-target-per-drop in the
+            dialog: server's applyResolutionsToOperations is
+            duplicate-safe (consumes a (drop, add) pair only once), and
+            independent radios match user expectations better than a
+            shrinking-pool UX. If two drops both pick "X" as their target,
+            only the first rename runs; the second drop falls through as
+            drop_and_add. F8 may revisit this once the Classifier ships. */}
+        {candidatesByDrop.size > 0 && (
+          <div className="space-y-3 rounded-md  border border-border bg-primary/5 p-3">
+            <Label className="text-sm font-medium">
+              Possible field renames
+            </Label>
+            {Array.from(candidatesByDrop.entries()).map(([dropKey, group]) => {
+              const first = group[0];
+              if (!first) return null;
+              return (
+                <div key={dropKey} className="space-y-1.5">
+                  {/* A removed field is known here only by its column, so it is
+                      shown as its name in the database and API, labelled as
+                      that. The table it lives in is left out: it is an
+                      internal name and tells an author nothing. */}
+                  <div className="text-sm">
+                    A field was removed. Its name in the database and API:{" "}
+                    <code
+                      className="font-mono text-xs"
+                      data-builder-copy="database-name"
+                    >
+                      {first.from}
+                    </code>
+                  </div>
+                  <div className="flex flex-col gap-1.5 pl-2">
+                    {group.map(c => (
+                      <label
+                        key={c.to}
+                        className="flex items-center gap-2 text-sm"
+                      >
+                        <input
+                          type="radio"
+                          name={`rename-${dropKey}`}
+                          checked={renameSelections[dropKey] === c.to}
+                          onChange={() => updateRename(dropKey, c.to)}
+                        />
+                        {/* The outcome stands in for the two column types,
+                            which are the database's names for them. */}
+                        <span>
+                          Rename to{" "}
+                          <code className="font-mono text-xs">{c.to}</code>{" "}
+                          <span className="text-muted-foreground">
+                            (
+                            {!c.typesCompatible
+                              ? "incompatible types, not recommended"
+                              : c.preservesValues
+                                ? "data preserved"
+                                : "rows kept, values change"}
+                            )
+                          </span>
+                        </span>
+                      </label>
+                    ))}
+                    {/* The reason sits under the option rather than inside its
+                        parenthetical: it is the sentence an author needs to
+                        decide, and a conversion that rewrites every row should
+                        not read as a footnote on a radio label. */}
+                    {group
+                      .filter(c => c.typesCompatible && !c.preservesValues)
+                      .map(c => (
+                        <p
+                          key={`${c.to}-why`}
+                          className="pl-6 text-xs text-muted-foreground"
+                        >
+                          <code className="font-mono text-foreground">
+                            {c.to}:
+                          </code>{" "}
+                          {c.valueChangeReason}
+                        </p>
+                      ))}
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="radio"
+                        name={`rename-${dropKey}`}
+                        checked={renameSelections[dropKey] === null}
+                        onChange={() => updateRename(dropKey, null)}
+                      />
+                      <span>Remove it and add a new field (data lost)</span>
+                    </label>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Interactive fields -- need user input */}
+        {promptedFields.length > 0 && (
+          <div className="space-y-3 rounded-md  border border-warning-border bg-warning-surface p-3">
+            {promptedFields.map(field => (
+              <div key={field.name} className="space-y-2">
+                {/* The prompt says what needs an answer in plain words; the
+                    field is known here only by its column, so that is shown
+                    as its name in the database and API, labelled as that. */}
+                <Label className="text-sm font-medium">
+                  {field.reason === "new_required_no_default"
+                    ? `A new required field has no value in ${field.tableRowCount.toLocaleString()} existing entries`
+                    : `A field made required is empty in ${field.nullCount?.toLocaleString()} entries`}
+                </Label>
+                <p className="text-xs text-muted-foreground">
+                  Its name in the database and API:{" "}
+                  <code className="font-mono" data-builder-copy="database-name">
+                    {field.name}
+                  </code>
+                </p>
+                <div className="flex flex-col gap-1.5">
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="radio"
+                      name={`resolve-${field.name}`}
+                      checked={
+                        resolutions[field.name]?.action === "provide_default"
+                      }
+                      onChange={() =>
+                        updateResolution(field.name, {
+                          action: "provide_default",
+                          value: resolutions[field.name]?.value ?? "",
+                        })
+                      }
+                    />
+                    Provide a default value
+                  </label>
+                  {resolutions[field.name]?.action === "provide_default" && (
+                    <Input
+                      className="ml-6 h-8"
+                      placeholder="Enter default value..."
+                      value={resolutions[field.name]?.value ?? ""}
+                      onChange={e =>
+                        updateResolution(field.name, {
+                          action: "provide_default",
+                          value: e.target.value,
+                        })
+                      }
+                    />
+                  )}
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="radio"
+                      name={`resolve-${field.name}`}
+                      checked={
+                        resolutions[field.name]?.action === "mark_nullable"
+                      }
+                      onChange={() =>
+                        updateResolution(field.name, {
+                          action: "mark_nullable",
+                        })
+                      }
+                    />
+                    Mark as optional instead
+                  </label>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* The data-loss notice shows exactly when the save deletes values; the
+            server's other warnings (a field made required over empty
+            entries, say) still show, as a caution rather than a loss. */}
+        {deletesData ? (
+          <Alert variant="destructive">
+            <AlertTriangle className="h-4 w-4" />
+            <AlertTitle>Data loss warning</AlertTitle>
+            <AlertDescription>
+              {warnings.length > 0
+                ? warnings.map((w, i) => (
+                    <span key={i} className="block">
+                      {w}
+                    </span>
+                  ))
+                : fieldsDeleteData && (
+                    <span className="block">
+                      Saving deletes the values stored in the fields removed
+                      above.
+                    </span>
+                  )}
+              {conversionLosses.map(line => (
+                <span key={line} className="block">
+                  {line}
+                </span>
+              ))}
+            </AlertDescription>
+          </Alert>
+        ) : warnings.length > 0 ? (
+          <Alert variant="warning">
+            <AlertTriangle className="h-4 w-4" />
+            <AlertTitle>Before you save</AlertTitle>
+            <AlertDescription>
+              {warnings.map((w, i) => (
+                <span key={i} className="block">
+                  {w}
+                </span>
+              ))}
+            </AlertDescription>
+          </Alert>
+        ) : null}
+
+        <SchemaChangeDialogFooter
+          nothingSaveable={nothingSaveable}
+          refusedCount={refusedColumns.size}
+          // Red only when saving deletes stored values (see `deletesData`); the
+          // overall flag also covers changes that only need an answer.
+          emphasisDestructive={deletesData}
+          isApplying={isApplying}
+          canApply={canApply}
+          onClose={() => onOpenChange(false)}
+          onApply={() =>
+            onConfirm(buildResolutions(), buildRenameResolutions())
+          }
+        />
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+/**
+ * The review's title, in sentence case like every Builder title. The plain
+ * save names the kind it saves, so a Single's review does not read "Save
+ * collection".
+ */
+function dialogTitle(
+  kind: BuilderKind,
+  refused: boolean,
+  classification: SchemaChangeDialogProps["classification"],
+  hasDestructiveChanges: boolean
+): string {
+  if (refused) return "Schema change needs another step";
+  if (classification === "interactive") return "Schema changes need input";
+  return hasDestructiveChanges
+    ? "Schema changes detected"
+    : `Save ${BUILDER_KIND_NOUN[kind]}`;
+}
+
+function SchemaChangeDialogHeader({
+  kind,
+  entityName,
+  title,
+  refused,
+}: {
+  kind: BuilderKind;
+  entityName: string;
+  title: string;
+  refused: boolean;
+}) {
+  const noun = BUILDER_KIND_NOUN[kind];
+  return (
+    <AlertDialogHeader>
+      <AlertDialogTitle>{title}</AlertDialogTitle>
+      {/* A refused change applies nothing, so the description must not promise
+          it will. Both sentences name the kind being saved. */}
+      <AlertDialogDescription>
+        {refused
+          ? `This change cannot be saved to the ${noun} `
+          : `The following changes will be applied to the ${noun} `}
+        <strong className="text-foreground">{entityName}</strong>
+        {refused ? " in one step." : "."}
+      </AlertDialogDescription>
+    </AlertDialogHeader>
+  );
+}
+
+/**
+ * When nothing in the change could be saved there is no Save to disable, so the footer offers
+ * only Close. When something could, Save stays, disabled, with what to fix beside it.
+ */
+function SchemaChangeDialogFooter({
+  nothingSaveable,
+  refusedCount,
+  emphasisDestructive,
+  isApplying,
+  canApply,
+  onClose,
+  onApply,
+}: {
+  nothingSaveable: boolean;
+  refusedCount: number;
+  emphasisDestructive: boolean;
+  isApplying: boolean;
+  canApply: boolean;
+  onClose: () => void;
+  onApply: () => void;
+}) {
+  if (nothingSaveable) {
+    return (
+      <AlertDialogFooter>
+        <AlertDialogAction onClick={onClose}>Close</AlertDialogAction>
+      </AlertDialogFooter>
+    );
+  }
+  return (
+    <AlertDialogFooter>
+      {refusedCount > 0 && (
+        <p className="text-xs text-muted-foreground sm:mr-auto sm:self-center">
+          {refusedCount === 1
+            ? "Fix the field above to save."
+            : "Fix the fields above to save."}
+        </p>
+      )}
+      <AlertDialogCancel disabled={isApplying}>Cancel</AlertDialogCancel>
+      <AlertDialogAction
+        onClick={e => {
+          // Prevent auto-close so we show the overlay during apply
+          e.preventDefault();
+          onApply();
+        }}
+        disabled={isApplying || !canApply}
+        // The variant carries the fill and its contrast notes (button.tsx).
+        variant={emphasisDestructive ? "destructive" : "primary"}
+      >
+        {/* Sentence case, as every Builder button is. */}
+        {isApplying
+          ? "Applying..."
+          : emphasisDestructive
+            ? "Apply changes"
+            : "Save changes"}
+      </AlertDialogAction>
+    </AlertDialogFooter>
+  );
+}
+
+/** A rename the save keeps: its column's old and new names, or the field's when the column stays. */
+interface KeptRename {
+  from: string;
+  to: string;
+}
+
+/**
+ * The renames the Builder decided, once each: a field renamed on its own table and its
+ * translations table is one rename to the person.
+ */
+function DecidedRenames({
+  renames,
+}: {
+  renames: readonly KeptRename[];
+}): JSX.Element | null {
+  const once = [
+    ...new Map(renames.map(c => [`${c.from}->${c.to}`, c])).values(),
+  ];
+  if (once.length === 0) return null;
+  return (
+    <ul className="space-y-1 rounded-md border border-border bg-primary/5 p-3 text-sm">
+      {once.map(c => (
+        <li key={`${c.from}->${c.to}`}>
+          <code className="font-mono text-xs">{c.from}</code> is renamed to{" "}
+          <code className="font-mono text-xs">{c.to}</code>. Its values are
+          kept.
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * The fields the save moves into or out of a group, each kept with every value, then the save's
+ * own lines on them: what each move does not carry. Only for a save with moves; a line the review
+ * already lists as a conversion (`BroughtUpToDate`) is not repeated, matched by that conversion's
+ * own words.
+ */
+function KeptMoves({
+  moves,
+  notices,
+  conversions,
+}: {
+  moves: readonly DraftMove[];
+  notices: readonly string[];
+  conversions: readonly SchemaPreviewConversion[];
+}): JSX.Element | null {
+  if (moves.length === 0) return null;
+  const lines = notices.filter(
+    notice => !conversions.some(c => notice.includes(c.change))
+  );
+  return (
+    <ul className="space-y-1 rounded-md border border-border bg-primary/5 p-3 text-sm">
+      {moves.map(move => (
+        <li key={`${movePath(move.from)}->${movePath(move.to)}`}>
+          <code className="font-mono text-xs">{movePath(move.from)}</code> is
+          moved to{" "}
+          <code className="font-mono text-xs">{movePath(move.to)}</code>. Its
+          values are kept.
+        </li>
+      ))}
+      {lines.map(line => (
+        <li key={line} className="text-muted-foreground">
+          {line}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * What the save also brings up to date in a table an earlier Nextly version made, in the server's
+ * own words. Nothing to tick: Save confirms every conversion listed, and Cancel confirms none.
+ * Bounded in height, as the change list is, so a long list scrolls inside the dialog and its Save
+ * and Cancel stay in reach; focusable, so the list scrolls from the keyboard too.
+ */
+function BroughtUpToDate({
+  conversions,
+}: {
+  conversions: readonly SchemaPreviewConversion[];
+}): JSX.Element | null {
+  const headingId = useId();
+  if (conversions.length === 0) return null;
+  return (
+    <section
+      aria-labelledby={headingId}
+      tabIndex={0}
+      className="max-h-48 space-y-1.5 overflow-y-auto rounded-md border border-border bg-primary/5 p-3"
+    >
+      <h3 id={headingId} className="text-sm font-medium">
+        Brought up to date
+      </h3>
+      {broughtUpToDateLines(conversions).map(line => (
+        <p key={line} className="text-sm text-muted-foreground">
+          {line}
+        </p>
+      ))}
+    </section>
+  );
+}

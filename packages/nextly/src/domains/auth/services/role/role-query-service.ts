@@ -1,0 +1,399 @@
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import { caseInsensitiveContains } from "@nextlyhq/adapter-drizzle/text-match";
+import { and, asc, count, desc, eq, gte, inArray, lte } from "drizzle-orm";
+
+import type { RoleListSelectResult } from "@nextly/types/rbac-operations";
+
+// PR 4 migration: replaced result-shape returns and mapDbErrorToServiceError
+// with throw-based NextlyError.
+import { toDbError } from "../../../../database/errors";
+import { NextlyError } from "../../../../errors/nextly-error";
+import { BaseService } from "../../../../services/base-service";
+import type { Logger } from "../../../../services/shared";
+import { requireFilterValue } from "../../../../shared/lib/require-filter-value";
+import {
+  builtInMarkOf,
+  isAssignableRole,
+  type BuiltInRole,
+} from "../public-role";
+
+import { toDialectBool } from "./utils";
+
+/**
+ * RoleQueryService handles all role read/query operations.
+ *
+ * Responsibilities:
+ * - List roles with pagination and filtering
+ * - Get role by ID
+ * - Find role by name or slug
+ *
+ * @example
+ * ```typescript
+ * const queryService = new RoleQueryService(adapter, logger);
+ * const result = await queryService.listRoles({ page: 1, limit: 10 });
+ * ```
+ */
+export class RoleQueryService extends BaseService {
+  /**
+   * Creates a new RoleQueryService instance.
+   *
+   * @param adapter - Database adapter
+   * @param logger - Logger instance
+   */
+  constructor(adapter: DrizzleAdapter, logger: Logger) {
+    super(adapter, logger);
+  }
+
+  /**
+   * List all roles with pagination, search, and filtering.
+   *
+   * @param options - Pagination, search, filter, and sort options
+   * @returns Paginated list of roles with metadata
+   */
+  async listRoles(options?: {
+    // Pagination
+    page?: number;
+    limit?: number;
+    // Search
+    search?: string;
+    // Filters
+    isSystem?: boolean;
+    levelMin?: number;
+    levelMax?: number;
+    // Sorting
+    sortBy?: "name" | "level";
+    sortOrder?: "asc" | "desc";
+    // Include permissions
+    includePermissions?: boolean;
+  }): Promise<{
+    data: Array<{
+      id: string;
+      name: string;
+      slug: string;
+      description: string | null;
+      level: number;
+      isSystem: boolean;
+      /** Whether it may be given to someone or inherited (`isAssignableRole`). */
+      assignable: boolean;
+      /** Which built-in role it is, if one (`builtInMarkOf`). */
+      builtIn?: BuiltInRole;
+    }>;
+    meta: {
+      total: number;
+      page: number;
+      limit: number;
+      totalPages: number;
+    };
+  }> {
+    try {
+      const {
+        page = 1,
+        limit = 10,
+        search,
+        isSystem,
+        levelMin,
+        levelMax,
+        sortBy = "level",
+        sortOrder = "asc",
+        includePermissions = false,
+      } = options || {};
+
+      const { roles, rolePermissions } = this.tables;
+
+      // Build WHERE conditions
+      const conditions = [];
+
+      // Search by name (case-insensitive)
+      if (search) {
+        // The name contains the text as typed, ignoring case on every dialect, through the one
+        // rule for it: ilike() exists on PostgreSQL only, and SQLite's lower() folds ASCII only.
+        conditions.push(
+          caseInsensitiveContains(this.dialect, roles.name, search)
+        );
+      }
+
+      // Filter by isSystem
+      if (isSystem !== undefined) {
+        conditions.push(eq(roles.isSystem, toDialectBool(isSystem)));
+      }
+
+      // Filter by level range
+      if (levelMin !== undefined) {
+        conditions.push(gte(roles.level, levelMin));
+      }
+      if (levelMax !== undefined) {
+        conditions.push(lte(roles.level, levelMax));
+      }
+
+      const whereClause =
+        conditions.length > 0 ? and(...conditions) : undefined;
+
+      // Determine sort column
+      let orderByClause;
+      const orderFn = sortOrder === "asc" ? asc : desc;
+
+      switch (sortBy) {
+        case "name":
+          orderByClause = orderFn(roles.name);
+          break;
+        case "level":
+          orderByClause = orderFn(roles.level);
+          break;
+        default:
+          orderByClause = orderFn(roles.level);
+      }
+
+      // Calculate pagination
+      const offset = (page - 1) * limit;
+
+      // Get total count of all roles (including those without permissions)
+
+      const countResult = await this.db
+        .select({ value: count() })
+        .from(roles)
+        .where(whereClause);
+
+      const total = Number(countResult[0]?.value ?? 0);
+
+      // Fetch paginated roles (including those without permissions)
+
+      const rows = await this.db
+        .select({
+          id: roles.id,
+          name: roles.name,
+          slug: roles.slug,
+          description: roles.description,
+          level: roles.level,
+          isSystem: roles.isSystem,
+        })
+        .from(roles)
+        .where(whereClause)
+        .orderBy(orderByClause)
+        .limit(limit)
+        .offset(offset);
+
+      const totalPages = Math.ceil(total / limit);
+
+      // Fetch child roles for all roles using a single join query
+      const roleIds = rows.map((row: RoleListSelectResult) => String(row.id));
+      const childRolesMap = new Map<string, string[]>();
+
+      if (roleIds.length > 0) {
+        const roleInherits = this.tables.roleInherits;
+
+        const childRolesRows = await this.db
+          .select({
+            parentRoleId: roleInherits.parentRoleId,
+            childRoleId: roleInherits.childRoleId,
+          })
+          .from(roleInherits)
+          .where(inArray(roleInherits.parentRoleId, roleIds));
+
+        for (const row of childRolesRows) {
+          const parentId = String(row.parentRoleId);
+          const childId = String(row.childRoleId);
+          if (!childRolesMap.has(parentId)) {
+            childRolesMap.set(parentId, []);
+          }
+          childRolesMap.get(parentId)?.push(childId);
+        }
+      }
+
+      // Fetch permissions for each role if requested
+      const permissionsMap = new Map<string, string[]>();
+      if (includePermissions && roleIds.length > 0) {
+        const rolePermissionsRows = await this.db
+          .select({
+            roleId: rolePermissions.roleId,
+            permissionId: rolePermissions.permissionId,
+          })
+          .from(rolePermissions)
+          .where(inArray(rolePermissions.roleId, roleIds));
+
+        for (const row of rolePermissionsRows) {
+          const roleId = String(row.roleId);
+          const permId = String(row.permissionId);
+          if (!permissionsMap.has(roleId)) {
+            permissionsMap.set(roleId, []);
+          }
+          permissionsMap.get(roleId)?.push(permId);
+        }
+      }
+
+      // Map results with child roles and permissions
+      const data = rows.map((row: RoleListSelectResult) => {
+        const roleId = String(row.id);
+        return {
+          id: roleId,
+          name: row.name,
+          slug: row.slug,
+          description: row.description,
+          level: row.level,
+          isSystem: Boolean(row.isSystem),
+          assignable: isAssignableRole({ slug: String(row.slug) }),
+          ...builtInMarkOf({ slug: String(row.slug) }),
+          childRoleIds: childRolesMap.get(roleId) ?? [],
+          ...(includePermissions && {
+            permissionIds: permissionsMap.get(roleId) ?? [],
+          }),
+        };
+      });
+
+      return {
+        data,
+        meta: {
+          total,
+          page,
+          limit,
+          totalPages,
+        },
+      };
+    } catch (e: unknown) {
+      // Any DB error during the list query -> NextlyError with generic
+      // public message and the original error preserved as cause. Normalise
+      // raw driver errors via toDbError(dialect) so the kind is preserved.
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, e));
+    }
+  }
+
+  /**
+   * Get a single role by ID.
+   *
+   * @param roleId - The role ID to fetch
+   * @returns Role data or null if not found
+   */
+  async getRoleById(roleId: string): Promise<{
+    id: string;
+    name: string;
+    slug: string;
+    description: string | null;
+    level: number;
+    isSystem: boolean;
+    /** Whether it may be given to someone or inherited (`isAssignableRole`). */
+    assignable: boolean;
+    /** Which built-in role it is, if one (`builtInMarkOf`). */
+    builtIn?: BuiltInRole;
+  }> {
+    try {
+      // Validate input. Per §13.8 the public message names the field but
+      // never echoes the bad value; that goes to logContext.
+      if (!roleId || typeof roleId !== "string" || roleId.trim() === "") {
+        throw NextlyError.validation({
+          errors: [
+            {
+              path: "roleId",
+              code: "REQUIRED",
+              message: "roleId is required and must be a non-empty string.",
+            },
+          ],
+        });
+      }
+
+      const uuidRegex =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+      if (!uuidRegex.test(roleId)) {
+        throw NextlyError.validation({
+          errors: [
+            {
+              path: "roleId",
+              code: "INVALID_FORMAT",
+              message: "roleId must be a valid UUID.",
+            },
+          ],
+          logContext: { roleId },
+        });
+      }
+
+      const role = await this.db.query.roles.findFirst({
+        where: { id: requireFilterValue(roleId, "roleId") },
+        columns: {
+          id: true,
+          name: true,
+          slug: true,
+          description: true,
+          level: true,
+          isSystem: true,
+        },
+      });
+
+      if (!role) {
+        throw NextlyError.notFound({ logContext: { roleId } });
+      }
+
+      return {
+        id: String(role.id),
+        name: role.name,
+        slug: role.slug,
+        description: role.description,
+        level: role.level,
+        isSystem: Boolean(role.isSystem),
+        assignable: isAssignableRole({ slug: String(role.slug) }),
+        ...builtInMarkOf({ slug: String(role.slug) }),
+      };
+    } catch (e: unknown) {
+      // Re-throw NextlyErrors unchanged. Map raw DB errors via fromDatabaseError.
+      if (NextlyError.is(e)) throw e;
+      // Normalise raw driver errors so unique/fk/etc. produce the right kind.
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, e));
+    }
+  }
+
+  /**
+   * Find role by name.
+   *
+   * @param name - The role name to search for
+   * @returns Role ID or null if not found
+   */
+  async getRoleByName(name: string): Promise<{ id: string } | null> {
+    const role = await this.db.query.roles.findFirst({
+      where: { name: name },
+      columns: { id: true },
+    });
+    return role ? { id: String(role.id) } : null;
+  }
+
+  /**
+   * Find role ID by slug.
+   *
+   * @param slug - The role slug to search for
+   * @returns Role ID or null if not found
+   */
+  async findRoleIdBySlug(slug: string): Promise<{ id: string } | null> {
+    const { roles } = this.tables;
+    const role = await this.db
+      .selectDistinct({ id: roles.id })
+      .from(roles)
+      .where(eq(roles.slug, slug))
+      .limit(1);
+    return role && role.length > 0 ? { id: String(role[0].id) } : null;
+  }
+
+  /**
+   * Find the roles carrying any of the given slugs, in one read.
+   *
+   * A caller resolving a set of slugs asks once rather than once per slug.
+   * Each role comes back with the slug it carries, in no particular order,
+   * and a slug no role carries is simply absent — so a caller that must
+   * name the missing one keys the answer by slug. The empty set reads
+   * nothing.
+   *
+   * @param slugs - The role slugs to search for
+   * @returns The id and slug of every role carrying one of them
+   */
+  async findRoleIdsBySlugs(
+    slugs: readonly string[]
+  ): Promise<Array<{ id: string; slug: string }>> {
+    if (slugs.length === 0) return [];
+    const { roles } = this.tables;
+    const rows = await this.db
+      .select({ id: roles.id, slug: roles.slug })
+      .from(roles)
+      .where(inArray(roles.slug, [...new Set(slugs)]));
+    // The dialect-union handle leaves the row untyped; both columns are
+    // stringified as `findRoleIdBySlug` does with its id.
+    return rows.map((row: { id: unknown; slug: unknown }) => ({
+      id: String(row.id),
+      slug: String(row.slug),
+    }));
+  }
+}

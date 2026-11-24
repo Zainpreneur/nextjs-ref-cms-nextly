@@ -1,0 +1,1579 @@
+/**
+ * Schema changes for a Field Group, owned in one place with the registry write they belong to.
+ *
+ * ## Why this exists
+ *
+ * A field group can be created through three transports, and only one of them made the table. The
+ * dispatcher generated the DDL, ran it and wrote the registry row; `api/field-groups.ts` POST and
+ * the Direct API wrote the row and returned success. The registry then described a `comp_<slug>`
+ * table that did not exist, and every read and write to that field group failed against the
+ * database. The reason was structural rather than careless: the code that provisions the table was
+ * private to the dispatcher, so nothing else could reach it.
+ *
+ * One service owns both halves, and every transport goes through it.
+ *
+ * ## What it guarantees, and what it does not
+ *
+ * **NOT atomic.** MySQL commits DDL implicitly, so a table change and a row write cannot be made
+ * atomic there by any ordering or any transaction. The migration engine reached the same conclusion
+ * and says so in `field-groups/migration/steps.ts`. Promising atomicity would be a promise that
+ * silently does not hold on one of the three supported databases.
+ *
+ * The DDL runs first and the row is written last, carrying the outcome the apply reached. A crash
+ * between the two leaves a table nothing has a record of, and a DDL that FAILS still writes its row
+ * recording `failed`. Writing the intent first would trade the first cost for a worse one: a row
+ * persisted before the table is touched owns the slug from that moment, and nothing here can yet
+ * finish or discard an interrupted attempt, so a create killed mid-flight would block every retry.
+ * The ordering changes when a recovery path exists to release what an interrupted attempt claimed.
+ *
+ * 🔴 Everything that can REJECT a create runs before `createFieldGroup` is called, so a rejected
+ * request neither creates a table nor writes a row.
+ */
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+
+import { readRequestLocalized } from "../../../dispatcher/helpers/request-localized";
+import { NextlyError } from "../../../errors";
+import type { FieldDefinition } from "../../../schemas/dynamic-collections";
+import type {
+  DynamicFieldGroupInsert,
+  DynamicFieldGroupRecord,
+  FieldGroupMigrationStatus as SchemaFieldGroupMigrationStatus,
+} from "../../../schemas/dynamic-field-groups/types";
+import { STORAGE_FORMAT } from "../../../schemas/storage-format";
+import {
+  addressRefusalError,
+  assertAddressAllowed,
+  findSameSnakeCaseAddress,
+} from "../../../shared/address-rule";
+import type { Logger } from "../../../shared/types";
+import { storesPerLanguage } from "../../i18n/per-language-storage";
+import type {
+  BuilderSaveSetup,
+  CollectionSaveDeps,
+} from "../../schema/builder-save/collection-save";
+import { entitySaveDeps } from "../../schema/builder-save/entity-save-deps";
+import { fieldGroupEntity } from "../../schema/builder-save/stored-entity";
+import { writeRegistryRowsWith } from "../../schema/schema-version";
+import { identifierBytes } from "../../schema/services/index-name";
+import { withSchemaChangeExcluded } from "../../schema/services/schema-change-exclusion";
+import { assertNoNewSiblingClashes } from "../../schema/sibling-fields";
+import { assertSaveLeavesNoFieldGroupCycle } from "../field-group-cycles";
+import { typeColumnForNewTable } from "../storage/resolve-storage-names";
+
+import { assertNotDiverged } from "./assert-not-diverged";
+import type { FieldGroupRegistryService } from "./field-group-registry-service";
+import {
+  fieldGroupTableNameFor,
+  resolveFieldGroupStorageNames,
+} from "./field-group-storage-names";
+import { recordStrandedTransition } from "./record-stranded-transition";
+
+/**
+ * The Builder save writer, loaded where a save runs: it brings the migration
+ * generator and runner, which a read, or a save with no writer set up, never
+ * needs.
+ */
+const loadEntitySave = () => import("../../schema/builder-save/entity-save");
+const loadCollectionSave = () =>
+  import("../../schema/builder-save/collection-save");
+
+/**
+ * 🔴 The schema service and the table provisioning are loaded on demand, NOT at the top of this
+ * file.
+ *
+ * This service is registered in the DI container, and the registration module is imported during
+ * boot by anything that touches the container. A static import here would pull the whole schema and
+ * i18n machinery into that graph for every consumer, including every process that never creates a
+ * field group. `di/register.ts` avoids exactly this with its `await import()` calls covering these
+ * same modules, and a static import from a registration module quietly undoes that work.
+ */
+
+/**
+ * How far a schema change got: the subset of migration statuses THIS SERVICE writes.
+ *
+ * 🔴 Narrower than the schema's set, and DERIVED from it rather than restated. `Extract` keeps the
+ * relationship a compiler can check: a member renamed or removed from the canonical union stops
+ * compiling here, where a hand-written copy would go on accepting a value the column no longer has.
+ * That is the rule this file already follows elsewhere — a narrower view is derived from the richer
+ * one, never computed alongside it.
+ *
+ * `diverged` is in the set because the tables were changed and the row recording it was not. It is
+ * distinct from `failed` because the two call for OPPOSITE actions: `failed` means the change did
+ * not happen and retrying is the repair; `diverged` means half of it did and retrying compounds it.
+ */
+export type FieldGroupMigrationStatus = Extract<
+  SchemaFieldGroupMigrationStatus,
+  "pending" | "applied" | "failed" | "diverged"
+>;
+
+/**
+ * The registry row to create, minus the one field this service owns.
+ *
+ * Deliberately the registry's own insert type rather than a hand-listed subset: a bespoke input
+ * shape silently drops whatever it forgets, and that is not hypothetical — the singles equivalent
+ * listed its fields by hand and lost three of them, which nothing in the types or the tests caught.
+ */
+export type CreateFieldGroupInput = Omit<
+  DynamicFieldGroupInsert,
+  "migrationStatus"
+>;
+
+/**
+ * A create as a transport asks for it: the table name may be left to the service, which names it
+ * under the naming the site's storage is on (`field-group-storage-names`) inside the create's
+ * exclusion, where no storage migration can move the storage between the naming and the create.
+ */
+export type CreateFieldGroupRequest = Omit<
+  CreateFieldGroupInput,
+  "tableName"
+> & {
+  tableName?: string;
+};
+
+export interface CreateFieldGroupResult {
+  record: DynamicFieldGroupRecord;
+  migrationStatus: FieldGroupMigrationStatus;
+}
+
+/**
+ * A field group's metadata edit, with the physical change it implies.
+ *
+ * Every property is optional and `undefined` means UNTOUCHED rather than cleared, which is the
+ * shape all three transports already spoke — a PATCH that omits `label` must not erase it. The
+ * distinction matters most for `localized`: absent leaves the persisted value alone, while `false`
+ * is a request to disable and moves data back out of the companion table.
+ */
+export interface UpdateFieldGroupInput {
+  slug: string;
+  label?: string;
+  description?: string;
+  admin?: Record<string, unknown>;
+  fields?: FieldDefinition[];
+  localized?: boolean;
+  /**
+   * Who is asking, which decides whether a LOCKED field group may be written.
+   *
+   * A locked field group is owned by code, so only the code-first sync may change it. Defaulting to
+   * `"ui"` means a transport that forgets to say gets the restrictive answer.
+   */
+  source?: "ui" | "code";
+}
+
+export interface UpdateFieldGroupResult {
+  record: DynamicFieldGroupRecord;
+}
+
+export class FieldGroupMetadataService {
+  constructor(
+    private readonly registry: FieldGroupRegistryService,
+    private readonly logger: Logger,
+    /**
+     * Optional on purpose, and it changes what this service does rather than whether it works.
+     *
+     * With no adapter registered the statements are generated and never run, which is the behaviour
+     * the request handler had before this service existed. Demanding a connection here would turn a
+     * configuration this product supports into a crash.
+     */
+    private readonly adapter?: DrizzleAdapter
+  ) {}
+
+  /** Where a Builder save writes its migration, when the app has one set up. */
+  private builderSave?: BuilderSaveSetup;
+
+  /**
+   * Have every save here write its migration and snapshot through the
+   * Builder save writer (`writeCollectionSave`), as a collection's does.
+   * Set by the service registration.
+   */
+  setBuilderSave(setup: BuilderSaveSetup): void {
+    this.builderSave = setup;
+  }
+
+  /** The writer's dependencies for a save here, when a writer is set up. */
+  private saveDeps(): CollectionSaveDeps | undefined {
+    return entitySaveDeps(this.builderSave, this.adapter, this.logger);
+  }
+
+  /**
+   * The dialect the DDL is generated for.
+   *
+   * Read from the adapter that will RUN the statements, never from a default. `DB_DIALECT` is
+   * optional and falls back to `postgresql`, so an app configured with only a MySQL or SQLite URL
+   * would otherwise have its table created as PostgreSQL.
+   */
+  private get dialect(): "postgresql" | "mysql" | "sqlite" {
+    return this.adapter?.getCapabilities().dialect ?? "postgresql";
+  }
+
+  /**
+   * Create a field group's table and its registry row.
+   *
+   * The caller has already validated the input's shape.
+   */
+  async createFieldGroup(
+    request: CreateFieldGroupRequest
+  ): Promise<CreateFieldGroupResult> {
+    // 🔴 Everything is inside, including the planning, and the reason planning is inside is not the
+    // storage migration.
+    //
+    // Rendering DDL consults the PROCESS-GLOBAL field-type registry for plugin fields
+    // (`pluginEmptyColumnDefault` -> `getFieldType`), and an HMR reload replaces that registry
+    // wholesale — `clearFieldTypes()` then re-registration — from inside this same exclusion. Plan
+    // outside it and a create can render its columns against one mapping while the binding below
+    // uses another, leaving a registered schema that disagrees with the column that was created.
+    // Worse, the swap has a window where the registry is EMPTY, so a plan running through it can
+    // refuse a field type that is perfectly valid.
+    //
+    // The ownership check is inside for its own reason: it reads which table names are taken, and a
+    // migration renaming tables is what makes such a read stale.
+    //
+    // What that costs, stated rather than glossed: taking the exclusion may CREATE and seed the
+    // lock table, so a create refused for a malformed field can leave that table behind. It is
+    // empty, it holds no user data, its creation is idempotent, and the next valid request would
+    // have made it anyway — a far smaller price than a column whose type disagrees with the schema
+    // bound to it.
+    return withSchemaChangeExcluded(
+      {
+        adapter: this.adapter,
+        logger: this.logger,
+        label: `create field group "${request.slug}"`,
+        migrationsDir: this.builderSave?.migrationsDir,
+        issuesDdl: true,
+      },
+      async () =>
+        this.createFieldGroupExcluded({
+          ...request,
+          tableName:
+            request.tableName ?? (await this.newTableName(request.slug)),
+        })
+    );
+  }
+
+  /**
+   * The table a new field group with `slug` is created under: its slug's name under the naming
+   * this site's storage is on, so a group created after the storage migration, or on a new site,
+   * starts on the current names. Legacy where the service has no database to ask.
+   */
+  private async newTableName(slug: string): Promise<string> {
+    const naming =
+      this.adapter === undefined
+        ? "legacy"
+        : (await resolveFieldGroupStorageNames(this.adapter)).naming;
+    return fieldGroupTableNameFor(naming, slug);
+  }
+
+  private async createFieldGroupExcluded(
+    input: CreateFieldGroupInput
+  ): Promise<CreateFieldGroupResult> {
+    // 0. RE-ESTABLISH every precondition the caller checked outside this exclusion.
+    //
+    // 🔴 One step, deliberately, and the place a NEW precondition goes. Both of these were checked
+    // by the transport before the lock existed: a table another field group owns, and whether each
+    // plugin field's options satisfy that plugin. The second is the subtle one — what changes while
+    // this request waits is not the input but the JUDGE, because an HMR reload replaces the
+    // process-global field-type registry from inside this same exclusion. A declaration the old
+    // registration accepted would otherwise be built and stored against the new one, and every
+    // later write to the field group would fail on options the active plugin rejects.
+    await this.assertNewAddressAvailable(input.slug, input.tableName);
+    const { assertOptionValuesDistinct, assertValidPluginFieldOptions } =
+      await import("../../../api/fields-payload");
+    assertValidPluginFieldOptions(input.fields);
+    // Nor two options sharing one value, which the stored value could not tell apart.
+    assertOptionValuesDistinct(input.fields);
+    // A new field group holds no pair of sibling fields yet, so every pair it is created with is new.
+    assertNoNewSiblingClashes(
+      { kind: "fieldGroup", slug: input.slug },
+      input.fields,
+      null
+    );
+    await this.assertSaveLeavesNoCycle(input.slug, input.fields);
+    // A translated field marked unique needs an index this server may not be able to key. Refused
+    // here, before the main table: the companion is provisioned after it, and a failure there is
+    // recorded rather than raised. With no adapter, nothing is applied at all.
+    if (this.adapter) {
+      const { refuseUnindexableTranslatedUnique } = await import(
+        "../../i18n/migration/translated-unique-preconditions"
+      );
+      refuseUnindexableTranslatedUnique(this.adapter, {
+        entity: input.slug,
+        builtBy: "fieldGroup",
+        oldFields: [],
+        newFields: input.fields as unknown as FieldDefinition[],
+        wasLocalized: false,
+        isLocalized: storesPerLanguage(input),
+      });
+    }
+
+    // 1. PLAN. The generator validates as well as renders, so a request it refuses leaves no table
+    // and no row behind.
+    const migrationSQL = await this.planCreate(input);
+
+    // 1a. REFUSE names the database would not store, read from the statements themselves.
+    await this.assertIdentifiersFit(input, migrationSQL);
+
+    // 1b. CLEAR THE GROUND. A table already standing where this create is about to build is never
+    // adopted: empty, it is dropped so the apply renders every column from this request; holding
+    // rows, the create is refused before any statement runs (`clearLeftoverStorage`).
+    if (this.adapter) {
+      const adapter = this.adapter;
+      const { clearLeftoverStorage } = await import(
+        "../../schema/services/leftover-storage"
+      );
+      await clearLeftoverStorage({
+        adapter,
+        kind: "fieldGroup",
+        slug: input.slug,
+        tableName: input.tableName,
+        // A component row keeps a many-to-many as a list of its own, so a field group's create
+        // makes no junction table: anything referencing its leftover belongs to something else.
+        makesJunctionTables: false,
+        logger: this.logger,
+        // The translations table references the main one, so it goes first. No CASCADE: anything
+        // else depending on these tables has already refused the create rather than go with them.
+        dropFamily: async () => {
+          await adapter.dropTable(`${input.tableName}_locales`, {
+            ifExists: true,
+          });
+          await adapter.dropTable(input.tableName, { ifExists: true });
+        },
+      });
+    }
+
+    // 2. APPLY. Through the Builder save writer where one is set up: it writes the field group's
+    // migration and snapshot, as a collection's save does, and in development runs them, so the
+    // table is on record for every migration after it. Without one, the DDL runs here as before.
+    // The direct apply never throws (a failure is a status the row records); the writer refuses
+    // a save it could not write, leaving neither file nor table.
+    const deps = this.saveDeps();
+    const migrationStatus =
+      deps === undefined
+        ? await this.applyCreateDdl(input, migrationSQL)
+        : await this.writeCreate(deps, input);
+
+    // 3. RECORD, with the outcome already known.
+    // The row and the stored schema version in one transaction, so the
+    // version's count moves with the save it records (`writeRegistryRows`).
+    // A migration the writer ran writes the field group's row as `nextly migrate` does, so it
+    // stands already and takes the rest of the record.
+    const rowWritten =
+      deps?.applies === true &&
+      (await this.registry.findComponentForWrite(input.slug)) !== null;
+    const record = await writeRegistryRowsWith(this.adapter, () =>
+      rowWritten
+        ? this.registry.updateComponent(input.slug, {
+            ...input,
+            migrationStatus,
+          })
+        : this.registry.registerComponent({ ...input, migrationStatus })
+    );
+
+    // 4. BIND the runtime schema, and only now.
+    //
+    // 🔴 The order here is what decides a race, so it is not arbitrary. Two creates whose slugs
+    // normalise to one table can both pass the ownership check above, because a read cannot exclude
+    // a write that has not happened yet. What separates them is the registry's own `table_name`
+    // unique index: the second INSERT is rejected by the database.
+    //
+    // That only helps if nothing irreversible has happened first. Binding before the insert meant
+    // the loser rebound the shared table to ITS field list and only then failed, leaving the winner
+    // reading through a schema that does not describe it until the process restarts. Binding after
+    // the insert means the loser never reaches this line.
+    //
+    // A lock spanning the check, the DDL and the insert would be stronger, and is what the migration
+    // lock will provide once it exists. It cannot be built here: MySQL commits DDL implicitly, so no
+    // transaction opened around this can cover the table change on all three dialects.
+    if (migrationStatus === "applied") {
+      await this.bindRuntimeSchema(input);
+    }
+
+    return { record, migrationStatus };
+  }
+
+  /**
+   * Change a field group's schema and its registry row, as one operation.
+   *
+   * 🔴 The founding defect of this service, still live on the UPDATE path until now. Three
+   * transports edit a field group and only the dispatcher moved the physical schema: the mounted
+   * route and the Direct API wrote new `fields` and a new `schema_hash` to the registry and ran no
+   * DDL at all, because the provisioning was private to the dispatcher. The row then described
+   * columns the table did not have. Bounded rather than silent — the registry marks
+   * `migration_status: "pending"` and a preview introspects the live database — but two transports
+   * performing different halves of one operation is not a difference any caller can be expected to
+   * know about.
+   *
+   * Inside the exclusion for the same reasons the create is, and one more. Rendering the companion
+   * transition consults the process-global field-type registry, which an HMR reload replaces
+   * wholesale from inside this same exclusion; and the OLD fields this diffs against are read here
+   * rather than passed in, so a concurrent writer cannot make the transition describe a shape that
+   * is no longer current.
+   */
+  async updateFieldGroup(
+    input: UpdateFieldGroupInput
+  ): Promise<UpdateFieldGroupResult> {
+    // 🔴 Validated BEFORE the exclusion, because it is a PRECONDITION and preconditions run first.
+    // Inside, the flag below has already given this request permission to create the lock table, so
+    // a deployment whose role holds DML but not DDL answers an invalid `localized` with a database
+    // permission error instead of the validation error that actually describes it — a caller told
+    // the wrong thing about their own mistake. Nothing here reads the database, so there is no
+    // reason for it to wait behind a lock.
+    const requestedLocalized = readRequestLocalized(input);
+
+    return withSchemaChangeExcluded(
+      {
+        adapter: this.adapter,
+        logger: this.logger,
+        label: `update field group "${input.slug}"`,
+        migrationsDir: this.builderSave?.migrationsDir,
+        // 🔴 Derived from the request, CONSERVATIVELY, because claiming DDL is not free: the
+        // exclusion may create and seed its lock table, and a deployment whose role holds DML but
+        // not DDL then fails an otherwise valid metadata edit on that `CREATE TABLE`.
+        //
+        // `fields` or `localized` being PRESENT is the conservative test, not whether they turn out
+        // to differ from what is stored. A `localized` toggle carries no fields while moving every
+        // translatable column, so reading the request for "does this touch schema" has to treat the
+        // key's presence as a yes — the comparison that would say otherwise needs the stored row,
+        // which cannot be read before deciding whether to take the lock that protects reading it.
+        issuesDdl: input.fields !== undefined || input.localized !== undefined,
+      },
+      () => this.updateFieldGroupExcluded(input, requestedLocalized)
+    );
+  }
+
+  private async updateFieldGroupExcluded(
+    input: UpdateFieldGroupInput,
+    /** Already validated by the caller, which runs outside the lock. */
+    requestedLocalized: boolean | undefined
+  ): Promise<UpdateFieldGroupResult> {
+    // 0. RE-ESTABLISH every precondition, against the state as it is NOW.
+    //
+    // Read inside the exclusion rather than accepted from the caller: whether the field group
+    // exists, whether it is locked, and what its current fields are all decide what this does, and
+    // all three can change while a request waits for the lock.
+    // Raises NOT_FOUND itself when the slug is gone, so there is no absence branch here. One that
+    // existed would be a guard that can never fire, and a guard that cannot fire reads as coverage
+    // while proving nothing.
+    // As stored, past the registry row cache: a row cached before the lock was taken describes
+    // the state this read exists to re-establish.
+    const existing = await this.registry.getComponentForWrite(input.slug);
+    // 🔴 A diverged field group is REFUSED for any edit that would move storage again.
+    //
+    // Recording the state is only half of it. Without this, an editor opened after the mark reads
+    // the bumped `schema_version` together with the STALE stored fields, satisfies
+    // `assertSchemaVersionMatch`, and plans its next transition from a shape the tables no longer
+    // have — the exact retry the state exists to declare unsafe. A status nothing enforces is a
+    // note, not a control.
+    //
+    // Metadata-only edits are deliberately still allowed: a label or a description moves no
+    // storage, and locking an operator out of renaming the thing they are trying to reconcile
+    // would make the state harder to get out of rather than safer.
+    // Only edits that MOVE STORAGE are refused; a label or description change is still allowed, so
+    // an operator is never locked out of renaming the thing they are trying to reconcile.
+    //
+    // 🔴 Localization is judged by whether it TOGGLES, not by whether it was sent. Presence is a
+    // proxy for "this moves storage" and it is wrong in the direction that matters here: a
+    // full-form client resends every field it renders, so `{ label, localized: false }` against a
+    // group that is already not localized asks for no transition at all and would be refused —
+    // locking an operator out of the metadata edits this contract explicitly permits, on the one
+    // path they are using to get out of the state.
+    //
+    // `fields` stays a presence check on purpose. Deciding whether a resent field array is
+    // identical is a deep comparison this has no reason to make, and refusing a no-op edit is the
+    // safe direction where refusing a rename is not.
+    const wasLocalized = existing.localized === true;
+    const togglesLocalization =
+      input.localized !== undefined && input.localized !== wasLocalized;
+    if (input.fields !== undefined || togglesLocalization) {
+      assertNotDiverged(input.slug, existing);
+    }
+    if (existing.locked && input.source !== "code") {
+      throw NextlyError.definedInCode({
+        thing: "component",
+        change: "change",
+        logContext: {
+          reason: "component-locked",
+          slug: input.slug,
+          source: input.source ?? "ui",
+        },
+      });
+    }
+    if (input.fields !== undefined) {
+      const { assertOptionValuesDistinct, assertValidPluginFieldOptions } =
+        await import("../../../api/fields-payload");
+      assertValidPluginFieldOptions(input.fields);
+      // Nor two options sharing one value, which the stored value could not tell apart.
+      assertOptionValuesDistinct(input.fields);
+      // Judged against the fields as stored now, so only a pair of sibling fields this save
+      // creates is refused, and one the field group already holds keeps working.
+      assertNoNewSiblingClashes(
+        { kind: "fieldGroup", slug: input.slug },
+        input.fields,
+        existing.fields ?? []
+      );
+      await this.assertSaveLeavesNoCycle(input.slug, input.fields);
+    }
+
+    const localized = requestedLocalized ?? wasLocalized;
+    const fields = (input.fields ??
+      existing.fields) as unknown as FieldDefinition[];
+
+    // Gated only on the false -> true transition: a field group that is ALREADY localized must stay
+    // editable after the app's localization config is removed, or its content becomes unreachable.
+    if (!wasLocalized && localized) {
+      const { assertLocalizationConfigured } = await import(
+        "../../i18n/config/require-app-config"
+      );
+      assertLocalizationConfigured("component", input.slug);
+    }
+
+    // 1. REFUSE a field set this path cannot deliver.
+    //
+    // 🔴 This method changes the COMPANION table and nothing else. A field whose column lives on the
+    // main table therefore needs DDL that only `applySchemaChanges` emits — and without this guard
+    // the request SUCCEEDED, wrote the new fields and a matching `schema_hash`, and left the table
+    // without the columns the registry now claims it has. The registry marks
+    // `migration_status: "pending"` and a preview still introspects the truth, so the drift is
+    // recorded rather than silent; it is still a success answered to a caller whose change did not
+    // happen.
+    //
+    // Refusing rather than applying the pipeline here is deliberate. `applySchemaChanges` carries a
+    // version guard, rename detection and an interactive resolution step — a rename is ambiguous
+    // (rename versus drop-and-add) and a PATCH has no way to ask. Duplicating that inside a metadata
+    // edit would be a second implementation of "apply a schema change"; refusing keeps one, and
+    // turns a silent wrong result into an actionable error.
+    await this.assertNoUnappliableSchemaChange({ existing, fields, localized });
+
+    // Where a Builder save writer is set up, this edit is written as the field group's migration
+    // (`writeUpdate`), whichever entry point made it: the history checks a save makes run here,
+    // before the first write (the archive of a field leaving translation, just below). A
+    // code-first sync writes none: its migrations are the developer's.
+    const deps = input.source === "code" ? undefined : this.saveDeps();
+    if (deps !== undefined) {
+      const { checkEntitySaveHistory } = await loadEntitySave();
+      await checkEntitySaveHistory(deps);
+    }
+
+    // A field leaving, joining or replaced in translation has preconditions of its own, asked by
+    // the same preflight as the collection and Single settings saves, before the companion changes.
+    // The check above judges only fields that render a companion column, so a translated field
+    // replaced by a nested field group (which renders none) passes it, and the companion reconcile
+    // would then drop the removed field's column with every language's value.
+    if (input.fields !== undefined && (wasLocalized || localized)) {
+      await this.assertFieldsMayLeaveTranslation({
+        existing,
+        fields,
+        wasLocalized,
+        localized,
+      });
+    } else if (localized !== wasLocalized && this.adapter) {
+      // A `localized` toggle with no field edit still moves every translated field's values, so
+      // their columns are asked what the move would lose, before the companion changes.
+      const { refuseTranslationMovesLosingDefinition } = await import(
+        "../../i18n/migration/archive-preflight"
+      );
+      await refuseTranslationMovesLosingDefinition({
+        adapter: this.adapter,
+        // A field group's own table, which decides the column bounds compared.
+        builtBy: "fieldGroup",
+        tableName: existing.tableName,
+        oldFields: fields,
+        newFields: fields,
+        wasLocalized,
+        isLocalized: localized,
+        surface: "builder",
+      });
+    }
+
+    // 2. MOVE the physical schema, when this edit implies one. A `localized` toggle alone does:
+    // enabling seeds the companion from the main table and drops those columns, disabling restores
+    // and archives them. A save that skipped that would persist the flag while the content stayed
+    // where the runtime no longer looks for it.
+    // 🔴 What the reconciler DID, not what the request implied. A field-set change on a group that
+    // was and remains non-localized reaches the reconciler and moves nothing — this path emits no
+    // main-table DDL at all — so inferring a physical transition from the request shape would mark a
+    // row diverged and tell a caller not to retry an edit that changed nothing.
+    // Held in an object, as the move below may run from inside the writer.
+    const ran = { moved: false };
+    const move = async (): Promise<void> => {
+      ran.moved =
+        (input.fields !== undefined || localized !== wasLocalized) &&
+        (await this.reconcileCompanion({
+          existing,
+          fields,
+          localized,
+          wasLocalized,
+        }));
+    };
+    if (deps === undefined) {
+      await move();
+    } else {
+      await this.writeUpdate(
+        deps,
+        { existing, input, fields, localized },
+        move
+      );
+    }
+    const movedSchema = ran.moved;
+
+    // 3. RECORD, after the physical change succeeded.
+    try {
+      // The row and the stored schema version in one transaction
+      // (`writeRegistryRows`).
+      const record = await writeRegistryRowsWith(this.adapter, async () =>
+        this.registry.updateComponent(
+          input.slug,
+          {
+            ...(input.label !== undefined ? { label: input.label } : {}),
+            ...(input.description !== undefined
+              ? { description: input.description }
+              : {}),
+            ...(input.admin !== undefined ? { admin: input.admin } : {}),
+            ...(requestedLocalized !== undefined
+              ? { localized: requestedLocalized }
+              : {}),
+            ...(input.fields !== undefined
+              ? {
+                  fields:
+                    input.fields as unknown as DynamicFieldGroupInsert["fields"],
+                  schemaHash: await this.hashFields(input.fields),
+                }
+              : {}),
+          },
+          { source: input.source ?? "ui" }
+        )
+      );
+
+      return { record };
+    } catch (error) {
+      // Only when the tables actually MOVED. A metadata-only edit that fails to write has changed
+      // nothing, so the row still describes the database correctly and there is no divergence to
+      // record — marking it `failed` there would invent a repair for a state that is fine.
+      if (!movedSchema) throw error;
+      // 🔴 A throw from the registry does NOT mean the row went unwritten.
+      //
+      // MySQL has no `RETURNING`, so `DrizzleAdapter.update` runs the UPDATE and then SELECTs the
+      // row back on the same executor. A failure in that second query raises out of a write that
+      // already committed — and marking a fully synchronized row as diverged, bumping its version
+      // again and telling the caller its definition is stale would all be false.
+      //
+      // Asked of the DATABASE rather than inferred from the error, because no error shape
+      // distinguishes the two: the read-back and the write raise through the same path.
+      const settled = await this.readBackSettledRow(input, requestedLocalized);
+      if (settled) {
+        this.logger.warn(
+          "[FieldGroups] The registry write raised but the row already carries the change; the error was in reading it back.",
+          { slug: input.slug }
+        );
+        return { record: settled };
+      }
+      // Usually a raise; the one value it can return is a settled row discovered on its second
+      // look, which is a success this catch then answers with.
+      return await this.recordUnrecordedTransition(
+        input,
+        requestedLocalized,
+        existing,
+        error
+      );
+    }
+  }
+
+  /**
+   * An edit written as the field group's migration through the Builder save writer, then made by
+   * `move` (the companion reconcile): its label, description, admin options, translation and
+   * fields as the definition file spells them, so the table any entry point changes stays on
+   * record for the migrations after it. A metadata-only edit writes its settings-only migration,
+   * as a collection's does.
+   *
+   * A failure before `move`, or in it, is thrown as before, with nothing written. Once `move` has
+   * run the tables have moved, and the row must still record it: where the writer then refuses to
+   * record the files applied (the database does not stand as their snapshot says), the files are
+   * kept for `nextly migrate` to name, and the edit goes on to its registry write.
+   */
+  private async writeUpdate(
+    deps: CollectionSaveDeps,
+    edit: {
+      existing: DynamicFieldGroupRecord;
+      input: UpdateFieldGroupInput;
+      fields: FieldDefinition[];
+      localized: boolean;
+    },
+    move: () => Promise<void>
+  ): Promise<void> {
+    const { previousEntity, writeEntitySave } = await loadEntitySave();
+    const { existing, input } = edit;
+    const stored = fieldGroupEntity(existing);
+    // Held in an object, as `move` runs from inside the writer.
+    const ran = { moved: false };
+    try {
+      await writeEntitySave(
+        deps,
+        {
+          kind: "fieldGroup",
+          slug: input.slug,
+          previous: await previousEntity(
+            deps,
+            "fieldGroup",
+            input.slug,
+            stored
+          ),
+          entity: fieldGroupEntity({
+            ...existing,
+            ...(input.label !== undefined ? { label: input.label } : {}),
+            ...(input.description !== undefined
+              ? { description: input.description }
+              : {}),
+            ...(input.admin !== undefined ? { admin: input.admin } : {}),
+            localized: edit.localized,
+            fields: edit.fields,
+          }),
+          change: "update",
+        },
+        async () => {
+          await move();
+          ran.moved = true;
+        }
+      );
+    } catch (error) {
+      if (!ran.moved) throw error;
+      this.logger.error(
+        `[FieldGroups] The edit of "${input.slug}" ran, but its migration could not be recorded applied: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
+  /**
+   * Re-read the row and answer whether it ALREADY carries this edit.
+   *
+   * Only the properties this edit actually sent are compared, and only the ones that decide the
+   * physical shape: this is reached exclusively when the tables moved, which means `fields`,
+   * `localized`, or both were present. Comparing anything else would let a concurrent label edit
+   * decide whether a schema transition was recorded.
+   *
+   * `null` on any doubt — including a re-read that itself fails, which is the likely case when the
+   * database is the reason the first write raised. Doubt has to resolve to "not settled": treating
+   * an unreadable row as written would swallow a real divergence, which is the failure this whole
+   * path exists to surface.
+   */
+  private async readBackSettledRow(
+    input: UpdateFieldGroupInput,
+    requestedLocalized: boolean | undefined
+  ): Promise<DynamicFieldGroupRecord | null> {
+    try {
+      // As stored: whether this save's own write landed.
+      const current = await this.registry.getComponentForWrite(input.slug);
+      if (input.fields !== undefined) {
+        if (current.schemaHash !== (await this.hashFields(input.fields)))
+          return null;
+      }
+      if (requestedLocalized !== undefined) {
+        if ((current.localized === true) !== requestedLocalized) return null;
+      }
+      return current;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Refuse a field change whose physical consequence this path cannot carry out.
+   *
+   * 🔴 Two tables, and exactly one of them can be moved from here:
+   *
+   * - the MAIN `comp_<slug>` table receives no DDL at all on this path, so ANY difference in the
+   *   table it should have — a column added, dropped or reshaped, an index created or removed — is
+   *   unappliable and has to be refused;
+   * - the companion `comp_<slug>_locales` IS reconciled, but only by ADDING and DROPPING columns by
+   *   NAME. A localized field that keeps its name while its column changes shape emits no statement
+   *   there either, so that case is refused too.
+   *
+   * Every question is answered by the code that already owns it, so this guard cannot disagree with
+   * what actually emits DDL:
+   *
+   * - `buildDesiredTableFromComponentFields` is the desired-state builder the diff engine runs for a
+   *   field group. It renders each column for the dialect, injects the same system columns both
+   *   sides get, carries the `idx_`/`uq_` indexes the schema service creates, and omits translatable
+   *   columns when the group is localized. Comparing the table it describes for the old fields
+   *   against the one it describes for the new is comparing what the generator would build;
+   * - `fieldToLocalizedColumnSpec` and `ddlType` are what the companion reconciler renders its
+   *   `ADD COLUMN` from, so the text they produce is the companion column itself;
+   * - `isFieldLocalized` is the predicate `reconcileCompanion` filters on, and it folds in the
+   *   entity flag, so a non-localized field group needs no separate branch.
+   *
+   * Both sides are built at the SAME localization state, deliberately. A `localized` toggle moves
+   * columns between the two tables and `reconcileCompanion` performs exactly that move, so holding
+   * the flag constant asks the question this guard is for — does the FIELD SET edit need DDL — and
+   * leaves the transition to the code that applies it.
+   *
+   * A fourth opinion about where a column lives, or about what shape it takes, is exactly how the
+   * three transports came to disagree in the first place.
+   */
+  private async assertNoUnappliableSchemaChange(args: {
+    existing: DynamicFieldGroupRecord;
+    fields: FieldDefinition[];
+    localized: boolean;
+  }): Promise<void> {
+    const { buildDesiredTableFromComponentFields } = await import(
+      "../../schema/pipeline/diff/build-from-fields"
+    );
+    const { fieldsStoredOnRow, getColumnDescriptor } = await import(
+      "../../schema/services/field-column-descriptor"
+    );
+    const { isFieldLocalized } = await import("../../i18n/classify-fields");
+    const { fieldToLocalizedColumnSpec } = await import(
+      "../../i18n/migration/field-to-column-spec"
+    );
+    const { ddlType } = await import("../../i18n/migration/ddl-types");
+
+    const oldFields = args.existing.fields as unknown as FieldDefinition[];
+    const dialect = this.dialect;
+
+    const desiredTable = (fields: FieldDefinition[]) =>
+      buildDesiredTableFromComponentFields(
+        args.existing.tableName,
+        fields,
+        dialect,
+        { localized: args.localized, builtBy: "fieldGroup" }
+      );
+
+    const before = desiredTable(oldFields);
+    const after = desiredTable(args.fields);
+
+    /**
+     * Which field a column belongs to, for the error path only.
+     *
+     * The comparison above has already decided; this just names the field so the caller is told
+     * WHICH one to take through the apply flow. It reads the same `getColumnDescriptor(...).name`
+     * the builder resolves its own column names with, and falls back to the raw column name when a
+     * column belongs to no field — the system columns, which are identical on both sides and so
+     * never appear here.
+     */
+    const fieldNameByColumn = new Map<string, string>();
+    // Through `fieldsStoredOnRow`, as the desired table reads them: a field inside a group with no
+    // name owns its column on the row, and the group itself has no column, nor a name to spell one.
+    for (const field of fieldsStoredOnRow([...oldFields, ...args.fields])) {
+      const column = getColumnDescriptor(field, dialect, "fieldGroup");
+      if (column) fieldNameByColumn.set(column.name, field.name);
+    }
+    const attribute = (column: string): string =>
+      fieldNameByColumn.get(column) ?? column;
+
+    const changed = new Set<string>();
+
+    // Columns, by name: a serialised ColumnSpec so a spec gaining a property is not silently
+    // excluded from the check that exists to notice it.
+    const columnsOf = (table: typeof before): Map<string, string> =>
+      new Map(
+        table.columns.map(column => [column.name, JSON.stringify(column)])
+      );
+    const columnsBefore = columnsOf(before);
+    const columnsAfter = columnsOf(after);
+    for (const [name, spec] of columnsAfter) {
+      if (columnsBefore.get(name) !== spec) changed.add(attribute(name));
+    }
+    for (const name of columnsBefore.keys()) {
+      if (!columnsAfter.has(name)) changed.add(attribute(name));
+    }
+
+    // Indexes, by name. A field toggling `unique` or `index` leaves its COLUMN identical and moves
+    // only this list, which is why the column comparison alone let it through. An index is
+    // attributed to every field it covers, so a composite one names all of them.
+    const indexesOf = (table: typeof before) =>
+      new Map((table.indexes ?? []).map(index => [index.name, index]));
+    const indexesBefore = indexesOf(before);
+    const indexesAfter = indexesOf(after);
+    for (const [name, index] of indexesAfter) {
+      const was = indexesBefore.get(name);
+      if (was && JSON.stringify(was) === JSON.stringify(index)) continue;
+      for (const column of index.columns) changed.add(attribute(column));
+    }
+    for (const [name, index] of indexesBefore) {
+      if (indexesAfter.has(name)) continue;
+      for (const column of index.columns) changed.add(attribute(column));
+    }
+
+    // What the CREATOR would write for the main table, line by line.
+    //
+    // 🔴 The desired-table builder answers "which columns and indexes exist", which is what the diff
+    // engine compares against introspection — and it deliberately carries no DEFAULT for a user
+    // column, because a live database reports defaults in a form that would make every reconcile
+    // propose changing them. `FieldGroupSchemaService` is the thing that actually creates a field
+    // group's table, and it DOES emit a checkbox's `DEFAULT`. So a `defaultValue` edit changes the
+    // column the creator writes while leaving the desired table identical, and rows inserted without
+    // the field would keep taking the old default.
+    //
+    // Each user column is one line beginning with its quoted name, so a changed line still names the
+    // field it belongs to.
+    const { FieldGroupSchemaService } = await import(
+      "../../../services/field-groups/field-group-schema-service"
+    );
+    const creatorLines = (fields: FieldDefinition[]): Map<string, string> => {
+      const sql = new FieldGroupSchemaService(dialect).generateMigrationSQL(
+        args.existing.tableName,
+        // The stored field list and the config field list are two representations of one thing, and
+        // this service already crosses between them where it writes the registry row and where it
+        // reconciles the companion. Crossed here for the same reason: the creator is declared
+        // against the config shape, and it is the creator's answer this needs.
+        fields as unknown as Parameters<
+          InstanceType<typeof FieldGroupSchemaService>["generateMigrationSQL"]
+        >[1],
+        { localized: args.localized }
+      );
+      const out = new Map<string, string>();
+      for (const line of sql.split("\n")) {
+        // A column definition, and nothing else: INDENTED and QUOTED, which the statements are
+        // not. Matching an unquoted leading word instead picked up `CREATE TABLE ...` and reported
+        // a field called "CREATE". The index statements are excluded on purpose — they are already
+        // compared, by name and uniqueness, from the desired table above.
+        const column = /^\s+["`]([A-Za-z0-9_]+)["`]\s+\S/.exec(line);
+        if (column) out.set(column[1], line.trim());
+      }
+      return out;
+    };
+    const creatorBefore = creatorLines(oldFields);
+    const creatorAfter = creatorLines(args.fields);
+    for (const [column, line] of creatorAfter) {
+      if (creatorBefore.get(column) !== line) changed.add(attribute(column));
+    }
+    for (const column of creatorBefore.keys()) {
+      if (!creatorAfter.has(column)) changed.add(attribute(column));
+    }
+
+    // The companion, for a field localized on both sides. Compared as the rendered DDL type rather
+    // than the spec object, because that string IS the column the reconciler would write: on SQLite
+    // a `maxLength` change moves the spec and renders to the same TEXT, which needs no statement and
+    // must not be refused.
+    // Not a valid rendering of any column, so it can never equal one.
+    const NO_COMPANION_COLUMN = "\u0000none";
+    const companionOf = (fields: FieldDefinition[]): Map<string, string> => {
+      const out = new Map<string, string>();
+      for (const field of fields) {
+        if (!isFieldLocalized(field, args.localized)) continue;
+        const column = fieldToLocalizedColumnSpec(field, dialect, "fieldGroup");
+        // 🔴 Recorded even when it materialises NO column, rather than skipped.
+        //
+        // Skipping made a field that gains or loses its column invisible: a `component` or
+        // many-to-many field stores its data elsewhere and produces none, so changing it to `text`
+        // under the same name left this map without a "before" entry and the change without a
+        // common name to compare. `buildCompanionReconcileStatements` then diffs the raw localized
+        // NAMES, sees the name already present, and emits no ADD — so the registry and the runtime
+        // advance to a companion column nothing created. The reverse leaves the old one behind.
+        //
+        // A sentinel keeps the name in the map with a value that cannot collide with a rendered
+        // column, so the transition reads as what it is: a change on a name present in both.
+        out.set(
+          field.name,
+          column
+            ? `${column.name} ${ddlType(column, dialect)}`
+            : NO_COMPANION_COLUMN
+        );
+      }
+      return out;
+    };
+    const companionBefore = companionOf(oldFields);
+    const companionAfter = companionOf(args.fields);
+    for (const [name, column] of companionAfter) {
+      // Only a field present on BOTH sides: an add or a drop is the delta the reconciler applies.
+      const was = companionBefore.get(name);
+      if (was !== undefined && was !== column) changed.add(name);
+    }
+
+    // 🔴 A companion that both GAINS and LOSES a column in one edit is a rename the reconciler
+    // cannot see, and the consequence is destroyed content rather than a stale shape.
+    //
+    // Neither companion path resolves it. While the group STAYS localized,
+    // `buildCompanionReconcileStatements` diffs by name alone, so a rename becomes ADD the new
+    // column, DROP the old — and every stored translation goes with the drop. While localization is
+    // being ENABLED, `buildCompanionTransitionStatements` seeds only the new columns whose name
+    // already exists on main, so a renamed field is seeded from nothing and its old column is left
+    // behind on the main table.
+    //
+    // A drop-and-add pair is the ambiguity the apply pipeline exists to resolve — its rename
+    // detector asks which of the two a caller meant, and a PATCH has no way to ask. So this refuses
+    // only the PAIR: a pure add is a new translatable field and a pure drop is a removed one, and
+    // the reconciler applies both correctly.
+    // 🔴 Only fields that actually RENDER a column, which is narrower than the map's keys.
+    //
+    // The map deliberately records every localized field, sentinel included, so that a field
+    // GAINING or LOSING its column shows up as a change on a common name. That is the right domain
+    // for the value comparison above and the wrong one here: two columnless fields swapped for each
+    // other — a `component` removed and a differently named `component` added — are one add and one
+    // drop by key, which reads as a rename pair, while neither materialises a companion column and
+    // `buildCompanionReconcileStatements` emits nothing for either. Refusing that would reject a
+    // safe metadata-only edit.
+    //
+    // The same narrowing is correct for the enablement rule below: a columnless field removed during
+    // an enable leaves no column behind on the main table, so there is nothing stranded to refuse.
+    const rendersColumn = (map: Map<string, string>, name: string): boolean =>
+      map.get(name) !== NO_COMPANION_COLUMN;
+    const companionAdded = [...companionAfter.keys()].filter(
+      name => !companionBefore.has(name) && rendersColumn(companionAfter, name)
+    );
+    const companionDropped = [...companionBefore.keys()].filter(
+      name => !companionAfter.has(name) && rendersColumn(companionBefore, name)
+    );
+    if (companionAdded.length > 0 && companionDropped.length > 0) {
+      for (const name of [...companionAdded, ...companionDropped])
+        changed.add(name);
+    }
+
+    // 🔴 A DROP is only appliable when the companion already exists, which an ENABLE means it does
+    // not.
+    //
+    // Both main-table snapshots are built at the requested state, so a field that is translatable
+    // under it never appears on either — including one this edit REMOVES, whose column is still
+    // physically on the main table because the group is not localized yet. The enable planner then
+    // derives its companion from the NEW fields alone, so nothing drops that column: the registry
+    // stops describing the field while its data sits on a column nothing will ever read again.
+    //
+    // The pair rule above cannot catch it, because a removal on its own has no matching add.
+    const isEnabling = args.existing.localized !== true && args.localized;
+    if (isEnabling && companionDropped.length > 0) {
+      for (const name of companionDropped) changed.add(name);
+    }
+
+    if (changed.size === 0) return;
+
+    const names = [...changed];
+    throw NextlyError.validation({
+      errors: names.map(name => ({
+        path: `fields.${name}`,
+        code: "requires_schema_change",
+        message: `Changing "${name}" alters the field group's table. Use the schema preview and apply flow, which reviews the change and resolves renames, rather than updating the field group directly.`,
+      })),
+      logContext: {
+        reason: "field update requires ddl this path does not emit",
+        slug: args.existing.slug,
+        fields: names,
+      },
+    });
+  }
+
+  /**
+   * The first step of a field leaving translation (`archiveFieldsLeavingTranslation`) for a
+   * settings save, which has no schema dialog to answer a rename: the preflight decides by the
+   * main table's rule and refuses what it must, before the companion changes. Nothing is asked
+   * with no adapter, as nothing moves then.
+   */
+  private async assertFieldsMayLeaveTranslation(args: {
+    existing: DynamicFieldGroupRecord;
+    fields: FieldDefinition[];
+    wasLocalized: boolean;
+    localized: boolean;
+  }): Promise<void> {
+    const adapter = this.adapter;
+    if (!adapter) return;
+    // Imported when needed, as this service does for its other collaborators. The same default
+    // locale the companion reconcile reads (`reconcileComponentCompanion`): the site's languages as
+    // the language registry serves them, so a default stored in Settings counts in both steps.
+    const [
+      { archiveFieldsLeavingTranslation },
+      { appLanguageOrder, appLocalization },
+    ] = await Promise.all([
+      import("../../i18n/migration/archive-preflight"),
+      import("../../i18n/configured-locales"),
+    ]);
+    await archiveFieldsLeavingTranslation({
+      // A field group's own table, which decides the column bounds compared.
+      builtBy: "fieldGroup",
+      tableName: args.existing.tableName,
+      defaultLocale: appLocalization()?.defaultLocale ?? "en",
+      languageOrder: appLanguageOrder(),
+      adapter,
+      entity: args.existing.slug,
+      kind: "fieldGroup",
+      oldFields: (args.existing.fields ?? []) as unknown as FieldDefinition[],
+      newFields: args.fields,
+      wasLocalized: args.wasLocalized,
+      isLocalized: args.localized,
+    });
+  }
+
+  /**
+   * The registry write failed AFTER the companion transition committed. Say so, and mark the row.
+   *
+   * 🔴 The two halves of this operation cannot be made atomic — MySQL commits DDL implicitly, which
+   * is why this service says so at the top of the file — so this is the state the ordering leaves
+   * when the second half fails. The tables have the new shape and the row still describes the old
+   * one.
+   *
+   * Raising the registry's own error would be worse than useless here: it reads as "the write did
+   * not happen", which invites a retry, and a retry re-derives `wasLocalized` from the row that
+   * still says the old value. For an enable that means seeding the companion a second time from
+   * main-table columns the first attempt already dropped. The caller has to be told the physical
+   * change stands.
+   *
+   * 🔴 The marker is a COMPARE-AND-SET against the version this edit started from, because "the
+   * write raised" does not mean "the row went unwritten". The read-back that would settle that can
+   * itself fail transiently, and a marker written unconditionally after two failed reads stamps
+   * `diverged` onto a row the original write reached after all — permanently refusing schema edits
+   * on a group that is completely fine, with its version bumped twice. Pinning the version makes
+   * the DATABASE answer the question the reads could not: zero rows matched MEANS the row already
+   * advanced, i.e. the original write landed, and this takes one more look before answering
+   * success. The version advance the marker needs (an editor loaded before the transition must
+   * fail `assertSchemaVersionMatch`) is the conditional write's own contract.
+   *
+   * The status write is BEST EFFORT and its failure is not raised. It is a narrow single-column
+   * update, so it survives the failures that realistically break the full write — a rejected field
+   * list, an oversized label, a value the driver cannot encode — and if the database is genuinely
+   * unreachable it fails too, which is why the log carries everything needed to find the field
+   * group without it.
+   */
+  private async recordUnrecordedTransition(
+    input: UpdateFieldGroupInput,
+    requestedLocalized: boolean | undefined,
+    existing: DynamicFieldGroupRecord,
+    cause: unknown
+  ): Promise<UpdateFieldGroupResult> {
+    // The decision, the logging and the three public messages live in one module because the
+    // builder's apply path reaches the same state and must answer it identically. Only the
+    // "does the row already carry MY edit" question is answered here, because only this caller
+    // knows what it sent.
+    return await recordStrandedTransition<DynamicFieldGroupRecord>({
+      registry: this.registry,
+      logger: this.logger,
+      slug: input.slug,
+      expectedSchemaVersion: existing.schemaVersion,
+      tableName: existing.tableName,
+      wasLocalized: existing.localized === true,
+      cause,
+      readBackSettled: () => this.readBackSettledRow(input, requestedLocalized),
+    });
+  }
+
+  /** The stored hash for a field set, from the one implementation the whole pipeline uses. */
+  private async hashFields(fields: FieldDefinition[]): Promise<string> {
+    const { calculateSchemaHash } = await import(
+      "../../schema/services/schema-hash"
+    );
+    return calculateSchemaHash(fields as never);
+  }
+
+  /**
+   * Apply the companion-table transition this edit implies, and let a failure be a failure.
+   *
+   * 🔴 NOT swallowed, and that is a deliberate change from the dispatcher this replaces. It logged
+   * the error and fell through to the registry write, so a transition that failed still committed a
+   * row saying the field group was localized with the new field set — the exact state whose
+   * consequence the code above it describes as content stranded in the wrong table. Refusing leaves
+   * the registry describing the old shape, which is the shape the table still has.
+   *
+   * The runtime rebinding happens only after the move succeeds, for the reason the create path
+   * gives: the binding DESCRIBES the table, so describing a change that did not happen points the
+   * running process at columns nothing created.
+   */
+  private async reconcileCompanion(args: {
+    existing: DynamicFieldGroupRecord;
+    fields: FieldDefinition[];
+    localized: boolean;
+    wasLocalized: boolean;
+    // Whether DDL actually ran, carried up from the reconciler rather than re-derived. With no
+    // adapter registered nothing runs at all, which is a supported configuration and reports false.
+  }): Promise<boolean> {
+    const adapter = this.adapter;
+    if (!adapter) return false;
+
+    const {
+      reconcileComponentCompanion,
+      registerComponentRuntimeSchema,
+      resolveComponentTableColumns,
+    } = await import("./field-group-table-provisioning");
+
+    // 🔴 Probed BEFORE the transition, which is the helper's own documented contract. Resolving it
+    // afterwards means a probe that cannot answer rejects the request with the physical move
+    // already committed — an enable that dropped the main table's columns while the registry still
+    // records the group as non-localized. The discriminator is unaffected by the transition, so
+    // asking first is equivalent and fails while nothing has moved.
+    //
+    // With the columns the main table holds, read by the same listing. This path issues no DDL to
+    // the main table, so a field inside a group with no name whose column the table lacks yet is
+    // still missing after it, and the runtime table registered below leaves it out
+    // (`RuntimeSchemaOptions.heldColumns`); the companion move changes only translated columns,
+    // which such a field never is.
+    const { typeColumn, columns: heldColumns } =
+      await resolveComponentTableColumns(adapter, args.existing.tableName);
+
+    const moved = await reconcileComponentCompanion({
+      busyTable: { adapter, notify: line => this.logger.warn(line) },
+      slug: args.existing.slug,
+      tableName: args.existing.tableName,
+      oldFields: args.existing.fields as unknown as FieldDefinition[],
+      newFields: args.fields,
+      localized: args.localized,
+      wasLocalized: args.wasLocalized,
+      adapter,
+    });
+
+    registerComponentRuntimeSchema(
+      adapter,
+      this.dialect,
+      args.existing.tableName,
+      args.fields as never,
+      // PROBED, not the constant: unlike the create path this table already exists and the storage
+      // migration may have moved it, so which discriminator column it carries is a fact about the
+      // database rather than something this code can infer from its own version.
+      typeColumn,
+      args.localized,
+      heldColumns
+    );
+
+    return moved;
+  }
+
+  /**
+   * Point the runtime at the table that was just created.
+   *
+   * Separated from the apply so it can run after the registry write rather than with the DDL. It
+   * describes the table to the running process; the DDL only makes it exist.
+   */
+  private async bindRuntimeSchema(input: CreateFieldGroupInput): Promise<void> {
+    const adapter = this.adapter;
+    if (!adapter) return;
+
+    const { registerComponentRuntimeSchema } = await import(
+      "./field-group-table-provisioning"
+    );
+    registerComponentRuntimeSchema(
+      adapter,
+      this.dialect,
+      input.tableName,
+      input.fields,
+      // Decided by the name, NOT a probe, and this is the one path where that inference is sound:
+      // this is the CREATE path for a new slug, and the statements just executed are the DDL
+      // generator's own, which write the column this names for the table they created.
+      typeColumnForNewTable(input.tableName),
+      storesPerLanguage(input)
+    );
+  }
+
+  /**
+   * Refuse a create whose generated names the database would not store intact.
+   *
+   * 🔴 Checked over the NAMES rather than over the slug, because the slug is not the only input.
+   * A field's index is named `idx_<tableName>_<columnName>`, so the longest identifier depends on
+   * the slug AND the longest indexed field name — and no bound on one can constrain the other. A
+   * slug inside its limit paired with `authorId` still produces a 66-character index.
+   *
+   * Refused BEFORE any DDL because the failure is otherwise partial and silent-ish: the table and
+   * the parent index are created, the field index fails, and the caller gets back a record whose
+   * migration is recorded failed. Nothing is corrupted, but a field group exists that nothing can
+   * query, and the request that made it reported a success shape.
+   *
+   * Here rather than in a transport for the same reason the ownership check is: the mounted route
+   * bounded its slug and the other two transports did not, which is this service's founding defect
+   * reappearing one level up.
+   */
+  private async assertIdentifiersFit(
+    input: CreateFieldGroupInput,
+    migrationSQL: string
+  ): Promise<void> {
+    const { FieldGroupSchemaService, MAX_IDENTIFIER_LENGTH } = await import(
+      "./field-group-schema-service"
+    );
+
+    const schema = new FieldGroupSchemaService(this.dialect);
+    // The rendered statements, plus the companion this create would provision alongside them. The
+    // companion's DDL is generated later and separately, so its name is the one identifier the scan
+    // cannot see.
+    const names = schema.identifiersIn(migrationSQL);
+    if (storesPerLanguage(input)) {
+      names.push(`${input.tableName}${STORAGE_FORMAT.companionSuffix}`);
+    }
+
+    // In UTF-8 bytes, as PostgreSQL counts: a name of letters outside ASCII can be well within 63
+    // characters and still past 63 bytes, and PostgreSQL would keep only the first 63 of them.
+    const tooLong = names.filter(
+      name => identifierBytes(name) > MAX_IDENTIFIER_LENGTH
+    );
+    if (tooLong.length === 0) return;
+
+    throw NextlyError.validation({
+      errors: tooLong.map(name => ({
+        path: "slug",
+        code: "IDENTIFIER_TOO_LONG",
+        // The offending NAME, not just its length: a slug, a field name and the index derived from
+        // both all reach this, and the caller cannot otherwise tell which to shorten.
+        message: `Generated database identifier "${name}" is ${identifierBytes(name)} bytes once encoded as UTF-8; the limit is ${MAX_IDENTIFIER_LENGTH} (${MAX_IDENTIFIER_LENGTH} characters of plain ASCII). Shorten the field group's slug or the field name it derives from.`,
+      })),
+    });
+  }
+
+  /**
+   * Judge a new address by the one rule every road shares (`shared/address-rule`), and against the
+   * other field groups' addresses: one with the same snake_case form names the same table.
+   */
+  /**
+   * Refuse a save that would leave this field group placed inside itself, directly or through
+   * others. Judged inside the exclusion against every field group as stored now, so two saves that
+   * each close half of a cycle cannot both pass.
+   */
+  private async assertSaveLeavesNoCycle(
+    slug: string,
+    fields: unknown
+  ): Promise<void> {
+    assertSaveLeavesNoFieldGroupCycle({
+      saved: { slug, fields },
+      stored: await this.registry.getAllFieldLists(),
+    });
+  }
+
+  /**
+   * Whether a new field group may take `slug`, its table named `tableName`: the address rule,
+   * another field group's address of the same snake_case form, an address a field group already
+   * holds, and a table another field group owns, refused in that order. Public so the Schema
+   * Builder's address check asks these very preconditions before a create, rather than a copy of
+   * them that could drift from what the create refuses.
+   */
+  async assertNewAddressAvailable(
+    slug: string,
+    tableName: string
+  ): Promise<void> {
+    // The rule first, from the address alone, before anything is read.
+    assertAddressAllowed("fieldGroup", slug);
+    // One read of the field groups, which every check below is judged over: the Builder asks this
+    // as an address is typed, and a read per check would multiply that traffic.
+    const held = await this.registry.getAllComponents();
+    const twin = findSameSnakeCaseAddress(
+      "fieldGroup",
+      slug,
+      held.map(existing => ({
+        kind: "fieldGroup" as const,
+        address: existing.slug,
+      }))
+    );
+    if (twin) throw addressRefusalError(twin, slug);
+    // A field group already under this address, whatever table it was recorded with: an older one
+    // may keep a table name of its own, which the table check below cannot see. Refused here,
+    // before any DDL, rather than by the registry after the new table is built. Worded as the
+    // table check below words it, naming the address the caller sent: the bare "Resource already
+    // exists." left a person creating a field group under a taken name not knowing which name.
+    if (held.some(existing => existing.slug === slug)) {
+      throw NextlyError.duplicate({
+        message: `The field group "${slug}" could not be created: its name is already taken.`,
+        logContext: { reason: "field-group-address-taken", slug },
+      });
+    }
+    // A table another field group owns, keyed on the TABLE NAME: a slug is normalised on its way to
+    // a table name, so `foo-bar` and `foo_bar` name one physical table while looking like two free
+    // slugs. Before the DDL, because `CREATE TABLE IF NOT EXISTS` reports success against a table
+    // that exists, and the registration after it would rebind that table to this request's fields
+    // before the registry rejected the duplicate. Two callers racing can still both pass; the
+    // registry declares `table_name` unique, so the database rejects the second insert.
+    //
+    // A field group's tables are its main table and its `_locales` translations table, which a
+    // localization creates under exactly that name. Two field groups must not share either: one
+    // whose main table is another's translations table (`foo-locales` beside `foo`) would clear or
+    // adopt that table as its own, and the other would lose its translations.
+    const family = (table: string) => [table, `${table}_locales`];
+    const wanted = new Set(family(tableName));
+    const owner = held.find(existing =>
+      family(existing.tableName).some(name => wanted.has(name))
+    );
+    if (owner) {
+      // Names the slug the caller asked for, which tells it nothing it did not send; the field
+      // group already owning the table stays in the log.
+      throw NextlyError.duplicate({
+        message: `The field group "${slug}" could not be created: its name is already taken.`,
+        logContext: {
+          reason: "component-table-conflict",
+          slug,
+          tableName,
+          ownedBy: owner.slug,
+        },
+      });
+    }
+  }
+
+  /**
+   * What the create left out of its table, as one line, or null when the table holds every
+   * requested column as the type asked for. The request is the desired table a push compares the
+   * live one with, built as the creating SQL renders a field group's columns.
+   */
+  private async columnsLeftOut(
+    input: CreateFieldGroupInput,
+    adapter: NonNullable<typeof this.adapter>
+  ): Promise<string | null> {
+    const { buildDesiredTableFromComponentFields } = await import(
+      "../../schema/pipeline/diff/build-from-fields"
+    );
+    const { columnsTheCreateLeftOut, describeColumnsLeftOut } = await import(
+      "../../schema/services/created-table-shape"
+    );
+    const dialect = adapter.getCapabilities().dialect;
+    const leftOut = await columnsTheCreateLeftOut(
+      adapter.getDrizzle(),
+      dialect,
+      buildDesiredTableFromComponentFields(
+        input.tableName,
+        input.fields as unknown as Parameters<
+          typeof buildDesiredTableFromComponentFields
+        >[1],
+        dialect,
+        {
+          localized: storesPerLanguage(input),
+          builtBy: "fieldGroup",
+          // The discriminator the create's DDL wrote for a table under this name.
+          typeColumn: typeColumnForNewTable(input.tableName),
+        }
+      )
+    );
+    return leftOut.length === 0 ? null : describeColumnsLeftOut(leftOut);
+  }
+
+  /** Render the DDL. Separated from the apply because this half is allowed to reject the request. */
+  private async planCreate(input: CreateFieldGroupInput): Promise<string> {
+    const { FieldGroupSchemaService } = await import(
+      "../../../services/field-groups/field-group-schema-service"
+    );
+    return new FieldGroupSchemaService(this.dialect).generateMigrationSQL(
+      input.tableName,
+      input.fields,
+      // i18n: translatable columns are omitted from the main comp_ table when localized; they live
+      // in the companion `comp_<slug>_locales`, provisioned below.
+      { localized: storesPerLanguage(input) }
+    );
+  }
+
+  /**
+   * Write the create's migration and snapshot through the Builder save
+   * writer and, in development, run them; then provision a translated field
+   * group's companion as the direct apply does. Outside development nothing
+   * runs, and the row records the field group as pending.
+   */
+  private async writeCreate(
+    deps: CollectionSaveDeps,
+    input: CreateFieldGroupInput
+  ): Promise<FieldGroupMigrationStatus> {
+    const { writeCollectionSave } = await loadCollectionSave();
+    await writeCollectionSave(deps, {
+      kind: "fieldGroup",
+      slug: input.slug,
+      previous: null,
+      entity: fieldGroupEntity(input),
+      change: "create",
+    });
+    if (!deps.applies) return "pending";
+    // Observed, not assumed, as the direct apply observes it.
+    if (!(await deps.adapter.tableExists(input.tableName))) {
+      this.logger.error(
+        `[FieldGroups] Table "${input.tableName}" was not created by its migration`
+      );
+      return "failed";
+    }
+    const { reconcileComponentCompanion } = await import(
+      "./field-group-table-provisioning"
+    );
+    try {
+      await reconcileComponentCompanion({
+        slug: input.slug,
+        tableName: input.tableName,
+        oldFields: [],
+        newFields: input.fields as unknown as FieldDefinition[],
+        localized: storesPerLanguage(input),
+        wasLocalized: false,
+        adapter: deps.adapter,
+      });
+    } catch (error) {
+      this.logger.error(
+        `[FieldGroups] Companion provisioning failed for "${input.tableName}": ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      return "failed";
+    }
+    return "applied";
+  }
+
+  /**
+   * Run the create DDL, reporting how far it got.
+   *
+   * Never throws: a schema change that fails is recorded rather than raised, so the caller still has
+   * a row describing what was attempted. That is what makes the state repairable instead of lost.
+   */
+  private async applyCreateDdl(
+    input: CreateFieldGroupInput,
+    migrationSQL: string
+  ): Promise<FieldGroupMigrationStatus> {
+    const adapter = this.adapter;
+    if (!adapter) {
+      this.logger.warn(
+        "[FieldGroups] No adapter registered, migration not executed"
+      );
+      return "pending";
+    }
+
+    const isLocalized = storesPerLanguage(input);
+    const fields = input.fields as unknown as FieldDefinition[];
+
+    // The verification shares the statements' catch rather than following it. `tableExists`
+    // re-raises the query failures it meets, and left outside this it would reject the whole apply
+    // — breaking the one promise this method makes, that a schema change which fails is RECORDED
+    // rather than raised. A transient failure there would take the registry write with it and leave
+    // the table that was just created with nothing describing it.
+    try {
+      const { applyMigrationStatements } = await import(
+        "../../schema/services/apply-migration-statements"
+      );
+      // Waits for a table another session is using in short tries, as `nextly migrate` waits.
+      await applyMigrationStatements(adapter, migrationSQL, {
+        adapter,
+        notify: line => this.logger.warn(line),
+      });
+
+      // Observed, not assumed. "Applied" has to mean the table is there, holding every requested
+      // column as the type asked for (`columnsTheCreateLeftOut`).
+      if (!(await adapter.tableExists(input.tableName))) {
+        this.logger.error(
+          `[FieldGroups] Table "${input.tableName}" was not created after migration`
+        );
+        return "failed";
+      }
+      const leftOut = await this.columnsLeftOut(input, adapter);
+      if (leftOut !== null) {
+        this.logger.error(
+          `[FieldGroups] Table "${input.tableName}" was not created as requested: ${leftOut}`
+        );
+        return "failed";
+      }
+    } catch (error) {
+      this.logger.error(
+        `[FieldGroups] Migration execution failed for "${input.tableName}": ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      return "failed";
+    }
+
+    const { reconcileComponentCompanion } = await import(
+      "./field-group-table-provisioning"
+    );
+
+    // The companion is the other half of a localized field group's storage, so failing to provision
+    // it leaves translatable values with nowhere to live. Reported as a failed migration rather than
+    // thrown: the main table exists and the row describes it, which is what makes a retry possible.
+    try {
+      await reconcileComponentCompanion({
+        busyTable: { adapter, notify: line => this.logger.warn(line) },
+        slug: input.slug,
+        tableName: input.tableName,
+        oldFields: [],
+        newFields: fields,
+        localized: isLocalized,
+        // A brand-new field group was never localized, so a localized create is a create-only
+        // companion rather than an enable transition.
+        wasLocalized: false,
+        adapter,
+      });
+    } catch (error) {
+      this.logger.error(
+        `[FieldGroups] Companion provisioning failed for "${input.tableName}": ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      return "failed";
+    }
+
+    return "applied";
+  }
+}

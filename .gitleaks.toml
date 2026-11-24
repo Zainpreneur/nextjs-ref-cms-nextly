@@ -1,0 +1,44 @@
+# gitleaks configuration.
+#
+# Extends the default ruleset rather than replacing it — that way new
+# upstream rules (new cloud providers, new SaaS API key formats) keep
+# applying automatically.
+#
+# Add entries to [allowlist] only when a finding is genuinely a false
+# positive (e.g. a documentation example, a test fixture, a generated
+# fingerprint that pattern-matches the AWS-secret-key regex). Always
+# leave a comment so reviewers know why the exception exists.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "False-positive allowlist for the Nextly repo"
+
+# Lockfiles never contain real secrets but their dependency hashes
+# can pattern-match generic high-entropy rules. Treat them as data,
+# not code.
+paths = [
+  '''pnpm-lock\.yaml$''',
+  '''package-lock\.json$''',
+  '''yarn\.lock$''',
+  # API-key service tests carry "nx_live_*" fixtures by design — the
+  # fixtures are required to exercise hash determinism, prefix length,
+  # and avalanche-effect tests. They are NOT real secrets (no real
+  # entropy past the visible prefix). The generic-api-key rule fires on
+  # them because the fixture strings are long enough to look like keys.
+  '''packages/nextly/src/domains/auth/__tests__/api-key-service\.test\.ts$''',
+  '''packages/nextly/src/services/auth/api-key-service\.test\.ts$''',
+  # Auth pending-token / session tests sign JWTs with an obviously-fake
+  # fixture secret ("test-secret-at-least-32-chars-long-..."). signAccessToken
+  # requires a >=32-char key, so the fixture is long enough to trip the
+  # generic-api-key entropy rule. Not real secrets.
+  '''packages/nextly/src/auth/session/__tests__/get-session-pending-token\.test\.ts$''',
+  '''packages/nextly/src/auth/pipeline/__tests__/pending-token\.test\.ts$''',
+  # The plugin-settings tests encrypt and rotate fixture credentials, so they
+  # carry a deliberately long plaintext and two 32-character keys. The length
+  # is load-bearing rather than incidental: a short plaintext can appear
+  # inside ciphertext by chance, and a test passing for that reason proves
+  # nothing about encryption. Fixtures only — no real entropy, no real key.
+  '''packages/nextly/src/domains/plugins/__tests__/settings-service\.test\.ts$''',
+]

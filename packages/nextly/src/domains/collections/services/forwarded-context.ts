@@ -1,0 +1,97 @@
+/**
+ * Everything the collection facade forwards from a {@link RequestContext} to
+ * the entry service, in one object so no field can travel without the others.
+ *
+ * They are not the same KIND of thing, and the docblocks below say which is
+ * which — but they share one failure, which is why they share one function.
+ * Each facade method used to rebuild this argument as a hand-written literal,
+ * and a literal drops whatever it does not name. That dropped the hook context,
+ * so a plugin could not reach a channel core had accepted for months; and it
+ * dropped an API key's scope, so a key scoped to read was authorized on its
+ * OWNER's roles. Two unrelated defects, one shape, found weeks apart.
+ *
+ * Spread this rather than listing the fields inline. TypeScript cannot object
+ * to the omission: a spread into an object literal is exempt from
+ * excess-property checking, and every field here is optional on the
+ * destination, so both directions of the mistake compile clean.
+ * `forwarded-context-seam.test.ts` fails the build if a facade method
+ * hand-writes them instead.
+ *
+ * The same reasoning and shape as the Direct API's `accessOptions`, which
+ * closed the scope half on that transport; this is the seam the facade lacked.
+ *
+ * @module domains/collections/services/forwarded-context
+ */
+
+import type { AuthenticatedScope } from "../../../auth/authenticated-scope";
+import type { RequestActor } from "../../../auth/request-actor";
+import type { HookExemptRead } from "../../../services/collections/trust-grant";
+import type { RequestContext } from "../../../shared/types";
+
+/** What the entry service receives about the call it is being asked to make. */
+export interface ForwardedContext {
+  /** The authenticated ACCOUNT — for an API key, the key's owner. */
+  user: RequestContext["user"];
+  /** Trusted-server elevation; skips the access check, never validation or hooks. */
+  overrideAccess: boolean | undefined;
+  /**
+   * PERMISSION. The caller's own grants when they arrived on an API key, so the
+   * key is judged on what it was stamped with rather than on its owner's roles.
+   * Narrows what the caller may do; never widens it.
+   */
+  authenticatedScope: AuthenticatedScope | undefined;
+  /**
+   * DATA, not permission. Arbitrary values this operation's hooks receive as
+   * `ctx.context` — how a caller tells a hook something about the CALL that the
+   * row cannot say. Nothing here bypasses access, validation or any hook.
+   */
+  context: Record<string, unknown> | undefined;
+  /**
+   * The HTTP request that produced this operation, when one did. The core
+   * resolves it into what hooks read as `ctx.req.http`; its absence is what
+   * tells a rule scoped to a visitor that a seed or a job made this write.
+   */
+  request: Request | undefined;
+  /**
+   * DATA. The content locale a read answers in or a write stores into, and
+   * what a missing translation falls back to. The request context has carried
+   * both for as long as it has existed, and every entry-service read accepts
+   * both — but they stopped here, so a facade caller was answered in the
+   * default locale whatever it asked for. A method whose destination declares
+   * neither (a delete, a count) receives and ignores them, which the spread
+   * permits and the docblock above explains.
+   */
+  locale: string | undefined;
+  fallbackLocale: string | false | undefined;
+  /**
+   * A grant waiving the read hooks of the collections one plugin declared.
+   * Forwarded like the rest, and meaningful only to the query service, which
+   * honours it for a collection the grant covers and ignores it otherwise. A
+   * write receives and ignores it, so a write keeps every hook.
+   */
+  hookExemptRead: HookExemptRead | undefined;
+  /**
+   * Who a write is recorded under, when the context names one: the actor of
+   * the plugin route request a facade write was made for. Present only when
+   * set, so an actor passed beside the context is never cleared by an
+   * absent one.
+   */
+  actor?: RequestActor;
+}
+
+/** Read what the entry service needs off a {@link RequestContext}, whole. */
+export function forwardedFromContext(
+  context: RequestContext
+): ForwardedContext {
+  return {
+    user: context.user,
+    overrideAccess: context.overrideAccess,
+    authenticatedScope: context.authenticatedScope,
+    context: context.context,
+    request: context.request,
+    locale: context.locale,
+    fallbackLocale: context.fallbackLocale,
+    hookExemptRead: context.hookExemptRead,
+    ...(context.actor === undefined ? {} : { actor: context.actor }),
+  };
+}

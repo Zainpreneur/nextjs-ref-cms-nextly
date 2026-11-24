@@ -1,0 +1,365 @@
+"use client";
+
+import { zodResolver } from "@hookform/resolvers/zod";
+import {
+  Button,
+  FieldShell,
+  FormActions,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@nextlyhq/ui";
+import type React from "react";
+import { useEffect } from "react";
+import { useForm, type Control } from "react-hook-form";
+import { z } from "zod";
+
+import {
+  SettingsLayout,
+  SettingsSection,
+} from "@admin/components/features/settings";
+import { PageContainer } from "@admin/components/layout/page-container";
+import { PlaceTabs, TargetSlot } from "@admin/components/shared/target-slot";
+import { toast } from "@admin/components/ui";
+import { Form, FormField } from "@admin/components/ui/form";
+import {
+  useGeneralSettings,
+  useUpdateGeneralSettings,
+} from "@admin/hooks/queries/useGeneralSettings";
+import { useCurrentUserPermissions } from "@admin/hooks/useCurrentUserPermissions";
+import { useDashboardUser } from "@admin/hooks/useDashboardUser";
+import { useT } from "@admin/lib/i18n/I18nProvider";
+import { settingsChangesAllowed } from "@admin/lib/permissions/settings-changes";
+import type {
+  GeneralSettingsRecord,
+  UpdateGeneralSettingsPayload,
+} from "@admin/services/generalSettingsApi";
+
+import { GeneralSettingsSkeleton } from "./components/GeneralSettingsSkeleton";
+
+// ============================================================
+// Options
+// ============================================================
+
+const TIMEZONE_OPTIONS = [
+  // --- Americas ---
+  { value: "America/New_York", label: "Eastern Time (US & Canada)" },
+  { value: "America/Chicago", label: "Central Time (US & Canada)" },
+  { value: "America/Denver", label: "Mountain Time (US & Canada)" },
+  { value: "America/Los_Angeles", label: "Pacific Time (US & Canada)" },
+  { value: "America/Anchorage", label: "Alaska" },
+  { value: "Pacific/Honolulu", label: "Hawaii" },
+  { value: "America/Toronto", label: "Eastern Time (Canada)" },
+  { value: "America/Vancouver", label: "Pacific Time (Canada)" },
+  { value: "America/Mexico_City", label: "Mexico City" },
+  { value: "America/Sao_Paulo", label: "Brasilia" },
+  { value: "America/Buenos_Aires", label: "Buenos Aires" },
+  { value: "America/Santiago", label: "Santiago" },
+  { value: "America/Lima", label: "Lima" },
+  { value: "America/Bogota", label: "Bogota" },
+
+  // --- Europe ---
+  { value: "Europe/London", label: "London, Dublin" },
+  { value: "Europe/Paris", label: "Paris" },
+  { value: "Europe/Berlin", label: "Berlin" },
+  { value: "Europe/Amsterdam", label: "Amsterdam" },
+  { value: "Europe/Rome", label: "Rome" },
+  { value: "Europe/Madrid", label: "Madrid" },
+  { value: "Europe/Stockholm", label: "Stockholm" },
+  { value: "Europe/Warsaw", label: "Warsaw" },
+  { value: "Europe/Istanbul", label: "Istanbul" },
+  { value: "Europe/Moscow", label: "Moscow" },
+  { value: "Europe/Kiev", label: "Kiev" },
+
+  // --- Middle East & Africa ---
+  { value: "Asia/Dubai", label: "Dubai, Abu Dhabi" },
+  { value: "Asia/Qatar", label: "Qatar" },
+
+  // --- Asia ---
+  { value: "Asia/Karachi", label: "Karachi, Islamabad (Pakistan)" },
+  { value: "Asia/Kolkata", label: "Mumbai, Kolkata, New Delhi" },
+  { value: "Asia/Kathmandu", label: "Kathmandu" },
+  { value: "Asia/Dhaka", label: "Dhaka" },
+  { value: "Asia/Singapore", label: "Singapore" },
+  { value: "Asia/Shanghai", label: "Beijing, Shanghai" },
+  { value: "Asia/Seoul", label: "Seoul" },
+  { value: "Asia/Tokyo", label: "Tokyo" },
+
+  // --- Australia & Pacific ---
+  { value: "Australia/Sydney", label: "Sydney" },
+  { value: "Australia/Melbourne", label: "Melbourne" },
+  { value: "Australia/Brisbane", label: "Brisbane" },
+  { value: "Australia/Perth", label: "Perth" },
+  { value: "Australia/Adelaide", label: "Adelaide" },
+  { value: "Pacific/Auckland", label: "Auckland" },
+  { value: "Pacific/Fiji", label: "Fiji" },
+];
+
+const DATE_FORMAT_OPTIONS = [
+  { value: "MM/DD/YYYY", label: "MM/DD/YYYY (01/31/2025)" },
+  { value: "DD/MM/YYYY", label: "DD/MM/YYYY (31/01/2025)" },
+  { value: "YYYY-MM-DD", label: "YYYY-MM-DD (2025-01-31)" },
+  { value: "DD.MM.YYYY", label: "DD.MM.YYYY (31.01.2025)" },
+  { value: "MMM DD, YYYY", label: "MMM DD, YYYY (Jan 31, 2025)" },
+];
+
+const TIME_FORMAT_OPTIONS = [
+  { value: "12h", label: "12-hour (1:30 PM)" },
+  { value: "24h", label: "24-hour (13:30)" },
+];
+
+// ============================================================
+// Schema
+// ============================================================
+
+const formSchema = z.object({
+  applicationName: z.string().max(255).optional(),
+  siteUrl: z
+    .string()
+    .refine(
+      val => !val || /^https?:\/\/.+/.test(val),
+      "Site URL must start with http:// or https://"
+    )
+    .optional(),
+  adminEmail: z
+    .string()
+    .refine(
+      val => !val || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(val),
+      "Please enter a valid email address"
+    )
+    .optional(),
+  timezone: z.string().optional(),
+  dateFormat: z.string().optional(),
+  timeFormat: z.string().optional(),
+  logoUrl: z
+    .string()
+    .refine(
+      val => !val || /^https?:\/\/.+/.test(val),
+      "Logo URL must start with http:// or https://"
+    )
+    .optional(),
+});
+
+type FormValues = z.infer<typeof formSchema>;
+
+/** The form's values for the stored settings: each one as stored, or empty. */
+function formValuesFrom(
+  settings: GeneralSettingsRecord | undefined
+): FormValues {
+  const stored = (key: keyof FormValues) => settings?.[key] ?? "";
+  return {
+    applicationName: stored("applicationName"),
+    siteUrl: stored("siteUrl"),
+    adminEmail: stored("adminEmail"),
+    timezone: stored("timezone"),
+    dateFormat: stored("dateFormat"),
+    timeFormat: stored("timeFormat"),
+    logoUrl: stored("logoUrl"),
+  };
+}
+
+/**
+ * What a save sends: an empty text field clears its setting, and so does a
+ * choice left empty or blank.
+ */
+function payloadFrom(values: FormValues): UpdateGeneralSettingsPayload {
+  const textOrNull = (value?: string) => value || null;
+  const choiceOrNull = (value?: string) => (value?.trim() ? value : null);
+  return {
+    applicationName: textOrNull(values.applicationName),
+    siteUrl: textOrNull(values.siteUrl),
+    adminEmail: textOrNull(values.adminEmail),
+    timezone: choiceOrNull(values.timezone),
+    dateFormat: choiceOrNull(values.dateFormat),
+    timeFormat: choiceOrNull(values.timeFormat),
+    logoUrl: textOrNull(values.logoUrl),
+  };
+}
+
+/** One of the page's choices: a labelled select over its options. */
+function SettingSelect({
+  control,
+  name,
+  label,
+  description,
+  placeholder,
+  options,
+  disabled,
+}: {
+  control: Control<FormValues>;
+  name: "timezone" | "dateFormat" | "timeFormat";
+  label: string;
+  description: string;
+  placeholder: string;
+  options: readonly { value: string; label: string }[];
+  disabled: boolean;
+}) {
+  return (
+    <FormField
+      control={control}
+      name={name}
+      render={({ field, fieldState }) => (
+        <FieldShell
+          label={label}
+          description={description}
+          error={fieldState.error?.message}
+        >
+          {({ id, describedBy, invalid }) => (
+            <Select
+              onValueChange={field.onChange}
+              value={field.value ?? ""}
+              disabled={disabled}
+            >
+              <SelectTrigger
+                id={id}
+                aria-describedby={describedBy}
+                aria-invalid={invalid}
+              >
+                <SelectValue placeholder={placeholder} />
+              </SelectTrigger>
+              <SelectContent>
+                {options.map(opt => (
+                  <SelectItem key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+        </FieldShell>
+      )}
+    />
+  );
+}
+
+// ============================================================
+// Page
+// ============================================================
+
+const SettingsGeneralPage: React.FC = () => {
+  // Pending, not loading: the read waits for the session before it is asked,
+  // and the form is held until it has answered.
+  const { data: settings, isPending: isLoading } = useGeneralSettings();
+  const { mutate: updateSettings, isPending } = useUpdateGeneralSettings();
+  // A reader without `update-settings` sees the settings read-only: the server
+  // refuses their save, so none is offered.
+  const { hasPermission } = useCurrentUserPermissions();
+  const mayUpdate = settingsChangesAllowed(hasPermission).update;
+  const { user } = useDashboardUser();
+  const t = useT();
+  // What a plugin's block or tab on this page is told: who is looking. Held
+  // while the viewer is not known yet, so no contribution is handed an id
+  // that is not theirs.
+  const placeContext = user ? { userId: user.id } : null;
+
+  const form = useForm<FormValues>({
+    resolver: zodResolver(formSchema),
+    defaultValues: formValuesFrom(settings),
+  });
+
+  // When settings data arrives or changes, update the form immediately.
+  useEffect(() => {
+    if (settings) {
+      form.reset(formValuesFrom(settings));
+    }
+  }, [settings, form]);
+
+  function onSubmit(values: FormValues) {
+    updateSettings(payloadFrom(values), {
+      onSuccess: () => {
+        // Reset the form to make it "clean" again after a successful save.
+        form.reset(values);
+        toast.success("Settings saved", {
+          description: "General settings have been updated.",
+        });
+      },
+      onError: err => {
+        toast.error("Failed to save settings", {
+          description: err.message,
+        });
+      },
+    });
+  }
+
+  return (
+    <PageContainer type="form">
+      {/* The page's own form is the `content` built-in: plugins' blocks
+          draw around it and their tabs beside it, in the order sent. */}
+      <PlaceTabs
+        place="settings"
+        context={placeContext}
+        contentLabel={t("nextly.places.settings.content")}
+      >
+        <TargetSlot
+          place="settings"
+          context={placeContext}
+          builtIns={{
+            content: (
+              <Form {...form}>
+                <form
+                  onSubmit={e => {
+                    void form.handleSubmit(onSubmit)(e);
+                  }}
+                >
+                  <SettingsLayout
+                    title="General Settings"
+                    description="Manage your application and configuration"
+                  >
+                    {isLoading ? (
+                      <GeneralSettingsSkeleton />
+                    ) : (
+                      // ── Section: Locale & Formatting ──
+                      <SettingsSection label="Locale & Formatting">
+                        <SettingSelect
+                          control={form.control}
+                          name="timezone"
+                          label="Timezone"
+                          description="Time zone used across the admin and email notifications."
+                          placeholder="Select a timezone"
+                          options={TIMEZONE_OPTIONS}
+                          disabled={isLoading || !mayUpdate}
+                        />
+
+                        <SettingSelect
+                          control={form.control}
+                          name="dateFormat"
+                          label="Date Format"
+                          description="How dates appear in lists and detail pages."
+                          placeholder="Select a date format"
+                          options={DATE_FORMAT_OPTIONS}
+                          disabled={isLoading || !mayUpdate}
+                        />
+
+                        <SettingSelect
+                          control={form.control}
+                          name="timeFormat"
+                          label="Time Format"
+                          description="12-hour vs 24-hour clock."
+                          placeholder="Select a time format"
+                          options={TIME_FORMAT_OPTIONS}
+                          disabled={isLoading || !mayUpdate}
+                        />
+                      </SettingsSection>
+                    )}
+
+                    <FormActions dirty={form.formState.isDirty}>
+                      {mayUpdate && (
+                        <Button type="submit" disabled={isPending || isLoading}>
+                          {isPending ? "Saving…" : "Save Changes"}
+                        </Button>
+                      )}
+                    </FormActions>
+                  </SettingsLayout>
+                </form>
+              </Form>
+            ),
+          }}
+        />
+      </PlaceTabs>
+    </PageContainer>
+  );
+};
+
+export default SettingsGeneralPage;

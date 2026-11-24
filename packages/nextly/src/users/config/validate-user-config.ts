@@ -1,0 +1,743 @@
+/**
+ * User Configuration Validator
+ *
+ * Validates UserConfig objects including:
+ * - Field type restrictions (only scalar types allowed)
+ * - Field name format and uniqueness
+ * - Reserved field name checking (built-in user columns)
+ * - SQL keyword blocking
+ * - Select/radio option validation
+ * - Admin option validation (listFields references)
+ *
+ * @module users/config/validate-user-config
+ * @since 1.0.0
+ *
+ * @example
+ * ```typescript
+ * import { validateUserConfig } from '@nextly/core';
+ *
+ * const result = validateUserConfig({
+ *   fields: [
+ *     { type: 'text', name: 'company', label: 'Company' },
+ *   ],
+ * });
+ *
+ * if (!result.valid) {
+ *   console.error('Validation errors:', result.errors);
+ * }
+ * ```
+ */
+
+import { SQL_RESERVED_KEYWORDS } from "../../collections/config/validate-config";
+import type { FieldStoragePrimitive } from "../../collections/fields/catalog";
+import { isVirtualField } from "../../collections/fields/virtual";
+import {
+  getFieldType,
+  isPluginFieldTypeOnSurface,
+} from "../../domains/schema/field-types/field-type-registry";
+import { RESERVED_PLUGIN_OPTION_KEYS } from "../../plugins/plugin-options";
+
+import type { UserConfig } from "./types";
+
+/**
+ * The users-surface plugin field types a config declares, which validation
+ * accepts before boot registers them: their names, or each name with the
+ * storage primitive it declares, which is what decides whether such a field
+ * can be unique.
+ */
+type ConfigUsersTypes =
+  | ReadonlySet<string>
+  | ReadonlyMap<string, FieldStoragePrimitive>;
+
+// ============================================================
+// Validation Error Types
+// ============================================================
+
+/**
+ * Error codes for user config validation failures.
+ */
+export type UserValidationErrorCode =
+  // Field type errors
+  | "USER_FIELD_TYPE_NOT_ALLOWED"
+  | "USER_FIELD_TYPE_REQUIRED"
+  | "USER_FIELD_HAS_MANY_UNSUPPORTED"
+  | "USER_FIELD_VIRTUAL_UNSUPPORTED"
+  | "USER_FIELD_PLUGIN_OPTION_RESERVED"
+  | "USER_FIELD_UNIQUE_UNSUPPORTED"
+  // Field name errors
+  | "USER_FIELD_NAME_REQUIRED"
+  | "USER_FIELD_NAME_INVALID_FORMAT"
+  | "USER_FIELD_NAME_SQL_KEYWORD"
+  | "USER_FIELD_NAME_DUPLICATE"
+  | "USER_FIELD_NAME_RESERVED"
+  // Field-specific errors
+  | "USER_SELECT_OPTIONS_REQUIRED"
+  | "USER_SELECT_OPTIONS_EMPTY"
+  | "USER_RADIO_OPTIONS_REQUIRED"
+  | "USER_RADIO_OPTIONS_EMPTY"
+  // Fields array errors
+  | "USER_FIELDS_INVALID_TYPE"
+  // Admin errors
+  | "USER_ADMIN_INVALID_TYPE"
+  | "USER_ADMIN_LIST_FIELD_UNKNOWN"
+  | "USER_ADMIN_GROUP_INVALID_TYPE";
+
+/**
+ * A single user config validation error with path and context.
+ */
+export interface UserValidationError {
+  /** Dot-notation path to the invalid property. */
+  path: string;
+  /** Human-readable error message. */
+  message: string;
+  /** Machine-readable error code for programmatic handling. */
+  code: UserValidationErrorCode;
+}
+
+/**
+ * Result of user config validation.
+ */
+export interface UserValidationResult {
+  /** Whether the configuration is valid. */
+  valid: boolean;
+  /** Array of validation errors (empty if valid). */
+  errors: UserValidationError[];
+}
+
+// ============================================================
+// Constants
+// ============================================================
+
+/**
+ * Built-in user field names that cannot be used as custom field names.
+ * These correspond to columns in the core `users` table.
+ */
+export const RESERVED_USER_FIELD_NAMES = [
+  "id",
+  "name",
+  "email",
+  "emailVerified",
+  "passwordHash",
+  "passwordUpdatedAt",
+  "image",
+  "isActive",
+  "createdAt",
+  "updatedAt",
+  "roles",
+  "accounts",
+  "password",
+  // Each person's own interface language: a custom field of this name would
+  // answer to the same name on the merged user.
+  "interfaceLanguage",
+] as const;
+
+/**
+ * Allowed field types for user custom fields.
+ * Limited to scalar types — complex types (relationship, array, group, etc.)
+ * are not supported in user extension fields.
+ */
+export const ALLOWED_USER_FIELD_TYPES = [
+  "text",
+  "textarea",
+  "number",
+  "email",
+  "url",
+  "phone",
+  "select",
+  "radio",
+  "checkbox",
+  "date",
+] as const;
+
+/**
+ * Set for O(1) lookup of reserved user field names.
+ */
+const RESERVED_NAMES_SET = new Set<string>(
+  RESERVED_USER_FIELD_NAMES.map(n => n.toLowerCase())
+);
+
+/**
+ * Set for O(1) lookup of allowed user field types.
+ */
+const ALLOWED_TYPES_SET = new Set<string>(ALLOWED_USER_FIELD_TYPES);
+
+/**
+ * Set for O(1) lookup of SQL keywords.
+ */
+const SQL_KEYWORDS_SET = new Set<string>(SQL_RESERVED_KEYWORDS);
+
+/**
+ * Regex pattern for valid field names.
+ * Must start with a letter, contain only letters, numbers, and underscores.
+ */
+const FIELD_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_]*$/;
+
+// ============================================================
+// Validation Helper Functions
+// ============================================================
+
+/**
+ * Checks if a string is a SQL reserved keyword.
+ */
+function isSQLKeyword(name: string): boolean {
+  return SQL_KEYWORDS_SET.has(name.toLowerCase());
+}
+
+/**
+ * Checks if a field name conflicts with built-in user fields.
+ */
+function isReservedUserFieldName(name: string): boolean {
+  return RESERVED_NAMES_SET.has(name.toLowerCase());
+}
+
+/**
+ * A reason a user field name cannot be used, or `null` when it is usable.
+ *
+ * `message` is safe to show to whoever supplied the name: it names the
+ * offending value and says what to do instead, and carries nothing about
+ * the caller or the surrounding config.
+ */
+export interface UserFieldNameRejection {
+  code: UserValidationErrorCode;
+  message: string;
+}
+
+/**
+ * The `user_ext` column a field is stored in: its name in snake case. One
+ * mapping for validation and for the table's statements, so a check here sees
+ * the column the table will actually have.
+ */
+export function userFieldColumnName(name: string): string {
+  return name
+    .replace(/([A-Z])/g, "_$1")
+    .toLowerCase()
+    .replace(/^_/, "");
+}
+
+/** The columns `user_ext` keeps for itself, which no field may be stored in. */
+const USER_EXT_OWN_COLUMNS: ReadonlySet<string> = new Set([
+  "id",
+  "user_id",
+  "created_at",
+  "updated_at",
+]);
+
+/**
+ * Why a field's `unique` cannot be honoured, or null when it can (or is off).
+ *
+ * A textarea is TEXT on MySQL and a multi-value select is JSON, and neither
+ * takes a plain unique index on every dialect; nor does a plugin type stored
+ * as long text or JSON. One rule everywhere, rather than a field that works
+ * on SQLite and goes without its index, or stops `nextly migrate`, elsewhere.
+ * The table's statements ask the same question, for definitions stored before
+ * validation refused it.
+ */
+export function userFieldUniqueRejection(
+  field: {
+    type?: unknown;
+    hasMany?: unknown;
+    unique?: unknown;
+  },
+  configUsersTypes?: ConfigUsersTypes
+): string | null {
+  if (field.unique !== true) return null;
+  if (field.type === "textarea") {
+    return "A textarea field cannot be unique: its column cannot carry a unique index on every database. Use a text field with a maxLength.";
+  }
+  if (field.type === "select" && field.hasMany === true) {
+    return "A select field holding several values cannot be unique: its values are stored together, in one JSON column.";
+  }
+  // A plugin type on the users surface is stored as its declared primitive,
+  // so the primitive decides whether its column can be unique: from the
+  // registry once boot has registered it, else from the config declaring it.
+  const pluginType = typeof field.type === "string" ? field.type : undefined;
+  const storage = pluginType
+    ? isPluginFieldTypeOnSurface(pluginType, "users")
+      ? getFieldType(pluginType)?.storage
+      : configUsersTypes instanceof Map
+        ? configUsersTypes.get(pluginType)
+        : undefined
+    : undefined;
+  if (storage === "longText") {
+    return `A '${pluginType}' field cannot be unique: it is stored as long text, whose column cannot carry a unique index on every database.`;
+  }
+  if (storage === "json") {
+    return `A '${pluginType}' field cannot be unique: it is stored as JSON, whose column cannot carry a unique index.`;
+  }
+  return null;
+}
+
+/**
+ * Decide whether a single name may be used for a custom user field.
+ *
+ * Duplicate detection is deliberately excluded: it needs the set of sibling
+ * names, which only the caller has. `defineConfig()` compares against the
+ * other fields in the config; the database compares via a unique index.
+ *
+ * @returns the first reason the name is unusable, or `null` if it is fine
+ */
+export function checkUserFieldName(
+  name: unknown
+): UserFieldNameRejection | null {
+  if (!name || typeof name !== "string") {
+    return {
+      code: "USER_FIELD_NAME_REQUIRED",
+      message: "Field name is required",
+    };
+  }
+
+  if (!FIELD_NAME_PATTERN.test(name)) {
+    return {
+      code: "USER_FIELD_NAME_INVALID_FORMAT",
+      message: `Field name '${name}' must start with a letter and contain only letters, numbers, and underscores`,
+    };
+  }
+
+  if (isReservedUserFieldName(name)) {
+    return {
+      code: "USER_FIELD_NAME_RESERVED",
+      message: `Field name '${name}' conflicts with a built-in user field. Rename the app's field. Reserved names: ${RESERVED_USER_FIELD_NAMES.join(", ")}`,
+    };
+  }
+
+  // `userId` is not a built-in name, but it is stored as `user_id`, the
+  // column that ties a row to its user: the table would hold it twice.
+  const column = userFieldColumnName(name);
+  if (USER_EXT_OWN_COLUMNS.has(column)) {
+    return {
+      code: "USER_FIELD_NAME_RESERVED",
+      message: `Field name '${name}' would be stored in the column '${column}', which the user fields' table keeps for itself`,
+    };
+  }
+
+  if (isSQLKeyword(name)) {
+    return {
+      code: "USER_FIELD_NAME_SQL_KEYWORD",
+      message: `Field name '${name}' is a SQL reserved keyword. Consider using a different name like '${name}Field' or '${name}Value'`,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Decide whether a type may be used for a custom user field.
+ *
+ * @returns a reason the type is unusable, or `null` if it is fine
+ */
+export function checkUserFieldType(
+  type: unknown,
+  /**
+   * Plugin field type ids the surrounding config declares for the users surface.
+   * Lets `defineConfig()` validation accept a code-defined plugin user field
+   * whose plugin has not been registered into the global registry yet (config is
+   * validated at definition time, before boot registers `contributes.fieldTypes`).
+   */
+  configUsersTypes?: ConfigUsersTypes
+): UserFieldNameRejection | null {
+  if (!type) {
+    return {
+      code: "USER_FIELD_TYPE_REQUIRED",
+      message: "Field type is required",
+    };
+  }
+
+  // Reported as its own type name rather than its value: a non-string type
+  // is arbitrary caller data and must not be stringified into a message.
+  const described = typeof type === "string" ? type : typeof type;
+
+  // A plugin may contribute a field type that opts into the users surface; it
+  // persists as its declared storage primitive, so it is as usable here as a
+  // built-in scalar. Built-ins keep the fast allowlist; plugin types fall
+  // through to the registry (surface-gated) or the config's own declarations.
+  const isAllowed =
+    typeof type === "string" &&
+    (ALLOWED_TYPES_SET.has(type) ||
+      isPluginFieldTypeOnSurface(type, "users") ||
+      (configUsersTypes?.has(type) ?? false));
+
+  if (!isAllowed) {
+    return {
+      code: "USER_FIELD_TYPE_NOT_ALLOWED",
+      message: `User custom fields do not support type '${described}'. Allowed types: ${ALLOWED_USER_FIELD_TYPES.join(", ")}. A plugin-contributed field type is also accepted when it declares the "users" surface.`,
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Validates a single user field's name.
+ */
+function validateUserFieldName(
+  name: unknown,
+  path: string,
+  errors: UserValidationError[],
+  seenNames: Set<string>
+): void {
+  const rejection = checkUserFieldName(name);
+  if (rejection) {
+    errors.push({ path: `${path}.name`, ...rejection });
+  }
+
+  // A non-string name cannot participate in duplicate detection, and
+  // checkUserFieldName has already reported it.
+  if (typeof name !== "string") return;
+
+  // Two fields collide when their names differ only in case, and also when
+  // they are stored in one column (`fooBar` and `foo_bar`): the table could
+  // not hold both. Columns go in the same set under a prefix no name can have.
+  const nameLower = name.toLowerCase();
+  const column = userFieldColumnName(name);
+  const columnKey = `column:${column}`;
+  if (seenNames.has(nameLower) || seenNames.has(columnKey)) {
+    errors.push({
+      path: `${path}.name`,
+      message: seenNames.has(nameLower)
+        ? `Duplicate field name '${name}'`
+        : `Field '${name}' would be stored in the column '${column}', which another field already uses`,
+      code: "USER_FIELD_NAME_DUPLICATE",
+    });
+  } else {
+    seenNames.add(nameLower);
+    seenNames.add(columnKey);
+  }
+}
+
+/**
+ * Validates that a field's type is in the allowed set.
+ */
+function validateUserFieldType(
+  field: Record<string, unknown>,
+  path: string,
+  errors: UserValidationError[],
+  configUsersTypes?: ConfigUsersTypes
+): void {
+  const rejection = checkUserFieldType(field.type, configUsersTypes);
+  if (rejection) {
+    errors.push({ path: `${path}.type`, ...rejection });
+  }
+}
+
+/**
+ * Validates select/radio field options.
+ */
+function validateUserSelectOptions(
+  field: Record<string, unknown>,
+  path: string,
+  errors: UserValidationError[],
+  fieldType: "select" | "radio"
+): void {
+  const options = field.options;
+
+  if (!options) {
+    errors.push({
+      path: `${path}.options`,
+      message: `${fieldType} field must have an 'options' array`,
+      code:
+        fieldType === "select"
+          ? "USER_SELECT_OPTIONS_REQUIRED"
+          : "USER_RADIO_OPTIONS_REQUIRED",
+    });
+    return;
+  }
+
+  if (!Array.isArray(options)) {
+    errors.push({
+      path: `${path}.options`,
+      message: `${fieldType} field 'options' must be an array`,
+      code:
+        fieldType === "select"
+          ? "USER_SELECT_OPTIONS_REQUIRED"
+          : "USER_RADIO_OPTIONS_REQUIRED",
+    });
+    return;
+  }
+
+  if (options.length === 0) {
+    errors.push({
+      path: `${path}.options`,
+      message: `${fieldType} field must have at least one option`,
+      code:
+        fieldType === "select"
+          ? "USER_SELECT_OPTIONS_EMPTY"
+          : "USER_RADIO_OPTIONS_EMPTY",
+    });
+  }
+}
+
+/**
+ * Validates the fields array in UserConfig.
+ */
+function validateUserFields(
+  fields: unknown,
+  errors: UserValidationError[],
+  configUsersTypes?: ConfigUsersTypes
+): Set<string> {
+  const fieldNames = new Set<string>();
+
+  if (fields === undefined || fields === null) {
+    return fieldNames;
+  }
+
+  if (!Array.isArray(fields)) {
+    errors.push({
+      path: "fields",
+      message: "User fields must be an array",
+      code: "USER_FIELDS_INVALID_TYPE",
+    });
+    return fieldNames;
+  }
+
+  const seenNames = new Set<string>();
+
+  fields.forEach((field, index) => {
+    const fieldPath = `fields[${index}]`;
+
+    if (!field || typeof field !== "object") {
+      return;
+    }
+
+    const f = field as Record<string, unknown>;
+
+    validateUserFieldType(f, fieldPath, errors, configUsersTypes);
+    validateUserFieldName(f.name, fieldPath, errors, seenNames);
+    const uniqueRejection = userFieldUniqueRejection(f, configUsersTypes);
+    if (uniqueRejection) {
+      errors.push({
+        path: `${fieldPath}.unique`,
+        message: uniqueRejection,
+        code: "USER_FIELD_UNIQUE_UNSUPPORTED",
+      });
+    }
+
+    // Both routes a plugin type reaches this validator by: registered in the
+    // live registry, and declared by a config whose plugins have not been
+    // registered yet. `checkUserFieldType` already accepts either, so checking
+    // only the registry let a code-defined type through to fail at the column.
+    // A plugin type persists as one storage primitive, which is one column
+    // holding one value. The user_ext mapper builds that scalar column whatever
+    // this says, so a list would be accepted here, generated as a scalar, and
+    // then fail while binding — and a failed user_ext insert is read as the
+    // table being absent, so the value would be dropped rather than reported.
+    if (
+      typeof f.type === "string" &&
+      f.hasMany === true &&
+      (isPluginFieldTypeOnSurface(f.type, "users") ||
+        configUsersTypes?.has(f.type) === true)
+    ) {
+      errors.push({
+        path: `${fieldPath}.hasMany`,
+        code: "USER_FIELD_HAS_MANY_UNSUPPORTED",
+        message: `User custom field '${f.type}' stores a single value, so hasMany cannot be used with it.`,
+      });
+    }
+
+    // A custom user field is always a `user_ext` column: its DDL, its runtime
+    // table and every user write build that column from the field whatever the
+    // flag says, so a virtual user field would be stored rather than computed.
+    // Refused here, where the config is read, instead of accepted and ignored.
+    if (isVirtualField(f)) {
+      errors.push({
+        path: `${fieldPath}.virtual`,
+        code: "USER_FIELD_VIRTUAL_UNSUPPORTED",
+        message:
+          "User custom fields are stored in the user_ext table and cannot be virtual. Remove `virtual`, or compute the value where the user is read.",
+      });
+    }
+
+    // The instance a field type is handed restates `type` and `name` as its
+    // identity after folding the container, so an option under either would be
+    // shadowed and never reach the callback that asked for it. Type generation
+    // refuses these already, but only once `nextly build` runs — long after a
+    // config carrying one has booted and synced. Checked wherever the container
+    // is written rather than only for a plugin-typed field, because generation
+    // reads it off every user field and would fail on any of them.
+    const container = f.pluginOptions;
+    if (container !== null && typeof container === "object") {
+      for (const key of Object.keys(container)) {
+        if (!RESERVED_PLUGIN_OPTION_KEYS.has(key)) continue;
+        errors.push({
+          path: `${fieldPath}.pluginOptions.${key}`,
+          code: "USER_FIELD_PLUGIN_OPTION_RESERVED",
+          message: `'${key}' cannot be used as a plugin option: it states which field the type is looking at`,
+        });
+      }
+    }
+
+    // Field-specific validation
+    const fieldType = f.type;
+    if (fieldType === "select") {
+      validateUserSelectOptions(f, fieldPath, errors, "select");
+    } else if (fieldType === "radio") {
+      validateUserSelectOptions(f, fieldPath, errors, "radio");
+    }
+
+    // Track valid field names for admin.listFields validation
+    if (typeof f.name === "string" && FIELD_NAME_PATTERN.test(f.name)) {
+      fieldNames.add(f.name);
+    }
+  });
+
+  return fieldNames;
+}
+
+/**
+ * Validates the admin options in UserConfig.
+ */
+function validateAdminOptions(
+  admin: unknown,
+  fieldNames: Set<string>,
+  errors: UserValidationError[]
+): void {
+  if (admin === undefined || admin === null) {
+    return;
+  }
+
+  if (typeof admin !== "object" || Array.isArray(admin)) {
+    errors.push({
+      path: "admin",
+      message: "Admin options must be an object",
+      code: "USER_ADMIN_INVALID_TYPE",
+    });
+    return;
+  }
+
+  const adminObj = admin as Record<string, unknown>;
+
+  // Validate listFields
+  if (adminObj.listFields !== undefined) {
+    if (!Array.isArray(adminObj.listFields)) {
+      errors.push({
+        path: "admin.listFields",
+        message: "admin.listFields must be an array of field names",
+        code: "USER_ADMIN_INVALID_TYPE",
+      });
+    } else {
+      adminObj.listFields.forEach((ref: unknown, index: number) => {
+        if (typeof ref !== "string") {
+          errors.push({
+            path: `admin.listFields[${index}]`,
+            message: "Each listFields entry must be a string",
+            code: "USER_ADMIN_LIST_FIELD_UNKNOWN",
+          });
+        } else if (!fieldNames.has(ref)) {
+          const available =
+            fieldNames.size > 0
+              ? `Available fields: ${Array.from(fieldNames).sort().join(", ")}`
+              : "No custom fields defined";
+          errors.push({
+            path: `admin.listFields[${index}]`,
+            message: `Unknown field '${ref}' in admin.listFields. ${available}`,
+            code: "USER_ADMIN_LIST_FIELD_UNKNOWN",
+          });
+        }
+      });
+    }
+  }
+
+  // Validate group
+  if (adminObj.group !== undefined && typeof adminObj.group !== "string") {
+    errors.push({
+      path: "admin.group",
+      message: "admin.group must be a string",
+      code: "USER_ADMIN_GROUP_INVALID_TYPE",
+    });
+  }
+}
+
+// ============================================================
+// Main Validation Functions
+// ============================================================
+
+/**
+ * Validates a complete user configuration.
+ *
+ * Performs comprehensive validation including:
+ * - Field type restrictions (only scalar types allowed)
+ * - Field name format, uniqueness, and reserved name checking
+ * - SQL keyword blocking for field names
+ * - Select/radio option validation
+ * - Admin listFields reference validation
+ *
+ * @param config - The user configuration to validate
+ * @returns Validation result with any errors found
+ *
+ * @example
+ * ```typescript
+ * import { validateUserConfig } from '@nextly/core';
+ *
+ * const result = validateUserConfig({
+ *   fields: [
+ *     { type: 'text', name: 'company', label: 'Company' },
+ *     { type: 'select', name: 'department', label: 'Department', options: [...] },
+ *   ],
+ *   admin: {
+ *     listFields: ['company', 'department'],
+ *   },
+ * });
+ *
+ * if (!result.valid) {
+ *   result.errors.forEach(err => {
+ *     console.error(`[${err.code}] ${err.path}: ${err.message}`);
+ *   });
+ * }
+ * ```
+ */
+export function validateUserConfig(
+  config: UserConfig,
+  configUsersTypes?: ConfigUsersTypes
+): UserValidationResult {
+  const errors: UserValidationError[] = [];
+
+  // Validate fields (returns set of valid field names for admin validation)
+  const fieldNames = validateUserFields(
+    config.fields,
+    errors,
+    configUsersTypes
+  );
+
+  // Validate admin options
+  validateAdminOptions(config.admin, fieldNames, errors);
+
+  return {
+    valid: errors.length === 0,
+    errors,
+  };
+}
+
+/**
+ * Throws an error if the user configuration is invalid.
+ *
+ * Convenience wrapper around `validateUserConfig` that throws a
+ * descriptive error instead of returning a result object.
+ *
+ * @param config - The user configuration to validate
+ * @throws Error if validation fails with all error messages
+ *
+ * @example
+ * ```typescript
+ * import { assertValidUserConfig } from '@nextly/core';
+ *
+ * // Throws if invalid
+ * assertValidUserConfig({
+ *   fields: [
+ *     { type: 'relationship', name: 'manager' }, // throws — type not allowed
+ *   ],
+ * });
+ * ```
+ */
+export function assertValidUserConfig(
+  config: UserConfig,
+  configUsersTypes?: ConfigUsersTypes
+): void {
+  const result = validateUserConfig(config, configUsersTypes);
+
+  if (!result.valid) {
+    const errorMessages = result.errors
+      .map(err => `  - [${err.code}] ${err.path}: ${err.message}`)
+      .join("\n");
+
+    throw new Error(`Invalid user config:\n${errorMessages}`);
+  }
+}

@@ -1,0 +1,471 @@
+import { describe, expect, it, vi } from "vitest";
+import { PREVIEW_COOKIE_SAME_SITE } from "../preview-frame-policy";
+
+import {
+  isSingleScope,
+  signPreviewToken,
+} from "../../../auth/preview/preview-token";
+import {
+  PREVIEW_SCOPE_COOKIE,
+  createPreviewRoute,
+  previewGrantsDraft,
+  readPreviewScope,
+  type VerifiedPreviewLink,
+} from "../preview-route";
+
+// The link's own record. What it decides is covered by the integration suite
+// against real rows; here it allows, so these cases stay about the token.
+vi.mock("../preview-route-defaults", async importOriginal => ({
+  ...(await importOriginal<typeof import("../preview-route-defaults")>()),
+  defaultLinkChecks: {
+    opened: () => Promise.resolve(true),
+    live: () => Promise.resolve(true),
+  },
+}));
+
+const TEST_SECRET = "preview-route-test-secret-at-least-32-chars!!";
+const GENERATION = 1;
+const SCOPE = { collection: "pages", entryId: "entry-1" };
+
+/** A draft-mode double that records whether the route enabled it. */
+function draftModeDouble() {
+  const enable = vi.fn();
+  return { enable, draftMode: () => Promise.resolve({ enable }) };
+}
+
+function routeFor(
+  overrides: Partial<Parameters<typeof createPreviewRoute>[0]> = {}
+) {
+  const draft = draftModeDouble();
+  const route = createPreviewRoute({
+    secret: TEST_SECRET,
+    generation: GENERATION,
+    // Narrowed rather than asserted: the scope is a union, and this suite's
+    // tokens are all entry-scoped, so the single branch is genuinely
+    // unreachable here and says so instead of being cast away.
+    redirectTo: scope =>
+      isSingleScope(scope)
+        ? `/single/${scope.single}`
+        : `/${scope.collection}/${scope.entryId}`,
+    draftMode: draft.draftMode,
+    ...overrides,
+  });
+  return { route, enable: draft.enable };
+}
+
+function request(token?: string): Request {
+  const url = new URL("https://site.example/api/preview");
+  if (token !== undefined) url.searchParams.set("token", token);
+  return new Request(url);
+}
+
+function cookiesFrom(response: Response) {
+  const header = response.headers.get("set-cookie") ?? "";
+  const value = /__nextly_preview=([^;]*)/.exec(header)?.[1];
+  return {
+    header,
+    get: (name: string) =>
+      name === PREVIEW_SCOPE_COOKIE && value !== undefined
+        ? { value }
+        : undefined,
+  };
+}
+
+describe("the preview route", () => {
+  it("starts a draft session and sends the visitor to the document", async () => {
+    const { token } = await signPreviewToken(SCOPE, TEST_SECRET, {
+      generation: GENERATION,
+      minter: "minter-1",
+    });
+    const { route, enable } = routeFor();
+
+    const response = await route.GET(request(token));
+
+    expect(response.status).toBe(307);
+    expect(response.headers.get("location")).toBe("/pages/entry-1");
+    expect(enable).toHaveBeenCalledOnce();
+  });
+
+  it("carries the scope in an httpOnly cookie that dies with the token", async () => {
+    // Next's draft mode is one boolean for the whole host, so the cookie is
+    // what keeps a link meant for ONE page from unlocking every draft.
+    const { token, expiresAt } = await signPreviewToken(SCOPE, TEST_SECRET, {
+      generation: GENERATION,
+      minter: "minter-1",
+    });
+    const { route } = routeFor();
+
+    const header = cookiesFrom(await route.GET(request(token))).header;
+
+    expect(header).toContain("HttpOnly");
+    /*
+     * Derived from the policy rather than repeating the literal. The mint tells
+     * the admin whether its pane can frame the site, and that answer is only
+     * correct for the attribute this cookie actually carries — a route that
+     * went back to writing its own would leave the two agreeing on the day it
+     * was changed and disagreeing forever after, with the pane confidently
+     * framing a site that renders the published page.
+     */
+    expect(header).toContain(`SameSite=${PREVIEW_COOKIE_SAME_SITE}`);
+    expect(header).toContain("Secure");
+    expect(header).toContain(`Expires=${expiresAt.toUTCString()}`);
+  });
+
+  describe("refusals", () => {
+    const cases: Array<[string, () => Promise<Request>]> = [
+      ["no token at all", () => Promise.resolve(request())],
+      ["an empty token", () => Promise.resolve(request(""))],
+      ["a garbage token", () => Promise.resolve(request("not-a-jwt"))],
+      [
+        "a token signed with another secret",
+        async () =>
+          request(
+            (
+              await signPreviewToken(SCOPE, `${TEST_SECRET}-other`, {
+                generation: GENERATION,
+                minter: "minter-1",
+              })
+            ).token
+          ),
+      ],
+      [
+        "a revoked token",
+        async () =>
+          request(
+            (
+              await signPreviewToken(SCOPE, TEST_SECRET, {
+                generation: GENERATION - 1,
+                minter: "minter-1",
+              })
+            ).token
+          ),
+      ],
+    ];
+
+    for (const [label, build] of cases) {
+      it(`answers 404 to ${label}, and identically`, async () => {
+        const { route, enable } = routeFor();
+
+        const response = await route.GET(await build());
+
+        // Every failure looks the same: anything else makes the endpoint an
+        // oracle for which entries have unpublished drafts.
+        expect(response.status).toBe(404);
+        expect(response.headers.get("set-cookie")).toBeNull();
+        expect(response.headers.get("location")).toBeNull();
+        expect(enable).not.toHaveBeenCalled();
+      });
+    }
+
+    it("refuses to redirect anywhere but this site", async () => {
+      // The target comes from the app rather than the request, so this guards a
+      // mistake — but an open redirect wearing a preview link is worth making
+      // unreachable.
+      const { token } = await signPreviewToken(SCOPE, TEST_SECRET, {
+        generation: GENERATION,
+        minter: "minter-1",
+      });
+
+      for (const target of [
+        "//evil.example/x",
+        // A special scheme normalises a backslash to a slash, so these resolve
+        // to another host while still starting with a single "/".
+        "/\\evil.example/x",
+        "/\\\\evil.example/x",
+        "https://evil.example/x",
+        "javascript:alert(1)",
+        // Not off-site, but not a path either: a bare relative target resolves
+        // against the ROUTE's own directory, so it would silently send the
+        // visitor somewhere under /api rather than where the app meant.
+        "pages/entry-1",
+        // No fixed sentinel origin can be named to slip past the check, because
+        // there is no fixed sentinel origin: the target is resolved against the
+        // request's own.
+        "//nextly.invalid/x",
+        "///nextly.invalid/x",
+      ]) {
+        const { route, enable } = routeFor({ redirectTo: () => target });
+        const response = await route.GET(request(token));
+
+        expect(response.status).toBe(404);
+        expect(response.headers.get("location")).toBeNull();
+        expect(enable).not.toHaveBeenCalled();
+      }
+    });
+
+    it("refuses a link whose target cannot be resolved", async () => {
+      // A preview link outlives what it points at. When the entry has been
+      // deleted since the link was minted, the app's lookup rejects — and a 500
+      // here while every other failure answers 404 would make the endpoint an
+      // oracle again, separating entries that once existed from those that
+      // never did.
+      const { token } = await signPreviewToken(SCOPE, TEST_SECRET, {
+        generation: GENERATION,
+        minter: "minter-1",
+      });
+
+      for (const redirectTo of [
+        () => {
+          throw new Error("entry was deleted");
+        },
+        () => Promise.reject(new Error("entry was deleted")),
+        // Saying so without throwing, which is the shape an app should reach
+        // for first.
+        () => null,
+      ]) {
+        const { route, enable } = routeFor({ redirectTo });
+        const response = await route.GET(request(token));
+
+        expect(response.status).toBe(404);
+        expect(response.headers.get("set-cookie")).toBeNull();
+        expect(enable).not.toHaveBeenCalled();
+      }
+    });
+
+    it("sends the normalised target rather than the string it checked", async () => {
+      // CR, LF and NUL in a path — from a slug field, say — make the `Response`
+      // constructor throw when they reach a header raw. Emitting what the URL
+      // parser produced closes the gap between the value that was validated and
+      // the value that is used: the parser strips CR and LF and percent-encodes
+      // NUL, so the header cannot carry a second one.
+      const { token } = await signPreviewToken(SCOPE, TEST_SECRET, {
+        generation: GENERATION,
+        minter: "minter-1",
+      });
+      const CR = String.fromCharCode(13);
+      const LF = String.fromCharCode(10);
+      const NUL = String.fromCharCode(0);
+
+      for (const target of [
+        `/pages/a${CR}${LF}X-Injected: yes`,
+        `/pages/a${LF}X-Injected: yes`,
+        `/pages/a${NUL}b`,
+      ]) {
+        const { route, enable } = routeFor({ redirectTo: () => target });
+        const response = await route.GET(request(token));
+
+        expect(response.status).toBe(307);
+        const location = response.headers.get("location") ?? "";
+        expect(location).not.toContain(CR);
+        expect(location).not.toContain(LF);
+        expect(location).not.toContain(NUL);
+        expect(response.headers.get("x-injected")).toBeNull();
+        expect(enable).toHaveBeenCalledOnce();
+      }
+    });
+
+    it("keeps the query and fragment of a target it accepts", async () => {
+      // Normalising must not quietly drop the parts of a path a preview link
+      // needs — a locale query or an anchor into the page being reviewed.
+      const { token } = await signPreviewToken(SCOPE, TEST_SECRET, {
+        generation: GENERATION,
+        minter: "minter-1",
+      });
+      const { route } = routeFor({
+        redirectTo: () => "/pages/entry-1?locale=fr#section-2",
+      });
+
+      const response = await route.GET(request(token));
+
+      expect(response.headers.get("location")).toBe(
+        "/pages/entry-1?locale=fr#section-2"
+      );
+    });
+  });
+});
+
+describe("request input the reader must survive", () => {
+  it("treats a cookie that cannot be decoded as no session", async () => {
+    // A cookie is request input whoever wrote it, and "%" alone makes
+    // decodeURIComponent throw — which would answer a page request with a 500
+    // rather than simply no preview.
+    const scope = await readPreviewScope({
+      secret: TEST_SECRET,
+      generation: GENERATION,
+      cookies: () => Promise.resolve({ get: () => ({ value: "%" }) }),
+    });
+
+    expect(scope).toBeNull();
+  });
+});
+
+describe("what a preview session may read", () => {
+  async function sessionFor(scope = SCOPE, generation = GENERATION) {
+    const { token } = await signPreviewToken(scope, TEST_SECRET, {
+      generation,
+      minter: "minter-1",
+    });
+    const { route } = routeFor();
+    return cookiesFrom(await route.GET(request(token)));
+  }
+
+  it("reports the document the link named", async () => {
+    const store = await sessionFor();
+
+    const scope = await readPreviewScope({
+      secret: TEST_SECRET,
+      generation: GENERATION,
+      cookies: () => Promise.resolve(store),
+    });
+
+    expect(scope).toEqual(SCOPE);
+  });
+
+  it("grants that document and refuses every other", async () => {
+    const store = await sessionFor();
+    const scope = await readPreviewScope({
+      secret: TEST_SECRET,
+      generation: GENERATION,
+      cookies: () => Promise.resolve(store),
+    });
+
+    expect(previewGrantsDraft(scope, SCOPE)).toBe(true);
+    expect(
+      previewGrantsDraft(scope, {
+        collection: "pages",
+        entryId: "entry-2",
+      })
+    ).toBe(false);
+    expect(
+      previewGrantsDraft(scope, {
+        collection: "posts",
+        entryId: "entry-1",
+      })
+    ).toBe(false);
+    // No session at all grants nothing, which is the default for every visitor.
+    expect(previewGrantsDraft(null, SCOPE)).toBe(false);
+  });
+
+  it("stops granting the moment the generation moves", async () => {
+    // The session is re-verified on every read rather than trusted because the
+    // route once said yes, so revoking reaches sessions already in flight.
+    const store = await sessionFor();
+
+    const scope = await readPreviewScope({
+      secret: TEST_SECRET,
+      generation: GENERATION + 1,
+      cookies: () => Promise.resolve(store),
+    });
+
+    expect(scope).toBeNull();
+    expect(previewGrantsDraft(scope, SCOPE)).toBe(false);
+  });
+
+  it("reports nothing when there is no cookie", async () => {
+    const scope = await readPreviewScope({
+      secret: TEST_SECRET,
+      generation: GENERATION,
+      cookies: () => Promise.resolve({ get: () => undefined }),
+    });
+
+    expect(scope).toBeNull();
+  });
+});
+
+describe("the link's own record", () => {
+  async function recordedToken(): Promise<{ token: string; linkId: string }> {
+    const { token, linkId } = await signPreviewToken(SCOPE, TEST_SECRET, {
+      generation: GENERATION,
+      minter: "user-1",
+      recorded: true,
+    });
+    return { token, linkId };
+  }
+
+  function checks(answer: boolean) {
+    return {
+      opened: vi.fn((_link: VerifiedPreviewLink) => Promise.resolve(answer)),
+      live: vi.fn((_link: VerifiedPreviewLink) => Promise.resolve(answer)),
+    };
+  }
+
+  it("refuses a link its record refuses, the same as any other failure", async () => {
+    const { token } = await recordedToken();
+    const links = checks(false);
+    const { route, enable } = routeFor({ links });
+
+    const response = await route.GET(request(token));
+
+    expect(response.status).toBe(404);
+    expect(response.headers.get("set-cookie")).toBeNull();
+    expect(enable).not.toHaveBeenCalled();
+    // Refused at the first ask, before anything is counted.
+    expect(links.live).toHaveBeenCalledTimes(1);
+    expect(links.opened).not.toHaveBeenCalled();
+  });
+
+  it("asks the record about a recorded link by its id, and an older one without", async () => {
+    const { token, linkId } = await recordedToken();
+    const { token: older } = await signPreviewToken(SCOPE, TEST_SECRET, {
+      generation: GENERATION,
+      minter: "user-1",
+    });
+    const links = checks(true);
+    const { route } = routeFor({ links });
+
+    expect((await route.GET(request(token))).status).toBe(307);
+    expect((await route.GET(request(older))).status).toBe(307);
+
+    const [first, second] = links.opened.mock.calls.map(call => call[0]);
+    expect(first.linkId).toBe(linkId);
+    expect(first.scope).toEqual(SCOPE);
+    expect(first.issuedAt).toBeInstanceOf(Date);
+    expect(second.linkId).toBeUndefined();
+    expect(second.issuedAt).toBeInstanceOf(Date);
+  });
+
+  it("refuses a revoked link before resolving where it would have gone", async () => {
+    // Resolving the target is a trusted read of the draft, and it may run the
+    // application's preview callback and read hooks: a revoked link must not
+    // keep setting that work off.
+    const { token } = await recordedToken();
+    const links = checks(false);
+    const redirectTo = vi.fn(() => "/pages/entry-1");
+    const { route } = routeFor({ links, redirectTo });
+
+    expect((await route.GET(request(token))).status).toBe(404);
+    expect(redirectTo).not.toHaveBeenCalled();
+    expect(links.opened).not.toHaveBeenCalled();
+  });
+
+  it("does not count an opening that is refused for another reason", async () => {
+    const { token } = await recordedToken();
+    const links = checks(true);
+    const { route } = routeFor({ links, redirectTo: () => null });
+
+    expect((await route.GET(request(token))).status).toBe(404);
+    expect(links.opened).not.toHaveBeenCalled();
+  });
+
+  it("ends a session already in flight once its record refuses it", async () => {
+    const { token } = await recordedToken();
+    const cookies = async () => ({
+      get: (name: string) =>
+        name === PREVIEW_SCOPE_COOKIE
+          ? { value: encodeURIComponent(token) }
+          : undefined,
+    });
+    const allowed = checks(true);
+    const refused = checks(false);
+
+    expect(
+      await readPreviewScope({
+        secret: TEST_SECRET,
+        generation: GENERATION,
+        cookies,
+        links: allowed,
+      })
+    ).toEqual(SCOPE);
+    expect(
+      await readPreviewScope({
+        secret: TEST_SECRET,
+        generation: GENERATION,
+        cookies,
+        links: refused,
+      })
+    ).toBeNull();
+    // Rendering is not opening: only `live` is asked.
+    expect(allowed.opened).not.toHaveBeenCalled();
+    expect(allowed.live).toHaveBeenCalledTimes(1);
+  });
+});

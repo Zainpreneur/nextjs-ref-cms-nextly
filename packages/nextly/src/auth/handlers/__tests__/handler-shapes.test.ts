@@ -1,0 +1,1553 @@
+/**
+ * Regression tests for auth-handler response shapes.
+ *
+ * One test per handler asserts the canonical respondX wire shape against
+ * the spec §7.6 / 7.7 table:
+ *
+ *   - login            -> respondAction("Logged in.", { user, accessToken, ... })
+ *   - logout           -> respondAction("Logged out.")
+ *   - refresh          -> respondData({ user, accessToken, refreshToken, expiresAt })
+ *   - register         -> respondAction(message, ...)  [silent vs reveal paths]
+ *   - setup-status     -> respondData({ isSetup, requiresInitialUser, ... })
+ *   - setup            -> respondAction("Setup complete.", { user, ... }, status 201)
+ *   - forgot-password  -> respondAction("If an account exists ...")  [no email leak]
+ *   - reset-password   -> respondAction("Password reset.")
+ *   - verify-email     -> respondAction("Email verified.", { email })
+ *   - verify-email/resend -> respondAction("Verification email sent.")
+ *   - change-password  -> respondAction("Password changed.")
+ *   - session          -> respondData({ user, accessToken })
+ *   - csrf             -> respondData({ token })
+ *
+ * Every test also asserts the body has no `data` property, guarding
+ * against accidental re-introduction of a `{ data: ... }` envelope.
+ */
+import { jwtVerify } from "jose";
+import { poolWaitTimeoutError } from "@nextlyhq/adapter-drizzle/types";
+import { describe, expect, it, vi } from "vitest";
+
+// These tests read a session with no database behind it. Whether the account
+// may still use its token is the session check's own question, covered by
+// `auth/session/__tests__/session-standing.test.ts` and, on each dialect,
+// `session-cutoff.integration.test.ts`; here every account may.
+vi.mock("../../session/session-standing", async importOriginal => ({
+  ...(await importOriginal<typeof import("../../session/session-standing")>()),
+  sessionTokenIsCurrent: async () => true,
+}));
+
+import { hashPassword } from "../../password";
+import { signAccessToken } from "../../jwt/sign";
+import { setCsrfCookie } from "../../csrf/csrf-cookie";
+import { setAccessTokenCookie } from "../../cookies/access-token-cookie";
+import { setRefreshTokenCookies } from "../../cookies/refresh-token-cookie";
+import { handleChangePassword } from "../change-password";
+import { handleCsrf } from "../csrf";
+import { handleForgotPassword } from "../forgot-password";
+import { handleLogin } from "../login";
+import { handleLogout } from "../logout";
+import { handleRefresh } from "../refresh";
+import { handleRegister } from "../register";
+import { handleAcceptInvite } from "../accept-invite";
+import { handleResetPassword } from "../reset-password";
+import { NextlyError } from "../../../errors/nextly-error";
+import { getNextlyLogger } from "../../../observability/logger";
+import { handleSession } from "../session";
+import { handleSetup, handleSetupStatus } from "../setup";
+import { handleResendVerification, handleVerifyEmail } from "../verify-email";
+import { secretToKey } from "../../jwt/sign";
+import { hashRefreshToken } from "../../session/refresh";
+import { verifyCredentials } from "../../credentials/verify-credentials";
+import { AuthHookRegistry } from "../../pipeline/hooks";
+import { createPasswordStrategy } from "../../pipeline/password-strategy";
+
+import { fakeSessionRows } from "./session-row-fake";
+
+/**
+ * The cost the fixture password hashes are made at. bcrypt writes its cost into
+ * the hash, so the login handler's verification runs the same code against a
+ * cost-4 hash as against a cost-12 one, in a fraction of the time; these tests
+ * are about the handler's answers, not the hashing.
+ */
+const FIXTURE_SALT_ROUNDS = 4;
+
+const SECRET = "test-secret-that-is-at-least-32-characters-long!!";
+
+/**
+ * The account-state gate every session-issuing path now runs. These fixtures
+ * assert response shapes rather than account state, so the gate is given a
+ * usable account and the shape under test is what decides the result.
+ */
+const usableAccount = async (userId: string) => ({
+  userId,
+  isActive: true,
+  lockedUntil: null,
+  emailVerified: new Date("2026-01-01T00:00:00Z"),
+  passwordUpdatedAt: null,
+  // The identity the session is signed with comes from this read, so it is
+  // the fixture user's.
+  email: "a@example.com",
+  name: "A",
+  image: null,
+  sessionEpoch: 0,
+});
+const usableAccountGate = {
+  requireEmailVerification: true,
+  fetchAccountState: usableAccount,
+  withSessionRowTransaction:
+    fakeSessionRows(usableAccount).withSessionRowTransaction,
+};
+
+/**
+ * Build the auth-pipeline deps a login-path test needs: the built-in password
+ * strategy (wrapping verifyCredentials with the given lockout deps, exactly as
+ * deps-bridge does), an empty hook registry, and the challenge token TTL. With
+ * these, handleLogin runs its normal pipeline and the behavior is unchanged.
+ */
+function loginPipelineDeps(lockoutDeps: {
+  findUserByEmail: (email: string) => Promise<unknown>;
+  incrementFailedAttempts: (userId: string) => Promise<void>;
+  lockAccount: (userId: string, lockedUntil: Date) => Promise<void>;
+  resetFailedAttempts: (userId: string) => Promise<void>;
+  maxLoginAttempts: number;
+  lockoutDurationSeconds: number;
+  requireEmailVerification: boolean;
+}) {
+  const passwordStrategy = createPasswordStrategy({
+    verify: async ({ email, password }) => {
+      const u = await verifyCredentials(
+        { email, password },
+        lockoutDeps as never
+      );
+      return {
+        id: u.id as never,
+        email: u.email,
+        name: u.name,
+        image: u.image,
+        mustChangePassword: u.mustChangePassword,
+        passwordUpdatedAt: u.passwordUpdatedAt,
+        sessionEpoch: u.sessionEpoch,
+      };
+    },
+  });
+  return {
+    authStrategies: [passwordStrategy],
+    authHooks: new AuthHookRegistry(),
+    pluginCtx: {} as never,
+    challengeTokenTTL: 300,
+    auditLog: { write: vi.fn().mockResolvedValue(undefined) },
+  };
+}
+
+function makeRequest(
+  method: string,
+  body: Record<string, unknown> | null,
+  extra?: { cookie?: string; csrfToken?: string }
+): Request {
+  const csrfToken = extra?.csrfToken ?? "csrf-test-token";
+  // Inject a matching csrf cookie so the double-submit check passes
+  // unless the caller explicitly overrides the cookie header.
+  const cookie = extra?.cookie ?? `nextly_csrf=${csrfToken}`;
+  const merged =
+    body == null
+      ? null
+      : body.csrfToken === undefined
+        ? { ...body, csrfToken }
+        : body;
+  return new Request("http://localhost:3000/admin/api/auth/x", {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      Origin: "http://localhost:3000",
+      cookie,
+    },
+    body: merged == null ? undefined : JSON.stringify(merged),
+  });
+}
+
+const ALLOWED_ORIGINS = ["http://localhost:3000"];
+
+/** Setup as development has it: no token asked for, one setup at a time. */
+const OPEN_SETUP = {
+  required: false,
+  verify: async () => "valid" as const,
+  confirm: async () => "valid" as const,
+  spend: async () => {},
+  claim: async () => ({ release: async () => {} }),
+};
+
+describe("login handler: respondAction shape", () => {
+  it("returns { message, user, accessToken, refreshToken, expiresAt }", async () => {
+    const fakeUser = {
+      id: "u1",
+      email: "a@example.com",
+      name: "A",
+      image: null,
+      passwordHash: "$2a$10$abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+      emailVerified: new Date(),
+      isActive: true,
+      failedLoginAttempts: 0,
+      sessionEpoch: 0,
+      lockedUntil: null,
+    };
+
+    // verifyCredentials uses bcryptjs; supply a real hash so the compare
+    // succeeds without us having to monkey-patch the credentials module.
+    const passwordHash = await hashPassword("Pass1234!", FIXTURE_SALT_ROUNDS);
+
+    const findUserByEmail = vi
+      .fn()
+      .mockResolvedValue({ ...fakeUser, passwordHash });
+    const incrementFailedAttempts = vi.fn().mockResolvedValue(undefined);
+    const lockAccount = vi.fn().mockResolvedValue(undefined);
+    const resetFailedAttempts = vi.fn().mockResolvedValue(undefined);
+
+    const deps = {
+      ...usableAccountGate,
+      secret: SECRET,
+      isProduction: false,
+      accessTokenTTL: 900,
+      refreshTokenTTL: 604800,
+      maxLoginAttempts: 5,
+      lockoutDurationSeconds: 900,
+      loginStallTimeMs: 0,
+      requireEmailVerification: true,
+      allowedOrigins: ALLOWED_ORIGINS,
+      trustProxy: false,
+      trustedProxyIps: [],
+      findUserByEmail,
+      incrementFailedAttempts,
+      lockAccount,
+      resetFailedAttempts,
+      fetchSessionRoles: vi
+        .fn()
+        .mockResolvedValue({ roleIds: ["super-admin"], validUntil: undefined }),
+      fetchCustomFields: vi.fn().mockResolvedValue({}),
+      storeRefreshToken: vi.fn().mockResolvedValue(undefined),
+      ...loginPipelineDeps({
+        findUserByEmail,
+        incrementFailedAttempts,
+        lockAccount,
+        resetFailedAttempts,
+        maxLoginAttempts: 5,
+        lockoutDurationSeconds: 900,
+        requireEmailVerification: true,
+      }),
+    };
+
+    const req = makeRequest("POST", {
+      email: "a@example.com",
+      password: "Pass1234!",
+    });
+    const res = await handleLogin(req, deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+
+    expect(body).not.toHaveProperty("data");
+    expect(body.message).toBe("Logged in.");
+    expect(body.user).toMatchObject({
+      id: "u1",
+      email: "a@example.com",
+      name: "A",
+      roleIds: ["super-admin"],
+    });
+    expect(typeof body.accessToken).toBe("string");
+    expect(typeof body.refreshToken).toBe("string");
+    expect(typeof body.expiresAt).toBe("string");
+    // expiresAt is ISO-8601, future-dated
+    expect(Number.isFinite(Date.parse(body.expiresAt as string))).toBe(true);
+  });
+
+  it("records a login-succeeded audit event once a session is issued", async () => {
+    // Failures are recorded already. Without the matching success an operator
+    // reading the trail after a credential leak can see that someone tried and
+    // not whether they got in, which is the question that actually matters.
+    const passwordHash = await hashPassword("Pass1234!", FIXTURE_SALT_ROUNDS);
+    const fakeUser = {
+      id: "u1",
+      email: "a@example.com",
+      name: "A",
+      passwordHash,
+      isActive: true,
+      emailVerified: true,
+      failedLoginAttempts: 0,
+      sessionEpoch: 0,
+      lockedUntil: null,
+      mustChangePassword: false,
+    };
+    const findUserByEmail = vi.fn().mockResolvedValue(fakeUser);
+    const incrementFailedAttempts = vi.fn().mockResolvedValue(undefined);
+    const lockAccount = vi.fn().mockResolvedValue(undefined);
+    const resetFailedAttempts = vi.fn().mockResolvedValue(undefined);
+    const pipeline = loginPipelineDeps({
+      findUserByEmail,
+      incrementFailedAttempts,
+      lockAccount,
+      resetFailedAttempts,
+      maxLoginAttempts: 5,
+      lockoutDurationSeconds: 900,
+      requireEmailVerification: true,
+    });
+    const deps = {
+      ...usableAccountGate,
+      secret: SECRET,
+      accessTokenTTL: 900,
+      refreshTokenTTL: 604800,
+      loginStallTimeMs: 0,
+      requireEmailVerification: true,
+      allowedOrigins: ALLOWED_ORIGINS,
+      trustProxy: false,
+      trustedProxyIps: [],
+      findUserByEmail,
+      incrementFailedAttempts,
+      lockAccount,
+      resetFailedAttempts,
+      fetchSessionRoles: vi
+        .fn()
+        .mockResolvedValue({ roleIds: ["super-admin"], validUntil: undefined }),
+      fetchCustomFields: vi.fn().mockResolvedValue({}),
+      storeRefreshToken: vi.fn().mockResolvedValue(undefined),
+      ...pipeline,
+    };
+
+    const req = makeRequest("POST", {
+      email: "a@example.com",
+      password: "Pass1234!",
+    });
+    const res = await handleLogin(req, deps);
+    expect(res.status).toBe(200);
+
+    const write = pipeline.auditLog.write;
+    expect(write).toHaveBeenCalledTimes(1);
+    // Attributed, unlike a failure: a completed login names who completed it.
+    // A failure cannot, because saying which account was reached is the
+    // account-state leak the unified error shape exists to avoid.
+    expect(write).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "login-succeeded", actorUserId: "u1" })
+    );
+  });
+
+  /**
+   * Drive a login whose `afterLogin` hook rejects with the given failure, and
+   * hand back what was recorded. The hook belongs to plugin code, so the
+   * failure it raises is whatever that author chose — which is why this is
+   * parameterised rather than fixed to one error type.
+   */
+  async function loginWithRejectingAfterLogin(failure: unknown) {
+    const passwordHash = await hashPassword("Pass1234!", FIXTURE_SALT_ROUNDS);
+    const fakeUser = {
+      id: "u1",
+      email: "a@example.com",
+      name: "A",
+      passwordHash,
+      isActive: true,
+      emailVerified: true,
+      failedLoginAttempts: 0,
+      sessionEpoch: 0,
+      lockedUntil: null,
+      mustChangePassword: false,
+    };
+    const findUserByEmail = vi.fn().mockResolvedValue(fakeUser);
+    const incrementFailedAttempts = vi.fn().mockResolvedValue(undefined);
+    const lockAccount = vi.fn().mockResolvedValue(undefined);
+    const resetFailedAttempts = vi.fn().mockResolvedValue(undefined);
+    const pipeline = loginPipelineDeps({
+      findUserByEmail,
+      incrementFailedAttempts,
+      lockAccount,
+      resetFailedAttempts,
+      maxLoginAttempts: 5,
+      lockoutDurationSeconds: 900,
+      requireEmailVerification: true,
+    });
+    pipeline.authHooks.add({
+      afterLogin: () => {
+        throw failure;
+      },
+    } as never);
+    const deps = {
+      ...usableAccountGate,
+      secret: SECRET,
+      accessTokenTTL: 900,
+      refreshTokenTTL: 604800,
+      loginStallTimeMs: 0,
+      requireEmailVerification: true,
+      allowedOrigins: ALLOWED_ORIGINS,
+      trustProxy: false,
+      trustedProxyIps: [],
+      findUserByEmail,
+      incrementFailedAttempts,
+      lockAccount,
+      resetFailedAttempts,
+      fetchSessionRoles: vi
+        .fn()
+        .mockResolvedValue({ roleIds: ["super-admin"], validUntil: undefined }),
+      fetchCustomFields: vi.fn().mockResolvedValue({}),
+      storeRefreshToken: vi.fn().mockResolvedValue(undefined),
+      ...pipeline,
+    };
+
+    const res = await handleLogin(
+      makeRequest("POST", {
+        email: "a@example.com",
+        password: "Pass1234!",
+      }),
+      deps
+    );
+    return { res, write: pipeline.auditLog.write };
+  }
+
+  // The hook runs after the session is created but before the client has the
+  // token body or cookies. If it throws, the handler returns an error and
+  // records a failure — so a success recorded earlier would leave the trail
+  // asserting both outcomes for one attempt, and claiming the account was
+  // reached when nothing was ever delivered to it.
+  //
+  // Both error shapes are covered because the handler's catch branches on them:
+  // a typed failure keeps its own status, while anything else is wrapped as an
+  // internal error. The invariant under test — exactly one outcome per attempt —
+  // must hold on both branches, and a plugin author is bound by neither our
+  // error convention nor our types.
+  it.each([
+    [
+      "an untyped failure, as third-party plugin code raises",
+      new Error("afterLogin exploded"),
+    ],
+    [
+      "a typed failure",
+      NextlyError.internal({ logContext: { from: "afterLogin" } }),
+    ],
+  ])(
+    "does not record a success when an afterLogin hook rejects with %s",
+    async (_label, failure) => {
+      const { res, write } = await loginWithRejectingAfterLogin(failure);
+
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(write).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "login-failed" })
+      );
+      expect(write).not.toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "login-succeeded" })
+      );
+    }
+  );
+
+  it("reports the withheld detail to the operator log", async () => {
+    // The trail keeps only core-controlled values, so anything an error carried
+    // reaches the operator here or nowhere. The projection and the report are
+    // two halves of one contract, and asserting either alone leaves the other
+    // free to stop happening.
+    const logged: Record<string, unknown>[] = [];
+    const logger = getNextlyLogger();
+    const originalWarn = logger.warn.bind(logger);
+    logger.warn = (payload: unknown) => {
+      logged.push(payload as Record<string, unknown>);
+      return undefined as never;
+    };
+
+    try {
+      await loginWithRejectingAfterLogin(
+        NextlyError.internal({
+          logContext: { strategyReason: "no SAML assertion for ada" },
+        })
+      );
+    } finally {
+      logger.warn = originalWarn;
+    }
+
+    const entry = logged.find(e => e.kind === "auth-failed");
+    expect(entry).toBeDefined();
+    expect((entry?.context as Record<string, unknown>)?.strategyReason).toBe(
+      "no SAML assertion for ada"
+    );
+  });
+
+  it("stores no identifier a failing plugin hook put on its error", async () => {
+    // The projection is asserted directly elsewhere; this pins that the handler
+    // routes through it. A plugin names its own error code and writes its own
+    // log context, and the row this produces has no actor — so anything
+    // identifying that reaches it can never be erased for its subject.
+    const { write } = await loginWithRejectingAfterLogin(
+      new NextlyError({
+        code: "ada@example.com",
+        publicMessage: "Login failed.",
+        logContext: {
+          email: "ada@example.com",
+          userId: "u-77",
+          reason: "no account for ada@example.com",
+          originalCode: "acct-8891-ada",
+        },
+      })
+    );
+
+    const recorded = write.mock.calls
+      .map(([event]: [{ kind: string; metadata?: unknown }]) => event)
+      .find(event => event.kind === "login-failed");
+
+    // The strategy that decided is kept: a core-shaped method name, stated by
+    // the handler rather than taken from the plugin's error.
+    expect(recorded?.metadata).toEqual({
+      code: "INTERNAL_ERROR",
+      strategy: "password",
+    });
+    expect(JSON.stringify(recorded)).not.toContain("ada@example.com");
+    expect(JSON.stringify(recorded)).not.toContain("u-77");
+    expect(JSON.stringify(recorded)).not.toContain("acct-8891-ada");
+  });
+
+  it("returns password_change_required with a pending token (no session) for a must-change account", async () => {
+    const passwordHash = await hashPassword("Pass1234!", FIXTURE_SALT_ROUNDS);
+    const fakeUser = {
+      id: "u1",
+      email: "a@example.com",
+      name: "A",
+      image: null,
+      passwordHash,
+      emailVerified: new Date(),
+      isActive: true,
+      // The account still holds an admin-set password.
+      mustChangePassword: true,
+      failedLoginAttempts: 0,
+      sessionEpoch: 0,
+      lockedUntil: null,
+    };
+
+    const findUserByEmail = vi.fn().mockResolvedValue(fakeUser);
+    const incrementFailedAttempts = vi.fn().mockResolvedValue(undefined);
+    const lockAccount = vi.fn().mockResolvedValue(undefined);
+    const resetFailedAttempts = vi.fn().mockResolvedValue(undefined);
+    const storeRefreshToken = vi.fn().mockResolvedValue(undefined);
+
+    const deps = {
+      secret: SECRET,
+      isProduction: false,
+      accessTokenTTL: 900,
+      refreshTokenTTL: 604800,
+      maxLoginAttempts: 5,
+      lockoutDurationSeconds: 900,
+      loginStallTimeMs: 0,
+      requireEmailVerification: true,
+      allowedOrigins: ALLOWED_ORIGINS,
+      trustProxy: false,
+      trustedProxyIps: [],
+      findUserByEmail,
+      incrementFailedAttempts,
+      lockAccount,
+      resetFailedAttempts,
+      fetchSessionRoles: vi
+        .fn()
+        .mockResolvedValue({ roleIds: ["super-admin"], validUntil: undefined }),
+      fetchCustomFields: vi.fn().mockResolvedValue({}),
+      storeRefreshToken,
+      // Read earlier than the session path now: the account-state gate runs
+      // before any continuation is minted, so these deps carry it even for
+      // a login that pauses before a session.
+      fetchAccountState: vi.fn().mockResolvedValue({
+        userId: "u1",
+        isActive: true,
+        lockedUntil: null,
+        emailVerified: fakeUser.emailVerified,
+        mustChangePassword: true,
+      }),
+      ...loginPipelineDeps({
+        findUserByEmail,
+        incrementFailedAttempts,
+        lockAccount,
+        resetFailedAttempts,
+        maxLoginAttempts: 5,
+        lockoutDurationSeconds: 900,
+        requireEmailVerification: true,
+      }),
+    };
+
+    const req = makeRequest("POST", {
+      email: "a@example.com",
+      password: "Pass1234!",
+    });
+    const res = await handleLogin(req, deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+
+    // No session was issued: the response is the change-password step, not a login.
+    expect(body.status).toBe("password_change_required");
+    expect(typeof body.pendingToken).toBe("string");
+    expect(body).not.toHaveProperty("accessToken");
+    expect(body).not.toHaveProperty("user");
+    // And no refresh token was persisted — the account has no session yet.
+    expect(storeRefreshToken).not.toHaveBeenCalled();
+    // No Set-Cookie for the access-token session.
+    expect(res.headers.get("set-cookie") ?? "").not.toContain("nextly_session");
+    // And no successful-login record. This leg returns 200 with a pending
+    // token, so a success recorded on status alone would tell an operator the
+    // account was reached when no session exists.
+    expect(deps.auditLog.write).not.toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "login-succeeded" })
+    );
+  });
+});
+
+/**
+ * What the login page is told about an unverified account. Through the real
+ * strategy pipeline, because the distinct code is only useful if it survives
+ * the chain and reaches the response the page reads.
+ */
+describe("login handler: an unverified account", () => {
+  async function loginAsUnverified(
+    password: string,
+    deactivatedAt: Date | null = null
+  ): Promise<Response> {
+    const passwordHash = await hashPassword("Pass1234!", FIXTURE_SALT_ROUNDS);
+    const fakeUser = {
+      id: "u1",
+      email: "a@example.com",
+      name: "A",
+      image: null,
+      passwordHash,
+      emailVerified: null,
+      isActive: false,
+      mustChangePassword: false,
+      failedLoginAttempts: 0,
+      sessionEpoch: 0,
+      lockedUntil: null,
+      deactivatedAt,
+    };
+    const lockout = {
+      findUserByEmail: vi.fn().mockResolvedValue(fakeUser),
+      incrementFailedAttempts: vi.fn().mockResolvedValue(undefined),
+      lockAccount: vi.fn().mockResolvedValue(undefined),
+      resetFailedAttempts: vi.fn().mockResolvedValue(undefined),
+      maxLoginAttempts: 5,
+      lockoutDurationSeconds: 900,
+      requireEmailVerification: true,
+    };
+    const deps = {
+      secret: SECRET,
+      isProduction: false,
+      accessTokenTTL: 900,
+      refreshTokenTTL: 604800,
+      loginStallTimeMs: 0,
+      allowedOrigins: ALLOWED_ORIGINS,
+      trustProxy: false,
+      trustedProxyIps: [],
+      fetchSessionRoles: vi
+        .fn()
+        .mockResolvedValue({ roleIds: [], validUntil: undefined }),
+      fetchCustomFields: vi.fn().mockResolvedValue({}),
+      storeRefreshToken: vi.fn().mockResolvedValue(undefined),
+      fetchAccountState: vi.fn().mockResolvedValue({
+        userId: "u1",
+        isActive: false,
+        lockedUntil: null,
+        emailVerified: null,
+      }),
+      ...lockout,
+      ...loginPipelineDeps(lockout),
+    };
+    return handleLogin(
+      makeRequest("POST", { email: "a@example.com", password }),
+      deps
+    );
+  }
+
+  async function codeOf(res: Response): Promise<unknown> {
+    const body = (await res.json()) as { error?: { code?: string } };
+    return body.error?.code;
+  }
+
+  it("is named to a caller who gave the right password", async () => {
+    // The login page offers to resend the verification link on this code.
+    const res = await loginAsUnverified("Pass1234!");
+    expect(res.status).toBe(403);
+    expect(await codeOf(res)).toBe("EMAIL_NOT_VERIFIED");
+  });
+
+  it("is not named for an account an administrator deactivated", async () => {
+    // No verification link is sent to it, so the resend the page would offer
+    // could never arrive: it is refused like any deactivated account.
+    const res = await loginAsUnverified("Pass1234!", new Date());
+    expect(res.status).toBe(401);
+    expect(await codeOf(res)).toBe("AUTH_INVALID_CREDENTIALS");
+  });
+
+  it("is not named to a caller who gave the wrong one", async () => {
+    const res = await loginAsUnverified("Wrong1234!");
+    expect(res.status).toBe(401);
+    expect(await codeOf(res)).toBe("AUTH_INVALID_CREDENTIALS");
+  });
+});
+
+describe("logout handler: respondAction shape", () => {
+  it("returns just { message }", async () => {
+    const deps = {
+      allowedOrigins: ALLOWED_ORIGINS,
+      deleteRefreshTokenByHash: vi.fn().mockResolvedValue(undefined),
+    };
+    const req = makeRequest("POST", {});
+    const res = await handleLogout(req, deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toEqual({ message: "Logged out." });
+    expect(body).not.toHaveProperty("data");
+  });
+});
+
+describe("refresh handler: respondData shape", () => {
+  it("returns { user, accessToken, refreshToken, expiresAt } with no message", async () => {
+    const tokenHash = hashRefreshToken("raw-refresh-token");
+    const deps = {
+      ...usableAccountGate,
+      secret: SECRET,
+      isProduction: false,
+      accessTokenTTL: 900,
+      refreshTokenTTL: 604800,
+      trustProxy: false,
+      trustedProxyIps: [],
+      findRefreshTokenByHash: vi.fn().mockResolvedValue({
+        id: "rt1",
+        userId: "u1",
+        expiresAt: new Date(Date.now() + 60_000),
+      }),
+      deleteRefreshToken: vi.fn().mockResolvedValue(undefined),
+      findUserById: vi.fn().mockResolvedValue({
+        id: "u1",
+        email: "a@example.com",
+        name: "A",
+        image: null,
+        isActive: true,
+      }),
+      fetchSessionRoles: vi
+        .fn()
+        .mockResolvedValue({ roleIds: ["super-admin"], validUntil: undefined }),
+      fetchCustomFields: vi.fn().mockResolvedValue({}),
+    };
+
+    const req = new Request("http://localhost:3000/admin/api/auth/refresh", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        cookie: `nextly_refresh=raw-refresh-token`,
+      },
+      body: JSON.stringify({}),
+    });
+
+    const res = await handleRefresh(req, deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("data");
+    expect(body).not.toHaveProperty("message");
+    expect(body.user).toMatchObject({ id: "u1", email: "a@example.com" });
+    expect(typeof body.accessToken).toBe("string");
+    expect(typeof body.refreshToken).toBe("string");
+    expect(typeof body.expiresAt).toBe("string");
+  });
+
+  // A transient DB failure during the rotation must surface as 503 and
+  // leave the session intact: the old refresh token must not be deleted,
+  // no `Set-Cookie` clears, and the response must carry the canonical
+  // `{ error }` envelope. Logging out the user on a momentary pool hiccup
+  // is the destructive behavior this guards against.
+  it("returns 503 (and does NOT delete old refresh token or clear cookies) when findUserById throws", async () => {
+    const tokenHash = hashRefreshToken("raw-refresh-token");
+    const deleteRefreshToken = vi.fn().mockResolvedValue(undefined);
+    const rows = fakeSessionRows(usableAccount);
+    const deps = {
+      secret: SECRET,
+      isProduction: false,
+      accessTokenTTL: 900,
+      refreshTokenTTL: 604800,
+      trustProxy: false,
+      trustedProxyIps: [],
+      findRefreshTokenByHash: vi.fn().mockResolvedValue({
+        id: "rt1",
+        userId: "u1",
+        expiresAt: new Date(Date.now() + 60_000),
+      }),
+      deleteRefreshToken,
+      withSessionRowTransaction: rows.withSessionRowTransaction,
+      findUserById: vi.fn().mockRejectedValue(new Error("connection lost")),
+      fetchSessionRoles: vi
+        .fn()
+        .mockResolvedValue({ roleIds: ["super-admin"], validUntil: undefined }),
+      fetchCustomFields: vi.fn().mockResolvedValue({}),
+    };
+
+    const req = new Request("http://localhost:3000/admin/api/auth/refresh", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        cookie: `nextly_refresh=${tokenHash}`,
+      },
+      body: JSON.stringify({}),
+    });
+
+    const res = await handleRefresh(req, deps);
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("SERVICE_UNAVAILABLE");
+    // Cookies must NOT be cleared on a transient failure -- the session
+    // is still valid; the next attempt should be able to rotate.
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    expect(setCookie).not.toMatch(/nextly_session=;/);
+    expect(setCookie).not.toMatch(/nextly_refresh=;/);
+    // Old token must remain in the DB so the next attempt can find it.
+    expect(deleteRefreshToken).not.toHaveBeenCalled();
+    expect(rows.calls).toEqual([]);
+  });
+});
+
+describe("register handler: respondAction shape", () => {
+  it("silent-success path returns generic message (no email echo, no user)", async () => {
+    const deps = {
+      allowedOrigins: ALLOWED_ORIGINS,
+      allowRegistration: true,
+      revealRegistrationConflict: false,
+      loginStallTimeMs: 0,
+      registerUser: vi.fn().mockResolvedValue({
+        id: "u1",
+        email: "a@example.com",
+        name: "A",
+      }),
+    };
+    const req = makeRequest("POST", {
+      email: "a@example.com",
+      password: "Pass1234!",
+      name: "A",
+    });
+    const res = await handleRegister(req, deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("data");
+    expect(body).not.toHaveProperty("user");
+    expect(body.message).toMatch(/^If this email is available/);
+    // §13.8: never echo the email back
+    expect(JSON.stringify(body)).not.toContain("a@example.com");
+  });
+
+  it("reveal-on success path returns 201 with user", async () => {
+    const deps = {
+      allowedOrigins: ALLOWED_ORIGINS,
+      allowRegistration: true,
+      revealRegistrationConflict: true,
+      loginStallTimeMs: 0,
+      registerUser: vi.fn().mockResolvedValue({
+        id: "u1",
+        email: "a@example.com",
+        name: "A",
+      }),
+    };
+    const req = makeRequest("POST", {
+      email: "a@example.com",
+      password: "Pass1234!",
+      name: "A",
+    });
+    const res = await handleRegister(req, deps);
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("data");
+    expect(body.message).toBe("Account created.");
+    expect(body.user).toMatchObject({ id: "u1", email: "a@example.com" });
+  });
+});
+
+describe("setup-status handler: respondData shape", () => {
+  it("with no administrator yet, returns { isSetup: false, requiresInitialUser: true }", async () => {
+    const deps = {
+      hasAdministrator: vi.fn().mockResolvedValue(false),
+      setupToken: OPEN_SETUP,
+      allowRegistration: false,
+    };
+    const req = new Request(
+      "http://localhost:3000/admin/api/auth/setup-status"
+    );
+    const res = await handleSetupStatus(req, deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toEqual({
+      isSetup: false,
+      requiresInitialUser: true,
+      requiresSetupToken: false,
+      allowRegistration: false,
+      passwordRule: { minLength: 8, maxBytes: 72 },
+    });
+    expect(body).not.toHaveProperty("data");
+    expect(body).not.toHaveProperty("isSetupComplete");
+  });
+
+  it("once an administrator exists, returns { isSetup: true, requiresInitialUser: false }", async () => {
+    const deps = {
+      hasAdministrator: vi.fn().mockResolvedValue(true),
+      setupToken: OPEN_SETUP,
+      // On, so a field read from anything but the flag shows as a mismatch.
+      allowRegistration: true,
+    };
+    const req = new Request(
+      "http://localhost:3000/admin/api/auth/setup-status"
+    );
+    const res = await handleSetupStatus(req, deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toEqual({
+      isSetup: true,
+      requiresInitialUser: false,
+      requiresSetupToken: false,
+      allowRegistration: true,
+      passwordRule: { minLength: 8, maxBytes: 72 },
+    });
+  });
+
+  // A transient DB failure during the administrator check must surface as 503, not
+  // collapse to `{ isSetup: false }` -- the bootstrap-gate must never
+  // synthesise a default on incomplete data.
+  it("when the administrator check throws, returns 503 SERVICE_UNAVAILABLE envelope (not isSetup:false)", async () => {
+    const deps = {
+      hasAdministrator: vi.fn().mockRejectedValue(new Error("connection lost")),
+      setupToken: OPEN_SETUP,
+      allowRegistration: false,
+    };
+    const req = new Request(
+      "http://localhost:3000/admin/api/auth/setup-status"
+    );
+    const res = await handleSetupStatus(req, deps);
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("SERVICE_UNAVAILABLE");
+    // Client distinguishes "unknown" from "false" by absence of the field.
+    expect(body).not.toHaveProperty("isSetup");
+    expect(body).not.toHaveProperty("requiresInitialUser");
+  });
+});
+
+describe("setup handler: respondAction shape", () => {
+  it("returns 201 with message + user + tokens", async () => {
+    const deps = {
+      secret: SECRET,
+      isProduction: false,
+      accessTokenTTL: 900,
+      refreshTokenTTL: 604800,
+      allowedOrigins: ALLOWED_ORIGINS,
+      trustProxy: false,
+      trustedProxyIps: [],
+      hasAdministrator: vi.fn().mockResolvedValue(false),
+      setupToken: OPEN_SETUP,
+      createSuperAdmin: vi.fn().mockResolvedValue({
+        id: "u1",
+        email: "a@example.com",
+        name: "A",
+      }),
+      fetchSessionRoles: vi
+        .fn()
+        .mockResolvedValue({ roleIds: ["super-admin"], validUntil: undefined }),
+      seedPermissions: vi.fn().mockResolvedValue(undefined),
+      storeRefreshToken: vi.fn().mockResolvedValue(undefined),
+      auditLog: { write: vi.fn().mockResolvedValue(undefined) },
+    };
+    const req = makeRequest("POST", {
+      email: "a@example.com",
+      password: "Pass1234!",
+      name: "A",
+    });
+    const res = await handleSetup(req, deps);
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("data");
+    expect(body.message).toBe("Setup complete.");
+    expect(body.user).toMatchObject({ id: "u1", email: "a@example.com" });
+    expect(typeof body.accessToken).toBe("string");
+    expect(typeof body.refreshToken).toBe("string");
+    expect(typeof body.expiresAt).toBe("string");
+    // The first administrator receives a working session, so the trail has to
+    // show it. Setup is the one session-issuing path that does not run through
+    // the shared login completion, which is exactly why it was missing.
+    expect(deps.auditLog.write).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "login-succeeded", actorUserId: "u1" })
+    );
+    // The reported expiry must be the token's own, not a clock reading taken
+    // after the awaited work above. Asserting the signer in isolation would not
+    // catch a caller that ignores what it returns.
+    const { payload } = await jwtVerify(
+      body.accessToken as string,
+      secretToKey(SECRET)
+    );
+    expect(Date.parse(body.expiresAt as string)).toBe(
+      (payload.exp as number) * 1000
+    );
+  });
+
+  // The rules a password failed are the only actionable part of the refusal.
+  // They used to travel under `details`, a key nothing reads, so the person
+  // was told their password was rejected and never by what. Asserting the
+  // canonical `data.errors` is what keeps them where a reader looks.
+  it("reports every unmet password rule on the canonical data.errors key", async () => {
+    const createSuperAdmin = vi.fn();
+    const deps = {
+      secret: SECRET,
+      isProduction: false,
+      accessTokenTTL: 900,
+      refreshTokenTTL: 604800,
+      allowedOrigins: ALLOWED_ORIGINS,
+      trustProxy: false,
+      trustedProxyIps: [],
+      hasAdministrator: vi.fn().mockResolvedValue(false),
+      setupToken: OPEN_SETUP,
+      createSuperAdmin,
+      fetchSessionRoles: vi.fn(),
+      seedPermissions: vi.fn(),
+      storeRefreshToken: vi.fn(),
+      auditLog: { write: vi.fn().mockResolvedValue(undefined) },
+    };
+    const req = makeRequest("POST", {
+      email: "a@example.com",
+      // 130 characters breaks two rules at once — the 128-character ceiling
+      // and the digester's 72-byte reach — so a single-reason envelope would
+      // still be hiding half the answer. Nothing shorter can multi-offend:
+      // a below-minimum password trips only the length rule, and the common
+      // list holds nothing under 8 characters.
+      password: "a".repeat(130),
+      name: "A",
+    });
+    const res = await handleSetup(req, deps);
+
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as {
+      error: {
+        code: string;
+        data?: {
+          errors?: Array<{ path: string; code: string; message: string }>;
+        };
+      };
+    };
+    const errors = body.error.data?.errors ?? [];
+    expect(errors.length).toBeGreaterThan(1);
+    expect(errors.every(e => e.path === "password")).toBe(true);
+    expect(errors.every(e => e.code === "WEAK_PASSWORD")).toBe(true);
+    expect(errors.map(e => e.message)).toContain(
+      "Password must be at most 128 characters"
+    );
+    expect(errors.map(e => e.message)).toContain(
+      "Password exceeds the 72-byte limit of the password digester."
+    );
+    // The old shape put them here, where no client would ever find them.
+    expect(body.error).not.toHaveProperty("details");
+    expect(createSuperAdmin).not.toHaveBeenCalled();
+  });
+
+  // Security: an unknown user count must never be treated as 0 -- a second
+  // super-admin must not be creatable on the assumption that setup is open.
+  it("when the administrator check throws, returns 503 envelope and does NOT create a user", async () => {
+    const createSuperAdmin = vi.fn();
+    const deps = {
+      secret: SECRET,
+      isProduction: false,
+      accessTokenTTL: 900,
+      refreshTokenTTL: 604800,
+      allowedOrigins: ALLOWED_ORIGINS,
+      trustProxy: false,
+      trustedProxyIps: [],
+      hasAdministrator: vi.fn().mockRejectedValue(new Error("connection lost")),
+      setupToken: OPEN_SETUP,
+      createSuperAdmin,
+      fetchSessionRoles: vi.fn(),
+      seedPermissions: vi.fn(),
+      storeRefreshToken: vi.fn(),
+    };
+    const req = makeRequest("POST", {
+      email: "a@example.com",
+      password: "Pass1234!",
+      name: "A",
+    });
+    const res = await handleSetup(req, deps);
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("SERVICE_UNAVAILABLE");
+    expect(createSuperAdmin).not.toHaveBeenCalled();
+  });
+});
+
+describe("forgot-password handler: respondAction shape", () => {
+  it("returns generic message; never echoes the email", async () => {
+    const deps = {
+      allowedOrigins: ALLOWED_ORIGINS,
+      loginStallTimeMs: 0,
+      generatePasswordResetToken: vi.fn().mockResolvedValue({}),
+    };
+    const req = makeRequest("POST", { email: "leaked@example.com" });
+    const res = await handleForgotPassword(req, deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("data");
+    expect(body.message).toBe(
+      "If an account exists for this email, a password reset link has been sent."
+    );
+    // §13.8: never echo user-supplied data
+    expect(JSON.stringify(body)).not.toContain("leaked@example.com");
+  });
+});
+
+describe("reset-password handler: respondAction shape", () => {
+  it("returns just { message: 'Password reset.' }", async () => {
+    const deps = {
+      allowedOrigins: ALLOWED_ORIGINS,
+      resetPasswordWithToken: vi
+        .fn()
+        .mockResolvedValue({ email: "a@example.com" }),
+    };
+    const req = makeRequest("POST", {
+      token: "t",
+      newPassword: "Pass1234!",
+    });
+    const res = await handleResetPassword(req, deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("data");
+    expect(body).toEqual({ message: "Password reset." });
+  });
+});
+
+describe("accept-invite handler", () => {
+  const baseDeps = () => ({
+    allowedOrigins: ALLOWED_ORIGINS,
+    acceptInvite: vi.fn().mockResolvedValue({ userId: "u1" }),
+  });
+
+  it("returns just { message: 'Invite accepted.' } on success", async () => {
+    const deps = baseDeps();
+    const req = makeRequest("POST", { token: "t", newPassword: "Pass1234!" });
+    const res = await handleAcceptInvite(req, deps);
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("data");
+    expect(body).toEqual({ message: "Invite accepted." });
+    expect(deps.acceptInvite).toHaveBeenCalledWith("t", "Pass1234!");
+  });
+
+  it("400s when the token or password is missing", async () => {
+    const deps = baseDeps();
+    const req = makeRequest("POST", { token: "t" });
+    const res = await handleAcceptInvite(req, deps);
+
+    expect(res.status).toBe(400);
+    expect(deps.acceptInvite).not.toHaveBeenCalled();
+  });
+
+  it("400s on non-string fields rather than passing them to the service", async () => {
+    const deps = baseDeps();
+    const req = makeRequest("POST", { token: 123, newPassword: { a: 1 } });
+    const res = await handleAcceptInvite(req, deps);
+
+    expect(res.status).toBe(400);
+    expect(deps.acceptInvite).not.toHaveBeenCalled();
+  });
+
+  it("400s on an empty body instead of a 500", async () => {
+    const deps = baseDeps();
+    // No JSON body at all — the parse falls back to {} and both fields fail.
+    const req = new Request("http://localhost:3000/admin/api/auth/x", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://localhost:3000",
+        cookie: "nextly_csrf=csrf-test-token",
+        "x-csrf-token": "csrf-test-token",
+      },
+    });
+    const res = await handleAcceptInvite(req, deps);
+
+    expect(res.status).toBe(400);
+    expect(deps.acceptInvite).not.toHaveBeenCalled();
+  });
+
+  it("collapses a bad token into one generic message", async () => {
+    const deps = baseDeps();
+    deps.acceptInvite.mockRejectedValue(
+      NextlyError.validation({
+        errors: [{ path: "token", code: "INVALID_INVITE", message: "no" }],
+      })
+    );
+    const req = makeRequest("POST", {
+      token: "wrong",
+      newPassword: "Pass1234!",
+    });
+    const res = await handleAcceptInvite(req, deps);
+
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error?: { message?: string } };
+    expect(body.error?.message).toBe(
+      "This invite link is invalid or has expired."
+    );
+  });
+
+  it("passes a weak-password error through, since the person can act on it", async () => {
+    const deps = baseDeps();
+    deps.acceptInvite.mockRejectedValue(
+      NextlyError.validation({
+        errors: [
+          { path: "newPassword", code: "WEAK_PASSWORD", message: "Too short." },
+        ],
+      })
+    );
+    const req = makeRequest("POST", { token: "t", newPassword: "weak" });
+    const res = await handleAcceptInvite(req, deps);
+
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as {
+      error?: { data?: { errors?: Array<{ path: string }> } };
+    };
+    expect(body.error?.data?.errors?.[0]?.path).toBe("newPassword");
+  });
+
+  it("403s when the CSRF token is missing", async () => {
+    const deps = baseDeps();
+    const req = makeRequest(
+      "POST",
+      { token: "t", newPassword: "Pass1234!", csrfToken: "mismatch" },
+      { cookie: "nextly_csrf=different" }
+    );
+    const res = await handleAcceptInvite(req, deps);
+
+    expect(res.status).toBe(403);
+    expect(deps.acceptInvite).not.toHaveBeenCalled();
+  });
+});
+
+describe("verify-email handler: respondAction shape", () => {
+  it("verify-email returns { message: 'Email verified.', email }", async () => {
+    const deps = {
+      allowedOrigins: ALLOWED_ORIGINS,
+      verifyEmail: vi
+        .fn()
+        .mockResolvedValue({ success: true, email: "a@example.com" }),
+      resendVerificationEmail: vi.fn().mockResolvedValue({ success: true }),
+    };
+    const req = makeRequest("POST", { token: "t" });
+    const res = await handleVerifyEmail(req, deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("data");
+    expect(body.message).toBe("Email verified.");
+    expect(body.email).toBe("a@example.com");
+  });
+
+  it("resend returns { message: 'Verification email sent.' } and does NOT echo email", async () => {
+    const deps = {
+      allowedOrigins: ALLOWED_ORIGINS,
+      verifyEmail: vi.fn(),
+      resendVerificationEmail: vi.fn().mockResolvedValue({ success: true }),
+    };
+    const req = makeRequest("POST", { email: "leaked@example.com" });
+    const res = await handleResendVerification(req, deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("data");
+    expect(body).toEqual({ message: "Verification email sent." });
+    expect(JSON.stringify(body)).not.toContain("leaked@example.com");
+  });
+});
+
+describe("change-password handler: respondAction shape", () => {
+  it("returns just { message: 'Password changed.' } on success", async () => {
+    // Build a real signed access token so getSession() succeeds.
+    const accessToken = await signAccessToken(
+      {
+        sub: "u1",
+        email: "a@example.com",
+        name: "A",
+        image: null,
+        roleIds: ["super-admin"],
+      },
+      SECRET,
+      900
+    );
+    const deps = {
+      secret: SECRET,
+      allowedOrigins: ALLOWED_ORIGINS,
+      changePassword: vi.fn().mockResolvedValue({ success: true }),
+      auditLog: { write: vi.fn().mockResolvedValue(undefined) },
+      trustProxy: false,
+      trustedProxyIps: [],
+    };
+    const req = new Request("http://localhost:3000/admin/api/auth/cp", {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "http://localhost:3000",
+        cookie: `nextly_csrf=ct;nextly_session=${accessToken}`,
+      },
+      body: JSON.stringify({
+        currentPassword: "old",
+        newPassword: "new-Pass1234!",
+        csrfToken: "ct",
+      }),
+    });
+    const res = await handleChangePassword(req, deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("data");
+    expect(body).toEqual({ message: "Password changed." });
+  });
+
+  // Signed in, so the request reaches the CSRF check rather than stopping at
+  // the 401 an anonymous request gets first.
+  async function signedInRequest(
+    origin: string,
+    csrf: { cookie?: string; body?: string }
+  ): Promise<Request> {
+    const accessToken = await signAccessToken(
+      {
+        sub: "u1",
+        email: "a@example.com",
+        name: "A",
+        image: null,
+        roleIds: ["super-admin"],
+      },
+      SECRET,
+      900
+    );
+    const cookies = [`nextly_session=${accessToken}`];
+    if (csrf.cookie) cookies.push(`nextly_csrf=${csrf.cookie}`);
+    return new Request("http://localhost:3000/admin/api/auth/cp", {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: origin,
+        cookie: cookies.join(";"),
+      },
+      body: JSON.stringify({
+        currentPassword: "old",
+        newPassword: "new-Pass1234!",
+        ...(csrf.body ? { csrfToken: csrf.body } : {}),
+      }),
+    });
+  }
+
+  const refusingDeps = () => ({
+    secret: SECRET,
+    allowedOrigins: ALLOWED_ORIGINS,
+    changePassword: vi.fn(),
+    auditLog: { write: vi.fn().mockResolvedValue(undefined) },
+    trustProxy: false,
+    trustedProxyIps: [],
+  });
+
+  it("a refused origin names the reason and the app's own address", async () => {
+    const deps = refusingDeps();
+    const res = await handleChangePassword(
+      await signedInRequest("http://127.0.0.1:3000", {
+        cookie: "ct",
+        body: "ct",
+      }),
+      deps
+    );
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: unknown }).error).toEqual({
+      code: "CSRF_FAILED",
+      message: "Invalid request origin",
+      data: { reason: "origin", appOrigin: "http://localhost:3000" },
+    });
+    expect(deps.changePassword).not.toHaveBeenCalled();
+  });
+
+  it("a refused token names the reason, and no address", async () => {
+    const deps = refusingDeps();
+    const res = await handleChangePassword(
+      await signedInRequest("http://localhost:3000", {}),
+      deps
+    );
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: unknown }).error).toEqual({
+      code: "CSRF_FAILED",
+      message: "Missing CSRF token",
+      data: { reason: "token" },
+    });
+    expect(deps.changePassword).not.toHaveBeenCalled();
+  });
+});
+
+describe("session handler: respondData shape", () => {
+  it("authenticated returns { user, accessToken } with no message wrapper", async () => {
+    const accessToken = await signAccessToken(
+      {
+        sub: "u1",
+        email: "a@example.com",
+        name: "A",
+        image: null,
+        roleIds: ["super-admin"],
+      },
+      SECRET,
+      900
+    );
+    const deps = { secret: SECRET };
+    const req = new Request("http://localhost:3000/admin/api/auth/session", {
+      method: "GET",
+      headers: { cookie: `nextly_session=${accessToken}` },
+    });
+    const res = await handleSession(req, deps);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("data");
+    expect(body).not.toHaveProperty("message");
+    expect(body.user).toMatchObject({ id: "u1", email: "a@example.com" });
+    expect(body.accessToken).toBe(accessToken);
+  });
+});
+
+describe("csrf handler: respondData shape", () => {
+  it("returns { token } and sets the matching cookie", async () => {
+    const deps = { isProduction: false };
+    const req = new Request("http://localhost:3000/admin/api/auth/csrf");
+    const res = await handleCsrf(req, deps);
+    expect(res.status).toBe(200);
+    const setCookie = res.headers.get("set-cookie") ?? "";
+    expect(setCookie).toMatch(/csrf=/i);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("data");
+    expect(body).not.toHaveProperty("csrfToken");
+    expect(typeof body.token).toBe("string");
+    expect((body.token as string).length).toBeGreaterThan(0);
+  });
+});
+
+// Unused references retained to keep eslint happy if the imports get
+// pruned automatically. These helpers are intentionally available for
+// future expansion of the suite.
+void setCsrfCookie;
+void setAccessTokenCookie;
+void setRefreshTokenCookies;
+
+describe("the account-state gate before continuations", () => {
+  it("refuses an INACTIVE account before any hook or challenge runs", async () => {
+    // A custom strategy authenticating an inactive account used to reach the
+    // challenge/hook machinery before the session-time gate refused: the
+    // person got a second-factor prompt to solve — and the code the
+    // challenge sent — before learning they could not sign in at all.
+    const seen: string[] = [];
+    const custom = {
+      name: "header-token",
+      authenticate: async () => ({
+        type: "authenticated",
+        user: { id: "u1", email: "a@b.c", name: "A", image: null },
+      }),
+    };
+    const hooks = new AuthHookRegistry();
+    hooks.add({
+      afterAuthenticate: async user => {
+        seen.push("afterAuthenticate");
+        return user;
+      },
+    });
+
+    // The handler answers its failures with a Response rather than a throw,
+    // so the refusal is the status — and the hook list stays empty either
+    // way, which is the separating assertion.
+    const res = await handleLogin(
+      makeRequest("POST", { email: "a@b.c", password: "x" }),
+      {
+        ...usableAccountGate,
+        secret: SECRET,
+        isProduction: false,
+        accessTokenTTL: 900,
+        refreshTokenTTL: 604800,
+        maxLoginAttempts: 5,
+        lockoutDurationSeconds: 900,
+        loginStallTimeMs: 0,
+        requireEmailVerification: true,
+        allowedOrigins: ALLOWED_ORIGINS,
+        trustProxy: false,
+        trustedProxyIps: [],
+        findUserByEmail: vi.fn().mockResolvedValue(null),
+        incrementFailedAttempts: vi.fn().mockResolvedValue(undefined),
+        lockAccount: vi.fn().mockResolvedValue(undefined),
+        resetFailedAttempts: vi.fn().mockResolvedValue(undefined),
+        fetchSessionRoles: vi
+          .fn()
+          .mockResolvedValue({ roleIds: [], validUntil: undefined }),
+        fetchCustomFields: vi.fn().mockResolvedValue({}),
+        storeRefreshToken: vi.fn().mockResolvedValue(undefined),
+        authStrategies: [custom] as never,
+        authHooks: hooks,
+        pluginCtx: {} as never,
+        challengeTokenTTL: 300,
+        auditLog: { write: vi.fn().mockResolvedValue(undefined) },
+        fetchAccountState: async (userId: string) => ({
+          userId,
+          isActive: false,
+          lockedUntil: null,
+          emailVerified: new Date("2026-01-01T00:00:00Z"),
+        }),
+      } as never
+    );
+
+    expect(res.status).toBe(401);
+    // The hook never ran: the refusal arrived before anything was done on
+    // the account's behalf.
+    expect(seen).toEqual([]);
+  });
+});
+
+// Each handler's service failing the way the adapters fail a request that
+// waited out its bound for a connection, reaching the handler unconverted.
+describe.each([
+  {
+    name: "reset-password",
+    run: (failure: Error) =>
+      handleResetPassword(
+        makeRequest("POST", { token: "t", newPassword: "Pass1234!" }),
+        {
+          allowedOrigins: ALLOWED_ORIGINS,
+          resetPasswordWithToken: vi.fn().mockRejectedValue(failure),
+        }
+      ),
+  },
+  {
+    name: "accept-invite",
+    run: (failure: Error) =>
+      handleAcceptInvite(
+        makeRequest("POST", { token: "t", newPassword: "Pass1234!" }),
+        {
+          allowedOrigins: ALLOWED_ORIGINS,
+          acceptInvite: vi.fn().mockRejectedValue(failure),
+        }
+      ),
+  },
+  {
+    name: "forgot-password",
+    run: (failure: Error) =>
+      handleForgotPassword(makeRequest("POST", { email: "a@example.com" }), {
+        allowedOrigins: ALLOWED_ORIGINS,
+        loginStallTimeMs: 0,
+        generatePasswordResetToken: vi.fn().mockRejectedValue(failure),
+      }),
+  },
+  {
+    name: "register",
+    run: (failure: Error) =>
+      handleRegister(
+        makeRequest("POST", {
+          email: "a@example.com",
+          password: "Pass1234!",
+          name: "A",
+        }),
+        {
+          allowedOrigins: ALLOWED_ORIGINS,
+          allowRegistration: true,
+          revealRegistrationConflict: false,
+          loginStallTimeMs: 0,
+          registerUser: vi.fn().mockRejectedValue(failure),
+        }
+      ),
+  },
+])("$name handler, when its database fails", ({ run }) => {
+  it("answers a busy database as DATABASE_BUSY with Retry-After", async () => {
+    const res = await run(poolWaitTimeoutError(15000));
+
+    expect(res.status).toBe(503);
+    expect(res.headers.get("retry-after")).toBe("5");
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("DATABASE_BUSY");
+  });
+
+  it("still answers any other failure as an internal error, with no retry hint", async () => {
+    const res = await run(new Error("socket hang up"));
+
+    expect(res.status).toBe(500);
+    expect(res.headers.get("retry-after")).toBeNull();
+  });
+});

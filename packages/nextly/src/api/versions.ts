@@ -1,0 +1,176 @@
+/**
+ * Version History API Route Handler for Next.js
+ *
+ * Lists version metadata for one document. Snapshots are never included; use
+ * the detail route to fetch one.
+ *
+ * Services are auto-initialized on first request using environment variables:
+ * - DB_DIALECT: Database dialect ("postgresql" | "mysql" | "sqlite")
+ * - DATABASE_URL: Database connection string
+ *
+ * @example
+ * ```typescript
+ * // In your Next.js app: app/api/versions/[kind]/[slug]/[id]/route.ts
+ * export { GET } from 'nextly/api/versions';
+ * ```
+ *
+ * @module api/versions
+ */
+
+import { getService } from "../di";
+import { appLocalization } from "../domains/i18n/configured-locales";
+import { configuredLocale } from "../domains/i18n/resolve-locale";
+import { attachVersionAuthors } from "../domains/versions/author-hydration";
+import { NextlyError } from "../errors/nextly-error";
+import type { VersionScopeKind } from "../schemas/versions/types";
+
+import { privateToSession, respondList } from "./response-shapes";
+import {
+  historyListLanguages,
+  requireRouteVersionReadAccess,
+  withLastViewedMarks,
+} from "./versions-access";
+import { withErrorHandler } from "./with-error-handler";
+
+/** Page size when the caller does not ask for one. */
+const DEFAULT_LIMIT = 25;
+
+/** Hard ceiling, so one request cannot serialize an unbounded history. */
+const MAX_LIMIT = 100;
+
+/**
+ * Context object for dynamic route handlers.
+ * Next.js passes route params as a Promise.
+ */
+interface RouteContext {
+  params: Promise<{ kind: string; slug: string; id: string }>;
+}
+
+/**
+ * Narrow the path segment to a routable scope kind. `page` exists in the
+ * version scope union but has no HTTP surface yet, so it is rejected here
+ * rather than reaching the service.
+ */
+function parseScopeKind(kind: string): VersionScopeKind {
+  if (kind === "collection" || kind === "single") return kind;
+  throw NextlyError.validation({
+    errors: [
+      {
+        path: "kind",
+        code: "INVALID_VALUE",
+        message: 'Version scope must be "collection" or "single".',
+      },
+    ],
+  });
+}
+
+/** Parse an optional positive-integer query parameter, rejecting junk. */
+function parsePositiveInt(
+  raw: string | null,
+  name: string
+): number | undefined {
+  if (raw === null) return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    throw NextlyError.validation({
+      errors: [
+        {
+          path: name,
+          code: "INVALID_VALUE",
+          message: `${name} must be a positive integer.`,
+        },
+      ],
+    });
+  }
+  return value;
+}
+
+/**
+ * GET handler listing version metadata, newest-first.
+ *
+ * Path and query parameters are validated before the access gate so malformed
+ * input fails fast. The gate then confirms the caller may read the live
+ * document: history metadata (authors, timestamps, how often a document
+ * changed) is itself disclosure, so it is restricted exactly as the document is.
+ *
+ * Rows carry only an author id as stored, so each is resolved to a display name
+ * before returning.
+ */
+// Private to the session, refusals included: the page marks where this person
+// last looked.
+export const GET = privateToSession(
+  withErrorHandler(async (request: Request, context: RouteContext) => {
+    const { kind, slug, id } = await context.params;
+    const scopeKind = parseScopeKind(kind);
+
+    const url = new URL(request.url);
+    const requestedLimit = parsePositiveInt(
+      url.searchParams.get("limit"),
+      "limit"
+    );
+    const cursor = parsePositiveInt(url.searchParams.get("cursor"), "cursor");
+    // A plain string scoping the listing to one locale's versions. An empty
+    // value is treated as absent (list every locale) rather than matching a
+    // non-existent empty-string locale.
+    const localeParam = url.searchParams.get("locale");
+    // An older spelling of a configured language lists the versions stored under its code.
+    const localization = appLocalization();
+    const locale =
+      localeParam !== null && localeParam.length > 0
+        ? ((localization && configuredLocale(localization, localeParam)) ??
+          localeParam)
+        : undefined;
+
+    // Always bounded: an unset limit still pages, and an oversized one is
+    // clamped, so no single request can serialize an entire long history.
+    const limit = Math.min(requestedLimit ?? DEFAULT_LIMIT, MAX_LIMIT);
+
+    // Asked in the language the listing names, or in any its history holds.
+    const caller = await requireRouteVersionReadAccess(
+      request,
+      scopeKind,
+      slug,
+      id,
+      locale
+    );
+
+    // The languages this caller may read the history in: the one asked for,
+    // or every one they may read.
+    const languages = historyListLanguages(locale, caller.readableLanguages);
+
+    const versions = getService("versionsService");
+    // Fetch one more than asked for: its presence is what proves another page
+    // exists. Inferring `hasNext` from a full page instead would claim a next
+    // page whenever the history length is an exact multiple of the page size,
+    // sending the client to an empty page.
+    const window = await versions.list(
+      { scopeKind, scopeSlug: slug, entryId: id },
+      {
+        limit: limit + 1,
+        ...(cursor !== undefined ? { cursor } : {}),
+        ...languages,
+      }
+    );
+    const hasNext = window.length > limit;
+    const rows = hasNext ? window.slice(0, limit) : window;
+
+    // Keyset pagination: page/totalPages are not meaningful for a cursor walk,
+    // so the meta describes the returned window.
+    // Rows record only an author id; a history list shows a person. For a
+    // person, each part's "You last looked here" row is marked; reading the
+    // list records nothing.
+    const items = await withLastViewedMarks(await attachVersionAuthors(rows), {
+      ref: { scopeKind, scopeSlug: slug, entryId: id },
+      user: caller.user,
+      authenticatedScope: caller.authenticatedScope,
+    });
+    return respondList(items, {
+      total: rows.length,
+      page: 1,
+      limit,
+      totalPages: 1,
+      hasNext,
+      hasPrev: cursor !== undefined,
+    });
+  })
+);

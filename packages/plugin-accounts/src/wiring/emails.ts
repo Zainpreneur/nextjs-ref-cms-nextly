@@ -1,0 +1,251 @@
+import type { PluginEmailTemplate } from "@nextlyhq/plugin-sdk";
+
+import type { AccountsEmail } from "../flows/mail";
+
+type Kind = AccountsEmail["kind"];
+
+/** An email's template, as the plugin first ships it; a site edits its copy in the admin. */
+interface Template {
+  name: string;
+  /** When the email is sent, in a sentence the admin shows beside it. */
+  description: string;
+  /** What causes this email to be sent, in user-facing statements. */
+  sentBy?: string[];
+  subject: string;
+  /** The body, with `{{variable}}` for each of the email's fields. */
+  html: string;
+  /**
+   * Whether the email carries a link or code that acts for whoever holds it,
+   * so no template copy (cc or bcc) may ever be added to it.
+   */
+  carriesSecret?: true;
+  /**
+   * Variables the email carries that its body does not use, declared so a
+   * site editing its copy can use them too.
+   */
+  alsoCarries?: string[];
+}
+
+/**
+ * Every email the flows send, one template each. Keyed by the email's kind,
+ * so a kind added to the flows without a template fails to compile.
+ */
+const TEMPLATES: Record<Kind, Template> = {
+  "verify-address": {
+    name: "Verify an address",
+    description:
+      "Sent when someone signs up, with the link and code that verify their address and a link to remove the account.",
+    sentBy: ["Someone signs up", "Someone asks for a new verification link"],
+    carriesSecret: true,
+    subject: "Confirm your email address",
+    html: `<p>Confirm your email address: <a href="{{link}}">confirm</a>, or type the code <strong>{{code}}</strong>.</p><p>Didn't sign up? <a href="{{notMeLink}}">Remove this account</a>.</p>`,
+  },
+  "sign-up-taken": {
+    name: "Sign-up with an address that has an account",
+    description:
+      "Sent when someone tries to sign up with an address that already has an account.",
+    sentBy: ["Someone signs up with an address that already has an account"],
+    subject: "Someone tried to sign up with your address",
+    html: `<p>Someone tried to make an account with this address, which already has one.</p><p>If it was you, <a href="{{signInLink}}">sign in</a> or <a href="{{resetLink}}">reset your password</a>. If your account was closed, contact us.</p>`,
+  },
+  "reset-password": {
+    name: "Reset a password",
+    description:
+      "Sent when someone asks to reset the password of an account, with the link that sets a new one.",
+    sentBy: ["Someone asks to reset their password"],
+    carriesSecret: true,
+    subject: "Reset your password",
+    html: `<p>Someone asked to reset the password for this address. <a href="{{link}}">Choose a new password</a>.</p><p>If it wasn't you, you can ignore this email.</p>`,
+  },
+  "reset-required": {
+    name: "A reset is needed",
+    description:
+      "Sent when too many wrong passwords mean the account needs a reset, with the link that sets a new one.",
+    sentBy: [
+      "An account needs a password reset after too many wrong passwords",
+    ],
+    carriesSecret: true,
+    subject: "Reset your password to sign in again",
+    html: `<p>There have been too many wrong passwords for your account, so it now needs a reset to sign in from a new browser. <a href="{{link}}">Choose a new password</a>.</p>`,
+  },
+  "address-change-asked": {
+    name: "An address change was asked for",
+    description:
+      "Sent to an account's address when a change to another address is asked for, with the link that cancels it.",
+    sentBy: ["Someone asks to change their account's email address"],
+    carriesSecret: true,
+    subject: "A change of your email address was asked for",
+    html: `<p>Someone signed in to your account asked to change its address to {{newAddress}}.</p><p>If it wasn't you, <a href="{{cancelLink}}">cancel the change</a>.</p>`,
+  },
+  "confirm-new-address": {
+    name: "Confirm a new address",
+    description:
+      "Sent to a new address an account asked to move to, with the link and code that confirm it.",
+    sentBy: ["Someone asks to change their account's email address"],
+    carriesSecret: true,
+    subject: "Confirm your new email address",
+    html: `<p>Confirm this as your account's new address: <a href="{{link}}">confirm</a>, or type the code <strong>{{code}}</strong> while signed in.</p>`,
+  },
+  "address-in-use": {
+    name: "An address change named an address in use",
+    description:
+      "Sent to an address that has an account when another account tries to move to it.",
+    sentBy: [
+      "Someone asks to change an account's email address to one already in use",
+    ],
+    subject: "Someone tried to use your email address",
+    html: `<p>Someone tried to move another account to this address, which already has an account. Nothing has changed.</p>`,
+  },
+  "address-changed": {
+    name: "An address changed",
+    description:
+      "Sent to an account's old address once the change to a new one is made.",
+    sentBy: ["An account's email address is changed"],
+    subject: "Your account's email address changed",
+    html: `<p>Your account's address is now {{newAddress}}. If you didn't do this, contact us.</p>`,
+  },
+  "account-deleted": {
+    name: "An account was deleted",
+    description: "Sent when the holder deletes their account.",
+    sentBy: ["Someone deletes their account"],
+    subject: "Your account was deleted",
+    html: `<p>Your account has been deleted.</p>`,
+  },
+  "password-changed": {
+    name: "A password changed",
+    description: "Sent when an account's password changes.",
+    sentBy: ["An account's password is changed"],
+    subject: "Your password changed",
+    html: `<p>Your account's password changed. If you didn't do this, reset it now.</p>`,
+  },
+  invitation: {
+    name: "An invitation",
+    description:
+      "Sent when the site invites an address that has no account, with the link that makes one.",
+    sentBy: ["The site invites someone to make an account"],
+    carriesSecret: true,
+    subject: "You're invited to make an account",
+    // Greets by name and says when the link stops working, and reads
+    // plainly too where the email holds neither, as one queued before
+    // invitations carried them does.
+    html: `<p>{% if name %}Hello {{name}},{% else %}Hello,{% endif %}</p><p>You're invited to make an account with this address. <a href="{{link}}">Choose a password</a> to start.{% if expiresAtText %} The link works until {{expiresAtText}} ({{timeZone}}).{% endif %}</p><p>If you weren't expecting this, you can ignore this email.</p>`,
+    alsoCarries: ["expiresAt"],
+  },
+  "invitation-has-account": {
+    name: "An invitation to an address that has an account",
+    description:
+      "Sent when the site invites an address that already has an account, which signs in instead.",
+    sentBy: ["The site invites someone whose address already has an account"],
+    subject: "You're invited to sign in",
+    html: `<p>You're invited to use your account here, and this address already has one. <a href="{{signInLink}}">Sign in</a>, or <a href="{{resetLink}}">reset your password</a> if you've forgotten it. If your account was closed, contact us.</p>`,
+  },
+};
+
+/**
+ * How the editor shows each variable the templates use, and its test value.
+ * Presentation only: what a send is given is unchanged.
+ */
+const VARIABLE_PRESENTATION: Record<
+  string,
+  { type: "text" | "link"; label: string; example: string }
+> = {
+  link: {
+    type: "link",
+    label: "Link",
+    example: "https://example.com/account/verify?token=sample",
+  },
+  code: { type: "text", label: "Code", example: "123456" },
+  newAddress: {
+    type: "text",
+    label: "New email address",
+    example: "ada@example.com",
+  },
+  cancelLink: {
+    type: "link",
+    label: "Cancel link",
+    example: "https://example.com/account/cancel?token=sample",
+  },
+  notMeLink: {
+    type: "link",
+    label: "Not me link",
+    example: "https://example.com/account/not-me?token=sample",
+  },
+  resetLink: {
+    type: "link",
+    label: "Reset link",
+    example: "https://example.com/account/reset?token=sample",
+  },
+  signInLink: {
+    type: "link",
+    label: "Sign-in link",
+    example: "https://example.com/account/sign-in?token=sample",
+  },
+  name: { type: "text", label: "Name", example: "Ayesha Khan" },
+  expiresAt: {
+    type: "text",
+    label: "Link expiry (ISO 8601, UTC)",
+    example: "2026-11-30T12:00:00.000Z",
+  },
+  expiresAtText: {
+    type: "text",
+    label: "Link expiry",
+    example: "30 November 2026, 5:00 PM",
+  },
+  timeZone: { type: "text", label: "Time zone", example: "Asia/Karachi" },
+};
+
+/** The slug an email kind's template is registered under. */
+export function templateSlug(kind: Kind): string {
+  return `accounts-${kind}`;
+}
+
+/** The templates the plugin contributes, one per email kind. */
+export function accountsEmailTemplates(): PluginEmailTemplate[] {
+  return (Object.entries(TEMPLATES) as Array<[Kind, Template]>).map(
+    ([kind, template]) => ({
+      slug: templateSlug(kind),
+      name: template.name,
+      description: template.description,
+      ...(template.sentBy ? { sentBy: template.sentBy } : {}),
+      ...(template.carriesSecret ? { carriesSecret: true } : {}),
+      subject: template.subject,
+      htmlContent: template.html,
+      variables: [
+        ...variablesIn(template.html),
+        ...(template.alsoCarries ?? []),
+      ].map(name => ({
+        name,
+        required: true,
+        ...VARIABLE_PRESENTATION[name],
+      })),
+    })
+  );
+}
+
+/** What an email holds that is never one of its template's variables. */
+const NOT_VARIABLES = new Set(["kind", "accountId", "to", "refs"]);
+
+/**
+ * An email's fields as its template's variables: everything but its kind,
+ * its account, its recipient and the refs its secrets are sent by. Takes the
+ * email a send rebuilt from its queued form as well as one a flow built.
+ */
+export function emailVariables(
+  email: AccountsEmail | Readonly<Record<string, unknown>>
+): Record<string, string> {
+  const variables: Record<string, string> = {};
+  for (const [name, value] of Object.entries(email)) {
+    if (NOT_VARIABLES.has(name)) continue;
+    variables[name] = String(value);
+  }
+
+  return variables;
+}
+
+function variablesIn(html: string): string[] {
+  return [
+    ...new Set(
+      [...html.matchAll(/\{\{(\w+)\}\}/g)].map(match => match[1] ?? "")
+    ),
+  ];
+}

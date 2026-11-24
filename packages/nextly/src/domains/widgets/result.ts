@@ -1,0 +1,472 @@
+/**
+ * What a widget query ANSWERS with, whatever kind of source answered it.
+ *
+ * Its own module because two producers now share it: the collection path, which
+ * compiles a query to the Direct API, and a system source's resolver, which
+ * hands the question to a domain service. Left in `execute.ts`, the resolver
+ * contract would import the executor and the executor would import the resolver
+ * registry -- a cycle around a type neither of them owns.
+ *
+ * @module domains/widgets/result
+ */
+
+import type { TimeseriesInterval } from "../collections/query/timeseries-interval";
+
+import type { toDefinition } from "./declaration/declared-widgets";
+import type { TransportableValue } from "./declaration/transportable";
+import type { GridSize } from "./grid-size";
+import type { WidgetFieldChoice, WidgetSourceFieldType } from "./sources";
+
+/**
+ * What an activity row says happened, as a reader is told it: an entry or
+ * Single was created, saved, published, unpublished or deleted.
+ *
+ * The `event` of a `system:activity` row and of a `GET /dashboard/activity`
+ * row, published here beside the rows' other wire types so a consumer can
+ * switch on it exhaustively. A closed set: the server names an event only by
+ * one of these (`activityEventOf`), and leaves it out of a row it cannot name
+ * one for.
+ *
+ * @experimental
+ */
+export type ActivityEvent =
+  | "created"
+  | "saved"
+  | "published"
+  | "unpublished"
+  | "deleted";
+
+/**
+ * One column of a list result, as the admin needs to head it.
+ *
+ * Carried on the RESULT rather than published as source metadata, and the
+ * difference is an access-control one. A widget's declared source is proven
+ * readable by the caller before a row is returned, and `select` names the
+ * fields they asked for -- so answering with labels for exactly those fields
+ * tells them nothing they did not already have. Publishing a source's field
+ * list separately would be an enumeration surface: the endpoint is careful
+ * that a source the caller may not read answers exactly as one that does not
+ * exist, and a metadata channel beside it would undo that.
+ */
+export interface WidgetResultField {
+  name: string;
+  /** Absent when the source has no human label for this field. */
+  label?: string;
+  /**
+   * What KIND of value this column holds, as the source declared it.
+   *
+   * 🔴 Carried so the renderer can present a value instead of printing it. Every
+   * source already declares this -- `{ name: "scheduledAt", type: "date" }` --
+   * and it stopped at the server, so a date crossed as an ISO string and the row
+   * drew `2026-09-01T07:00:00.000Z` at the reader. Selecting a different field
+   * is not a fix for that; it is choosing which column to not render properly,
+   * and the next card that selects a date has the same problem again.
+   *
+   * Optional because a source may describe a field it has no declaration for,
+   * and because a widget result predating this carries none. The renderer treats
+   * an absent type as "print it as text", which is what it did for everything
+   * before this existed -- so an old result and a new one differ in quality, not
+   * in correctness.
+   */
+  type?: WidgetSourceFieldType;
+  /**
+   * What each stored value of this column is called, for a choice column: the status, a select,
+   * a radio. A row shows the label for the value it holds, so a person reads "Published" rather
+   * than `published`. Absent for every other column, which is presented by its `type`.
+   */
+  choices?: readonly WidgetFieldChoice[];
+}
+
+export type WidgetResult =
+  | {
+      op: "count";
+      total: number;
+      /**
+       * Whether `total` is a FLOOR rather than the whole answer.
+       *
+       * 🔴 Present because some counts cannot be computed in the database. Where
+       * a source's rows are filtered by something the query cannot express — the
+       * collection's own lifecycle lives on its table, not on the sidecar table
+       * being counted — the only honest count walks
+       * candidates and authorizes them, which is bounded work. Past that bound
+       * the choice is to refuse, to publish a number that is quietly too small,
+       * or to say plainly that there are at least this many.
+       *
+       * Saying so is the option that stays true: a reader learns the scale
+       * without being told a wrong figure, and a card renders `1,000+` rather
+       * than failing. Absent means the count is whole.
+       */
+      atLeast?: boolean;
+    }
+  | {
+      op: "list";
+      items: Record<string, unknown>[];
+      /**
+       * The selected fields, in the order they were asked for.
+       *
+       * Present only when the query declared `select`: without it the rows
+       * carry whatever the collection holds, so there are no columns the
+       * widget chose and nothing honest to head them with.
+       */
+      fields?: WidgetResultField[];
+      /**
+       * How many rows the read matched in all, of which `items` is the first page.
+       *
+       * Taken from the same read that returned `items` -- its own count under the
+       * same filter and the same caller -- so a card's "View all (N)" names the rows
+       * the list it links to holds, never a second count that could disagree with
+       * the first. Absent from a source that does not count its rows; a card then
+       * says only that more exist, as a floor.
+       *
+       * @experimental
+       */
+      total?: number;
+      /**
+       * Whether `total` is a FLOOR rather than the whole count, as the count arm's
+       * `atLeast` is. Absent means `total` is whole.
+       *
+       * @experimental
+       */
+      atLeast?: boolean;
+      /**
+       * How `total` divides among the kinds of thing the rows are, for a
+       * source whose rows are of several kinds and each says which (`kind`):
+       * `{ collection: 8, single: 5 }` for 13 rows. Counted by the same read
+       * as `total`, so the parts add up to it. Absent from a source whose rows
+       * are of one kind.
+       *
+       * @experimental
+       */
+      totalByKind?: Readonly<Record<string, number>>;
+      /**
+       * The span of time the source looked at, in whole days back from now.
+       *
+       * A source that keeps rows only for a period answers from that period
+       * alone, so an empty answer means "none in that span" rather than
+       * "none ever", and a card can say which. Absent when the source looked
+       * without a bound, and from a source that does not say.
+       *
+       * @experimental
+       */
+      window?: { days: number };
+    }
+  | {
+      op: "groupBy";
+      /**
+       * Distinct values of the grouped field, largest bucket first.
+       *
+       * `value` is null where the column is null, which is a bucket in its own
+       * right rather than an absence: "how many rows have no region" is a real
+       * answer and folding it into another bucket would misreport both.
+       *
+       * A bucket's `atLeast` says its own count is a floor, for a source whose
+       * buckets are bounded one by one; absent, that count is whole. Optional
+       * and additive: a reader that ignores it still reads every bucket.
+       */
+      buckets: { value: string | null; count: number; atLeast?: boolean }[];
+      /**
+       * Whether buckets were left out because a cap was reached.
+       *
+       * The bucket set is ranked and capped after grouping completes, so the
+       * ones returned are genuinely the largest -- but a chart drawn from a
+       * capped set is not the whole picture, and saying so is the same choice
+       * `atLeast` makes for a bounded count. Absent means every bucket is here.
+       */
+      truncated?: boolean;
+      /**
+       * The instant the answer was computed at, in ISO 8601 UTC, for a source
+       * whose buckets depend on it (a window ending "a week from now"). A card
+       * building a link from such a bucket builds it from this instant rather
+       * than its own clock, so the list it opens holds what was counted.
+       * Additive: absent, nothing in the answer depends on when it was read.
+       *
+       * @experimental
+       */
+      asOf?: string;
+      /**
+       * The grouped field: its label for the chart's axis, and the label of each value a bucket
+       * holds. Absent when the source does not declare the field.
+       */
+      field?: WidgetResultField;
+      /**
+       * Whether each bucket's `count` is a FLOOR rather than its whole count.
+       *
+       * A different claim from `truncated`, and a result can make both.
+       * `truncated` is about the SET of buckets: some were left out. This is
+       * about the numbers inside the buckets that are here. A source that has to
+       * read and authorize rows one at a time before it can group them stops at
+       * a work bound, and past it every bucket it holds is real while every count
+       * may be short. Setting `truncated` instead would say buckets are missing,
+       * which is false; saying nothing would present short counts as whole ones.
+       * Mirrors the count arm's `atLeast`. Absent means every count is whole.
+       */
+      atLeast?: boolean;
+    }
+  | {
+      op: "timeseries";
+      /**
+       * One point per interval in the window, oldest first.
+       *
+       * An interval with no rows is present with a count of zero rather than
+       * left out. A `GROUP BY` cannot report a bucket it never grouped, so the
+       * quiet interval is simply missing from the database's answer -- and a
+       * line drawn through the gap reads as steady activity rather than none.
+       *
+       * Zero means NO ROWS, never unknown: every interval in the window was
+       * read, so a reader can act on a zero the same way they act on a five.
+       *
+       * `start` is the instant the interval begins, as UTC. A chart shows it in
+       * the viewer's own zone; bucketing happens in UTC so the same row lands
+       * in the same interval whoever is looking.
+       */
+      points: { start: string; count: number }[];
+      /** The interval the points were bucketed by. */
+      interval: TimeseriesInterval;
+    }
+  | {
+      /**
+       * A declared widget's own data, for the component it draws itself with.
+       *
+       * 🔴 A RESULT kind only, never a query's op: no query asks for it and no
+       * source answers with it. Core's runner makes it, for a widget declared
+       * with its own display, from what that widget's data function answered
+       * once the value is known to reach the browser as itself. Anything else
+       * answering with it is refused as a malformed answer.
+       */
+      op: "data";
+      data: TransportableValue;
+    };
+
+/**
+ * Whether an answer holds nothing a core display would draw: a list with no
+ * items, groups with no bucket, a series with no point. A count always holds
+ * its number, and a declared widget's own data is judged by its `isEmpty`.
+ *
+ * The one rule: each core display draws its empty state by it, and the layout
+ * read leaves a card that hides while empty off the dashboard by it, so the
+ * page is drawn without the card exactly when the card would draw nothing.
+ */
+export function answerHasNothing(result: WidgetResult): boolean {
+  switch (result.op) {
+    case "list":
+      return result.items.length === 0;
+    case "groupBy":
+      return result.buckets.length === 0;
+    case "timeseries":
+      return result.points.length === 0;
+    case "count":
+    case "data":
+      return false;
+  }
+}
+
+/**
+ * Whether a card's answer holds nothing: its widget's own empty test held
+ * (`empty`), or the core display that draws it would find nothing in it
+ * (`answerHasNothing`).
+ *
+ * The one rule a card that hides while empty is judged by, on both sides of
+ * the dashboard: the layout read leaves such a card off the page when its
+ * answer holds nothing, and the admin shows a card it was drawn without once
+ * the card's own batch answer holds something.
+ */
+export function cardAnswerIsEmpty(answer: {
+  result: WidgetResult;
+  empty?: boolean;
+}): boolean {
+  return answer.empty === true || answerHasNothing(answer.result);
+}
+
+/**
+ * A setting's label as it reads inside a sentence: "Collection" becomes
+ * "collection". The one rule for every prompt built from a label, on the
+ * server and in the admin, so the two never write it differently.
+ */
+export function settingInSentence(label: string): string {
+  return label.charAt(0).toLowerCase() + label.slice(1);
+}
+
+/**
+ * What a card missing a setting says: "No collection chosen yet". The
+ * server's needs-setting answer and the admin's empty state alike.
+ */
+export function noSettingChosen(label: string): string {
+  return `No ${settingInSentence(label)} chosen yet`;
+}
+
+/**
+ * The widget as `/admin-meta/workspace` serves it to the admin: one entry of the
+ * workspace payload's `widgets`. Never written by a widget author; declare a
+ * widget with `defineWidget`.
+ *
+ * Derived from the function the registry publishes every widget through
+ * (`toDefinition`), so the admin reads the shape the server actually sends and
+ * the two cannot drift. A type only: importing it adds nothing to a bundle.
+ */
+export type PublishedWidget = ReturnType<typeof toDefinition>;
+
+/**
+ * One slot of the dashboard batch response: what ONE widget's query answered.
+ *
+ * 🔴 A failure is a VALUE here, not a thrown error, because the batch answers
+ * 200 with every other widget's data intact -- one widget failing must colour
+ * one card, never blank the dashboard.
+ *
+ * 🔴 A discriminated union, not an object with three optional fields. The loose
+ * shape could describe a slot that reports success and carries no result, or
+ * reports failure and says nothing about why -- neither of which any producer
+ * here means to send, and both of which a consumer would have to defend against
+ * on every read. Declared this way, the compiler refuses the malformed slot at
+ * the point it would be constructed rather than leaving every reader to
+ * discover it.
+ */
+export type WidgetSlot =
+  | {
+      ok: true;
+      result: WidgetResult;
+      /**
+       * Present when a declared widget's empty test holds for this answer: the
+       * card shows its empty state, with the answer still carried. Not a failure,
+       * so never a Retry; absent for every answer that is not empty, and for
+       * every widget that declares no test.
+       */
+      empty?: true;
+    }
+  | {
+      ok: false;
+      error: string;
+      /**
+       * Present when the card's source is not available to this caller: forbidden, no longer
+       * existing, kept off the dashboard, or unable to answer what the card asks. Every one of
+       * them answers with this one code and the same `error`, so the card shows one "not
+       * available" state and nobody learns from it whether a source they cannot see exists.
+       * Absent for every other failure, which the card shows as an error with Retry.
+       */
+      code?: "unavailable";
+    }
+  | {
+      ok: false;
+      error: string;
+      /**
+       * The card's widget cannot be loaded until a setting has a value: its `load` was not
+       * run, and the card asks its reader for the setting rather than showing an error. Not a
+       * failure, so never a Retry.
+       */
+      code: "needs-setting";
+      /** The setting's label, as the card's settings name it. */
+      setting: string;
+    }
+  | {
+      ok: false;
+      error: string;
+      /**
+       * The widget's own `shows` answered no for this person: the card is left out of their
+       * dashboard, neither drawn nor counted, and its `load` was not run. Not a failure.
+       */
+      code: "not-shown";
+    }
+  | {
+      ok: false;
+      error: string;
+      /**
+       * An access or field rule the card's read needs could not run: its own database query
+       * waited out the bound for a connection. Not a refusal, since the rule never answered, and
+       * not "not available": the card shows an error with Retry, which is the remedy.
+       */
+      code: "RULE_COULD_NOT_RUN";
+      /** The collection or Single whose rule it is. */
+      subject: string;
+      /** The field, for a field's rule. */
+      field?: string;
+    };
+
+/**
+ * The dashboard batch response body, positionally matched to the queries asked.
+ *
+ * Positional rather than keyed, because two placements may ask the SAME widget
+ * different questions; a key would have to be invented and agreed by both ends,
+ * and the array index already is one.
+ */
+export interface WidgetQueryBatchResponse {
+  results: WidgetSlot[];
+}
+
+/**
+ * A card's current size, which changes as the card is resized or the screen
+ * it is drawn on does.
+ *
+ * `w` and `h` are the card's size in grid units (`{ w, h }`, twelve columns
+ * wide), within its widget's declared bounds. `tier` is how much room the card
+ * has on this screen, read from the width it is drawn at: below 340 pixels
+ * `small`, from 700 `large`, `medium` between. On a narrow dashboard a card is
+ * drawn wider than its `w` says, so a component that lays itself out by the
+ * room it has reads `tier`, not `w`.
+ *
+ * Declared here, beside the props it travels in, so the admin that builds
+ * those props and the declaration that types them read one shape.
+ *
+ * @experimental
+ */
+export interface WidgetRenderSize extends GridSize {
+  tier: "small" | "medium" | "large";
+}
+
+/**
+ * What a setting's own editor is handed by the card's settings sheet: the
+ * setting's value and a way to change it, and the card's other settings as
+ * the sheet holds them now, so an editor whose choices depend on another
+ * setting (a collection's fields, say) can offer the right ones.
+ *
+ * A change is the sheet's like any field's: kept in the form, checked by the
+ * setting's own rules, and saved with the rest when the reader saves.
+ *
+ * @experimental While the dashboard widget SDK is being built.
+ */
+export interface SettingEditorProps<Value> {
+  /** The setting's key among the card's settings. */
+  name: string;
+  /** Its label, as the settings sheet names it. */
+  label: string;
+  /** Its value in the sheet; `undefined` while none is chosen. */
+  value: Value | undefined;
+  /**
+   * Sets its value in the sheet; `undefined` clears it, so the setting is
+   * saved unset and the card reads its default, or no value where it has none.
+   */
+  onChange: (value: Value | undefined) => void;
+  /** The card's other settings, by key, as the sheet holds them now. */
+  settings: Readonly<Record<string, unknown>>;
+  /** True while the sheet is saving: the editor takes no input then. */
+  disabled: boolean;
+}
+
+/**
+ * What a widget declared with `defineWidget` and drawn by its own component is
+ * handed, as the admin builds it: the shape `WidgetProps<W>` types from the
+ * declaration, its settings and data left untyped here because only the
+ * declaration knows them.
+ *
+ * 🔴 A `type` and not an `interface`, for a reason the compiler enforces: an
+ * interface has no implicit index signature, so it is not assignable to the
+ * `Record<string, unknown>` that `PluginSlot` forwards props through, and the
+ * admin annotates the object it forwards with this, so a renamed or dropped
+ * prop fails to compile there.
+ *
+ * @experimental
+ */
+export type DeclaredComponentProps = {
+  widgetId: string;
+  /** The card's id: one widget may sit on a dashboard more than once. */
+  placementId: string;
+  settings: Record<string, unknown>;
+  size: WidgetRenderSize;
+  /**
+   * The card's data, always present: the host draws loading, no permission
+   * and error itself, and calls the component only once there is data.
+   */
+  data: unknown;
+  /** True while a newer answer is on its way; `data` is the last one. */
+  refreshing: boolean;
+  /** Asks for the card's data again. */
+  retry: () => void;
+};

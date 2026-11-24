@@ -1,0 +1,1210 @@
+/**
+ * Form Submission Handler
+ *
+ * Processes form submissions including validation, spam detection,
+ * storage, and notification triggering.
+ *
+ * @module handlers/submit-form
+ * @since 0.1.0
+ */
+
+import { isLocaleSelector } from "@nextlyhq/plugin-sdk";
+import { NextlyError, NO_SUCH_FORM } from "nextly";
+import type { PluginContext } from "nextly";
+
+import { asFormDocument, asSubmissionDocument } from "../document-shapes";
+import type {
+  FormDocument,
+  SubmissionDocument,
+  ResolvedFormBuilderConfig,
+} from "../types";
+import { closedMessageOf, formAvailabilityNow } from "../utils/form-closing";
+import { normalizeFormSettings } from "../utils/form-settings";
+import type { ValidationIssue } from "../utils/generate-schema";
+import {
+  applyRedirectPattern,
+  documentReachability,
+  parseRedirectReference,
+  pickedDocumentField,
+  type RedirectTargetDocument,
+  type RedirectUrlPattern,
+} from "../utils/redirect-target";
+import { pageFromReferer } from "../utils/sent-from";
+
+import { botCheckReady, botTokensOf, judgeBotCheck } from "./bot-check";
+import { heldRefusal, SETTINGS_CHANGED } from "./form-closing-hold";
+import { ALREADY_RESPONDED, browserTokenOf } from "./one-response";
+import { asPluginSubmission, prepareSubmission } from "./prepare-submission";
+import { checkSpam, type SpamCheckResult } from "./spam-detection";
+
+// ============================================================
+// Types
+// ============================================================
+
+/**
+ * Options for submitting a form.
+ */
+export interface SubmitFormOptions {
+  /** Form slug (URL-friendly identifier) */
+  formSlug: string;
+
+  /** Form submission data */
+  data: Record<string, unknown>;
+
+  /** Optional metadata about the submission */
+  metadata?: {
+    /** Submitter's IP address */
+    ipAddress?: string;
+    /** Submitter's user agent string */
+    userAgent?: string;
+    /**
+     * The page it was sent from, such as the request's `Referer`. Kept as
+     * its origin and path only, and only when it is a web page
+     * (`pageFromReferer`).
+     */
+    page?: string;
+  };
+
+  /**
+   * The HTTP request this submission arrived on.
+   *
+   * A route calling this helper is its own route, outside everything Nextly
+   * pins a request around, so nothing else can supply it. Without it the write
+   * reaches the submissions hooks looking like a seed or a job, and every rule
+   * scoped to a visitor stands down: the rate limit above all.
+   *
+   * The request rather than an address, because the core resolves the client
+   * from it under this deployment's proxy-trust settings. `metadata.ipAddress`
+   * is a string the caller chose, which is the right shape for the audit column
+   * it fills and the wrong shape for deciding who to throttle.
+   */
+  request?: Request;
+
+  /**
+   * Whose permissions the reads and the write are judged against.
+   *
+   * Defaults to `system`, so every existing caller behaves as before.
+   */
+  access?: SubmissionAccess;
+
+  /**
+   * The language the visitor submitted in.
+   *
+   * Decides which translation a picked redirect page is read in, and so which
+   * URL the visitor is sent to: a page whose slug is `thanks` in English and
+   * `merci` in French answered `/thanks` to everyone, because the target was
+   * read with no locale and the default answered. The built-in route takes it
+   * from `?locale=` on the submit URL, the same way core's own routes take a
+   * locale on the wire; a host route passes whatever it resolved for the page
+   * the form was on.
+   *
+   * A code that is not a configured locale reads as the default rather than
+   * failing the submission, which the collection services decide. Absent means
+   * the default, as it always has. The read wildcards (`all`, `*`) are not a
+   * language a visitor can have submitted in and are treated as absent: a read
+   * in "every language" answers a localized URL field with one value per
+   * language, which no URL pattern can be filled from.
+   */
+  locale?: string;
+}
+
+/**
+ * How this submission reaches the collections it touches.
+ *
+ * `system` is the default and is right for host code: the caller already
+ * decided, and there is no visitor whose permissions could be consulted.
+ *
+ * `public` is for a route serving an anonymous visitor. It keeps the
+ * collection's configured `access` rules in force, so a host that closed
+ * submissions or restricted reading forms is obeyed rather than bypassed. The
+ * former core endpoint ran this way, and elevating a public route to `system`
+ * silently overrode that configuration.
+ */
+export type SubmissionAccess = { as: "system" } | { as: "public" };
+
+/**
+ * Why a submission ended the way it did.
+ *
+ * `success` alone cannot carry this. An HTTP route has to answer 404 for a slug
+ * nobody used, 409 for a form its author closed and 400 for data that did not
+ * validate, and a boolean plus a human sentence cannot tell those apart without
+ * matching on the sentence.
+ *
+ * `accepted` covers every ending a visitor is told succeeded, INCLUDING the two
+ * that are deliberately indistinguishable from success: a submission the
+ * honeypot flagged, and one the rate limiter refused. A caller must not try to
+ * separate them, which is why they do not appear here as their own names.
+ */
+export type SubmitFormOutcome =
+  | "accepted"
+  | "no-such-form"
+  | "closed"
+  | "invalid"
+  | "duplicate"
+  | "failed";
+
+/**
+ * Result of form submission.
+ */
+export interface SubmitFormResult {
+  /** Whether the submission was successful */
+  success: boolean;
+
+  /**
+   * Which ending this was, for a caller that has to map it to a status code.
+   *
+   * Required rather than optional, so a return path added later cannot omit it
+   * and leave the HTTP route guessing from the message text.
+   */
+  outcome: SubmitFormOutcome;
+
+  /** The created submission document (on success) */
+  submission?: SubmissionDocument;
+
+  /** Error message (on failure) */
+  error?: string;
+
+  /** Field-level validation errors */
+  validationErrors?: Record<string, string>;
+
+  /**
+   * The same failures with their machine codes, for a caller building an HTTP
+   * error. `validationErrors` above cannot carry one, so a route reading only
+   * that has to invent a code and reports every blank answer as `INVALID`.
+   */
+  validationIssues?: ValidationIssue[];
+
+  /** Redirect URL (if form configured for redirect on success) */
+  redirect?: string;
+
+  /**
+   * The error that ended a `failed` submission, kept rather than flattened.
+   *
+   * A collection can refuse a write for reasons its host chose: a
+   * `beforeValidate` hook throwing `NextlyError.validation`, a uniqueness
+   * conflict. Those carry their own status and field detail, and reporting them
+   * all as one internal error tells a visitor the server broke when in fact
+   * their submission was answered deliberately.
+   */
+  cause?: unknown;
+
+  /**
+   * The toast the form's author wrote for a successful submission.
+   *
+   * Carried on the result rather than read from the form again by whoever
+   * presents it: the HTTP route would otherwise have to fetch the form a second
+   * time purely to learn a string this function already had in hand, and a
+   * second read is a second chance to disagree about which form was submitted.
+   *
+   * Present on every `accepted` ending, including the ones a bot caused, so the
+   * message cannot be used to tell an accepted submission from a flagged one.
+   */
+  successMessage?: string;
+}
+
+/**
+ * A submission's spam verdict and its prepared data: the honeypot first,
+ * BEFORE validation, so a bot that trips the trap while also failing
+ * validation still receives the same fake success as any other bot; then the
+ * form's bot check for one that would otherwise be refused as invalid.
+ */
+async function judgeAndPrepare(input: {
+  data: Record<string, unknown>;
+  form: FormDocument;
+  settings: ReturnType<typeof normalizeFormSettings>;
+  pluginConfig: ResolvedFormBuilderConfig;
+  pluginContext: PluginContext;
+  ipAddress: string | undefined;
+  formSlug: string;
+  /** A request produced the submission, as the write seam judges. */
+  requested: boolean;
+}): Promise<{
+  spamResult: SpamCheckResult;
+  prepared: ReturnType<typeof prepareSubmission>;
+  throttled: boolean;
+  rateCounted: boolean;
+}> {
+  const { data, form, settings, pluginConfig, pluginContext, formSlug } = input;
+  const { logger } = pluginContext;
+  // 3. Spam detection — BEFORE validation, so a bot that trips the trap
+  // while also failing validation still receives the same fake success as
+  // any other bot instead of a distinguishable validation error.
+  // Honeypot fields are by definition NOT declared form fields, so the
+  // probe is the raw payload minus the declared schema — a declared field
+  // (e.g. a real "website" input) must never trip the trap.
+  const declaredFieldNames = new Set(form.fields.map(field => field.name));
+  const undeclaredData = Object.fromEntries(
+    Object.entries(data).filter(([key]) => !declaredFieldNames.has(key))
+  );
+
+  // The honeypot only, and only to decide whether to validate. It is a pure
+  // read of the payload, so running it here and again at the write seam
+  // costs nothing and cannot disagree. The RATE LIMIT is not asked here: it
+  // counts, and a check with a side effect run twice counts one submission
+  // twice. The seam owns that one, and owns the verdict written to the row.
+  let spamResult: SpamCheckResult = await checkSpam({
+    data: undeclaredData,
+    formSlug,
+    config: {
+      // Per-form overrides win where set; blank inherits the plugin config.
+      honeypot:
+        settings.honeypotEnabled ?? pluginConfig.spamProtection.honeypot,
+    },
+  });
+
+  const isContentSpam = spamResult.isSpam;
+
+  // 4. Transform + validate. Content spam skips validation entirely — it
+  // is stored for review exactly as the bot shaped it (declared fields
+  // only, sanitized), and requiring validity would drop the evidence.
+  if (isContentSpam) {
+    logger.info?.("Spam submission detected — storing flagged", {
+      formSlug,
+      reason: spamResult.reason,
+      ipAddress: input.ipAddress,
+    });
+  }
+
+  let prepared = prepareSubmission({
+    data,
+    fields: form.fields,
+    validate: !isContentSpam,
+  });
+
+  // An invalid submission meets its form's bot check here, before it is
+  // refused, so it is judged as one written any other way: a failing or
+  // missing token keeps it as spam evidence rather than answering the bot
+  // with validation errors. Checked once: kept as evidence, the seam does
+  // not check it again, and a passing token is spent on a refusal.
+  let early: EarlyBotCheck = { rateCounted: false };
+  if (prepared.validationErrors && !isContentSpam) {
+    early = await botCheckBeforeRefusal(input);
+    if (early.spam) {
+      spamResult = early.spam;
+      prepared = prepareSubmission({
+        data,
+        fields: form.fields,
+        validate: false,
+      });
+    }
+  }
+
+  return {
+    spamResult,
+    prepared,
+    throttled: early.throttled === true,
+    rateCounted: early.rateCounted,
+  };
+}
+
+/** What the bot check made of an invalid submission, before its refusal. */
+interface EarlyBotCheck {
+  /** The submission's network is over the form's rate limit. */
+  throttled?: true;
+  /** The token failed or was missing: keep it as spam evidence. */
+  spam?: SpamCheckResult;
+  /** The rate limit has counted this submission, so the seam must not. */
+  rateCounted: boolean;
+}
+
+/**
+ * An invalid submission meets its form's bot check here, before it is
+ * refused, so it is judged as one written any other way: a failing or
+ * missing token keeps it as spam evidence rather than answering the bot with
+ * validation errors. Only for a request-made submission to a form whose
+ * check is ready, as the write seam judges. The rate limit is asked first,
+ * so a throttled network cannot make the provider be called, and is counted
+ * once: the seam is told it has been.
+ */
+async function botCheckBeforeRefusal(input: {
+  data: Record<string, unknown>;
+  form: FormDocument;
+  settings: ReturnType<typeof normalizeFormSettings>;
+  pluginConfig: ResolvedFormBuilderConfig;
+  pluginContext: PluginContext;
+  ipAddress: string | undefined;
+  requested: boolean;
+}): Promise<EarlyBotCheck> {
+  const spam = input.pluginConfig.spamProtection;
+  if (!input.requested || !botCheckReady(input.settings, spam)) {
+    return { rateCounted: false };
+  }
+  const rateCounted = Boolean(spam.rateLimit && input.ipAddress);
+  if (rateCounted) {
+    const limited = await checkSpam({
+      data: {},
+      ipAddress: input.ipAddress,
+      // The key the write seam counts the same form under.
+      formSlug: input.form.id,
+      config: { rateLimit: spam.rateLimit },
+    });
+    if (limited.isSpam) return { throttled: true, rateCounted };
+  }
+  const { logger } = input.pluginContext;
+  const bot = await judgeBotCheck({
+    settings: input.settings,
+    spam,
+    tokens: botTokensOf(input.data),
+    ip: input.ipAddress,
+    fetch: input.pluginContext.fetch,
+    warn: (message, warnContext) => logger.warn?.(message, warnContext),
+  });
+  return bot ? { spam: bot, rateCounted } : { rateCounted };
+}
+
+/**
+ * Context for the submission handler.
+ */
+export interface SubmitFormContext {
+  /** Plugin context with access to services */
+  pluginContext: PluginContext;
+
+  /** Resolved plugin configuration */
+  pluginConfig: ResolvedFormBuilderConfig;
+}
+
+// ============================================================
+// Main Submission Handler
+// ============================================================
+
+/**
+ * Whether a failed store was refused because the person has responded
+ * already: the database refused a second one-response key, or the hold found
+ * an earlier submission with the same value (`heldRefusal`).
+ */
+function isRepeatResponse(
+  error: unknown,
+  held: ReturnType<typeof heldRefusal>
+): boolean {
+  return (
+    held === "responded" ||
+    (error instanceof NextlyError &&
+      (error as { code?: unknown }).code === "DUPLICATE")
+  );
+}
+
+/**
+ * Process a form submission.
+ *
+ * This is the main entry point for handling form submissions.
+ * It performs the following steps:
+ *
+ * 1. Fetch form configuration by slug
+ * 2. Verify form status (must be "published")
+ * 3. Transform and validate submission data
+ * 4. Check for spam (honeypot, rate limiting)
+ * 5. Create submission record in database
+ * 6. Return result with redirect info if configured
+ *
+ * Note: Email notifications are triggered separately via collection
+ * hooks in the submissions collection (see Phase 4.2).
+ *
+ * @param options - Submission options
+ * @param context - Handler context with services
+ * @returns Submission result
+ *
+ * @example
+ * ```typescript
+ * const result = await submitForm(
+ *   {
+ *     formSlug: 'contact-form',
+ *     data: { name: 'John', email: 'john@example.com', message: 'Hello!' },
+ *     metadata: { ipAddress: '127.0.0.1', userAgent: 'Mozilla/5.0...' },
+ *   },
+ *   { pluginContext, pluginConfig }
+ * );
+ *
+ * if (result.success) {
+ *   console.log('Submission created:', result.submission?.id);
+ *   if (result.redirect) {
+ *     // Redirect user
+ *   }
+ * } else {
+ *   console.error('Submission failed:', result.error);
+ * }
+ * ```
+ */
+export async function submitForm(
+  options: SubmitFormOptions,
+  context: SubmitFormContext
+): Promise<SubmitFormResult> {
+  const { formSlug, data, metadata, request } = options;
+  const access: SubmissionAccess = options.access ?? { as: "system" };
+  const locale = visitorLocale(options.locale);
+  const targetRead: TargetRead = { access, locale, request };
+  const { pluginContext, pluginConfig } = context;
+  const { collections } = pluginContext.services;
+  const { logger } = pluginContext;
+
+  try {
+    // 1. Fetch form configuration
+    // In the visitor's language: the answers are judged against the fields
+    // and options that language drew, which a host may have localized.
+    const form = await fetchFormBySlug(
+      formSlug,
+      pluginConfig,
+      pluginContext,
+      access,
+      locale
+    );
+
+    if (!form) {
+      logger.warn?.("Form submission attempted for non-existent form", {
+        formSlug,
+      });
+      return { success: false, outcome: "no-such-form", error: NO_SUCH_FORM };
+    }
+
+    // The destination is resolved from one place, because two endings ask for
+    // it — the accepted submission and the throttled one disguised as accepted
+    // — and two call sites naming the inputs separately is how one of them
+    // comes to be answered in the wrong language while the other is right.
+    const redirectFor = () =>
+      resolveRedirectUrl(form, pluginConfig, pluginContext, targetRead);
+
+    // A throttled submission is answered as an accepted one, so a bot told
+    // it was limited does not learn the rate to sit under. Nothing is kept.
+    const throttledAnswer = async (): Promise<SubmitFormResult> => {
+      logger.info?.("Form submission refused (rate limit)", { formSlug });
+      return {
+        success: true,
+        outcome: "accepted",
+        successMessage: settings.successMessage,
+        // The same destination an accepted submission gets. Returning early
+        // without it left a throttled visitor on the form instead of the page
+        // its author sends people to, and made the one response this exists to
+        // disguise the only accepted one carrying no redirect.
+        redirect: await redirectFor(),
+      };
+    };
+
+    // Settings come through the one canonical reader: stored settings may
+    // carry legacy keys from earlier builder versions.
+    const settings = normalizeFormSettings(form.settings);
+
+    // 2. Check form status. The same reading the HTTP and Direct API paths do,
+    // so what a visitor is told does not depend on which entry point their
+    // client used, then the form's closing time. Its limit is judged where
+    // the submission is stored, under the lock that makes it exact.
+    const availability = formAvailabilityNow(form, settings, {
+      now: new Date(),
+    });
+    if (availability.kind !== "open") {
+      logger.info?.("Form submission rejected - form not accepting", {
+        formSlug,
+        status: form.status,
+        availability: availability.kind,
+      });
+      // `absent` answers exactly as a slug nobody used does. Saying "not
+      // currently accepting submissions" here would confirm the form exists,
+      // which is the enumeration this whole reading exists to prevent — and it
+      // would disagree with the REST and Direct API paths, which is how the
+      // four came to give four different answers in the first place.
+      return {
+        success: false,
+        outcome: availability.kind === "closed" ? "closed" : "no-such-form",
+        error:
+          availability.kind === "closed" ? availability.message : NO_SUCH_FORM,
+      };
+    }
+
+    // 2c. Single-submission forms: the same visitor (by IP) submits once.
+    // Checked before spam so a repeat visitor gets the honest message
+    // instead of an inexplicable success that stored nothing new. This is a
+    // best-effort deterrent, not a guarantee: IPs are shared (NAT/proxies),
+    // and the check-then-create pair is not atomic, so two truly concurrent
+    // submissions can both pass — an airtight version needs a partial
+    // unique index the portable field config cannot express yet.
+    // One per network address is the one-response check this path makes; the
+    // other modes are not checked here.
+    const onePerAddress = settings.oneResponse === "ip";
+    if (onePerAddress && !metadata?.ipAddress) {
+      // Without an identifier there is nothing to deduplicate on. Failing
+      // closed would block every server-to-server integration, so the gate
+      // stays open — loudly.
+      logger.warn?.(
+        "Single-submission form received a submission without an IP — the restriction cannot apply",
+        { formSlug }
+      );
+    }
+    if (onePerAddress && metadata?.ipAddress) {
+      const existing = await collections.count(
+        pluginConfig.formSubmissionOverrides.slug,
+        {
+          where: {
+            form: { equals: form.id },
+            ipAddress: { equals: metadata.ipAddress },
+            status: { not_equals: "spam" },
+          },
+        },
+        // Deliberately elevated, unlike the write below. This counts rows the
+        // visitor is not entitled to see in order to refuse their second
+        // submission; judged as the public it would count zero on any install
+        // that hides submissions and the restriction would never apply.
+        { as: "system" }
+      );
+      if (existing > 0) {
+        logger.info?.("Repeat submission rejected (single-submission form)", {
+          formSlug,
+          ipAddress: metadata.ipAddress,
+        });
+        return {
+          success: false,
+          outcome: "duplicate",
+          error: ALREADY_RESPONDED,
+        };
+      }
+    }
+
+    // 3. Spam detection, then 4. transform and validate (`judgeAndPrepare`).
+    const { spamResult, prepared, throttled, rateCounted } =
+      await judgeAndPrepare({
+        data,
+        form,
+        settings,
+        pluginConfig,
+        pluginContext,
+        ipAddress: metadata?.ipAddress,
+        formSlug,
+        requested: request !== undefined,
+      });
+    if (throttled) return throttledAnswer();
+    let isContentSpam = spamResult.isSpam;
+
+    if (prepared.validationErrors) {
+      logger.debug?.("Form validation failed", {
+        formSlug,
+        errors: prepared.validationErrors,
+      });
+      return {
+        success: false,
+        outcome: "invalid",
+        error: "Validation failed",
+        validationErrors: prepared.validationErrors,
+        validationIssues: prepared.validationIssues,
+      };
+    }
+
+    const storedData = prepared.data;
+
+    // 5. Create submission record. Content spam (honeypot/recaptcha) is
+    // stored FLAGGED, never silently dropped: a false positive stays
+    // reviewable in the Spam view and recoverable via "Not spam".
+    const submissionData = {
+      form: form.id,
+      data: storedData,
+      status: isContentSpam ? ("spam" as const) : ("new" as const),
+      spamReason: isContentSpam ? (spamResult.reason ?? null) : null,
+      ipAddress: metadata?.ipAddress || null,
+      userAgent: metadata?.userAgent || null,
+      page: pageFromReferer(metadata?.page) ?? null,
+      submittedAt: new Date(),
+    };
+
+    // Marked as the plugin's own write for the length of the call, so the
+    // write-seam hook knows a flagged row is evidence this handler chose to
+    // keep rather than a caller asking for validation to be skipped.
+    // Marked as this plugin's own write, so the write seam knows a flagged row
+    // is evidence this handler chose to keep rather than a caller asking for
+    // validation to be skipped. The form goes with it so the seam does not read
+    // it a second time.
+    const browserToken = browserTokenOf(data);
+    let submission: Awaited<ReturnType<typeof collections.createEntry>>;
+    try {
+      submission = await collections.createEntry(
+        pluginConfig.formSubmissionOverrides.slug,
+        asPluginSubmission(submissionData, {
+          keepAsEvidence: isContentSpam,
+          // Its settings too: the seam makes the row's one-response key from
+          // them. Its slug names it in a warning the seam may log.
+          form: {
+            id: form.id,
+            slug: form.slug,
+            fields: form.fields,
+            settings: form.settings,
+          },
+          // The bot-check tokens the visitor's form sent, read before the
+          // row keeps only the form's fields: the seam verifies them.
+          botTokens: botTokensOf(data),
+          // And the browser's token, for one response per browser.
+          ...(browserToken === undefined ? {} : { browserToken }),
+          // Counted already on the way here; the seam does not count it again.
+          ...(rateCounted ? { rateCounted } : {}),
+        }),
+        // Public form submission — create as system. No ambient user; an
+        // empty context already resolves to system, but be explicit.
+        //
+        // The request travels with it so the seam judges this submission on the
+        // same facts as one arriving through a Nextly route. Omitted by a caller
+        // that has none, and then the seam correctly reads the write as
+        // server-side work.
+        //
+        // `access` rather than a fixed `system`, so a route serving an anonymous
+        // visitor is still judged against the collection's own create rule. A
+        // host that closed public submissions configured that on the
+        // collection, and a write elevated past it reports a 201 for a
+        // submission they had refused.
+        { ...access, ...(request ? { request } : {}) }
+      );
+    } catch (error) {
+      // The form's closing is held again where the submission is stored, the
+      // limit under a lock that makes it exact (`form-closing-hold`): the last place
+      // went to a submission stored first, or the closing time passed since
+      // the check above, and this one is told what a visitor to a closed
+      // form is told.
+      const held = heldRefusal(error);
+      if (held === "closed") {
+        logger.info?.("Form submission refused (form closed)", { formSlug });
+        return {
+          success: false,
+          outcome: "closed",
+          error: closedMessageOf(form),
+        };
+      }
+      if (held === "changed") {
+        logger.info?.("Form submission refused (settings changed)", {
+          formSlug,
+        });
+        return { success: false, outcome: "failed", error: SETTINGS_CHANGED };
+      }
+      // The database refused a second submission with the same one-response
+      // key, or the hold found an earlier one with its value: one with the
+      // same email or network was stored first, even if only a moment before.
+      if (isRepeatResponse(error, held)) {
+        logger.info?.("Repeat submission rejected (one response per person)", {
+          formSlug,
+        });
+        return {
+          success: false,
+          outcome: "duplicate",
+          error: ALREADY_RESPONDED,
+        };
+      }
+      // The seam refuses a submission over the limit, and refuses it the same
+      // way at every door. This answers its own caller with a success anyway: a
+      // browser is on the other end of it, and a bot told it was limited learns
+      // the rate to sit under.
+      //
+      // `POST /api/forms/:slug/submit` reaches this. The route is contributed
+      // by this plugin and calls this function, so the refusal a visitor sees
+      // is decided here rather than being reconstructed as a 429 by an endpoint
+      // that never consulted the seam.
+      //
+      // Nothing is stored. A limiter that wrote a row per refusal would hand an
+      // attacker a way to fill the database with the very volume it exists to
+      // refuse.
+      if (NextlyError.isRateLimited(error)) return throttledAnswer();
+      throw error;
+    }
+
+    // The stored row decides: the write seam may have flagged it (a failing
+    // bot token) after the handler's own checks passed, and a flagged row is
+    // answered as spam, its id never handed back.
+    if ((submission.item as { status?: unknown }).status === "spam") {
+      isContentSpam = true;
+    }
+
+    logger.info?.("Form submission created successfully", {
+      formSlug,
+      submissionId: submission.item.id,
+      flaggedAsSpam: isContentSpam,
+    });
+
+    // A post-commit hook cannot un-save the submission, so a failure there is
+    // logged against the row rather than turned into a failed submission: the
+    // notification email is the one that fails this way, and telling the
+    // visitor their submission did not go through would have them send it
+    // again.
+    if (submission.warnings) {
+      logger.warn?.("Form submission side effects failed", {
+        formSlug,
+        submissionId: submission.item.id,
+        warnings: submission.warnings,
+      });
+    }
+
+    // Email notifications are sent via the afterCreate hook registered in
+    // plugin.ts init(), so they fire for all submission paths (HTTP + direct).
+    // The hook itself skips spam-flagged rows.
+
+    // 6. Determine redirect URL. Spam gets the same success shape as a real
+    // submission (minus the stored row reference) so bots can't diff the two.
+    const redirect = await redirectFor();
+
+    if (isContentSpam) {
+      return {
+        success: true,
+        outcome: "accepted",
+        successMessage: settings.successMessage,
+        redirect,
+      };
+    }
+
+    return {
+      success: true,
+      outcome: "accepted",
+      successMessage: settings.successMessage,
+      // The created ROW, not the envelope around it. Through the shared
+      // conversion, which is where the unchecked step lives and says so; the
+      // integration test reads `submission.id` off the result because nothing
+      // at compile time will.
+      submission: asSubmissionDocument(submission.item),
+      redirect,
+    };
+  } catch (error) {
+    logger.error?.("Form submission error", {
+      formSlug,
+      error: error instanceof Error ? error.message : String(error),
+    });
+
+    return {
+      success: false,
+      outcome: "failed",
+      error: "An error occurred processing your submission. Please try again.",
+      cause: error,
+    };
+  }
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+/**
+ * Fetch a form by its slug via a service-level `where` query.
+ *
+ * @param slug - Form slug
+ * @param pluginConfig - Plugin configuration
+ * @param pluginContext - Plugin context
+ * @returns Form document or null if not found
+ */
+export async function fetchFormBySlug(
+  slug: string,
+  pluginConfig: ResolvedFormBuilderConfig,
+  pluginContext: PluginContext,
+  access: SubmissionAccess = { as: "system" },
+  locale?: string
+): Promise<FormDocument | null> {
+  const { collections } = pluginContext.services;
+
+  // D56: resolve the form by slug via a service-level `where` query instead of
+  // fetching every form and filtering client-side.
+  //
+  // Nothing is caught here. A read that THREW did not establish that the form
+  // is absent, and answering `null` made a database outage or a broken schema
+  // indistinguishable from a slug nobody has ever used: the caller was told
+  // "no such form", which is a 404 a client may cache and a person may act on
+  // by deleting the link. A failure now propagates and is answered as the
+  // server error it is.
+  const result = await collections.listEntries(
+    pluginConfig.formOverrides.slug,
+    { where: { slug: { equals: slug } }, pagination: { limit: 1 } },
+    // Read in `locale` when one is named, so a localized form answers in it.
+    locale === undefined ? access : { ...access, locale }
+  );
+
+  const form = result.data?.[0];
+  return form ? asFormDocument(form) : null;
+}
+
+/**
+ * Where a successful submission sends the visitor, or undefined for nowhere.
+ *
+ * A destination is either TYPED as a URL or PICKED as a document, and the two
+ * are answered differently: a typed URL is returned verbatim, since it may
+ * legitimately point off-site, while a picked document has to be read and put
+ * through its collection's configured URL pattern.
+ *
+ * Two settings hold a picked document — `redirectPage` under the
+ * "Redirect to Page" option, and `redirectRelation` under the URL option —
+ * and both resolve through the same path, because they ask the same question.
+ *
+ * Every way of failing to produce a URL is logged. A form whose destination
+ * cannot be built behaves exactly like one configured to stay put, so without
+ * a line in the log the two are indistinguishable from the outside.
+ */
+async function resolveRedirectUrl(
+  form: FormDocument,
+  pluginConfig: ResolvedFormBuilderConfig,
+  pluginContext: PluginContext,
+  read: TargetRead
+): Promise<string | undefined> {
+  const settings = form.settings;
+  if (!settings) return undefined;
+
+  // A typed URL is returned verbatim: it is the whole point of that option,
+  // and it may legitimately point off-site.
+  if (settings.confirmationType === "redirect" && settings.redirectUrl) {
+    return settings.redirectUrl;
+  }
+
+  // Otherwise whichever key names a document, read through the SAME function
+  // the save-time rule uses. Two readers here would let this path redirect to
+  // a document the rule never inspected — which it did: the rule matched only
+  // `relationship`, so a `redirect`-with-relation form was resolved here and
+  // guarded nowhere.
+  const field = pickedDocumentField(settings as Record<string, unknown>);
+  if (!field) return undefined;
+
+  return urlForPickedDocument(
+    (settings as Record<string, unknown>)[field],
+    form,
+    pluginConfig,
+    pluginContext,
+    read
+  );
+}
+
+/**
+ * The URL for a picked document, or undefined with a reason in the log.
+ *
+ * Every branch reports. A form whose destination cannot be built behaves
+ * exactly like one configured to stay put, so without a line here the two are
+ * indistinguishable from outside — which is how a redirect that never fired
+ * went unnoticed.
+ */
+async function urlForPickedDocument(
+  stored: unknown,
+  form: FormDocument,
+  pluginConfig: ResolvedFormBuilderConfig,
+  pluginContext: PluginContext,
+  read: TargetRead
+): Promise<string | undefined> {
+  const { logger } = pluginContext;
+  const patterns = pluginConfig.redirectRelationships;
+  const reference = parseRedirectReference(stored, Object.keys(patterns));
+
+  if (!reference) {
+    logger.warn?.("Form redirects to a page, but names no readable document", {
+      form: form.slug,
+    });
+    return undefined;
+  }
+
+  const pattern = patterns[reference.collection];
+  if (!pattern) {
+    logger.warn?.(
+      "Form redirects to a collection that is not in redirectRelationships",
+      { form: form.slug, collection: reference.collection }
+    );
+    return undefined;
+  }
+
+  const target = await readTarget(reference, form, pluginContext, read);
+  if (!target) return undefined;
+
+  // Reachability is re-decided HERE, not inherited from the save. Nothing runs
+  // a forms hook when the target itself changes, so a page that was published
+  // when the form was saved can be unpublished afterwards and the save-time
+  // rule never sees it. Sending a visitor there produces exactly the "page not
+  // found" that rule exists to prevent, so this degrades to no redirect — the
+  // submission is still stored and still succeeds.
+  // The target collection's own `localized` setting, resolved at plugin init.
+  // Absent means it could not be read, which reports as undecided rather than
+  // as "not localized" — dropping a redirect on that guess would strand a
+  // destination a translation is still serving.
+  if (
+    documentReachability(
+      target,
+      pluginConfig.redirectTargetLocalization[reference.collection]
+    ) === "unreachable"
+  ) {
+    logger.warn?.("Form redirects to a page that has never been published", {
+      form: form.slug,
+      collection: reference.collection,
+      target: reference.id,
+    });
+    return undefined;
+  }
+
+  return buildUrl(pattern, target, reference.collection, form, pluginContext);
+}
+
+/**
+ * The pattern applied, or undefined with the reason logged.
+ *
+ * Separate because a configured pattern may be a FUNCTION — host code, which
+ * can throw. Letting that escape would reach `submitForm`'s outer catch AFTER
+ * the submission row exists, reporting a failure the caller may retry into a
+ * duplicate of a submission that was already saved.
+ */
+function buildUrl(
+  pattern: RedirectUrlPattern,
+  target: RedirectTargetDocument,
+  collection: string,
+  form: FormDocument,
+  pluginContext: PluginContext
+): string | undefined {
+  const { logger } = pluginContext;
+  try {
+    const url = applyRedirectPattern(pattern, target);
+    if (!url) {
+      logger.warn?.(
+        "Form redirect pattern could not be filled from the target document",
+        { form: form.slug, collection }
+      );
+    }
+    return url;
+  } catch (error) {
+    logger.warn?.("Form redirect pattern threw while building a URL", {
+      form: form.slug,
+      collection,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
+}
+
+/** The target row, or undefined — a deleted target and a failed read differ. */
+/**
+ * How the redirect target is read: as whom, in which language, and on which
+ * request.
+ *
+ * As whom is the submission's own `access`, because the destination is a page
+ * the VISITOR is about to be sent to, and the visitor's view of it is the one
+ * that decides whether it is there. A public submission reads the target as a
+ * public caller, which is scoped to published rows and — the part the locale
+ * makes matter — to published TRANSLATIONS: a companion row still in draft is
+ * withheld and the field falls back to the published default. Read as the
+ * system instead, the trusted read admits every draft, and a French slug that
+ * nobody has published yet becomes the URL a French visitor is sent to.
+ *
+ * A host that elevated the submission to `system` keeps the trusted read it
+ * asked for, as before this carried a language.
+ *
+ * The request travels for the same reason the access does: a read that is
+ * the visitor's should look like the visitor's to every hook on the target
+ * collection. One that selects content by a tenant header, or applies only
+ * to a browser, reads `ctx.req.http` — and a read carrying no request runs
+ * those hooks as background work and builds a URL the visitor was never
+ * meant to get.
+ */
+interface TargetRead {
+  access: SubmissionAccess;
+  locale: string | undefined;
+  request: Request | undefined;
+}
+
+/**
+ * The language a visitor submitted in, or nothing.
+ *
+ * A selector is not one: it asks the collection services for every
+ * translation at once, which answers a localized URL field with one value per
+ * language — a shape no URL pattern can be filled from — and the plugin
+ * boundary refuses it outright, which after the submission is stored degrades
+ * to no redirect. Neither is a language a form was filled in, so a selector
+ * reads as no language named. Which spellings are selectors is the core's
+ * question, asked of the core, so this cannot forward one the boundary has
+ * since learned to refuse.
+ */
+function visitorLocale(locale: string | undefined): string | undefined {
+  if (locale === undefined || isLocaleSelector(locale)) return undefined;
+  return locale;
+}
+
+async function readTarget(
+  reference: { collection: string; id: string },
+  form: FormDocument,
+  pluginContext: PluginContext,
+  read: TargetRead
+): Promise<RedirectTargetDocument | undefined> {
+  const { logger } = pluginContext;
+  const context = {
+    form: form.slug,
+    collection: reference.collection,
+    id: reference.id,
+  };
+
+  let row: unknown;
+  try {
+    // In the visitor's language, so a localized URL field answers with the
+    // slug that page has THERE, and as the visitor, so it answers only with a
+    // translation they can reach (see {@link TargetRead}). The fallback chain
+    // stays in force: a page with no published translation for this locale
+    // still has a URL, in the language the site falls back to, and sending
+    // the visitor there beats sending them nowhere.
+    //
+    // That fallback is whole-document, and asked for by name. A public read
+    // in a language the page is not published in finds nothing, so without
+    // it a French visitor to a page whose French translation is still a
+    // draft got no redirect at all, rather than the published default's URL.
+    row = await pluginContext.services.collections.findEntryById(
+      reference.collection,
+      reference.id,
+      {
+        ...read.access,
+        locale: read.locale,
+        request: read.request,
+        wholeDocumentFallback: true,
+      }
+    );
+  } catch (error) {
+    // The submission already succeeded, so this degrades to "no redirect"
+    // rather than failing the request — reported, because a broken read and a
+    // deleted target are different problems with the same symptom.
+    logger.warn?.("Form redirect target could not be read", {
+      ...context,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return undefined;
+  }
+
+  if (!row || typeof row !== "object") {
+    logger.warn?.("Form redirect target no longer exists", context);
+    return undefined;
+  }
+  return row as RedirectTargetDocument;
+}
+
+// ============================================================
+// Validation-Only Function
+// ============================================================
+
+/**
+ * Validate form data without creating a submission.
+ *
+ * Useful for real-time validation in the frontend.
+ *
+ * @param formSlug - Form slug
+ * @param data - Form data to validate
+ * @param context - Handler context
+ * @returns Validation result
+ *
+ * @example
+ * ```typescript
+ * const result = await validateSubmission(
+ *   'contact-form',
+ *   { name: 'John', email: 'invalid-email' },
+ *   { pluginContext, pluginConfig }
+ * );
+ *
+ * if (!result.valid) {
+ *   console.log('Validation errors:', result.errors);
+ * }
+ * ```
+ */
+export async function validateSubmission(
+  formSlug: string,
+  data: Record<string, unknown>,
+  context: SubmitFormContext
+): Promise<{ valid: boolean; errors?: Record<string, string> }> {
+  const { pluginContext, pluginConfig } = context;
+
+  // Fetch form
+  const form = await fetchFormBySlug(formSlug, pluginConfig, pluginContext);
+
+  if (!form) {
+    return { valid: false, errors: { _form: "Form not found" } };
+  }
+
+  // The same rule storage applies, asked rather than restated. Restating it
+  // meant this answered on the transformed but unsanitized value while the
+  // write seam answers on the sanitized one, so a preflight check could call a
+  // submission valid that storage then refused.
+  const prepared = prepareSubmission({
+    data,
+    fields: form.fields,
+    validate: true,
+  });
+
+  if (!prepared.validationErrors) {
+    return { valid: true };
+  }
+
+  return {
+    valid: false,
+    errors: prepared.validationErrors,
+  };
+}
+
+// ============================================================
+// Form Status Check
+// ============================================================
+
+/**
+ * Check if a form is accepting submissions.
+ *
+ * @param formSlug - Form slug
+ * @param context - Handler context
+ * @returns Whether the form accepts submissions
+ */
+export async function isFormAcceptingSubmissions(
+  formSlug: string,
+  context: SubmitFormContext
+): Promise<boolean> {
+  const { pluginContext, pluginConfig } = context;
+
+  const form = await fetchFormBySlug(formSlug, pluginConfig, pluginContext);
+
+  if (!form) {
+    return false;
+  }
+
+  return form.status === "published";
+}
+
+// ============================================================
+// Bulk Operations (Admin)
+// ============================================================
+
+/**
+ * Get submission statistics for a form.
+ *
+ * Note: This function uses client-side filtering which works for
+ * small-medium submission counts. For large-scale deployments,
+ * consider using direct database queries with COUNT aggregation.
+ *
+ * @param formSlug - Form slug
+ * @param context - Handler context
+ * @returns Submission statistics
+ */
+export async function getFormSubmissionStats(
+  formSlug: string,
+  context: SubmitFormContext
+): Promise<{
+  total: number;
+  new: number;
+  read: number;
+  archived: number;
+} | null> {
+  const { pluginContext, pluginConfig } = context;
+  const { collections } = pluginContext.services;
+
+  // Get form ID
+  const form = await fetchFormBySlug(formSlug, pluginConfig, pluginContext);
+  if (!form) {
+    return null;
+  }
+
+  try {
+    const submissionsSlug = pluginConfig.formSubmissionOverrides.slug;
+    const sys = { as: "system" } as const;
+    const base = { form: { equals: form.id } };
+
+    // D56: count per status server-side instead of listing every
+    // submission and counting client-side. Stats run as system (plugin-owned
+    // aggregate over submissions for this form).
+    const [total, newCount, read, archived] = await Promise.all([
+      collections.count(submissionsSlug, { where: base }, sys),
+      collections.count(
+        submissionsSlug,
+        { where: { ...base, status: { equals: "new" } } },
+        sys
+      ),
+      collections.count(
+        submissionsSlug,
+        { where: { ...base, status: { equals: "read" } } },
+        sys
+      ),
+      collections.count(
+        submissionsSlug,
+        { where: { ...base, status: { equals: "archived" } } },
+        sys
+      ),
+    ]);
+
+    return { total, new: newCount, read, archived };
+  } catch {
+    return null;
+  }
+}

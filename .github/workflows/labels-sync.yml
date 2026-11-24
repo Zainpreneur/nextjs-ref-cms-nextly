@@ -1,0 +1,34 @@
+name: Sync Labels
+
+# On a push to `dev` alone, the branch pull requests merge into. Labels are
+# one repository-wide set and the sync deletes any label the file lacks, so
+# syncing `main` as well would put back an older list each time a promotion
+# carried a file `dev` had since changed.
+on:
+  push:
+    branches: [dev]
+    paths:
+      - .github/labels.yml
+      - .github/workflows/labels-sync.yml
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  sync:
+    name: Sync .github/labels.yml to GitHub
+    runs-on: ubuntu-latest
+    steps:
+      # The checkout only reads labels.yml; label-sync talks to the API with
+      # its own token input, so the git credential is never needed.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Sync labels
+        uses: EndBug/label-sync@52074158190acb45f3077f9099fea818aa43f97a # v2.3.3
+        with:
+          config-file: .github/labels.yml
+          # Delete labels that exist on GitHub but are not in labels.yml.
+          # Set to false on first run if you want to migrate gradually.
+          delete-other-labels: true

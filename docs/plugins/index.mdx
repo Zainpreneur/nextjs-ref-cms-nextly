@@ -1,0 +1,227 @@
+---
+title: Plugins
+description: Extend Nextly with official and custom plugins that add collections, admin views, hooks, and API endpoints.
+---
+
+> **Alpha (`0.x`) — pin your versions.**
+>
+> The plugin SDK is alpha: its `@public` surface becomes semver-protected at 1.0 (see [API stability](/docs/plugins/stability)). Build against `@nextlyhq/plugin-sdk` — the stability boundary — and until then pin exact `nextly` / `@nextlyhq/plugin-sdk` versions.
+
+Plugins extend Nextly with new functionality without modifying core code. A plugin can add collections, register lifecycle hooks, inject custom admin views, and transform configuration -- all through a single `plugins` array in your config.
+
+## Official Plugins
+
+| Plugin                                     | Package                         | Description                                                                                                                                                                                         |
+| ------------------------------------------ | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Form Builder](/docs/plugins/form-builder) | `@nextlyhq/plugin-form-builder` | Visual drag-and-drop form builder with submission management, email notifications, spam protection, and export                                                                                      |
+| [Page Builder](/docs/page-builder)         | `@nextlyhq/plugin-page-builder` | Blocks your team arranges on a page, rendered on the server; the core blocks add no JavaScript of their own (see [What reaches the browser](/docs/page-builder#what-reaches-the-browser))           |
+| [SEO](/docs/plugins/seo)                   | `@nextlyhq/plugin-seo`          | An SEO field group on the collections you name, and a sitemap of published content over plain HTTP. Turning those fields into `<meta>` tags is `buildMetadata` from `nextly/runtime`, which is core |
+
+## Community Plugins
+
+Community plugins are distributed on npm — search the [`nextly-plugin`](https://www.npmjs.com/search?q=keywords:nextly-plugin) keyword. To get yours listed here, see [Contributing a plugin](/docs/plugins/contributing).
+
+_No community plugins listed yet — be the first._
+
+## Adding a Plugin
+
+One command adds a plugin to your site:
+
+```bash
+npx nextly plugins add @nextlyhq/plugin-form-builder
+```
+
+It installs the package with your project's package manager, registers the plugin in
+`nextly.config.ts`, adds `nextly plugins install <name>` to your build after
+`nextly migrate` (a production start refuses a plugin that was never installed), runs
+`nextly generate:types`, and applies the plugin's schema to your database. The same
+command also runs as `nextly add <package>`.
+
+- **Options the plugin asks for.** A plugin can ask for values at install, such as your
+  site's production address. Give each as `--option <name>=<value>`; in a terminal, the
+  command asks for any you leave out. They are written into your config as the plugin's
+  options.
+- **Nextly's own plugins** named without a version are installed at the version of
+  `nextly` your site has, since Nextly's packages are released together.
+- **Already installed.** `--skip-install` registers a package you installed yourself,
+  such as one from a folder or a git address.
+- **See it first.** `--dry-run` names every change the command would make, and makes
+  none.
+- **Run it again.** A plugin already in your config, and a build that already installs
+  it, are left as they are.
+- **A new database.** On a database `nextly migrate` has not prepared yet, the schema is
+  left to your build, which migrates and then installs the plugin.
+
+The command registers a plugin the way its package declares (see
+[Declaring how a plugin is added](/docs/plugins/distribution#declaring-how-a-plugin-is-added)),
+or, for a package that declares nothing, the one plugin definition it exports. When it
+cannot tell, or your config is written in a way it will not edit safely (a `plugins` list
+held in a variable, for one), it says so and prints the lines to add, and the steps
+below are yours.
+
+### Adding a plugin by hand
+
+Install the plugin package, then add it to your `defineConfig` call.
+
+```typescript
+// nextly.config.ts
+import { defineConfig } from "nextly";
+import { formBuilder } from "@nextlyhq/plugin-form-builder";
+
+const fb = formBuilder();
+
+export default defineConfig({
+  plugins: [fb.plugin],
+  collections: [Posts, Users, Media],
+});
+```
+
+Plugin collections are merged automatically -- you do not need to spread them into the `collections` array yourself. The plugin's `config()` transformer handles this during initialization.
+
+For simpler setups where you do not need to customize plugin options, use the pre-configured default instance:
+
+```typescript
+// nextly.config.ts
+import { defineConfig } from "nextly";
+import { formBuilderPlugin } from "@nextlyhq/plugin-form-builder";
+
+export default defineConfig({
+  plugins: [formBuilderPlugin],
+  collections: [Posts, Users, Media],
+});
+```
+
+## How Plugins Work
+
+Every plugin implements the `PluginDefinition` interface from `@nextlyhq/plugin-sdk`, the import surface for plugin authors. It is alpha: its `@public` surface becomes semver-protected at 1.0, parts of it are `@experimental`, and it may change before then (see [API stability](/docs/plugins/stability)). The lifecycle has two phases:
+
+### 1. Declarative + setup phase
+
+Plugins declare schema, permissions, routes, and admin UI in `contributes` (read by the host without running the plugin). Before services start, Nextly also runs each plugin's optional `setup(config)` escape hatch — all `setup`s run before any `init`. It receives copies of the plain settings and the plugin definitions, without the database adapter, logger or any other live handle, and returns the config the boot continues with.
+
+```typescript
+import { definePlugin } from "@nextlyhq/plugin-sdk";
+
+export const myPlugin = definePlugin({
+  name: "@acme/nextly-plugin-example",
+  version: "1.0.0",
+  nextly: ">=0.0.2-alpha.67",
+  contributes: {
+    collections: [MyCollection], // merged automatically by the pipeline
+  },
+  setup(config) {
+    return { ...config }; // escape hatch for advanced config transforms
+  },
+});
+```
+
+### 2. Initialization Phase
+
+After all services are registered, Nextly calls each plugin's `init(ctx)` with a `PluginContext`. It provides:
+
+- **`services`** -- managed, secure-by-default data access (`{ as: 'system' }` to elevate)
+- **`db`** -- typed, owner-checked access to your plugin's tables and its dependencies' tables (unmanaged); `db.raw` is the Drizzle builder
+- **`hooks`** / **`events`** / **`filters`** / **`actions`** -- in-transaction hooks, post-commit events, typed seams
+- **`self`** -- your entities' resolved slugs after any host `.rename()`
+- **`logger`**, **`config`**, **`nextlyVersion`**
+
+```typescript
+import { definePlugin } from "@nextlyhq/plugin-sdk";
+
+export const auditPlugin = definePlugin({
+  name: "audit-log",
+  version: "1.0.0",
+  nextly: ">=0.0.2-alpha.67",
+
+  async init(ctx) {
+    ctx.hooks.on("afterCreate", "*", async context => {
+      ctx.logger.info("Created entry", {
+        collection: context.collection,
+        id: context.data?.id,
+      });
+    });
+  },
+});
+```
+
+See the **[Plugin Author Guide](/docs/plugins/author-guide)** for the full workflow.
+
+## Plugin Admin Integration
+
+Plugins can control where their collections appear in the admin sidebar and customize their visual appearance.
+
+```typescript
+import type { PluginDefinition } from "@nextlyhq/plugin-sdk";
+import { MyCollection } from "./collections/my-collection";
+
+const plugin: PluginDefinition = {
+  name: "my-plugin",
+  version: "0.1.0",
+  nextly: ">=0.0.2-alpha.63",
+  contributes: { collections: [MyCollection] },
+
+  // Placement and appearance stay at the top level. This is complementary to
+  // `contributes.admin`, which is the declarative menu, pages and views surface.
+  admin: {
+    order: 50,
+    description: "What this plugin does",
+    appearance: {
+      icon: "BarChart",
+      label: "Analytics",
+      badge: "Beta",
+      badgeVariant: "secondary",
+    },
+  },
+};
+```
+
+Plugins can also register custom admin view components. The Form Builder plugin, for example, replaces the default collection edit view with a visual drag-and-drop builder. Components are referenced by path strings (e.g., `@nextlyhq/plugin-form-builder/admin#FormBuilderView`) and auto-registered when the admin panel loads.
+
+## Overriding Plugin Behavior
+
+Host applications can override a plugin's sidebar placement and appearance through the `admin.pluginOverrides` section of `defineConfig`:
+
+```typescript
+// nextly.config.ts
+import { AdminPlacement } from "nextly";
+
+export default defineConfig({
+  plugins: [fb.plugin],
+  admin: {
+    pluginOverrides: {
+      "@nextlyhq/plugin-form-builder": {
+        placement: AdminPlacement.COLLECTIONS,
+        order: 10,
+        appearance: {
+          label: "Contact Forms",
+        },
+      },
+    },
+  },
+});
+```
+
+## Next Steps
+
+**Build a plugin**
+
+- [Plugin Author Guide](/docs/plugins/author-guide) -- the overview: lifecycle, `ctx`, and the scaffold → dev → test → publish loop
+- [Lifecycle, dependencies & order](/docs/plugins/lifecycle) -- `setup`/`init`/`destroy`, load order, `dependsOn`, version compatibility, `enabled`
+- [Data access](/docs/plugins/services) -- `ctx.services`, queries, bulk ops, `{ as: "system" }`
+- [Permissions](/docs/plugins/permissions) -- declare-but-never-grant, route gating, `useCan`/`<Can>`
+- [HTTP routes](/docs/plugins/routes) -- `contributes.routes`, secure-by-default, middleware
+- [Admin UI](/docs/plugins/admin-ui) -- menu, pages, view overrides, placement
+- [Schema & data lifecycle](/docs/plugins/schema) -- collections, `extend`, relations, provenance, uninstall
+- [Testing](/docs/plugins/testing) -- `createTestNextly` + real-database tests
+
+**Ship & maintain**
+
+- [API stability](/docs/plugins/stability) -- what's `@public` vs `@experimental`, semver + deprecation policy
+- [Publishing & distribution](/docs/plugins/distribution) -- publish, discovery, the trust model
+- [Contributing a plugin](/docs/plugins/contributing) -- the quality checklist + how to get listed
+
+**Reference**
+
+- [Plugin API Reference](/docs/plugins/api-reference) -- the public `@nextlyhq/plugin-sdk` surface
+- [Plugin Error Reference](/docs/plugins/error-reference) -- fail-fast boot errors and how to fix them
+- [Configuration Reference](/docs/configuration/nextly-config) -- full `defineConfig` options including the `plugins` array

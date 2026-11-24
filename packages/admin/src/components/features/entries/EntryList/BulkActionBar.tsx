@@ -1,0 +1,278 @@
+/**
+ * Bulk Action Bar Component
+ *
+ * Displays when entries are selected, showing count and available
+ * bulk actions.
+ *
+ * @module components/entries/EntryList/BulkActionBar
+ * @since 1.0.0
+ */
+
+import { Button } from "@nextlyhq/ui";
+import type { JSX } from "react";
+
+import { EyeOff, Send, Trash2, X } from "@admin/components/icons";
+
+import type { CollectionForColumns } from "./EntryTableColumns";
+import { useEntryBulkActions } from "./useEntryBulkActions";
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/**
+ * Props for the BulkActionBar component.
+ */
+export interface BulkActionBarProps {
+  /** Number of selected entries */
+  selectedCount: number;
+  /** Collection configuration (for future field-specific bulk updates) */
+  collection?: CollectionForColumns;
+  /** Callback for bulk delete action */
+  onDelete: () => void;
+  /** Callback for bulk update action (optional) */
+  onUpdate?: (data: Record<string, unknown>) => void;
+  /**
+   * Callback for bulk publish (sets `status: 'published'` on every selected
+   * entry). Only invoked from the Publish button, which is gated on
+   * `collection.status === true`. Caller wires this to the bulk-update
+   * mutation.
+   */
+  onPublish?: () => void;
+  /**
+   * Callback for bulk unpublish (sets `status: 'draft'`). Same gating as
+   * `onPublish` — only relevant for collections that opted into the
+   * built-in Draft / Published lifecycle.
+   */
+  onUnpublish?: () => void;
+  /** Whether either Publish or Unpublish bulk action is in flight. */
+  isPublishing?: boolean;
+  /** Callback to clear selection */
+  onClear: () => void;
+  /** Singular/plural label used in the selected-count text */
+  itemLabel?: string;
+  /**
+   * Plugins' declared bulk actions, in the order delivered, each already
+   * judged against the selection: drawn after the built-in actions, before
+   * the destructive one.
+   */
+  declaredActions?: readonly {
+    id: string;
+    label: string;
+    disabled: boolean;
+    /** Why it is held back, shown beside the bar's actions. */
+    note?: string;
+    onSelect: () => void;
+  }[];
+  /**
+   * The workflow moves over the selection, each present only where the caller may make it, on a
+   * collection a workflow holds. Approve is never one: each approval is given from that
+   * document's review, for the version shown.
+   */
+  workflowMoves?: {
+    submit?: () => void;
+    assign?: () => void;
+    sendBack?: () => void;
+    /** Whether a move is on its way: each move is held back until it is answered. */
+    pending?: boolean;
+  };
+}
+
+// ============================================================================
+// Component
+// ============================================================================
+
+/**
+ * Action bar displayed when entries are selected for bulk operations.
+ *
+ * Surfaces a selected-count display, a "delete selected" button, and
+ * a "clear selection" button.
+ *
+ * @param props - Bulk action bar props
+ * @returns Bulk action bar component
+ *
+ * @example
+ * ```tsx
+ * <BulkActionBar
+ *   selectedCount={5}
+ *   collection={collection}
+ *   onDelete={() => bulkDelete.mutate(selectedIds)}
+ *   onUpdate={(data) => bulkUpdate.mutate({ ids: selectedIds, data })}
+ *   onClear={() => setRowSelection({})}
+ * />
+ * ```
+ */
+export function BulkActionBar({
+  selectedCount,
+  collection,
+  onDelete,
+  onPublish,
+  onUnpublish,
+  isPublishing = false,
+  onClear,
+  itemLabel = "entry",
+  declaredActions = [],
+  workflowMoves,
+}: BulkActionBarProps): JSX.Element {
+  // The workflow's moves, only on a collection a workflow holds.
+  const moves = collection?.workflow ? workflowMoves : undefined;
+  // Each action is offered on its own permission, as the server answers it:
+  // a user may hold one without the others. Publish / Unpublish are only
+  // meaningful for collections with the built-in Draft / Published lifecycle,
+  // which the shared answer already folds in, and each button also needs the
+  // callback that performs it.
+  const offered = useEntryBulkActions(collection);
+  const showPublish = offered.publish && !!onPublish;
+  const showUnpublish = offered.unpublish && !!onUnpublish;
+  const showPublishActions = showPublish || showUnpublish;
+  // Pluralize the label. "entry" -> "entries", "category" -> "categories",
+  // "collection" -> "collections", "user" -> "users". Already-plural labels
+  // (ending in "s") pass through unchanged.
+  const pluralLabel = itemLabel.endsWith("s")
+    ? itemLabel
+    : itemLabel.endsWith("y")
+      ? `${itemLabel.slice(0, -1)}ies`
+      : `${itemLabel}s`;
+  const selectedItemLabel = selectedCount === 1 ? itemLabel : pluralLabel;
+
+  return (
+    <div
+      role="region"
+      aria-label="Bulk actions"
+      // Wrapping at every width: the actions, the plugins' among them, are
+      // more than a narrow bar holds on one line.
+      className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-border bg-primary/[0.07] px-4 py-2.5"
+    >
+      {/* Selection info */}
+      <span className="text-sm font-medium text-foreground">
+        {selectedCount} {selectedItemLabel} selected
+      </span>
+
+      {/* Actions */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onClear}
+          className="gap-1.5 text-muted-foreground hover:text-foreground"
+          aria-label="Clear selection"
+        >
+          <X className="h-4 w-4" />
+          Clear
+        </Button>
+
+        {/* The workflow's moves over the selection, never Approve: each approval is given from
+            that document's review, which the note says. */}
+        {moves && (
+          <>
+            {moves.submit && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={moves.pending === true}
+                onClick={moves.submit}
+              >
+                Submit for review
+              </Button>
+            )}
+            {moves.assign && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={moves.pending === true}
+                onClick={moves.assign}
+              >
+                Assign…
+              </Button>
+            )}
+            {moves.sendBack && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={moves.pending === true}
+                onClick={moves.sendBack}
+              >
+                Send back…
+              </Button>
+            )}
+            <span className="text-xs text-muted-foreground">
+              {"Approve from each document's review."}
+            </span>
+          </>
+        )}
+
+        {/* Publish / Unpublish (only for collections with the built-in
+            Draft / Published lifecycle, and only the transitions this caller
+            is permitted to make). Each is shown on its own permission. */}
+        {showPublishActions && (
+          <>
+            {showUnpublish && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onUnpublish}
+                disabled={isPublishing}
+                className="gap-1.5"
+                aria-label="Unpublish selected"
+              >
+                <EyeOff className="h-4 w-4" />
+                Unpublish
+              </Button>
+            )}
+            {showPublish && (
+              <Button
+                variant="default"
+                size="sm"
+                onClick={onPublish}
+                disabled={isPublishing}
+                className="gap-1.5"
+                aria-label="Publish selected"
+              >
+                <Send className="h-4 w-4" />
+                Publish
+              </Button>
+            )}
+          </>
+        )}
+
+        {/* Why a declared action is held back, said once per action. */}
+        {declaredActions.map(action =>
+          action.note ? (
+            <span
+              key={`${action.id}:note`}
+              className="text-xs text-muted-foreground"
+            >
+              {action.note}
+            </span>
+          ) : null
+        )}
+
+        {/* Plugins' declared bulk actions, run on the selected rows. */}
+        {declaredActions.map(action => (
+          <Button
+            key={action.id}
+            variant="outline"
+            size="sm"
+            onClick={action.onSelect}
+            disabled={action.disabled}
+          >
+            {action.label}
+          </Button>
+        ))}
+
+        {/* Delete selected, only for a caller who may delete here. */}
+        {offered.delete && (
+          <Button
+            variant="destructive"
+            size="sm"
+            onClick={onDelete}
+            className="gap-1.5"
+          >
+            <Trash2 className="h-4 w-4" />
+            Delete selected
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}

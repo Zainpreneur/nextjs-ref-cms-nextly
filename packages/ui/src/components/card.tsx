@@ -1,0 +1,259 @@
+import { cva, type VariantProps } from "class-variance-authority";
+import {
+  forwardRef,
+  type HTMLAttributes,
+  type ForwardRefExoticComponent,
+  type PropsWithoutRef,
+  type RefAttributes,
+} from "react";
+
+import { cn } from "../lib/utils";
+import type { VariantsFn } from "../lib/variants";
+
+/** The arms `cardVariants` is built from. Its type is read from them: {@link VariantsFn}. */
+export const CARD_VARIANT_MAP = {
+  variant: {
+    default: "",
+    interactive: "cursor-pointer hover:border-primary active:scale-[0.99]",
+    elevated: "shadow-md",
+  },
+};
+
+/**
+ * Card Component - Design System Specification
+ *
+ * A container component for grouping related content with clear visual separation.
+ * Cards provide a structured layout with header, content, and footer sections.
+ *
+ * Design Specs:
+ * - Border radius: `rounded-lg`, the container step of the `--radius` scale
+ * - Padding: 24px (p-6) for header/content, 16px 24px for footer
+ * - Shadow: sm (default), md (hover/elevated)
+ * - Border: 1px solid  border border-border color
+ *
+ * Variants:
+ * - default: Standard card with subtle shadow
+ * - interactive: Hover effects for clickable cards  (border border-border highlight, shadow increase)
+ *   ⚠️ IMPORTANT: When using the interactive variant, you MUST add appropriate
+ *   accessibility attributes:
+ *   - Add role="button" or use an actual <button> wrapper
+ *   - Add tabIndex={0} to make it keyboard accessible
+ *   - Add onClick handler for mouse/touch interaction
+ *   - Add onKeyDown handler to support Enter/Space keys
+ *   - Add aria-label or aria-labelledby to describe the action
+ *   Example:
+ *   <Card
+ *     variant="interactive"
+ *     role="button"
+ *     tabIndex={0}
+ *     onClick={handleClick}
+ *     onKeyDown={(e) => e.key === 'Enter' && handleClick()}
+ *     aria-label="View user details"
+ *   >
+ * - elevated: More prominent shadow for emphasis
+ *
+ * Structure:
+ * <Card>
+ *   <CardHeader>
+ *     <CardTitle>Title</CardTitle>
+ *     <CardDescription>Description</CardDescription>
+ *     <CardAction>Action buttons</CardAction>
+ *   </CardHeader>
+ *   <CardContent>Main content</CardContent>
+ *   <CardFooter>Footer actions</CardFooter>
+ * </Card>
+ *
+ * Accessibility:
+ * - Semantic HTML structure supports screen readers
+ * - Interactive cards MUST have role, tabIndex, and keyboard handlers (see above)
+ * - Ensure sufficient color contrast for all text (WCAG 2.2 AA minimum)
+ * - Use aria-label or aria-labelledby for cards without visible text labels
+ * @experimental
+ */
+const cardVariants: VariantsFn<typeof CARD_VARIANT_MAP> = cva(
+  "bg-card text-foreground rounded-lg  border border-border   transition-all duration-200",
+  {
+    variants: CARD_VARIANT_MAP,
+    defaultVariants: {
+      variant: "default",
+    },
+  }
+);
+
+/** @experimental */
+export type CardProps = HTMLAttributes<HTMLDivElement> &
+  VariantProps<typeof cardVariants>;
+
+/** @experimental */
+const Card: ForwardRefExoticComponent<
+  PropsWithoutRef<CardProps> & RefAttributes<HTMLDivElement>
+> = forwardRef<HTMLDivElement, CardProps>(
+  ({ className, variant, ...props }, ref) => {
+    return (
+      <div
+        ref={ref}
+        data-slot={`card.${variant || "default"}`}
+        className={cn(cardVariants({ variant }), className)}
+        {...props}
+      />
+    );
+  }
+);
+Card.displayName = "Card";
+
+/** @experimental */
+export interface CardHeaderProps extends HTMLAttributes<HTMLDivElement> {
+  /**
+   * Whether to hide the bottom  border border-border separator between header and content.
+   * Default: false  (border border-border is shown per design spec)
+   */
+  noBorder?: boolean;
+}
+
+/** @experimental */
+const CardHeader: ForwardRefExoticComponent<
+  PropsWithoutRef<CardHeaderProps> & RefAttributes<HTMLDivElement>
+> = forwardRef<HTMLDivElement, CardHeaderProps>(
+  ({ className, noBorder = false, ...props }, ref) => {
+    return (
+      <div
+        ref={ref}
+        data-slot="card-header"
+        className={cn(
+          // Mirrors CardFooter: a header that carries its own tint runs the full
+          // width of the card, so at a nonzero --radius it would paint square
+          // across the card's curved top corners. `inherit` takes the parent's
+          // computed radius rather than restating a step. It only helps when the
+          // header is a direct child of the card; a header nested inside another
+          // wrapper inherits that wrapper's radius instead, and such a card needs
+          // `overflow-hidden` to clip the fill.
+          "flex flex-col rounded-t-[inherit] p-4",
+          !noBorder && "border-b border-border",
+          className
+        )}
+        {...props}
+      />
+    );
+  }
+);
+CardHeader.displayName = "CardHeader";
+
+/** @experimental */
+export type CardTitleProps = HTMLAttributes<HTMLHeadingElement>;
+
+/** @experimental */
+const CardTitle: ForwardRefExoticComponent<
+  PropsWithoutRef<CardTitleProps> & RefAttributes<HTMLHeadingElement>
+> = forwardRef<HTMLHeadingElement, CardTitleProps>(
+  ({ className, ...props }, ref) => {
+    return (
+      <h3
+        ref={ref}
+        data-slot="card-title"
+        className={cn("text-xl font-semibold leading-none", className)}
+        {...props}
+      />
+    );
+  }
+);
+CardTitle.displayName = "CardTitle";
+
+/** @experimental */
+export type CardDescriptionProps = HTMLAttributes<HTMLParagraphElement>;
+
+/** @experimental */
+const CardDescription: ForwardRefExoticComponent<
+  PropsWithoutRef<CardDescriptionProps> & RefAttributes<HTMLParagraphElement>
+> = forwardRef<HTMLParagraphElement, CardDescriptionProps>(
+  ({ className, ...props }, ref) => {
+    return (
+      <p
+        ref={ref}
+        data-slot="card-description"
+        className={cn("text-sm text-muted-foreground", className)}
+        {...props}
+      />
+    );
+  }
+);
+CardDescription.displayName = "CardDescription";
+
+/** @experimental */
+export type CardActionProps = HTMLAttributes<HTMLDivElement>;
+
+/** @experimental */
+const CardAction: ForwardRefExoticComponent<
+  PropsWithoutRef<CardActionProps> & RefAttributes<HTMLDivElement>
+> = forwardRef<HTMLDivElement, CardActionProps>(
+  ({ className, ...props }, ref) => {
+    return (
+      <div
+        ref={ref}
+        data-slot="card-action"
+        className={cn("flex items-center justify-end", className)}
+        {...props}
+      />
+    );
+  }
+);
+CardAction.displayName = "CardAction";
+
+/** @experimental */
+export type CardContentProps = HTMLAttributes<HTMLDivElement>;
+
+/** @experimental */
+const CardContent: ForwardRefExoticComponent<
+  PropsWithoutRef<CardContentProps> & RefAttributes<HTMLDivElement>
+> = forwardRef<HTMLDivElement, CardContentProps>(
+  ({ className, ...props }, ref) => {
+    return (
+      <div
+        ref={ref}
+        data-slot="card-content"
+        className={cn("p-6", className)}
+        {...props}
+      />
+    );
+  }
+);
+CardContent.displayName = "CardContent";
+
+/** @experimental */
+export type CardFooterProps = HTMLAttributes<HTMLDivElement>;
+
+/** @experimental */
+const CardFooter: ForwardRefExoticComponent<
+  PropsWithoutRef<CardFooterProps> & RefAttributes<HTMLDivElement>
+> = forwardRef<HTMLDivElement, CardFooterProps>(
+  ({ className, ...props }, ref) => {
+    return (
+      <div
+        ref={ref}
+        data-slot="card-footer"
+        className={cn(
+          // The footer's tint runs the full width of the card, so at a nonzero
+          // --radius it would paint square across the card's curved bottom
+          // corners. `inherit` takes the card's own computed radius rather than
+          // restating a step, so a card whose radius is overridden stays
+          // matched, and it can never disagree with the card at any --radius,
+          // including the shipped 0 where `rounded-lg` is 0.
+          "flex items-center px-6 py-4  border-t border-border bg-primary/5 rounded-b-[inherit]",
+          className
+        )}
+        {...props}
+      />
+    );
+  }
+);
+CardFooter.displayName = "CardFooter";
+
+export {
+  Card,
+  CardHeader,
+  CardFooter,
+  CardTitle,
+  CardAction,
+  CardDescription,
+  CardContent,
+  cardVariants,
+};

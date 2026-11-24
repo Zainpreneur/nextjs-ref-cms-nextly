@@ -1,0 +1,119 @@
+---
+title: Quick start
+description: Create a Nextly project, start it, and create the first admin. Then build something with it.
+---
+
+1. Create a project in `my-app` with the defaults.
+2. Start the dev server.
+3. Open [http://localhost:3000/admin/setup](http://localhost:3000/admin/setup) and create the first admin.
+
+<Tabs items={["npm", "pnpm", "yarn", "bun"]}>
+<Tab value="npm">
+```bash
+npx create-nextly-app@alpha my-app -y && cd my-app && npm run dev
+```
+</Tab>
+<Tab value="pnpm">
+```bash
+pnpm create nextly-app@alpha my-app -y && cd my-app && pnpm dev
+```
+</Tab>
+<Tab value="yarn">
+```bash
+yarn create nextly-app@alpha my-app -y && cd my-app && yarn dev
+```
+</Tab>
+<Tab value="bun">
+```bash
+bun create nextly-app@alpha my-app -y && cd my-app && bun run dev
+```
+</Tab>
+</Tabs>
+
+`-y` takes the defaults: the blank template, SQLite, local storage and the Nextly agent skills. To choose instead, see [Choose instead of the defaults](#choose-instead-of-the-defaults). Each step below says what you should see before you move on.
+
+## Create the project
+
+When the project is ready, the CLI ends with its next steps. With npm, `create-nextly-app` 0.0.2-alpha.69 prints:
+
+<YouShouldSee>
+
+```txt
+◇  Next steps ──────────────────────────────────────────────────────────────╮
+│                                                                           │
+│    cd my-app                                                              │
+│    npm run dev                                                            │
+│                                                                           │
+│    Your database (SQLite) is stored at ./data/nextly.db                   │
+│    npm run dev will create system tables on first run.                    │
+│    Visit http://localhost:3000/admin/setup to create your admin account.  │
+│                                                                           │
+│    Storage: Using local disk (./public/uploads) by default.               │
+│    See docs to configure S3, Vercel Blob, or other providers.             │
+│                                                                           │
+├───────────────────────────────────────────────────────────────────────────╯
+│
+└  Docs: https://nextlyhq.com/docs
+```
+
+</YouShouldSee>
+
+Above it, the CLI lists what it wrote: the skills for coding agents in `.agents/skills/` and `.claude/skills/`, and a `.env`, which it adds to `.gitignore`. Every new Nextly project also ships with an AGENTS.md and CLAUDE.md written for coding agents.
+
+## Start the dev server
+
+`npm run dev` starts Next.js. The first run creates the system tables.
+
+<YouShouldSee>
+
+Next.js reports `Local: http://localhost:3000`, and on the first run Nextly logs `[nextly] Setting up database schema...`. [http://localhost:3000](http://localhost:3000) shows "Welcome to your new Nextly project."
+
+</YouShouldSee>
+
+## Create the first admin
+
+Open [http://localhost:3000/admin/setup](http://localhost:3000/admin/setup) and enter your name, an email and a password. Until an admin exists, `/admin` takes you to this page. The first account gets the Super Admin role, with every permission.
+
+<YouShouldSee>
+
+The admin's dashboard at `/admin`, signed in as the account you just created. The admin is at `/admin` from then on.
+
+</YouShouldSee>
+
+<Callout type="info" title="In production">
+In production, the web setup asks for a one-time setup token, printed in the server log, before it creates the first admin. Development setup asks for none.
+</Callout>
+
+## Choose instead of the defaults
+
+Leave off `-y` and the CLI asks. Each question also has a flag, and a flag answers its question even with `-y`, which then takes the defaults for the rest.
+
+| Question | Choices | Flag |
+| --- | --- | --- |
+| What should your project be called? | The folder to create. `.` uses the current folder. | The first argument, `my-app` |
+| Pick a starting template | Blank project (an empty config), Blog (posts, authors, categories and public pages) or Plugin (a reusable Nextly plugin with a `/dev` playground) | `-t blank`, `-t blog`, `-t plugin` |
+| How would you like to define your content schema? | Code-first or the Visual Schema Builder, for templates that offer both | `-a code-first`, `-a visual` |
+| Which database will you use? | SQLite, PostgreSQL or MySQL. PostgreSQL and MySQL need a running server and its connection string, which the CLI asks for next; with `-y` it writes a placeholder to `.env` for you to replace. | `-d sqlite`, `-d postgresql`, `-d mysql` |
+| Add Nextly skills for coding agents (Claude Code, Codex, Cursor)? | Yes by default. A plugin project is not asked and gets none. | `--no-skills` leaves them out |
+
+For example, `npx create-nextly-app@alpha my-blog -t blog -y` creates a blog on SQLite. See [Templates](/docs/templates) for what each template ships with.
+
+To add Nextly to an app you already have, run the CLI inside it instead: see [Add to an existing Next.js project](/docs/getting-started/installation#option-b-add-to-an-existing-nextjs-project).
+
+## Requirements
+
+| Requirement | Version |
+| --- | --- |
+| Node.js | 22.12+ or 24+ (Node 24 LTS recommended) |
+| Next.js | The supported range in [Requirements](/docs/getting-started/installation#requirements), with the App Router |
+| React and React DOM | The supported range in [Requirements](/docs/getting-started/installation#requirements) |
+| Database | PostgreSQL 15 or later, MySQL 8 or later, or SQLite 3.38 or later for local work |
+
+SQLite is the default, so the quick start needs no database server. See [Database](/docs/database) before you deploy.
+
+## Next steps
+
+- [Tutorial: build a blog](/docs/getting-started/build-a-blog) -- Define posts and categories, add content in the admin, and read it in a page with the Direct API.
+- [Project structure](/docs/getting-started/project-structure) -- What the CLI wrote, file by file.
+- [Set up with a coding agent](/docs/guides/coding-agents) -- Work on the project with Claude Code, Codex or Cursor.
+- [Deployment](/docs/guides/deployment) -- Run migrations where you deploy, then start the app.

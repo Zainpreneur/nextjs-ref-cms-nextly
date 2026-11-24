@@ -1,0 +1,2331 @@
+/**
+ * What a mail provider has to tell Nextly about itself.
+ *
+ * A provider used to be a `type` string plus a factory, which was enough to
+ * dispatch a send and not enough for anything else: the REST layer validated
+ * against a hardcoded union, the admin rendered one of three bespoke forms, and
+ * redaction guessed which values were secret from their key names. Each of
+ * those had to be edited to add a provider, so the extension point existed
+ * without being reachable.
+ *
+ * A definition carries the answers instead. Core stops knowing provider names.
+ *
+ * @module domains/email/provider-definition
+ */
+
+import { NextlyError } from "../../errors";
+
+import { type EmailFailure, failureOf, withEmailFailure } from "./failure";
+import {
+  isEmailSetupCategory,
+  withSetupCategory,
+  type EmailSetupCategory,
+} from "./setup-category";
+import type { EmailProviderAdapter } from "./types";
+
+/**
+ * What an adapter's `send` resolves to.
+ *
+ * Derived from the adapter contract rather than restated, so a change to what
+ * a provider may return cannot leave the containment below checking a shape
+ * nothing produces any more.
+ */
+type EmailSendResult = Awaited<ReturnType<EmailProviderAdapter["send"]>>;
+
+/**
+ * Longest provider type id that every dialect can store.
+ *
+ * Postgres and MySQL declare `email_providers.type` as `varchar(50)` while
+ * SQLite is unbounded text, so a longer namespaced id registers fine, works on
+ * SQLite, and is rejected or silently truncated on the other two. Truncation is
+ * the worse half: the stored type would no longer match any registered
+ * provider, leaving a row nothing can build an adapter for.
+ *
+ * Enforced at registration so the failure names the plugin at boot, rather than
+ * appearing as a database error the first time someone saves a provider.
+ */
+export const MAX_EMAIL_PROVIDER_TYPE_LENGTH = 50;
+
+/**
+ * The single error for an over-long provider type.
+ *
+ * Shared by the authoring helper and the registry so one invariant does not
+ * report itself two ways. A 500 would be wrong: nothing failed inside Nextly,
+ * an install declared a provider it cannot store, and the person who can fix it
+ * is reading the message. The type is named in the public sentence because it
+ * comes from the install's own code, not from a request.
+ */
+export function emailProviderTypeTooLong(type: string): NextlyError {
+  // No inline statusCode: `BUSINESS_RULE_VIOLATION` now carries 422 in the
+  // canonical map, so every throw site of this code answers the same way and
+  // a change to that meaning happens in one place.
+  return new NextlyError({
+    code: "BUSINESS_RULE_VIOLATION",
+    publicMessage: `Email provider type "${type}" is longer than ${MAX_EMAIL_PROVIDER_TYPE_LENGTH} characters, the width of the column every database stores it in. Shorten the type id.`,
+    logContext: { type, max: MAX_EMAIL_PROVIDER_TYPE_LENGTH },
+  });
+}
+
+/**
+ * How one configuration value is entered and treated.
+ *
+ * Serializable on purpose: this is the only part of a definition that crosses
+ * to the browser, so a provider can describe its form without shipping React,
+ * depending on admin internals, or being renderable in only one place.
+ */
+export interface EmailProviderConfigField {
+  /** Key within the stored `configuration` object. */
+  name: string;
+  /** Field label shown to whoever is configuring the provider. */
+  label: string;
+  /** Which control to render, and how to treat the value. */
+  kind: "text" | "password" | "number" | "boolean" | "select";
+  required?: boolean;
+  /** Pre-filled when adding a provider of this type. */
+  default?: string | number | boolean;
+  /** One line under the field. Say what it is for, not what it is called. */
+  help?: string;
+  placeholder?: string;
+  /** Choices for `kind: "select"`. Ignored otherwise. */
+  options?: ReadonlyArray<{ value: string; label: string }>;
+  /**
+   * Marks a credential.
+   *
+   * Redaction reads this rather than inferring from the key name, which
+   * mistakes a field called `credential` for public and a harmless one called
+   * `token` for secret. Declaring it is the only way to be right about a name
+   * core has never seen.
+   */
+  secret?: boolean;
+  /**
+   * Hints so the form can object before a round trip.
+   *
+   * Deliberately a tiny closed set rather than an expression language:
+   * `parseConfig` stays authoritative, and a rule that can only live there
+   * cannot drift from a copy here. A provider whose constraint does not fit in
+   * these three keys should express it in `parseConfig` alone.
+   */
+  constraints?: { min?: number; max?: number; maxLength?: number };
+  /**
+   * What a BLANK value means for this field, when the field is optional.
+   *
+   * A client editing a stored provider can express three things about an
+   * optional field — leave it, set it, remove it — and a blank input has to be
+   * mapped onto one of them. Which one is right depends entirely on how the
+   * provider's own parser is written, and nothing else in the descriptor says:
+   *
+   * - `"omit"` (the default) suits `z.string().min(1).optional()` and
+   *   `z.enum(...).optional()`, which accept an absent key and reject `""`.
+   * - `"empty"` suits a key nested inside a REQUIRED object, where the parser
+   *   demands the key exist and decides for itself what an empty value means.
+   *   The built-in SMTP provider is the live example: `auth` is required and
+   *   its `user`/`pass` may be empty for a loopback sink, so omitting them
+   *   fails with "expected string, received undefined" for the one setup this
+   *   repository documents.
+   *
+   * Declared rather than guessed, for the same reason `secret` is: a client
+   * cannot read `parseConfig`, and the two shapes are indistinguishable from
+   * the outside. Ignored for a required field, which can never be blank.
+   */
+  blankAs?: "omit" | "empty";
+}
+
+/** What a provider can do, so a UI never offers what it cannot honour. */
+export interface EmailProviderCapabilities {
+  /** Accepts file attachments. */
+  attachments?: boolean;
+  /** Can be probed without sending a message (`testConnection`). */
+  connectionTest?: boolean;
+  /** Honours a Reply-To address. */
+  replyTo?: boolean;
+  /**
+   * Only accepts a sender on a domain verified with the provider.
+   *
+   * Declared rather than inferred. A hosted API provider generally requires it
+   * and a self-hosted relay does not, but nothing else in the descriptor
+   * distinguishes them — using the presence of `docsUrl` as the signal reads as
+   * a rule and is a coincidence, and it silently drops the warning for any
+   * provider that documents itself elsewhere.
+   *
+   * The consequence of getting it wrong is quiet: a provider saves cleanly with
+   * an unusable sender and fails at the first send.
+   */
+  requiresVerifiedSender?: boolean;
+}
+
+/**
+ * A registered mail provider.
+ *
+ * @typeParam TConfig - the shape `parseConfig` produces and `createAdapter`
+ *   consumes. Defaulted so a definition can be held without naming it.
+ */
+/**
+ * @experimental What a connection probe found. `detail` is the provider's own
+ * text and goes only to the server log; `setup` says what a person setting the
+ * provider up should check when the probe failed.
+ */
+export interface ConnectionTestResult {
+  ok: boolean;
+  detail?: string;
+  setup?: EmailSetupCategory;
+}
+
+/**
+ * @experimental Whether a provider has verified the domain email is sent
+ * from, and the DNS records it expects for it.
+ */
+export interface EmailDomainStatus {
+  domain: string;
+  status: "verified" | "pending" | "failed";
+  records: Array<{
+    type: string;
+    name: string;
+    value: string;
+    /** An MX record's priority. */
+    priority?: number;
+  }>;
+}
+
+export interface EmailProviderDefinition<TConfig = Record<string, unknown>> {
+  /** Stored in `email_providers.type`. Unique across built-ins and plugins. */
+  type: string;
+  /** Shown in the provider picker. */
+  label: string;
+  description?: string;
+  /** Where to read about getting credentials. */
+  docsUrl?: string;
+  /**
+   * One line about which sender addresses this provider will accept.
+   *
+   * Shown beside the From address. Only for a provider whose rule cannot be
+   * derived from `capabilities.requiresVerifiedSender` alone — Resend, for
+   * instance, publishes a shared testing address that works before any domain
+   * is verified, and a form that says only "use a verified domain" makes a
+   * usable configuration look impossible.
+   *
+   * Prose in a wire format is a cost, and it is the same cost `help` and
+   * `description` already pay: the alternative is provider-specific copy
+   * hardcoded in a client, which is what a catalog exists to end.
+   */
+  senderGuidance?: string;
+  capabilities?: EmailProviderCapabilities;
+  /** Field metadata, in the order a form should render it. */
+  configFields: ReadonlyArray<EmailProviderConfigField>;
+  /**
+   * Validate stored or submitted configuration. The authoritative boundary.
+   *
+   * A function rather than a schema object so no validation library becomes
+   * part of the provider contract: a package may use Zod internally, but a Zod
+   * major would otherwise break every third-party provider at once, and each
+   * would have to resolve a version compatible with core's.
+   *
+   * Throws when the input cannot be used. `NextlyError.validation` gives the
+   * caller field paths; any thrown error is caught and reported by the service.
+   */
+  parseConfig: (input: unknown) => TConfig;
+  /** Build the adapter that sends. */
+  createAdapter: (config: TConfig) => EmailProviderAdapter;
+  /**
+   * Cheap reachability probe that sends nothing.
+   *
+   * Only meaningful where the protocol has one — SMTP can open a session and
+   * authenticate, a REST provider generally cannot check anything short of
+   * sending. Declare `capabilities.connectionTest` alongside it, so a UI can
+   * tell the difference between "this failed" and "this cannot be asked".
+   */
+  testConnection?: (config: TConfig) => Promise<ConnectionTestResult>;
+  /**
+   * The status of a sending domain, where the provider reports one. Resolves
+   * `null` when the provider does not know the domain. Reads only; it must
+   * never change anything at the provider.
+   */
+  domainStatus?: (
+    config: TConfig,
+    domain: string
+  ) => Promise<EmailDomainStatus | null>;
+  /**
+   * Whether this install can run the provider at all.
+   *
+   * Distinct from `testConnection`, which asks whether a CONFIGURATION works.
+   * This asks whether the code could run given one, which is a question about
+   * the machine rather than the credentials -- so it takes no config and is
+   * answered before anything is filled in.
+   *
+   * Omit it unless the provider needs something the host may not have. A
+   * provider that declares nothing is treated as ready, which is right for
+   * every transport that speaks over `fetch`.
+   */
+  checkAvailability?: () => ProviderAvailability;
+}
+
+/**
+ * The control kinds a credential may be entered with.
+ *
+ * A secret is masked on read, which means the value a client holds for it is a
+ * STRING that stands for the stored one. Only a textual control can carry that:
+ * a switch has nowhere to put a mask, a select would have to list it as an
+ * option, and a number input rejects it outright. A provider declaring `secret`
+ * on any of those describes a field that cannot be edited without being
+ * replaced, so it is refused where the definition is written rather than
+ * discovered when someone tries to save one.
+ */
+const SECRET_CAPABLE_KINDS: ReadonlyArray<EmailProviderConfigField["kind"]> = [
+  "text",
+  "password",
+];
+
+/**
+ * Path segments a configuration key may never contain.
+ *
+ * A field name is a PATH that both the service and any client walk to read and
+ * write a value. These three do not name a property of the configuration; they
+ * reach the object prototype. A client assembling a form from the descriptor
+ * would write through one and corrupt every plain object it holds — and merely
+ * opening the form is enough, no save required.
+ *
+ * Refused at registration because that is the only place with the whole list,
+ * and because a provider cannot be made safe afterwards: every consumer of the
+ * descriptor would have to remember the same rule.
+ */
+const UNWALKABLE_PATH_SEGMENTS = new Set([
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
+
+/** The value type each control can actually hold. */
+const DEFAULT_TYPE_FOR_KIND: Record<
+  EmailProviderConfigField["kind"],
+  "string" | "number" | "boolean"
+> = {
+  text: "string",
+  password: "string",
+  select: "string",
+  number: "number",
+  boolean: "boolean",
+};
+
+/** Reject a field name that cannot be walked safely. */
+function assertFieldNameIsWalkable(
+  type: string,
+  field: EmailProviderConfigField
+): void {
+  if (PATH_RESERVED_CHARACTERS.test(field.name)) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" declares the configuration field "${field.name}". A field name may not contain brackets or quotes: a form library reads those as structure and would store the value somewhere other than where it is validated and sent.`,
+      logContext: { type, field: field.name },
+    });
+  }
+
+  const segments = field.name.split(".");
+
+  // A numeric segment is read as an ARRAY INDEX by the form library and as a
+  // literal key by everything else: `servers.0.host` registers as
+  // `{ servers: [{ host }] }` in the form and is validated and sent as
+  // `{ servers: { "0": { host } } }`. Same declaration, two shapes, and
+  // nothing positioned to notice the disagreement.
+  const numeric = segments.find(segment => /^\d+$/.test(segment));
+  if (numeric !== undefined) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" declares the configuration field "${field.name}", whose segment "${numeric}" is a number. A form library reads a numeric segment as an array index while the rest of the contract reads it as a key, so the value would be stored somewhere other than where it is validated.`,
+      logContext: { type, field: field.name, segment: numeric },
+    });
+  }
+
+  const offender = segments.find(
+    segment => segment === "" || UNWALKABLE_PATH_SEGMENTS.has(segment)
+  );
+  if (offender === undefined) return;
+
+  throw new NextlyError({
+    code: "BUSINESS_RULE_VIOLATION",
+    publicMessage: `Email provider "${type}" declares the configuration field "${field.name}", whose path segment "${offender}" cannot be used. A field name is a dotted path into stored configuration and may not contain an empty segment or reach an object prototype.`,
+    logContext: { type, field: field.name, segment: offender },
+  });
+}
+
+/**
+ * Reject a default a control cannot hold.
+ *
+ * `default` is typed as the union of all three primitives, which is right for
+ * one property covering five kinds and wrong for any single field: a select
+ * defaulting to `true` renders as unselected and then fails its own generated
+ * string schema before anyone touches it, and a number field defaulting to
+ * `"3"` renders blank while quietly submitting a string. Correlating the two is
+ * a rule rather than a type, so it is checked where the definition is written.
+ */
+function assertDefaultMatchesKind(
+  type: string,
+  field: EmailProviderConfigField
+): void {
+  if (field.default === undefined) return;
+
+  const expected = DEFAULT_TYPE_FOR_KIND[field.kind];
+  if (typeof field.default === expected) return;
+
+  throw new NextlyError({
+    code: "BUSINESS_RULE_VIOLATION",
+    publicMessage: `Email provider "${type}" gives the ${field.kind} field "${field.name}" a ${typeof field.default} default. A ${field.kind} field can only default to a ${expected}.`,
+    logContext: {
+      type,
+      field: field.name,
+      kind: field.kind,
+      defaultType: typeof field.default,
+    },
+  });
+}
+
+/**
+ * Reject a default on a credential, and a blank-as-empty on a kind that has no
+ * empty value.
+ *
+ * **A secret default cannot be honoured.** `toDescriptor` strips it, correctly:
+ * the descriptor is served to anyone holding read or create, so forwarding a
+ * credential there would hand out the value stored configuration is masked to
+ * protect. And nothing server-side applies descriptor defaults -- they are a
+ * hint for the form and nothing else. A declared secret default is therefore
+ * inert in both directions, while looking to its author like a working
+ * fallback. A provider that wants one reads its environment inside
+ * `parseConfig`, which is authoritative and never leaves the server.
+ *
+ * **`blankAs: "empty"` needs a kind whose blank IS an empty string.** A number
+ * input's blank normalises to absent long before the payload is built, and a
+ * switch always holds a value, so declaring it on either is a request the form
+ * cannot carry out.
+ */
+/** The two spellings `blankAs` may take. */
+const BLANK_AS_VALUES: ReadonlyArray<
+  NonNullable<EmailProviderConfigField["blankAs"]>
+> = ["omit", "empty"];
+
+function assertDeclarationsCanBeHonoured(
+  type: string,
+  field: EmailProviderConfigField
+): void {
+  if (field.secret === true && field.default !== undefined) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" gives the credential "${field.name}" a default. A descriptor is served to any caller who can read providers, so a secret default is withheld from it — and nothing applies descriptor defaults on the server, so it would never be used. Read the fallback inside \`parseConfig\` instead.`,
+      logContext: { type, field: field.name },
+    });
+  }
+
+  // A typo reads as the default. `blankAs` has two spellings and the code below
+  // tests for one of them, so `"emty"` is silently treated as `"omit"` -- and
+  // for a field whose parser demands the key exist, every blank create is then
+  // stripped and rejected by the server instead of the descriptor being named
+  // at boot. An unrecognised value is a malformed descriptor, not a preference.
+  if (field.blankAs !== undefined && !BLANK_AS_VALUES.includes(field.blankAs)) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" declares \`blankAs: "${String(field.blankAs)}"\` on the field "${field.name}". It must be ${BLANK_AS_VALUES.map(value => `"${value}"`).join(" or ")}.`,
+      logContext: { type, field: field.name, blankAs: String(field.blankAs) },
+    });
+  }
+
+  if (
+    field.blankAs === "empty" &&
+    field.kind !== "text" &&
+    field.kind !== "password" &&
+    field.kind !== "select"
+  ) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" declares \`blankAs: "empty"\` on the ${field.kind} field "${field.name}". Only a text, password or select field has an empty string to send; a blank number is absent and a switch is never blank.`,
+      logContext: { type, field: field.name, kind: field.kind },
+    });
+  }
+}
+
+/**
+ * How one text property is allowed to be absent or blank.
+ *
+ * - `"required"` — must be a non-empty string. Blank is refused because the
+ *   value is a label somewhere: a control with no name, or a picker entry that
+ *   cannot be told from its neighbours.
+ * - `"identifier"` — must be a string, and emptiness belongs to another rule
+ *   that reports it better than "empty" would.
+ * - `"optional"` — may be omitted; if present it has to be a string.
+ */
+type TextRequirement = "required" | "identifier" | "optional";
+
+/**
+ * Reject descriptor text that is not text.
+ *
+ * A descriptor is the only part of a provider that crosses to the browser, and
+ * the admin renders these values directly: `help` and `senderGuidance` become
+ * React children, where a non-string throws and takes the settings page down
+ * with it, and `label` is called as a string while building a select's
+ * validation message. A descriptor is also structural, so a JavaScript plugin
+ * or a hand-built object supplies whatever it wrote.
+ *
+ * Refused where the descriptor is published rather than where it is rendered:
+ * the admin cannot say which install shipped the bad value, and by then the
+ * only symptom is a blank page.
+ */
+function assertTextIsRenderable(
+  type: string,
+  subject: string,
+  entries: ReadonlyArray<[key: string, value: unknown, rule: TextRequirement]>
+): void {
+  for (const [key, value, rule] of entries) {
+    if (value === undefined && rule === "optional") continue;
+
+    if (typeof value !== "string") {
+      throw new NextlyError({
+        code: "BUSINESS_RULE_VIOLATION",
+        publicMessage: `Email provider "${type}" gives ${subject} a non-string \`${key}\` (${value === null ? "null" : typeof value}). Descriptor text is rendered by the admin as it arrives, so a value that is not a string breaks the page that would have shown it.`,
+        logContext: { type, subject, key, valueType: typeof value },
+      });
+    }
+
+    if (rule === "required" && value.trim().length === 0) {
+      throw new NextlyError({
+        code: "BUSINESS_RULE_VIOLATION",
+        publicMessage: `Email provider "${type}" gives ${subject} an empty \`${key}\`. It is what names this in the admin, so nothing else identifies it once it is blank.`,
+        logContext: { type, subject, key },
+      });
+    }
+  }
+}
+
+/**
+ * Every text property a descriptor publishes about the provider itself.
+ *
+ * Exported for the same reason the field rules are: `RegisteredEmailProvider`
+ * is structural, so the registry is a second door into the admin and checking
+ * only the authoring helper would leave it open.
+ */
+export function assertProviderTextIsRenderable(provider: {
+  type: string;
+  label: string;
+  description?: string;
+  docsUrl?: string;
+  senderGuidance?: string;
+}): void {
+  assertTextIsRenderable(String(provider.type), "the provider", [
+    // Before the rules that read `.trim()` and `.length` off it. Emptiness is
+    // left to the registry, whose message for it says more than "empty".
+    ["type", provider.type, "identifier"],
+    ["label", provider.label, "required"],
+    ["description", provider.description, "optional"],
+    ["docsUrl", provider.docsUrl, "optional"],
+    ["senderGuidance", provider.senderGuidance, "optional"],
+  ]);
+
+  assertCapabilitiesAreBoolean(provider);
+}
+
+/**
+ * Reject a capability whose value is not a boolean.
+ *
+ * Every reader tests a capability for truth, so `"false"` is TRUE and the admin
+ * then tells an operator that a verified sender is required by a provider whose
+ * author wrote the opposite. The same mistake on a field flag is already
+ * refused; a capability crosses to the browser the same way and is read the
+ * same way, so it cannot be left to chance because it sits one level up.
+ *
+ * `EmailProviderCapabilities` is a structural type on a structural definition,
+ * so a JavaScript plugin or a hand-built object arrives with whatever it wrote.
+ */
+function assertCapabilitiesAreBoolean(provider: {
+  type: string;
+  capabilities?: EmailProviderCapabilities;
+}): void {
+  const capabilities = provider.capabilities;
+  if (capabilities === undefined) return;
+
+  // An array is caught by name rather than by `typeof`, which answers
+  // "object" for one. Its entries would then pass the boolean loop below --
+  // `Object.entries([true])` yields `["0", true]` -- and `toDescriptor`
+  // spreads the result, publishing `{ "0": true }` as a capability no client
+  // has a name for.
+  if (
+    capabilities === null ||
+    typeof capabilities !== "object" ||
+    Array.isArray(capabilities)
+  ) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${provider.type}" declares \`capabilities\` that is not an object (${capabilities === null ? "null" : Array.isArray(capabilities) ? "array" : typeof capabilities}).`,
+      logContext: { type: provider.type },
+    });
+  }
+
+  for (const [name, value] of Object.entries(capabilities)) {
+    if (value === undefined || typeof value === "boolean") continue;
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${provider.type}" gives the capability \`${name}\` a non-boolean value (${value === null ? "null" : typeof value}). Every reader tests it for truth, so anything else reads as \`true\` — including the string "false".`,
+      logContext: { type: provider.type, capability: name },
+    });
+  }
+}
+
+/**
+ * Reject metadata whose TYPE is wrong, before anything reads its value.
+ *
+ * Every rule in this file tests `field.secret === true` and
+ * `field.required === true`, which is correct for a boolean and silently wrong
+ * for anything else: `secret: "true"` is not `true`, so the field is treated as
+ * PUBLIC — `declaredSecretPaths` omits it while `declaredConfigPaths` still
+ * recognises it, and `maskConfiguration` then returns the credential in clear
+ * text to anyone who can read providers.
+ *
+ * `configFields` is a structural type, so a JavaScript plugin or a hand-built
+ * object reaches registration with whatever it wrote. A truthy string is the
+ * dangerous case precisely because it looks right.
+ */
+function assertFlagsAreBoolean(
+  type: string,
+  field: EmailProviderConfigField
+): void {
+  const flags: Array<[string, unknown]> = [
+    ["secret", field.secret],
+    ["required", field.required],
+  ];
+
+  for (const [name, value] of flags) {
+    if (value === undefined || typeof value === "boolean") continue;
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" gives the field "${field.name}" a non-boolean \`${name}\` (${typeof value}). Only \`true\` marks a field, so any other value reads as unset — for \`secret\` that means the credential is served in the clear.`,
+      logContext: { type, field: field.name, flag: name, kind: typeof value },
+    });
+  }
+}
+
+/**
+ * Reject a default that its own field would refuse.
+ *
+ * A form initialises from the default and validates against the same
+ * constraints, so a default outside them opens the form already invalid and
+ * the operator has to change a value they never chose in order to submit. The
+ * descriptor is the only place both halves are visible, so it is where they
+ * are checked against each other.
+ */
+function assertDefaultSatisfiesConstraints(
+  type: string,
+  field: EmailProviderConfigField
+): void {
+  const value = field.default;
+  if (value === undefined) return;
+  const { min, max, maxLength } = field.constraints ?? {};
+
+  // Requiredness is a constraint the form applies too, and a blank string is
+  // the value it applies it to: the generated schema reports an empty required
+  // field as missing, so a descriptor pre-filling one opens every create form
+  // already invalid. Checked before the bounds, which a blank satisfies -- it
+  // has the right type and violates no maximum, which is exactly why it slipped
+  // through them.
+  if (
+    field.required === true &&
+    typeof value === "string" &&
+    value.trim() === ""
+  ) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" gives the required field "${field.name}" a blank default. A required field rejects a blank, so the form opens on a value it will not accept and cannot be submitted until the operator changes something nobody chose. Omit the default, or make the field optional.`,
+      logContext: { type, field: field.name },
+    });
+  }
+
+  const violation =
+    typeof value === "number" && min !== undefined && value < min
+      ? `is below its minimum of ${min}`
+      : typeof value === "number" && max !== undefined && value > max
+        ? `is above its maximum of ${max}`
+        : typeof value === "string" &&
+            maxLength !== undefined &&
+            value.length > maxLength
+          ? `is longer than its maximum length of ${maxLength}`
+          : undefined;
+
+  if (violation === undefined) return;
+
+  throw new NextlyError({
+    code: "BUSINESS_RULE_VIOLATION",
+    publicMessage: `Email provider "${type}" gives the field "${field.name}" a default of ${JSON.stringify(value)}, which ${violation}. A form starting on a value it must reject cannot be submitted without changing something nobody chose.`,
+    logContext: {
+      type,
+      field: field.name,
+      default: value,
+      min,
+      max,
+      maxLength,
+    },
+  });
+}
+
+/**
+ * Reject an optional boolean that does not say what "unset" looks like.
+ *
+ * A switch has two positions and no third. Without a default, an absent stored
+ * key renders as OFF and every subsequent save writes `false` — so a parser
+ * that distinguishes absence from false (an optional flag defaulting to true
+ * server-side, say) is silently overwritten, and the clearing path cannot help
+ * because a switch can never be "emptied" back to absence.
+ *
+ * Declaring the default removes the ambiguity at the source: the form starts
+ * where the provider says, and the value it sends is always one the provider
+ * chose. A field that genuinely needs three states is a select, not a switch.
+ */
+function assertOptionalBooleanHasDefault(
+  type: string,
+  field: EmailProviderConfigField
+): void {
+  if (field.kind !== "boolean") return;
+  if (field.default !== undefined) return;
+  // A REQUIRED boolean has no absence to represent: the form initialises the
+  // switch to `false`, the generated schema accepts it, and both positions are
+  // a value the provider asked for. Only an optional one has three states to
+  // squeeze onto two positions.
+  if (field.required === true) return;
+
+  throw new NextlyError({
+    code: "BUSINESS_RULE_VIOLATION",
+    publicMessage: `Email provider "${type}" declares the boolean field "${field.name}" without a default. A switch has two positions, so an absent value would render as off and be saved as false — overwriting a provider default nobody changed. Declare \`default\`, or use a select if the field genuinely has three states.`,
+    logContext: { type, field: field.name },
+  });
+}
+
+/**
+ * Reject two fields that claim the same place in the configuration.
+ *
+ * A declaration and one of its own descendants — `auth` beside `auth.pass` —
+ * cannot both be represented: whichever is built second either overwrites the
+ * other's branch or tries to treat a leaf as one. Neither order produces a
+ * working form, and both fail somewhere far from the declaration, so the
+ * overlap is refused where it is written.
+ */
+function assertNoOverlappingPaths(
+  type: string,
+  fields: ReadonlyArray<EmailProviderConfigField>
+): void {
+  const seen: string[][] = [];
+
+  for (const field of fields) {
+    const path = field.name.split(".");
+    for (const other of seen) {
+      const shorter = other.length <= path.length ? other : path;
+      const longer = other.length <= path.length ? path : other;
+      const overlaps = shorter.every((part, index) => part === longer[index]);
+      if (!overlaps) continue;
+
+      throw new NextlyError({
+        code: "BUSINESS_RULE_VIOLATION",
+        publicMessage: `Email provider "${type}" declares the configuration fields "${other.join(".")}" and "${field.name}", which claim the same place in the stored configuration. Field paths must not repeat or nest inside one another.`,
+        logContext: { type, first: other.join("."), second: field.name },
+      });
+    }
+    seen.push(path);
+  }
+}
+
+/**
+ * Reject a select nobody can choose from.
+ *
+ * Two shapes the type permits and no form can render. A select with no options
+ * draws an empty control, and if it is required the provider can never be
+ * saved. An option whose value is the empty string is worse: the admin's select
+ * reserves `""` for "nothing selected" and throws on an item carrying it, so
+ * merely opening the form reaches an error boundary.
+ *
+ * Refused here rather than worked around in a client, because every client
+ * would otherwise need the same two workarounds and a form is not the place to
+ * discover that a provider is undeclarable.
+ */
+/**
+ * Refuse `options` metadata nothing can publish, whatever KIND declared it.
+ *
+ * Checked for every kind rather than for selects alone, because `toDescriptor`
+ * copies `options` off any field that carries one: a text field declaring
+ * `options: null` registers happily and then throws a raw `TypeError` out of
+ * the catalog endpoint. That takes every descriptor-driven form down, not just
+ * this provider's, since one response carries the whole catalog.
+ *
+ * `configFields` is a structural type, so a JavaScript plugin or a hand-built
+ * provider reaches here with whatever it wrote.
+ */
+function assertOptionsArePublishable(
+  type: string,
+  field: EmailProviderConfigField
+): void {
+  if (field.options === undefined) return;
+
+  if (!Array.isArray(field.options)) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" gives the field "${field.name}" an \`options\` that is not an array.`,
+      logContext: { type, field: field.name, kind: field.kind },
+    });
+  }
+
+  // `{ value: 1 }` would pass a looser check and then be unselectable -- the
+  // control renders strings and the generated schema validates strings, so a
+  // stored number matches no option.
+  const malformed = field.options.findIndex(
+    option =>
+      option === null ||
+      typeof option !== "object" ||
+      typeof option.value !== "string" ||
+      typeof option.label !== "string"
+  );
+  if (malformed !== -1) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" gives the field "${field.name}" an option at index ${malformed} that is not \`{ value: string; label: string }\`. A non-string value cannot be selected: the control and the generated schema both work in strings.`,
+      logContext: { type, field: field.name, index: malformed },
+    });
+  }
+}
+
+function assertSelectIsChoosable(
+  type: string,
+  field: EmailProviderConfigField
+): void {
+  if (field.kind !== "select") return;
+
+  // Shape is already settled by `assertOptionsArePublishable`, which runs for
+  // every kind; what follows is what a SELECT additionally needs to be usable.
+  const options = field.options ?? [];
+
+  if (options.length === 0) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" declares the select field "${field.name}" with no options. A select must offer at least one choice.`,
+      logContext: { type, field: field.name },
+    });
+  }
+
+  const blankLabel = options.findIndex(option => option.label.trim() === "");
+  if (blankLabel !== -1) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" gives the select field "${field.name}" an option at index ${blankLabel} with a blank label. The label is the only thing an operator sees in the menu, so a blank one is a choice nobody can tell from its neighbours -- and once picked, the control shows nothing.`,
+      logContext: { type, field: field.name, index: blankLabel },
+    });
+  }
+
+  // Two options sharing a value are two menu items the form cannot tell apart:
+  // they render with the same React key and the same select value, so which
+  // label survives reconciliation is not decided by anything the provider
+  // wrote, and both choices store the same configuration.
+  const duplicate = options.findIndex(
+    (option, index) =>
+      options.findIndex(other => other.value === option.value) !== index
+  );
+  if (duplicate !== -1) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" gives the select field "${field.name}" two options with the value "${options[duplicate]?.value ?? ""}". A value identifies a choice, so two choices cannot share one.`,
+      logContext: {
+        type,
+        field: field.name,
+        value: options[duplicate]?.value,
+        index: duplicate,
+      },
+    });
+  }
+
+  if (options.some(option => option.value === "")) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" gives the select field "${field.name}" an option with an empty value. An empty value means "nothing selected", so it cannot also be a choice.`,
+      logContext: { type, field: field.name },
+    });
+  }
+
+  // A default outside its own option list renders as nothing selected and then
+  // fails the schema generated from the same list, so the field arrives
+  // invalid and the provider cannot be saved until someone changes a value
+  // they never chose.
+  if (
+    field.default !== undefined &&
+    !options.some(option => option.value === field.default)
+  ) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" defaults the select field "${field.name}" to a value that is not one of its options.`,
+      logContext: { type, field: field.name, default: String(field.default) },
+    });
+  }
+}
+
+/**
+ * Characters a form library will read as structure rather than as a name.
+ *
+ * React Hook Form parses a registered path by splitting on `[` and stripping
+ * brackets and quotes, while this contract and every consumer of it split on
+ * dots alone. A field called `headers[x-api-key]` therefore registers as
+ * `{ headers: { "x-api-key": … } }` in the form and is validated and sent as
+ * `{ "headers[x-api-key]": … }` -- two different places in the configuration,
+ * neither of which reports the disagreement.
+ *
+ * Measured rather than assumed: `set(values, "configuration.headers[x-api-key]", v)`
+ * against react-hook-form produces the first shape, and the schema built from
+ * the same descriptor expects the second.
+ */
+const PATH_RESERVED_CHARACTERS = /[[\]"']/;
+
+/**
+ * The control kinds a form knows how to render.
+ *
+ * The admin switches over this union exhaustively, which is a COMPILE-time
+ * guarantee and no guarantee at all about a JavaScript plugin or a hand-built
+ * object. A `kind` outside the set falls off the end of that switch, the field
+ * gets no schema, and building the form recurses into `undefined` — so an
+ * unrenderable kind takes down the whole provider form rather than skipping one
+ * field.
+ */
+const RENDERABLE_KINDS: ReadonlyArray<EmailProviderConfigField["kind"]> = [
+  "text",
+  "password",
+  "number",
+  "boolean",
+  "select",
+];
+
+/** Reject a control nothing can draw. */
+function assertKindIsRenderable(
+  type: string,
+  field: EmailProviderConfigField
+): void {
+  if (RENDERABLE_KINDS.includes(field.kind)) return;
+
+  throw new NextlyError({
+    code: "BUSINESS_RULE_VIOLATION",
+    publicMessage: `Email provider "${type}" declares the field "${field.name}" with kind "${String(field.kind)}", which no form can render. Use one of: ${RENDERABLE_KINDS.join(", ")}.`,
+    logContext: { type, field: field.name, kind: String(field.kind) },
+  });
+}
+
+/**
+ * Reject numeric metadata that cannot survive the wire.
+ *
+ * A descriptor is served as JSON, and `JSON.stringify` turns `Infinity`,
+ * `-Infinity` and `NaN` into `null`. A client then reads a present limit whose
+ * value is `null`, and `value.length > null` is `value.length > 0` — so
+ * `maxLength: Infinity`, declared to mean "no limit", rejects every non-empty
+ * string and makes a required field impossible to submit.
+ *
+ * Refused at registration rather than coerced, because a provider author
+ * writing `Infinity` means "unbounded" and the way to say that is to omit the
+ * key. Silently dropping it would work and teach nothing.
+ */
+/**
+ * Reject a constraints container that is not one.
+ *
+ * Every rule reads `field.constraints?.min`, so `null` slips past all of them
+ * -- optional chaining treats it as absent. `toDescriptor` then tests
+ * `!== undefined`, finds it present, and dereferences it: the catalog endpoint
+ * throws a raw `TypeError` and EVERY provider's form becomes unavailable, not
+ * just this one's.
+ *
+ * Checked at registration, where the failure names the plugin, rather than at
+ * the first request for the catalog.
+ */
+function assertConstraintsAreAnObject(
+  type: string,
+  field: EmailProviderConfigField
+): void {
+  const constraints = field.constraints;
+  if (constraints === undefined) return;
+  if (constraints !== null && typeof constraints === "object") return;
+
+  throw new NextlyError({
+    code: "BUSINESS_RULE_VIOLATION",
+    publicMessage: `Email provider "${type}" gives the field "${field.name}" a \`constraints\` that is not an object (${constraints === null ? "null" : typeof constraints}). Omit the key to declare no bounds.`,
+    logContext: {
+      type,
+      field: field.name,
+      constraints: constraints === null ? "null" : typeof constraints,
+    },
+  });
+}
+
+function assertNumericMetadataIsFinite(
+  type: string,
+  field: EmailProviderConfigField
+): void {
+  const candidates: Array<[string, number | undefined]> = [
+    ["constraints.min", field.constraints?.min],
+    ["constraints.max", field.constraints?.max],
+    ["constraints.maxLength", field.constraints?.maxLength],
+    ["default", typeof field.default === "number" ? field.default : undefined],
+  ];
+
+  for (const [key, value] of candidates) {
+    if (value === undefined || Number.isFinite(value)) continue;
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" gives the field "${field.name}" a non-finite ${key} (${String(value)}). Descriptors are served as JSON, where that becomes null and reads as a real limit. Omit the key to mean "no limit".`,
+      logContext: { type, field: field.name, key, value: String(value) },
+    });
+  }
+}
+
+/**
+ * Which control each constraint describes, and the phrase naming those
+ * controls in the refusal.
+ *
+ * A character limit describes a string the operator types; a numeric bound
+ * describes a number input's value. Everything else either has no keyboard
+ * behind it (a switch), takes its value from an option list (a select), or
+ * measures the wrong quantity (`maxLength` on a number is not its magnitude).
+ */
+const CONSTRAINT_KINDS: ReadonlyArray<{
+  key: "maxLength" | "min" | "max";
+  kinds: ReadonlyArray<EmailProviderConfigField["kind"]>;
+  applies: string;
+}> = [
+  {
+    key: "maxLength",
+    kinds: ["text", "password"],
+    applies: "text or password",
+  },
+  { key: "min", kinds: ["number"], applies: "number" },
+  { key: "max", kinds: ["number"], applies: "number" },
+];
+
+/**
+ * Reject a constraint on a control that does not apply it.
+ *
+ * The generated form enforces `maxLength` in its text and password branch and
+ * `min`/`max` in its number branch, and nowhere else. Declaring one elsewhere
+ * publishes a constraint to every client that reads the descriptor while the
+ * form it describes ignores it — so the operator is allowed to enter a value
+ * the provider's own parser then rejects, after exactly the round trip the
+ * hint existed to avoid.
+ *
+ * Refused rather than dropped, on the same reasoning as `blankAs` on a number:
+ * an author who wrote it meant something by it, and a constraint that quietly
+ * does nothing teaches the opposite.
+ */
+function assertConstraintsApplyToKind(
+  type: string,
+  field: EmailProviderConfigField
+): void {
+  for (const { key, kinds, applies } of CONSTRAINT_KINDS) {
+    if (field.constraints?.[key] === undefined) continue;
+    if (kinds.includes(field.kind)) continue;
+
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" declares \`${key}\` on the ${field.kind} field "${field.name}". That constraint is only applied to a ${applies} field, so this one is published to every client and enforced by nothing.`,
+      logContext: {
+        type,
+        field: field.name,
+        kind: field.kind,
+        constraint: key,
+      },
+    });
+  }
+}
+
+/** Reject a text length no value can satisfy. */
+function assertTextLengthIsSatisfiable(
+  type: string,
+  field: EmailProviderConfigField
+): void {
+  const maxLength = field.constraints?.maxLength;
+  if (maxLength === undefined || maxLength >= 1) return;
+
+  // A field that can hold at most zero characters is not a field. Required, it
+  // rejects the empty string AND every non-empty one; optional, it permits
+  // exactly nothing. Either way the provider can never be saved through a form
+  // built from this descriptor.
+  throw new NextlyError({
+    code: "BUSINESS_RULE_VIOLATION",
+    publicMessage: `Email provider "${type}" gives the field "${field.name}" a maximum length of ${maxLength}. No value can satisfy that.`,
+    logContext: { type, field: field.name, maxLength },
+  });
+}
+
+/** Reject a numeric range no value can satisfy. */
+function assertNumericBoundsAreSatisfiable(
+  type: string,
+  field: EmailProviderConfigField
+): void {
+  const { min, max } = field.constraints ?? {};
+  if (min === undefined || max === undefined || min <= max) return;
+
+  throw new NextlyError({
+    code: "BUSINESS_RULE_VIOLATION",
+    publicMessage: `Email provider "${type}" gives the number field "${field.name}" a minimum of ${min} and a maximum of ${max}. No value can satisfy both, so the provider could never be saved.`,
+    logContext: { type, field: field.name, min, max },
+  });
+}
+
+/**
+ * Every rule a provider's field metadata has to satisfy.
+ *
+ * Exported and called from BOTH the authoring helper and the registry.
+ * `RegisteredEmailProvider` is a structural type, so a JavaScript plugin or a
+ * hand-built object reaches registration without passing through
+ * `defineEmailProvider` — checking in one place only would leave the rules
+ * enforced for the authors least likely to break them.
+ */
+export function assertConfigFieldsAreUsable(
+  type: string,
+  fields: ReadonlyArray<EmailProviderConfigField>
+): void {
+  // The CONTAINER before anything in it. `configFields` is structural, so a
+  // JavaScript plugin or a hand-built object reaches here with whatever it
+  // wrote, and the loop below turns `null` into `fields is not iterable` and a
+  // null entry into `Cannot read properties of null` -- raw TypeErrors that
+  // name neither the provider nor the position, thrown from a boot path where
+  // the only thing an operator can act on is which plugin to remove.
+  if (!Array.isArray(fields)) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" declares \`configFields\` as ${fields === null ? "null" : typeof fields}. It has to be an array, even an empty one.`,
+      logContext: { type, received: fields === null ? "null" : typeof fields },
+    });
+  }
+
+  const malformed = fields.findIndex(
+    field => field === null || typeof field !== "object"
+  );
+  if (malformed !== -1) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage: `Email provider "${type}" declares a configuration field at index ${malformed} that is not an object. Every entry has to describe one field.`,
+      logContext: { type, index: malformed },
+    });
+  }
+
+  for (const field of fields) {
+    // Text first, because `name` is how every rule below says WHICH field it
+    // means and the walkability rule splits it: a non-string name otherwise
+    // surfaces as `field.name.split is not a function`, which names neither
+    // the plugin nor the field.
+    assertTextIsRenderable(type, `the field "${String(field.name)}"`, [
+      ["name", field.name, "identifier"],
+      ["label", field.label, "required"],
+      ["help", field.help, "optional"],
+      ["placeholder", field.placeholder, "optional"],
+    ]);
+    // Then kind: every rule below reads it, and a rule that switches on an
+    // unrenderable kind would report the wrong problem.
+    assertKindIsRenderable(type, field);
+    assertFieldNameIsWalkable(type, field);
+    // Before every rule that reads a flag, so a wrong TYPE is reported as
+    // itself rather than as the rule that silently read it as unset.
+    assertFlagsAreBoolean(type, field);
+    // Before every rule that reads `secret`: a credential declared on a
+    // control that cannot hold one is the more fundamental mistake, and
+    // reporting a rule about its default first would send the author to the
+    // wrong line.
+    if (field.secret === true && !SECRET_CAPABLE_KINDS.includes(field.kind)) {
+      throw secretFieldMustBeTextual(type, field);
+    }
+    // Before the satisfiability rules, which compare these numbers: `NaN`
+    // fails every comparison silently, so a bound of `NaN` would pass
+    // "min <= max" and be reported as fine.
+    // Before every rule that reads a bound off it: `null` reads as absent
+    // through optional chaining, so each of them passes and the descriptor
+    // build is where it finally fails.
+    assertConstraintsAreAnObject(type, field);
+    assertNumericMetadataIsFinite(type, field);
+    // Before satisfiability, which would report a `maxLength` of 0 on a select
+    // as a limit no value meets rather than as a limit that control never
+    // applies — sending the author to argue with the number instead of
+    // removing the key.
+    assertConstraintsApplyToKind(type, field);
+    assertTextLengthIsSatisfiable(type, field);
+    assertDefaultMatchesKind(type, field);
+    assertDefaultSatisfiesConstraints(type, field);
+    assertDeclarationsCanBeHonoured(type, field);
+    assertOptionalBooleanHasDefault(type, field);
+    assertOptionsArePublishable(type, field);
+    assertSelectIsChoosable(type, field);
+    assertNumericBoundsAreSatisfiable(type, field);
+  }
+  assertNoOverlappingPaths(type, fields);
+}
+
+/** The single error for a credential declared on a control that cannot hold one. */
+export function secretFieldMustBeTextual(
+  type: string,
+  field: EmailProviderConfigField
+): NextlyError {
+  return new NextlyError({
+    code: "BUSINESS_RULE_VIOLATION",
+    publicMessage: `Email provider "${type}" marks the ${field.kind} field "${field.name}" as secret. A credential is masked on read, so it can only be declared on a text or password field. Change the kind, or drop \`secret\`.`,
+    logContext: { type, field: field.name, kind: field.kind },
+  });
+}
+
+/**
+ * A registered definition with its config type erased.
+ *
+ * The registry holds providers whose `TConfig`s differ, and no single generic
+ * argument describes them all: `parseConfig` and `createAdapter` are
+ * contravariant in it, so `EmailProviderDefinition<unknown>` rejects every
+ * concrete definition.
+ *
+ * The erased form takes `unknown` and returns the parsed value as `unknown`.
+ * The TYPE stays inside the closure that knows it, which is what removes the
+ * need to cast one back; `createAdapterFrom` still parses AND builds, so an
+ * adapter cannot be constructed from configuration that was never validated.
+ * That safety property is unchanged.
+ *
+ * What changed is that the parsed VALUE now comes back out, because the caller
+ * that persists a configuration has to persist the one the adapter will run
+ * on. While it did not, the stored configuration and the configuration the
+ * adapter received could differ, and nothing reconciled them: a parser doing
+ * `raw.trim()` meant containment compared a padded credential against an
+ * unpadded one, and a `z.coerce` meant the admin rendered a value its own
+ * control could not hold. Both were patched at the symptom before the cause
+ * was addressed here.
+ */
+export interface RegisteredEmailProvider {
+  type: string;
+  label: string;
+  description?: string;
+  docsUrl?: string;
+  senderGuidance?: string;
+  capabilities?: EmailProviderCapabilities;
+  configFields: ReadonlyArray<EmailProviderConfigField>;
+  /**
+   * Parse this configuration, or throw if it is unusable.
+   *
+   * Returns the PARSED value, which is what a caller must persist: what the
+   * adapter runs on is this, not the input. `unknown` rather than the concrete
+   * type, so the erasure holds — a caller can store it and hand it back, and
+   * cannot read it as anything in particular.
+   */
+  parseConfiguration: (input: unknown) => unknown;
+  /** Validate and build in one step; the parsed value never escapes. */
+  createAdapterFrom: (input: unknown) => EmailProviderAdapter;
+  /** Present only when the definition supplied a probe. */
+  testConnectionFrom?: (input: unknown) => Promise<ConnectionTestResult>;
+  /** Present only when the definition supplied one. */
+  domainStatusFrom?: (
+    input: unknown,
+    domain: string
+  ) => Promise<EmailDomainStatus | null>;
+  /** Whether a probe exists, without exposing it. */
+  readonly hasConnectionTest: boolean;
+  /**
+   * Present only when the definition supplied one. Takes no configuration, so
+   * unlike the other callbacks it needs no erased wrapper.
+   */
+  checkAvailability?: () => ProviderAvailability;
+}
+
+/**
+ * Whether the configuration holds a leaf no field declares.
+ *
+ * Walked as PATHS, matching how `configFields[].name` addresses nested values
+ * (`auth.pass`), so a declared branch's children are covered by their own
+ * declarations rather than by the branch.
+ */
+function hasUndeclaredLeaf(
+  fields: ReadonlyArray<EmailProviderConfigField>,
+  config: Record<string, unknown>
+): boolean {
+  const declared = new Set(fields.map(field => field.name));
+
+  const walk = (value: unknown, prefix: string): boolean => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      return !declared.has(prefix);
+    }
+    return Object.entries(value as Record<string, unknown>).some(
+      ([key, leaf]) => walk(leaf, prefix ? `${prefix}.${key}` : key)
+    );
+  };
+
+  return Object.entries(config).some(([key, value]) => walk(value, key));
+}
+
+/**
+ * The values a provider DECLARED as credentials, read out of its configuration.
+ *
+ * Declared rather than guessed, exactly as masking does: a heuristic over key
+ * names calls `credential` public and a harmless `token` secret, and it can
+ * only ever be right about names core has seen.
+ *
+ * A value of one to three characters cannot be compared safely: it matches
+ * almost any identifier, so using it as a needle would delete every message id
+ * the provider returns. It is reported as UNMATCHABLE rather than skipped, and
+ * the caller drops the id instead of trying to match it.
+ *
+ * A provider that declares NO fields is the same case. An empty list is an
+ * absence of information, not a statement that nothing is secret — the service
+ * masks every configuration leaf for exactly that reason — so containment
+ * fails closed here too.
+ */
+/** What containment knows about a provider's declared credentials. */
+interface DeclaredSecretValues {
+  comparable: string[];
+  /** Anything at all that makes an identifier from this provider untrustworthy. */
+  hasUnmatchable: boolean;
+  /**
+   * Whether a DECLARED credential is one this configuration cannot supply a
+   * usable needle for: a boolean, a scalar too short to compare without
+   * deleting every legitimate id, or one the configuration does not hold at
+   * all.
+   *
+   * Separated from the rest because the two travel differently between the
+   * stored configuration and the parsed one. An UNDECLARED leaf describes the
+   * shape of a configuration, and a parser is entitled to change that --
+   * filling a default, deriving a working field it alone uses -- so reading it
+   * from the parsed form would withhold every id from every provider that has
+   * a default.
+   *
+   * A declared credential is different, in both directions. Missing from the
+   * STORED configuration, it is one a parser default supplied and nothing here
+   * ever saw. Missing from the PARSED configuration, the parser has moved it:
+   * `{ apiKey }` becomes `{ token: base64(apiKey) }`, and the adapter now
+   * interpolates a value the stored needle cannot match. Neither side can be
+   * trusted to have produced a comparable form of it, so both count.
+   */
+  hasUnusableSecret: boolean;
+}
+
+/**
+ * Needles covering a credential in BOTH the form it was stored in and the form
+ * the provider's own code holds.
+ *
+ * `containProviderCallbacks` wraps a registered provider from the outside and
+ * can only see the stored input, so a parser that derives a credential --
+ * Base64-encoding a key, deriving a token -- leaves it comparing a value the
+ * provider never used. Every callback that runs AFTER `parseConfig` therefore
+ * builds its needles here, where both forms are in scope.
+ *
+ * The stored side contributes every reason it has, including an UNDECLARED
+ * leaf: a value in the stored configuration that no field describes really is
+ * a credential nobody accounted for.
+ *
+ * The parsed side contributes only what it says about DECLARED credentials,
+ * because a parser is entitled to add keys of its own and counting those would
+ * withhold every identifier from every provider that fills in a default.
+ *
+ * Both ways a parser can move a declared credential out of reach are covered
+ * by that. It may shorten one -- `"00007"` becomes `7` under a numeric
+ * coercion -- leaving the provider interpolating a value too ambiguous to use
+ * as a needle while the stored form still looks matchable. Or it may rename
+ * one -- `{ apiKey }` becomes `{ token: base64(apiKey) }` -- leaving the
+ * declared path empty in what the provider holds, and the stored needle unable
+ * to match what it interpolates.
+ */
+function secretsFromBothForms(
+  fields: ReadonlyArray<EmailProviderConfigField>,
+  stored: unknown,
+  parsed: unknown
+): DeclaredSecretValues {
+  const fromStored = declaredSecretValues(fields, stored);
+  const fromParsed = declaredSecretValues(fields, parsed);
+
+  return {
+    comparable: [...fromStored.comparable, ...fromParsed.comparable],
+    hasUnmatchable: fromStored.hasUnmatchable || fromParsed.hasUnusableSecret,
+    hasUnusableSecret:
+      fromStored.hasUnusableSecret || fromParsed.hasUnusableSecret,
+  };
+}
+
+function declaredSecretValues(
+  fields: ReadonlyArray<EmailProviderConfigField>,
+  config: unknown
+): DeclaredSecretValues {
+  if (config === null || typeof config !== "object") {
+    return {
+      comparable: [],
+      hasUnmatchable: false,
+      hasUnusableSecret: false,
+    };
+  }
+
+  // No metadata and a configuration to protect: nothing here can say which
+  // leaf is a credential, so no message id from this provider can be trusted.
+  // `declaredSecretPaths` reaches the same conclusion and masks everything.
+  if (fields.length === 0) {
+    return {
+      comparable: [],
+      // Shape, not value: nothing here names a credential, so every id from
+      // this provider is untrustworthy — but a parser that adds keys to a
+      // configuration nobody described has not made it any worse.
+      hasUnmatchable: Object.keys(config).length > 0,
+      hasUnusableSecret: false,
+    };
+  }
+
+  const comparable: string[] = [];
+  let hasUnmatchable = false;
+  let hasUnusableSecret = false;
+
+  // A configuration leaf no field DECLARES is treated as secret by
+  // `maskConfiguration`, on the reasoning that absence of information has to
+  // mask more rather than less -- a credential left behind by a provider
+  // upgrade is exactly the case. Containment has to agree, or a legacy API key
+  // is withheld from every read and then handed back inside a message id.
+  //
+  // Its value is not compared, because an undeclared leaf may be anything;
+  // its mere presence makes ids from this provider untrustworthy.
+  if (hasUndeclaredLeaf(fields, config as Record<string, unknown>)) {
+    hasUnmatchable = true;
+  }
+
+  for (const field of fields) {
+    if (field.secret !== true) continue;
+    let current: unknown = config;
+    for (const segment of field.name.split(".")) {
+      if (current === null || typeof current !== "object") {
+        current = undefined;
+        break;
+      }
+      current = (current as Record<string, unknown>)[segment];
+    }
+    // Every SCALAR, not only strings. A declared credential may be a number --
+    // a numeric PIN on a `kind: "number"` field is a legal declaration -- and
+    // reading only strings hands back an empty list for exactly the provider
+    // whose credential is about to be interpolated into an identifier.
+    //
+    // A BOOLEAN credential is unmatchable rather than compared. `secret: true`
+    // is permitted on a boolean field, and its two renderings -- "true" and
+    // "false" -- appear inside ordinary identifiers often enough that using
+    // them as needles would delete legitimate message ids while catching the
+    // credential only by accident.
+    if (typeof current === "boolean") {
+      hasUnmatchable = true;
+      hasUnusableSecret = true;
+      continue;
+    }
+
+    // A declared credential ABSENT from the stored configuration is the case a
+    // parser default fires on -- `z.string().default(process.env.KEY)` fills an
+    // undefined key and the adapter then holds a credential that was never
+    // stored, so there is nothing here to compare an id against. Absence is
+    // distinguished from an empty value on purpose: a default does not fire for
+    // `""`, so the adapter holds the empty string and has no secret to leak.
+    // The built-in SMTP provider's loopback sink sends `auth.pass` as `""` and
+    // keeps its message ids because of that distinction.
+    if (current === undefined) {
+      hasUnmatchable = true;
+      hasUnusableSecret = true;
+      continue;
+    }
+
+    // An object or an array is skipped: its rendering is not what a provider
+    // would interpolate, and stringifying one produces a needle that matches
+    // nothing while looking like protection.
+    const scalar =
+      typeof current === "string"
+        ? current
+        : typeof current === "number" || typeof current === "bigint"
+          ? String(current)
+          : undefined;
+    if (scalar === undefined || scalar.length === 0) continue;
+    // Both the stored form and its trimmed form. A parser is free to normalise
+    // what it is handed -- `z.string().trim()` is the ordinary way to write a
+    // credential field -- and the adapter then closes over the trimmed value
+    // while this only ever sees what was stored. Comparing the stored form
+    // alone lets `"  key  "` be returned inside `id-key`, which is the whole
+    // disclosure this exists to stop.
+    for (const needle of new Set([scalar, scalar.trim()])) {
+      if (needle.length === 0) continue;
+      // A secret of one to three characters matches almost any identifier, so
+      // comparing against it would delete every message id this provider
+      // returns. It cannot be compared safely and it cannot be ignored either
+      // -- it is recorded as UNMATCHABLE, and the caller drops the id
+      // outright. Applied per needle, so a credential that is long only
+      // because of its whitespace is treated as the short one it really is.
+      if (needle.length < 4) {
+        hasUnmatchable = true;
+        hasUnusableSecret = true;
+      } else comparable.push(needle);
+    }
+  }
+
+  return { comparable, hasUnmatchable, hasUnusableSecret };
+}
+
+/**
+ * Drop a `messageId` that carries one of this provider's credentials.
+ *
+ * Dropped rather than redacted. A message id exists to be matched against the
+ * provider's own record of the send, and a partially rewritten one matches
+ * nothing while still looking like an identifier — so the honest outcome is
+ * that this send has no id. The row is still written, and still says the
+ * message was sent.
+ */
+/**
+ * A domain status free of the declared credentials. It goes to every reader
+ * of the provider, and the callback that built it held decrypted
+ * configuration, so a credential written into a record would be handed to the
+ * browser. Where a credential cannot be compared, no status is shown. Read
+ * defensively: a contributed callback may answer with anything.
+ */
+const DOMAIN_STATES: ReadonlyArray<EmailDomainStatus["status"]> = [
+  "verified",
+  "pending",
+  "failed",
+];
+
+function withoutLeakedStatus(
+  status: EmailDomainStatus | null,
+  secrets: { comparable: readonly string[]; hasUnmatchable: boolean }
+): EmailDomainStatus | null {
+  if (status === null || typeof status !== "object") return null;
+  if (secrets.hasUnmatchable) return null;
+  const clean = (text: unknown) =>
+    withoutDeclaredSecrets(typeof text === "string" ? text : "", secrets);
+  const records = Array.isArray(status.records) ? status.records : [];
+  return {
+    domain: clean(status.domain),
+    status: DOMAIN_STATES.includes(status.status) ? status.status : "pending",
+    records: records.map(record => ({
+      type: clean(record.type),
+      name: clean(record.name),
+      value: clean(record.value),
+      // A number is compared as its digits: a contributed provider may
+      // declare a numeric credential and hand it back as a priority.
+      ...(typeof record.priority === "number" &&
+      clean(String(record.priority)) === String(record.priority)
+        ? { priority: record.priority }
+        : {}),
+    })),
+  };
+}
+
+/**
+ * A probe's answer with its `detail` free of the declared credentials. The
+ * detail is the provider's own text, written with decrypted configuration in
+ * scope, and goes to the server log: a probe that returns
+ * `Invalid key ${config.apiKey}` rather than throwing it must not be the way
+ * around the containment a thrown failure gets. Where a credential cannot be
+ * compared, the detail is dropped. Read defensively: a contributed probe may
+ * answer with anything.
+ */
+function withoutLeakedDetail(
+  result: ConnectionTestResult,
+  secrets: { comparable: readonly string[]; hasUnmatchable: boolean }
+): ConnectionTestResult {
+  if (result === null || typeof result !== "object") return { ok: false };
+  const { detail, ...rest } = result;
+  if (typeof detail !== "string" || secrets.hasUnmatchable) return rest;
+  return { ...rest, detail: withoutDeclaredSecrets(detail, secrets) };
+}
+
+function withoutLeakedSecrets(
+  result: EmailSendResult,
+  secrets: { comparable: readonly string[]; hasUnmatchable: boolean }
+): EmailSendResult {
+  // A refusal's reason is the provider's own text, contained like any other.
+  // Read defensively: this runs after the provider has answered, so a throw
+  // here would report a message it accepted as failed. A value that is not a
+  // list, or an entry that is not an object, is dropped rather than read.
+  const refusals: unknown = result.refusals;
+  const contained = Array.isArray(refusals)
+    ? {
+        ...result,
+        refusals: refusals.flatMap(refusal => {
+          if (refusal === null || typeof refusal !== "object") return [];
+          const entry = refusal as NonNullable<
+            EmailSendResult["refusals"]
+          >[number];
+          // Every entry through containment, a reason-less one included: its
+          // status reaches the caller too, and could be a credential.
+          return [
+            typeof entry.reason === "string"
+              ? containedClassification(
+                  { ...entry, reason: entry.reason },
+                  secrets
+                )
+              : withContainedStatus(entry, secrets),
+          ];
+        }),
+      }
+    : refusals === undefined
+      ? result
+      : { ...result, refusals: undefined };
+  return withoutLeakedMessageId(contained, secrets);
+}
+
+/** `result` without a message id that carries a declared credential. */
+function withoutLeakedMessageId(
+  result: EmailSendResult,
+  secrets: { comparable: readonly string[]; hasUnmatchable: boolean }
+): EmailSendResult {
+  const messageId = result.messageId;
+  if (typeof messageId !== "string") return result;
+
+  // A provider holding a secret too short to compare loses its message ids
+  // entirely. That is the honest trade: the id is a convenience for matching a
+  // send against the provider's own dashboard, and a credential in a database
+  // column is not recoverable. A provider that wants its ids back declares a
+  // longer credential.
+  if (secrets.hasUnmatchable) return { ...result, messageId: undefined };
+
+  // Case-insensitive, for the same reason the trimmed form is compared: a
+  // parser that lowercases a hex token leaves the adapter holding a value this
+  // never saw. An id that carries the credential in any casing is dropped.
+  const haystack = messageId.toLowerCase();
+  if (
+    !secrets.comparable.some(secret => haystack.includes(secret.toLowerCase()))
+  ) {
+    return result;
+  }
+  return { ...result, messageId: undefined };
+}
+
+/**
+ * A provider failure, split into what may be shown and what must be logged.
+ *
+ * Normalising a provider's own error moves the useful half onto `cause`, where
+ * a log line reading `error.message` no longer sees it — so the operator gets
+ * "the reason is in the server log" and a log containing that same sentence.
+ * Shared by every site that reports one, because two sites deciding separately
+ * how deep to look is how one of them ends up looking one level short.
+ *
+ * The chain is walked rather than read once: a provider may wrap its own error
+ * before throwing, and the sentence worth having is at the bottom.
+ */
+export function describeProviderFailure(error: unknown): {
+  message: string;
+  cause?: string;
+} {
+  const message = error instanceof Error ? error.message : String(error);
+
+  const causes: string[] = [];
+  let current: unknown = error instanceof Error ? error.cause : undefined;
+  // Bounded: a cycle in a `cause` chain would otherwise hang the log call that
+  // was meant to describe a failure.
+  for (let depth = 0; current instanceof Error && depth < 5; depth += 1) {
+    causes.push(current.message);
+    current = current.cause;
+  }
+
+  return causes.length > 0
+    ? { message, cause: causes.join(": ") }
+    : { message };
+}
+
+/**
+ * Register a provider, erasing its config type.
+ *
+ * This is the function a provider package calls. Its argument stays fully
+ * typed, so an author gets checking on the shape they actually wrote, while
+ * the registry receives something it can store beside every other provider.
+ */
+export function defineEmailProvider<TConfig>(
+  definition: EmailProviderDefinition<TConfig>
+): RegisteredEmailProvider {
+  assertProviderTextIsRenderable(definition);
+
+  if (definition.type.length > MAX_EMAIL_PROVIDER_TYPE_LENGTH) {
+    throw emailProviderTypeTooLong(definition.type);
+  }
+
+  assertConfigFieldsAreUsable(definition.type, definition.configFields);
+
+  // Captured so the branch below narrows: an optional read off the object
+  // inside a closure does not stay narrowed, and asserting it would hide a
+  // definition that removed the probe after registration.
+  const probe = definition.testConnection;
+  const domainProbe = definition.domainStatus;
+
+  /**
+   * Parse, turning any failure into one the API boundary can report.
+   *
+   * A provider is free to validate with whatever library it likes, and the
+   * documented example uses `schema.parse(input)` — which throws that library's
+   * own error. Unrecognised errors are classified as internal, so a caller's
+   * malformed configuration would come back as a 500 rather than as the
+   * validation failure it is. A deliberately thrown `NextlyError` passes
+   * through untouched, so a provider that wants specific field paths keeps them.
+   */
+  const parse = (input: unknown): TConfig => {
+    try {
+      return definition.parseConfig(input);
+    } catch (error) {
+      // `NextlyError.is` rather than `instanceof`: a provider package bundling
+      // its own copy of nextly throws an error from a different class object,
+      // and the brand is what survives that boundary. Without it, a plugin's
+      // carefully-pathed validation error would be flattened below.
+      if (NextlyError.is(error)) throw error;
+
+      // The parser's own message is NOT made public. A plugin may interpolate
+      // configuration into it -- `Invalid API key ${input.apiKey}` is an easy
+      // thing to write -- and adapter resolution parses DECRYPTED stored
+      // configuration before sending, so an authenticated caller could provoke
+      // a failure and read back a credential the masked provider APIs exist to
+      // withhold. The original is kept as the logged cause for operators.
+      throw NextlyError.validation({
+        errors: [
+          {
+            path: "configuration",
+            code: "INVALID_PROVIDER_CONFIG",
+            message: "Provider configuration is invalid.",
+          },
+        ],
+        cause: error instanceof Error ? error : undefined,
+        logContext: { providerType: definition.type },
+      });
+    }
+  };
+
+  /**
+   * Keep a provider's own failure out of a response.
+   *
+   * `createAdapter` and `testConnection` receive DECRYPTED configuration, and
+   * `testProvider` reports a caught error's `message` to the caller. A provider
+   * that writes its configuration into a diagnostic — `Invalid key ${apiKey}`
+   * is an easy thing to write — would therefore hand a credential back to any
+   * authenticated caller who pressed Test, which is the exact leak the parse
+   * wrapper already closes for `parseConfig`.
+   *
+   * A deliberately thrown `NextlyError` passes through, for the same reason it
+   * does there: its `publicMessage` is an authoring decision about what is safe
+   * to show, while a bare `Error`'s message is whatever the throw site
+   * happened to interpolate.
+   */
+
+  // Built raw, then contained. The wrapper is the same one `register()` applies
+  // to a hand-built provider, so the two cannot come to differ about what a
+  // callback is allowed to let out -- and applying it twice is harmless, which
+  // is what makes enforcing at both ends safe.
+  return containProviderCallbacks({
+    type: definition.type,
+    label: definition.label,
+    description: definition.description,
+    docsUrl: definition.docsUrl,
+    senderGuidance: definition.senderGuidance,
+    capabilities: definition.capabilities,
+    configFields: definition.configFields,
+    parseConfiguration: (input: unknown): unknown => parse(input),
+    // Parses AND builds, so the typed value never escapes the closure that
+    // knows its type. Nothing here catches: the containment above does it.
+    createAdapterFrom: (input: unknown): EmailProviderAdapter => {
+      const config = parse(input);
+      const fromParsed = secretsFromBothForms(
+        definition.configFields,
+        input,
+        config
+      );
+
+      // Built inside the containment, not before it. `createAdapter` receives
+      // the PARSED configuration and is as free as any other callback to write
+      // it into a message -- `throw new Error(\`bad key ${config.token}\`)\` is
+      // an easy thing to write, and construction is where a provider is most
+      // likely to object to a credential. Left outside, that throw travelled
+      // to the caller and into `email.failed` with the value intact.
+      let adapter: EmailProviderAdapter;
+      try {
+        adapter = definition.createAdapter(config);
+      } catch (error) {
+        throw normalizeProviderFailure(
+          definition.type,
+          error,
+          "createAdapter",
+          fromParsed
+        );
+      }
+
+      return {
+        ...adapter,
+        send: async options => {
+          try {
+            return withoutLeakedSecrets(
+              await adapter.send(options),
+              fromParsed
+            );
+          } catch (error) {
+            // Normalised here rather than thrown contained. The wrapper around
+            // this one passes a `NextlyError` through untouched, on the
+            // reading that a provider chose it deliberately -- so throwing a
+            // bare contained value would make it the error the caller sees,
+            // in place of the sentence naming which provider failed.
+            throw normalizeProviderFailure(
+              definition.type,
+              error,
+              "send",
+              fromParsed
+            );
+          }
+        },
+      };
+    },
+    testConnectionFrom: probe
+      ? async (input: unknown) => {
+          const config = parse(input);
+          try {
+            return withoutLeakedDetail(
+              await probe(config),
+              secretsFromBothForms(definition.configFields, input, config)
+            );
+          } catch (error) {
+            // Contained here, where the parsed configuration is in scope. The
+            // outer wrapper contains this callback too, but only against the
+            // stored form -- and a probe is handed the parsed one, so a
+            // rejection quoting a derived credential passed that pass
+            // untouched. Running first also means the outer pass sees a
+            // `NextlyError` and leaves it alone, which is what keeps the two
+            // from disagreeing about what a probe may say.
+            throw normalizeProviderFailure(
+              definition.type,
+              error,
+              "testConnection",
+              secretsFromBothForms(definition.configFields, input, config)
+            );
+          }
+        }
+      : undefined,
+    domainStatusFrom: domainProbe
+      ? async (input: unknown, domain: string) => {
+          const config = parse(input);
+          const secrets = secretsFromBothForms(
+            definition.configFields,
+            input,
+            config
+          );
+          try {
+            return withoutLeakedStatus(
+              await domainProbe(config, domain),
+              secrets
+            );
+          } catch (error) {
+            // Contained as the probe is: it holds the parsed configuration.
+            throw normalizeProviderFailure(
+              definition.type,
+              error,
+              "domainStatus",
+              secrets
+            );
+          }
+        }
+      : undefined,
+    hasConnectionTest: typeof probe === "function",
+    // Forwarded rather than invoked here: the answer belongs to the moment the
+    // catalog is built, not to the moment the provider was defined, so calling
+    // it now would freeze the state the process started in.
+    checkAvailability: definition.checkAvailability,
+  });
+}
+
+/**
+ * The browser-safe half of a definition.
+ *
+ * Sent to the admin so it can render a form for a provider core was never
+ * compiled against. Functions are dropped rather than serialized to `undefined`
+ * by accident, and nothing here carries a stored value.
+ */
+/**
+ * Whether a registered provider can actually run on this install.
+ *
+ * A provider can be registered and still be unusable, because the transport
+ * library it needs is an optional peer dependency the host never installed.
+ * The admin has to be able to say so precisely, naming the package and the
+ * command, rather than offering an option that fails when a message is sent.
+ *
+ * A union rather than a boolean plus loose fields: "ready" carries nothing to
+ * report, and the unavailable case is useless without the remedy, so the two
+ * states have genuinely different shapes.
+ */
+export type ProviderAvailability =
+  | { status: "ready" }
+  | {
+      status: "needs-dependency";
+      /** The npm package that is missing. */
+      packageName: string;
+      /** The exact command that installs it. */
+      installCommand: string;
+      /** Where the provider documents its setup, when it does. */
+      docsUrl?: string;
+    };
+
+export interface EmailProviderDescriptor {
+  type: string;
+  label: string;
+  description?: string;
+  docsUrl?: string;
+  senderGuidance?: string;
+  capabilities: EmailProviderCapabilities;
+  configFields: ReadonlyArray<EmailProviderConfigField>;
+  availability: ProviderAvailability;
+}
+
+/** Reduce a registered provider to what may safely leave the server. */
+/**
+ * A provider callback's failure, as it is allowed to leave the provider.
+ *
+ * A deliberately thrown `NextlyError` passes through: its `publicMessage` is an
+ * authoring decision about what is safe to show, while a bare `Error`'s message
+ * is whatever the throw site happened to interpolate — and a provider that
+ * writes its configuration into a diagnostic (`Invalid key ${apiKey}` is an
+ * easy thing to write) would otherwise hand a credential to any authenticated
+ * caller who pressed Test.
+ *
+ * The provider's own text is not lost: it is moved onto `cause`, which is what
+ * the log reads.
+ */
+/** What a declared credential is replaced with when it appears in a diagnostic. */
+export const REDACTED_SECRET = "[secret]";
+
+/**
+ * Every occurrence of one literal, whatever its case.
+ *
+ * The literal is escaped before it becomes a pattern: a credential may contain
+ * characters a regular expression reads as syntax, and an unescaped one either
+ * matches the wrong text or throws while building.
+ *
+ * A pattern rather than a hand-rolled scan over `toLowerCase()`, for two
+ * reasons that both bite in production. Case folding can CHANGE LENGTH -- `İ`
+ * lowercases to two code units -- so an index found in a folded copy does not
+ * address the original, and enough of them ahead of a credential shift the
+ * replacement clear of it and leave the whole secret in the text. And a folded
+ * copy taken per match makes the work grow with the number of matches, so a
+ * provider quoting a large remote error body back turns the failure path into
+ * a stall. Matching over the ORIGINAL string keeps offsets exact by having
+ * none, and one pass is one pass.
+ */
+function caseInsensitivePattern(literal: string): RegExp {
+  return new RegExp(literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+}
+
+/**
+ * A provider's own diagnostic, with its declared credentials taken out.
+ *
+ * A thrown error is the longest route a credential has out of a provider: the
+ * wrapper keeps it out of the response by refusing to make the message public,
+ * but `describeProviderFailure` walks the `cause` chain into the `email.failed`
+ * log line, and `Error(config.apiKey)` is an easy thing for a provider to
+ * write. A process log is shipped to aggregators and read by more people than
+ * the configuration is.
+ *
+ * Done HERE rather than at the log site because this is the only place that
+ * knows which values are credentials — the same knowledge the message-id
+ * containment beside it uses.
+ *
+ * The rest of the text survives. An SMTP status line or an API error code is
+ * the one fact worth having when a send fails, and redacting the whole
+ * diagnostic to remove a credential that may not be in it would trade a real
+ * disclosure for a permanent loss of the reason.
+ */
+function containedFailure(
+  error: unknown,
+  secrets: DeclaredSecretValues
+): Error | undefined {
+  if (!(error instanceof Error)) return undefined;
+
+  const texts: string[] = [];
+  let current: unknown = error;
+  // Bounded like the reader that consumes this: a cycle in a `cause` chain
+  // must not hang the failure path.
+  for (let depth = 0; current instanceof Error && depth < 5; depth += 1) {
+    texts.push(current.message);
+    current = current.cause;
+  }
+
+  // Nothing here can say which text is safe, so none of it is kept -- the same
+  // answer the message id gets when its credentials cannot be compared.
+  if (secrets.hasUnmatchable) {
+    return new NextlyError({
+      code: "INTERNAL_ERROR",
+      publicMessage:
+        "Provider diagnostics were withheld: this provider's credentials cannot be checked for in its own text.",
+      logContext: { reason: "provider-diagnostic-unmatchable" },
+    });
+  }
+
+  // Case-insensitively, for the same reason the message id is compared that
+  // way: a parser that lowercases a key leaves the adapter holding a spelling
+  // this never saw, and a provider quoting it back would slip past an exact
+  // match. The literal is escaped before it becomes a pattern, so a credential
+  // containing characters a regular expression would read as syntax matches
+  // itself rather than whatever they would have meant.
+  const text = withoutDeclaredSecrets(texts.join(": "), secrets);
+  // A `NextlyError`, not a bare one: this value is attached as the `cause` of
+  // the error the wrapper throws, and everything constructed as an error in
+  // this package is a `NextlyError`. Its sentence is the provider's own
+  // diagnostic with the declared credentials taken out, which is what the
+  // failure log is for -- the caller sees the OUTER error's message, never
+  // this one.
+  return new NextlyError({
+    code: "INTERNAL_ERROR",
+    publicMessage: text,
+    logContext: { reason: "provider-diagnostic" },
+  });
+}
+
+/**
+ * `text` with every declared credential replaced, case-insensitively.
+ */
+function withoutDeclaredSecrets(
+  text: string,
+  secrets: { comparable: readonly string[] }
+): string {
+  // LONGEST first. A provider may declare one credential that is a prefix of
+  // another -- `sk_live` beside `sk_live_REAL_SECRET` -- and redacting the
+  // short one first consumes the head of the long one, leaving its tail in the
+  // text as `[secret]_REAL_SECRET`. Replacing the longest match first cannot
+  // be undone by a shorter one, because the characters are already gone.
+  const byLengthDescending = [...secrets.comparable].sort(
+    (left, right) => right.length - left.length
+  );
+  let redacted = text;
+  for (const secret of byLengthDescending) {
+    if (secret.length === 0) continue;
+    redacted = redacted.replace(
+      caseInsensitivePattern(secret),
+      REDACTED_SECRET
+    );
+  }
+  return redacted;
+}
+
+/**
+ * A provider's classification, with its reason fit to reach a caller: free of
+ * the declared credentials, or, where they cannot be compared, replaced by the
+ * sentence the classification itself gives.
+ */
+/**
+ * A status a provider chose, unless it could be a declared credential: one
+ * that equals a credential, or any status at all where a credential is too
+ * short to compare, is not passed on.
+ */
+function containedStatus(
+  status: number | undefined,
+  secrets: { comparable: readonly string[]; hasUnmatchable: boolean }
+): number | undefined {
+  return status !== undefined &&
+    !secrets.hasUnmatchable &&
+    !secrets.comparable.includes(String(status))
+    ? status
+    : undefined;
+}
+
+/** `entry` with its status contained, for a refusal that gave no reason. */
+function withContainedStatus<E extends { status?: number }>(
+  entry: E,
+  secrets: { comparable: readonly string[]; hasUnmatchable: boolean }
+): Omit<E, "status"> & { status?: number } {
+  const status = containedStatus(entry.status, secrets);
+  const { status: _withheld, ...rest } = entry;
+  return { ...rest, ...(status !== undefined ? { status } : {}) };
+}
+
+function containedClassification<F extends EmailFailure>(
+  failure: F,
+  secrets: { comparable: readonly string[]; hasUnmatchable: boolean }
+): Omit<F, "status" | "reason"> & EmailFailure {
+  const status = containedStatus(failure.status, secrets);
+  const reason = secrets.hasUnmatchable
+    ? (failureOf({ emailFailure: { retryable: failure.retryable, status } })
+        ?.reason ?? failure.reason)
+    : withoutDeclaredSecrets(failure.reason, secrets);
+  const { status: _withheld, reason: _replaced, ...rest } = failure;
+  return { ...rest, ...(status !== undefined ? { status } : {}), reason };
+}
+
+/**
+ * A provider's deliberate error with its `cause` contained. The public
+ * sentence is the provider's choice and is kept; the cause is whatever it
+ * wrapped, often the raw failure with a credential in its message, and it
+ * reaches the server log as the cause of every failure built from this one.
+ */
+function withContainedCause(
+  error: NextlyError,
+  secrets: DeclaredSecretValues
+): void {
+  if (error.cause === undefined) return;
+  Object.defineProperty(error, "cause", {
+    value: containedFailure(error.cause, secrets),
+    configurable: true,
+    writable: true,
+    enumerable: false,
+  });
+}
+
+function normalizeProviderFailure(
+  type: string,
+  error: unknown,
+  stage: "createAdapter" | "testConnection" | "domainStatus" | "send",
+  secrets: DeclaredSecretValues
+): unknown {
+  // A provider that threw a `NextlyError` deliberately chose its own public
+  // sentence and field paths; passing it through is the point. Containment is
+  // applied to everything else, HERE rather than at the call sites, so a
+  // contained cause can never be handed back into this check and mistaken for
+  // that deliberate error.
+  // Its classification, if it has one, is carried across, contained like the
+  // rest of what the provider said.
+  const failure = failureOf(error);
+  // The setup category is one of a fixed set of words, with nothing of the
+  // provider's in it, so it crosses as it is. Only a provider's check and
+  // test send read it; a send's result never carries it.
+  const attached = (error as { emailSetup?: unknown } | null)?.emailSetup;
+  const setup = isEmailSetupCategory(attached) ? attached : undefined;
+  const keepSetup = <E extends object>(value: E): E =>
+    setup && value instanceof Error ? withSetupCategory(value, setup) : value;
+  if (NextlyError.is(error)) {
+    withContainedCause(error, secrets);
+    return keepSetup(
+      failure
+        ? withEmailFailure(error, containedClassification(failure, secrets))
+        : error
+    );
+  }
+  // Constructed rather than `NextlyError.internal()`, which fixes its own
+  // public sentence: naming the provider is what tells an operator which of
+  // several configured providers failed, and the type comes from the install's
+  // own code rather than from a request.
+  const normalized = new NextlyError({
+    code: "INTERNAL_ERROR",
+    publicMessage: `The "${type}" email provider failed. Check the server logs for the reason.`,
+    cause: containedFailure(error, secrets),
+    logContext: { providerType: type, stage },
+  });
+  return keepSetup(
+    failure
+      ? withEmailFailure(normalized, containedClassification(failure, secrets))
+      : normalized
+  );
+}
+
+/**
+ * Wrap a provider's callbacks so a credential cannot leave through one.
+ *
+ * `defineEmailProvider` applies this to what it builds, and the registry
+ * applies it to everything it is handed. Both, because
+ * `RegisteredEmailProvider` is a STRUCTURAL type: a JavaScript plugin or a
+ * hand-built object reaches `register()` with its own `createAdapterFrom`, and
+ * containment that lived only in the authoring helper would protect exactly the
+ * authors least likely to need it.
+ *
+ * Applying it twice is harmless: `normalizeProviderFailure` passes a
+ * `NextlyError` through unchanged, and a message id with no credential in it is
+ * returned as it is. That is what makes enforcing at both ends safe.
+ *
+ * The secrets are read from the configuration this adapter was built FROM,
+ * because the parsed form never leaves `createAdapterFrom` -- the erased
+ * definition returns an adapter, not the value it parsed. The adapter can
+ * therefore hold a credential in a shape this never saw, so the stored string
+ * and its trimmed form are both compared and the comparison ignores case,
+ * which covers the normalisations a credential field ordinarily receives.
+ *
+ * A parser that transforms a credential further -- encodes it, or derives a
+ * token from it -- is outside what any comparison here can reach. Closing that
+ * needs the parsed value, which is a change to the provider contract rather
+ * than to this wrapper.
+ */
+export function containProviderCallbacks(
+  provider: RegisteredEmailProvider
+): RegisteredEmailProvider {
+  const probe = provider.testConnectionFrom;
+  const domainProbe = provider.domainStatusFrom;
+
+  return {
+    ...provider,
+    createAdapterFrom: (input: unknown): EmailProviderAdapter => {
+      // Read BEFORE the callback runs. Building the adapter is itself a stage
+      // that can throw a credential -- `createAdapter` receives the decrypted
+      // configuration -- so containment cannot wait until after it succeeds.
+      const secrets = declaredSecretValues(provider.configFields, input);
+
+      let adapter: EmailProviderAdapter;
+      try {
+        adapter = provider.createAdapterFrom(input);
+      } catch (error) {
+        throw normalizeProviderFailure(
+          provider.type,
+          error,
+          "createAdapter",
+          secrets
+        );
+      }
+
+      return {
+        ...adapter,
+        send: async options => {
+          let result: EmailSendResult;
+          try {
+            result = await adapter.send(options);
+          } catch (error) {
+            throw normalizeProviderFailure(
+              provider.type,
+              error,
+              "send",
+              secrets
+            );
+          }
+          return withoutLeakedSecrets(result, secrets);
+        },
+      };
+    },
+    ...(probe
+      ? {
+          testConnectionFrom: async (input: unknown) => {
+            // The probe holds the decrypted configuration exactly as `send`
+            // does, and `testProvider` writes its cause into the process log.
+            const secrets = declaredSecretValues(provider.configFields, input);
+            try {
+              return withoutLeakedDetail(await probe(input), secrets);
+            } catch (error) {
+              throw normalizeProviderFailure(
+                provider.type,
+                error,
+                "testConnection",
+                secrets
+              );
+            }
+          },
+        }
+      : {}),
+    ...(domainProbe
+      ? {
+          domainStatusFrom: async (input: unknown, domain: string) => {
+            // Contained as the probe is: it holds the decrypted configuration.
+            const secrets = declaredSecretValues(provider.configFields, input);
+            try {
+              return withoutLeakedStatus(
+                await domainProbe(input, domain),
+                secrets
+              );
+            } catch (error) {
+              throw normalizeProviderFailure(
+                provider.type,
+                error,
+                "domainStatus",
+                secrets
+              );
+            }
+          },
+        }
+      : {}),
+  };
+}
+
+export function toDescriptor(
+  provider: RegisteredEmailProvider
+): EmailProviderDescriptor {
+  return {
+    type: provider.type,
+    label: provider.label,
+    description: provider.description,
+    docsUrl: provider.docsUrl,
+    senderGuidance: provider.senderGuidance,
+    capabilities: {
+      ...provider.capabilities,
+      // Derived, not echoed: a definition that claims the capability without
+      // supplying a probe would advertise a button that cannot do anything.
+      // Derived from the callback that actually exists, not from either
+      // declared flag. `RegisteredEmailProvider` is structural, so a hand-built
+      // provider can set `hasConnectionTest: true` and omit the callback -- the
+      // descriptor would then advertise a probe the service cannot find.
+      connectionTest:
+        provider.capabilities?.connectionTest === true &&
+        typeof provider.testConnectionFrom === "function",
+    },
+    configFields: provider.configFields.map(publishableField),
+    availability: publishableAvailability(provider),
+  };
+}
+
+/**
+ * Whether this provider can run here, in the shape a client may receive.
+ *
+ * Asked at descriptor time rather than read from a stored flag: availability is
+ * a property of the machine, and a value captured at module load would keep
+ * reporting the state the process started in after an operator installs the
+ * package and restarts.
+ *
+ * Rebuilt key by key for the reason `publishableField` is: the definition is a
+ * structural type, so a JavaScript plugin can return an object carrying
+ * anything, and a spread would publish all of it to every client holding read.
+ */
+function publishableAvailability(
+  provider: RegisteredEmailProvider
+): ProviderAvailability {
+  let reported: ProviderAvailability;
+
+  try {
+    reported = provider.checkAvailability?.() ?? { status: "ready" };
+  } catch {
+    // A provider that cannot answer the question is not one to offer. Failing
+    // the whole catalog instead would let one badly written plugin take the
+    // Settings page down for every other provider on the install.
+    return {
+      status: "needs-dependency",
+      packageName: provider.type,
+      installCommand: `Check what the ${provider.label} provider requires before selecting it.`,
+    };
+  }
+
+  if (reported.status === "ready") return { status: "ready" };
+
+  return {
+    status: "needs-dependency",
+    packageName: reported.packageName,
+    installCommand: reported.installCommand,
+    ...(reported.docsUrl !== undefined ? { docsUrl: reported.docsUrl } : {}),
+  };
+}
+
+/**
+ * One config field, rebuilt from the properties a descriptor declares.
+ *
+ * Copied key by key rather than spread. `EmailProviderConfigField` is a
+ * structural type on a structural definition, so a JavaScript plugin or a
+ * hand-built provider can hang anything it likes off a field -- an operational
+ * `value`, a `credentials` blob -- and a spread publishes all of it to every
+ * client holding read or create. Registration ignores the extra property,
+ * which is exactly why nothing else would notice it leaving.
+ *
+ * An allowlist rather than a list of things to strip: a denylist is wrong the
+ * moment someone invents a key nobody thought of, and the set of keys a
+ * descriptor MEANS is already written down as this interface.
+ *
+ * A default on a secret field is withheld even though registration refuses
+ * one, for the same structural reason. The field is still described; only its
+ * value is withheld.
+ */
+function publishableField(
+  field: EmailProviderConfigField
+): EmailProviderConfigField {
+  const withheldDefault = field.secret === true;
+
+  return {
+    name: field.name,
+    label: field.label,
+    kind: field.kind,
+    ...(field.required !== undefined ? { required: field.required } : {}),
+    ...(field.default !== undefined && !withheldDefault
+      ? { default: field.default }
+      : {}),
+    ...(field.help !== undefined ? { help: field.help } : {}),
+    ...(field.placeholder !== undefined
+      ? { placeholder: field.placeholder }
+      : {}),
+    ...(field.options !== undefined
+      ? {
+          options: field.options.map(option => ({
+            value: option.value,
+            label: option.label,
+          })),
+        }
+      : {}),
+    ...(field.secret !== undefined ? { secret: field.secret } : {}),
+    ...(field.constraints !== undefined
+      ? {
+          constraints: {
+            ...(field.constraints.min !== undefined
+              ? { min: field.constraints.min }
+              : {}),
+            ...(field.constraints.max !== undefined
+              ? { max: field.constraints.max }
+              : {}),
+            ...(field.constraints.maxLength !== undefined
+              ? { maxLength: field.constraints.maxLength }
+              : {}),
+          },
+        }
+      : {}),
+    ...(field.blankAs !== undefined ? { blankAs: field.blankAs } : {}),
+  };
+}

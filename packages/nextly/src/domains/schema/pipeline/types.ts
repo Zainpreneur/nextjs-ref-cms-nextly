@@ -1,0 +1,142 @@
+// The locked input contract for applyDesiredSchema().
+// A snapshot of what the database should look like after the apply.
+//
+// Three top-level keys mirror the user mental model: collections,
+// singles, components. Each value is keyed by slug for O(1) lookups.
+//
+// Field-shape only — display metadata (label, admin, access, hooks)
+// lives on the same FieldConfig type but is ignored by the schema
+// pipeline. See plans/specs/F2-apply-desired-schema-design.md §5.
+
+import type {
+  FieldConfig,
+  IndexConfig,
+} from "../../../collections/config/define-collection";
+
+export interface DesiredSchema {
+  collections: Record<string, DesiredCollection>;
+  singles: Record<string, DesiredSingle>;
+  components: Record<string, DesiredFieldGroup>;
+}
+
+export interface DesiredCollection {
+  slug: string;
+  tableName: string;
+  fields: FieldConfig[];
+  indexes?: IndexConfig[];
+  /**
+   * Whether the collection has Draft/Published status enabled.
+   * When true, the diff input includes a `status` system column so the
+   * pipeline knows to add it on first enable and drop it on disable.
+   */
+  status?: boolean;
+  /**
+   * Whether the collection is localized (i18n). When true, translatable fields
+   * are omitted from the main table's desired snapshot because they live in the
+   * companion `_locales` table. Without this the push/HMR/preview diff re-adds
+   * the localized columns to the main table.
+   */
+  localized?: boolean;
+  /**
+   * Whether this entity is owned by code-first config or a plugin (locked in
+   * the registry). A UI/builder save must never emit DDL against a locked
+   * table — those tables are owned by `nextly.config.ts` and its migrations,
+   * so drift is reconciled by db:sync, not by the Schema Builder.
+   */
+  locked?: boolean;
+  /**
+   * Whether this entity was authored in the Schema Builder rather than in code.
+   *
+   * Stated explicitly rather than inferred from `locked`, because most snapshot builders omit
+   * `locked` entirely and an absent flag says nothing about origin: reading it as "not locked,
+   * therefore the Builder's" reclassified every code-first entity on the HMR and db:sync paths.
+   *
+   * Absent means code-first, which is the conservative answer — a producer that has not learned to
+   * state this leaves behaviour exactly as it was.
+   */
+  builderOwned?: boolean;
+  /**
+   * The fields the registry records for this collection before the change, as it records them, so
+   * a field outside them is one the change adds. A Schema Builder save states it: MySQL commits
+   * each schema statement, so an apply refused part-way can leave an added field's column in place
+   * without its foreign key, and the next apply keys it (`withBuilderForeignKeys`). A recorded
+   * relationship's target tells a column that apply renamed from one it added. Absent, no column
+   * already in place is keyed, as before.
+   *
+   * The roads that apply configuration in code (a reload under `next dev`, `nextly db:sync`) state
+   * it too, from the registry row before their own sync replaces it: on SQLite a relationship
+   * switched between one related entry and many is told by nothing else
+   * (`withRecordedShapes`).
+   */
+  recordedFields?: readonly FieldConfig[];
+}
+
+export interface DesiredSingle {
+  slug: string;
+  tableName: string;
+  fields: FieldConfig[];
+  indexes?: IndexConfig[];
+  /** Same semantics as DesiredCollection.status. */
+  status?: boolean;
+  /** Same semantics as DesiredCollection.localized — translatable fields live in
+   *  the companion `single_<slug>_locales` table and are omitted from main. */
+  localized?: boolean;
+  /**
+   * The fields the registry records for this Single before the change, as it records them: what a
+   * relationship switched between one related entry and many was, which SQLite's column cannot
+   * tell. Same source and use as `DesiredCollection.recordedFields`; absent, nothing is switched.
+   */
+  recordedFields?: readonly FieldConfig[];
+  /**
+   * Whether this entity is owned by code-first config or a plugin (locked in
+   * the registry). A UI/builder save must never emit DDL against a locked
+   * table — those tables are owned by `nextly.config.ts` and its migrations,
+   * so drift is reconciled by db:sync, not by the Schema Builder.
+   */
+  locked?: boolean;
+  /**
+   * Whether this entity was authored in the Schema Builder rather than in code.
+   *
+   * Stated explicitly rather than inferred from `locked`, because most snapshot builders omit
+   * `locked` entirely and an absent flag says nothing about origin: reading it as "not locked,
+   * therefore the Builder's" reclassified every code-first entity on the HMR and db:sync paths.
+   *
+   * Absent means code-first, which is the conservative answer — a producer that has not learned to
+   * state this leaves behaviour exactly as it was.
+   */
+  builderOwned?: boolean;
+}
+
+export interface DesiredFieldGroup {
+  slug: string;
+  tableName: string;
+  fields: FieldConfig[];
+  /**
+   * The fields the registry records for this field group before the change, as it records them:
+   * what a relationship switched between one related entry and many was. Same source and use as
+   * `DesiredCollection.recordedFields`; absent, the diff reads the column's type alone.
+   */
+  recordedFields?: readonly FieldConfig[];
+  indexes?: IndexConfig[];
+  /** Same semantics as DesiredCollection.localized — translatable fields live in
+   *  the companion `comp_<slug>_locales` table and are omitted from main. */
+  localized?: boolean;
+  /**
+   * Whether this entity is owned by code-first config or a plugin (locked in
+   * the registry). A UI/builder save must never emit DDL against a locked
+   * table — those tables are owned by `nextly.config.ts` and its migrations,
+   * so drift is reconciled by db:sync, not by the Schema Builder.
+   */
+  locked?: boolean;
+  /**
+   * Whether this entity was authored in the Schema Builder rather than in code.
+   *
+   * Stated explicitly rather than inferred from `locked`, because most snapshot builders omit
+   * `locked` entirely and an absent flag says nothing about origin: reading it as "not locked,
+   * therefore the Builder's" reclassified every code-first entity on the HMR and db:sync paths.
+   *
+   * Absent means code-first, which is the conservative answer — a producer that has not learned to
+   * state this leaves behaviour exactly as it was.
+   */
+  builderOwned?: boolean;
+}

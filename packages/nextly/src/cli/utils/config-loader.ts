@@ -1,0 +1,1237 @@
+/**
+ * Config Loader
+ *
+ * Loads and parses nextly.config.ts at runtime using esbuild.
+ * Supports TypeScript, ESM, and CommonJS config files.
+ *
+ * @module cli/utils/config-loader
+ * @since 1.0.0
+ *
+ * @example
+ * ```typescript
+ * import { loadConfig, watchConfig } from 'nextly/cli/utils/config-loader';
+ *
+ * // Load config once
+ * const config = await loadConfig();
+ *
+ * // Watch for changes (dev mode)
+ * const config = await loadConfig({ watch: true });
+ * watchConfig((newConfig) => {
+ *   console.log('Config updated:', newConfig);
+ * });
+ * ```
+ */
+
+import { existsSync, watch, type FSWatcher } from "node:fs";
+import { resolve, dirname } from "node:path";
+
+import {
+  defineConfig,
+  type SanitizedNextlyConfig,
+} from "../../collections/config/define-config";
+import { assertOpensIn } from "../../collections/config/opens-in";
+import type { NextlyServiceConfig } from "../../di/register";
+import { emailRetentionAfterTransform } from "../../domains/email/retention-config";
+import { judgeFieldGroupCyclesAtStart } from "../../domains/field-groups/field-group-cycles";
+import {
+  clearFieldTypes,
+  registerFieldType,
+  restoreFieldTypes,
+  snapshotFieldTypes,
+  withoutDisabledBehavior,
+} from "../../domains/schema/field-types/field-type-registry";
+import { loadLatestSnapshot } from "../../domains/schema/migrate-create/snapshot-io";
+import {
+  currentWithheldScopeFields,
+  publishWithheldScopeFields,
+} from "../../domains/schema/pipeline/withheld-scope-fields";
+import {
+  resolvePostgresSchema,
+  setActivePostgresSchema,
+} from "../../domains/schema/services/postgres-schema";
+import { assertBuilderDefinitionsKept } from "../../domains/schema/ui-schema/builder-definitions";
+import { loadUiSchema } from "../../domains/schema/ui-schema/loader";
+import { manifestToBuilderEntities } from "../../domains/schema/ui-schema/merge";
+import { publishWebhookEventTypes } from "../../domains/webhooks/event-type-registry";
+import { NextlyError, describeError } from "../../errors/index";
+import type { PluginFieldType } from "../../plugins/contributions";
+import { getCoreVersion } from "../../plugins/core-version";
+import { collectCustomPermissions } from "../../plugins/permissions/collect-permissions";
+import { withWithheldConfig } from "../../plugins/plugin-config-view";
+import {
+  NO_PLUGIN_CONSENT,
+  pluginConsentFromConfig,
+  type PluginConsent,
+  setupTransformerInput,
+} from "../../plugins/plugin-consent";
+import type { PluginDefinition } from "../../plugins/plugin-context";
+import {
+  resolveDeclaredPlugins,
+  resolveTransformedPlugins,
+} from "../../plugins/resolve";
+import {
+  applyPluginSchemaContributionsDeferred,
+  type BuilderEntities,
+  type DeferredExtend,
+  type FieldsAddedByPlugins,
+  assertRegisteredKeepTheirKind,
+  resolveBuilderExtends,
+} from "../../plugins/schema/apply-contributions";
+import {
+  collectUnresolvedRelationTargets,
+  finalizeRelationTargets,
+  validateCrossPluginRelations,
+} from "../../plugins/schema/validate-relations";
+import { assertSettingsPermissionsOwned } from "../../plugins/settings-permission";
+import { assertFieldTypeSettings } from "../../plugins/validate-field-type-settings";
+import { withEditorPlaces } from "../../shared/lib/build-messages";
+import {
+  CONFIG_FILE_NAMES,
+  CONFIG_SEARCH_DIRS,
+  findConfigFile,
+} from "../../shared/lib/config-file";
+import { configurationProblems } from "../../shared/lib/config-problems";
+import { consoleLogger } from "../../shared/types";
+
+import { bundleAndRequire } from "./config-bundler";
+
+/**
+ * What `readBuilderEntities` gives for a definition file it could not read: no entities, and,
+ * being this one object, told apart from a file that declares none, so nothing is called lost
+ * for a file whose content is unknown.
+ */
+const UNREAD_BUILDER_ENTITIES: BuilderEntities = Object.freeze({});
+
+/**
+ * The Builder's entities from the app's ui-schema file, empty when there is none. A malformed file
+ * is surfaced by migrate:create and migrate:check, which load it again; loading the configuration
+ * for any other command does not fail on it, and gets `UNREAD_BUILDER_ENTITIES`.
+ */
+async function readBuilderEntities(
+  projectRoot: string,
+  uiSchemaFile: Parameters<typeof loadUiSchema>[0]["uiSchemaFile"]
+): Promise<BuilderEntities> {
+  try {
+    return manifestToBuilderEntities(
+      await loadUiSchema({ projectRoot, uiSchemaFile })
+    );
+  } catch {
+    return UNREAD_BUILDER_ENTITIES;
+  }
+}
+
+/**
+ * Refuse, as `migrate:check` and `migrate:create` do (`assertBuilderDefinitionsKept`), when the
+ * newest snapshot records a Builder entity that neither the configuration nor the definition file
+ * declares now. Asked where a plugin's extend or a relationship names a target nothing declares:
+ * that target may be the entity the file lost, and restoring the file is then the fix. Returns
+ * where nothing was lost, or where the definition file or the snapshot cannot be read, which
+ * those commands report as what they are.
+ */
+async function refuseLostBuilderDefinitions(
+  projectRoot: string,
+  config: SanitizedNextlyConfig,
+  builderEntities: BuilderEntities
+): Promise<void> {
+  if (builderEntities === UNREAD_BUILDER_ENTITIES) return;
+  let latest: Awaited<ReturnType<typeof loadLatestSnapshot>>;
+  try {
+    latest = await loadLatestSnapshot(
+      resolve(projectRoot, config.db.migrationsDir, "meta")
+    );
+  } catch {
+    return;
+  }
+  assertBuilderDefinitionsKept({
+    recorded: latest?.data.entities,
+    merged: {
+      collections: [
+        ...(config.collections ?? []),
+        ...(builderEntities.collections ?? []),
+      ],
+      singles: [...(config.singles ?? []), ...(builderEntities.singles ?? [])],
+      components: [
+        ...(config.fieldGroups ?? []),
+        ...(builderEntities.components ?? []),
+      ],
+    },
+    definitionFile: config.db.uiSchemaFile,
+  });
+}
+
+/** The refusals of a plugin's extend, or a relationship, whose target nothing declares. */
+const UNKNOWN_TARGET_CODES: ReadonlySet<string> = new Set([
+  "NEXTLY_SCHEMA_EXTEND_TARGET_UNKNOWN",
+  "NEXTLY_SCHEMA_RELATION_TARGET_MISSING",
+]);
+
+/** Whether `error` refuses a target nothing declares, which may be an entity the file lost. */
+function namesAnUnknownTarget(error: unknown): boolean {
+  return NextlyError.is(error) && UNKNOWN_TARGET_CODES.has(error.code);
+}
+
+/** Builder collection slugs (the only valid relationTo targets among Builder entities). */
+function builderCollectionSlugs(builder: BuilderEntities): string[] {
+  return (builder.collections ?? []).map(c => c.slug);
+}
+
+/**
+ * Validate (D6) and topologically order (D5) the configured plugins using the
+ * single shared resolver — the SAME resolver the runtime uses (register.ts), so
+ * CLI and runtime agree on order and fail identically (D6). Fail-fast (D7).
+ * The CLI then runs each plugin's `setup` in this order, and judges the
+ * transformed list against the record (`preSetup`) taken here, before any of
+ * them ran.
+ */
+export function orderConfigPlugins(
+  plugins: PluginDefinition[],
+  consent: PluginConsent
+): ReturnType<typeof resolveDeclaredPlugins> {
+  if (plugins.length === 0) {
+    // Resolution is skipped for an empty list, so nothing it would publish is
+    // published. The webhook event types are published empty here, so a config
+    // reloaded down to no plugins stops offering the last one's types.
+    publishWebhookEventTypes([]);
+    return { plugins: [], preSetup: [] };
+  }
+  return resolveDeclaredPlugins(plugins, {
+    coreVersion: getCoreVersion(),
+    consent,
+  });
+}
+
+/**
+ * Merge the folded collections/singles/components + transformed plugins/storage/admin onto base.
+ * Pure.
+ */
+function applyFoldedToBase(
+  base: SanitizedNextlyConfig,
+  folded: NextlyServiceConfig,
+  transformed: SanitizedNextlyConfig
+): SanitizedNextlyConfig {
+  return {
+    ...base,
+    collections: folded.collections ?? base.collections,
+    singles: folded.singles ?? base.singles,
+    fieldGroups: folded.fieldGroups ?? base.fieldGroups,
+    plugins: transformed.plugins ?? base.plugins,
+    storage: transformed.storage ?? base.storage,
+    // The app's own declared permissions as the boot collects them: from the transformed config,
+    // which a plugin's setup() may add to, replace or clear. Left at the base, `migrate:create`
+    // recorded a list the running server does not declare, and the permission check below judged
+    // one the boot never sees.
+    permissions: transformed.permissions,
+    // The admin block as the boot registers it: a plugin's setup() may add or
+    // replace the site's dashboard widgets, and `generate:types` and its
+    // `--check` list their components from this config. Left at the base, the
+    // map lacked a widget the running server offers.
+    admin: transformed.admin ?? base.admin,
+    // Carry a plugin setup transformer's audit decision through, so an audit
+    // plugin that forces recording is not dropped back to the base value on a
+    // reload. Always a resolved boolean on a sanitized config.
+    webhookAuditEnabled: transformed.webhookAuditEnabled,
+    // Likewise carry a plugin's resolved retention policy: a plugin that tunes
+    // or disables `webhooks.retention` in setup() must not be reverted to the
+    // base value (which `webhooks:prune` and the runtime would otherwise use).
+    webhookRetention: transformed.webhookRetention,
+    // And the email block, which is the one this list was missing. A plugin
+    // that sets `email.retention: false` in setup() had that decision reverted
+    // on the first reload, because only the base value was carried here — so an
+    // unrelated save could start deleting rows the live boot configuration had
+    // been retaining.
+    //
+    // The flattened policy is DERIVED from the block rather than carried
+    // beside it, through the same function the DI root uses. Carrying both
+    // independently is what let them disagree in the first place.
+    email: transformed.email ?? base.email,
+    emailRetention:
+      emailRetentionAfterTransform(transformed.email, base.emailRetention) ??
+      base.emailRetention,
+  };
+}
+
+/**
+ * Merge a plugin-`setup()`-transformed config back onto the base config and fold
+ * declarative plugin schema contributions (D3/D12) via the SAME shared function
+ * the runtime boot uses (`applyPluginSchemaContributionsDeferred` in
+ * `register.ts`), so the CLI and runtime produce the same merged schema (D50).
+ * Threads collections, singles, AND field groups. Extend targets that aren't
+ * code/plugin entities are deferred (candidate Builder targets, P8/R2) and
+ * resolved by the caller against the Builder set — not thrown here. Exported for
+ * unit/parity testing.
+ */
+export function mergeSetupResultIntoConfig(
+  base: SanitizedNextlyConfig,
+  transformed: SanitizedNextlyConfig,
+  plugins: PluginDefinition[]
+): SanitizedNextlyConfig {
+  const { config: folded } = applyPluginSchemaContributionsDeferred(
+    transformed as unknown as NextlyServiceConfig,
+    plugins
+  );
+  return applyFoldedToBase(base, folded, transformed);
+}
+
+/**
+ * Options for loading the config file.
+ */
+export interface LoadConfigOptions {
+  /**
+   * Custom path to the config file.
+   * If not provided, searches default locations.
+   */
+  configPath?: string;
+
+  /**
+   * Working directory for resolving relative paths.
+   * Defaults to `process.cwd()`.
+   */
+  cwd?: string;
+
+  /**
+   * Enable watch mode for file changes.
+   * When enabled, the config will be reloaded on changes.
+   * @default false
+   */
+  watch?: boolean;
+
+  /**
+   * Enable verbose logging for debugging.
+   * @default false
+   */
+  debug?: boolean;
+
+  /**
+   * What happens when no configuration file is found (and `configPath` names none):
+   * `"defaults"` gives the default configuration, which declares no collection, Single or field
+   * group; `"refuse"` throws, naming where it looked. A command that reads the app's entities
+   * refuses, since acting on the default would generate, migrate or prune as if the app declared
+   * nothing; the running site and the commands that read none of them keep the default.
+   * @default "defaults"
+   */
+  missing?: "defaults" | "refuse";
+}
+
+/**
+ * Result of loading the config file.
+ */
+export interface LoadConfigResult {
+  /**
+   * The loaded and sanitized config.
+   */
+  config: SanitizedNextlyConfig;
+
+  /**
+   * Path to the config file that was loaded.
+   * Undefined if using default config (no file found).
+   */
+  configPath?: string;
+
+  /**
+   * The project the config was looked for in, as an absolute path: `cwd`
+   * when one was given, otherwise the process's own directory. The app whose
+   * installed packages a boot from this config judges.
+   */
+  projectRoot: string;
+
+  /**
+   * List of files that the config depends on.
+   * Useful for watch mode to know what files to watch.
+   */
+  dependencies: string[];
+
+  /**
+   * Plugin `contributes.extend` clauses whose target wasn't a code/plugin entity
+   * (candidate Builder/UI-schema targets, P8). Already resolved + validated here
+   * against the Builder set; threaded out so `migrate-create`/`migrate-check` can
+   * materialize the extra columns onto the Builder tables without re-folding.
+   */
+  deferredExtends?: DeferredExtend[];
+
+  /**
+   * The fields plugins added to entities they do not own, by `extend` or a
+   * transform, as the fold's ownership ledgers recorded them: what a full
+   * uninstall of a plugin takes with it. Absent when no plugin is configured.
+   */
+  fieldsAddedByPlugins?: FieldsAddedByPlugins;
+
+  /**
+   * The plugin field types this config registered, captured at the end of its
+   * load.
+   *
+   * Work that outlives the load it started from — the `db:sync` watcher keeps
+   * syncing across a save — resolves against this rather than the live registry,
+   * which the next load clears and rebuilds.
+   */
+  fieldTypes?: ReadonlyMap<string, PluginFieldType>;
+
+  /**
+   * What the app lists plugins for, read from the config as the app wrote it,
+   * before any `setup` transformer ran. A command that resolves or boots the
+   * plugins again uses this rather than deriving consent from `config`, which
+   * is the transformed one.
+   */
+  pluginConsent: PluginConsent;
+
+  /**
+   * @experimental The config as the app wrote it, sanitized, before any
+   * `setup` transformer ran or any plugin contribution was folded in.
+   *
+   * What a command that boots the runtime builds its service config from:
+   * the boot runs every transformer and fold itself, so booting from
+   * `config`, which already holds their result, runs each a second time, and
+   * a transformer that adds a plugin or a collection adds it twice.
+   */
+  appConfig: SanitizedNextlyConfig;
+}
+
+/**
+ * Callback for config change events.
+ */
+export type ConfigChangeCallback = (result: LoadConfigResult) => void;
+
+let cachedConfig: LoadConfigResult | null = null;
+
+let fileWatcher: FSWatcher | null = null;
+
+/** The reload currently running for the watched file, if any. */
+let watcherReload: Promise<void> | null = null;
+
+/** Whether a save arrived while that reload was running. */
+let watcherReloadPending = false;
+
+/**
+ * The options the next drained reload should use.
+ *
+ * The loop below used to close over the options it started with. A watcher
+ * stopped mid-reload and immediately replaced — `clearConfigCache()` followed
+ * by another `watch: true` load — left that loop reloading the OLD config and
+ * delivering it to the NEW callbacks, while the new watcher's change was never
+ * loaded at all. Reading the latest options each turn means a drained reload
+ * always belongs to the watcher that is currently installed.
+ */
+let watcherReloadOptions: LoadConfigOptions | null = null;
+
+/**
+ * Which watcher the reloads in flight belong to.
+ *
+ * Stopping a watcher bumps this. A reload already awaiting its load carries the
+ * value it started with, so it can tell that the watcher it was triggered for
+ * has since been replaced and decline to deliver a config nobody asked for to
+ * callbacks registered by whoever replaced it.
+ */
+let watcherGeneration = 0;
+
+/**
+ * The field-type registry the currently installed config loaded.
+ *
+ * A superseded reload finishing last leaves its own registrations live. This is
+ * what it has to put back — the set belonging to whoever is watching now, not
+ * whatever the registry happened to hold before that reload started.
+ */
+let installedFieldTypes: ReadonlyMap<string, PluginFieldType> | null = null;
+
+/**
+ * The tail of the loads that rebuild the process-wide field-type registry.
+ *
+ * A load clears the registry, registers the config's own types, and only then
+ * awaits again before snapshotting what it registered. Two loads overlapping
+ * across that await share one registry, so each can capture the other's types —
+ * and a superseded watcher reload, whose job is to put the installed set back,
+ * can put it back over a live load's registrations, leaving the new config
+ * paired with the previous config's types.
+ *
+ * The watcher's own reloads were already serialized against each other. An
+ * explicit `loadConfig()` never joined them, so a `clearConfigCache()` and
+ * reload arriving while a reload was in flight overlapped with it.
+ */
+let registryLoad: Promise<void> = Promise.resolve();
+
+/**
+ * Run `load` once every earlier registry-rebuilding load has finished.
+ *
+ * The chain records completion rather than outcome: a rejection left on it
+ * would be adopted by every later waiter and fail loads that were fine.
+ */
+function withRegistryLock<T>(load: () => Promise<T>): Promise<T> {
+  const run = registryLoad.then(load);
+  registryLoad = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
+const changeCallbacks: Set<ConfigChangeCallback> = new Set();
+
+function debugLog(options: LoadConfigOptions, ...args: unknown[]): void {
+  if (options.debug) {
+    console.log("[config-loader]", ...args);
+  }
+}
+
+function startWatching(configPath: string, options: LoadConfigOptions): void {
+  stopWatching();
+
+  debugLog(options, "Starting file watcher for:", configPath);
+
+  fileWatcher = watch(configPath, eventType => {
+    if (eventType !== "change") return;
+    debugLog(options, "Config file changed, reloading...");
+    scheduleWatchReload(options);
+  });
+
+  fileWatcher.on("error", error => {
+    console.error("[config-loader] File watcher error:", error);
+  });
+}
+
+/** One reload of the watched file, notifying every registered callback. */
+async function runWatchReload(options: LoadConfigOptions): Promise<void> {
+  const generation = watcherGeneration;
+  cachedConfig = null;
+
+  // The lock covers the load and the registry bookkeeping that follows it, so
+  // the decision about which set is installed is made against a registry no
+  // other load is rebuilding. It is released before the callbacks run: those
+  // are caller code, and one of them calling `loadConfig()` while this held the
+  // lock would wait on itself.
+  const result = await withRegistryLock(async () => {
+    try {
+      const loaded = await loadConfigInternal(options);
+
+      // The watcher this reload belongs to was stopped while the load was in
+      // flight, so this result describes a config nothing is watching.
+      // Delivering it would hand the replacement watcher's callbacks the
+      // previous config, which they would apply until the replacement's own
+      // reload arrived.
+      if (generation !== watcherGeneration) {
+        // The load cleared and rebuilt the live registry on its way through, so
+        // the set left behind is this obsolete config's. Put back whatever the
+        // watcher that is actually installed loaded, or every later lookup
+        // would classify its fields with the wrong storage primitives.
+        if (installedFieldTypes) restoreFieldTypes(installedFieldTypes);
+        return null;
+      }
+
+      // This reload is the live one, so its registry is the authoritative set.
+      installedFieldTypes = loaded.fieldTypes ?? snapshotFieldTypes();
+      return loaded;
+    } catch (error) {
+      // A failed load restores the registry it found, which for a superseded
+      // reload is the obsolete config's rather than the installed one's. Put
+      // the installed set back for the same reason the success path does.
+      if (generation !== watcherGeneration && installedFieldTypes) {
+        restoreFieldTypes(installedFieldTypes);
+      }
+      console.error("[config-loader] Error reloading config:", error);
+      return null;
+    }
+  });
+
+  if (!result) return;
+
+  for (const callback of changeCallbacks) {
+    try {
+      callback(result);
+    } catch (error) {
+      console.error("[config-loader] Error in change callback:", error);
+    }
+  }
+}
+
+/**
+ * Serialize reloads triggered by the watcher.
+ *
+ * A load clears and rebuilds the process-wide field-type registry and captures
+ * what it registered on its result. Two overlapping loads share that registry,
+ * so each could capture the other's types and hand a caller a config paired
+ * with the wrong ones — which is exactly what the result's snapshot exists to
+ * prevent.
+ *
+ * Saves arriving during a reload collapse into one trailing run rather than
+ * queueing per event: they all want the state after the last of them, and the
+ * file is read fresh when that run starts.
+ */
+function scheduleWatchReload(options: LoadConfigOptions): void {
+  watcherReloadOptions = options;
+
+  if (watcherReload) {
+    watcherReloadPending = true;
+    return;
+  }
+
+  watcherReload = (async () => {
+    do {
+      watcherReloadPending = false;
+      const next = watcherReloadOptions;
+      // Cleared by `stopWatching`, which is how a reload queued against a
+      // watcher that no longer exists is dropped rather than applied.
+      if (!next) break;
+      await runWatchReload(next);
+    } while (watcherReloadPending);
+  })().finally(() => {
+    watcherReload = null;
+    // A save that arrived while this loop was leaving set the flag against a
+    // run that had already stopped checking it, so it starts the next one.
+    if (watcherReloadPending && watcherReloadOptions) {
+      scheduleWatchReload(watcherReloadOptions);
+    }
+  });
+}
+
+/** Record the registry a freshly installed config left live. */
+function markInstalledFieldTypes(result: LoadConfigResult): void {
+  installedFieldTypes = result.fieldTypes ?? snapshotFieldTypes();
+}
+
+function stopWatching(): void {
+  if (fileWatcher) {
+    fileWatcher.close();
+    fileWatcher = null;
+  }
+  // Anything this watcher had queued belongs to a config nobody is watching
+  // for any more, and applying it would hand the next watcher's callbacks a
+  // result they never asked for.
+  watcherReloadPending = false;
+  watcherReloadOptions = null;
+  watcherGeneration += 1;
+}
+
+/**
+ * The thrown value as the error's cause. An error raised in another realm, as Node's module
+ * loader raises a missing package, fails `instanceof Error` while being one, and dropping it
+ * would lose the code that says what failed.
+ */
+function asCause(error: unknown): Error | undefined {
+  if (error instanceof Error) return error;
+  return typeof error === "object" &&
+    error !== null &&
+    typeof (error as { message?: unknown }).message === "string"
+    ? (error as Error)
+    : undefined;
+}
+
+async function loadConfigInternal(
+  options: LoadConfigOptions
+): Promise<LoadConfigResult> {
+  // Resolved once, before the config's code runs: a config or a `setup`
+  // transformer that changes the process's directory must not move the
+  // project the config was found in.
+  const cwd = resolve(options.cwd ?? process.cwd());
+
+  const configPath = options.configPath
+    ? resolve(cwd, options.configPath)
+    : findConfigFile(cwd);
+
+  if (!configPath && options.missing === "refuse") {
+    // The status is the code's own (`error-codes.ts`).
+    throw new NextlyError({
+      code: "INVALID_INPUT",
+      publicMessage: "Failed to load Nextly configuration.",
+      logMessage: "Config loader error",
+      // Where the search looked, from the one list it reads, so the report names each place.
+      logContext: {
+        projectRoot: cwd,
+        names: [...CONFIG_FILE_NAMES],
+        folders: [...CONFIG_SEARCH_DIRS],
+        reason: "config-missing",
+      },
+    });
+  }
+
+  if (!configPath) {
+    debugLog(options, "No config file found, using default config");
+    // Cleared here too: a long-lived process that had loaded a plugin config
+    // and then lost its config file would otherwise keep the removed plugins'
+    // types registered, and Builder saves would go on recognizing them and
+    // running their `validate` and `validateOptions`.
+    clearFieldTypes();
+    const appConfig = defineConfig({});
+    return {
+      config: appConfig,
+      appConfig,
+      configPath: undefined,
+      projectRoot: cwd,
+      dependencies: [],
+      pluginConsent: NO_PLUGIN_CONSENT,
+      // Empty, matching the clear above: work pinned to this result must not
+      // resolve plugin types a later config happens to register.
+      fieldTypes: snapshotFieldTypes(),
+    };
+  }
+
+  if (!existsSync(configPath)) {
+    throw new NextlyError({
+      code: "INVALID_INPUT",
+      publicMessage: "Failed to load Nextly configuration.",
+      statusCode: 400,
+      logMessage: "Config loader error",
+      // `requested` is the path as given to `-c`, so the error can name it as the user typed it.
+      logContext: {
+        configPath,
+        requested: options.configPath,
+        reason: "config-not-found",
+      },
+    });
+  }
+
+  debugLog(options, "Loading config from:", configPath);
+
+  // Held across the whole load so a failure below can put the registry back.
+  // Callers that keep running on the previous config after a bad edit — the
+  // `db:sync` watcher, the HMR reload — would otherwise resolve that config's
+  // plugin field types against an empty registry.
+  const previousFieldTypes = snapshotFieldTypes();
+  // So is what the fold publishes as held back from switched-off types: a
+  // refused load leaves the previous config running, whose kept columns a
+  // sync must still keep.
+  const previousWithheld = currentWithheldScopeFields();
+
+  try {
+    // bundleAndRequire is our Turbopack-safe alternative to the
+    // previous `bundle-require` dependency. See `config-bundler.ts`
+    // for the full rationale; the short version is bundle-require's
+    // internal `import(file)` triggers Turbopack's "Cannot find
+    // module as expression is too dynamic" failure when nextly
+    // runs inside a Next.js dev server. The new loader uses
+    // `createRequire(import.meta.url)` instead, which Turbopack
+    // recognizes as a Node-builtin escape hatch and does not
+    // analyze. The external-list contract is preserved verbatim.
+    const { mod, dependencies } = await bundleAndRequire({
+      filepath: configPath,
+      cwd: dirname(configPath),
+      external: [
+        "nextly",
+        "@nextly/*",
+        "drizzle-orm",
+        "drizzle-orm/*",
+        "better-sqlite3",
+        "pg",
+        "mysql2",
+        "next",
+        "next/*",
+        "react",
+        "react-dom",
+        "dotenv",
+        "crypto",
+        "fs",
+        "path",
+        "node:*",
+      ],
+    });
+
+    const rawConfig = mod.default ?? mod;
+
+    if (!rawConfig || typeof rawConfig !== "object") {
+      throw new NextlyError({
+        code: "INVALID_INPUT",
+        publicMessage: "Failed to load Nextly configuration.",
+        statusCode: 400,
+        logMessage: "Config loader error",
+        logContext: {
+          configPath,
+          reason: "invalid-config-export",
+          exportType: typeof rawConfig,
+        },
+      });
+    }
+
+    // Kept as written: the transformers below receive copies of it
+    // (`setupTransformerInput`), and `config` is rebuilt from their result,
+    // so this stays the untransformed config a boot starts from.
+    const appConfig = defineConfig(rawConfig);
+    let config = appConfig;
+    let deferredExtends: DeferredExtend[] | undefined;
+    let fieldsAddedByPlugins: FieldsAddedByPlugins | undefined;
+
+    // Resolve (validate + topo order) before running setups, mirroring the
+    // runtime boot (register.ts) so both paths agree (D5/D6/D7).
+    //
+    // The consent comes from the config as the app wrote it, before any
+    // `setup` transformer runs, exactly as the boot reads it: a transformer
+    // is plugin code and must not be able to list a plugin itself.
+    const pluginConsent = pluginConsentFromConfig(config);
+    const { plugins, preSetup } = orderConfigPlugins(
+      config.plugins ?? [],
+      pluginConsent
+    );
+
+    // Cleared on EVERY load, not only when plugins are present. A reload that
+    // removes the last plugin would otherwise leave its types in the
+    // process-global registry, so its `validateOptions` would keep running and
+    // later Builder saves would keep treating the type as registered.
+    clearFieldTypes();
+
+    // The Builder's field groups, set by the plugin block, which reads them anyway.
+    let builderFieldGroups:
+      | {
+          stored: NonNullable<BuilderEntities["components"]>;
+          registered: NonNullable<BuilderEntities["components"]>;
+        }
+      | undefined;
+
+    if (plugins.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let transformedConfig: any = setupTransformerInput(config, plugins);
+
+      for (const plugin of plugins) {
+        if (plugin.setup) {
+          try {
+            transformedConfig = plugin.setup(transformedConfig);
+          } catch (error) {
+            throw new NextlyError({
+              code: "INVALID_INPUT",
+              publicMessage: "Failed to load Nextly configuration.",
+              statusCode: 400,
+              logMessage: "Config loader error",
+              logContext: {
+                configPath,
+                reason: "plugin-setup-transformer-failed",
+                pluginName: plugin.name,
+                cause: describeError(error),
+              },
+              cause: asCause(error),
+            });
+          }
+        }
+      }
+
+      // The transformed list, RESOLVED in full by the same call the boot
+      // makes: a `setup` transformer can add, rename or replace plugins, and
+      // everything below consumes the transformed config. Checking only slugs
+      // and widgets here let `nextly migrate`, `build`, `db:sync` and the dev
+      // reload accept a transformer-added plugin with an incompatible core
+      // version, an unmet `requires` or a mistyped secret path, while the
+      // deployed app refused to start on it. The resolved list, in its sorted
+      // order, is also what the fold and the field types below read, so a
+      // transformer-added plugin's collections and field types reach the CLI
+      // exactly as they reach the boot.
+      transformedConfig = resolveTransformedPlugins(
+        // The app's own live handles back in: the transformers were handed
+        // none of them (`setupTransformerInput`).
+        withWithheldConfig(config, transformedConfig),
+        {
+          coreVersion: getCoreVersion(),
+          consent: pluginConsent,
+          declared: preSetup,
+        }
+      ).config;
+      const transformedPlugins: PluginDefinition[] = transformedConfig.plugins;
+
+      // Fold plugin contributions. Extend targets that aren't code/plugin
+      // entities are DEFERRED (candidate Builder/UI-schema targets) rather than
+      // thrown, so a plugin may extend/relate to a Builder-made collection
+      // (P8/D3/R2).
+      const folded = applyPluginSchemaContributionsDeferred(
+        transformedConfig,
+        transformedPlugins
+      );
+      config = applyFoldedToBase(config, folded.config, transformedConfig);
+      deferredExtends = folded.deferredExtends;
+      fieldsAddedByPlugins = folded.fieldsAddedByPlugins;
+
+      // Register plugin custom field types (C7/D16) so the CLI's column
+      // classifier (getColumnDescriptor) resolves each plugin type to its
+      // storage primitive when reading ui-schema.json — parity with runtime boot
+      // (di/register.ts). Clear-and-rebuild; ALL plugins (incl. disabled, per
+      // D49) since field types are declarative + schema-affecting.
+      // Their declared settings are judged first, as the boot judges them, so
+      // a malformed list refuses the CLI and a development reload too.
+      assertFieldTypeSettings(transformedPlugins);
+      for (const fieldTypePlugin of transformedPlugins) {
+        for (const fieldType of fieldTypePlugin.contributes?.fieldTypes ?? []) {
+          registerFieldType(
+            withoutDisabledBehavior(fieldType, fieldTypePlugin)
+          );
+        }
+      }
+
+      // Load the Builder set (ui-schema) and resolve the deferred extend +
+      // relation targets against it — the SAME shared functions the runtime boot
+      // runs (D50). Eager fail-fast is preserved: a target in NEITHER code/plugin
+      // NOR the Builder set still throws. ui-schema is optional (empty manifest
+      // when absent), so non-Builder apps behave exactly as before.
+      const builderEntities = await readBuilderEntities(
+        cwd,
+        config.db?.uiSchemaFile
+      );
+      // One slug, one kind, now that the Builder's entities are readable: the
+      // fold could not see them, and the runtime boot makes the same check
+      // against the registry rows (register.ts), so the two paths agree (D50).
+      assertRegisteredKeepTheirKind(config, builderEntities);
+      // Kept for the cycle judgement below: the Builder's field groups as stored, and with each
+      // plugin's extension onto them, as the boot judges them.
+      let extended: ReturnType<typeof resolveBuilderExtends>;
+      try {
+        extended = resolveBuilderExtends(
+          folded.deferredExtends,
+          builderEntities
+        );
+        finalizeRelationTargets(
+          collectUnresolvedRelationTargets(
+            config as unknown as NextlyServiceConfig
+          ),
+          builderCollectionSlugs(builderEntities)
+        );
+      } catch (error) {
+        // A target the definition file lost is that loss first: refused as the migrate commands
+        // refuse it, so the fix named is restoring the file, not creating the target. Only a
+        // target nothing declares can be that entity; any other refusal is reported as itself.
+        if (namesAnUnknownTarget(error)) {
+          await refuseLostBuilderDefinitions(cwd, config, builderEntities);
+        }
+        throw error;
+      }
+      builderFieldGroups = {
+        stored: builderEntities.components ?? [],
+        registered: extended.components ?? [],
+      };
+      validateCrossPluginRelations(transformedPlugins);
+
+      // Fail fast on invalid plugin-declared custom permissions (D36) — same
+      // collector the runtime boot runs (register.ts), so both paths agree (D50).
+      // A plugin's settings permission is then checked against what it keeps,
+      // with the Builder's entities beside it, as the boot checks it: a command
+      // must not build or migrate an application whose boot would refuse it.
+      assertSettingsPermissionsOwned(
+        transformedPlugins,
+        collectCustomPermissions(config, transformedPlugins),
+        [
+          ...(builderEntities.collections ?? []),
+          ...(builderEntities.singles ?? []),
+        ].map(entity => entity.slug)
+      );
+
+      debugLog(
+        options,
+        `Applied config transformers from ${plugins.length} plugin(s)`
+      );
+    } else {
+      // No plugin, so no fold runs to publish what scopes hold back: a config
+      // whose last plugin was removed holds nothing back, and its fields stop
+      // being kept by the schema changes that read this (`kept-scope-fields`).
+      publishWithheldScopeFields(new Map());
+
+      // Nor does a fold resolve relation targets. A code relationship naming a target that
+      // neither the configuration nor the Builder declares may name an entity the definition
+      // file lost, which is refused as that loss, as it is where a plugin is configured.
+      const builderEntities = await readBuilderEntities(
+        cwd,
+        config.db?.uiSchemaFile
+      );
+      const builderSlugs = new Set(builderCollectionSlugs(builderEntities));
+      const unknownTarget = collectUnresolvedRelationTargets(
+        config as unknown as NextlyServiceConfig
+      ).some(relation => !builderSlugs.has(relation.target));
+      if (unknownTarget) {
+        await refuseLostBuilderDefinitions(cwd, config, builderEntities);
+      }
+      builderFieldGroups = {
+        stored: builderEntities.components ?? [],
+        registered: builderEntities.components ?? [],
+      };
+    }
+
+    // Where each collection opens its entries, and each Single, judged as the
+    // boot judges it (register.ts) whether or not a plugin is configured: a
+    // view named with no plugin to declare it is refused here too, so a
+    // command does not build or migrate an application whose start would
+    // refuse it.
+    assertOpensIn(config.collections, config.plugins ?? [], config.singles);
+
+    // Every problem in the configuration's entities, found by the rules that judge each one, so
+    // a command refuses an invalid configuration before it does anything else, and names every
+    // problem rather than the first. Run once the plugins' field types are registered, since a
+    // field's type is judged against them.
+    // The app's own entities, in the form the plugins' setups left them, placed where the app
+    // declared them; a plugin's contributions keep the checks of their own type.
+    const problems = configurationProblems(appConfig, config);
+    if (problems.length > 0) {
+      throw NextlyError.validation({
+        errors: problems,
+        logContext: { configPath, reason: "config-invalid" },
+      });
+    }
+
+    // After the configuration's problems, among which a cycle in its own field groups is listed.
+    // Field groups placed in a cycle are judged over code and the Builder's field groups whether
+    // or not a plugin is configured, as the boot judges them, so a command does not pass what a
+    // start refuses. Without plugins nothing above read the Builder's field groups.
+    if (builderFieldGroups === undefined) {
+      const stored =
+        (await readBuilderEntities(cwd, config.db?.uiSchemaFile)).components ??
+        [];
+      builderFieldGroups = { stored, registered: stored };
+    }
+    judgeFieldGroupCyclesAtStart({
+      code: config.fieldGroups ?? [],
+      registered: builderFieldGroups.registered,
+      stored: builderFieldGroups.stored,
+      warn: message => consoleLogger.warn(message),
+    });
+
+    debugLog(options, "Config loaded successfully");
+    debugLog(options, "Dependencies:", dependencies);
+
+    return {
+      config,
+      appConfig,
+      configPath,
+      projectRoot: cwd,
+      dependencies,
+      deferredExtends,
+      fieldsAddedByPlugins,
+      pluginConsent,
+      // Captured after registration, so it holds exactly what this config
+      // contributed rather than whatever the live set becomes later.
+      fieldTypes: snapshotFieldTypes(),
+    };
+  } catch (error) {
+    // The load owns the registry from the clear above until it returns, so
+    // every failure between them leaves it half-built or empty.
+    restoreFieldTypes(previousFieldTypes);
+    publishWithheldScopeFields(previousWithheld);
+
+    if (NextlyError.is(error)) {
+      throw error;
+    }
+
+    // A build failure carried as esbuild reports it would name its place a
+    // second way under `--verbose` (bytes from 0) below the editor's place
+    // the error shows, so it is carried with the editor's places instead.
+    const failure = withEditorPlaces(error) ?? error;
+    throw new NextlyError({
+      code: "INVALID_INPUT",
+      publicMessage: "Failed to load Nextly configuration.",
+      statusCode: 400,
+      logMessage: "Config loader error",
+      logContext: {
+        configPath,
+        reason: "load-error",
+        cause: describeError(failure),
+      },
+      cause: asCause(failure),
+    });
+  }
+}
+
+/**
+ * Make the config's PostgreSQL schema the one this CLI process resolves in.
+ *
+ * The runtime publishes the same value at boot, from the dialect the adapter
+ * reports. A CLI command has no adapter yet when it loads the config, so it
+ * resolves against the dialect the environment names — the same answer, taken
+ * one step earlier.
+ *
+ * Without this the application ran in `cms` while `migrate`, `migrate:down`
+ * and the status commands worked through `public`: a split lock, a split
+ * ledger, and DDL applied to a namespace nothing reads.
+ */
+function publishConfiguredPostgresSchema(config: {
+  db?: { postgres?: { schema?: string } };
+}): void {
+  const dialect =
+    process.env.DB_DIALECT ??
+    (process.env.DATABASE_URL?.startsWith("postgres") === true
+      ? "postgresql"
+      : "sqlite");
+  // Published on EVERY load, including one that names no schema.
+  //
+  // Returning early when the key was absent made the value sticky: a process
+  // that loaded a config naming `cms` and then loaded one without the key kept
+  // `cms` active, so the second config's commands read and wrote a schema it
+  // never asked for — its migrations and ledger landing somewhere its own
+  // settings do not describe. The CLI reloads config (watch mode, a second
+  // command in one process), so this is reachable, not theoretical.
+  //
+  // `resolvePostgresSchema` already answers `public` for `undefined`, so the
+  // absent case has a value; it was simply never being published.
+  setActivePostgresSchema(
+    resolvePostgresSchema(config.db?.postgres?.schema, dialect)
+  );
+}
+
+/**
+ * Load the Nextly configuration from file.
+ *
+ * Searches for config files in the following locations (in order):
+ * 1. `./nextly.config.ts`
+ * 2. `./nextly.config.mts`
+ * 3. `./nextly.config.js`
+ * 4. `./nextly.config.mjs`
+ * 5. `./src/nextly.config.ts` (and other extensions)
+ * 6. `./config/nextly.config.ts` (and other extensions)
+ *
+ * If no config file is found, returns a default configuration.
+ *
+ * @param options - Load options
+ * @returns Promise resolving to the loaded config result
+ *
+ * @example
+ * ```typescript
+ * // Basic usage
+ * const { config } = await loadConfig();
+ * console.log(config.collections);
+ *
+ * // With custom path
+ * const { config } = await loadConfig({
+ *   configPath: './custom/nextly.config.ts'
+ * });
+ *
+ * // With watch mode
+ * const { config } = await loadConfig({ watch: true });
+ * watchConfig((result) => {
+ *   console.log('Config changed:', result.config);
+ * });
+ * ```
+ */
+/** The configuration file `options` names or the search finds, as `loadConfigInternal` resolves it. */
+function configFileFor(options: LoadConfigOptions): string | undefined {
+  const cwd = resolve(options.cwd ?? process.cwd());
+  if (!options.configPath) return findConfigFile(cwd);
+  // A file `-c` names that is gone is none: `loadConfigInternal` refuses it (`CONFIG_NOT_FOUND`).
+  const named = resolve(cwd, options.configPath);
+  return existsSync(named) ? named : undefined;
+}
+
+export async function loadConfig(
+  options: LoadConfigOptions = {}
+): Promise<LoadConfigResult> {
+  // The cache answers only for the file this call would read itself: one from another project,
+  // or from a file since removed, is read again, whatever the caller does without one. And a
+  // cached default, given where no configuration file was found, is no answer to a caller that
+  // refuses to act without one: it is asked again, and refused.
+  const wanted = configFileFor(options);
+  const cachedElsewhere =
+    cachedConfig !== null &&
+    (cachedConfig.configPath !== wanted ||
+      (wanted === undefined && options.missing === "refuse"));
+  if (cachedConfig && !options.watch && !cachedElsewhere) {
+    debugLog(options, "Returning cached config");
+    return cachedConfig;
+  }
+
+  // Serialized with the watcher's reloads, which rebuild the same registry. A
+  // reload still in flight from a watcher this call is replacing would
+  // otherwise interleave with it and put its own set back over this one's.
+  const result = await withRegistryLock(async () => {
+    const loaded = await loadConfigInternal(options);
+
+    cachedConfig = loaded;
+    // This config is now the installed one, so its registry is what a
+    // superseded reload has to put back if it finishes after the swap.
+    markInstalledFieldTypes(loaded);
+    // And its PostgreSQL schema is now the one every CLI command resolves in.
+    // Published HERE because this is the one place every command that reads
+    // `nextly.config.ts` passes through: the adapter factory and the schema
+    // pipeline both read the active value, so `migrate` cannot end up applying
+    // DDL to `public` while the application it is migrating runs in `cms`.
+    publishConfiguredPostgresSchema(loaded.config);
+    return loaded;
+  });
+
+  if (options.watch && result.configPath) {
+    startWatching(result.configPath, options);
+  }
+
+  return result;
+}
+
+/**
+ * Register a callback to be called when the config file changes.
+ * Only works when config was loaded with `watch: true`.
+ *
+ * @param callback - Function to call when config changes
+ * @returns Unsubscribe function
+ *
+ * @example
+ * ```typescript
+ * // Load with watch mode
+ * await loadConfig({ watch: true });
+ *
+ * // Register callback
+ * const unsubscribe = watchConfig((result) => {
+ *   console.log('Config updated:', result.config);
+ * });
+ *
+ * // Later, unsubscribe
+ * unsubscribe();
+ * ```
+ */
+export function watchConfig(callback: ConfigChangeCallback): () => void {
+  changeCallbacks.add(callback);
+
+  return () => {
+    changeCallbacks.delete(callback);
+  };
+}
+
+/**
+ * Clear the cached config and stop watching.
+ * Useful for testing or when you need to force a reload.
+ *
+ * @example
+ * ```typescript
+ * // Clear cache and reload
+ * clearConfigCache();
+ * const { config } = await loadConfig();
+ * ```
+ */
+export function clearConfigCache(): void {
+  cachedConfig = null;
+  stopWatching();
+  changeCallbacks.clear();
+}
+
+/**
+ * Get the currently cached config without loading.
+ * Returns null if no config is cached.
+ *
+ * @returns Cached config result or null
+ *
+ * @example
+ * ```typescript
+ * const cached = getCachedConfig();
+ * if (cached) {
+ *   console.log('Using cached config');
+ * } else {
+ *   const { config } = await loadConfig();
+ * }
+ * ```
+ */
+export function getCachedConfig(): LoadConfigResult | null {
+  return cachedConfig;
+}
+
+/**
+ * Check if a config file exists in the default locations.
+ *
+ * @param cwd - Working directory to search from
+ * @returns Path to config file if found, undefined otherwise
+ *
+ * @example
+ * ```typescript
+ * const configPath = findNextlyConfig();
+ * if (configPath) {
+ *   console.log('Found config at:', configPath);
+ * } else {
+ *   console.log('No config file found');
+ * }
+ * ```
+ */
+export function findNextlyConfig(
+  cwd: string = process.cwd()
+): string | undefined {
+  return findConfigFile(cwd);
+}
+
+/**
+ * Supported config file extensions.
+ */
+export const SUPPORTED_EXTENSIONS = CONFIG_FILE_NAMES;
+
+/**
+ * Default search directories for config files.
+ */
+export const SEARCH_DIRECTORIES = CONFIG_SEARCH_DIRS;

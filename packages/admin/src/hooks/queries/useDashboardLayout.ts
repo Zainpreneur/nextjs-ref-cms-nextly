@@ -1,0 +1,465 @@
+/**
+ * One reader's dashboard arrangement, and the two guards a write must echo.
+ *
+ * `GET /api/dashboard/layout` answers the arrangement RESOLVED against the live
+ * registry — placements whose widget no longer exists, or whose permission this
+ * caller lacks, are already gone — plus `available`, the widgets they may see
+ * and have not placed.
+ *
+ * ## Why a write echoes two things and not one
+ *
+ * `version` guards the ROW: another tab saved first. `scope` guards the FILTER
+ * that shaped what this client was shown: a permission grant, a role change or
+ * a plugin registering elsewhere moves the visible set without touching the
+ * row, so `version` still matches while the snapshot in hand is stale. A
+ * mismatch on either is a 409, and the remedy for both is identical — re-read.
+ * That is why this hook exposes one `conflict` flag rather than two: a caller
+ * that had to tell them apart would be a caller with two recovery paths, and
+ * there is only one.
+ *
+ * ## Why saving invalidates rather than writing through
+ *
+ * The response echoes what was submitted, not what was stored — the server
+ * merges back placements this caller was never shown, and deliberately does not
+ * disclose them. Seeding the cache from the response would therefore be seeding
+ * it with a deliberately partial answer. Invalidating costs one round trip and
+ * keeps the client's copy the server's copy.
+ *
+ * @module hooks/queries/useDashboardLayout
+ */
+
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type UseMutationResult,
+} from "@tanstack/react-query";
+import { useCallback, useEffect } from "react";
+
+import { dashboardWidthNow } from "@admin/components/features/widgets/useDashboardWidth";
+import {
+  ADMIN_WORKSPACE_KEY,
+  useSchemaUpdateInvalidation,
+} from "@admin/hooks/useSchemaUpdateInvalidation";
+import { protectedApi } from "@admin/lib/api/protectedApi";
+import type { AdminBranding } from "@admin/types/branding";
+import type {
+  DashboardLayoutRead,
+  DashboardLayoutResponse,
+  WidgetPlacement,
+} from "@admin/types/dashboard/widgets";
+
+import { DASHBOARD_SUMMARY_KEY } from "./useDashboardSummary";
+
+/** The one query key this feature owns, so a save can invalidate exactly it. */
+export const DASHBOARD_LAYOUT_KEY = ["dashboard", "layout"] as const;
+
+const LAYOUT_PATH = "/dashboard/layout";
+
+/** What a save sends. Both guards, always — neither is optional server-side. */
+/**
+ * The layout read: one fetch for every query under {@link DASHBOARD_LAYOUT_KEY}, so a card
+ * reading the same answer as the grid shares the grid's request and cache entry.
+ *
+ * Sent the dashboard's width as it measures now (`dashboardWidthNow`), for the server to judge
+ * each card that hides while empty at the tier it is drawn at. Read at the request, never part of
+ * the key, so a resize does not split the cache; asked with no dashboard drawn, it sends none and
+ * the answer judges no card.
+ *
+ * The answer carries the width it was sent (`askedAtWidth`): a cached answer is drawn from on the
+ * next visit, whose dashboard may be another width, and its verdict holds only where every card
+ * is drawn at the tier it was judged at (`useHiddenWhileEmptyAtFirstPaint`).
+ */
+export async function fetchDashboardLayout(): Promise<DashboardLayoutRead> {
+  const width = dashboardWidthNow();
+  if (width === undefined) {
+    return protectedApi.get<DashboardLayoutResponse>(LAYOUT_PATH);
+  }
+  const answer = await protectedApi.get<DashboardLayoutResponse>(
+    `${LAYOUT_PATH}?${new URLSearchParams({ width: String(width) })}`
+  );
+  return { ...answer, askedAtWidth: width };
+}
+
+export interface SaveLayoutInput {
+  /** The WHOLE ordered list, removed cards included: the order is the array's. */
+  placements: WidgetPlacement[];
+  version: number;
+  scope: string;
+  /**
+   * Whether this write is the reader TAKING CHARGE of their arrangement.
+   *
+   * `true` for the editor's save, `false` for a dismissal. The difference is
+   * what a reader keeps receiving: a dashboard somebody has arranged is theirs,
+   * and a widget declared later is only offered; one that has merely had a card
+   * sent away still follows the defaults, so later widgets keep arriving.
+   * Without it, one click on a card's dismiss control silently froze a reader
+   * out of every widget declared afterwards.
+   *
+   * Required rather than defaulted, so a new caller cannot make the freezing
+   * kind of write by forgetting to say which kind it is.
+   */
+  arranged: boolean;
+  /**
+   * The reader confirmed replacing a stored arrangement the server could not
+   * read. The server refuses a save over such a row without it, so it is sent
+   * only after the reader was asked.
+   */
+  replaceUnreadable?: boolean;
+}
+
+/**
+ * What a saved reset sends: the guards the reset was STAGED against.
+ *
+ * A reset is staged in customise mode and saved later, so the version and scope
+ * it travels with are the draft's, not whatever the last refetch produced. The
+ * server refuses the delete, removing nothing, when either has moved.
+ */
+export interface ResetLayoutInput {
+  version: number;
+  scope: string;
+}
+
+export interface UseDashboardLayoutResult {
+  layout: DashboardLayoutRead | undefined;
+  isPending: boolean;
+  /**
+   * Whether the arrangement could not be read at all.
+   *
+   * Distinct from an empty one: a reader with no widgets and a reader whose
+   * request failed both hold zero placements, and only the second is a fault.
+   */
+  isUnavailable: boolean;
+  save: UseMutationResult<unknown, Error, SaveLayoutInput>;
+  reset: UseMutationResult<unknown, Error, ResetLayoutInput>;
+  /**
+   * The write a standing dismiss performs, separate from the editor's save.
+   *
+   * Separate because its FAILURES are: the editor's chrome describes editing,
+   * and a reader who dismissed a card from the dashboard is not editing. Its
+   * pending state is also what stops two dismissals racing the same version
+   * guard.
+   */
+  dismiss: UseMutationResult<unknown, Error, SaveLayoutInput>;
+  /**
+   * The write a card's settings make outside customise mode: the quick
+   * setting, and the settings sheet's Done.
+   *
+   * Its own channel for the reason `dismiss` has one: its failures belong to
+   * the card, not to the editor's chrome, and its pending state is what
+   * disables the control while one is in flight.
+   */
+  cardSettings: UseMutationResult<unknown, Error, SaveLayoutInput>;
+  /**
+   * Whether the last write lost a race — on EITHER guard.
+   *
+   * One flag for two causes because the recovery is one action. The server
+   * authors both messages and both end "Reload and try again."
+   */
+  isConflict: boolean;
+  /**
+   * A write that failed for any OTHER reason, as something to show the reader.
+   *
+   * Separate from `isConflict` because the remedies differ: a conflict is
+   * recovered by reloading, a network error or a 500 by trying again. Reported
+   * at all because it previously was not — only conflicts were rendered, so a
+   * failed save left the reader in edit mode with the spinner stopped and
+   * nothing said, believing their arrangement had been stored.
+   */
+  writeError: Error | null;
+  /**
+   * Whether a row exists for this reader to reset.
+   *
+   * 🔴 A non-zero VERSION, which is not the same as `source === "own"`. A row
+   * the service could not decode is reported as `source: "unreadable"` — the
+   * dashboard falls back to the default — while keeping its real, non-zero
+   * version. Asked of `"own"` instead, the one control that could clear the
+   * bad row was hidden, and with an untouched draft Save is disabled too, so
+   * the reader had no way out and every read went on logging the same decode
+   * failure.
+   *
+   * Answered HERE rather than by each caller, because it is a fact about what
+   * the read found and the subtlety above is one nobody should have to
+   * re-derive.
+   */
+  hasStoredRow: boolean;
+  /**
+   * Whether the reader has a stored arrangement the server could not read.
+   *
+   * They are being shown the default in its place, and a save replaces the
+   * stored row only once they confirm it; any single-card write is refused
+   * until then.
+   */
+  isUnreadable: boolean;
+  /**
+   * Whether the reader has arranged their dashboard, as the read says (`arranged`): a card they
+   * remove at rest is then taken out of their arrangement, where a reader following the default
+   * has it hidden.
+   */
+  isArranged: boolean;
+  /**
+   * Whether ANY write against this layout is in flight.
+   *
+   * 🔴 All three channels, because they all send a whole-layout snapshot
+   * guarded by one cached version. A dismissal in flight while the reader
+   * enters edit mode and saves puts two writes against the same guard, so one
+   * of their own actions comes back as a conflict somebody else caused — and a
+   * reset racing a dismissal can land in either order, reversing what they
+   * asked for. Separate from `isSaving`, which says what the editor is doing
+   * and is what the Save button's own label reads.
+   */
+  isWriting: boolean;
+  /**
+   * The arrangement the client HOLDS right now, read from the query cache.
+   *
+   * 🔴 The cache rather than `layout` above, which is this render's copy and so
+   * the answer from before any write that has landed since. The cache is what
+   * the grid draws, so a caller checking that what it wrote is visible asks
+   * the same thing a reader's eyes do.
+   */
+  cached: () => DashboardLayoutResponse | undefined;
+  /**
+   * When the arrangement in the cache was read, and whether the latest read of it failed.
+   *
+   * 🔴 What tells a re-read that landed from one that did not: `invalidateQueries` resolves
+   * either way, and a failed re-read leaves the earlier answer in the cache, so `cached()` alone
+   * reads the same before and after a re-read that failed.
+   */
+  lastRead: () => { at: number; failed: boolean };
+  reload: () => Promise<unknown>;
+}
+
+/**
+ * Whether a failed write was a lost race rather than a broken request.
+ *
+ * Exported for a caller that has to tell the reader which of the two just
+ * happened to a write it made: the same rule the `isConflict` flag reads, so
+ * the two cannot disagree.
+ */
+export function isConflictError(error: Error | null): boolean {
+  if (!error) return false;
+  // The status is what the server actually distinguishes on; the message is
+  // human copy that may be translated or reworded. Read the code where one is
+  // available and fall back to the status only.
+  const status = (error as { status?: number }).status;
+  const code = (error as { code?: string }).code;
+  return status === 409 || code === "CONFLICT";
+}
+
+/** The first failure that is NOT a lost race, or `null`. */
+function nonConflictError(...errors: Array<Error | null>): Error | null {
+  return errors.find(error => error && !isConflictError(error)) ?? null;
+}
+
+/** The two things this derivation reads from a write channel. */
+interface WriteChannel {
+  error: Error | null;
+  isPending: boolean;
+}
+
+/**
+ * What the write channels say about the layout, read in one place.
+ *
+ * 🔴 The channels are NOT treated alike, and the asymmetry is the point.
+ * `isConflict` and `writeError` read `save` and `reset` only: they are rendered
+ * by the editor's chrome whatever the mode, and a failed dismissal or card
+ * setting reported there tells a reader who is not editing that unsaved
+ * changes will be lost. `isWriting` reads every channel, the standing ones
+ * (`dismiss`, `cardSettings`) included, because all of them send a
+ * whole-layout snapshot guarded by one cached version, so any of them in
+ * flight makes another a conflict the reader caused themselves.
+ *
+ * At module scope, and pure, so the rule can be read without stepping through
+ * the hook's queries and effects to find it.
+ */
+function writeState(
+  save: WriteChannel,
+  reset: WriteChannel,
+  standing: readonly WriteChannel[]
+): Pick<UseDashboardLayoutResult, "isConflict" | "writeError" | "isWriting"> {
+  return {
+    isConflict: isConflictError(save.error) || isConflictError(reset.error),
+    writeError: nonConflictError(save.error, reset.error),
+    isWriting:
+      save.isPending ||
+      reset.isPending ||
+      standing.some(channel => channel.isPending),
+  };
+}
+
+export function useDashboardLayout(): UseDashboardLayoutResult {
+  const queryClient = useQueryClient();
+
+  // A schema change moves what this endpoint answers: a collection created a
+  // moment ago has cards to OFFER, and one just deleted no longer does. Nothing
+  // else invalidates this key — `refetchOnWindowFocus` is the only other route,
+  // so a dashboard left open would keep a picker that cannot add the new card
+  // and still offers the removed one, whose save is then refused.
+  useSchemaUpdateInvalidation(DASHBOARD_LAYOUT_KEY);
+
+  const query = useQuery({
+    queryKey: DASHBOARD_LAYOUT_KEY,
+    queryFn: fetchDashboardLayout,
+    // Matching `useDashboardStats` and `useWidgetQueries`: fresh on mount and
+    // on focus, and NO polling. An arrangement that rearranges itself while
+    // somebody is reading it is worse than a stale one.
+    staleTime: 0,
+    refetchOnWindowFocus: true,
+  });
+
+  // Every write and every reload re-reads the header's summary with the
+  // layout: a part counts for a card on the dashboard, so a card added,
+  // removed, dismissed or reset moves the summary as it moves the layout.
+  // Fired rather than returned, so a write is held only until its own layout
+  // re-read lands, never behind a summary part still being counted.
+  const invalidate = useCallback(() => {
+    void queryClient.invalidateQueries({ queryKey: DASHBOARD_SUMMARY_KEY });
+    return queryClient.invalidateQueries({ queryKey: DASHBOARD_LAYOUT_KEY });
+  }, [queryClient]);
+
+  // 🔴 The workspace payload is held fresh for minutes, and it is built for
+  // one audience -- the cards this reader may see and the shortcut gates
+  // inside them. A grant, a role change or a plugin registering elsewhere
+  // moves that audience, and a payload built for the old one has no
+  // declaration for a card the server now places and withholds a shortcut
+  // newly permitted. Both responses carry the token of the audience they were
+  // built for, so each layout read compares its own with the payload's and
+  // reads the payload again when they differ.
+  //
+  // Compared, not remembered: an earlier version re-read only when the
+  // layout's token MOVED between two of its reads, and so assumed the first
+  // token it saw described the cached payload -- a payload cached before a
+  // grant met a first dashboard visit after it, and was kept.
+  //
+  // On a LAYOUT read, and never on a workspace update. At a layout read the
+  // layout is the freshest answer, so a payload that disagrees is the stale
+  // side; reacting to the payload as well could re-read one against the other
+  // indefinitely. A payload that carries no token says nothing either way.
+  const audience = query.data?.audience;
+  const readAt = query.dataUpdatedAt;
+  useEffect(() => {
+    if (audience === undefined || readAt === 0) return;
+    const heldForAnother = queryClient
+      .getQueriesData<AdminBranding>({ queryKey: ADMIN_WORKSPACE_KEY })
+      .some(
+        ([, payload]) =>
+          payload?.widgetAudience !== undefined &&
+          payload.widgetAudience !== audience
+      );
+    if (heldForAnother) {
+      void queryClient.invalidateQueries({ queryKey: ADMIN_WORKSPACE_KEY });
+    }
+  }, [audience, readAt, queryClient]);
+
+  /*
+   * One definition, because the two channels below send the same request to the
+   * same endpoint under the same guards. Written once so they cannot drift into
+   * disagreeing about the retry policy, which is the half that is subtle.
+   *
+   * 🔴 No retries, against the provider's default of two. A version-guarded
+   * write is not idempotent under an AMBIGUOUS failure: if the server commits
+   * and the response is lost, the retry sends the same now-stale version, the
+   * server refuses it, and the reader is told another editor changed their
+   * dashboard — when in fact their own save had already succeeded. The retry
+   * manufactures the exact conflict the guard exists to report truthfully.
+   */
+  const writeLayout = {
+    mutationFn: (input: SaveLayoutInput) =>
+      protectedApi.put<unknown>(LAYOUT_PATH, input),
+    retry: false as const,
+    // 🔴 RETURNED, not merely fired. TanStack awaits a mutation's own
+    // `onSuccess` before it reports success, so returning the invalidation
+    // keeps the write pending until the re-read has landed or failed. That is
+    // what holds `isWriting` -- and the lock on every other layout control --
+    // through the re-read, and what lets a `mutate` callback read the cache
+    // knowing it is already current. `() => { void invalidate(); }` would
+    // release both before the new version arrived.
+    onSuccess: invalidate,
+  };
+
+  const cached = useCallback(
+    () =>
+      queryClient.getQueryData<DashboardLayoutResponse>(DASHBOARD_LAYOUT_KEY),
+    [queryClient]
+  );
+
+  // The query's own state, so a failed re-read is told apart from one that landed.
+  const lastRead = useCallback(() => {
+    const state = queryClient.getQueryState(DASHBOARD_LAYOUT_KEY);
+    return { at: state?.dataUpdatedAt ?? 0, failed: state?.status === "error" };
+  }, [queryClient]);
+
+  const save = useMutation(writeLayout);
+
+  /*
+   * The SAME request, on its own channel, and the separation is the point.
+   *
+   * 🔴 A dismissal is performed by a reader who is not editing, and
+   * `isConflict` and `writeError` below are rendered by `DashboardEditChrome`
+   * whatever the mode. Sharing `save` therefore answered a failed dismiss with
+   * the editor's own alert — telling somebody who never opened the editor that
+   * their dashboard changed "while you were editing" and that unsaved changes
+   * would be lost, when there is no draft at all.
+   *
+   * Its own mutation also gives the control a pending state to disable itself
+   * with. Every dismissal builds a whole-layout snapshot from the cached
+   * version, so two in flight at once carry the same guard and the server can
+   * only honour one.
+   *
+   * A write refused as a conflict reads the layout again before it reports,
+   * RETURNED for the reason `onSuccess` returns its invalidation: the channel
+   * stays pending through the re-read, so nothing else is sent against the
+   * refused guards, and a `mutate` callback finds the cache holding the
+   * guards a second attempt must carry, or `lastRead` saying the re-read
+   * failed and there are none (`useDismissPlacement`). Without it the
+   * cache kept the refused guards, and every later attempt was refused the
+   * same way until the page was reloaded.
+   */
+  const dismiss = useMutation({
+    ...writeLayout,
+    onError: (error: Error) =>
+      isConflictError(error) ? invalidate() : undefined,
+  });
+
+  // A card's settings changed outside customise mode: the same request again,
+  // on its own channel, for the reasons `dismiss` has its own.
+  const cardSettings = useMutation(writeLayout);
+
+  const reset = useMutation({
+    // Query parameters rather than a body: some clients and proxies drop a
+    // DELETE body, and the guards are what stop a stale tab deleting an
+    // arrangement another tab saved. `URLSearchParams` encodes the opaque
+    // scope token, which may hold characters a raw query string would mangle.
+    mutationFn: (input: ResetLayoutInput) =>
+      protectedApi.delete<unknown>(
+        `${LAYOUT_PATH}?${new URLSearchParams({
+          version: String(input.version),
+          scope: input.scope,
+        }).toString()}`
+      ),
+    // Idempotent by design — deleting a row that is already gone is the same
+    // answer — but retried silently it would still hide a server that is
+    // failing, and the reader would watch a spinner rather than a message.
+    retry: false,
+    onSuccess: invalidate,
+  });
+
+  return {
+    layout: query.data,
+    isPending: query.isPending,
+    // A cached answer that a BACKGROUND refetch failed over is still a usable
+    // answer, so only an error with nothing to show counts as unavailable.
+    isUnavailable: query.isError && query.data === undefined,
+    save,
+    reset,
+    dismiss,
+    cardSettings,
+    ...writeState(save, reset, [dismiss, cardSettings]),
+    hasStoredRow: (query.data?.version ?? 0) > 0,
+    isUnreadable: query.data?.source === "unreadable",
+    isArranged: query.data?.arranged === true,
+    cached,
+    lastRead,
+    reload: invalidate,
+  };
+}

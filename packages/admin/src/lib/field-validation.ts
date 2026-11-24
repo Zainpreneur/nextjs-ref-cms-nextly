@@ -1,0 +1,994 @@
+/**
+ * Field Validation - Client-Side Schema Generation
+ *
+ * Generates Zod schemas from Nextly field configurations for client-side form validation.
+ * This allows automatic validation of entry forms based on collection field definitions.
+ *
+ * Features:
+ * - Converts all data field types to Zod schemas
+ * - Recursively handles nested fields (array, group, blocks)
+ * - Extracts data fields from layout wrappers (tabs, row, collapsible)
+ * - Supports custom validation functions (async)
+ * - Handles polymorphic relationships
+ *
+ * @module lib/field-validation
+ * @since 1.0.0
+ */
+
+import type {
+  FieldConfig,
+  DataFieldConfig,
+  TextFieldConfig,
+  TextareaFieldConfig,
+  EmailFieldConfig,
+  PasswordFieldConfig,
+  CodeFieldConfig,
+  NumberFieldConfig,
+  SelectFieldConfig,
+  RadioFieldConfig,
+  RelationshipFieldConfig,
+  UploadFieldConfig,
+  RepeaterFieldConfig,
+  GroupFieldConfig,
+} from "nextly/config";
+import {
+  isTextField,
+  isTextareaField,
+  isEmailField,
+  isPasswordField,
+  isCodeField,
+  isIconField,
+  isIconIdShape,
+  isRichTextField,
+  isNumberField,
+  isCheckboxField,
+  isDateField,
+  isSelectField,
+  isRadioField,
+  isRelationshipField,
+  isUploadField,
+  isRepeaterField,
+  isGroupField,
+  isJSONField,
+} from "nextly/config";
+import { declaresOwnId } from "nextly/field-catalog";
+import { z } from "zod";
+
+import { fieldLabel } from "./field-label";
+import { RESTRICTED_REFERENCE } from "./form/stored-references";
+
+// ============================================================
+// Types
+// ============================================================
+
+/**
+ * Options for schema generation
+ */
+export interface GenerateSchemaOptions {
+  /**
+   * Whether to include custom validate functions in the schema.
+   * When false, only Zod built-in validations are used.
+   * @default false
+   */
+  includeCustomValidators?: boolean;
+
+  /**
+   * Form mode the schema validates for. Password fields are write-only on
+   * the server (stored hashes never round-trip), so an edit form seeds
+   * them blank and blank means "keep the current password" — `required`
+   * may only be enforced on create.
+   * @default "create"
+   */
+  mode?: "create" | "edit";
+}
+
+/**
+ * Extended field config that includes the field name and optional tab name.
+ * We require `name` to be a string for data fields we process.
+ */
+interface ExtractedField {
+  name: string;
+  type: string;
+  required?: boolean;
+  _tabName?: string;
+  [key: string]: unknown;
+}
+
+// ============================================================
+// Validation Helpers
+// ============================================================
+
+/**
+ * Helper to get validation values from a field.
+ * Supports both flat format (field.minLength) and nested format (field.validation.minLength).
+ * This allows compatibility with both static configs and dynamic collection fields.
+ */
+type ValidationKey =
+  | "minLength"
+  | "maxLength"
+  | "min"
+  | "max"
+  | "minRows"
+  | "maxRows"
+  | "pattern";
+
+function getValidation(
+  field: DataFieldConfig | ExtractedField,
+  key: ValidationKey
+): number | string | undefined {
+  // Cast to index-accessible form — field configs don't carry an index signature
+  // but may hold flat validation keys (e.g., field.minLength) or a nested
+  // `validation` object. Both shapes are checked below.
+  const rec = field as unknown as Record<string, unknown>;
+  // First check flat format (e.g., field.minLength)
+  if (key in rec && rec[key] !== undefined) {
+    return rec[key] as number | string | undefined;
+  }
+  // Then check nested validation object (e.g., field.validation.minLength)
+  const validation = rec.validation as Record<string, unknown> | undefined;
+  if (validation && key in validation && validation[key] !== undefined) {
+    return validation[key] as number | string | undefined;
+  }
+  return undefined;
+}
+
+// ============================================================
+// Main Exports
+// ============================================================
+
+/**
+ * Generate a Zod schema from collection field definitions.
+ *
+ * This function recursively processes all fields, including those nested
+ * within layout fields (tabs, rows, collapsibles), and generates a
+ * comprehensive Zod object schema for client-side validation.
+ *
+ * @param fields - Array of field configurations from a collection
+ * @param options - Schema generation options
+ * @returns A Zod object schema that validates the collection data structure
+ *
+ * @example
+ * ```typescript
+ * import { generateClientSchema } from '@nextly/admin/lib/field-validation';
+ *
+ * const schema = generateClientSchema(collection.fields);
+ * const result = schema.safeParse(formData);
+ *
+ * if (!result.success) {
+ *   console.error(z.flattenError(result.error));
+ * }
+ * ```
+ */
+export function generateClientSchema(
+  fields: FieldConfig[],
+  options: GenerateSchemaOptions = {}
+): z.ZodObject<Record<string, z.ZodTypeAny>> {
+  const shape: Record<string, z.ZodTypeAny> = {};
+
+  // Flatten and process all fields, including those in layout containers
+  const dataFields = extractDataFields(fields);
+
+  for (const field of dataFields) {
+    // Handle named tabs specially - they create nested objects
+    if (field._tabName) {
+      const tabName = field._tabName;
+      const fieldName = field.name;
+
+      if (!shape[tabName]) {
+        shape[tabName] = z.object({});
+      }
+
+      // Merge the field into the tab's object
+      const currentTabShape = (
+        shape[tabName] as z.ZodObject<Record<string, z.ZodTypeAny>>
+      ).shape;
+      shape[tabName] = z.object({
+        ...currentTabShape,
+        [fieldName]: fieldToZodSchema(
+          field as unknown as DataFieldConfig,
+          options
+        ),
+      });
+    } else {
+      shape[field.name] = fieldToZodSchema(
+        field as unknown as DataFieldConfig,
+        options
+      );
+    }
+  }
+
+  return z.object(shape);
+}
+
+/**
+ * Validate a single field value using Zod schema and optional custom validator.
+ *
+ * This function first runs Zod validation based on the field configuration,
+ * then optionally runs the field's custom validate function if defined.
+ *
+ * @param field - The field configuration
+ * @param value - The value to validate
+ * @param data - The full document data (for custom validators that need context)
+ * @returns `true` if valid, or an error message string if invalid
+ *
+ * @example
+ * ```typescript
+ * import { validateFieldValue } from '@nextly/admin/lib/field-validation';
+ *
+ * const result = await validateFieldValue(titleField, 'Hello', formData);
+ * if (result !== true) {
+ *   setError('title', { message: result });
+ * }
+ * ```
+ */
+export async function validateFieldValue(
+  field: FieldConfig,
+  value: unknown,
+  data: Record<string, unknown> = {}
+): Promise<string | true> {
+  // Run Zod validation first
+  const zodSchema = fieldToZodSchema(field);
+  const result = zodSchema.safeParse(value);
+
+  if (!result.success) {
+    // Get the first issue from the error
+    const issues = result.error.issues;
+    if (issues && issues.length > 0) {
+      return issues[0].message;
+    }
+    return "Invalid value";
+  }
+
+  // Run custom validate function if defined
+  if ("validate" in field && typeof field.validate === "function") {
+    try {
+      const customResult = await field.validate(value as never, {
+        data,
+        req: {}, // Minimal request context for client-side
+      });
+
+      if (typeof customResult === "string") {
+        return customResult;
+      }
+    } catch (error) {
+      // Custom validator threw an error
+      return error instanceof Error ? error.message : "Validation failed";
+    }
+  }
+
+  return true;
+}
+
+// ============================================================
+// Field Extraction (Handle Layout Fields)
+// ============================================================
+
+/**
+ * Whether a field carries a value in the FORM.
+ *
+ * Deliberately not `isDataField`. That guard answers a different question —
+ * "does core generate a database column for this type?" — by testing membership
+ * of a closed list of built-in types. The two questions had the same answer for
+ * as long as every field type was built in, and stopped having it the moment
+ * `pluginField()` allowed a type outside that union: a contributed field stores
+ * data and appears in the form, and core's list cannot name it, because not
+ * naming it is what makes it contributed.
+ *
+ * Asking the wrong one here is not a missing validator. The shape this feeds is
+ * a `z.object`, which STRIPS keys it has no entry for, and the resolver's output
+ * is what the editors submit — so a field absent from this list is absent from
+ * the request body, and its edits are silently dropped on every save.
+ *
+ * A name is the whole test, and it stays the whole test. Core's own
+ * `ALL_FIELD_TYPES` is exactly `DATA_FIELD_TYPES`, so there is no named
+ * presentational type to exclude; anything carrying a name carries a value.
+ * That is a boundary rather than a list — a type nobody has written yet passes
+ * it, which is the property a list of known types can never have.
+ */
+function carriesFormValue(field: FieldConfig): boolean {
+  const named = field as { name?: unknown };
+  return typeof named.name === "string" && named.name.length > 0;
+}
+
+/**
+ * Extract every field that carries a value, for the form's schema.
+ *
+ * An unrecognised type is kept rather than dropped: `fieldToZodSchema` already
+ * ends in `z.unknown()`, which passes a present value through untouched, so a
+ * contributed field validates as permissively as the admin can honestly manage
+ * and reaches the server intact. The server holds the authoritative rule for it.
+ */
+function extractDataFields(fields: FieldConfig[]): ExtractedField[] {
+  const result: ExtractedField[] = [];
+
+  for (const field of fields) {
+    if (carriesFormValue(field)) {
+      result.push(field as ExtractedField);
+    }
+  }
+
+  return result;
+}
+
+// ============================================================
+// Field to Zod Schema Converter
+// ============================================================
+
+/**
+ * Convert a single data field configuration to a Zod schema.
+ */
+function fieldToZodSchema(
+  field: DataFieldConfig,
+  options: GenerateSchemaOptions = {}
+): z.ZodTypeAny {
+  let schema: z.ZodTypeAny;
+
+  // Route to the appropriate converter based on field type
+  if (isTextField(field)) {
+    schema = convertTextFieldToZod(field);
+  } else if (isTextareaField(field)) {
+    schema = convertTextareaFieldToZod(field);
+  } else if (isEmailField(field)) {
+    schema = convertEmailFieldToZod(field);
+  } else if (isPasswordField(field)) {
+    schema = convertPasswordFieldToZod(field);
+  } else if (isCodeField(field)) {
+    schema = convertCodeFieldToZod(field);
+  } else if (isIconField(field)) {
+    schema = convertIconFieldToZod();
+  } else if (isRichTextField(field)) {
+    schema = convertRichTextFieldToZod();
+  } else if (isNumberField(field)) {
+    schema = convertNumberFieldToZod(field);
+  } else if (isCheckboxField(field)) {
+    schema = convertCheckboxFieldToZod();
+  } else if (isDateField(field)) {
+    schema = convertDateFieldToZod();
+  } else if (isSelectField(field)) {
+    schema = convertSelectFieldToZod(field);
+  } else if (isRadioField(field)) {
+    schema = convertRadioFieldToZod(field);
+  } else if (isRelationshipField(field)) {
+    schema = convertRelationshipFieldToZod(field);
+  } else if (isUploadField(field)) {
+    schema = convertUploadFieldToZod(field);
+  } else if (isRepeaterField(field)) {
+    schema = convertRepeaterFieldToZod(field, options);
+  } else if (isGroupField(field)) {
+    schema = convertGroupFieldToZod(field, options);
+  } else if (isJSONField(field)) {
+    schema = convertJSONFieldToZod();
+  } else {
+    // Unknown field type - accept anything
+    schema = z.unknown();
+  }
+
+  // Handle required vs optional. Requiredness is read through
+  // `isFieldRequired` so the flat and nested shapes are interpreted in
+  // exactly one place.
+  let isRequired = isFieldRequired(field);
+
+  // Password values never round-trip from the server, so edit forms seed
+  // them blank and blank means "keep the current password". Demanding a
+  // value on edit would block every save of an entry with a required
+  // password field.
+  if (isPasswordField(field) && options.mode === "edit") {
+    isRequired = false;
+  }
+
+  if (!isRequired) {
+    // An untouched optional scalar field arrives from the form as "" (empty
+    // string). `.optional()` only tolerates `undefined`, so "" would otherwise
+    // be run through the field's format/length rules (email, minLength) and
+    // wrongly block save. Accept "" alongside the schema for scalars only —
+    // without rewriting the value. Array fields (hasMany / chips / repeater)
+    // use [] as their empty value, which the base array schema already accepts,
+    // so they must not also accept a stray "".
+    const optionalBase =
+      schema instanceof z.ZodArray ? schema : z.union([z.literal(""), schema]);
+    schema = optionalBase.optional().nullable();
+  } else {
+    const message = requiredMessage(field);
+    if (isRichTextField(field)) {
+      // Why: richText's schema is `z.unknown()` (Lexical handles its own
+      // structural validation), so an empty editor is not a missing value
+      // to the check below. Refine with `isRichTextEmpty` so the user gets a
+      // real required error when the editor is empty.
+      schema = schema.refine(value => !isRichTextEmpty(value), { message });
+    }
+    schema = requiredFirst(schema, message, emptyListIsMissing(field));
+  }
+
+  return schema;
+}
+
+/**
+ * What a required field with no value says: the field's name, as the server
+ * says it (`entry-validation`'s `REQUIRED` issue), so the form and the save
+ * word one mistake one way.
+ */
+function requiredMessage(field: DataFieldConfig | ExtractedField): string {
+  const label = fieldLabel(field);
+  return `${label || "This field"} is required.`;
+}
+
+/**
+ * Whether a value counts as not given, by the server's own rule (`isEmpty` in
+ * `entry-validation`): absent, null, or text of nothing but spaces. A list is
+ * left to its own schema, whose row bounds already judge an empty one — except
+ * where the field is one `emptyListIsMissing` names, whose empty list the
+ * server reads as not given.
+ */
+function isMissingValue(value: unknown): boolean {
+  return (
+    value === undefined ||
+    value === null ||
+    (typeof value === "string" && value.trim() === "")
+  );
+}
+
+/**
+ * Whether a required field's empty list counts as not given, as the server
+ * judges it (`entry-validation`): a select, a relationship or an upload
+ * holding many values must hold one, while chips (a text or number `hasMany`)
+ * and a repeater are judged by their row bounds instead — there required
+ * alone says nothing about an empty list, and only `minRows` does.
+ */
+function emptyListIsMissing(field: DataFieldConfig): boolean {
+  if (isSelectField(field)) return field.hasMany === true;
+  if (isRelationshipField(field)) return field.hasMany === true;
+  if (isUploadField(field)) return field.hasMany === true;
+  return false;
+}
+
+/**
+ * A required field's schema, asked first whether the value was given at all.
+ *
+ * Without this, a required field the form seeds empty as `null` — a select, a
+ * number, a date, a relationship, an upload — met its TYPE check first and
+ * showed zod's own words, `Invalid option: expected one of "draft"|"published"`
+ * or `Invalid input: expected number, received null`: a developer's message
+ * that names raw option values and says nothing about what to do. A missing
+ * value now says only that it is required, and the type's own rules are asked
+ * only of a value that was given. An empty list counts as missing only where
+ * `emptyListIsMissing` says the server reads it that way, so the form never
+ * refuses a list the save would take.
+ */
+function requiredFirst(
+  schema: z.ZodTypeAny,
+  message: string,
+  emptyListMissing = false
+): z.ZodTypeAny {
+  return z
+    .unknown()
+    .refine(
+      value =>
+        !isMissingValue(value) &&
+        !(emptyListMissing && Array.isArray(value) && value.length === 0),
+      { message, abort: true }
+    )
+    .pipe(schema);
+}
+
+// ============================================================
+// String Field Converters
+// ============================================================
+
+function convertTextFieldToZod(field: TextFieldConfig): z.ZodTypeAny {
+  if (field.hasMany) {
+    // Each item carries the same length and pattern rules a single value
+    // would, worded per item; the row bounds then guard the list length.
+    return applyRowBounds(constrainedStringSchema(field, "Each item"), field);
+  }
+  return constrainedStringSchema(field, "");
+}
+
+function convertTextareaFieldToZod(field: TextareaFieldConfig): z.ZodTypeAny {
+  // Textarea enforces exactly the text single-value rule set.
+  return constrainedStringSchema(field, "");
+}
+
+/**
+ * Whether a field is marked required, reading both flat (`field.required`)
+ * and nested (`field.validation.required`) shapes for compatibility with
+ * the Schema Builder and code-first configs.
+ */
+function isFieldRequired(field: DataFieldConfig | ExtractedField): boolean {
+  const rec = field as unknown as Record<string, unknown>;
+  const validation = rec.validation as Record<string, unknown> | undefined;
+  return Boolean(rec.required) || Boolean(validation?.required);
+}
+
+/**
+ * Apply a regex pattern to a Zod string schema. For required fields the
+ * regex runs unconditionally. For optional fields we explicitly allow the
+ * empty string to bypass the pattern — the contract is "if filled, must
+ * match", not "must always match." Without this gate, an optional field
+ * with `validation.pattern` rejects every empty submission, which is
+ * surprising and breaks ergonomic forms.
+ */
+function applyPattern(
+  schema: z.ZodString,
+  pattern: string,
+  message: string | undefined,
+  required: boolean,
+  named: string
+): z.ZodTypeAny {
+  const re = compileRegexOrUndefined(pattern);
+  if (!re) return schema;
+  // With no message of the author's, the field is named as the server names
+  // it on the same failure, rather than a bare "Invalid format" that said
+  // neither which field nor that a message could be written for it.
+  const msg = message ?? `${named} does not match the required format.`;
+  if (required) {
+    return schema.regex(re, msg);
+  }
+  return schema.refine(v => v === "" || re.test(v), { message: msg });
+}
+
+/**
+ * Reads `validation.message` from a field config, falling back to a flat
+ * `field.message` for completeness. Used together with `validation.pattern`
+ * to give the user a friendly error instead of a generic "Invalid format".
+ */
+function getPatternMessage(
+  field: DataFieldConfig | ExtractedField
+): string | undefined {
+  const rec = field as unknown as Record<string, unknown>;
+  const validation = rec.validation as Record<string, unknown> | undefined;
+  const nested = validation?.message;
+  if (typeof nested === "string" && nested.trim().length > 0) return nested;
+  const flat = rec.message;
+  if (typeof flat === "string" && flat.trim().length > 0) return flat;
+  return undefined;
+}
+
+/**
+ * Safely compile a user-supplied regex. The pattern comes straight from the
+ * Builder which doesn't enforce regex validity at save time, so a malformed
+ * pattern would otherwise crash the Zod schema build. We log + drop in that
+ * case so the form can still render.
+ */
+function compileRegexOrUndefined(pattern: string): RegExp | undefined {
+  try {
+    return new RegExp(pattern);
+  } catch {
+    if (process.env.NODE_ENV === "development") {
+      console.warn(
+        "[field-validation] Ignoring invalid validation.pattern:",
+        pattern
+      );
+    }
+    return undefined;
+  }
+}
+
+// ============================================================
+// Shared Constraint Builders
+// ============================================================
+
+/**
+ * Word a bound message. `subject` names the constrained thing ("Password",
+ * "Email", "Each item", "Each value"); an empty subject renders the generic
+ * form. `unit` ("characters", or "" for numbers) names what is counted, so
+ * every bound in this module shares one sentence shape.
+ */
+function boundMessage(
+  subject: string,
+  bound: "least" | "most",
+  value: number,
+  unit: string
+): string {
+  const unitSuffix = unit ? ` ${unit}` : "";
+  if (subject) {
+    return `${subject} must be at ${bound} ${value}${unitSuffix}`;
+  }
+  return `Must be at ${bound} ${value}${unitSuffix}`;
+}
+
+/**
+ * Wrap an item schema in a list and apply the row-count bounds
+ * (`minRows` / `maxRows`). The single implementation of the repeater
+ * row-count rule, shared by every list-bearing field type (text and number
+ * hasMany, relationship, upload, repeater); the noun only names what the
+ * field collects in the message. A bound of 0 means "unset".
+ */
+function applyRowBounds(
+  itemSchema: z.ZodTypeAny,
+  field: DataFieldConfig | ExtractedField,
+  noun: "items" | "relationships" | "files" = "items"
+): z.ZodTypeAny {
+  const minRows = getValidation(field, "minRows") as number | undefined;
+  const maxRows = getValidation(field, "maxRows") as number | undefined;
+
+  let listSchema = z.array(itemSchema);
+  if (minRows) {
+    listSchema = listSchema.min(minRows, `Minimum ${minRows} ${noun} required`);
+  }
+  if (maxRows) {
+    listSchema = listSchema.max(maxRows, `Maximum ${maxRows} ${noun} allowed`);
+  }
+  return listSchema;
+}
+
+/**
+ * Apply `minLength` / `maxLength` to a string schema. A length of 0 means
+ * "unset" (truthiness check), matching how the Schema Builder serialises an
+ * empty bound.
+ */
+function applyStringLengthBounds(
+  schema: z.ZodString,
+  field: DataFieldConfig | ExtractedField,
+  subject: string
+): z.ZodString {
+  const minLength = getValidation(field, "minLength") as number | undefined;
+  const maxLength = getValidation(field, "maxLength") as number | undefined;
+
+  if (minLength) {
+    schema = schema.min(
+      minLength,
+      boundMessage(subject, "least", minLength, "characters")
+    );
+  }
+  if (maxLength) {
+    schema = schema.max(
+      maxLength,
+      boundMessage(subject, "most", maxLength, "characters")
+    );
+  }
+  return schema;
+}
+
+/**
+ * Build the string schema for fields whose whole rule set is length plus
+ * pattern: text (single value), textarea, password, code, and each item of
+ * a text hasMany (via the "Each item" subject). Email is deliberately not a
+ * caller — it composes length bounds with the built-in format check but
+ * does not enforce `validation.pattern`, and routing it here would newly
+ * reject addresses it accepts today.
+ */
+function constrainedStringSchema(
+  field: DataFieldConfig | ExtractedField,
+  subject: string
+): z.ZodTypeAny {
+  const schema = applyStringLengthBounds(z.string(), field, subject);
+  const pattern = getValidation(field, "pattern") as string | undefined;
+  if (pattern) {
+    return applyPattern(
+      schema,
+      pattern,
+      getPatternMessage(field),
+      isFieldRequired(field),
+      // Each item of a list is named as the bounds name it; a single value
+      // by the field's own name.
+      subject === "Each item" ? subject : fieldLabel(field) || "This value"
+    );
+  }
+  return schema;
+}
+
+/**
+ * Apply `min` / `max` to a number schema. Unlike string lengths, a bound of
+ * 0 is a real constraint (`min: 0` rejects negatives), so presence is
+ * `!== undefined`. A developer-set `validation.message` replaces the
+ * generated wording on both bounds.
+ */
+function applyNumberBounds(
+  schema: z.ZodNumber,
+  field: DataFieldConfig | ExtractedField,
+  subject: string
+): z.ZodNumber {
+  const min = getValidation(field, "min") as number | undefined;
+  const max = getValidation(field, "max") as number | undefined;
+  const customMsg = getPatternMessage(field);
+
+  if (min !== undefined) {
+    schema = schema.min(
+      min,
+      customMsg ?? boundMessage(subject, "least", min, "")
+    );
+  }
+  if (max !== undefined) {
+    schema = schema.max(
+      max,
+      customMsg ?? boundMessage(subject, "most", max, "")
+    );
+  }
+  return schema;
+}
+
+function convertEmailFieldToZod(field: EmailFieldConfig): z.ZodTypeAny {
+  // Email composes the built-in format check with the shared length bounds
+  // ("Email must be at least N characters"). `validation.pattern` stays
+  // unenforced here: applying it would newly reject addresses the product
+  // accepts today, so email deliberately does not use
+  // `constrainedStringSchema`.
+  return applyStringLengthBounds(
+    z.string().email("Invalid email address"),
+    field,
+    "Email"
+  );
+}
+
+function convertPasswordFieldToZod(field: PasswordFieldConfig): z.ZodTypeAny {
+  // Blank means "keep the current password" on edit, and "no password" when
+  // the field is optional. That empty-string tolerance is applied centrally in
+  // `fieldToZodSchema` (the optional branch), together with the edit-mode rule
+  // that treats a required password field as optional, so no per-type handling
+  // is needed here beyond the Password-worded bounds.
+  return constrainedStringSchema(field, "Password");
+}
+
+function convertCodeFieldToZod(field: CodeFieldConfig): z.ZodTypeAny {
+  return constrainedStringSchema(field, "");
+}
+
+/**
+ * An icon field holds an icon id, `lucide:star`. The shape is checked with the
+ * predicate the server validates with; whether the set still draws the icon is
+ * not, because a stored id the set has dropped is kept and shown as missing
+ * rather than blocking the save.
+ */
+function convertIconFieldToZod(): z.ZodTypeAny {
+  // Empty passes here so a required field reports "required" (its own
+  // check, added after this one) rather than a malformed id.
+  return z
+    .string()
+    .refine(value => value === "" || isIconIdShape(value), "Not an icon id");
+}
+
+function convertRichTextFieldToZod(): z.ZodTypeAny {
+  // Rich text stores as Lexical state (JSON) or HTML string. We accept
+  // any non-null payload here; the higher-level required gate (in
+  // `fieldToZodSchema`) does the empty-state check via `isRichTextEmpty`
+  // so a `required: true` rich-text field actually blocks submit when
+  // the editor has no content. Previously this returned `z.unknown()`
+  // unconditionally and the required path was a silent no-op.
+  return z.unknown();
+}
+
+/**
+ * Heuristic for "is this rich-text value empty?" — used by the required
+ * gate so a rich-text field marked required actually blocks submit when
+ * the user hasn't typed anything.
+ *
+ * Lexical produces a stable shape: a `root` node with `children: []` (or
+ * a single empty paragraph). We recognise both. The HTML / string
+ * fallback covers exporters that serialise to a single empty `<p></p>`.
+ */
+export function isRichTextEmpty(value: unknown): boolean {
+  if (value == null) return true;
+  if (typeof value === "string") {
+    // Strip simple empty-paragraph and whitespace shapes; anything else
+    // counts as content.
+    const stripped = value
+      .replace(/<p>\s*<\/p>/gi, "")
+      .replace(/<br\s*\/?>/gi, "")
+      .trim();
+    return stripped.length === 0;
+  }
+  if (typeof value === "object") {
+    const root = (value as { root?: { children?: unknown[] } }).root;
+    if (!root || !Array.isArray(root.children) || root.children.length === 0) {
+      return true;
+    }
+    // A single empty paragraph (no children of its own) is also "empty".
+    if (root.children.length === 1) {
+      const only = root.children[0] as {
+        type?: string;
+        children?: unknown[];
+      };
+      if (
+        only?.type === "paragraph" &&
+        Array.isArray(only.children) &&
+        only.children.length === 0
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// ============================================================
+// Numeric Field Converters
+// ============================================================
+
+function convertNumberFieldToZod(field: NumberFieldConfig): z.ZodTypeAny {
+  if (field.hasMany) {
+    // Per-item bounds are worded per value; the row bounds guard the list.
+    const itemSchema = applyNumberBounds(z.number(), field, "Each value");
+    return applyRowBounds(itemSchema, field);
+  }
+  return applyNumberBounds(z.number(), field, "");
+}
+
+// ============================================================
+// Selection Field Converters
+// ============================================================
+
+function convertCheckboxFieldToZod(): z.ZodTypeAny {
+  // Preprocess to handle string/number values from the database
+  // (e.g., "true"/"false" or 0/1) before validating as boolean.
+  return z.preprocess(val => {
+    if (typeof val === "string") {
+      return val === "true" || val === "1";
+    }
+    if (typeof val === "number") {
+      return val !== 0;
+    }
+    return val;
+  }, z.boolean());
+}
+
+function convertDateFieldToZod(): z.ZodTypeAny {
+  // Accept ISO date strings or Date objects
+  return z.string().datetime({ offset: true }).or(z.date());
+}
+
+function convertSelectFieldToZod(field: SelectFieldConfig): z.ZodTypeAny {
+  if (field.options && field.options.length > 0) {
+    const values = field.options.map(o => o.value) as [string, ...string[]];
+
+    if (field.hasMany) {
+      return z.array(z.enum(values));
+    }
+
+    return z.enum(values);
+  }
+
+  // No options defined - accept any string
+  return field.hasMany ? z.array(z.string()) : z.string();
+}
+
+function convertRadioFieldToZod(field: RadioFieldConfig): z.ZodTypeAny {
+  if (field.options && field.options.length > 0) {
+    const values = field.options.map(o => o.value) as [string, ...string[]];
+    return z.enum(values);
+  }
+
+  // No options defined - accept any string
+  return z.string();
+}
+
+// ============================================================
+// Relational Field Converters
+// ============================================================
+
+function convertRelationshipFieldToZod(
+  field: RelationshipFieldConfig
+): z.ZodTypeAny {
+  // Determine if this is a polymorphic relationship
+  const isPolymorphic = Array.isArray(field.relationTo);
+
+  let singleSchema: z.ZodTypeAny;
+
+  if (isPolymorphic) {
+    // Polymorphic: { relationTo, value } or just string ID.
+    //
+    // `value` is the target's id, or the target row itself once the entry was
+    // read at a populating depth — which the edit page asks for. The form
+    // validates its own defaults on every submit, so rejecting the populated
+    // shape here fails a save that only touched some other field.
+    singleSchema = z
+      .object({
+        relationTo: z.string(),
+        value: z.string().or(z.object({ id: z.string() }).passthrough()),
+        // Kept through validation: a save resets the form to the values it
+        // parsed, and a link the editor cannot see must stay marked there.
+        [RESTRICTED_REFERENCE]: z.literal(true).optional(),
+      })
+      .or(z.string()); // Allow ID string for backwards compatibility
+  } else {
+    // Single collection: ID string or object with ID
+    singleSchema = z
+      .object({
+        id: z.string(),
+      })
+      .passthrough()
+      .or(z.string()); // Accept ID string or full object
+  }
+
+  if (field.hasMany) {
+    return applyRowBounds(singleSchema, field, "relationships");
+  }
+
+  return singleSchema;
+}
+
+function convertUploadFieldToZod(field: UploadFieldConfig): z.ZodTypeAny {
+  // Upload is similar to relationship but with file metadata
+  const fileSchema = z
+    .object({
+      id: z.string(),
+      url: z.string().optional(),
+      filename: z.string().optional(),
+      mimeType: z.string().optional(),
+      filesize: z.number().optional(),
+    })
+    .passthrough()
+    .or(z.string()); // Accept ID string or full object
+  // A field naming several collections stores `{ relationTo, value }`, which
+  // is how a file the editor cannot see comes back for one. Without this the
+  // form would refuse every save of a document holding one.
+  const singleSchema = Array.isArray(field.relationTo)
+    ? fileSchema.or(
+        z
+          .object({
+            relationTo: z.string(),
+            value: z.string().or(z.object({ id: z.string() }).passthrough()),
+          })
+          .passthrough()
+      )
+    : fileSchema;
+
+  if (field.hasMany) {
+    return applyRowBounds(singleSchema, field, "files");
+  }
+
+  return singleSchema;
+}
+
+// ============================================================
+// Structured Field Converters
+// ============================================================
+
+function convertRepeaterFieldToZod(
+  field: RepeaterFieldConfig,
+  options: GenerateSchemaOptions
+): z.ZodTypeAny {
+  // Items are nested field groups; a repeater with no nested fields
+  // validates each item as an empty group object.
+  const rowFields = (field.fields ?? []) as FieldConfig[];
+  const rowSchema: z.ZodObject<Record<string, z.ZodTypeAny>> =
+    rowFields.length > 0
+      ? generateClientSchema(rowFields, options)
+      : z.object({});
+
+  // A row's `id` is its saved identity. The object schema would strip it, the
+  // save would send the row without one, and the server could then pair a
+  // moved row with nothing and give it a new id. The value is the system's, so
+  // it is carried rather than judged. A row declaring its own `id` field is
+  // judged by that field's rules, and the system gives it no id.
+  const itemSchema = declaresOwnId(rowFields)
+    ? rowSchema
+    : rowSchema.extend({ id: z.unknown().optional() });
+
+  return applyRowBounds(itemSchema, field);
+}
+
+function convertGroupFieldToZod(
+  field: GroupFieldConfig,
+  options: GenerateSchemaOptions
+): z.ZodTypeAny {
+  // Generate schema for group fields
+  if (field.fields && field.fields.length > 0) {
+    return generateClientSchema(field.fields as FieldConfig[], options);
+  }
+
+  return z.object({});
+}
+
+// ============================================================
+// Special Field Converters
+// ============================================================
+
+function convertJSONFieldToZod(): z.ZodTypeAny {
+  // JSON field can contain any valid JSON value
+  return z.unknown();
+}
+
+// ============================================================
+// Utility Exports
+// ============================================================
+
+/**
+ * Get the Zod schema for a specific field type without required/optional handling.
+ * Useful for building custom validation logic.
+ */
+export function getBaseFieldSchema(
+  field: DataFieldConfig,
+  options: GenerateSchemaOptions = {}
+): z.ZodTypeAny {
+  return fieldToZodSchema(field, options);
+}

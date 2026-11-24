@@ -1,0 +1,337 @@
+/**
+ * The one composition of an email template into what a recipient receives.
+ *
+ * Sending and previewing both call this. A narrower view — the preview
+ * surfaces' `{ subject, html }` — is DERIVED from the result rather than
+ * computed alongside it: the two compositions that existed before agreed when
+ * they were written and had drifted on four observable properties by the time
+ * they were unified, each in the flattering direction, because a preview that
+ * omits something looks correct.
+ *
+ * Pure, and layout-INJECTED rather than layout-resolving. Resolving which
+ * layout wraps a template needs the database; composing with it does not, and
+ * only the second half belongs here. That split is what lets an unsaved draft
+ * be rendered through the same code as a saved row.
+ *
+ * Templates render as Liquid (`liquid-engine.ts`). A template or layout stored
+ * before Liquid that holds syntax the old `{{variable}}` engine sent as text is
+ * marked `legacy` by its caller and renders exactly as that engine did.
+ */
+import { randomUUID } from "crypto";
+
+import type {
+  EmailTemplateKind,
+  EmailTemplateRecord,
+} from "../../../schemas/email-templates/types";
+import {
+  BRAND_BINDING,
+  brandVariables,
+  STARTING_BRAND,
+  type BrandSettings,
+} from "../brand-settings";
+import { compileWrittenHtml, compileWrittenText } from "../written/compile";
+import {
+  WRITTEN_LINK_CLASS,
+  type TemplateFormat,
+  type WrittenDocument,
+} from "../written/document";
+
+import {
+  markHtml,
+  renderLiquid,
+  TrustedHtml,
+  type LiquidContext,
+} from "./liquid-engine";
+import { htmlToText, interpolateTemplate } from "./template-engine";
+
+/** The slot a layout declares for the message body. */
+const CONTENT_MARKER = "{{content}}";
+
+/**
+ * The product name used when nothing is configured.
+ *
+ * Declared once and imported by every caller that needs a fallback: a second
+ * literal is a second answer to the same question, and the two would drift
+ * exactly as the two compositions this module replaced did.
+ */
+export const DEFAULT_APP_NAME = "Nextly";
+
+/**
+ * The wrapper for the inbox preview line.
+ *
+ * Hidden in every client that honours inline styles, so it contributes preview
+ * text without appearing in the rendered body.
+ */
+const PREHEADER_OPEN =
+  '<div style="display:none;max-height:0;overflow:hidden;mso-hide:all;">';
+
+/**
+ * What a render needs from a template, whether or not it has been saved.
+ *
+ * Structurally satisfied by `EmailTemplateRecord`, so a saved row is passed
+ * directly and a draft supplies the same fields.
+ */
+export interface TemplateFields {
+  subject: string;
+  htmlContent: string;
+  plainTextContent: string | null;
+  preheader: string | null;
+  useLayout: boolean;
+  kind: EmailTemplateKind;
+  /**
+   * Render with the old `{{variable}}` engine, for a template stored before
+   * Liquid that it would read differently. Decided by the caller, from what
+   * is stored about the template; absent means Liquid.
+   */
+  legacy?: boolean;
+  /**
+   * Written (blocks) or coded; coded when absent. A written template renders
+   * from its blocks, written out as Liquid when it is rendered.
+   */
+  format?: TemplateFormat;
+  /** A written template's blocks. */
+  blocks?: WrittenDocument | null;
+}
+
+/** A layout as the render needs it. */
+export type LayoutFields = Pick<EmailTemplateRecord, "htmlContent"> & {
+  legacy?: boolean;
+};
+
+/**
+ * The complete artifact: everything the transport is handed.
+ *
+ * A type alias rather than an interface so it carries an implicit index
+ * signature, which is what lets a route hand it straight to `respondData`
+ * without a copy whose fields could fall out of step with these.
+ */
+export type RenderedTemplate = {
+  subject: string;
+  /** Layout-wrapped, with the preheader prepended. */
+  html: string;
+  /** The authored plain text, else one derived from the body. */
+  text: string;
+};
+
+export interface RenderTemplateOptions {
+  /** Value for `{{appName}}` when the caller's data supplies none. */
+  appName: string;
+  /**
+   * The site's brand settings, read as `brand` by a layout and by a body
+   * whose send supplies no `brand` of its own. Absent means the starting
+   * values, which render core's built-ins as they were before brand settings.
+   */
+  brand?: BrandSettings;
+}
+
+/**
+ * Marked HTML as the old engine writes it, the way Liquid does: as it is in
+ * HTML, and as its text in plain text. Without this the old engine would
+ * escape a brand setting's markup into visible tags.
+ */
+function trustedAsHtml(value: unknown): string | undefined {
+  return TrustedHtml.is(value) ? value.html : undefined;
+}
+
+function trustedAsText(value: unknown): string | undefined {
+  return TrustedHtml.is(value) ? htmlToText(value.html) : undefined;
+}
+
+/**
+ * Fill one field. HTML is escaped; plain text is not; a line is plain text
+ * with line breaks removed. The old engine has no notion of a line, and keeps
+ * the plain-text behaviour it always had.
+ */
+function fill(
+  source: string,
+  data: Record<string, unknown>,
+  context: LiquidContext,
+  legacy: boolean | undefined
+): string {
+  if (legacy) {
+    return interpolateTemplate(source, data, {
+      escapeHtml: context === "html",
+      trusted: context === "html" ? trustedAsHtml : trustedAsText,
+    });
+  }
+  return renderLiquid(source, data, context);
+}
+
+/**
+ * A written template as the render reads it: its body and plain text written
+ * from its blocks as they are now, on Liquid. Compiled here, at every render,
+ * so a preview, a test and a send of the same blocks write the same email.
+ * Anything that decides about a render from its text (what the brand settings
+ * reach) reads this too.
+ */
+export function fromBlocks<T extends TemplateFields>(template: T): T {
+  if (template.format !== "written" || !template.blocks) return template;
+  return {
+    ...template,
+    htmlContent: compileWrittenHtml(template.blocks),
+    plainTextContent: compileWrittenText(template.blocks),
+    legacy: false,
+  };
+}
+
+/**
+ * @throws NextlyError when a Liquid template cannot be rendered (it does not
+ *   parse, or a render limit is hit); it is not retryable.
+ */
+export function renderTemplate(
+  given: TemplateFields,
+  layout: LayoutFields | null,
+  data: Record<string, unknown>,
+  options: RenderTemplateOptions
+): RenderedTemplate {
+  return renderTemplateParts(given, layout, data, options).rendered;
+}
+
+/**
+ * A render, plus the preheader as it was spliced into the HTML: `null` when
+ * the template has none. A preview reads its inbox line from this, so it is
+ * the line the HTML carries and not a second render's.
+ *
+ * @throws NextlyError as `renderTemplate` does.
+ */
+export function renderTemplateParts(
+  given: TemplateFields,
+  layout: LayoutFields | null,
+  data: Record<string, unknown>,
+  options: RenderTemplateOptions
+): { rendered: RenderedTemplate; preheaderHtml: string | null } {
+  // A written template renders from its blocks as they are now.
+  const template = fromBlocks(given);
+  const legacy = template.legacy;
+  // The rule that keeps written links readable in dark mode, for an email
+  // that carries them: a written one, or one converted from it to code.
+  // Every other email's layout is unchanged.
+  const layoutData = withLayoutChrome(data, options, {
+    writtenLinks: template.htmlContent.includes(
+      `class="${WRITTEN_LINK_CLASS}"`
+    ),
+  });
+  // The body reads the brand settings as `brand` too, so a site's template
+  // can write in them. A send's own `brand` wins there, as every explicit value
+  // does in a body: a template written for a `brand` its sends supply keeps
+  // reading it.
+  // Under `nextly_brand` (BRAND_BINDING) the settings are there whatever the
+  // send holds, which is what core's built-ins read.
+  const bodyData = {
+    ...data,
+    ...(data.brand === undefined ? { brand: layoutData.brand } : {}),
+    [BRAND_BINDING]: layoutData[BRAND_BINDING],
+  };
+  // Mail clients render a subject as plain text, so escaping it would show the
+  // reader `&amp;` where the value contains `&`.
+  const subject = fill(template.subject, bodyData, "line", legacy);
+
+  // A layout row IS the wrapper, so the chrome variables its own markup
+  // references resolve here exactly as they do when a body is spliced into it.
+  // Withheld from an ordinary body (all but `brand`): a template that says
+  // `{{appName}}` in its own copy has always rendered whatever the caller
+  // supplied, and nothing when the caller supplied nothing.
+  let html = fill(
+    template.htmlContent,
+    template.kind === "layout" ? layoutData : bodyData,
+    "html",
+    legacy
+  );
+
+  // Derived BEFORE the preheader and the layout are spliced in. The preheader
+  // is a hidden preview line, and a text part derived after it would repeat
+  // that line as the message's opening words; the layout's chrome would follow
+  // it into the text part for the same reason.
+  const text = template.plainTextContent?.trim()
+    ? fill(template.plainTextContent, bodyData, "text", legacy)
+    : htmlToText(html);
+
+  let preheaderHtml: string | null = null;
+  if (template.preheader?.trim()) {
+    preheaderHtml = fill(template.preheader, bodyData, "html", legacy);
+    html = `${PREHEADER_OPEN}${preheaderHtml}</div>${html}`;
+  }
+
+  // A layout row IS a wrapper, so wrapping it in another would nest two
+  // documents. It renders as itself.
+  if (template.kind !== "layout" && template.useLayout && layout) {
+    html = spliceIntoLayout(layout, html, layoutData);
+  }
+
+  return { rendered: { subject, html, text }, preheaderHtml };
+}
+
+/**
+ * The caller's data, plus the variables a layout's chrome routinely references.
+ *
+ * A layout's markup says `{{appName}}` and `{{year}}` in its footer, and a
+ * caller rendering one specific template has no reason to know that. Supplied
+ * for BOTH the wrapper a body is spliced into and a layout row rendering
+ * itself: they are the same markup, and filling one but not the other is what
+ * made a layout preview its own footer as blank.
+ *
+ * Only where the caller said nothing — an explicit value always wins. The
+ * one exception is `brand`, the site's brand settings, which a layout always
+ * reads from the settings: core's default layout is written in it, so a send
+ * whose data happens to carry a `brand` of its own (a product's brand name,
+ * say) must not take the layout's colours and footer with it. The body still
+ * reads the caller's value, and the settings only when the caller gave none.
+ */
+function withLayoutChrome(
+  data: Record<string, unknown>,
+  options: RenderTemplateOptions,
+  markup: { writtenLinks?: boolean } = {}
+): Record<string, unknown> {
+  const chrome = {
+    ...data,
+    year: data.year ?? new Date().getFullYear().toString(),
+    appName: data.appName ?? options.appName,
+  };
+  const brand = brandVariables(options.brand ?? STARTING_BRAND, chrome, markup);
+  return { ...chrome, brand, [BRAND_BINDING]: brand };
+}
+
+/**
+ * Inject an already-rendered body at the wrapper's first `{{content}}`.
+ *
+ * The body is spliced verbatim and never re-interpolated or re-escaped: it is
+ * finished HTML, and a second pass would either escape its markup into visible
+ * text or expand a `{{...}}` that legitimately survived from user content.
+ *
+ * A well-formed layout carries exactly one marker. With none, the body is
+ * appended after the wrapper so a malformed layout drops nothing.
+ */
+function spliceIntoLayout(
+  layout: LayoutFields,
+  body: string,
+  variables: Record<string, unknown>
+): string {
+  const wrapper = layout.htmlContent;
+  const at = wrapper.indexOf(CONTENT_MARKER);
+  if (layout.legacy) {
+    const options = { trusted: trustedAsHtml };
+    if (at === -1)
+      return interpolateTemplate(wrapper, variables, options) + body;
+    return (
+      interpolateTemplate(wrapper.slice(0, at), variables, options) +
+      body +
+      interpolateTemplate(
+        wrapper.slice(at + CONTENT_MARKER.length),
+        variables,
+        options
+      )
+    );
+  }
+  if (at === -1) return renderLiquid(wrapper, variables, "html") + body;
+  // A Liquid layout renders as one document, so a block may enclose the body.
+  // The body arrives as marked HTML in a slot the marker is swapped for, and is
+  // written as it is: it is finished, already-escaped output. The slot is named
+  // afresh for each render, so no layout can assign to it and no data key can
+  // collide with it.
+  const slot = `nextly_body_${randomUUID().replace(/-/g, "")}`;
+  return renderLiquid(
+    `${wrapper.slice(0, at)}{{ ${slot} }}${wrapper.slice(at + CONTENT_MARKER.length)}`,
+    { ...variables, [slot]: markHtml(body) },
+    "html"
+  );
+}

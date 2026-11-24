@@ -1,0 +1,1421 @@
+/**
+ * A widget's data request, as structured data.
+ *
+ * It is never a string, never SQL, and never a query language typed by a user.
+ * Metabase and Superset both ship a structured IR for exactly this reason: an
+ * opaque query string cannot be checked before execution, so row-level security
+ * silently does not apply to it. Everything here resolves against the source
+ * registry before it reaches the compiler.
+ *
+ * @module domains/widgets/query
+ */
+
+import { z } from "zod";
+
+import { NextlyError } from "../../errors/nextly-error";
+import {
+  parseNearQuery,
+  parseWithinQuery,
+} from "../collections/query/geo-utils";
+import { localizedGroupKeyProblem } from "../collections/query/localized-group-key";
+import {
+  GEO_OPERATORS,
+  isValidOperator,
+} from "../collections/query/query-operators";
+import {
+  bucketStartUtc,
+  intervalAfter,
+  intervalWindow,
+  isTimeseriesInterval,
+  TIMESERIES_INTERVALS,
+  type TimeseriesInterval,
+} from "../collections/query/timeseries-interval";
+import {
+  isWorkflowKey,
+  workflowKeyProblem,
+  WORKFLOW_KEY_PURPOSE,
+} from "../collections/query/workflow-filter";
+
+import { effectiveWidgetLimit } from "./query-limits";
+import {
+  failUnavailableSourceOrOp,
+  getSource,
+  isWidgetTab,
+  sourceKindFromId,
+  WIDGET_TABS,
+  type WidgetOp,
+  type WidgetSource,
+  type WidgetSourceFilter,
+} from "./sources";
+
+// The row limits and their one rule live in the import-free
+// `query-limits.ts`, so the browser reserves rows by the validator's own
+// answer. Re-exported, so this module's importers are unchanged.
+export { MAX_WIDGET_LIMIT } from "./query-limits";
+
+/** How deep a `where` clause may nest before validation itself gets expensive. */
+const MAX_WHERE_DEPTH = 8;
+
+const VALID_STATUSES = ["published", "draft", "all"] as const;
+
+export interface WidgetQuery {
+  source: string;
+  op: WidgetOp;
+  where?: Record<string, unknown>;
+  status?: "published" | "draft" | "all";
+  select?: string[];
+  sort?: string;
+  groupBy?: string;
+  /** The date field a `timeseries` places its rows on. */
+  dateField?: string;
+  /** How wide each point of a `timeseries` is. */
+  interval?: TimeseriesInterval;
+  limit?: number;
+  /**
+   * The start of a `count` or `timeseries` read, as a span back from when the
+   * query runs: rows from that instant on. With {@link WidgetQuery.until}, the
+   * window is half-open, `[since, until)`. See {@link RelativeSpan}.
+   *
+   * @experimental While the content widgets are being built.
+   */
+  since?: RelativeSpan;
+  /**
+   * The end of the window `since` starts, as a span back from when the query
+   * runs: rows before that instant. Absent, the window ends at that moment.
+   *
+   * @experimental While the content widgets are being built.
+   */
+  until?: RelativeSpan;
+  /**
+   * The range a `timeseries` draws, from the instant that far before the query
+   * runs: it sets the interval and how many are drawn, and bounds the rows to
+   * the range. Sent instead of `interval`, `since` and `until`. See
+   * {@link TimeseriesRange}.
+   *
+   * @experimental While the content widgets are being built.
+   */
+  range?: TimeseriesRange;
+}
+
+/**
+ * The spans a query may reach back by, as one CLOSED list: a new one is a
+ * deliberate addition, not a grammar a caller can extend.
+ *
+ * A span is that many WHOLE intervals of its unit, ending with the one now
+ * falls in, on the same UTC calendar a timeseries buckets by:
+ *
+ * - `30d` starts at the start of today (UTC) less 29 days: the thirty calendar
+ *   days including today, exactly the thirty bars a daily chart draws.
+ * - `12m` starts at the start of this month (UTC) less 11 months.
+ *
+ * Whole intervals, so a window and the chart over it agree, and two adjacent
+ * windows (`since: "60d", until: "30d"` beside `since: "30d"`) leave no
+ * instant between them. Days are UTC days: for a reader east of UTC, "today"
+ * starts during their morning.
+ *
+ * Resolved by the server against the one "now" its batch took
+ * ({@link relativeSpanStart}), so every read in a batch measures from the same
+ * instant and no reader's clock decides a count.
+ *
+ * @experimental While the content widgets are being built.
+ */
+export const RELATIVE_SPANS = ["7d", "30d", "60d", "90d", "12m"] as const;
+
+/** @experimental */
+export type RelativeSpan = (typeof RELATIVE_SPANS)[number];
+
+/** The boundary's reading of a span: one of {@link RELATIVE_SPANS}, or a refusal. */
+const relativeSpanSchema = z.enum(RELATIVE_SPANS);
+
+/**
+ * The instant `span` before `now`, by the rules {@link RELATIVE_SPANS} states.
+ *
+ * @experimental
+ */
+export function relativeSpanStart(span: RelativeSpan, now: Date): Date {
+  const amount = Number(span.slice(0, -1));
+  const unit: TimeseriesInterval = span.endsWith("d") ? "day" : "month";
+  // The first of the `amount` intervals ending with now's: the timeseries'
+  // own window arithmetic, so a span and a chart share one calendar.
+  return intervalWindow(now, unit, amount)[0];
+}
+
+/**
+ * The window keys a source answering a fixed question refuses: it has no rows
+ * placed in time for a window to bound. One spelling for every such source's
+ * table of query keys, so a window key added here reaches each of them.
+ */
+export const WINDOW_KEYS_REFUSED = {
+  since: "refused",
+  until: "refused",
+  range: "refused",
+} as const satisfies Partial<Record<keyof WidgetQuery, "refused">>;
+
+/**
+ * The ranges a chart over time may draw, as one CLOSED list.
+ *
+ * Unlike a span ({@link RELATIVE_SPANS}), a range starts at the exact instant
+ * that far before the query runs, and the chart draws every interval the range
+ * overlaps, the first one partial, each starting at midnight UTC:
+ *
+ * - `7d` and `30d`: one point per day, 7 or 8, or 30 or 31;
+ * - `90d`: one point per ISO week, from Monday, 13 or 14;
+ * - `12m`: one point per calendar month, 12 or 13.
+ *
+ * Only rows inside the range are counted, so the first interval counts only
+ * the part of it the range covers. The window is half-open, `[start, now)`.
+ *
+ * @experimental While the content widgets are being built.
+ */
+export const TIMESERIES_RANGES = ["7d", "30d", "90d", "12m"] as const;
+
+/** @experimental */
+export type TimeseriesRange = (typeof TIMESERIES_RANGES)[number];
+
+/**
+ * The interval each range is drawn in. Kept literal (`as const`), so the
+ * intervals a range can be drawn in are a type of their own
+ * ({@link RangeInterval}), read from this one table.
+ */
+const RANGE_INTERVAL = {
+  "7d": "day",
+  "30d": "day",
+  "90d": "week",
+  "12m": "month",
+} as const satisfies Readonly<Record<TimeseriesRange, TimeseriesInterval>>;
+
+/** The intervals a range is drawn in: a day, a week or a month. @experimental */
+export type RangeInterval = (typeof RANGE_INTERVAL)[TimeseriesRange];
+
+/** Whether an interval is one a range is drawn in ({@link RangeInterval}). @experimental */
+export function isRangeInterval(value: unknown): value is RangeInterval {
+  return (Object.values(RANGE_INTERVAL) as readonly unknown[]).includes(value);
+}
+
+/** Whether a value is one of {@link TIMESERIES_RANGES}. @experimental */
+export function isTimeseriesRange(value: unknown): value is TimeseriesRange {
+  return (TIMESERIES_RANGES as readonly unknown[]).includes(value);
+}
+
+/**
+ * What a range draws, measured from `now`: its interval, the instant it
+ * starts, the instant its last interval is placed by, and how many intervals
+ * it overlaps.
+ *
+ * @experimental
+ */
+export interface RangeWindow {
+  interval: RangeInterval;
+  /** The range's first instant: rows from here on are counted. */
+  start: Date;
+  /**
+   * The window's last instant, a millisecond before `now`: the window is
+   * half-open, so at an interval's exact start the interval opening then
+   * holds nothing yet and is not drawn.
+   */
+  anchor: Date;
+  /** The intervals the range overlaps, the first and the current one partial. */
+  intervals: number;
+}
+
+/**
+ * The window a range draws at `now`, by the rules {@link TIMESERIES_RANGES}
+ * states. One answer for the rows a range counts and the points it draws.
+ *
+ * @experimental
+ */
+export function rangeWindow(range: TimeseriesRange, now: Date): RangeWindow {
+  const interval = RANGE_INTERVAL[range];
+  const start = new Date(now.getTime());
+  if (range === "12m") start.setTime(yearBefore(now).getTime());
+  else start.setUTCDate(start.getUTCDate() - Number(range.slice(0, -1)));
+  const anchor = new Date(now.getTime() - 1);
+  // Counted by stepping the calendar, as the chart's own window is built: a
+  // month is not a constant width.
+  const last = bucketStartUtc(anchor, interval).getTime();
+  let intervals = 1;
+  for (
+    let at = bucketStartUtc(start, interval);
+    at.getTime() < last;
+    at = intervalAfter(at, interval)
+  ) {
+    intervals += 1;
+  }
+  return { interval, start, anchor, intervals };
+}
+
+/**
+ * The exclusive upper bound of a window that ends at `now`: one millisecond
+ * past the whole second at or after it, so the window keeps that second.
+ *
+ * 🔴 MySQL stores a DATETIME to the second, rounding to the nearest, so a row
+ * written just before `now` can be stored up to half a second after it, and a
+ * window ending at `now` would miss it until the clock passes the stored
+ * value. Every stored value of a row written by `now` is at most that whole
+ * second. On a dialect that keeps milliseconds, the most this admits is a row
+ * written later in the same second. Only the open end moves: interval edges,
+ * and a window's start, are where they were.
+ *
+ * @experimental
+ */
+export function openWindowEnd(now: Date): Date {
+  return new Date(Math.ceil(now.getTime() / 1000) * 1000 + 1);
+}
+
+/**
+ * The same instant a calendar year before `now`, its day clamped to the
+ * month's last: February 29 steps back to February 28, where `setUTCMonth`
+ * would roll over into March 1 and drop the window's first day.
+ */
+function yearBefore(now: Date): Date {
+  const year = now.getUTCFullYear() - 1;
+  const month = now.getUTCMonth();
+  const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  const at = new Date(now.getTime());
+  at.setUTCFullYear(year, month, Math.min(now.getUTCDate(), lastDay));
+  return at;
+}
+
+/**
+ * A query as an AUTHOR declares it, with the op/key dependency enforced.
+ *
+ * `WidgetQuery` stays flat, and this narrows it at the position a person
+ * writes one. Written as an intersection per member rather than by turning
+ * `WidgetQuery` itself into a union: `keyof` over a union keeps only the keys
+ * every member shares, so `groupBy` would drop out of `keyof WidgetQuery` and
+ * silently shrink the exhaustive `Record<keyof WidgetQuery, ...>` tables that
+ * make each fixed-question source state a position on every field. Those
+ * tables failing to compile is how a new field gets considered at all, and a
+ * union would have removed that without any error.
+ *
+ * `groupBy?: never` on the other ops is what makes the wrong pairing a compile
+ * error rather than a value the validator refuses at request time. Runtime
+ * validation stays regardless: a request body is untyped, and this reaches
+ * only the authors who write TypeScript.
+ */
+export type WidgetQuerySpec =
+  | (WidgetQuery & {
+      op: Exclude<WidgetOp, "groupBy" | "timeseries">;
+      groupBy?: never;
+      dateField?: never;
+      interval?: never;
+      range?: never;
+    })
+  | (WidgetQuery & {
+      op: "groupBy";
+      groupBy: string;
+      dateField?: never;
+      interval?: never;
+      range?: never;
+      // `select` and `sort` describe ROWS, and this op returns buckets. The
+      // validator refuses them, so admitting them here would compile a
+      // declaration whose every request fails -- an author learning at runtime
+      // what the type could have told them.
+      select?: never;
+      sort?: never;
+    })
+  | (WidgetQuery & {
+      op: "timeseries";
+      dateField: string;
+      interval: TimeseriesInterval;
+      range?: never;
+      // A timeline groups by a bucketing expression over its date field, so a
+      // second group key would be a different question asked at the same time.
+      groupBy?: never;
+      select?: never;
+      sort?: never;
+    })
+  | (WidgetQuery & {
+      // A chart over a range: the range sets the interval, the window and so
+      // the number of points, so none of them is stated beside it.
+      op: "timeseries";
+      dateField: string;
+      range: TimeseriesRange;
+      interval?: never;
+      since?: never;
+      until?: never;
+      limit?: never;
+      groupBy?: never;
+      select?: never;
+      sort?: never;
+    });
+
+/**
+ * A card's query before its Collection setting has given it a source: what a
+ * widget offered per collection carries until a card is set to a collection.
+ * Never sent: a card holding one asks nothing and is not available.
+ *
+ * @experimental While the content widgets are being built.
+ */
+export type SourcelessWidgetQuery = Omit<WidgetQuery, "source"> & {
+  source?: undefined;
+};
+
+/**
+ * A declared query whose source the card's Collection setting supplies: the
+ * same shapes as {@link WidgetQuerySpec}, with no source of its own.
+ *
+ * The collection knob of `applyWidgetSettings` fills `source` with the
+ * collection a card was set to, so a widget offered per collection asks the
+ * collection each card reads. A card whose Collection setting is empty asks
+ * nothing.
+ *
+ * A grouped one may leave its group key to the card's Group by setting as
+ * well: which field a collection divides by depends on the collection, so a
+ * widget offered per collection cannot always name it. Registration requires
+ * that setting where the key is left out.
+ *
+ * @experimental While the content widgets are being built.
+ */
+export type SettingSourcedQuerySpec = WidgetQuerySpec extends infer Spec
+  ? Spec extends WidgetQuerySpec
+    ? Spec extends { op: "groupBy" }
+      ? Omit<Spec, "source" | "groupBy"> & {
+          source?: undefined;
+          groupBy?: string;
+        }
+      : Omit<Spec, "source"> & { source?: undefined }
+    : never
+  : never;
+
+/**
+ * Product code in `packages/nextly/**` throws `NextlyError`, never a bare
+ * `Error` (repo lint rule). `.message` is set verbatim from this string, so
+ * the tests' regex assertions match unchanged.
+ */
+function fail(message: string): never {
+  throw NextlyError.invalidInput({
+    message: `Invalid widget query: ${message}`,
+  });
+}
+
+/**
+ * The caller's query with every property read EXACTLY ONCE, into locals
+ * nothing outside this module can reach.
+ *
+ * `validateWidgetQuery` is public API, so its argument may be a Proxy or carry
+ * accessors, and an accessor is free to answer differently on each call. Every
+ * property that is read twice -- once to check it, once to build the returned
+ * object -- is therefore a TOCTOU: the value that was validated and the value
+ * that ships can differ. An earlier commit closed this for `where` by cloning
+ * before the walk and left the other five open, which is one gap per family
+ * member rather than one gap.
+ *
+ * Reading them all here, up front, is what makes the invariant structural: no
+ * later step can read the caller's object again, because no later step is
+ * handed it.
+ */
+export interface RawWidgetQuery {
+  source: unknown;
+  op: unknown;
+  where: unknown;
+  status: unknown;
+  select: unknown;
+  sort: unknown;
+  groupBy: unknown;
+  dateField: unknown;
+  interval: unknown;
+  limit: unknown;
+  since: unknown;
+  until: unknown;
+  range: unknown;
+}
+
+/**
+ * Narrows `unknown` to an object, then takes its one read of each property.
+ *
+ * Exported so a caller that must AUTHORIZE the source before it is told
+ * anything specific about the query can do so without reading `source` a
+ * second time. That second read is the whole hazard this function exists to
+ * remove: an accessor is free to answer `collection:allowed` to an
+ * authorization gate and `collection:secret` to the validator that follows.
+ * Read once, here, and pass the result down.
+ */
+export function readWidgetQuery(query: unknown): RawWidgetQuery {
+  if (typeof query !== "object" || query === null) fail("expected an object");
+  const q = query as Record<string, unknown>;
+  return {
+    source: q.source,
+    op: q.op,
+    where: q.where,
+    status: q.status,
+    select: q.select,
+    sort: q.sort,
+    dateField: q.dateField,
+    interval: q.interval,
+    groupBy: q.groupBy,
+    limit: q.limit,
+    since: q.since,
+    until: q.until,
+    range: q.range,
+  };
+}
+
+/** Resolves `source` against the registry. A caller-invented id cannot exist here. */
+export function resolveWidgetSource(source: unknown): WidgetSource {
+  if (typeof source !== "string") {
+    failUnavailableSourceOrOp("source is required");
+  }
+  const found = getSource(source);
+  if (!found) failUnavailableSourceOrOp(`unknown source "${source}"`);
+  return found;
+}
+
+/**
+ * Confirms the source declares support for the requested op.
+ *
+ * Refuses through `failUnavailableSourceOrOp`, the same refusal an unknown
+ * source gets: "does not support op" would otherwise confirm the source
+ * EXISTS. `POST /api/dashboard/query` now authorizes the source before it
+ * reaches this point, so on THAT path the flattening is belt-and-braces rather
+ * than the gate -- but `validateWidgetQuery` is public API and its own
+ * composition runs no authorization, so for a direct caller this is still the
+ * only thing standing between an unsupported op and a source-existence oracle.
+ */
+function assertSupportedOp(source: WidgetSource, op: unknown): WidgetOp {
+  if (typeof op !== "string" || !source.supports.includes(op as WidgetOp)) {
+    failUnavailableSourceOrOp(
+      `source "${source.id}" does not support op "${String(op)}"`
+    );
+  }
+  return op as WidgetOp;
+}
+
+/**
+ * Whether `operator` is a key the query layer actually understands, DERIVED
+ * from the same vocabulary the collections query compiler uses -- not a
+ * hand-kept copy of it. A hand-kept list would agree with
+ * `query-operators.ts` on the day it was written and silently stop agreeing
+ * the next time an operator is added or renamed there. See
+ * `domains/collections/query/query-operators.ts` (`isValidOperator`, the
+ * `QueryOperator` union `buildWhereClause` accepts) and, one layer down,
+ * `WHERE_OPERATORS` in `packages/adapter-drizzle/src/types/query.ts` for the
+ * SQL-facing operators those compile to.
+ */
+function isAllowedWhereOperator(operator: string): boolean {
+  return isValidOperator(operator) || GEO_OPERATORS.has(operator);
+}
+
+/**
+ * Confirms a field's condition value is usable, and returns its operator
+ * entries to check -- or `undefined` for a bare scalar, which has no keys
+ * of its own and so nothing further to check (it is an implicit equality
+ * test, e.g. `{ status: "draft" }`, and is accepted as-is).
+ *
+ * `null` and `{}` are refused rather than treated as "nothing to check
+ * either": both compile to NO condition at all downstream --
+ * `buildWhereClause` does `if (value === null) continue`, and `{}` has no
+ * operator keys for `isFieldCondition` to recognise. An accepted query whose
+ * author wrote a condition that silently vanishes returns a WIDER result
+ * set than the query reads as promising, which is exactly the "accepted
+ * means something different from what it says" failure this validator
+ * exists to prevent.
+ *
+ * An array under a field name is refused too: it matches none of the shapes
+ * the query operators produce (`buildWhereClause` treats it as neither a
+ * field condition nor plain equality and silently drops it), so admitting
+ * it here would be a no-op at best and a hiding place for a nested field
+ * reference (`["x", { secretScore: 1 }]`) at worst.
+ */
+function assertFieldConditionUsable(
+  field: string,
+  value: unknown
+): Array<[string, unknown]> | undefined {
+  if (value === null) {
+    fail(`where condition for "${field}" is null, which matches every row`);
+  }
+  if (typeof value !== "object") return undefined;
+
+  if (Array.isArray(value)) {
+    fail(
+      `where condition for "${field}" must be an operator object, not an array`
+    );
+  }
+
+  const entries = Object.entries(value);
+  if (entries.length === 0) {
+    fail(`where condition for "${field}" is empty, which matches every row`);
+  }
+  return entries;
+}
+
+/** Confirms `operator` is one the query layer actually understands. */
+function assertOperatorAllowed(field: string, operator: string): void {
+  if (!isAllowedWhereOperator(operator)) {
+    fail(`where uses unknown operator "${operator}" on field "${field}"`);
+  }
+}
+
+/**
+ * Confirms an operator's value is not itself a plain object. None of the
+ * operators in the vocabulary take an object as their value (comparisons
+ * take scalars, `in`/`not_in` take arrays), so an object here has no
+ * legitimate use and is the only place left a field name could hide -- it
+ * is refused rather than walked for exactly that reason: there is no
+ * operator whose semantics a nested object could ever satisfy.
+ */
+function assertOperatorValueShape(
+  field: string,
+  operator: string,
+  operatorValue: unknown
+): void {
+  if (
+    operatorValue !== null &&
+    typeof operatorValue === "object" &&
+    !Array.isArray(operatorValue)
+  ) {
+    fail(
+      `where operator "${operator}" on field "${field}" may not take a nested object`
+    );
+  }
+}
+
+/**
+ * The canonical parser for each geo operator's value.
+ *
+ * These are the SAME functions `extractGeoFilters` runs downstream, not a
+ * second opinion about coordinate ranges, distance units or argument order. A
+ * hand-written check here would agree with them on the day it was written and
+ * start accepting values the executor then discards, which is precisely the
+ * failure being closed.
+ */
+// The type argument is on `new Map`, not only on the binding: an unannotated
+// `new Map([...])` infers its value type from the entry array, which fixes on
+// the first parser's return type and then rejects the second.
+const GEO_VALUE_PARSERS: ReadonlyMap<string, (value: string) => unknown> =
+  new Map<string, (value: string) => unknown>([
+    ["near", parseNearQuery],
+    ["within", parseWithinQuery],
+  ]);
+
+/**
+ * Confirms a geo operator's value is one the executor will actually apply.
+ *
+ * This is the one operator family whose value decides whether the condition
+ * SURVIVES. `extractGeoFilters` lifts `near`/`within` out of the `where` before
+ * the rest is compiled, parses the string, and adds no filter when parsing
+ * fails -- and it removes the operator from `cleanedWhere` either way. So
+ * `{ location: { near: "not-a-location" } }` did not merely lose one condition:
+ * it left NO condition at all, and both `list` and `count` answered over the
+ * whole collection. An accepted query returning more rows than it asked for is
+ * exactly what this validator exists to prevent, so the value is checked here
+ * rather than the operator family being dropped from the contract -- geo
+ * filtering works end to end through `nextly.find`, and refusing to describe it
+ * would remove a capability instead of making acceptance honest.
+ *
+ * A geo operator with no parser registered is REFUSED rather than waved
+ * through. `GEO_OPERATORS` is the vocabulary and this map is what can be
+ * checked against it; a third operator added there and not here must fail
+ * closed, or the gap reopens silently under a new name.
+ */
+function assertGeoOperatorValue(
+  field: string,
+  operator: string,
+  operatorValue: unknown
+): void {
+  if (!GEO_OPERATORS.has(operator)) return;
+  const parse = GEO_VALUE_PARSERS.get(operator);
+  // `extractGeoFilters` only considers a geo operator whose value is a string,
+  // so a non-string is dropped exactly as an unparseable string is.
+  if (
+    !parse ||
+    typeof operatorValue !== "string" ||
+    parse(operatorValue) === null
+  ) {
+    fail(
+      `where operator "${operator}" on field "${field}" is not a valid ` +
+        `${operator} filter`
+    );
+  }
+}
+
+/**
+ * The facts every level of the `where` walk needs, carried once instead of
+ * threaded as four parallel parameters.
+ *
+ * `op` is in here because a geo predicate's legality depends on it: the same
+ * clause is executable under `list` and refused under `count` (see
+ * {@link assertGeoOperatorCountable}), so the walk cannot decide a condition
+ * without knowing which operation it is being validated for.
+ */
+interface WhereScope {
+  source: WidgetSource;
+  declared: ReadonlySet<string>;
+  op: WidgetOp;
+}
+
+/**
+ * Confirms the requested OPERATION can carry this geo operator at all.
+ *
+ * `countEntries` refuses a geo predicate unconditionally, and correctly:
+ * `extractGeoFilters` lifts `near`/`within` out of the `where` and
+ * `applyGeoFilters` evaluates them in memory over the rows `listEntries`
+ * fetched, of which a count has none -- and `buildWhereClause` emits no SQL for
+ * them, so a total that simply ignored one would describe every candidate the
+ * filter was meant to exclude.
+ *
+ * So a geographic `count` is not a query that runs badly; it is one the
+ * executor rejects. Accepting it here and letting it fail in its batch slot
+ * breaks the promise this validator exists to keep -- that an accepted query is
+ * one the executor will run -- and it breaks it at the least useful moment,
+ * with the reason attached to a widget's result rather than to the query that
+ * asked for it.
+ *
+ * Keyed on `GEO_OPERATORS` rather than on a list of ops that "need rows", so a
+ * geo operator added to that vocabulary is refused here without a second edit.
+ */
+function assertGeoOperatorCountable(
+  op: WidgetOp,
+  field: string,
+  operator: string
+): void {
+  // Keyed on the op that FETCHES rows rather than on a list of ops that do
+  // not, for the same reason this is keyed on `GEO_OPERATORS`: an aggregate
+  // added to the vocabulary returns no rows either, and naming the aggregates
+  // here would mean remembering to add it a second time. `groupBy` reached
+  // execution and was refused there while this only knew about `count` —
+  // accepted by the validator and failed in a batch slot, which is precisely
+  // what this guard exists to prevent.
+  if (op === "list" || !GEO_OPERATORS.has(operator)) return;
+  if (op === "count") {
+    fail(
+      `where operator "${operator}" on field "${field}" cannot be counted. ` +
+        `Geo predicates are evaluated over fetched rows, so they apply to a ` +
+        `list but not to a count`
+    );
+  }
+  fail(
+    `where operator "${operator}" on field "${field}" cannot be aggregated. ` +
+      `Geo predicates are evaluated over fetched rows, so they apply to a ` +
+      `list but not to an aggregate`
+  );
+}
+
+/**
+ * Confirms a single field's condition value cannot smuggle in an operator or
+ * a field name the earlier checks never see, cannot silently compile to
+ * no condition at all (see `assertFieldConditionUsable`), and names no operator
+ * the requested op cannot execute.
+ */
+function assertFieldConditionShape(
+  field: string,
+  value: unknown,
+  op: WidgetOp
+): void {
+  const entries = assertFieldConditionUsable(field, value);
+  if (!entries) return;
+  for (const [operator, operatorValue] of entries) {
+    assertOperatorAllowed(field, operator);
+    assertOperatorValueShape(field, operator, operatorValue);
+    assertGeoOperatorValue(field, operator, operatorValue);
+    assertGeoOperatorCountable(op, field, operator);
+  }
+}
+
+/**
+ * Confirms an `and`/`or` combinator's value is shaped the only way it may
+ * legitimately be shaped: an array of condition objects.
+ *
+ * This is the fix for the hole where a non-array combinator value used to be
+ * coerced to zero branches (`Array.isArray(value) ? value : []`) -- which
+ * walked nothing, refused nothing, and let `{ and: { secretScore: {...} } }`
+ * through with `secretScore` never added to the referenced-fields set and
+ * never refused. A non-array value, or a non-object element inside the
+ * array, is refused outright rather than coerced into "zero branches" or
+ * skipped: coercing a malformed shape into an empty, harmless-looking one is
+ * exactly how it went unrefused before.
+ *
+ * An EMPTY array is refused for the same reason `null` and `{}` are refused
+ * under a field name (see `assertFieldConditionUsable`): zero branches compile
+ * to no condition at all, so a query its author wrote as filtered returns
+ * every row instead. Accepting `[]` as a harmless no-op while refusing `null`
+ * and `{}` on exactly that argument was the inconsistency -- and `[]` is the
+ * value the coercion this function replaced used to manufacture.
+ */
+function assertCombinatorBranches(
+  key: "and" | "or",
+  value: unknown
+): unknown[] {
+  if (!Array.isArray(value)) {
+    fail(`where "${key}" must be an array of conditions`);
+  }
+  if (value.length === 0) {
+    fail(`where "${key}" is empty, which matches every row`);
+  }
+  for (const branch of value) {
+    if (
+      branch === null ||
+      typeof branch !== "object" ||
+      Array.isArray(branch)
+    ) {
+      fail(`where "${key}" branch must be an object`);
+    }
+  }
+  return value;
+}
+
+/**
+ * Walks a `where` clause at any nesting depth, refusing (rather than
+ * skipping) anything malformed: an over-deep clause, a malformed `and`/`or`,
+ * an undeclared field, or a field condition using an unknown operator or
+ * hiding a nested object under one.
+ */
+/**
+ * Every field name a `where` clause names, through its `and` and `or`
+ * branches, in the order they appear.
+ *
+ * Reads the clause as {@link walkWhereClause} does and judges nothing: a
+ * malformed branch contributes no names here and is refused there, when the
+ * query is validated. For a caller deciding, before a query is built, whether
+ * a stored filter still names only fields it may use.
+ */
+export function whereFieldNames(where: Record<string, unknown>): string[] {
+  const names: string[] = [];
+  for (const [key, value] of Object.entries(where)) {
+    if (key === "and" || key === "or") {
+      if (!Array.isArray(value)) continue;
+      for (const branch of value) {
+        if (typeof branch === "object" && branch !== null) {
+          names.push(...whereFieldNames(branch as Record<string, unknown>));
+        }
+      }
+      continue;
+    }
+    names.push(key);
+  }
+  return names;
+}
+
+function walkWhereClause(
+  where: Record<string, unknown>,
+  depth: number,
+  scope: WhereScope
+): void {
+  if (depth > MAX_WHERE_DEPTH) {
+    fail(`where clause is nested too deeply (max ${MAX_WHERE_DEPTH})`);
+  }
+  for (const [key, value] of Object.entries(where)) {
+    walkWhereEntry(key, value, depth, scope);
+  }
+}
+
+/**
+ * One key of a `where` clause, at `depth`: a combinator's branches walked in
+ * turn, a filter the source declares, a collection's workflow condition, or a
+ * declared field's condition. Anything else is refused.
+ */
+function walkWhereEntry(
+  key: string,
+  value: unknown,
+  depth: number,
+  scope: WhereScope
+): void {
+  if (key === "and" || key === "or") {
+    for (const branch of assertCombinatorBranches(key, value)) {
+      walkWhereClause(branch as Record<string, unknown>, depth + 1, scope);
+    }
+    return;
+  }
+  if (heldAsSourceFilter(key, value, depth, scope)) return;
+  if (
+    isWorkflowKey(key) &&
+    sourceKindFromId(scope.source.id) === "collection"
+  ) {
+    assertWorkflowCondition(key, value, depth);
+    return;
+  }
+  if (!scope.declared.has(key)) {
+    fail(`where references undeclared field "${key}" on "${scope.source.id}"`);
+  }
+  assertFieldConditionShape(key, value, scope.op);
+}
+
+/**
+ * A collection's workflow condition (`_pendingChange`, `_inRelease`), judged as
+ * the entry list judges it: read only at the top level, in the forms the list
+ * reads, so a card's count and the list it links to are one read. Who may ask
+ * one is the list's decision too, made when the query runs.
+ */
+function assertWorkflowCondition(
+  key: Parameters<typeof workflowKeyProblem>[0],
+  value: unknown,
+  depth: number
+): void {
+  if (depth > 0) {
+    fail(
+      `where condition "${key}" ${WORKFLOW_KEY_PURPOSE[key]}, and is read only at the top level`
+    );
+  }
+  const problem = workflowKeyProblem(key, value);
+  if (problem !== undefined) fail(`where condition ${problem.message}`);
+}
+
+/**
+ * Whether `key` is a filter the source declares, judged and so held apart from
+ * the field conditions. A declared filter is one of the source's own TOP-LEVEL
+ * keys, read by the source itself rather than compiled as a field condition,
+ * so it is held to its own value and never admitted inside a combinator.
+ */
+function heldAsSourceFilter(
+  key: string,
+  value: unknown,
+  depth: number,
+  scope: WhereScope
+): boolean {
+  // The declared filter `key` names, found by its own type.
+  const filter = (scope.source.filters ?? []).find(each => each === key);
+  if (depth !== 0 || filter === undefined) return false;
+  assertFilterValue(filter, value, scope.source.id);
+  return true;
+}
+
+/** A non-empty string: a collection's or a role's slug. */
+const isSlug = (value: unknown): boolean =>
+  typeof value === "string" && value !== "";
+
+/**
+ * What each source filter's value must be, and what a refusal says it must
+ * be: a collection by its slug, Only mine as true or false, a Tab as one of
+ * its values, a Role by its slug.
+ */
+const FILTER_VALUE_RULES: Readonly<
+  Record<
+    WidgetSourceFilter,
+    { holds: (value: unknown) => boolean; must: string }
+  >
+> = {
+  collection: { holds: isSlug, must: "be a collection's slug" },
+  onlyMine: {
+    holds: value => typeof value === "boolean",
+    must: "be true or false",
+  },
+  tab: { holds: isWidgetTab, must: `be one of: ${WIDGET_TABS.join(", ")}` },
+  role: { holds: isSlug, must: "be a role's slug" },
+};
+
+/**
+ * Confirms a source filter's value is the one it takes (`FILTER_VALUE_RULES`).
+ * Who "mine" is, is never in the query: the source reads it from the caller.
+ */
+function assertFilterValue(
+  key: WidgetSourceFilter,
+  value: unknown,
+  source: string
+): void {
+  const rule = FILTER_VALUE_RULES[key];
+  if (!rule.holds(value)) {
+    fail(`where filter "${key}" on "${source}" must ${rule.must}`);
+  }
+}
+
+/**
+ * Clones `where` up front -- before anything reads a single property of it
+ * -- and returns that clone, or `undefined` if there was no `where` to
+ * begin with. Every later step (the walk, and the value returned to the
+ * caller) operates on this SAME clone, never on the caller's original
+ * object.
+ *
+ * This closes a TOCTOU a clone-AFTER-validation order left open: a getter
+ * or Proxy on the caller's object can answer one value the first time a
+ * property is read and a different, hostile value the next time. With
+ * validate-then-clone, the walk's read and the later `structuredClone` read
+ * were two separate reads of the same accessor, and an accessor is free to
+ * answer differently each time it's called -- the walk could approve `{
+ * and: [] }` on its read and `structuredClone` could then capture `{ and:
+ * [{ secretScore: {...} }] }` moments later into the object actually
+ * returned. Reading each property exactly once, by validating the clone
+ * instead of the original, removes the seam that bug lived in: whatever the
+ * accessor returns on its one and only invocation is both what gets
+ * validated and what gets returned, with no way for those to diverge.
+ *
+ * `structuredClone` throws a raw `DOMException`/`TypeError` on a value it
+ * cannot clone (a function, symbol, or bigint nested in `where`) -- fails
+ * closed, but as an error outside the `NextlyError` contract, which would
+ * surface as an unhandled 500 rather than a named 400. Wrapped here so it
+ * reads the same as every other refusal in this module.
+ */
+function cloneWhereOrUndefined(
+  where: unknown
+): Record<string, unknown> | undefined {
+  if (where === undefined) return undefined;
+  if (typeof where !== "object" || where === null) {
+    fail("where must be an object");
+  }
+  try {
+    return structuredClone(where) as Record<string, unknown>;
+  } catch {
+    fail(
+      "where contains a value that cannot be cloned (functions, symbols, and bigints are not supported)"
+    );
+  }
+}
+
+/**
+ * Confirms every field named in `where` was declared, at every nesting depth,
+ * and that every operator it names is one the requested op can execute.
+ */
+function assertWhereClauseUsable(
+  where: Record<string, unknown> | undefined,
+  scope: WhereScope
+): void {
+  if (where === undefined) return;
+  walkWhereClause(where, 0, scope);
+}
+
+/**
+ * Copies `select` up front -- reading each element exactly once -- and returns
+ * that copy, which is both what gets validated and what gets returned.
+ *
+ * The same reasoning as `cloneWhereOrUndefined`, one level down: validating
+ * the caller's array and then spreading it into the result is two reads of
+ * every index, and an index can be an accessor too.
+ *
+ * An EMPTY array is refused, for the reason `where: { and: [] }` and an empty
+ * condition object are refused one field over: it reads as the narrowest
+ * possible request and produces the widest possible answer. "Select nothing"
+ * is not a projection the read path can express -- `listEntries` applies a
+ * selection only when it has keys (`Object.keys(params.select).length > 0`),
+ * so an empty one falls through to an UNSELECTED read and the whole document
+ * reaches a widget that asked for none of it.
+ *
+ * Refused here rather than given a second meaning in the executor. The
+ * keys-required rule is the framework's, shared by every caller of
+ * `nextly.find`, so teaching the widget seam its own reading of `[]` would be
+ * a second implementation of field selection rather than a fix. A widget that
+ * genuinely wants no fields back asks for `op: "count"`.
+ */
+function copySelectOrUndefined(select: unknown): string[] | undefined {
+  if (select === undefined) return undefined;
+  if (!Array.isArray(select)) fail("select must be an array of field names");
+  if (select.length === 0) {
+    fail("select is empty, which reads every field rather than none");
+  }
+  return [...(select as unknown[])] as string[];
+}
+
+/** Confirms every field named in `select` was declared by the source. */
+function assertSelectFieldsDeclared(
+  source: WidgetSource,
+  select: string[] | undefined,
+  declared: ReadonlySet<string>
+): void {
+  if (select === undefined) return;
+  for (const field of select) {
+    if (typeof field !== "string" || !declared.has(field)) {
+      fail(
+        `select references undeclared field "${String(field)}" on "${source.id}"`
+      );
+    }
+  }
+}
+
+/**
+ * Confirms the field named in `sort` was declared by the source, and returns
+ * the string it checked. `sort` may carry a leading `-` for descending order;
+ * it is stripped before checking, or `-secretScore` would slip an undeclared
+ * field past this guard.
+ */
+function assertSortFieldDeclared(
+  source: WidgetSource,
+  sort: unknown,
+  declared: ReadonlySet<string>
+): string | undefined {
+  if (sort === undefined) return undefined;
+  if (typeof sort !== "string") fail("sort must be a string");
+  const field = sort.startsWith("-") ? sort.slice(1) : sort;
+  if (!declared.has(field)) {
+    fail(`sort references undeclared field "${field}" on "${source.id}"`);
+  }
+  return sort;
+}
+
+/**
+ * Confirms the group key agrees with the op, and names a field the source
+ * declared.
+ *
+ * Op and key are judged TOGETHER rather than by two independent guards,
+ * because the failure worth closing is a key that validates and is then
+ * ignored. `groupBy` means something only to the `groupBy` op: carried
+ * alongside `count` it would pass a field check, ride along in the returned
+ * query and change no result, which reads back to the caller as a grouped
+ * count they asked for and did not get. A refusal names the mismatch instead.
+ *
+ * The empty direction is refused for the same reason. `op: "groupBy"` with no
+ * key has no bucket to group into, and leaving that for execution to discover
+ * moves the failure a long way from the thing that caused it.
+ *
+ * The key is checked against the same `declared` set `sort` and `select` are
+ * checked against, so one naming a field the source never published is refused
+ * here rather than reaching a compiler that would have to guess at its column.
+ */
+function assertGroupByAgreesWithOp(
+  source: WidgetSource,
+  groupBy: unknown,
+  declared: ReadonlySet<string>,
+  op: WidgetOp,
+  select: unknown,
+  sort: unknown
+): string | undefined {
+  if (op !== "groupBy") {
+    if (groupBy !== undefined) fail(`groupBy is not valid for op "${op}"`);
+    return undefined;
+  }
+  if (groupBy === undefined) fail('op "groupBy" requires a groupBy field');
+  // `select` and `sort` describe ROWS, and a grouped read returns buckets. The
+  // executor ignores both, so accepting them answers a different question than
+  // the one asked and says nothing about it — the same accepted-and-dropped
+  // shape this guard refuses a group key beside `count` for.
+  if (select !== undefined) {
+    fail(
+      'select is not valid for op "groupBy", which returns buckets and not rows'
+    );
+  }
+  if (sort !== undefined) {
+    fail('sort is not valid for op "groupBy"; buckets are ordered by size');
+  }
+  if (typeof groupBy !== "string") fail("groupBy must be a string");
+  if (!declared.has(groupBy)) {
+    fail(`groupBy references undeclared field "${groupBy}" on "${source.id}"`);
+  }
+  return groupBy;
+}
+
+/**
+ * Refuse a timeline key carried by an op that would ignore it.
+ *
+ * Accepted and dropped, a `dateField` beside `count` reads back to the caller
+ * as a timeline they asked for and did not get.
+ */
+function refuseTimelineKeysOutsideTimeseries(
+  op: WidgetOp,
+  dateField: unknown,
+  interval: unknown
+): void {
+  if (dateField !== undefined) fail(`dateField is not valid for op "${op}"`);
+  if (interval !== undefined) fail(`interval is not valid for op "${op}"`);
+}
+
+/**
+ * Confirms a timeline key names a field the source declared AS A DATE.
+ *
+ * The type is checked here rather than at execution because the source already
+ * states it. Accepted, a non-date key would reach the read, be refused there
+ * for storing no date, and arrive as a failed widget slot -- a runtime answer
+ * to a question the declaration already answers.
+ */
+function assertDateFieldBucketable(
+  source: WidgetSource,
+  dateField: string,
+  declared: ReadonlySet<string>
+): void {
+  if (!declared.has(dateField)) {
+    fail(
+      `dateField references undeclared field "${dateField}" on "${source.id}"`
+    );
+  }
+  const declaredField = source.fields.find(field => field.name === dateField);
+  // ONE rule, asked rather than repeated. The read refuses a localized group
+  // key through `localizedGroupKeyProblem`, and this asks the same leaf — so
+  // the day localized aggregation becomes supported, both start accepting it
+  // together instead of this one refusing a read the engine now allows.
+  //
+  // Still refused HERE rather than left to the `bucketable` flag below: that
+  // flag is derived by the collection source builder, and a plugin registering
+  // its own source through the SDK carries `localized` without it. Validating
+  // from the flag alone would approve exactly those sources and leave a widget
+  // that fails on every load.
+  const localizedProblem = localizedGroupKeyProblem(declaredField);
+  if (localizedProblem !== undefined) {
+    fail(`dateField "${dateField}" on "${source.id}" ${localizedProblem}`);
+  }
+  // Read off the DESCRIPTION rather than asked of the read's own guard. That
+  // guard reaches the field-level registry, and this module is type-checked by
+  // the admin, whose project does not define the `@nextly/*` aliases that graph
+  // pulls in -- importing it here reported a hundred errors about code the
+  // admin never touches. The source builder runs server-side and marks each
+  // date it publishes, so the answer still comes from one place.
+  //
+  // ONE decision, not two. Localization is one of the reasons a date cannot be
+  // bucketed, and `groupKeyDeclarationProblem` is where that list lives — so
+  // the source builder already marks a localized date `bucketable: false` and a
+  // second `localized` test beside this one was the same question answered
+  // twice. They agree today; the day localized aggregation becomes supported
+  // they would not, and the parallel test would keep refusing a read the engine
+  // had started accepting.
+  if (declaredField?.bucketable === false) {
+    fail(
+      `dateField "${dateField}" on "${source.id}" cannot be grouped, so its rows cannot be placed on a timeline`
+    );
+  }
+  const declaredType = declaredField?.type;
+  if (declaredType !== "date") {
+    fail(
+      `dateField "${dateField}" on "${source.id}" is a ${String(declaredType)} field; a timeseries needs a date`
+    );
+  }
+}
+
+/**
+ * Confirms the timeline keys agree with the op, and name a declared field.
+ *
+ * Judged together with the op for the reason the group key is: a `dateField`
+ * carried beside `count` would pass a field check, ride along in the returned
+ * query and change no result, which reads back as a timeline the caller asked
+ * for and did not get.
+ *
+ * Both keys are required together. An interval with no field has nothing to
+ * bucket, and a field with no interval has no width -- and defaulting either
+ * would answer a question the caller did not ask.
+ */
+function assertTimeseriesAgreesWithOp(
+  source: WidgetSource,
+  dateField: unknown,
+  interval: unknown,
+  declared: ReadonlySet<string>,
+  op: WidgetOp,
+  select: unknown,
+  sort: unknown
+): { dateField: string; interval: TimeseriesInterval } | undefined {
+  if (op !== "timeseries") {
+    refuseTimelineKeysOutsideTimeseries(op, dateField, interval);
+    return undefined;
+  }
+  if (dateField === undefined) {
+    fail('op "timeseries" requires a dateField');
+  }
+  if (interval === undefined) fail('op "timeseries" requires an interval');
+  // `select` and `sort` describe ROWS, and a timeline returns points. The
+  // executor ignores both, so accepting them answers a different question than
+  // the one asked and says nothing about it.
+  if (select !== undefined) {
+    fail(
+      'select is not valid for op "timeseries", which returns points and not rows'
+    );
+  }
+  if (sort !== undefined) {
+    fail('sort is not valid for op "timeseries"; points are ordered by time');
+  }
+  if (typeof dateField !== "string") fail("dateField must be a string");
+  assertDateFieldBucketable(source, dateField, declared);
+  if (!isTimeseriesInterval(interval)) {
+    fail(`interval must be one of ${TIMESERIES_INTERVALS.join(", ")}`);
+  }
+  return { dateField, interval };
+}
+
+/**
+ * Confirms `status`, when present, is one of the known values AND is one this
+ * source can actually answer, and returns it.
+ *
+ * 🔴 `draft` and `published` are refused for a source without the lifecycle,
+ * and that is a correctness refusal rather than a tidiness one. Nothing
+ * downstream can honour them: `resolveStatusFilter` returns no filter when the
+ * target carries no status column, so both selectors reach the same rows and
+ * two mutually exclusive questions come back with one answer. A card asking for
+ * drafts would report the published count and say nothing about having been
+ * ignored, so it is refused at the door, wherever the query comes from: a
+ * core widget's card, a site's own widget or a plugin's.
+ *
+ * `all` stays legal for every source. It is not a claim that a lifecycle
+ * exists, it is a statement that this read is not bounded by one, and it is
+ * what a card counting or listing every entry sends.
+ */
+function assertValidStatus(
+  source: WidgetSource,
+  status: unknown
+): WidgetQuery["status"] | undefined {
+  if (status === undefined) return undefined;
+  if (!VALID_STATUSES.includes(status as WidgetQuery["status"] & string)) {
+    fail(`status must be one of ${VALID_STATUSES.join(", ")}`);
+  }
+  if (status !== "all" && source.lifecycleStatus !== true) {
+    fail(
+      `${source.id} has no draft/published lifecycle, so status must be "all"`
+    );
+  }
+  return status as WidgetQuery["status"];
+}
+
+/**
+ * Validate and normalize. Returns a query fully independent of the input.
+ *
+ * EVERY property of the caller's object is read exactly once, by
+ * `readEachFieldOnce`, before any of them is inspected -- and every later step
+ * works on those locals, so nothing downstream is even handed the caller's
+ * object to read again. The composite values are copied at that same moment:
+ * `where` by `structuredClone` and `select` element by element, so their
+ * insides get the same single read.
+ *
+ * That is the whole point, and it is why the invariant is stated over the
+ * whole query rather than over `where` alone. A getter or Proxy is free to
+ * answer differently on each call, so any property read twice -- once to check
+ * it, once to build the result -- is a value that can be certified and then
+ * swapped: a `sort` answering "title" to the guard and "-secretScore" to the
+ * return spread yields a query whose sort was never checked. There is no seam
+ * for that here, because there is no second read.
+ *
+ * The returned query is safe to compile: its source exists, its op is
+ * supported, every field it names was declared by that source (at every
+ * `where` nesting depth, and only via operators the query layer actually
+ * understands, on conditions that are neither `null` nor empty), its group
+ * key agrees with its op, and its limit is a bounded, finite integer.
+ */
+export function validateWidgetQuery(query: unknown): WidgetQuery {
+  const raw = readWidgetQuery(query);
+  return validateReadWidgetQuery(raw, resolveWidgetSource(raw.source));
+}
+
+/**
+ * The rest of the validation, once the source has been resolved.
+ *
+ * Split from {@link validateWidgetQuery} so a caller can AUTHORIZE the source
+ * in between. Everything below this line answers with a specific reason --
+ * which field was undeclared, which operator was unknown -- and a specific
+ * reason about a source is a statement that the source is real. Running the
+ * whole validator before any access decision therefore made the endpoint a
+ * source-enumeration oracle: an existing collection answered with detail and a
+ * nonexistent one answered generically, and diffing the two walked the
+ * install's schema one name at a time.
+ *
+ * It takes the ALREADY-READ `raw` rather than the caller's object, so no
+ * property is read twice across the two halves.
+ */
+export function validateReadWidgetQuery(
+  raw: RawWidgetQuery,
+  source: WidgetSource
+): WidgetQuery {
+  const op = assertSupportedOp(source, raw.op);
+  const declared = new Set(source.fields.map(f => f.name));
+
+  const where = cloneWhereOrUndefined(raw.where);
+  const select = copySelectOrUndefined(raw.select);
+
+  assertWhereClauseUsable(where, { source, declared, op });
+  assertSelectFieldsDeclared(source, select, declared);
+  const sort = assertSortFieldDeclared(source, raw.sort, declared);
+  const status = assertValidStatus(source, raw.status);
+  const groupBy = assertGroupByAgreesWithOp(
+    source,
+    raw.groupBy,
+    declared,
+    op,
+    select,
+    sort
+  );
+  // A range sets the interval, so the timeline is checked with the one it
+  // sets, and the query carries the range alone.
+  const range = assertRangeAgreesWithOp(raw, op);
+  const timeline = assertTimeseriesAgreesWithOp(
+    source,
+    raw.dateField,
+    range === undefined ? raw.interval : RANGE_INTERVAL[range],
+    declared,
+    op,
+    select,
+    sort
+  );
+  const window = assertWindowAgreesWithOp(raw.since, raw.until, declared, op);
+
+  return {
+    source: source.id,
+    op,
+    ...(where ? { where } : {}),
+    ...(status ? { status } : {}),
+    ...(select ? { select } : {}),
+    ...(sort ? { sort } : {}),
+    ...(groupBy ? { groupBy } : {}),
+    ...timelineAsAsked(timeline, range),
+    ...window,
+    // A range sets how many points are drawn, so a ranged query carries no
+    // limit, and what this returns validates again unchanged.
+    ...(range === undefined ? { limit: effectiveWidgetLimit(raw.limit) } : {}),
+  };
+}
+
+/** A timeline's keys as the query carries them: its interval, or the range that sets it. */
+function timelineAsAsked(
+  timeline: { dateField: string; interval: TimeseriesInterval } | undefined,
+  range: TimeseriesRange | undefined
+): Pick<WidgetQuery, "dateField" | "interval" | "range"> {
+  if (timeline === undefined) return {};
+  return range === undefined
+    ? timeline
+    : { dateField: timeline.dateField, range };
+}
+
+/**
+ * A timeseries' range, checked: from the closed list, on a `timeseries` alone,
+ * and the only window and interval the query names. A range beside `since`,
+ * `until` or an interval is two answers to one question, so it is refused
+ * rather than settled by which one wins.
+ */
+function assertRangeAgreesWithOp(
+  raw: Pick<RawWidgetQuery, "range" | "since" | "until" | "interval" | "limit">,
+  op: WidgetOp
+): TimeseriesRange | undefined {
+  if (raw.range === undefined) return undefined;
+  if (op !== "timeseries") fail(`range draws a timeseries, not a ${op}`);
+  if (raw.since !== undefined || raw.until !== undefined) {
+    fail("range and since or until each name a window; send one");
+  }
+  if (raw.interval !== undefined) {
+    fail("range sets the interval; a query with a range names none");
+  }
+  if (raw.limit !== undefined) {
+    fail(
+      "range sets how many points are drawn; a query with a range names no limit"
+    );
+  }
+  if (!isTimeseriesRange(raw.range)) {
+    fail(`range must be one of ${TIMESERIES_RANGES.join(", ")}`);
+  }
+  return raw.range;
+}
+
+/**
+ * A read's window, checked: spans from the closed list, on a `count` or a
+ * `timeseries` alone, an end only after a start, and the end later than the
+ * start. A `count` is bounded on `createdAt`, so its source must declare it.
+ */
+function assertWindowAgreesWithOp(
+  since: unknown,
+  until: unknown,
+  declared: ReadonlySet<string>,
+  op: WidgetOp
+): Pick<WidgetQuery, "since" | "until"> {
+  if (since === undefined && until === undefined) return {};
+  if (op !== "count" && op !== "timeseries") {
+    fail(`since and until bound a count or a timeseries, not a ${op}`);
+  }
+  const start = relativeSpanOf(since, "since");
+  if (op === "count" && !declared.has("createdAt")) {
+    fail(
+      'since bounds a count on "createdAt", which this source does not declare'
+    );
+  }
+  if (until === undefined) return { since: start };
+  const end = relativeSpanOf(until, "until");
+  assertEndsAfterStart(start, end);
+  return { since: start, until: end };
+}
+
+/** A window bound read as a span from the closed list, or refused by name. */
+function relativeSpanOf(value: unknown, name: "since" | "until"): RelativeSpan {
+  const parsed = relativeSpanSchema.safeParse(value);
+  if (!parsed.success) {
+    fail(`${name} must be one of ${RELATIVE_SPANS.join(", ")}`);
+  }
+  return parsed.data;
+}
+
+/** Refuses an end that does not come after the start it closes. */
+function assertEndsAfterStart(start: RelativeSpan, end: RelativeSpan): void {
+  // Measured against one instant, so the comparison holds for every "now".
+  const probe = new Date(Date.UTC(2000, 0, 31));
+  if (
+    relativeSpanStart(end, probe).getTime() <=
+    relativeSpanStart(start, probe).getTime()
+  ) {
+    fail(`until (${end}) must end the window after since (${start}) starts it`);
+  }
+}

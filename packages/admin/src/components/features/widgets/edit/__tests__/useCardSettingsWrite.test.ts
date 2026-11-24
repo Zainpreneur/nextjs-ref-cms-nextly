@@ -1,0 +1,284 @@
+/**
+ * Saving one card's settings outside customise mode: what is sent, when the caller is told it
+ * landed, and what a refused or unreadable write does instead.
+ */
+import { act, renderHook } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { UseDashboardLayoutResult } from "@admin/hooks/queries/useDashboardLayout";
+import type {
+  DashboardLayoutResponse,
+  WidgetPlacement,
+} from "@admin/types/dashboard/widgets";
+
+const toastError = vi.hoisted(() => vi.fn());
+vi.mock("@admin/components/ui", () => ({ toast: { error: toastError } }));
+
+import { useCardSettingsWrite, type CardChange } from "../useCardSettingsWrite";
+
+/** A settings change, as the quick setting and the drawer's Save make one. */
+const settings = (config: Record<string, unknown>): CardChange => ({
+  config,
+});
+
+const PLACEMENTS: WidgetPlacement[] = [
+  { id: "p1", widgetId: "core/a", w: 6, h: 3, removed: false },
+  { id: "p2", widgetId: "core/b", w: 6, h: 3, removed: false },
+];
+
+function stored(placements = PLACEMENTS): DashboardLayoutResponse {
+  return {
+    placements,
+    widgets: {},
+    available: [],
+    defaultPlacements: [],
+    version: 3,
+    source: "default",
+    arranged: false,
+    scope: "s",
+    audience: "aud",
+  } as DashboardLayoutResponse;
+}
+
+/**
+ * A layout whose `cardSettings` write succeeds or fails as told, and whose cache then holds
+ * what the server would have answered.
+ */
+function fakeLayout(
+  outcome: "ok" | "conflict" | "lost" = "ok",
+  patch: Partial<UseDashboardLayoutResult> = {}
+) {
+  let cache: DashboardLayoutResponse = stored();
+  const mutate = vi.fn(
+    (
+      input: { placements: WidgetPlacement[] },
+      options: { onSuccess?: () => void; onError?: (error: Error) => void }
+    ) => {
+      if (outcome === "conflict") {
+        options.onError?.(
+          Object.assign(new Error("Conflict"), { status: 409 })
+        );
+        return;
+      }
+      // "lost": the server accepted it, and the re-read that fills the cache did not land.
+      if (outcome === "ok") cache = stored(input.placements);
+      options.onSuccess?.();
+    }
+  );
+  const layout = {
+    layout: stored(),
+    isUnreadable: false,
+    isWriting: false,
+    cached: () => cache,
+    reload: vi.fn(() => Promise.resolve()),
+    cardSettings: { mutate, reset: vi.fn(), isPending: false },
+    ...patch,
+  } as unknown as UseDashboardLayoutResult;
+  return { layout, mutate };
+}
+
+beforeEach(() => vi.clearAllMocks());
+
+describe("saving a card's settings outside customise mode", () => {
+  it("sends the whole arrangement with only that card's settings changed, not arranged", () => {
+    const { layout, mutate } = fakeLayout();
+    const { result } = renderHook(() => useCardSettingsWrite(layout));
+    const onLanded = vi.fn();
+    act(() =>
+      result.current.write(
+        { placementId: "p2", title: "B", change: settings({ limit: 7 }) },
+        { onLanded }
+      )
+    );
+    expect(mutate.mock.calls[0]?.[0]).toEqual({
+      placements: [PLACEMENTS[0], { ...PLACEMENTS[1], config: { limit: 7 } }],
+      version: 3,
+      scope: "s",
+      arranged: false,
+    });
+    expect(onLanded).toHaveBeenCalledTimes(1);
+    expect(toastError).not.toHaveBeenCalled();
+  });
+
+  it("sends the card's own title with its settings, as the panel's Done keeps it", () => {
+    const { layout, mutate } = fakeLayout();
+    const { result } = renderHook(() => useCardSettingsWrite(layout));
+    const onLanded = vi.fn();
+    act(() =>
+      result.current.write(
+        {
+          placementId: "p2",
+          title: "B",
+          change: { config: {}, ownTitle: " Drafts " },
+        },
+        { onLanded }
+      )
+    );
+    expect(mutate.mock.calls[0]?.[0].placements[1]).toEqual({
+      ...PLACEMENTS[1],
+      title: "Drafts",
+    });
+    // Landed only once the dashboard it holds shows the title too.
+    expect(onLanded).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads the dashboard again and says nothing was saved when the write lost a race", () => {
+    const { layout } = fakeLayout("conflict");
+    const { result } = renderHook(() => useCardSettingsWrite(layout));
+    const onLanded = vi.fn();
+    const onFailed = vi.fn();
+    act(() =>
+      result.current.write(
+        { placementId: "p1", title: "A", change: settings({ limit: 7 }) },
+        { onLanded, onFailed }
+      )
+    );
+    expect(layout.reload).toHaveBeenCalledTimes(1);
+    expect(onLanded).not.toHaveBeenCalled();
+    expect(onFailed).toHaveBeenCalledWith(
+      "A changed elsewhere, so this change was not saved."
+    );
+  });
+
+  it("does not report a write as landed when the dashboard it holds does not show it", () => {
+    const { layout } = fakeLayout("lost");
+    const { result } = renderHook(() => useCardSettingsWrite(layout));
+    const onLanded = vi.fn();
+    act(() =>
+      result.current.write(
+        { placementId: "p1", title: "A", change: settings({ limit: 7 }) },
+        { onLanded }
+      )
+    );
+    expect(onLanded).not.toHaveBeenCalled();
+    expect(toastError).toHaveBeenCalledWith(
+      expect.stringContaining("could not be refreshed")
+    );
+  });
+
+  it("sends nothing, and says why, while the saved dashboard cannot be read", () => {
+    const { layout, mutate } = fakeLayout("ok", { isUnreadable: true });
+    const { result } = renderHook(() => useCardSettingsWrite(layout));
+    expect(result.current.unavailable).toMatch(/cannot be read/);
+    act(() =>
+      result.current.write({
+        placementId: "p1",
+        title: "A",
+        change: settings({}),
+      })
+    );
+    expect(mutate).not.toHaveBeenCalled();
+  });
+
+  it("sends nothing while another layout write is in flight, and says so to the caller", () => {
+    // A caller waiting on its save, the settings sheet's Done, would otherwise wait for good.
+    const { layout, mutate } = fakeLayout("ok", { isWriting: true });
+    const { result } = renderHook(() => useCardSettingsWrite(layout));
+    const onFailed = vi.fn();
+    act(() =>
+      result.current.write(
+        { placementId: "p1", title: "A", change: settings({}) },
+        { onFailed }
+      )
+    );
+    expect(mutate).not.toHaveBeenCalled();
+    expect(onFailed).toHaveBeenCalledWith(
+      expect.stringContaining("still saving")
+    );
+  });
+
+  it("says so to the caller when the card is no longer on the dashboard", () => {
+    const { layout, mutate } = fakeLayout();
+    const { result } = renderHook(() => useCardSettingsWrite(layout));
+    const onFailed = vi.fn();
+    act(() =>
+      result.current.write(
+        { placementId: "gone", title: "Old card", change: settings({}) },
+        { onFailed }
+      )
+    );
+    expect(mutate).not.toHaveBeenCalled();
+    expect(onFailed).toHaveBeenCalledWith(
+      "Old card is no longer on your dashboard, so its settings were not saved."
+    );
+  });
+
+  it("leaves a failure out of the toast when the caller shows it in place", () => {
+    const { layout } = fakeLayout("conflict");
+    const { result } = renderHook(() => useCardSettingsWrite(layout));
+    const onFailed = vi.fn();
+    act(() =>
+      result.current.write(
+        { placementId: "p1", title: "A", change: settings({ limit: 7 }) },
+        { onFailed, showsFailure: true }
+      )
+    );
+    expect(onFailed).toHaveBeenCalledWith(
+      "A changed elsewhere, so this change was not saved."
+    );
+    expect(toastError).not.toHaveBeenCalled();
+  });
+});
+
+describe("saving a card's width with its settings outside customise mode", () => {
+  /** Resizable from 3 by 2 to 12 by 6. */
+  const BOUNDS = {
+    default: { w: 6, h: 3 },
+    min: { w: 3, h: 2 },
+    max: { w: 12, h: 6 },
+  };
+
+  it("sends the whole arrangement with that card's settings and size changed in one write, not arranged", () => {
+    const { layout, mutate } = fakeLayout();
+    const { result } = renderHook(() => useCardSettingsWrite(layout));
+    const onLanded = vi.fn();
+    act(() =>
+      result.current.write(
+        {
+          // The first card, so a write that put it anywhere else in the list would differ.
+          placementId: "p1",
+          title: "A",
+          change: {
+            config: { limit: 10 },
+            size: { size: { w: 12, h: 4 }, bounds: BOUNDS },
+          },
+        },
+        { onLanded }
+      )
+    );
+    expect(mutate).toHaveBeenCalledTimes(1);
+    expect(mutate.mock.calls[0]?.[0]).toEqual({
+      placements: [
+        { ...PLACEMENTS[0], w: 12, h: 4, config: { limit: 10 } },
+        PLACEMENTS[1],
+      ],
+      version: 3,
+      scope: "s",
+      arranged: false,
+    });
+    expect(onLanded).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends nothing, and says so, for a size outside the widget's bounds", () => {
+    const { layout, mutate } = fakeLayout();
+    const { result } = renderHook(() => useCardSettingsWrite(layout));
+    const onFailed = vi.fn();
+    act(() =>
+      result.current.write(
+        {
+          placementId: "p2",
+          title: "B",
+          change: {
+            config: {},
+            size: { size: { w: 2, h: 3 }, bounds: BOUNDS },
+          },
+        },
+        { onFailed }
+      )
+    );
+    expect(mutate).not.toHaveBeenCalled();
+    expect(onFailed).toHaveBeenCalledWith(
+      "B can't be that size, so it was not resized."
+    );
+  });
+});

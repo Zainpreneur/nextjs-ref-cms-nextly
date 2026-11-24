@@ -1,0 +1,179 @@
+// F11 PR 3: MySQL SQL templates per Operation type.
+//
+// Differences from PG:
+// - Identifier quoting uses backticks (handled by quoteIdent).
+// - ALTER COLUMN TYPE → MODIFY COLUMN (no TYPE keyword).
+// - DROP NOT NULL / SET NOT NULL → MODIFY COLUMN with the type re-stated.
+// - DROP TABLE doesn't take CASCADE (FK cascading uses different DDL).
+// - RENAME COLUMN supported on MySQL 8.0+ (per F17 minimum).
+//
+// Pure functions. No I/O. No semicolons.
+
+import type {
+  ChangeColumnDefaultOp,
+  ChangeColumnNullableOp,
+  ChangeColumnTypeOp,
+  DropIndexOp,
+  DropTableOp,
+  Operation,
+  TableSpec,
+} from "../diff/types";
+import { referenceConversionStatements } from "../reference-list-conversion";
+
+import { commonStatementSql, dropConstraintSql } from "./common-statements";
+import { createIndexSql, tableColumnTypes } from "./create-index";
+import {
+  changeForeignKeyActionSql,
+  unsupportedOperation,
+} from "./foreign-key-action";
+import { quoteIdent } from "./identifier-quoting";
+
+const q = (n: string) => quoteIdent(n, "mysql");
+
+/**
+ * `tables` is the schema the statement leads to, where the caller has it. An `add_index` names only
+ * columns, and MySQL keys a TEXT/BLOB column only by prefix, so the index reads its columns' types
+ * from the table there; without it every column is keyed whole.
+ */
+export function generateMysqlSQL(
+  op: Operation,
+  tables: readonly TableSpec[] = []
+): string {
+  // The three dialect dispatchers are switches over the SAME `Operation`
+  // union, so their arms line up one for one and their tails are identical
+  // text. That parallelism is the safety property, not an accident: each
+  // narrows the union to `never` in its own default arm, so adding a member
+  // to `Operation` is a COMPILE error in every dialect that has not handled
+  // it — which is how `change_foreign_key_action` located all seven of its
+  // consumers instead of leaving one to fail at run time on whichever dialect
+  // a user happened to be on. Sharing them means a handler table keyed by op
+  // type, and a table is not exhaustiveness-checked per dialect: a missing
+  // entry becomes an undefined lookup while writing DDL.
+  // fallow-ignore-next-line code-duplication
+  switch (op.type) {
+    case "add_table":
+    case "rename_table":
+    case "add_column":
+    case "drop_column":
+    case "rename_column":
+    case "add_check":
+    case "add_foreign_key":
+      // Rendered alike on every dialect but for the quote function.
+      return commonStatementSql(op, "mysql", q);
+    case "drop_table":
+      return generateDropTable(op);
+    case "change_column_type":
+      return generateChangeColumnType(op);
+    case "change_column_nullable":
+      return generateChangeColumnNullable(op);
+    case "change_column_default":
+      return generateChangeColumnDefault(op);
+    case "drop_check":
+      return dropConstraintSql(op.tableName, op.check.name, "DROP CHECK", q);
+    case "drop_foreign_key":
+      return dropConstraintSql(
+        op.tableName,
+        op.foreignKey.name,
+        "DROP FOREIGN KEY",
+        q
+      );
+    case "add_index":
+      return createIndexSql(op.tableName, op.index, "mysql", q, {
+        columnTypes: tableColumnTypes(
+          tables.find(table => table.name === op.tableName)
+        ),
+      });
+    case "drop_index":
+      return generateDropIndex(op);
+    case "change_foreign_key_action":
+      // The add re-checks existing rows, and with `foreign_key_checks` on
+      // the server rebuilds the table to do it — so this is not a cheap
+      // statement on a large one. How each dialect spells the drop is
+      // decided once, beside the statements themselves.
+      return changeForeignKeyActionSql(op, "mysql");
+    default:
+      return unsupportedOperation("generateMysqlSQL", op);
+  }
+}
+
+// MySQL requires the table in DROP INDEX.
+function generateDropIndex(op: DropIndexOp): string {
+  return `DROP INDEX ${q(op.index.name)} ON ${q(op.tableName)}`;
+}
+
+function generateDropTable(op: DropTableOp): string {
+  return `DROP TABLE ${q(op.tableName)}`;
+}
+
+// F11 PR 3 review fix #1: MySQL MODIFY COLUMN requires the column type
+// to be re-stated. ChangeColumnTypeOp carries `toType` so we can emit
+// valid SQL — but the original column's NOT NULL / DEFAULT clauses are
+// dropped (operator must hand-edit if they need to preserve them).
+// Acceptable trade-off for v1.
+function generateChangeColumnType(op: ChangeColumnTypeOp): string {
+  // A column becoming a relation's list of references needs each bare value wrapped in a list
+  // before MySQL will accept the column as JSON; its DOWN unwraps them again.
+  if (op.conversion !== undefined) {
+    return referenceConversionStatements(op, "mysql").join("; ");
+  }
+  // MODIFY restates the WHOLE definition, so anything the caller knows about the column has to be
+  // restated with it or MySQL drops it. A caller that knows neither gets the historical behaviour.
+  const nullability =
+    op.nullable === undefined ? "" : op.nullable ? " NULL" : " NOT NULL";
+  const columnDefault =
+    op.columnDefault === undefined ? "" : ` DEFAULT ${op.columnDefault}`;
+  return `ALTER TABLE ${q(op.tableName)} MODIFY COLUMN ${q(op.columnName)} ${op.toType}${nullability}${columnDefault}`;
+}
+
+// F11 PR 3 review fix #1: previously emitted SQL with a comment-as-
+// placeholder for the missing column type. That parses (block comment
+// is valid MySQL), but `MODIFY COLUMN` REQUIRES the column type — so
+// the SQL would fail at apply time, NOT at migrate:create time. That
+// is the worst possible failure mode: migrate:create succeeds, the
+// operator commits the file, then prod CI fails with a confusing error
+// pointing at a comment.
+//
+// Fix: throw at template-generation time (parallel to SQLite). A migration
+// file does not come here: `generateStatements` writes the change as a
+// MODIFY built from the live catalog when the file runs
+// (`mysql-live-restate.ts`), which needs several statements on one
+// connection and so has no single-string form for this renderer.
+function generateChangeColumnNullable(op: ChangeColumnNullableOp): string {
+  throw new MysqlUnsupportedOperationError(
+    "change_column_nullable",
+    `Cannot generate valid MODIFY COLUMN SQL for ${op.tableName}.${op.columnName} ` +
+      `because the column type is not tracked on this operation. F12 will extend ` +
+      `ChangeColumnNullableOp with the type. For now, use 'nextly migrate:create --blank' ` +
+      `and hand-write 'ALTER TABLE \`${op.tableName}\` MODIFY COLUMN \`${op.columnName}\` ` +
+      `<TYPE> ${op.toNullable ? "NULL" : "NOT NULL"};'.`
+  );
+}
+
+function generateChangeColumnDefault(op: ChangeColumnDefaultOp): string {
+  const column = `ALTER TABLE ${q(op.tableName)} ALTER COLUMN ${q(op.columnName)}`;
+  if (op.toDefault === undefined) return `${column} DROP DEFAULT`;
+  return `${column} SET DEFAULT ${settableDefault(op.toDefault)}`;
+}
+
+/** A number, a quoted string, or one of MySQL's literal keywords. */
+const MYSQL_DEFAULT_LITERAL =
+  /^(?:[-+]?\d+(?:\.\d+)?|'(?:[^'\\]|''|\\.)*'|NULL|TRUE|FALSE)$/i;
+
+/**
+ * A default as `ALTER COLUMN … SET DEFAULT` takes it. That clause accepts a literal or an
+ * expression in parentheses and nothing else: the bare `CURRENT_TIMESTAMP` a column definition
+ * may carry is a syntax error there, so every non-literal default is wrapped, unless it already is.
+ */
+function settableDefault(expression: string): string {
+  const value = expression.trim();
+  if (MYSQL_DEFAULT_LITERAL.test(value)) return value;
+  if (value.startsWith("(") && value.endsWith(")")) return value;
+  return `(${value})`;
+}
+
+export class MysqlUnsupportedOperationError extends Error {
+  constructor(opType: string, hint: string) {
+    super(`MySQL F11 PR 3 limitation: ${opType}. ${hint}`);
+    this.name = "MysqlUnsupportedOperationError";
+  }
+}

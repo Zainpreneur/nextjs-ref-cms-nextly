@@ -1,0 +1,407 @@
+import { describe, expect, it, vi } from "vitest";
+
+import { NextlyError } from "../errors/nextly-error";
+import {
+  listRoleSlugsForUser,
+  listRoleSlugsForUserOrRefuse,
+} from "../services/lib/permissions";
+
+import {
+  resolveServiceOpts as resolve,
+  type ServiceOpts,
+} from "./service-opts";
+
+// Both resolvers, so a case can tell WHICH one the facade's own defaults use.
+// They ask the identical question of the identical rows and differ only in what
+// they do when the question cannot be asked, which is the whole point here.
+vi.mock("../services/lib/permissions", () => ({
+  listRoleSlugsForUser: vi.fn(async () => [] as string[]),
+  listRoleSlugsForUserOrRefuse: vi.fn(async () => {
+    // Its real contract: the strict lookup's failure, in the typed envelope
+    // and still carrying the cause. Proven against the real function in
+    // `services/lib/roles-or-refuse.test.ts`.
+    throw NextlyError.internal({
+      cause: new Error("the roles query did not run"),
+      logContext: { reason: "roles-unreadable", userId: "u1" },
+    });
+  }),
+}));
+
+/**
+ * The roles the resolver answers with, by user id. A user the table does not
+ * name holds none, which is what a fresh account looks like.
+ */
+const ROLES: Record<string, string[]> = { editor1: ["editor", "viewer"] };
+const deps = { listRoleSlugs: async (userId: string) => ROLES[userId] ?? [] };
+const resolveServiceOpts = (opts: ServiceOpts) => resolve(opts, deps);
+
+describe("resolveServiceOpts", () => {
+  it("defaults to system when no as and no user", async () => {
+    expect(await resolveServiceOpts({})).toEqual({ overrideAccess: true });
+  });
+
+  it("as:'system' → overrideAccess, no user", async () => {
+    expect(await resolveServiceOpts({ as: "system" })).toEqual({
+      overrideAccess: true,
+    });
+  });
+
+  it("as:'system' with a user stays trusted and keeps the user, so the write is attributed", async () => {
+    // The user is who the plugin acts beside, not a caller to be judged, so
+    // the call stays trusted and asks nothing about them: no role lookup runs,
+    // and one that would fail cannot refuse a trusted call that never needed it.
+    const lookups: string[] = [];
+    const failing = {
+      listRoleSlugs: async (userId: string): Promise<string[]> => {
+        lookups.push(userId);
+        throw new Error("role lookup unavailable");
+      },
+    };
+    expect(
+      await resolveServiceOpts(
+        {
+          as: "system",
+          user: { id: "editor1", email: "e@e.com", name: "E" },
+        },
+        failing
+      )
+    ).toEqual({
+      overrideAccess: true,
+      user: {
+        id: "editor1",
+        email: "e@e.com",
+        name: "E",
+        role: "",
+        roles: [],
+        permissions: [],
+      },
+    });
+    expect(lookups).toEqual([]);
+  });
+
+  it("as:'user' with a user → enforce, RequestContext.user shape", async () => {
+    expect(
+      await resolveServiceOpts({
+        as: "user",
+        user: { id: "u1", email: "u@e.com", name: "U" },
+      })
+    ).toEqual({
+      overrideAccess: false,
+      user: {
+        id: "u1",
+        email: "u@e.com",
+        name: "U",
+        role: "",
+        roles: [],
+        permissions: [],
+      },
+    });
+  });
+
+  it("resolves the caller's roles, so a rule reading user.role sees them", async () => {
+    // Built with `role: ""` before, so `req.user?.role === "editor"` refused
+    // every caller on this path while the same caller's own request passed.
+    expect(
+      await resolveServiceOpts({
+        as: "user",
+        user: { id: "editor1", email: "e@e.com", name: "E" },
+      })
+    ).toEqual({
+      overrideAccess: false,
+      user: {
+        id: "editor1",
+        email: "e@e.com",
+        name: "E",
+        role: "editor",
+        roles: ["editor", "viewer"],
+        permissions: [],
+      },
+    });
+  });
+
+  it("a user without explicit as is treated as as:'user'", async () => {
+    expect(
+      await resolveServiceOpts({ user: { id: "u1", email: "u@e.com" } })
+    ).toMatchObject({
+      overrideAccess: false,
+      user: { id: "u1" },
+    });
+  });
+
+  /**
+   * The mode a public plugin route needs, and the one that did not exist.
+   *
+   * `public: true` on a route waives the ROUTE's authentication. It says
+   * nothing about the collections behind it, and before this mode a route
+   * serving an anonymous visitor had no way to say so: `user` throws without a
+   * user, and every other spelling set `overrideAccess`. So a public route
+   * could only read by bypassing whatever the host had configured.
+   */
+  it("as:'public' enforces access with no user at all", async () => {
+    expect(await resolveServiceOpts({ as: "public" })).toEqual({
+      overrideAccess: false,
+    });
+  });
+
+  it("as:'public' does not become a user when one is in scope", async () => {
+    // A route may hold a `user` for other reasons while deliberately reading as
+    // the public. Letting the presence of one silently upgrade the mode would
+    // make the elevation depend on an unrelated field.
+    expect(
+      await resolveServiceOpts({
+        as: "public",
+        user: { id: "u1", email: "u@e.com", name: "U" },
+      })
+    ).toEqual({ overrideAccess: false });
+  });
+
+  it("as:'public' is the ONLY mode that enforces without a user", async () => {
+    // The control that makes the two above mean something. If any other
+    // spelling also enforced, a route could reach the right behaviour by
+    // accident and this mode would not need to exist.
+    const spellings = [
+      {},
+      { as: "system" as const },
+      { as: "public" as const },
+    ] as const;
+    const resolved = await Promise.all(
+      spellings.map(opts => resolveServiceOpts(opts))
+    );
+    const enforcingWithoutUser = spellings.filter(
+      (_, index) => resolved[index].overrideAccess === false
+    );
+
+    expect(enforcingWithoutUser).toEqual([{ as: "public" }]);
+  });
+
+  it("refuses the operation when the caller's roles could not be read", async () => {
+    // Without deps, so this is the facade's OWN resolver and not the fake.
+    // `listRoleSlugsForUser` degrades a failed query to an empty set, and an
+    // exclusion rule such as `user.role !== "suspended"` then admits a caller
+    // nobody could look up: the same empty-role grant this change removes,
+    // arriving by another door. An access decision taken on roles that were
+    // never read is not a decision.
+    await expect(
+      resolve({ as: "user", user: { id: "u1", email: "u@e.com" } })
+    ).rejects.toThrow();
+  });
+
+  it("refuses with a typed error, not the driver's own", async () => {
+    // Everything a plugin reaches through this facade answers in the typed
+    // envelope, and the strict resolver propagates the driver's exception by
+    // design. A raw error here would reach a plugin route with no `code` to
+    // branch on. The refusal is unchanged; only its shape is.
+    await expect(
+      resolve({ as: "user", user: { id: "u1", email: "u@e.com" } })
+    ).rejects.toSatisfy(
+      (error: unknown) =>
+        NextlyError.is(error) &&
+        (error as NextlyError).code === "INTERNAL_ERROR"
+    );
+  });
+
+  it("keeps the cause, so the driver's message is not lost", async () => {
+    // The control on the wrapping: an implementation that threw a fresh
+    // NextlyError and discarded the original passes the case above and leaves
+    // an operator with nothing to diagnose.
+    const error = await resolve({
+      as: "user",
+      user: { id: "u1", email: "u@e.com" },
+    }).catch((thrown: unknown) => thrown);
+    expect((error as { cause?: Error }).cause?.message).toBe(
+      "the roles query did not run"
+    );
+  });
+
+  it("asks the refusing resolver and not the one that swallows", async () => {
+    // The control on the case above, which a facade wired to EITHER resolver
+    // could pass if both threw. This says which door it went through.
+    vi.mocked(listRoleSlugsForUser).mockClear();
+    vi.mocked(listRoleSlugsForUserOrRefuse).mockClear();
+    await expect(
+      resolve({ as: "user", user: { id: "u1", email: "u@e.com" } })
+    ).rejects.toThrow();
+    expect(vi.mocked(listRoleSlugsForUserOrRefuse)).toHaveBeenCalledWith(
+      "u1",
+      undefined
+    );
+    expect(vi.mocked(listRoleSlugsForUser)).not.toHaveBeenCalled();
+  });
+
+  it("as:'user' without a user throws", async () => {
+    await expect(resolveServiceOpts({ as: "user" })).rejects.toThrow();
+  });
+});
+
+/**
+ * `user` names the key's OWNER, so a facade that receives it alone resolves the
+ * owner's roles and a viewer-scoped key minted by a super-admin is judged as a
+ * super-admin. This is the hop that either carries the key's own grants or
+ * drops them.
+ */
+describe("resolveServiceOpts — the caller's own scope", () => {
+  const KEY_SCOPE = {
+    actorType: "apiKey" as const,
+    permissions: ["read-posts"],
+  };
+
+  it("forwards an API key's grants alongside the account", async () => {
+    expect(
+      await resolveServiceOpts({
+        as: "user",
+        user: { id: "u1", email: "u@e.com", name: "U" },
+        authenticatedScope: KEY_SCOPE,
+      })
+    ).toEqual({
+      overrideAccess: false,
+      user: {
+        id: "u1",
+        email: "u@e.com",
+        name: "U",
+        role: "",
+        roles: [],
+        permissions: [],
+      },
+      authenticatedScope: KEY_SCOPE,
+    });
+  });
+
+  it("judges a key on ITS roles, never its owner's, when the scope carries them", async () => {
+    // The owner holds editor and viewer; the key was minted on viewer alone.
+    // A stored role rule reads `user.roles` with no scope in front of it, so
+    // the owner's roles here would let this key satisfy an editors-only rule
+    // over the plugin path that the REST path refuses it.
+    expect(
+      await resolveServiceOpts({
+        as: "user",
+        user: { id: "editor1", email: "e@e.com", name: "E" },
+        authenticatedScope: { ...KEY_SCOPE, roles: ["viewer"] },
+      })
+    ).toMatchObject({
+      overrideAccess: false,
+      user: { id: "editor1", role: "viewer", roles: ["viewer"] },
+    });
+  });
+
+  it("grants a key the role it was minted on even when its owner lacks it", async () => {
+    // The other direction, and the one that separates this from a blanket
+    // refusal: u1 holds no roles at all, the key holds editor.
+    expect(
+      await resolveServiceOpts({
+        as: "user",
+        user: { id: "u1", email: "u@e.com", name: "U" },
+        authenticatedScope: { ...KEY_SCOPE, roles: ["editor"] },
+      })
+    ).toMatchObject({ user: { role: "editor", roles: ["editor"] } });
+  });
+
+  it("a key whose role is gone holds no roles here either", async () => {
+    // `[]` is what authentication resolves for a role-based key whose role
+    // was deleted. It is a list, not an absence: falling back to the owner's
+    // roles on an empty one would revive the deleted role as the owner.
+    expect(
+      await resolveServiceOpts({
+        as: "user",
+        user: { id: "editor1", email: "e@e.com", name: "E" },
+        authenticatedScope: { ...KEY_SCOPE, roles: [] },
+      })
+    ).toMatchObject({ user: { role: "", roles: [] } });
+  });
+
+  it("falls back to the account's roles for a scope that carries none", async () => {
+    // `roles` is omitted, not emptied, when authentication resolved none;
+    // `apiKeyWriteAllowed` reads `scope.roles ?? user.roles` for the same
+    // reason, and this is the `user.roles` it falls back to.
+    expect(
+      await resolveServiceOpts({
+        as: "user",
+        user: { id: "editor1", email: "e@e.com", name: "E" },
+        authenticatedScope: KEY_SCOPE,
+      })
+    ).toMatchObject({ user: { role: "editor", roles: ["editor", "viewer"] } });
+  });
+
+  it("hands the rule a copy, not the scope's frozen list", async () => {
+    const scope = Object.freeze({
+      ...KEY_SCOPE,
+      roles: Object.freeze(["viewer"]) as readonly string[],
+    });
+    const resolved = await resolveServiceOpts({
+      as: "user",
+      user: { id: "editor1", email: "e@e.com", name: "E" },
+      authenticatedScope: scope,
+    });
+    expect(resolved.user?.roles).toEqual(["viewer"]);
+    expect(Object.isFrozen(resolved.user?.roles)).toBe(false);
+  });
+
+  it("omits the key entirely for a session caller, who has no key scope", async () => {
+    // The control. `toEqual` ignores an explicitly-undefined property, so
+    // asserting the scope is absent has to be done on the KEYS — otherwise a
+    // hop that always wrote `authenticatedScope: undefined` would satisfy it,
+    // and so would one that wrote nothing.
+    const resolved = await resolveServiceOpts({
+      as: "user",
+      user: { id: "u1", email: "u@e.com", name: "U" },
+    });
+    // On the KEY rather than the value: `toEqual` ignores an
+    // explicitly-undefined property, so comparing against `undefined` would be
+    // satisfied by a hop that always wrote `authenticatedScope: undefined` and
+    // by one that wrote nothing, which are different behaviours downstream.
+    //
+    // Asserting this one key rather than the whole key set, because the set is
+    // shared: `context` arrived here from another change and broke an
+    // exact-set assertion that was never about it.
+    expect(Object.keys(resolved)).not.toContain("authenticatedScope");
+    expect(resolved.overrideAccess).toBe(false);
+  });
+
+  it("drops a scope under system elevation, which bypasses the check it feeds", async () => {
+    // A scope only means anything to an access check, and `as:'system'` skips
+    // it. Carrying one here would imply a narrowing that is not applied.
+    expect(
+      await resolveServiceOpts({ as: "system", authenticatedScope: KEY_SCOPE })
+    ).toEqual({ overrideAccess: true });
+  });
+});
+
+describe("verified claims on the supplied identity", () => {
+  it("survive into the identity the access rule is judged on", async () => {
+    // 🔴 `readCaller` spreads `auth.claims` onto the user it builds, so a
+    // caller handed to a plugin carries what the token proved. Rebuilt from
+    // id/name/email/roles alone, a code-defined `access` rule reading one of
+    // those claims saw a DIFFERENT caller than the endpoint authenticated --
+    // and an absence-tolerant rule like `user.plan !== "suspended"` then
+    // GRANTS where it should deny.
+    const resolved = await resolveServiceOpts({
+      as: "user",
+      user: {
+        id: "user-1",
+        email: "a@example.com",
+        tenant: "acme",
+        plan: "suspended",
+      } as never,
+    });
+
+    const judged = resolved.user as unknown as Record<string, unknown>;
+    expect(judged.tenant).toBe("acme");
+    expect(judged.plan).toBe("suspended");
+    // The declared fields still come from the identity, not from the spread.
+    expect(judged.id).toBe("user-1");
+    expect(judged.email).toBe("a@example.com");
+  });
+
+  it("adds nothing for an identity carrying only the declared fields", async () => {
+    // The must-differ half: without it, a version that attached some fixed
+    // object to every caller would satisfy the case above.
+    const resolved = await resolveServiceOpts({
+      as: "user",
+      user: { id: "user-2", email: "b@example.com" } as never,
+    });
+
+    const judged = resolved.user as unknown as Record<string, unknown>;
+    expect(judged.tenant).toBeUndefined();
+    expect(judged.plan).toBeUndefined();
+    expect(judged.id).toBe("user-2");
+  });
+});

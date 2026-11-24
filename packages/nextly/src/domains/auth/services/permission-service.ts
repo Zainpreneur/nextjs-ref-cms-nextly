@@ -1,0 +1,1203 @@
+import { randomUUID } from "crypto";
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import { caseInsensitiveContains } from "@nextlyhq/adapter-drizzle/text-match";
+import { and, asc, count, desc, eq, inArray, or, sql } from "drizzle-orm";
+
+import type {
+  PermissionInsertData,
+  PermissionSelectResult,
+  PermissionUpdateData,
+  RBACDatabaseInstance,
+} from "@nextly/types/rbac-operations";
+
+// PR 4 migration: replaced legacy result-shape returns and
+// mapDbErrorToServiceError calls with throw-based NextlyError. Methods now
+// return their data directly; failures throw a NextlyError.
+import { toDbError } from "../../../database/errors";
+import { NextlyError } from "../../../errors/nextly-error";
+import { isSystemResource, permissionSlug } from "../../../schemas/_zod/rbac";
+import { BaseService } from "../../../services/base-service";
+import { writingPermissions } from "../../../services/lib/permissions";
+import type { Logger } from "../../../services/shared";
+import { requireFilterValue } from "../../../shared/lib/require-filter-value";
+import { isUniqueViolation } from "../../../shared/lib/unique-violation";
+
+import { afterGrantsChanged } from "./role-grants-changed";
+
+interface PermissionsTableLike {
+  resource: unknown;
+  action: unknown;
+  orphanedAt: unknown;
+}
+
+function buildHiddenPermissionConditions(
+  permissionsTable: PermissionsTableLike,
+  options?: { includeOrphaned?: boolean }
+) {
+  const conditions = [
+    // Hide the legacy `permissions` resource from assignable/admin permission lists.
+    sql`${permissionsTable.resource} <> 'permissions'`,
+  ];
+
+  if (!options?.includeOrphaned) {
+    // A permission nothing declares any more should not be offered as a choice
+    // — it enforces nothing, so granting it does nothing. It stays in the table
+    // and keeps its grants; this only takes it off the menu. Retiring it is a
+    // separate, deliberate act, and the cleanup that does the retiring asks for
+    // orphans explicitly.
+    conditions.push(sql`${permissionsTable.orphanedAt} IS NULL`);
+  }
+
+  return conditions;
+}
+
+/**
+ * Whether a permission is one of the hidden internal ones: the legacy
+ * `permissions` resource, as {@link buildHiddenPermissionConditions} hides it
+ * from lists. It is answered as if absent, so nothing confirms it exists.
+ * Create and delete on `settings` are granted like any other permission, so
+ * they are listed.
+ */
+function isHiddenPermission(permission: { resource: string }): boolean {
+  return permission.resource === "permissions";
+}
+
+/**
+ * Refuse deleting a permission on a system resource, whichever way the delete
+ * names it. A built-in permission is never deleted, and the caller is told
+ * so: a fact about the permission, not about their permissions, which §13.8
+ * keeps generic. A hidden one is refused in the generic words, so the refusal
+ * does not confirm it exists. The detail goes to the log.
+ */
+function refuseDeletingBuiltIn(permission: {
+  id: unknown;
+  action: string;
+  resource: string;
+}): void {
+  if (!isSystemResource(permission.resource)) return;
+  const logContext = {
+    reason: "system-permission-undeletable",
+    permissionId: String(permission.id),
+    resource: permission.resource,
+  };
+  if (isHiddenPermission(permission)) {
+    throw NextlyError.forbidden({ logContext });
+  }
+  throw NextlyError.builtIn({
+    thing: "permission",
+    change: "delete",
+    logContext,
+  });
+}
+
+/**
+ * The line logged when a permission's orphan mark changes: what happened to
+ * the permission, and the roles that hold it as the database has them once
+ * the mark is written. A mark never adds or removes a grant, so those roles
+ * are the ones that held it before the change too. One wording for both
+ * places a mark changes: the sweep that marks and clears, and the ensure that
+ * clears it when a declaration returns.
+ */
+function orphanMarkChangeLine(change: {
+  permission: string;
+  owner: string | null;
+  orphaned: boolean;
+  holders: readonly string[];
+}): string {
+  const by = change.owner ? ` by ${change.owner}` : "";
+  const grants =
+    change.holders.length === 0
+      ? "no role holds it"
+      : `${change.holders.length} ${change.holders.length === 1 ? "role" : "roles"}: ${change.holders.join(", ")}`;
+  return change.orphaned
+    ? `Permission "${change.permission}" is no longer declared${by}: marked orphaned. Its grants are kept (${grants}).`
+    : `Permission "${change.permission}" is declared again${by}: orphan mark cleared. Its grants are as they were (${grants}).`;
+}
+
+/**
+ * PermissionService handles all permission CRUD operations.
+ *
+ * Responsibilities:
+ * - List permissions with pagination and filtering
+ * - Create, read, update, delete permissions
+ * - Validate permission uniqueness (action + resource)
+ * - Ensure permissions exist idempotently
+ *
+ * @example
+ * ```typescript
+ * const permissionService = new PermissionService(adapter, logger);
+ * const result = await permissionService.listPermissions({ action: 'read' });
+ * ```
+ */
+/** One permission as a seeder declares it: its identity, its spelling and its provenance. */
+export interface PermissionDeclaration {
+  action: string;
+  resource: string;
+  name: string;
+  slug: string;
+  description?: string;
+  meta?: { owner?: string; group?: string; danger?: boolean };
+}
+
+/** A stored permission, with what a declaration is compared against. */
+export type PermissionRow = Record<
+  | "id"
+  | "action"
+  | "resource"
+  | "owner"
+  | "slug"
+  | "permissionGroup"
+  | "danger"
+  | "orphanedAt",
+  unknown
+>;
+
+/**
+ * The key a permission is matched on: its action and resource without regard to
+ * case, as `findByActionResource` matches them with `LOWER()`.
+ */
+export function permissionKey(action: string, resource: string): string {
+  // A space cannot occur in either: both are slugs.
+  return `${action.toLowerCase()} ${resource.toLowerCase()}`;
+}
+
+/**
+ * The permission fields an update may change, named ONCE.
+ *
+ * They were enumerated three times inside `updatePermission` -- in the no-op comparison, in the
+ * payload construction, and in the parameter type -- and the three had to agree for the method to
+ * be correct. A field added to the payload but forgotten in the comparison makes an update that
+ * changes only that field return early as a no-op, which is a write that silently does nothing;
+ * forgotten the other way, an unchanged request writes anyway. Neither shows up as an error.
+ *
+ * Deriving both behaviours from one list makes those two disagreements unrepresentable, and the
+ * parameter type below is the one remaining copy, which the compiler ties to this list.
+ */
+const EDITABLE_PERMISSION_FIELDS = [
+  "name",
+  "slug",
+  "action",
+  "resource",
+  "description",
+] as const;
+
+export class PermissionService extends BaseService {
+  constructor(adapter: DrizzleAdapter, logger: Logger) {
+    super(adapter, logger);
+  }
+
+  private async validateResource(resource: string): Promise<void> {
+    await this.validateResources([resource], { bySlug: true });
+  }
+
+  /**
+   * Check each of `resources` against the registries, as a permission's
+   * resource is checked before it is ensured: a system resource, a registered
+   * collection or a registered Single is recognised, and any other is warned
+   * about, since it may be one pre-seeded for an entity not created yet. One
+   * read per registry, and only for what the one before did not find, however
+   * many resources are asked about: a single permission's resource is looked
+   * up by its slug (`bySlug`), and a batch's against every slug the registry
+   * holds, so its statement stays the same whatever the number of entities.
+   */
+  private async validateResources(
+    resources: Iterable<string>,
+    { bySlug }: { bySlug: boolean }
+  ): Promise<void> {
+    let unrecognised = [...new Set(resources)].filter(
+      resource => !isSystemResource(resource)
+    );
+    for (const registry of [
+      this.tables?.dynamicCollections,
+      this.tables?.dynamicSingles,
+    ]) {
+      if (!registry || unrecognised.length === 0) continue;
+      try {
+        const slugs = this.db.select({ slug: registry.slug }).from(registry);
+        const found = new Set(
+          (bySlug
+            ? await slugs.where(inArray(registry.slug, unrecognised))
+            : await slugs
+          ).map((row: { slug: unknown }) => String(row.slug))
+        );
+        unrecognised = unrecognised.filter(resource => !found.has(resource));
+      } catch {
+        // Table may not exist yet (fresh DB). Silently continue.
+      }
+    }
+    for (const resource of unrecognised) {
+      this.logger.warn(
+        `Permission resource "${resource}" is not a recognized system resource or existing collection. ` +
+          `This may be intentional (e.g., pre-seeding for a collection not yet created).`
+      );
+    }
+  }
+
+  /**
+   * List all permissions with pagination, search, and filtering.
+   *
+   * @param options - Pagination, search, filter, and sort options
+   * @returns Paginated list of permissions with metadata
+   */
+  async listPermissions(options?: {
+    // Pagination
+    page?: number;
+    limit?: number;
+    // Search
+    search?: string;
+    // Filters
+    action?: string;
+    resource?: string;
+    // Sorting
+    sortBy?: "action" | "resource" | "name";
+    sortOrder?: "asc" | "desc";
+    /**
+     * Include permissions nothing declares any more. Off by default: they are
+     * not a choice anyone should be offered. The cleanup that retires them
+     * needs to see them, and asks.
+     */
+    includeOrphaned?: boolean;
+  }): Promise<{
+    data: Array<{
+      id: string;
+      name: string;
+      slug: string;
+      action: string;
+      resource: string;
+      description: string | null;
+      category?: string;
+      /** Package that declared this permission; null for the built-in seeds. */
+      owner: string | null;
+      /** True once the declaring package stopped declaring it. */
+      orphaned: boolean;
+      /** Heading within the owner's section; null when the owner set none. */
+      group: string | null;
+      /** True for a permission the admin should warn before granting. */
+      danger: boolean;
+    }>;
+    meta: {
+      total: number;
+      page: number;
+      limit: number;
+      totalPages: number;
+    };
+  }> {
+    try {
+      const {
+        page = 1,
+        limit = 10,
+        search,
+        action,
+        resource,
+        sortBy = "resource",
+        sortOrder = "asc",
+        includeOrphaned = false,
+      } = options || {};
+
+      const { permissions } = this.tables;
+
+      const conditions = [
+        ...buildHiddenPermissionConditions(permissions, { includeOrphaned }),
+      ];
+
+      // Each text as typed, ignoring case on every dialect, through the one rule for it.
+      if (search) {
+        const searchCondition = or(
+          caseInsensitiveContains(this.dialect, permissions.name, search),
+          caseInsensitiveContains(this.dialect, permissions.action, search),
+          caseInsensitiveContains(this.dialect, permissions.resource, search),
+          caseInsensitiveContains(this.dialect, permissions.description, search)
+        );
+
+        if (searchCondition) {
+          conditions.push(searchCondition);
+        }
+      }
+
+      if (action) {
+        conditions.push(
+          caseInsensitiveContains(this.dialect, permissions.action, action)
+        );
+      }
+
+      if (resource) {
+        conditions.push(
+          caseInsensitiveContains(this.dialect, permissions.resource, resource)
+        );
+      }
+
+      const whereClause =
+        conditions.length > 0 ? and(...conditions) : undefined;
+
+      let sortColumn;
+      const orderFn = sortOrder === "asc" ? asc : desc;
+
+      switch (sortBy) {
+        case "name":
+          sortColumn = permissions.name;
+          break;
+        case "action":
+          sortColumn = permissions.action;
+          break;
+        case "resource":
+          sortColumn = permissions.resource;
+          break;
+        default:
+          sortColumn = permissions.resource;
+      }
+
+      // `id` breaks ties, and it is what makes OFFSET paging sound rather than
+      // tidy. None of the sortable columns is unique, so rows sharing a value
+      // have no defined order between pages: the engine may place a tied row
+      // after the boundary on one request and before it on the next, which
+      // DUPLICATES that row on one page and DROPS a different one from the
+      // other. A caller walking every page then sees neither the total it was
+      // promised nor a stable set, and the loss is silent because each page is
+      // individually well formed.
+      const orderByClause = [orderFn(sortColumn), asc(permissions.id)];
+
+      const offset = (page - 1) * limit;
+
+      const countResult = await this.db
+        .select({ value: count() })
+        .from(permissions)
+        .where(whereClause);
+
+      const total = Number(countResult[0]?.value ?? 0);
+
+      const rows = await this.db
+        .select({
+          id: permissions.id,
+          name: permissions.name,
+          slug: permissions.slug,
+          action: permissions.action,
+          resource: permissions.resource,
+          description: permissions.description,
+          owner: permissions.owner,
+          orphanedAt: permissions.orphanedAt,
+          permissionGroup: permissions.permissionGroup,
+          danger: permissions.danger,
+        })
+        .from(permissions)
+        .where(whereClause)
+        .orderBy(...orderByClause)
+        .limit(limit)
+        .offset(offset);
+
+      const totalPages = Math.ceil(total / limit);
+
+      const resourcesInRows = [
+        ...new Set(rows.map((row: PermissionSelectResult) => row.resource)),
+      ];
+
+      const collectionsMap = new Set<string>();
+      const singlesMap = new Set<string>();
+
+      if (this.tables?.dynamicCollections && resourcesInRows.length > 0) {
+        const collections = await this.db
+          .select({ slug: this.tables.dynamicCollections.slug })
+          .from(this.tables.dynamicCollections);
+        collections.forEach((c: { slug: string }) =>
+          collectionsMap.add(c.slug)
+        );
+      }
+
+      if (this.tables?.dynamicSingles && resourcesInRows.length > 0) {
+        const singles = await this.db
+          .select({ slug: this.tables.dynamicSingles.slug })
+          .from(this.tables.dynamicSingles);
+        singles.forEach((s: { slug: string }) => singlesMap.add(s.slug));
+      }
+
+      this.logger.debug("[PermissionService] Categorizing permissions", {
+        totalPermissions: rows.length,
+        collectionsCount: collectionsMap.size,
+        singlesCount: singlesMap.size,
+        collections: Array.from(collectionsMap),
+        singles: Array.from(singlesMap),
+      });
+
+      return {
+        data: rows.map((row: PermissionSelectResult) => {
+          let category = "collection-types";
+
+          if (isSystemResource(row.resource)) {
+            category = "settings";
+          } else if (singlesMap.has(row.resource)) {
+            category = "single-types";
+          } else if (collectionsMap.has(row.resource)) {
+            category = "collection-types";
+          }
+
+          this.logger.debug("[PermissionService] Permission categorized", {
+            resource: row.resource,
+            category,
+            isSystem: isSystemResource(row.resource),
+            isInSingles: singlesMap.has(row.resource),
+            isInCollections: collectionsMap.has(row.resource),
+          });
+
+          return {
+            id: String(row.id),
+            name: String(row.name),
+            slug: String(row.slug),
+            action: String(row.action),
+            resource: String(row.resource),
+            description: row.description ? String(row.description) : null,
+            category,
+            owner: row.owner ? String(row.owner) : null,
+            orphaned: row.orphanedAt !== null && row.orphanedAt !== undefined,
+            group: row.permissionGroup ? String(row.permissionGroup) : null,
+            danger: Boolean(row.danger),
+          };
+        }),
+        meta: {
+          total,
+          page,
+          limit,
+          totalPages,
+        },
+      };
+    } catch (err) {
+      // Any DB error during the list query -> NextlyError. fromDatabaseError
+      // gives us a generic public message and rich operator logContext.
+      // Normalise raw driver errors via toDbError(dialect) first so the
+      // correct kind is preserved (otherwise everything would collapse to
+      // INTERNAL_ERROR / 500).
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, err));
+    }
+  }
+
+  /**
+   * Get a permission by ID.
+   *
+   * @param permissionId - Permission ID
+   * @returns Permission details
+   * @throws NextlyError(NOT_FOUND) when no permission has this id, or it is
+   *   one of the hidden internal permissions (resource = 'permissions', or
+   *   create/delete on 'settings'). The hidden case maps to NOT_FOUND
+   *   intentionally — exposing it as FORBIDDEN would leak the policy.
+   * @throws NextlyError(INTERNAL_ERROR) when the id is nullish or empty. That
+   *   is not a miss, it is a caller bug: Drizzle drops an `undefined` filter
+   *   key entirely, so the lookup would run WITHOUT a where clause and return
+   *   an arbitrary permission — including the hidden ones the NOT_FOUND
+   *   mapping above exists to conceal. Refused rather than answered.
+   */
+  async getPermissionById(permissionId: string): Promise<{
+    id: string;
+    name: string;
+    slug: string;
+    action: string;
+    resource: string;
+    description: string | null;
+    category?: string;
+  }> {
+    const permission = await this.requirePermissionById(permissionId);
+
+    if (isHiddenPermission(permission)) {
+      // Hidden internal permission — surface as NOT_FOUND to avoid leaking
+      // the existence of the hidden surface area.
+      throw NextlyError.notFound({
+        logContext: {
+          permissionId,
+          reason: "hidden-permission",
+          resource: permission.resource,
+          action: permission.action,
+        },
+      });
+    }
+
+    let category = "collection-types";
+
+    if (isSystemResource(permission.resource)) {
+      category = "settings";
+    } else {
+      if (this.tables?.dynamicSingles) {
+        const single = await this.db
+          .select({ slug: this.tables.dynamicSingles.slug })
+          .from(this.tables.dynamicSingles)
+          .where(eq(this.tables.dynamicSingles.slug, permission.resource))
+          .limit(1);
+
+        if (single.length > 0) {
+          category = "single-types";
+        }
+      }
+    }
+
+    return {
+      id: String(permission.id),
+      name: String(permission.name),
+      slug: String(permission.slug),
+      action: String(permission.action),
+      resource: String(permission.resource),
+      description: permission.description
+        ? String(permission.description)
+        : null,
+      category,
+    };
+  }
+
+  /**
+   * Ensure a permission exists (idempotent create).
+   *
+   * Creates a permission if it doesn't exist. If a permission with the same
+   * action and resource already exists, returns the existing permission ID.
+   *
+   * @param action - Permission action (e.g., 'read', 'write', 'delete')
+   * @param resource - Permission resource (e.g., 'users', 'posts', 'settings')
+   * @param name - Human-readable permission name
+   * @param slug - URL-friendly permission slug
+   * @param description - Optional permission description
+   * @returns Permission ID (existing or newly created)
+   */
+  async ensurePermission(
+    action: string,
+    resource: string,
+    name: string,
+    slug: string,
+    description?: string,
+    /**
+     * What the declaration says about the permission beyond its identity.
+     *
+     * An object rather than three more positional arguments: the signature was
+     * already six deep, and `(…, undefined, undefined, true)` is not something
+     * anyone should have to read.
+     */
+    meta?: {
+      /**
+       * Who declared it — a plugin name, or omitted for the framework's own
+       * per-collection seeds. Recorded so the admin can tell a plugin's custom
+       * permission from a content type's, rather than inferring one from the
+       * slug and inventing a collection that does not exist.
+       */
+      owner?: string;
+      /** Heading within the owner's section of the matrix. */
+      group?: string;
+      /** True for a permission the admin should warn before granting. */
+      danger?: boolean;
+    }
+  ): Promise<{
+    /** ID of the existing or newly created permission row. */
+    id: string;
+    /** True if this call inserted a new row, false if a matching row already existed. */
+    created: boolean;
+  }> {
+    await this.validateResource(resource);
+    return this.ensureAgainst(
+      { action, resource, name, slug, description, meta },
+      await this.findByActionResource(action, resource)
+    );
+  }
+
+  /**
+   * Ensure each of `declared` exists, as `ensurePermission` does, against one
+   * read of the whole table (`rows`, read here when not handed in) rather than
+   * a read per permission, so ensuring every entity's permissions costs the
+   * same number of reads for five entities as for fifty. Each declaration's
+   * outcome is returned in order, a failure as its error rather than thrown,
+   * so one refused row does not stop the rest.
+   *
+   * Each resource is checked against the registries, as `ensurePermission`
+   * checks it, in one read per registry for all of them (`validateResources`).
+   */
+  // Reached through the seed service's `permissionService` property.
+  // fallow-ignore-next-line unused-class-member
+  async ensurePermissions(
+    declared: readonly PermissionDeclaration[],
+    rows?: readonly PermissionRow[]
+  ): Promise<Array<{ id: string; created: boolean } | { error: unknown }>> {
+    await this.validateResources(
+      declared.map(({ resource }) => resource),
+      { bySlug: false }
+    );
+    const byKey = new Map<string, PermissionRow>();
+    for (const row of rows ?? (await this.permissionRows())) {
+      byKey.set(permissionKey(String(row.action), String(row.resource)), row);
+    }
+    const outcomes: Array<
+      { id: string; created: boolean } | { error: unknown }
+    > = [];
+    for (const declaration of declared) {
+      const key = permissionKey(declaration.action, declaration.resource);
+      try {
+        const ensured = await this.ensureAgainst(
+          declaration,
+          byKey.get(key) ?? null
+        );
+        // A second declaration of the same permission finds the row just written.
+        if (ensured.created) {
+          byKey.set(key, {
+            id: ensured.id,
+            action: declaration.action,
+            resource: declaration.resource,
+            owner: declaration.meta?.owner ?? null,
+            slug: declaration.slug,
+            permissionGroup: declaration.meta?.group ?? null,
+            danger: declaration.meta?.danger === true,
+            orphanedAt: null,
+          });
+        }
+        outcomes.push(ensured);
+      } catch (error) {
+        outcomes.push({ error });
+      }
+    }
+    return outcomes;
+  }
+
+  /**
+   * Every permission row, or those of `resources`, with what
+   * `ensurePermission` compares a declaration against, in one read.
+   */
+  async permissionRows(
+    resources?: readonly string[]
+  ): Promise<PermissionRow[]> {
+    const { permissions } = this.tables;
+    const query = this.db
+      .select({
+        id: permissions.id,
+        action: permissions.action,
+        resource: permissions.resource,
+        owner: permissions.owner,
+        slug: permissions.slug,
+        permissionGroup: permissions.permissionGroup,
+        danger: permissions.danger,
+        orphanedAt: permissions.orphanedAt,
+      })
+      .from(permissions);
+    // Matched without regard to case, as `findByActionResource` matches.
+    return (await (resources === undefined
+      ? query
+      : query.where(
+          inArray(
+            sql`LOWER(${permissions.resource})`,
+            resources.map(resource => resource.toLowerCase())
+          )
+        ))) as PermissionRow[];
+  }
+
+  /**
+   * Bring the permission `declared` names in line with the declaration, given
+   * the row stored for its action and resource (`existing`, null for none):
+   * the one rule `ensurePermission` and `ensurePermissions` both apply.
+   */
+  private async ensureAgainst(
+    declared: PermissionDeclaration,
+    existing: Record<
+      "id" | "owner" | "slug" | "permissionGroup" | "danger" | "orphanedAt",
+      unknown
+    > | null
+  ): Promise<{ id: string; created: boolean }> {
+    const { action, resource, name, slug, description, meta } = declared;
+    const { permissions } = this.tables;
+    if (existing) {
+      // Adopt the row's provenance and slug if either is out of step with the
+      // declaration. Create-if-missing alone would leave every permission
+      // seeded before provenance existed permanently unattributed, which is
+      // most of them on any database that has already run — and the
+      // declaration is the truth about a permission, not whatever was true
+      // when it was first written.
+      //
+      // The slug is a label, not a key: identity is (action, resource) and
+      // grants reference the row by id, so bringing a stale slug into line
+      // renames without revoking. Without this, a corrected slug would reach
+      // new installs only, and existing databases would keep answering to a
+      // name no caller asks for.
+      const patch: {
+        owner?: string | null;
+        slug?: string;
+        permissionGroup?: string | null;
+        danger?: boolean;
+        orphanedAt?: Date | null;
+      } = {};
+
+      // Ensuring a permission IS the declaration, so a row that was retired
+      // rejoins the menu. Without this, a permission whose declaration went
+      // away and later came back stays marked: `listPermissions` filters
+      // orphans out by default, so preset-role syncing and the permission
+      // matrix would both skip a permission that exists and is declared.
+      const currentlyOrphaned =
+        (existing as { orphanedAt?: unknown }).orphanedAt != null;
+      if (currentlyOrphaned) {
+        patch.orphanedAt = null;
+      }
+
+      const currentOwner =
+        (existing as { owner?: string | null }).owner ?? null;
+      const declaredOwner = meta?.owner ?? null;
+      if (currentOwner !== declaredOwner) {
+        patch.owner = declaredOwner;
+      }
+
+      const currentGroup =
+        (existing as { permissionGroup?: string | null }).permissionGroup ??
+        null;
+      const declaredGroup = meta?.group ?? null;
+      if (currentGroup !== declaredGroup) {
+        patch.permissionGroup = declaredGroup;
+      }
+
+      const currentDanger = Boolean((existing as { danger?: unknown }).danger);
+      const declaredDanger = meta?.danger === true;
+      if (currentDanger !== declaredDanger) {
+        patch.danger = declaredDanger;
+      }
+
+      const currentSlug = (existing as { slug?: string | null }).slug ?? null;
+      if (currentSlug !== slug) {
+        patch.slug = slug;
+      }
+
+      // Entered only when something is actually being patched: an ensure that
+      // found the row already correct has written nothing, and the gate retires
+      // the caches for whatever it wraps.
+      if (Object.keys(patch).length > 0) {
+        await writingPermissions(permissions, async table => {
+          try {
+            await this.db
+              .update(table)
+              .set(patch)
+              .where(eq(table.id, String(existing.id)));
+          } catch (err) {
+            // Same contract as the insert below: a raw driver error never
+            // leaves this service. The reachable case is the slug — it carries
+            // a unique index, so adopting a declared slug already taken by
+            // another row fails here rather than at insert.
+            throw NextlyError.fromDatabaseError(toDbError(this.dialect, err));
+          }
+        });
+      }
+      // A cleared mark is said in the log, with the grants the permission
+      // has, as the sweep says a mark it sets or clears.
+      if (currentlyOrphaned) {
+        await this.logOrphanMarkChange({
+          id: String(existing.id),
+          action,
+          resource,
+          owner: declaredOwner,
+          orphaned: false,
+        });
+      }
+      return { id: String(existing.id), created: false };
+    }
+    const id = randomUUID();
+    const permissionData: PermissionInsertData = {
+      id,
+      name,
+      slug,
+      action,
+      resource,
+      description: description ?? null,
+      owner: meta?.owner ?? null,
+      permissionGroup: meta?.group ?? null,
+      danger: meta?.danger === true,
+    };
+    // A row the catalogue did not have before. Stale in the widening direction
+    // rather than the dangerous one, but a super-admin's key copies the
+    // catalogue and would not see it for the rest of its TTL.
+    //
+    // A plain insert, on every dialect. Skipping a conflicting row in silence
+    // reported this call's id as created when the row stored was another
+    // process's, so a caller then granted an id that was never written.
+    let duplicate: unknown;
+    await writingPermissions(this.tables.permissions, async table => {
+      try {
+        await (this.db as RBACDatabaseInstance)
+          .insert(table)
+          .values(permissionData);
+      } catch (err) {
+        if (isUniqueViolation(err)) {
+          duplicate = err;
+          return;
+        }
+        // Normalise raw driver errors first so the kind is mapped correctly.
+        throw NextlyError.fromDatabaseError(toDbError(this.dialect, err));
+      }
+    });
+    if (duplicate === undefined) return { id, created: true };
+
+    // Several processes starting at once each find the permission missing and
+    // insert it; one wins. Its row is the permission, so this call reports
+    // that row as found. A duplicate with no row for this action and resource
+    // collided on something else (the slug is unique too), and is a failure.
+    const winner = await this.findByActionResource(action, resource);
+    if (winner) return { id: String(winner.id), created: false };
+    throw NextlyError.fromDatabaseError(toDbError(this.dialect, duplicate));
+  }
+
+  /**
+   * Who declared the permission for `action` on `resource`: a plugin's or app's name, `null` for
+   * the framework's own seed, or `undefined` when there is no such permission.
+   */
+  // Published with the service (`nextly`'s services entry).
+  // fallow-ignore-next-line unused-class-member
+  async ownerOf(
+    action: string,
+    resource: string
+  ): Promise<string | null | undefined> {
+    const row = await this.findByActionResource(action, resource);
+    return row ? ((row as { owner?: string | null }).owner ?? null) : undefined;
+  }
+
+  /**
+   * Log that a permission's orphan mark was just set or cleared, naming the
+   * roles that hold it, read from the database after the mark is written.
+   *
+   * A failure to read the grants does not fail the change it reports: the
+   * mark is already written, so the line is logged as a warning that says the
+   * grants could not be read, rather than claiming any.
+   */
+  async logOrphanMarkChange(change: {
+    id: string;
+    action: string;
+    resource: string;
+    owner: string | null;
+    orphaned: boolean;
+  }): Promise<void> {
+    const permission = permissionSlug(change.action, change.resource);
+    let holders: string[];
+    try {
+      holders = await this.rolesHolding(change.id);
+    } catch (error) {
+      this.logger.warn(
+        `Permission "${permission}" ${
+          change.orphaned
+            ? "was marked orphaned"
+            : "had its orphan mark cleared"
+        }, and its grants could not be read: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      return;
+    }
+    this.logger.info?.(
+      orphanMarkChangeLine({
+        permission,
+        owner: change.owner,
+        orphaned: change.orphaned,
+        holders,
+      })
+    );
+  }
+
+  /** The slugs of the roles holding a permission, sorted. */
+  private async rolesHolding(permissionId: string): Promise<string[]> {
+    const { roles, rolePermissions } = this.tables;
+    const rows = (await this.db
+      .select({ slug: roles.slug })
+      .from(rolePermissions)
+      .innerJoin(roles, eq(rolePermissions.roleId, roles.id))
+      .where(eq(rolePermissions.permissionId, permissionId))) as Array<{
+      slug: string | null;
+    }>;
+    return rows.map(row => String(row.slug)).sort();
+  }
+
+  /**
+   * The permission row for an action and resource, or null. Matched without
+   * regard to case, as `listPermissions` matches.
+   */
+  private findByActionResource(
+    action: string,
+    resource: string
+  ): Promise<Record<
+    "id" | "owner" | "slug" | "permissionGroup" | "danger" | "orphanedAt",
+    unknown
+  > | null> {
+    const { permissions } = this.tables;
+    return this.db
+      .select({
+        id: permissions.id,
+        owner: permissions.owner,
+        slug: permissions.slug,
+        permissionGroup: permissions.permissionGroup,
+        danger: permissions.danger,
+        orphanedAt: permissions.orphanedAt,
+      })
+      .from(permissions)
+      .where(
+        and(
+          sql`LOWER(${permissions.action}) = LOWER(${action})`,
+          sql`LOWER(${permissions.resource}) = LOWER(${resource})`
+        )
+      )
+      .limit(1)
+      .then(
+        (
+          rows: Array<
+            Record<
+              | "id"
+              | "owner"
+              | "slug"
+              | "permissionGroup"
+              | "danger"
+              | "orphanedAt",
+              unknown
+            >
+          >
+        ) => rows[0] ?? null
+      );
+  }
+
+  /**
+   * Update a permission's name, action, resource, or description.
+   *
+   * Note: Changing action/resource may affect existing role-permission assignments.
+   *
+   * @param permissionId - Permission ID
+   * @param changes - Fields to update
+   * @returns Success/failure status
+   */
+  /**
+   * Load one permission's editable shape, or refuse.
+   *
+   * The two readers of this — the detail read and the update — had byte-identical lookups, and
+   * the pair became a genuine hazard rather than mere repetition once the unfiltered-lookup guard
+   * arrived: `requireFilterValue` has to wrap the id at BOTH, because Drizzle drops an object
+   * filter key whose value is `undefined` and compiles the query with no WHERE clause at all. One
+   * copy guarded and one not returns an arbitrary row from the second, which is the failure the
+   * guard exists to remove, reintroduced by the copy nobody looked at.
+   *
+   * @throws NextlyError(NOT_FOUND) when no permission carries this id.
+   * @throws NextlyError(INTERNAL_ERROR) when the id is empty — a caller bug, not a missing row.
+   */
+  private async requirePermissionById(permissionId: string): Promise<{
+    id: string;
+    name: string;
+    slug: string;
+    action: string;
+    resource: string;
+    description: string | null;
+  }> {
+    const permission = await (
+      this.db as RBACDatabaseInstance
+    ).query.permissions.findFirst({
+      where: { id: requireFilterValue(permissionId, "permissionId") },
+      columns: {
+        id: true,
+        name: true,
+        slug: true,
+        action: true,
+        resource: true,
+        description: true,
+      },
+    });
+
+    // Identifier moves to logContext per §13.8.
+    if (!permission) {
+      throw NextlyError.notFound({ logContext: { permissionId } });
+    }
+    return permission;
+  }
+
+  async updatePermission(
+    permissionId: string,
+    changes: Partial<
+      Record<(typeof EDITABLE_PERMISSION_FIELDS)[number], string>
+    >
+  ): Promise<void> {
+    try {
+      const permission = await this.requirePermissionById(permissionId);
+
+      if (
+        changes.resource !== undefined &&
+        changes.resource !== permission.resource
+      ) {
+        await this.validateResource(changes.resource);
+      }
+
+      // No-op: nothing to update. Returning void is idempotent and semantically correct here
+      // (the resource is already in the requested state).
+      const movesSomething = EDITABLE_PERMISSION_FIELDS.some(
+        field =>
+          changes[field] !== undefined && changes[field] !== permission[field]
+      );
+      if (!movesSomething) return;
+
+      // Every SUPPLIED field, not only the changed ones -- which is what the enumerated version
+      // did, and the difference is observable: re-sending a field at its current value still
+      // writes it, and a trigger or an updated_at stamp can depend on that.
+      const updateData: PermissionUpdateData = {};
+      for (const field of EDITABLE_PERMISSION_FIELDS) {
+        const value = changes[field];
+        if (value !== undefined) updateData[field] = value;
+      }
+
+      // What this slug means has changed, so every answer resolved from it is
+      // stale — including an API key's grants, which are copied from these very
+      // rows and cached for five minutes under the key's id. A role-based key
+      // would otherwise keep the old spelling and a super-admin's key the old
+      // catalogue until they aged out. No id scopes this: a permission belongs
+      // to no user and no role.
+      await writingPermissions(this.tables.permissions, table =>
+        (this.db as RBACDatabaseInstance)
+          .update(table)
+          .set(updateData)
+          .where(eq(table.id, permissionId))
+      );
+      // A new action, resource or slug changes what every role holding this
+      // permission grants, so scheduled releases are checked again against
+      // it, once the write has landed and the cached answers are retired.
+      if (
+        (["action", "resource", "slug"] as const).some(
+          field =>
+            changes[field] !== undefined && changes[field] !== permission[field]
+        )
+      ) {
+        await afterGrantsChanged();
+      }
+    } catch (err) {
+      // Re-throw NextlyError instances unchanged (e.g. our notFound above);
+      // map raw DB errors via fromDatabaseError. The legacy override message
+      // ("Permission with this slug or name already exists") is dropped:
+      // §13.8 favours generic "Resource already exists." which is what the
+      // unique-violation path already produces.
+      if (NextlyError.is(err)) throw err;
+      // Normalise raw driver errors first so unique-violation etc. are
+      // preserved (would collapse to INTERNAL_ERROR otherwise).
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, err));
+    }
+  }
+
+  /**
+   * Delete a permission by ID if it's not assigned to any roles.
+   *
+   * @param permissionId - Permission ID
+   * @throws NextlyError(NOT_FOUND) when no permission has this id.
+   * @throws NextlyError(FORBIDDEN) when the permission belongs to a system
+   *   resource (system permissions are immutable).
+   * @throws NextlyError(BUSINESS_RULE_VIOLATION) when the permission is
+   *   currently assigned to one or more roles.
+   */
+  /**
+   * Remove one permission row, and retire the answers copied from it.
+   *
+   * Both public deletes reach the same statement by different routes — one is
+   * given the id, the other resolves it from an action and a resource — so the
+   * removal itself is written once. Two copies drift, and the invalidation is
+   * exactly the kind of trailing step one copy loses: a permission row belongs
+   * to no user and no role, so nothing scoped can stand in for it, and a key
+   * that copied the row keeps a grant the install no longer declares.
+   */
+  private async removePermissionRow(permissionId: string): Promise<void> {
+    try {
+      await writingPermissions(this.tables.permissions, table =>
+        (this.db as RBACDatabaseInstance)
+          .delete(table)
+          .where(eq(table.id, permissionId))
+      );
+    } catch (err) {
+      // Normalise raw driver errors so fk-violation / etc. produce the right
+      // NextlyError instead of collapsing to INTERNAL_ERROR.
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, err));
+    }
+  }
+
+  async deletePermissionById(permissionId: string): Promise<void> {
+    const permission = await (
+      this.db as RBACDatabaseInstance
+    ).query.permissions.findFirst({
+      where: { id: requireFilterValue(permissionId, "permissionId") },
+      columns: {
+        id: true,
+        action: true,
+        resource: true,
+      },
+    });
+
+    if (!permission) {
+      throw NextlyError.notFound({ logContext: { permissionId } });
+    }
+
+    refuseDeletingBuiltIn(permission);
+
+    const usage = await (
+      this.db as RBACDatabaseInstance
+    ).query.rolePermissions.findFirst({
+      where: { permissionId: permissionId },
+      columns: {
+        id: true,
+      },
+    });
+
+    if (usage) {
+      // Business rule, not a validation issue: the data was correct, but the
+      // operation can't be completed in the current state. The status comes
+      // from the code, which `NEXTLY_ERROR_STATUS` already maps to 422.
+      throw new NextlyError({
+        code: "BUSINESS_RULE_VIOLATION",
+        publicMessage:
+          "This permission is currently assigned to one or more roles and cannot be deleted.",
+        logContext: { reason: "permission-in-use", permissionId },
+      });
+    }
+
+    await this.removePermissionRow(permissionId);
+  }
+
+  /**
+   * Delete a permission by action and resource if it's not assigned to any roles.
+   *
+   * @param action - Permission action
+   * @param resource - Permission resource
+   * @throws NextlyError(NOT_FOUND) when no permission matches.
+   * @throws NextlyError(FORBIDDEN) when the permission is built in.
+   * @throws NextlyError(BUSINESS_RULE_VIOLATION) when the permission is in use.
+   */
+  async deletePermission(action: string, resource: string): Promise<void> {
+    const { permissions } = this.tables;
+    // Case-insensitive matching to align with listPermissions behavior
+
+    const permission = await this.db
+      .select({
+        id: permissions.id,
+        action: permissions.action,
+        resource: permissions.resource,
+      })
+      .from(permissions)
+      .where(
+        and(
+          sql`LOWER(${permissions.action}) = LOWER(${action})`,
+          sql`LOWER(${permissions.resource}) = LOWER(${resource})`
+        )
+      )
+      .limit(1)
+      .then((rows: unknown[]) => rows[0] || null);
+
+    if (!permission) {
+      // Action + resource pair is operator context only; never echo into
+      // the public message.
+      throw NextlyError.notFound({ logContext: { action, resource } });
+    }
+
+    // The same guard the delete by id runs, before the row is looked at again.
+    refuseDeletingBuiltIn(
+      permission as { id: unknown; action: string; resource: string }
+    );
+    const permissionId = (permission as { id: unknown }).id;
+    const usage = await (
+      this.db as RBACDatabaseInstance
+    ).query.rolePermissions.findFirst({
+      where: { permissionId: permissionId },
+      columns: {
+        id: true,
+      },
+    });
+
+    if (usage) {
+      throw new NextlyError({
+        code: "BUSINESS_RULE_VIOLATION",
+        publicMessage:
+          "This permission is currently assigned to one or more roles and cannot be deleted.",
+        logContext: {
+          reason: "permission-in-use",
+          permissionId: String(permissionId),
+        },
+      });
+    }
+
+    await this.removePermissionRow(String(permissionId));
+  }
+}

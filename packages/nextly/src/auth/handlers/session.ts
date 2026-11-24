@@ -1,0 +1,337 @@
+/**
+ * GET /auth/session
+ * Returns the current session user from the access token.
+ * The cookie/JWT path is purely stateless — no database hit. The one
+ * exception is a user a plugin resolves from a custom credential
+ * (`determineUser`): that answer is a claim about the account, not proof,
+ * so the account row is re-read and gated before it is answered as a
+ * session.
+ *
+ * In dev (NODE_ENV !== "production"), this handler also implements
+ * `admin.devAutoLogin`: when the user has no valid session and the host
+ * config has `admin.devAutoLogin: { email }`, we look up that user and
+ * issue a real session cookie inline. Same JWT-signing codepath the
+ * regular login flow uses (no shortcut for the crypto). Hard-blocked in
+ * production with a console warning so a misconfigured deploy can't
+ * silently auto-login users. See `attemptDevAutoLogin` below.
+ */
+import { respondData } from "../../api/response-shapes";
+import { wholeSecondExpiry } from "../../domains/auth/services/token-account-binding";
+import type { PluginContext } from "../../plugins/plugin-context";
+import { consoleLogger } from "../../shared/types";
+import {
+  clearAccessTokenCookie,
+  readAccessTokenCookie,
+} from "../cookies/access-token-cookie";
+import { sessionCookies } from "../cookies/session-cookies";
+import { buildClaims } from "../jwt/claims";
+import { signAccessToken } from "../jwt/sign";
+import type { AuthHookRegistry } from "../pipeline/hooks";
+import {
+  accountMayHoldSession,
+  type AccountState,
+} from "../session/account-state";
+import { getSession } from "../session/get-session";
+import {
+  generateRefreshToken,
+  generateRefreshTokenId,
+  hashRefreshToken,
+} from "../session/refresh";
+
+import { jsonResponse, buildCookieHeaders } from "./handler-utils";
+import type { AuthRouterDeps } from "./router";
+
+// Track which dev-auto-login emails have already triggered the warning
+// log this process. The handler runs on every /admin/api/auth/session
+// request; without dedup the console fills up.
+const devAutoLoginWarned = new Set<string>();
+
+export type SessionHandlerDeps = Pick<
+  AuthRouterDeps,
+  | "secret"
+  | "isProduction"
+  | "accessTokenTTL"
+  | "refreshTokenTTL"
+  | "devAutoLogin"
+  | "findUserByEmail"
+  | "fetchSessionRoles"
+  | "fetchCustomFields"
+  | "storeRefreshToken"
+> & {
+  // ipAddress is best-effort here — used as the audit signal on the
+  // refresh-token row. Trust-proxy aware lookup happens upstream in
+  // login; for dev-auto-login we accept whatever the framework's
+  // existing extraction returns, since this codepath never runs in
+  // production anyway.
+  trustProxy?: boolean;
+  trustedProxyIps?: string[];
+  /**
+   * Auth-flow hooks (D71). Optional so legacy fixtures keep working; the DI path
+   * always supplies it. `determineUser` runs first, letting a plugin resolve the
+   * current user from a custom credential (e.g. API key) before core cookie/JWT
+   * resolution.
+   */
+  authHooks?: AuthHookRegistry;
+  /** Plugin context for {@link authHooks}; supplied alongside `authHooks`. */
+  pluginCtx?: PluginContext;
+  /**
+   * Account-state lookup for the plugin-resolved user, the same one the
+   * refresh handler gates with. Optional so legacy fixtures keep working;
+   * the DI path always supplies it. Without it a plugin-resolved identity
+   * cannot be checked, so it is not answered.
+   */
+  fetchAccountState?: (userId: string) => Promise<AccountState | null>;
+  /** Whether an unverified email disqualifies the account, as at sign-in. */
+  requireEmailVerification?: boolean;
+};
+
+// Reasons we treat the request as not-authenticated. The first three
+// come from `getSession`: the token's shape and signature, and whether its
+// account may still use it, which answers `invalid`. `user_gone`
+// is the dev-only stale-cookie case: the JWT verifies fine, but the
+// user it points to has been deleted (e.g. `pnpm dev:reset` wiped the
+// DB and re-seeded with a different super-admin id). Treated like
+// `invalid` for cookie cleanup so the stale token does not survive
+// across the next devAutoLogin re-issue.
+type FailureReason = "no_token" | "expired" | "invalid" | "user_gone";
+
+export async function handleSession(
+  request: Request,
+  deps: SessionHandlerDeps
+): Promise<Response> {
+  // determineUser (D71) — let a plugin resolve the current user from a custom
+  // credential (API key, alt token) before core cookie/JWT resolution. Returns
+  // null to fall through to the normal path.
+  if (deps.authHooks && deps.pluginCtx) {
+    const custom = await deps.authHooks.runDetermineUser(
+      request,
+      deps.pluginCtx
+    );
+    if (custom && deps.fetchAccountState) {
+      const state = await deps.fetchAccountState(custom.id);
+      // A password lockout does not disqualify: someone else's wrong guesses
+      // must not end a session the credential itself still holds, the same
+      // terms a refresh is judged on.
+      if (
+        accountMayHoldSession(state, {
+          requireEmailVerification: deps.requireEmailVerification ?? true,
+          enforcePasswordLockout: false,
+        })
+      ) {
+        return respondData({
+          user: {
+            id: custom.id,
+            email: custom.email,
+            name: custom.name ?? null,
+            image: custom.image ?? null,
+          },
+          accessToken: null,
+        });
+      }
+      // The credential names an account that may not hold a session right
+      // now (unknown, deactivated, or unverified where that disqualifies),
+      // so it is not answered as one. The stateless path below returns 401
+      // for a request carrying no cookie/JWT alongside the credential.
+    }
+  }
+
+  const result = await getSession(request, deps.secret);
+
+  let failureReason: FailureReason | null = null;
+  if (!result.authenticated) {
+    failureReason = result.reason;
+  } else if (!deps.isProduction && deps.devAutoLogin) {
+    // Dev-only safeguard against stale cookies. Without this check a
+    // valid JWT signed against an old DB would resolve as
+    // "authenticated", and every downstream permission lookup would
+    // 403 against a phantom user (plus FK-checked writes - permission
+    // cache, audit log - would crash with constraint failures).
+    //
+    // The seed always uses the same email (e.g. dev@nextly.local) but
+    // a fresh user id on each `pnpm dev:reset`, so checking only that
+    // the email exists isn't enough - we also compare ids. Any
+    // mismatch means the JWT's user has been replaced.
+    //
+    // One findUserByEmail per session check is acceptable in dev; the
+    // production path reads only the cached account check in `getSession`.
+    const live = await deps.findUserByEmail(result.user.email);
+    if (!live || live.id !== result.user.id) failureReason = "user_gone";
+  }
+
+  if (failureReason === null && result.authenticated) {
+    // Bare `{ user, accessToken }` per spec §7.6. The access token
+    // already verified successfully (it's how we got here), so reading it
+    // back from the cookie is safe. We surface it in the body so
+    // non-cookie SDK consumers (mobile, CLI) can pull the live token
+    // without owning cookie storage.
+    const accessToken = readAccessTokenCookie(request);
+    return respondData({ user: result.user, accessToken });
+  }
+
+  // Try dev-auto-login before the 401 path. Only fires when:
+  //   - NODE_ENV !== "production" (hard runtime gate)
+  //   - admin.devAutoLogin is configured with an email
+  //   - the named user actually exists (we don't create users here)
+  // Also reached when the JWT is valid but its user no longer exists
+  // in the DB (the stale-cookie-after-reset case above).
+  if (!deps.isProduction && deps.devAutoLogin) {
+    const autoLoginResponse = await attemptDevAutoLogin(deps);
+    if (autoLoginResponse) return autoLoginResponse;
+  } else if (deps.isProduction && deps.devAutoLogin) {
+    // Production guardrail: the config field shouldn't be set in prod,
+    // and even if it is we ignore it. Warn loudly once per config load.
+    const key = (deps.devAutoLogin as { email: string }).email;
+    if (!devAutoLoginWarned.has(`prod:${key}`)) {
+      devAutoLoginWarned.add(`prod:${key}`);
+      // The configured email stays out: a production log is no place for an
+      // address, and the warning is actionable without it.
+      consoleLogger.warn(
+        `[nextly] devAutoLogin ignored: NODE_ENV=production. ` +
+          `Set this only for development.`
+      );
+    }
+  }
+
+  // Only clear the access cookie when the JWT is tampered/malformed
+  // ("invalid"), or when its user has been deleted from the dev DB
+  // ("user_gone") - in either case the cookie is junk and should not
+  // round-trip again. For an expired JWT we want the cookie to stay so
+  // the client can still receive TOKEN_EXPIRED on parallel in-flight
+  // requests and participate in the single coalesced refresh; clearing
+  // here forces sibling requests into the no_token to AUTH_REQUIRED
+  // branch, which bypasses refresh.
+  const clearCookies: string[] = [];
+  if (failureReason === "invalid" || failureReason === "user_gone") {
+    clearCookies.push(clearAccessTokenCookie());
+  }
+
+  const code = failureReason === "expired" ? "TOKEN_EXPIRED" : "AUTH_REQUIRED";
+  const message =
+    code === "TOKEN_EXPIRED" ? "Session expired" : "Not authenticated";
+
+  if (clearCookies.length > 0) {
+    return new Response(JSON.stringify({ error: { code, message } }), {
+      status: 401,
+      headers: buildCookieHeaders(clearCookies),
+    });
+  }
+
+  return jsonResponse(401, { error: { code, message } });
+}
+
+/**
+ * Issue a real session for the configured devAutoLogin user. Mirrors the
+ * happy-path of handleLogin (jwt/sign + refresh-token/store + cookie/set)
+ * but deliberately skips password verification, lockout tracking,
+ * email-verification gating, and audit logging because:
+ *   - the contributor configured this in their own nextly.config.ts
+ *   - the path is hard-blocked in production by handleSession's caller
+ *   - bypassing `lockedUntil` and `emailVerified` is intentional: a dev
+ *     environment shouldn't lock the contributor out of their own admin
+ *     for typing the wrong password, and we don't want to require email
+ *     verification flows just to log into the playground
+ *
+ * The only check that DOES fire is `isActive`; a deactivated user
+ * shouldn't be auto-logged-in even in dev.
+ *
+ * Returns null when the user can't be found or the config shape is bad,
+ * letting handleSession fall through to the normal 401.
+ */
+async function attemptDevAutoLogin(
+  deps: SessionHandlerDeps
+): Promise<Response | null> {
+  if (!deps.devAutoLogin) return null;
+  const { email } = deps.devAutoLogin;
+  if (!email) return null;
+
+  const user = await deps.findUserByEmail(email);
+  if (!user || !user.isActive) {
+    if (!devAutoLoginWarned.has(`miss:${email}`)) {
+      devAutoLoginWarned.add(`miss:${email}`);
+      consoleLogger.warn(
+        `[nextly] devAutoLogin: user "${email}" not found. ` +
+          `Auto-login skipped. Either register the user or update ` +
+          `admin.devAutoLogin.email in your nextly.config.ts.`
+      );
+    }
+    return null;
+  }
+
+  // Per-process startup notice. Loud enough to spot in logs but
+  // dedup'd so it doesn't spam every session check.
+  if (!devAutoLoginWarned.has(`active:${email}`)) {
+    devAutoLoginWarned.add(`active:${email}`);
+    consoleLogger.warn(
+      `[nextly] devAutoLogin enabled for ${email}. ` +
+        `DO NOT use this in production deployments.`
+    );
+  }
+
+  // The shared account-state gate does not run on this path. It mints a
+  // session directly rather than through `issueSession`, and it is hard-blocked
+  // in production above, so the only accounts it can reach are ones a developer
+  // named in their own config.
+  const [sessionRoles, customFields] = await Promise.all([
+    deps.fetchSessionRoles(user.id),
+    deps.fetchCustomFields(user.id),
+  ]);
+  const { roleIds } = sessionRoles;
+
+  const claims = buildClaims({
+    userId: user.id,
+    email: user.email,
+    name: user.name,
+    image: user.image,
+    roleIds,
+    // Null on a row from before the column existed: epoch zero.
+    sessionEpoch: user.sessionEpoch ?? 0,
+    customFields,
+  });
+
+  // Capped as every session's token is, by the first of its roles to lapse.
+  const accessToken = await signAccessToken(
+    claims,
+    deps.secret,
+    deps.accessTokenTTL,
+    "session",
+    sessionRoles.validUntil
+  );
+  const rawRefreshToken = generateRefreshToken();
+  const refreshTokenHash = hashRefreshToken(rawRefreshToken);
+  await deps.storeRefreshToken({
+    id: generateRefreshTokenId(),
+    userId: user.id,
+    tokenHash: refreshTokenHash,
+    userAgent: null,
+    ipAddress: null,
+    // The whole second the instant falls in, as every session path: a
+    // column that keeps whole seconds rounds milliseconds rather than
+    // cutting them, which would store the session as living longer than
+    // issued.
+    expiresAt: wholeSecondExpiry(
+      new Date(Date.now() + deps.refreshTokenTTL * 1000)
+    ),
+  });
+
+  const cookies = sessionCookies(accessToken, rawRefreshToken, deps);
+
+  // Match the `respondData({ user, accessToken })` shape that the
+  // authenticated `handleSession` branch returns above so SDK clients
+  // (mobile, CLI, custom admin) parsing /auth/session see one shape
+  // regardless of whether dev-auto-login fired.
+  return new Response(
+    JSON.stringify({
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        image: user.image,
+      },
+      accessToken,
+    }),
+    {
+      status: 200,
+      headers: buildCookieHeaders(cookies),
+    }
+  );
+}

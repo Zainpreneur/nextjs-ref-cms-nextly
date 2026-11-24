@@ -1,0 +1,1924 @@
+/**
+ * Activity Log Service
+ *
+ * Records and queries user activity (create/update/delete) across all
+ * collections. Designed for the dashboard activity feed — not a full
+ * audit log. Writes are fire-and-forget; failures never propagate to
+ * the caller.
+ *
+ * @module services/dashboard/activity-log-service
+ * @since 1.0.0
+ */
+
+import { randomUUID } from "crypto";
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import type { WhereClause } from "@nextlyhq/adapter-drizzle/types";
+import { and, eq, gte, inArray, type Column, type Table } from "drizzle-orm";
+import { z } from "zod";
+
+import { authorizationGroups } from "../../auth/entity-read-access";
+import type { RequestActorType } from "../../auth/request-actor";
+import { toDbError } from "../../database/errors";
+// PR 4 migration: switched from ServiceError.fromDatabaseError to
+// NextlyError.fromDatabaseError. Public message stays generic per §13.8;
+// the underlying DbError is preserved as `cause` and rich DB context
+// (kind, dialect, code) flows into logContext automatically.
+import { insertErasureAware } from "../../domains/audit/erasure-aware-insert";
+import { effectiveWidgetLimit } from "../../domains/widgets/query-limits";
+import { NextlyError } from "../../errors";
+import type { LockableRead } from "../../shared/lib/row-lock";
+import { BaseService } from "../base-service";
+import {
+  resolveDocumentVisibilityScope,
+  visibleDocuments,
+  type DocumentRef,
+  type DocumentVisibilityScope,
+} from "../lib/document-visibility";
+import { existingDocumentIds } from "../lib/readable-documents";
+import type { Logger } from "../shared";
+
+import {
+  activityEventOf,
+  activityMetadataOf,
+  isContentSave,
+  isSettingsChange,
+  isSettingsNamespace,
+  type ActivityEvent,
+} from "./activity-changes";
+import {
+  afterRun,
+  runKeyOf,
+  runsOf,
+  type ActivityRun,
+  type CutRun,
+} from "./activity-runs";
+import {
+  someResources,
+  type ReadableResources,
+  type ReadCaller,
+} from "./readable-resources";
+
+/**
+ * What an activity-log entry records was done: the three mutations, and
+ * `read` for a read worth recording, such as a search of the delivery log by
+ * address (`address-search-activity`).
+ */
+export type ActivityLogAction = "create" | "update" | "delete" | "read";
+
+/** A single activity log record as returned by queries. */
+export interface ActivityLogEntry {
+  id: string;
+  /**
+   * What KIND of caller `userId` refers to.
+   *
+   * `"user"` on a row written before the column existed: no other kind was
+   * recordable then, so the NULL is read rather than guessed.
+   */
+  actorType: RequestActorType;
+  /**
+   * The actor, as an opaque reference that outlives their account.
+   *
+   * Still set after the account is deleted — that is what keeps one deleted
+   * actor's entries distinguishable from another's.
+   */
+  userId: string;
+  /** NULL once the actor's account was deleted and their identity erased. */
+  userName: string | null;
+  /** NULL once the actor's account was deleted and their identity erased. */
+  userEmail: string | null;
+  action: ActivityLogAction;
+  /**
+   * What the row says happened, as a reader is told it (`activityEventOf`):
+   * created, saved, published, unpublished or deleted. Absent from a
+   * settings change, and from an update whose record leaves open what it did:
+   * one written before its changed fields were recorded, or one of a document
+   * that no longer exists, whose marks were dropped with its title (see
+   * `historyOfRemovedDocuments`). Such a row says no more than its action.
+   */
+  event?: ActivityEvent;
+  collection: string;
+  entryId: string | null;
+  entryTitle: string | null;
+  /**
+   * What the row is about: a collection's entry, a Single, or an
+   * install-level settings change. A row written before the kind was recorded
+   * and filed under a settings namespace is a settings change, and says so
+   * (`isSettingsChange`, the rule the feed's runs and events read it by); any
+   * other such row is NULL, which is a collection's. Lets a reader head a
+   * Single's row by its label, and a settings change by what it changed,
+   * rather than read `collection` as a collection's slug.
+   */
+  subjectKind?: ActivitySubjectKind | null;
+  metadata: Record<string, unknown> | null;
+  /** When the save this row shows was made: the latest of a run's. */
+  createdAt: string;
+  /**
+   * How many saves this row stands for: one, or a run of one person's
+   * repeated saves of one document (see `activity-runs`). `id`, `createdAt`
+   * and `metadata` are the latest save's.
+   */
+  count: number;
+  /**
+   * Whether `count` is a floor: the feed's walk stopped at its bound inside
+   * the run, so more of it may lie beyond.
+   */
+  countAtLeast: boolean;
+  /** When the run's first save was made; `createdAt` for a single row. */
+  firstCreatedAt: string;
+  /**
+   * When THIS ROW's identity was erased. NULL while the actor still exists.
+   *
+   * The row's own erasure, deliberately, not the account's deletion. For an
+   * entry erased by a deletion the two coincide, because the erasure runs
+   * inside that transaction. For one written after the account was already
+   * gone they do not: nothing retains when that deletion happened, and
+   * claiming otherwise would put a number in an audit field that no record
+   * supports. Separate from a NULL name because "erased" and "never carried a
+   * name" are different facts, and only this one answers when.
+   */
+  identityErasedAt: string | null;
+}
+
+/** Input for recording a new activity. */
+export interface LogActivityInput {
+  /**
+   * What KIND of caller `userId` refers to.
+   *
+   * Decides how the write is stored, not just how it reads: only a `user` has
+   * an account, so only a user's write is routed through the erasure-aware
+   * insert. A key or system identifier has no row in `users`, and looking it up
+   * there would write the entry already-erased.
+   */
+  actorType: RequestActorType;
+  /**
+   * The actor's opaque reference, whatever the kind — a user's id, an API key's
+   * own id, or a system caller's reserved name. Never null: it is what keeps
+   * one actor's entries distinguishable from another's after erasure.
+   */
+  userId: string;
+  /**
+   * Display name to denormalize onto the row. Omit to take it from the account
+   * itself, which is what a caller that holds only an actor id does — the write
+   * already reads that row to decide whether the account still exists, so the
+   * name comes from the same look, under the same lock, as that decision.
+   */
+  userName?: string;
+  /** Email to denormalize onto the row; omit to take it from the account. */
+  userEmail?: string;
+  action: ActivityLogAction;
+  collection: string;
+  entryId?: string;
+  entryTitle?: string;
+  /** The language this write was made in; NULL means the default one. */
+  locale?: string | null;
+  /**
+   * What this row is ABOUT: a collection document, a single, or an
+   * install-level settings change. Omitted means "not stated", which the feed
+   * falls back to inferring from the registry — see `subjectOf`.
+   */
+  subjectKind?: ActivitySubjectKind | null;
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * A page of activity, and whether more of it exists.
+ *
+ * 🔴 There is deliberately no `total`. It used to be a `COUNT(*)` over the rows
+ * a caller's COLLECTION scope admitted, which counted edits to documents the
+ * caller may not read — the same disclosure the rows themselves carried, in a
+ * number. It cannot simply be narrowed either: a document rule can be an
+ * arbitrary function, so an authorized total means authorizing every matching
+ * row, which is unbounded over an audit table that grows forever.
+ *
+ * Publishing a number that cannot be made correct is worse than publishing
+ * none, so `hasMore` carries the pagination instead — the cursor-shaped answer
+ * this endpoint was already moving toward, and the one that does not put an
+ * unbounded aggregate on a growing table in front of every dashboard load.
+ */
+export interface ActivityLogResult {
+  activities: ActivityLogEntry[];
+  hasMore: boolean;
+  /**
+   * Where the next page starts, when there is one: strictly older than the
+   * OLDEST save of the last row shown, so a run is never shown again, in part,
+   * at the top of the next page. Pass it back as `before`. A page that showed
+   * nothing because every row its walk read was hidden starts the next one
+   * after the last row read instead, so the walk can pass any run of them.
+   */
+  next?: ActivityPosition;
+}
+
+/**
+ * A position in the feed's order: the instant and the id that breaks a tie at it.
+ *
+ * 🔴 SERVER-SIDE ONLY. A position can name a row its caller may not read -- the
+ * last row a walk read when it found nothing to show -- and so says that some
+ * activity this reader may not see happened at that instant. The id is random
+ * and names nothing; the instant is the disclosure. The dashboard endpoint
+ * publishes no position, and an HTTP route that comes to page the feed must
+ * hand out an opaque cursor at its own boundary, never this value as it is.
+ */
+export interface ActivityPosition {
+  createdAt: string;
+  id: string;
+  /**
+   * Present when the page before was cut inside a run, which it showed as a
+   * floor: the run's own key, so the page after leaves out the rest of it
+   * rather than showing it again as a row of its own. Opaque; it names only
+   * what the run's row already showed (who, which document).
+   */
+  run?: string;
+}
+
+/** Options for querying the activity log. */
+export interface ActivityLogQueryOptions {
+  limit?: number;
+  /**
+   * How many rows of the TRAIL the first read skips, not how many rows of the
+   * feed: a run of saves is many trail rows and one feed row, so an offset in
+   * feed rows would mean walking from the top on every page. Ignored when
+   * `before` is given; `before` is how a page follows the last.
+   */
+  offset?: number;
+  /** Start strictly after this position: the previous page's `next`. */
+  before?: ActivityPosition;
+  collection?: string;
+  userId?: string;
+  /**
+   * Which resources the caller may read. An omitted scope denies: this feed
+   * exposes entry titles across every collection, so a caller that forgets to
+   * scope it must get nothing rather than everything.
+   */
+  scope?: ReadableResources;
+  /**
+   * WHO is reading, so each row's document can be authorized.
+   *
+   * 🔴 Required in practice for the same reason `scope` is, and omitted the
+   * same way: no caller means no document can be authorized, so a feed asked
+   * without one answers empty rather than answering about everything the scope
+   * admits. The scope decides which collections are in reach; only the caller
+   * decides which of their documents are, and the read path's own filtering
+   * makes those different sets.
+   */
+  caller?: ReadCaller;
+  /**
+   * The Singles as the registry holds them now, for the rows that are a
+   * Single's. Omitted, or from a registry read that did not complete, no
+   * Single's row is returned: which Singles are kept off the dashboard is then
+   * unknown, and showing every Single's row would show the hidden ones too.
+   */
+  singles?: ActivitySingles;
+  /**
+   * The collections kept off the dashboard, whose rows the feed leaves out for
+   * every caller, a super-admin included: the dashboard shows what the admin's
+   * navigation shows (`keptOffDashboard`). Omitted, none are left out, as the
+   * activity count treats an omitted set. From a registry read that did not
+   * complete, the feed answers no rows at all, as the dashboard's activity
+   * count answers none: which collections are hidden is then unknown, and a
+   * hidden one's rows cannot be told from the rest.
+   */
+  keptOffCollections?: ActivityKeptOffCollections;
+}
+
+/**
+ * The collections one registry read found kept off the dashboard. `complete` is
+ * false when the read did not finish, and `slugs` then describes nothing.
+ */
+export interface ActivityKeptOffCollections {
+  slugs: ReadonlySet<string>;
+  complete: boolean;
+}
+
+/**
+ * The Singles one registry read found: each one's label, and which are kept
+ * off the dashboard. `complete` is false when the read did not finish, and the
+ * two sets then describe nothing.
+ */
+export interface ActivitySingles {
+  labels: ReadonlyMap<string, string>;
+  keptOff: ReadonlySet<string>;
+  complete: boolean;
+}
+
+/**
+ * The condition that leaves the rows of Singles kept off the dashboard out of
+ * the feed, by the row's stated kind.
+ *
+ * Written as three alternatives so a row that states no kind, from before the
+ * kind was recorded, always passes: that row is a collection's or a settings
+ * change's, and a bare `NOT (kind = 'single' AND ...)` evaluates to unknown on
+ * its NULL and would drop it. With no complete read of the Singles, only the
+ * first two remain, so every Single's row is left out rather than a hidden
+ * one shown.
+ */
+function singlesKeptOffClause(
+  singles: SinglesKeptOff | undefined
+): WhereClause | undefined {
+  const complete = singles?.complete === true;
+  // Nothing to leave out: no clause, rather than one every row satisfies.
+  if (complete && singles.keptOff.size === 0) return undefined;
+  return {
+    or: [
+      { column: "subjectKind", op: "IS NULL" },
+      { column: "subjectKind", op: "!=", value: "single" },
+      ...(complete
+        ? [
+            {
+              column: "collection",
+              op: "NOT IN" as const,
+              value: [...singles.keptOff],
+            },
+          ]
+        : []),
+    ],
+  };
+}
+
+/** What the feed needs of the Singles to leave the hidden ones out: not their labels. */
+type SinglesKeptOff = Pick<ActivitySingles, "keptOff" | "complete">;
+
+/**
+ * The conditions every read of the feed starts from, the feed's and the activity count's alike:
+ * inside what the caller may read, and without the rows of Singles and collections kept off the
+ * dashboard. `null` when the scope admits nothing, which is answered without a query (an empty
+ * `IN ()` is a syntax error on some dialects), and when the kept-off collections could not be
+ * read, so a hidden collection's rows are never shown for want of knowing it is hidden.
+ */
+function feedConditions(
+  scope: ReadableResources,
+  singles: SinglesKeptOff | undefined,
+  keptOffCollections: ActivityKeptOffCollections | undefined
+): NonNullable<WhereClause["and"]> | null {
+  if (keptOffCollections?.complete === false) return null;
+  const conditions: NonNullable<WhereClause["and"]> = [];
+  if (scope.kind === "some") {
+    if (scope.resources.size === 0) return null;
+    conditions.push({
+      column: "collection",
+      op: "IN",
+      value: [...scope.resources],
+    });
+  }
+  const singlesClause = singlesKeptOffClause(singles);
+  if (singlesClause !== undefined) conditions.push(singlesClause);
+  const collectionsClause = collectionsKeptOffClause(
+    keptOffCollections?.slugs ?? new Set()
+  );
+  if (collectionsClause !== undefined) conditions.push(collectionsClause);
+  return conditions;
+}
+
+/**
+ * The condition that leaves the rows of collections kept off the dashboard out of the feed and
+ * its count. A row that states no kind is read as a collection's, as the feed reads it, so only rows stating
+ * another kind are spared; `IN` is unknown on that row's NULL, and the slug decides.
+ */
+function collectionsKeptOffClause(
+  keptOff: ReadonlySet<string>
+): WhereClause | undefined {
+  if (keptOff.size === 0) return undefined;
+  return {
+    or: [
+      { column: "subjectKind", op: "IN", value: ["single", "settings"] },
+      { column: "collection", op: "NOT IN", value: [...keptOff] },
+    ],
+  };
+}
+
+/**
+ * The conditions narrowing the saves to one subject's, by its slug AND its
+ * kind, since a collection and a Single may share a slug: a collection's
+ * entries, by a row stating that kind or none (a row written before the kind
+ * was recorded is a collection's), and a Single's document, by a row stating
+ * it is a Single's. None when neither is asked for.
+ */
+function oneSubjectConditions(
+  options: Pick<RecentEditsOptions, "collection" | "single">
+): NonNullable<WhereClause["and"]> {
+  const conditions: NonNullable<WhereClause["and"]> = [];
+  if (options.collection !== undefined) {
+    conditions.push(
+      { column: "collection", op: "=", value: options.collection },
+      {
+        or: [
+          { column: "subjectKind", op: "IS NULL" },
+          { column: "subjectKind", op: "=", value: "collection" },
+        ],
+      }
+    );
+  }
+  if (options.single !== undefined) {
+    conditions.push(
+      { column: "collection", op: "=", value: options.single },
+      { column: "subjectKind", op: "=", value: "single" }
+    );
+  }
+  return conditions;
+}
+
+/**
+ * The conditions that keep the saves of one person (`savedBy`) or every save
+ * but theirs (`notSavedBy`), from one statement of what "a person's save" is,
+ * so the two are exact complements: a row written before the kind was
+ * recorded is a person's; an API key's save is never one, whatever its id.
+ */
+function saverConditions(
+  options: Pick<RecentEditsOptions, "savedBy" | "notSavedBy">
+): WhereClause[] {
+  const conditions: WhereClause[] = [];
+  const byPerson = (id: string): WhereClause => ({
+    and: [
+      { column: "userId", op: "=", value: id },
+      {
+        or: [
+          { column: "actorType", op: "IS NULL" },
+          { column: "actorType", op: "=", value: "user" },
+        ],
+      },
+    ],
+  });
+  if (options.savedBy !== undefined) {
+    conditions.push(byPerson(options.savedBy));
+  }
+  if (options.notSavedBy !== undefined) {
+    // NOT of the person's condition, spelled out: a NULL `userId` is nobody's.
+    conditions.push({
+      or: [
+        { column: "userId", op: "IS NULL" },
+        { column: "userId", op: "!=", value: options.notSavedBy },
+        {
+          and: [
+            { column: "actorType", op: "IS NOT NULL" },
+            { column: "actorType", op: "!=", value: "user" },
+          ],
+        },
+      ],
+    });
+  }
+  return conditions;
+}
+
+/** Options for the documents most recently saved; see `getRecentEdits`. */
+export interface RecentEditsOptions {
+  /** How many documents the card shows; clamped as every widget query is. */
+  limit?: number;
+  /** Which resources the caller may read; omitted, it denies, as the feed's does. */
+  scope?: ReadableResources;
+  /** WHO is reading, so each save's document can be authorized; omitted, nothing is answered. */
+  caller?: ReadCaller;
+  singles?: ActivitySingles;
+  keptOffCollections?: ActivityKeptOffCollections;
+  /** Only this collection's entries: never a Single, which may share its slug. */
+  collection?: string;
+  /**
+   * Only this Single's document: never a collection's entries, which may share
+   * its slug. Given with `collection`, both narrow, and no save is of both.
+   */
+  single?: string;
+  /**
+   * Only saves this person made. A PERSON's id: a row whose actor is an API
+   * key never matches it, though a key's id and a person's could be equal.
+   */
+  savedBy?: string;
+  /**
+   * Only saves this person did NOT make: every other person's, and every API
+   * key's, whatever its id. The exact complement of `savedBy` for the same id.
+   */
+  notSavedBy?: string;
+  /**
+   * Whether a publish or an unpublish on its own counts as its document's
+   * latest change. Off by default, as the cards that list what someone edited
+   * read the trail: there a publish never takes the row of the person who made
+   * the edits. On, each document's latest create or update is its row,
+   * whatever it changed, for a reader asking who last changed a document and
+   * when, which a status change does.
+   */
+  statusChanges?: boolean;
+}
+
+/**
+ * One document's latest save, as the feed maps a row, with the language it was
+ * saved in: null for a document's only or default language.
+ */
+export type RecentEdit = ActivityLogEntry & { locale: string | null };
+
+/** The documents most recently saved, newest first, one row each. */
+export interface RecentEdits {
+  /** Each document's latest save the caller may see. */
+  edits: RecentEdit[];
+  /** Whether another document lies past them, read and authorized like the rest. */
+  hasMore: boolean;
+}
+
+/** Options for counting recent activity; see `countRecentActivity`. */
+export interface RecentActivityCountOptions {
+  /** Rows after this instant are counted. */
+  since: Date;
+  /** Which resources the caller may read; omitted denies, as the feed's does. */
+  scope?: ReadableResources;
+  /** Who is reading, so each row's document is authorized as the feed's is. */
+  caller?: ReadCaller;
+  /** The Singles kept off the dashboard, as the feed is given them. */
+  singles?: SinglesKeptOff;
+  /** The collections kept off the dashboard, whose rows the figure leaves out. */
+  keptOffCollections?: ReadonlySet<string>;
+}
+
+/** A count of the feed's rows: whole, or a floor when the walk stopped at its bound. */
+export interface RecentActivityCount {
+  count: number;
+  /** The walk stopped at its bound with rows unread: at least `count` rows. */
+  atLeast: boolean;
+}
+
+const TABLE = "activity_log";
+
+/**
+ * Rows read per refill round.
+ *
+ * Larger than a dashboard page on purpose: a card asks for five, and reading
+ * five at a time would spend a round trip per unreadable row. Small enough that
+ * a round is a cheap read on a table that only grows.
+ */
+const ACTIVITY_PAGE_SIZE = 100;
+
+/**
+ * How many rounds a page will refill before answering short.
+ *
+ * The bound on an install whose recent activity is almost entirely unreadable
+ * to this caller. Reaching it returns FEWER rows than asked for, never rows the
+ * caller may not see, so the failure direction is a thin feed rather than a
+ * disclosure.
+ */
+const MAX_REFILL_ROUNDS = 10;
+
+/** `value` when it is a string, so a driver's `null` or number cannot pass. */
+function stringOr(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+/** The kind the ROW states, or undefined on a row written before the column. */
+function statedKindOf(
+  row: Record<string, unknown>
+): ActivitySubjectKind | undefined {
+  const stated = row.subjectKind;
+  return stated === "collection" || stated === "single" || stated === "settings"
+    ? stated
+    : undefined;
+}
+
+/**
+ * The heading a row is shown under. A Single's row takes the Single's label as
+ * the registry holds it now, so a renamed Single's rows read as it does today,
+ * and falls back to the label stored with the row. Every other row keeps the
+ * title it was recorded with: a deleted entry's title can be recovered nowhere
+ * else.
+ */
+function headingOf(
+  row: Record<string, unknown>,
+  singleLabels: ReadonlyMap<string, string> | undefined
+): string | null {
+  const stored = toNullableString(row.entryTitle);
+  if (statedKindOf(row) !== "single") return stored;
+  const slug = stringOr(row.collection);
+  return (slug === undefined ? undefined : singleLabels?.get(slug)) ?? stored;
+}
+
+/** True when `slug` names one of the install-level settings namespaces. */
+
+/** A decided document subject, with the language the write was made in. */
+function documentSubject(
+  kind: "collection" | "single",
+  slug: string,
+  entryId: string,
+  row: Record<string, unknown>
+): ActivitySubject {
+  // 🔴 The language the write was made IN, so the read rule is evaluated for
+  // that translation. A localized field answers differently per language, so a
+  // row judged without one is judged against the default — and an edit made in
+  // a language the rule denies would still show its title.
+  return {
+    kind: "document",
+    ref: { kind, slug, entryId, locale: stringOr(row.locale) ?? null },
+  };
+}
+
+/**
+ * What to do with a row that states no kind — one written before the column.
+ *
+ * 🔴 The column is nullable and NOT backfilled, so every upgraded installation
+ * keeps rows like these indefinitely and this is the only classification they
+ * ever get. The settings namespaces are therefore named EXPLICITLY rather than
+ * inferred from a registry miss: reading "not in the registry" as install-level
+ * returns a document whose collection has just been removed with its raw title,
+ * metadata and actor and no rule applied, which an HMR reload between the scope
+ * query and this pass makes ordinary.
+ *
+ * The COLLISION is the case that cannot be resolved, and it is resolved the only
+ * safe way. A resource that already held a now-reserved name may keep it, so a
+ * slug can be both a settings namespace and a registered collection — and a
+ * legacy row carries nothing saying which it was. Guessing "settings" would
+ * return a real document's row unauthorized, so it is dropped. Rows written from
+ * here on state their kind and are never ambiguous; what is lost is legacy
+ * settings detail, on colliding installations only.
+ *
+ * A row from before the column is a COLLECTION's or a settings change's, never
+ * a Single's: Singles were not recorded until every row they write stated its
+ * kind. So a legacy row under a slug the registry now holds as a Single is a
+ * collection row whose slug a Single has since taken, and it is dropped rather
+ * than shown as that Single's. The kept-off filters read such a row as a
+ * collection's too, so the two never disagree about what it is.
+ */
+function legacySubject(
+  row: Record<string, unknown>,
+  slug: string,
+  entryId: string,
+  kinds: ReadonlyMap<string, "collection" | "single">
+): ActivitySubject {
+  const registered = kinds.get(slug);
+  if (isSettingsNamespace(slug)) {
+    return registered ? { kind: "undecidable" } : { kind: "install-level" };
+  }
+  if (registered !== "collection") return { kind: "undecidable" };
+  return documentSubject(registered, slug, entryId, row);
+}
+
+/**
+ * What a feed row is, once the registry has been consulted.
+ *
+ * The row's `collection` is a FREE STRING whose namespace is deliberately wider
+ * than the registries — settings mutations are filed under names that are
+ * neither a collection nor a single — so what the row STATES, and failing that
+ * the registry, is what separates a content event from an install-level one.
+ */
+function subjectOf(
+  row: Record<string, unknown>,
+  kinds: ReadonlyMap<string, "collection" | "single">
+): ActivitySubject {
+  const slug = stringOr(row.collection);
+  const entryId = stringOr(row.entryId);
+  const stated = statedKindOf(row);
+
+  // A Single's row with no document id names a document no read check can be
+  // asked about, and a Single's row is shown only once one has answered. Every
+  // Single row is written with its live id, so this drops only a row that was
+  // not, rather than showing it to everyone as an install-level event.
+  if (stated === "single" && !entryId) return { kind: "undecidable" };
+
+  // No entry id, or a row that says it is a settings change: an install-level
+  // event with no document to authorize.
+  if (!slug || !entryId || stated === "settings") {
+    return { kind: "install-level" };
+  }
+
+  // A row that STATES a document kind is a document — but only a registered
+  // slug supplies a read path to ask, so one whose collection has gone is
+  // undecidable rather than install-level.
+  if (stated) {
+    return kinds.has(slug)
+      ? documentSubject(stated, slug, entryId, row)
+      : { kind: "undecidable" };
+  }
+
+  return legacySubject(row, slug, entryId, kinds);
+}
+
+/** One existence probe's worth of refused rows: a collection, in a language. */
+interface ProbeUnit {
+  slug: string;
+  locale: string | null;
+  entries: { row: Record<string, unknown>; entryId: string }[];
+}
+
+/**
+ * `refused` grouped into the units one existence probe can answer for.
+ *
+ * Per collection AND language, matching how the read path is asked: a localized
+ * document is a different row per translation, so one probe per slug would ask
+ * about whichever language the read defaulted to.
+ *
+ * Singles are excluded, and their absence is deliberate rather than an omission.
+ * A Single's document is REPLACED rather than removed, so
+ * `resolveSingleDocumentId` still answers and the read path can decide — there
+ * is no "gone" case here for a probe to find.
+ */
+function probeUnits(
+  refused: readonly Record<string, unknown>[],
+  scope: DocumentVisibilityScope
+): ProbeUnit[] {
+  const units = new Map<string, ProbeUnit>();
+  for (const row of refused) {
+    const subject = subjectOf(row, scope.kinds);
+    if (subject.kind !== "document" || subject.ref.kind !== "collection") {
+      continue;
+    }
+    const ref = subject.ref;
+    const locale = ref.locale ?? null;
+    const key = `${ref.slug} ${locale ?? ""}`;
+    const entry = { row, entryId: ref.entryId };
+    const unit = units.get(key);
+    if (unit) unit.entries.push(entry);
+    else units.set(key, { slug: ref.slug, locale, entries: [entry] });
+  }
+  return [...units.values()];
+}
+
+/**
+ * The Drizzle surface an activity write needs.
+ *
+ * Structural rather than the concrete types because the real ones are
+ * dialect-specific (NodePgDatabase / MySql2Database / BetterSQLite3Database),
+ * while the fluent API is identical.
+ */
+export interface ActivityWriteDb {
+  insert(table: unknown): { values(data: unknown): Promise<unknown> };
+  select(fields: unknown): {
+    from(table: unknown): {
+      where(condition: unknown): {
+        limit(count: number): LockableRead<Record<string, unknown>[]>;
+      };
+    };
+  };
+}
+
+/** The same surface plus the transaction a lock has to be held inside. */
+interface TransactionalActivityDb extends ActivityWriteDb {
+  transaction<T>(work: (tx: ActivityWriteDb) => Promise<T>): Promise<T>;
+}
+
+/** The two tables an activity write reads and writes. */
+interface ActivityWriteTables {
+  activityLog: Table & { identityErasedAt: Column };
+  users: Table & { id: Column; name: Column; email: Column };
+}
+
+/** The two tables the saved-Singles read joins, by their Drizzle properties. */
+interface SavedSinglesTables {
+  activityLog: Table & {
+    collection: Column;
+    subjectKind: Column;
+    createdAt: Column;
+  };
+  dynamicSingles: Table & { slug: Column; createdAt: Column };
+}
+
+/**
+ * The query surface the saved-Singles read uses, as each dialect's Drizzle
+ * builder has it: the builders differ per driver, the chain does not.
+ */
+interface DistinctJoinDb {
+  selectDistinct(fields: Record<string, unknown>): {
+    from(table: unknown): {
+      innerJoin(
+        table: unknown,
+        on: unknown
+      ): {
+        where(condition: unknown): Promise<Record<string, unknown>[]>;
+      };
+    };
+  };
+}
+
+/**
+ * One query filter, in the single spelling its only consumer needs.
+ *
+ * `adapter.select` resolves a name against the Drizzle table, so the schema
+ * property is what a filter carries. It used to carry the physical column
+ * beside it for a hand-written count query; that query is gone, and with it the
+ * only reason this type knew two names for one thing.
+ *
+ * A discriminated union rather than `op: "=" | "IN"` paired with
+ * `value: string | string[]`: those two fields varying independently let
+ * `{ op: "=", value: ["a", "b"] }` type-check, which is a filter no consumer
+ * can honour. Tying `op` to `value`'s shape makes that state unrepresentable.
+ */
+interface ActivityFilterBase {
+  /** The Drizzle schema property, for `adapter.select`. */
+  property: string;
+}
+
+type ActivityFilter =
+  | (ActivityFilterBase & { op: "="; value: string })
+  | (ActivityFilterBase & { op: "IN"; value: string[] });
+
+/**
+ * What an activity row is about.
+ *
+ * 🔴 RECORDED rather than inferred from the slug, because the slug cannot always
+ * decide it. `assertGlobalResourceSlugAvailable` lets a resource that already
+ * held a now-reserved name keep it, so an upgraded install can have a real
+ * collection called `email-providers` — and registry membership then classifies
+ * the settings namespace of the same name as a collection document. Its id is
+ * not in that collection, so the read path refuses it and the row is treated as
+ * history for a deleted document: stripped of the very changed-field detail a
+ * credential rotation exists to record.
+ */
+export type ActivitySubjectKind = "collection" | "single" | "settings";
+
+/**
+ * A refill's rows, and whether the TABLE ended or the rounds did.
+ *
+ * `end` is the distinction `hasMore` rests on. Reaching `MAX_REFILL_ROUNDS`
+ * with a short page looks identical to running out of activity, and reporting
+ * the second when the first happened tells a reader there is nothing further
+ * to see because the scan hit its own work bound.
+ */
+interface RefilledActivity {
+  rows: Record<string, unknown>[];
+  end: boolean;
+  /**
+   * The last row the walk READ, authorized or not: where a page that found
+   * nothing to show continues, so a stretch of hidden rows longer than the
+   * walk's bound is passed rather than read again by every page.
+   */
+  lastRead?: Record<string, unknown>;
+}
+
+/**
+ * What a feed row is, once the registry has been consulted.
+ *
+ * 🔴 THREE states, because two of them were one and the collapse was a hole. An
+ * install-level event has no document to authorize and is kept on the strength
+ * of the caller's scope; a document is authorized through the read path; and a
+ * row that NAMES a document nothing can currently decide is neither — it is
+ * dropped. Returning `null` for both the first and the third handed every
+ * undecidable row's raw title and metadata straight to the reader.
+ */
+type ActivitySubject =
+  | { kind: "install-level" }
+  | { kind: "undecidable" }
+  | { kind: "document"; ref: DocumentRef };
+
+/** A position in the feed's `(createdAt desc, id desc)` order. */
+interface ActivityCursor {
+  createdAt: Date;
+  id: string;
+}
+
+/** `row` as a cursor, or undefined when it cannot name a position exactly. */
+function cursorOf(
+  row: Record<string, unknown> | ActivityPosition | undefined
+): ActivityCursor | undefined {
+  if (!row) return undefined;
+  const { createdAt, id } = row;
+  if (typeof id !== "string") return undefined;
+  // Drivers disagree about whether a timestamp arrives decoded: the adapter's
+  // Drizzle path returns a Date, and a raw string is still a valid instant.
+  const at =
+    createdAt instanceof Date
+      ? createdAt
+      : typeof createdAt === "string"
+        ? new Date(createdAt)
+        : undefined;
+  if (!at || Number.isNaN(at.getTime())) return undefined;
+  return { createdAt: at, id };
+}
+
+/** Where the feed continues after `row`, as a caller hands it back. */
+function positionOf(
+  row: Record<string, unknown>
+): ActivityPosition | undefined {
+  const cursor = cursorOf(row);
+  return cursor
+    ? { createdAt: cursor.createdAt.toISOString(), id: cursor.id }
+    : undefined;
+}
+
+/**
+ * Strictly after `cursor` in `createdAt DESC, id DESC` order.
+ *
+ * Spelled as the two-branch disjunction rather than a row constructor, because
+ * `(a, b) < (x, y)` is not portable across the three dialects this runs on.
+ */
+function olderThan(cursor: ActivityCursor): WhereClause {
+  return {
+    or: [
+      { and: [{ column: "createdAt", op: "<", value: cursor.createdAt }] },
+      {
+        and: [
+          { column: "createdAt", op: "=", value: cursor.createdAt },
+          { column: "id", op: "<", value: cursor.id },
+        ],
+      },
+    ],
+  };
+}
+
+/** `where`, narrowed to rows strictly after `cursor`. */
+function withCursor(
+  where: WhereClause | undefined,
+  cursor: ActivityCursor
+): WhereClause {
+  return where ? { and: [where, olderThan(cursor)] } : olderThan(cursor);
+}
+
+/**
+ * A position as a caller hands it back, parsed rather than trusted: an instant,
+ * an id, and a run key shaped as `runKeyOf` writes one. Nothing about it is
+ * believed beyond where to start and which run's leading rows to leave out, and
+ * those rows are the caller's own visible ones, already authorized.
+ */
+const positionSchema = z.object({
+  createdAt: z.string().datetime(),
+  id: z.string().min(1),
+  run: z
+    .string()
+    .max(2_000)
+    .refine(isRunKey, "Not a run this feed wrote.")
+    .optional(),
+});
+
+/** Whether `value` is a run key as `runKeyOf` writes one: a JSON array of five scalars. */
+function isRunKey(value: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return (
+      Array.isArray(parsed) &&
+      parsed.length === 5 &&
+      parsed.every(part => part === null || typeof part === "string")
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Where the feed's first read starts, and the cut run it continues, if any. */
+interface FirstRead {
+  start: ActivityCursor | number;
+  cut?: CutRun;
+}
+
+/**
+ * Where the feed's first read starts: after the previous page's position, or a
+ * number of trail rows in. A position that cannot be read starts nowhere
+ * (`null`) rather than at the top, which would show the first page again as the
+ * second. A position that is not one this feed wrote is refused outright.
+ */
+function firstReadOf(
+  options: ActivityLogQueryOptions | undefined
+): FirstRead | null {
+  if (!options?.before) return { start: options?.offset ?? 0 };
+  const parsed = positionSchema.safeParse(options.before);
+  if (!parsed.success) {
+    throw NextlyError.validation({
+      errors: parsed.error.issues.map(issue => ({
+        path: ["before", ...issue.path].join("."),
+        code: "invalid",
+        message: issue.message,
+      })),
+    });
+  }
+  const cursor = cursorOf(parsed.data);
+  if (!cursor) return null;
+  return parsed.data.run
+    ? {
+        start: cursor,
+        cut: { key: parsed.data.run, createdAt: cursor.createdAt },
+      }
+    : { start: cursor };
+}
+
+/**
+ * Where the feed continues after `row`. When the run `row` closes was cut by the
+ * walk's bound, its key travels too, so the page after leaves out the rest of
+ * that run.
+ */
+function continuingAfter(
+  row: Record<string, unknown>,
+  cut: boolean
+): ActivityPosition | undefined {
+  const position = positionOf(row);
+  const key = cut ? runKeyOf(row) : undefined;
+  return position && key ? { ...position, run: key } : position;
+}
+
+/**
+ * The first round's anchor: a position the caller gave anchors it as a later
+ * round's anchor does; a number is a count of trail rows to skip, for the first
+ * round only.
+ */
+function firstRound(start: ActivityCursor | number): {
+  after: ActivityCursor | undefined;
+  offset: number;
+} {
+  return typeof start === "number"
+    ? { after: undefined, offset: start }
+    : { after: start, offset: 0 };
+}
+
+/**
+ * The feed's filter for these options and this scope, or `null` when the scope
+ * admits nothing, so no query is built.
+ *
+ * Named by Drizzle SCHEMA PROPERTY, which is what `adapter.select` resolves
+ * against the table. Naming the physical column here instead silently dropped
+ * the ordering and made a filtered query fail outright.
+ */
+function feedWhere(
+  options: ActivityLogQueryOptions | undefined,
+  scope: ReadableResources
+): WhereClause | undefined | null {
+  const filters: ActivityFilter[] = [];
+  if (options?.collection) {
+    filters.push({
+      property: "collection",
+      op: "=",
+      value: options.collection,
+    });
+  }
+  if (options?.userId) {
+    filters.push({ property: "userId", op: "=", value: options.userId });
+  }
+  const starting = feedConditions(
+    scope,
+    options?.singles,
+    options?.keptOffCollections
+  );
+  if (starting === null) return null;
+  const conditions: NonNullable<WhereClause["and"]> = [
+    ...filters.map(f => ({ column: f.property, op: f.op, value: f.value })),
+    ...starting,
+  ];
+  return conditions.length > 0 ? { and: conditions } : undefined;
+}
+
+/**
+ * Each document's newest save among `rows`, newest first: rows that are not a
+ * save are passed over, and a document is the kind, the slug and the id
+ * together, since a Single and a collection may share a slug. A row whose id
+ * was redacted names no document, and is passed over too. With
+ * `statusChanges`, a publish or an unpublish on its own is a save as well (see
+ * `RecentEditsOptions.statusChanges`).
+ */
+function latestSaves(
+  rows: readonly Record<string, unknown>[],
+  statusChanges = false
+): Record<string, unknown>[] {
+  const seen = new Set<string>();
+  const latest: Record<string, unknown>[] = [];
+  for (const row of rows) {
+    if (typeof row.entryId !== "string" || row.entryId.length === 0) continue;
+    if (!statusChanges && !isContentSave(row.action, row.metadata)) continue;
+    const document = JSON.stringify([
+      row.subjectKind ?? "collection",
+      row.collection,
+      row.entryId,
+    ]);
+    if (seen.has(document)) continue;
+    seen.add(document);
+    latest.push(row);
+  }
+  return latest;
+}
+
+/** One page of the feed, from the runs the walk read. */
+interface FeedPage {
+  shown: ActivityRun[];
+  /** Whether the last run shown may go on past what was read, so its count is a floor. */
+  lastCutShort: boolean;
+  hasMore: boolean;
+  next?: ActivityPosition;
+}
+
+/**
+ * The page `limit` rows long that `runs` make, and what lies beyond it.
+ *
+ * 🔴 `end` as well as the count, because a page can come back short for two
+ * opposite reasons. The extra run is the ordinary signal; a walk that stopped
+ * at its round limit found fewer than that and has said nothing about what
+ * lies beyond it, so reporting no more there tells the reader the feed has
+ * ended when only the scan did. The same stop with the page not yet full means
+ * the last run may go on past what was read.
+ *
+ * The next page continues after the OLDEST save of the last run shown, so none
+ * of that run reappears at its top.
+ */
+function pageOf(
+  runs: readonly ActivityRun[],
+  end: boolean,
+  limit: number
+): FeedPage {
+  const shown = runs.slice(0, limit);
+  const hasMore = runs.length > limit || !end;
+  const last = shown[shown.length - 1];
+  // Only a run that later saves could join is a floor. A creation, a deletion,
+  // a settings change or a status change is one row whatever lies past the
+  // bound, so its count is exact: the one run-key rule decides which is which.
+  const lastCutShort =
+    !end &&
+    runs.length <= limit &&
+    last !== undefined &&
+    runKeyOf(last.oldest) !== undefined;
+  const next =
+    hasMore && last ? continuingAfter(last.oldest, lastCutShort) : undefined;
+  return { shown, lastCutShort, hasMore, ...(next ? { next } : {}) };
+}
+
+/**
+ * The page the walk's `rows` make once the rest of a run the previous page was
+ * cut inside is left out.
+ *
+ * A page that left out every row it read, the run being longer than the walk's
+ * bound again, shows nothing and continues from the last row it left out, still
+ * carrying the run: each page reads at most the bound and moves strictly older,
+ * so the run is passed in steps and never read twice.
+ */
+function feedPage(
+  read: RefilledActivity,
+  limit: number,
+  cut: CutRun | undefined
+): FeedPage {
+  const { rest, skipped } = afterRun(read.rows, cut);
+  const page = pageOf(runsOf(rest), read.end, limit);
+  if (page.shown.length > 0 || read.end) return page;
+  // Nothing shown and more to read: continue past what this page read, or the
+  // next page would read the same rows and stop at the same bound. After the
+  // skipped run's last row it carries the run; after a hidden row it carries
+  // none, since no run was shown that a later save could join.
+  const next = skipped
+    ? continuingAfter(skipped, true)
+    : read.lastRead && positionOf(read.lastRead);
+  return { ...page, ...(next ? { next } : {}) };
+}
+
+/** A stored instant as the feed publishes it: ISO text, or the driver's own text. */
+function instantText(value: unknown): string {
+  return value instanceof Date ? value.toISOString() : String(value);
+}
+
+/** The event a row names, as `ActivityLogEntry.event` describes it, or nothing. */
+function eventOf(
+  row: Record<string, unknown>,
+  metadata: Record<string, unknown> | null
+): { event?: ActivityEvent } {
+  const event = activityEventOf({
+    action: row.action,
+    metadata,
+    subjectKind: row.subjectKind,
+    collection: row.collection,
+  });
+  return event === undefined ? {} : { event };
+}
+
+/**
+ * Safely convert an unknown driver-returned value to a nullable string.
+ * Avoids `Object.toString()` fallthrough that triggers no-base-to-string.
+ */
+function toNullableString(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") return value.length > 0 ? value : null;
+  if (typeof value === "number" || typeof value === "bigint") {
+    return String(value);
+  }
+  return null;
+}
+
+export class ActivityLogService extends BaseService {
+  constructor(adapter: DrizzleAdapter, logger: Logger) {
+    super(adapter, logger);
+  }
+
+  /**
+   * The columns of one entry that erasure never touches.
+   *
+   * The identity columns are decided by the write itself, against an account
+   * that may be being deleted at that moment, so they are supplied separately.
+   */
+  private entryValues(
+    input: LogActivityInput,
+    createdAt: Date
+  ): Record<string, unknown> {
+    return {
+      id: randomUUID(),
+      actorType: input.actorType,
+      userId: input.userId,
+      action: input.action,
+      collection: input.collection,
+      entryId: input.entryId ?? null,
+      entryTitle: input.entryTitle ?? null,
+      locale: input.locale ?? null,
+      subjectKind: input.subjectKind ?? null,
+      metadata: input.metadata ? JSON.stringify(input.metadata) : null,
+      createdAt,
+    };
+  }
+
+  /**
+   * Record an activity log entry as a self-contained write.
+   *
+   * For callers that own no transaction of their own — the auth and account
+   * seams. Supplies the transaction the identity decision needs (see
+   * {@link logActivityInTx}) and swallows failures: these callers have already
+   * committed by the time they log, so a throw here could only turn a recorded
+   * action into a failed one. A mutation recording inside its own write
+   * transaction wants the opposite and calls {@link logActivityInTx} directly.
+   */
+  async logActivity(input: LogActivityInput): Promise<void> {
+    try {
+      await this.logActivityOrThrow(input);
+    } catch (error) {
+      this.logger.error("Failed to log activity", {
+        error: error instanceof Error ? error.message : String(error),
+        input: {
+          action: input.action,
+          collection: input.collection,
+          entryId: input.entryId,
+        },
+      });
+    }
+  }
+
+  /**
+   * Record an activity log entry as a self-contained write, as
+   * {@link logActivity} does, with a failure reaching the caller: for an
+   * action that must not take place unrecorded, which the caller refuses
+   * when its entry cannot be written.
+   */
+  async logActivityOrThrow(input: LogActivityInput): Promise<void> {
+    if (this.dialect === "sqlite") {
+      await this.logActivityInTx(this.db as ActivityWriteDb, input);
+      return;
+    }
+    await (this.db as TransactionalActivityDb).transaction(tx =>
+      this.logActivityInTx(tx, input)
+    );
+  }
+
+  /**
+   * Write one activity entry through an executor the CALLER owns.
+   *
+   * Holds the whole erasure-aware identity decision, so the two writers — the
+   * standalone {@link logActivity} above and the mutation seam that records
+   * inside a content transaction — cannot come to disagree about what a row may
+   * carry. Both dialect mechanisms live here; only the transaction the
+   * statements run in differs between callers.
+   *
+   * Failures PROPAGATE, deliberately. A caller recording inside a content
+   * transaction needs the write to fail with it — an entry that cannot be
+   * written must take the change it describes down with it, rather than leaving
+   * a committed mutation nothing recorded. Swallowing is the standalone
+   * caller's decision to make, and it makes it above.
+   *
+   * The identity a row may carry has to be decided against an account that may
+   * be deleted at this very moment, and the two dialect families need
+   * different mechanisms for it.
+   *
+   * **Postgres and MySQL** first lock the account row, with the
+   * existence-check row lock (`readUnderRowLock`). `deleteUser` takes an EXCLUSIVE lock on that row
+   * before it erases anything, so the two cannot be in flight at once: either
+   * this lock is taken first and the deletion waits, so its erasure covers a
+   * row that already exists, or the deletion holds the row and this waits for
+   * its commit and then correctly finds the account gone. The lock is what
+   * closes the gap a single statement cannot — its subquery is answered when
+   * it STARTS while its row becomes visible when it COMMITS, and an insert
+   * spanning the deletion's commit satisfies neither the deletion's own erasure
+   * nor its post-commit sweep. The lock is shared wherever the server accepts
+   * it, so concurrent writes by the same author do not serialise against each
+   * other. On MariaDB and TiDB, which reject `FOR SHARE`, it is `FOR UPDATE`,
+   * and they take turns on the author's row until each one's transaction
+   * commits.
+   *
+   * **SQLite** has one writer, so its insert cannot interleave with the
+   * deletion's transaction at all and needs no lock. It decides the identity
+   * inside the statement instead, because a check followed by a separate
+   * insert would leave a durable row that a second statement was still going
+   * to correct.
+   */
+  async logActivityInTx(
+    db: ActivityWriteDb,
+    input: LogActivityInput
+  ): Promise<void> {
+    const { activityLog, users } = this.tables as ActivityWriteTables;
+    // The caller's identity when it supplied one, otherwise the account's own.
+    // Taking it from the account is what a caller holding only an actor id
+    // does: the write already looks at that row to decide whether the account
+    // exists, so the name comes from the same look as that decision.
+    // Only a USER has an account, so only a user's write can race an erasure.
+    //
+    // `insertErasureAware` decides by looking the actor up in `users`, and an
+    // API key's own id or a system caller's name has no row there — so routing
+    // one through it writes the entry already-erased, with null identity
+    // columns and a non-null stamp. That is precisely the record the old gate
+    // refused to create, reappearing one layer down now that the gate admits
+    // these actors.
+    if (input.actorType !== "user") {
+      await db.insert(activityLog).values(this.entryValues(input, new Date()));
+      return;
+    }
+
+    const supplied: Record<string, unknown> = {};
+    const fromAccount: Record<string, Column> = {};
+    if (input.userName !== undefined) supplied.userName = input.userName;
+    else fromAccount.userName = users.name;
+    if (input.userEmail !== undefined) supplied.userEmail = input.userEmail;
+    else fromAccount.userEmail = users.email;
+
+    await insertErasureAware(db, this.adapter.getCapabilities(), {
+      table: activityLog,
+      users,
+      row: this.entryValues(input, new Date()),
+      identity: supplied,
+      identityFromAccount: fromAccount,
+      actorUserId: input.userId,
+    });
+  }
+
+  /**
+   * Query recent activity log entries with optional filters.
+   *
+   * Uses the `limit + 1` pattern to determine `hasMore` without a
+   * separate COUNT query. The `total` field uses a separate count query
+   * only when needed.
+   */
+  async getRecentActivity(
+    options?: ActivityLogQueryOptions
+  ): Promise<ActivityLogResult> {
+    // The one clamp for every door onto the feed, the endpoint's and the
+    // widget source's: what any widget query is held to.
+    const limit = effectiveWidgetLimit(options?.limit);
+    const first = firstReadOf(options);
+    if (first === null) return { activities: [], hasMore: false };
+
+    // Fail-closed default: an omitted scope must deny, not grant. This feed
+    // exposes entry titles across every collection, so a caller that forgets
+    // to pass one gets nothing rather than everything.
+    const scope = options?.scope ?? someResources([]);
+    const caller = options?.caller;
+
+    try {
+      const where = feedWhere(options, scope);
+      // A scope that admits nothing matches nothing, the intended answer for a caller who may
+      // read nothing, and is answered before any query is built; so is a feed whose kept-off
+      // collections could not be read.
+      if (where === null) return { activities: [], hasMore: false };
+
+      // Read until one row PAST the page exists, counted in rows the feed
+      // shows: a run of saves only ends where a different row begins, so the
+      // page's last run is known whole once the next row is in hand. That row
+      // is also what makes `hasMore` an observation rather than a guess, read
+      // and AUTHORIZED like the rest, then dropped.
+      const visible = await this.visibleActivity(
+        where,
+        first.start,
+        caller,
+        rows => runsOf(afterRun(rows, first.cut).rest).length > limit
+      );
+      const page = feedPage(visible, limit, first.cut);
+      return {
+        activities: page.shown.map((run, index) =>
+          this.mapRun(
+            run,
+            page.lastCutShort && index === page.shown.length - 1,
+            options?.singles?.labels
+          )
+        ),
+        hasMore: page.hasMore,
+        ...(page.next ? { next: page.next } : {}),
+      };
+    } catch (error) {
+      this.logger.error("Failed to query activity log", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // PR 4 migration: NextlyError.fromDatabaseError yields a generic
+      // public message ("An unexpected error occurred." for non-DbError,
+      // or the §13.8 mapping for DbError) and preserves the original
+      // error as `cause` for operator logs. Normalise raw driver errors
+      // via toDbError(dialect) so the right kind is mapped instead of
+      // collapsing to INTERNAL_ERROR / 500.
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, error));
+    }
+  }
+
+  /**
+   * How many activity rows after `since` this caller may be told about: the rows the feed itself
+   * would show, counted by the feed's own walk rather than by an aggregate beside it.
+   *
+   * 🔴 Not a `COUNT(*)`. A document read rule cannot be pushed into a query over this table (see
+   * `visibleActivity`), so a count of what the scope admits counts edits to documents the caller
+   * may not open, and the number then says such edits happened. Walking and authorizing is
+   * bounded work instead: the walk reads at most its rounds of pages, and past that the count is
+   * a floor, said plainly (`atLeast`), the rule every bounded count in the dashboard follows.
+   * The cost is up to that many page reads and their authorization, where one aggregate used to
+   * run.
+   *
+   * Collections kept off the dashboard are left out as the feed leaves them out, by the same
+   * conditions (`feedConditions`): the figure counts the rows the feed would show. Their rows are
+   * removed from the candidates before the walk, so the walk is still the only thing deciding
+   * what may be seen.
+   */
+  async countRecentActivity(
+    options: RecentActivityCountOptions
+  ): Promise<RecentActivityCount> {
+    const starting = feedConditions(
+      options.scope ?? someResources([]),
+      options.singles,
+      // The figure's caller leaves out kept-off collections only once it has read them whole.
+      { slugs: options.keptOffCollections ?? new Set(), complete: true }
+    );
+    if (starting === null) return { count: 0, atLeast: false };
+    const where: WhereClause = {
+      and: [
+        ...starting,
+        { column: "createdAt", op: ">", value: options.since },
+        // A recorded read (a search by address) is in the feed, but it
+        // changed nothing.
+        { column: "action", op: "!=", value: "read" },
+      ],
+    };
+    // As many rows as the walk can find, so it stops at the table's end or at its own bound.
+    // Counted in rows of the trail, not of the feed: each save is a change, however
+    // close together they were made.
+    const visible = await this.visibleActivity(
+      where,
+      0,
+      options.caller,
+      () => false
+    );
+    return { count: visible.rows.length, atLeast: !visible.end };
+  }
+
+  /**
+   * The documents most recently saved, newest first: one row per document, its
+   * latest save this caller may see.
+   *
+   * The same walk as the feed, read and authorized row by row, so a save the
+   * caller may not see never stands for its document, and saves they may not
+   * read never leave the card short while readable ones lie further back: the
+   * walk pages on until the card is full or its rounds run out, as the feed's
+   * does. Checked, THEN collapsed: a document's newest readable save is its
+   * row, which keeps a readable save behind a newer one the caller may not
+   * read (another language's, say).
+   *
+   * A save is what `isContentSave` says it is, unless `statusChanges` asks for
+   * every change. A publish or an unpublish on its own otherwise never takes
+   * the row of the person who made the edits, and a deletion
+   * and the redacted history of a removed document name no document to list.
+   * Settings changes name none either, and are left out by kind.
+   */
+  async getRecentEdits(options: RecentEditsOptions): Promise<RecentEdits> {
+    const limit = effectiveWidgetLimit(options.limit);
+    const starting = feedConditions(
+      options.scope ?? someResources([]),
+      options.singles,
+      options.keptOffCollections
+    );
+    if (starting === null) return { edits: [], hasMore: false };
+    const where: WhereClause = {
+      and: [
+        ...starting,
+        // Deletions are never a save; filtered by the database, not the walk.
+        { column: "action", op: "IN", value: ["create", "update"] },
+        { column: "entryId", op: "IS NOT NULL" },
+        // A row that states no kind is a collection's, as the feed reads it.
+        {
+          or: [
+            { column: "subjectKind", op: "IS NULL" },
+            {
+              column: "subjectKind",
+              op: "IN",
+              value: ["collection", "single"],
+            },
+          ],
+        },
+        ...oneSubjectConditions(options),
+        ...saverConditions(options),
+      ],
+    };
+    try {
+      // Read until one document PAST the card is in hand, which is what makes
+      // `hasMore` an observation rather than a guess.
+      const visible = await this.visibleActivity(
+        where,
+        0,
+        options.caller,
+        rows => latestSaves(rows, options.statusChanges).length > limit
+      );
+      const saves = latestSaves(visible.rows, options.statusChanges);
+      return {
+        edits: saves.slice(0, limit).map(row => ({
+          ...this.mapRow(row, options.singles?.labels),
+          locale: toNullableString(row.locale),
+        })),
+        // A walk that stopped at its bound before the table's end has not seen
+        // what lies past it, so older documents may still exist: "more" then,
+        // as the feed's own paging says, rather than a claim that the list
+        // ended.
+        hasMore: saves.length > limit || !visible.end,
+      };
+    } catch (error) {
+      this.logger.error("Failed to query recent edits", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, error));
+    }
+  }
+
+  /**
+   * Which of `singles` the trail has recorded a save of since each was
+   * registered, in ONE query.
+   *
+   * A Single is saved by a named writer through `recordSingleActivity`, which
+   * files a row naming it with `subjectKind: "single"`; one such row is enough.
+   * Asked for every Single at once, with `DISTINCT`, because the setup steps
+   * ask it on every layout read and one query per Single would make a site with
+   * many Singles pay for each of them, every time the dashboard opens. No
+   * caller scope: whether a document was ever saved is not the document, and
+   * the caller is already one who may update it.
+   *
+   * 🔴 Only rows written since the Single's registry row was. A Single deleted
+   * and created again under its slug keeps the trail's record of the one
+   * before, since the trail is a record and deletion does not rewrite it;
+   * counted, that record would tick a Single nobody has saved. The registry is
+   * JOINED, read only, so the two instants are compared by the database, as
+   * stored, with no conversion in between. A row within the same instant
+   * counts, since a Single is commonly saved in the second it was created. So
+   * on the dialects that store whole seconds (SQLite, and MySQL at its default
+   * precision), a Single deleted and created again within the same second as
+   * its predecessor's save inherits that save; telling the two apart exactly
+   * would take a read of each Single's own document on every call.
+   *
+   * On MySQL the trail's instant is a TIMESTAMP, which the server converts
+   * through the session's time zone, and the registry's a DATETIME, which it
+   * does not; the adapter does not pin the session's zone
+   * (`adapter-mysql/src/index.ts`, where `timezone` sets only the driver's own
+   * conversion). The comparison is exact while that zone stays what it was
+   * when the rows were written. Should the server's zone later move west, the
+   * cutoff reads late and a Single's first saves are missed, which the setup
+   * steps then answer from the Single's stored instants. Should it move east,
+   * saves made shortly before a Single was created again read as after it,
+   * and every instant the trail shows is off by the same amount.
+   */
+  async singlesWithRecordedSaves(
+    singles: readonly string[]
+  ): Promise<Set<string>> {
+    // An empty `IN ()` is a syntax error on some dialects: answered without a query.
+    if (singles.length === 0) return new Set();
+    const { activityLog, dynamicSingles } = this.tables as SavedSinglesTables;
+    const rows = await (this.db as unknown as DistinctJoinDb)
+      .selectDistinct({ collection: activityLog.collection })
+      .from(activityLog)
+      .innerJoin(
+        dynamicSingles,
+        and(
+          eq(dynamicSingles.slug, activityLog.collection),
+          gte(activityLog.createdAt, dynamicSingles.createdAt)
+        )
+      )
+      .where(
+        and(
+          eq(activityLog.subjectKind, "single"),
+          inArray(activityLog.collection, [...singles])
+        )
+      );
+    return new Set(rows.map(row => String(row.collection)));
+  }
+
+  /**
+   * The activity rows the caller may actually be told about, read until `enough`.
+   *
+   * 🔴 Authorization happens AFTER the read and cannot be pushed into it. A
+   * stored read rule is a constraint over the COLLECTION's own fields, and
+   * `activity_log` carries none of them — only a free-text collection name, an
+   * entry id and a denormalised title — so there is no predicate to add here.
+   * Filtering afterwards is what makes the page short, which is why it refills.
+   *
+   * Refilling rather than filtering one page: a page whose rows are mostly
+   * unreadable would otherwise answer with two rows and `hasMore: false`, and
+   * the reader would take that as the end of the feed rather than as the end of
+   * what this page happened to contain.
+   */
+  private async visibleActivity(
+    where: WhereClause | undefined,
+    start: ActivityCursor | number,
+    caller: ReadCaller | undefined,
+    enough: (visible: readonly Record<string, unknown>[]) => boolean
+  ): Promise<RefilledActivity> {
+    // No caller means no document can be authorized, and this feed carries
+    // entry titles -- so it answers nothing rather than everything the scope
+    // admits. Same fail-closed direction as an omitted scope. The table is not
+    // what ended, but there is nothing further to offer either.
+    if (!caller) return { rows: [], end: true };
+
+    // 🔴 Resolved ONCE for the whole refill, not per page. The registry and the
+    // locale config both answer an unreachable dependency with an empty result,
+    // so a read per page lets a transient failure drop one page's rows while
+    // its neighbours keep theirs -- and the paging then reports a short feed as
+    // though it were the whole answer.
+    const scope = await resolveDocumentVisibilityScope();
+    if (scope.degraded) {
+      // 🔴 REFUSE rather than answer, and this direction is the whole point of
+      // the pass. `authorizedRows` reads a slug missing from `scope.kinds` as an
+      // install-level event and keeps it WITHOUT asking the read path — correct
+      // when the map is complete, because settings namespaces are neither a
+      // collection nor a single. When the registry could not be enumerated the
+      // same rule admits every document row unauthorized, so a transient
+      // dependency failure would turn the feed back into exactly the disclosure
+      // this service was repaired for, and turn it on silently.
+      //
+      // The empty-map case is not this one: an install that has registered
+      // nothing has no document rows to admit, and `degraded` is what tells the
+      // two apart.
+      throw NextlyError.internal({
+        logContext: { reason: "content-registry-unreachable" },
+      });
+    }
+    return this.refill(where, start, caller, scope, enough);
+  }
+
+  /**
+   * Read pages until the readable rows are `enough` or the rounds run out.
+   *
+   * Separate from the checks that precede it so each reads as one decision: the
+   * caller and the scope decide WHETHER to answer, and this decides how much to
+   * read to do it. `enough` is the caller's, because only the caller knows what
+   * it is counting: the feed counts the rows it will show, the 24-hour figure
+   * reads to the end.
+   */
+  private async refill(
+    where: WhereClause | undefined,
+    start: ActivityCursor | number,
+    caller: ReadCaller,
+    scope: DocumentVisibilityScope,
+    enough: (visible: readonly Record<string, unknown>[]) => boolean
+  ): Promise<RefilledActivity> {
+    const visible: Record<string, unknown>[] = [];
+    const first = firstRound(start);
+    let after = first.after;
+    let lastRead: Record<string, unknown> | undefined;
+    const offset = first.offset;
+
+    // Bounded so an install whose recent activity is almost entirely
+    // unreadable cannot walk the whole table for one card. Reaching it returns
+    // a SHORT page, never a wrong one.
+    for (let round = 0; round < MAX_REFILL_ROUNDS; round++) {
+      const page = await this.adapter.select<Record<string, unknown>>(TABLE, {
+        // 🔴 Rounds after the first are anchored to the LAST ROW READ, not to a
+        // running offset. `activity_log` grows while the feed is being built —
+        // every create, update and delete appends to it — and under OFFSET a row
+        // inserted between two rounds shifts every later position by one, so the
+        // next round repeats a row already seen and SKIPS one that was never
+        // read. The skipped row is lost silently: de-duplicating what arrived
+        // cannot reveal what did not, and the feed then reports the wrong
+        // `hasMore` about it too. The caller's own `offset` still positions the
+        // FIRST round, which is the only place it means what it says.
+        where: after ? withCursor(where, after) : where,
+        // Ending in a UNIQUE column is what lets that anchor name a position
+        // exactly. `createdAt` alone is not total -- MySQL stores these at
+        // second precision, so a burst of writes ties -- and a cursor over a
+        // non-unique key cannot say which of the tied rows a page ended on.
+        orderBy: [
+          { column: "createdAt", direction: "desc" },
+          { column: "id", direction: "desc" },
+        ],
+        limit: ACTIVITY_PAGE_SIZE,
+        ...(after ? {} : { offset }),
+      });
+      if (page.length === 0) return { rows: visible, end: true };
+      lastRead = page[page.length - 1];
+      after = cursorOf(lastRead) ?? after;
+
+      visible.push(...(await this.authorizedRows(page, scope, caller)));
+      // Enough rows found: the table has not ended, and the caller wants to
+      // know that so `hasMore` stays true.
+      if (enough(visible)) return { rows: visible, end: false, lastRead };
+      // A short page is the end of the table, not the end of this round.
+      if (page.length < ACTIVITY_PAGE_SIZE) {
+        return { rows: visible, end: true };
+      }
+      // A page whose last row cannot be read as a cursor would make the next
+      // round repeat it forever; stop rather than loop on an unknown position.
+      // Not an END: rows remain, this simply cannot reach them.
+      if (!after) return { rows: visible, end: false, lastRead };
+    }
+
+    // 🔴 The ROUNDS ran out, not the table. Reported as such, because the two
+    // are opposite answers to "is there more?" and only one of them is a fact
+    // about the data: a feed whose first thousand rows are unreadable would
+    // otherwise tell the reader there is no further activity, when the scan
+    // simply stopped working.
+    return { rows: visible, end: false, lastRead };
+  }
+
+  /**
+   * The rows of `page` whose subject this caller may read.
+   *
+   * Three kinds of row, and only one of them names a document:
+   *
+   * - A row with NO entry id is an install-level event -- a settings mutation
+   *   filed under a namespace that is neither a collection nor a single. There
+   *   is no document to authorize, and the caller's scope already admitted the
+   *   namespace, so it is kept. Dropping these would remove SMTP-credential
+   *   rotations and their kin from the feed entirely.
+   * - A row naming a slug in NEITHER registry is the same case wearing an entry
+   *   id, and is kept for the same reason: the scope admitted the namespace and
+   *   there is no content read path that could answer about it. It is not a way
+   *   in -- the scope is built from the registries plus those namespaces, so a
+   *   slug outside both never reaches this method.
+   * - A row naming a registered collection or single is authorized as the
+   *   document it names, by the same decision the pending-edit cards use.
+   */
+  private async authorizedRows(
+    page: readonly Record<string, unknown>[],
+    scope: DocumentVisibilityScope,
+    caller: ReadCaller
+  ): Promise<Record<string, unknown>[]> {
+    const subjects = new Map(
+      page.map(row => [row, subjectOf(row, scope.kinds)] as const)
+    );
+    const documentRows = page.filter(
+      row => subjects.get(row)?.kind === "document"
+    );
+    const readable = new Set(
+      await visibleDocuments(
+        documentRows,
+        row => {
+          const subject = subjects.get(row);
+          return subject?.kind === "document" ? subject.ref : null;
+        },
+        caller,
+        scope
+      )
+    );
+    const redacted = await this.historyOfRemovedDocuments(
+      documentRows.filter(row => !readable.has(row)),
+      scope
+    );
+    return page.flatMap(row => {
+      const subject = subjects.get(row);
+      // An install-level event has no document to authorize, and the caller's
+      // scope already admitted its namespace.
+      if (subject?.kind === "install-level") return [row];
+      // Nothing here can judge it, and admitting what cannot be judged is the
+      // inversion this pass exists to remove.
+      if (subject?.kind !== "document") return [];
+      if (readable.has(row)) return [row];
+      const kept = redacted.get(row);
+      return kept ? [kept] : [];
+    });
+  }
+
+  /**
+   * The refused rows that describe documents which no longer EXIST, redacted.
+   *
+   * 🔴 Without this, every deletion disappears from the feed. A collection
+   * delete removes the row and only then appends `entry.deleted`, so the
+   * document the event names can never be found again — and a filter that keeps
+   * only readable documents therefore drops the deletion, and all earlier
+   * history for that document, for everyone including a super admin. The most
+   * consequential events in the trail were the ones it silently lost.
+   *
+   * Refused and GONE are the same absence to a read that enforces access, so
+   * they are told apart by a privileged existence probe — asked only about rows
+   * already refused, and used only to decide whether anything remains to
+   * authorize.
+   *
+   * What survives is the event, not the document: the stored title and metadata
+   * are dropped, because the rule that would have decided who may read them died
+   * with the document and nothing can evaluate it now. A reader learns that
+   * something was deleted, by whom and when; they do not learn what it was
+   * called.
+   */
+  private async historyOfRemovedDocuments(
+    refused: readonly Record<string, unknown>[],
+    scope: DocumentVisibilityScope
+  ): Promise<Map<Record<string, unknown>, Record<string, unknown>>> {
+    const kept = new Map<Record<string, unknown>, Record<string, unknown>>();
+    if (refused.length === 0) return kept;
+
+    // 🔴 BOUNDED CONCURRENCY, not a sequential loop. Each unit is a full
+    // collection read, and a page can hold refused rows across as many
+    // collection/language pairs as it has rows — so one page could issue a
+    // hundred serial reads AFTER the authorization pass that is already bounded,
+    // and ten refill rounds could make that a thousand for one dashboard
+    // request. `authorizationGroups` is the same bound the authorization pass
+    // uses, and its first group of one keeps a cold per-user permission cache
+    // filled once rather than missed by everything behind it.
+    const units = probeUnits(refused, scope);
+    const byKey = new Map(units.map((unit, index) => [String(index), unit]));
+    for (const group of authorizationGroups([...byKey.keys()])) {
+      const settled = await Promise.allSettled(
+        group.map(async key => {
+          const unit = byKey.get(key) as ProbeUnit;
+          const existing = await existingDocumentIds(
+            unit.slug,
+            unit.entries.map(entry => entry.entryId),
+            unit.locale
+          );
+          return { unit, existing };
+        })
+      );
+      for (const outcome of settled) {
+        // A probe that could not answer has told us nothing, and nothing must
+        // not read as "deleted" -- that would publish a refused row.
+        if (outcome.status !== "fulfilled") continue;
+        const { unit, existing } = outcome.value;
+        for (const entry of unit.entries) {
+          if (existing.has(entry.entryId)) continue;
+          // 🔴 The IDENTIFIER goes with the title. Keeping `entryId` returns
+          // the denied document's id to every caller with collection access —
+          // the same thing the authorization pass exists to withhold, minus
+          // the words. What is left says an event happened, not which document
+          // it happened to.
+          //
+          // `userName` and `userEmail` stay, deliberately: an audit trail that
+          // cannot say WHO deleted something is not one, and that is the
+          // trade this redaction was chosen to make.
+          kept.set(entry.row, {
+            ...entry.row,
+            entryId: null,
+            entryTitle: null,
+            metadata: null,
+          });
+        }
+      }
+    }
+    return kept;
+  }
+
+  /**
+   * The kind a stored row records, defaulting a legacy NULL to `"user"`.
+   *
+   * An unrecognised value reads as `"user"` too. The column is written only by
+   * this service, so anything else came from outside it, and treating an
+   * unknown kind as a NON-person would attribute a real person's write to a
+   * machine — the more misleading of the two directions.
+   */
+  private static toActorType(value: unknown): RequestActorType {
+    return value === "apiKey" || value === "system" ? value : "user";
+  }
+
+  /**
+   * One row of the feed: the run's latest save as `mapRow` maps it, with how
+   * many saves it stands for and when the first was made.
+   */
+  private mapRun(
+    run: ActivityRun,
+    countAtLeast: boolean,
+    singleLabels?: ReadonlyMap<string, string>
+  ): ActivityLogEntry {
+    return {
+      ...this.mapRow(run.latest, singleLabels),
+      count: run.count,
+      countAtLeast,
+      firstCreatedAt: instantText(run.oldest.createdAt),
+    };
+  }
+
+  private mapRow = (
+    row: Record<string, unknown>,
+    /** The Singles' labels now, which head a Single's row over the stored one. */
+    singleLabels?: ReadonlyMap<string, string>
+  ): ActivityLogEntry => {
+    // Through the one reader of a row's metadata, the one the feed's runs use
+    // to tell a publish from a save.
+    const metadata = activityMetadataOf(row.metadata);
+
+    // Keyed by the Drizzle SCHEMA PROPERTY, not the column: `adapter.select`
+    // runs `db.select().from(table)` and throws outright when the table is not
+    // in the registry, so there is no raw-SQL path that would return
+    // `user_name`. Reading the column spelling yielded undefined for every
+    // field and surfaced as the string "undefined" in the feed.
+    const createdAt = row.createdAt;
+    const identityErasedAt = row.identityErasedAt;
+
+    return {
+      id: String(row.id),
+      // NULL means a row written before the column existed. No kind but `user`
+      // was recordable then, so this reads the old gate rather than guessing —
+      // and a reader that dropped the field would silently attribute a key's
+      // write to a person.
+      actorType: ActivityLogService.toActorType(row.actorType),
+      userId: String(row.userId),
+      // Through the same narrowing as the other nullable columns: an erased
+      // row holds SQL NULL here, and `String(null)` would surface the literal
+      // text "null" as the actor's name.
+      userName: toNullableString(row.userName),
+      userEmail: toNullableString(row.userEmail),
+      action: String(row.action) as ActivityLogAction,
+      // Named from the marks this row still carries, by the rule the runs read
+      // it by: an update that carries none, a removed document's among them,
+      // names none rather than calling its publish or unpublish a save.
+      ...eventOf(row, metadata),
+      collection: String(row.collection),
+      // Type-narrow before stringification so we don't fall through to
+      // Object#toString for non-primitive driver values.
+      entryId: toNullableString(row.entryId),
+      entryTitle: headingOf(row, singleLabels),
+      // Classified here, by the one rule, so a reader that tells a settings
+      // change from an entry need not know the settings namespaces.
+      subjectKind: isSettingsChange(row)
+        ? "settings"
+        : (statedKindOf(row) ?? null),
+      metadata,
+      createdAt: instantText(createdAt),
+      count: 1,
+      countAtLeast: false,
+      firstCreatedAt: instantText(createdAt),
+      identityErasedAt:
+        identityErasedAt instanceof Date
+          ? identityErasedAt.toISOString()
+          : toNullableString(identityErasedAt),
+    };
+  };
+}

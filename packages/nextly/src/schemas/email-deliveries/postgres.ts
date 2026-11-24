@@ -1,0 +1,291 @@
+/**
+ * PostgreSQL schema for the email delivery log.
+ *
+ * One row per RECIPIENT per send: which provider carried the message, which
+ * template produced it, whether that recipient was accepted, and a hash of the
+ * address. Together they answer "did this send", "how many are failing" and
+ * "did this person receive it" — the last for someone who was copied as much
+ * as for the primary recipient.
+ *
+ * ## What this table deliberately does not contain
+ *
+ * **The recipient's address.** Only a keyed hash of it, under the install's
+ * own secret. That answers "did this send" and "how many failed" without
+ * answering "to whom", and matches what the send path already does — it logs
+ * counts, never addresses. Support confirms a delivery by hashing the address
+ * they were given, which is the question they are actually asked, and the key
+ * is what leaves that query working while a stolen copy of the table cannot be
+ * enumerated: an email address has too little entropy for a bare digest to
+ * resist a dictionary.
+ *
+ * This reduces what the table discloses. It does not put the table outside
+ * identity-erasure obligations — a keyed hash of a person's address is
+ * pseudonymised data, and a request to erase a person still reaches these
+ * rows.
+ *
+ * **Two things erase them, for different populations.** Deleting a user account
+ * overwrites the `recipient_hash` of that person's rows with a sentinel no
+ * address hashes to, in the deletion's own transaction, and once more just
+ * after it commits, for a send that was already in flight. A send that writes
+ * its row after that second pass still leaves a live digest, until the
+ * retention pass removes the row by age: the erasure narrows that window rather
+ * than closing it. Someone who was only ever a recipient, with no account to
+ * delete, is erased the same way through the delivery service's
+ * `eraseRecipient`. Either way the row stays, because "how many sends failed
+ * last week" belongs to the install rather than to the recipient
+ * (`domains/email/erase-recipient.ts`). Apart from those requests, a retention
+ * pass deletes rows by age, scoped by `retention_class` below, which reaches
+ * every row whoever it was written for (`domains/email/prune.ts`).
+ *
+ * **The rendered subject.** The template SLUG is recorded instead. A slug says
+ * which kind of message this was, is stable across copy edits, and cannot carry
+ * a name — while a rendered subject is the single field in a message most
+ * likely to interpolate one. A raw send with no template records no slug, and
+ * the row still answers the question it exists for.
+ *
+ * **The message body.** Never, in any form.
+ *
+ * ## The retry columns are reserved and inert
+ *
+ * `status`, `attempt_count` and `next_attempt_at` exist from the first
+ * migration so that adding a drain later is not a migration on a table already
+ * holding production history. **Nothing drains this table today.**
+ *
+ * That distinction is load-bearing rather than pedantic, because a schema is
+ * read by more than the code that writes it. `next_attempt_at` is therefore
+ * always NULL: a timestamp in that column asserts that something will happen at
+ * that time, and an operator reading a failed row with a retry fifteen minutes
+ * out would wait for an attempt no code will ever make. A NULL is honestly
+ * empty; a populated column is a promise. `attempt_count` records attempts that
+ * actually happened, which is a fact rather than a promise, and is 1 for every
+ * row a log-only writer produces.
+ *
+ * @module schemas/email-deliveries/postgres
+ */
+
+import { sql } from "drizzle-orm";
+import {
+  pgTable,
+  uuid,
+  varchar,
+  text,
+  integer,
+  timestamp,
+  index,
+  boolean,
+} from "drizzle-orm/pg-core";
+
+import { emailProvidersPg } from "../email-providers/postgres";
+
+import {
+  EMAIL_DELIVERY_PRINCIPAL_ID_LENGTH,
+  EMAIL_DELIVERY_PRINCIPAL_KIND_LENGTH,
+} from "./widths";
+
+export const emailDeliveriesPg = pgTable(
+  "email_deliveries",
+  {
+    id: uuid("id")
+      .primaryKey()
+      .default(sql`gen_random_uuid()`),
+
+    /**
+     * The provider that carried the message, when one is still stored.
+     *
+     * `set null` rather than `cascade`: the delivery happened whether or not
+     * the provider still exists, and deleting a provider must not erase the
+     * evidence of what it sent. `provider_type` below is what survives.
+     */
+    providerId: uuid("provider_id").references(() => emailProvidersPg.id, {
+      onDelete: "set null",
+    }),
+
+    /**
+     * The registered type, denormalized so the row stays meaningful after the
+     * provider is deleted or its plugin uninstalled.
+     */
+    providerType: varchar("provider_type", { length: 50 }).notNull(),
+
+    /** Which template produced this, when one did. Never the rendered text. */
+    templateSlug: varchar("template_slug", { length: 255 }),
+
+    /**
+     * Keyed SHA-256 of the lowercased, trimmed recipient address, hex encoded.
+     *
+     * Fixed width, so `char`-like sizing is honest; `varchar(64)` keeps the
+     * three dialects aligned without a dialect-specific type.
+     */
+    recipientHash: varchar("recipient_hash", { length: 64 }).notNull(),
+
+    /**
+     * How this recipient received the message: `to`, `cc` or `bcc`.
+     *
+     * One row per recipient, because the table's whole purpose is to answer
+     * "did this person receive it", and a copied recipient received it just as
+     * much as the primary one.
+     *
+     * Rows for one message share a `message_id` but NOT necessarily a
+     * `status`. SMTP answers `RCPT TO` per address, so a server can accept the
+     * message for some recipients and refuse it for others; a refused address
+     * is recorded `failed` beside the accepted ones. A provider that reports a
+     * single outcome for the whole message gives every row the same status,
+     * which is the ordinary case rather than the guaranteed one.
+     *
+     * No column default. The recorder always supplies this, so a default would
+     * only describe rows nothing writes — and the DDL renderer emits a string
+     * default unquoted, which SQL rejects outright for a value that is also a
+     * keyword.
+     */
+    recipientKind: varchar("recipient_kind", { length: 3 }).notNull(),
+
+    /**
+     * `sent` or `failed`, PER RECIPIENT. A drain would add `pending` and
+     * `retrying`.
+     */
+    status: varchar("status", { length: 20 }).notNull(),
+
+    /** Attempts actually made. Always 1 until something retries. */
+    attemptCount: integer("attempt_count").notNull().default(1),
+
+    /** Reserved for a drain. Always NULL today — see the module comment. */
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
+
+    /**
+     * Why it failed, with anything address-shaped removed.
+     *
+     * An SMTP rejection quotes the recipient back at you — `550 5.1.1
+     * <someone@example.com> User unknown` — so storing a provider's message
+     * verbatim would reintroduce the address this table hashes to avoid
+     * holding, in the column right beside the hash.
+     */
+    error: text("error"),
+
+    /**
+     * The provider's own id for the message, when it returned one.
+     *
+     * Unbounded, because the adapter contract accepts any string and a bounded
+     * column would make a longer one a write error — which `record()` swallows
+     * by design, so a message that WAS dispatched would end up with no row at
+     * all. The log must not be the thing that decides a send is unrecordable.
+     */
+    messageId: text("message_id"),
+
+    /**
+     * Which retention window governs this row.
+     *
+     * READ, unlike `next_attempt_at` above it. `domains/email/prune.ts` sweeps
+     * by this column and by age, offered from the send path — rows are created
+     * by sends, so that is when the table grows.
+     *
+     * The sweep scopes its DELETE by class, which is what makes an unswept
+     * class invisible: one the writer can stamp but the pass does not scope for
+     * matches no branch, is never selected, and grows while the pass reports
+     * success. `EMAIL_RETENTION_CLASSES` is asserted against what the writer
+     * can stamp so that failure is a red test rather than a silent table.
+     *
+     * Present from the first migration, for the reason the retry columns are:
+     * adding it later would have been a migration on a table already holding
+     * production history.
+     */
+    retentionClass: varchar("retention_class", { length: 50 }).notNull(),
+    /**
+     * The plugin-defined person a plugin's email went to, by kind and id, on
+     * the rows of its `to` recipients. Names no staff user: an address can
+     * belong to a person and a staff user at once, and a person's deletion
+     * erases only the rows that name them. Once the person is reported
+     * deleted, the id is replaced by the keyed digest of kind and id.
+     */
+    principalKind: varchar("principal_kind", {
+      length: EMAIL_DELIVERY_PRINCIPAL_KIND_LENGTH,
+    }),
+    principalId: varchar("principal_id", {
+      length: EMAIL_DELIVERY_PRINCIPAL_ID_LENGTH,
+    }),
+    // The keyed digest of the idempotency key the send carried, on every
+    // record of that send; cleared on all of them when any one is erased.
+    keyDigest: varchar("key_digest", { length: 64 }),
+
+    /**
+     * The queued email this was an attempt of, when it was one, so its
+     * attempts read as one timeline.
+     */
+    queuedId: varchar("queued_id", { length: 36 }),
+    /**
+     * Which version of its template was sent: the template's owner (`core`,
+     * `plugin:<name>`, `site`, or `code` for the site's code version), whether
+     * the site had overridden it, and a digest of the version as saved, never
+     * its content or what it rendered to. `none` for a send without a
+     * template; null on a row written before versions were recorded.
+     */
+    // Unbounded, as a plugin's name is: a bounded column would refuse the
+    // record, which the recorder swallows, and the send would vanish.
+    templateOwner: text("template_owner"),
+    templateOverridden: boolean("template_overridden"),
+    templateDigest: varchar("template_digest", { length: 64 }),
+    /**
+     * The provider's answer to a failed send, structured: `retryable`,
+     * `refused` or `unknown`, and its status (HTTP or SMTP) where it gave
+     * one. Never the provider's own text, which can quote an address, the
+     * message or a credential.
+     */
+    failureKind: varchar("failure_kind", { length: 16 }),
+    failureStatus: integer("failure_status"),
+    /**
+     * Where the provider that carried it came from: `stored` (a provider row,
+     * which `provider_id` names while it exists) or `code` (the site's
+     * configured provider). Read with whether the stored one still exists,
+     * so a deleted provider reads `deleted`; null on a row from before.
+     */
+    providerOrigin: varchar("provider_origin", { length: 16 }),
+
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  t => [
+    // The unfiltered read — "what happened recently", and the default this
+    // service serves. Every other index below leads with a different column,
+    // so none of them can order the whole table; without this one the default
+    // list degrades to a full scan and sort as the log grows.
+    index("email_deliveries_created_idx").on(t.createdAt),
+    // "Did this address receive anything, and when" — the support question,
+    // answered by hashing the address the operator was given.
+    index("email_deliveries_recipient_idx").on(t.recipientHash, t.createdAt),
+    // "What is failing right now", and the retention scan, which walks one
+    // status oldest-first.
+    index("email_deliveries_status_created_idx").on(t.status, t.createdAt),
+    // One provider's history, newest first.
+    index("email_deliveries_provider_idx").on(t.providerId, t.createdAt),
+    // Deliveries by provider type, which outlives a deleted provider.
+    index("email_deliveries_provider_type_idx").on(t.providerType, t.createdAt),
+    // The shape a retention pass needs: one class at a time, oldest first.
+    // Present with the column and unused for the same reason.
+    index("email_deliveries_retention_idx").on(t.retentionClass, t.createdAt),
+    // Erasure finds a person's rows by kind and id.
+    index("email_deliveries_principal_idx").on(t.principalKind, t.principalId),
+    // Erasure clears a send's key digest from all its records.
+    index("email_deliveries_key_idx").on(t.keyDigest),
+    // A queued email's attempts, read as its timeline.
+    index("email_deliveries_queued_idx").on(t.queuedId),
+    index("email_deliveries_provider_origin_idx").on(
+      t.providerOrigin,
+      t.createdAt
+    ),
+    // One template's history, and when each template was last sent: the
+    // Activity list's template filter, and the Messages list's "Last sent".
+    index("email_deliveries_template_idx").on(
+      t.templateSlug,
+      t.status,
+      t.createdAt
+    ),
+    // One template's deliveries in the list's order, whatever their outcome.
+    index("email_deliveries_template_created_idx").on(
+      t.templateSlug,
+      t.createdAt,
+      t.id
+    ),
+  ]
+);
+
+export type EmailDeliveryPg = typeof emailDeliveriesPg.$inferSelect;
+export type EmailDeliveryInsertPg = typeof emailDeliveriesPg.$inferInsert;

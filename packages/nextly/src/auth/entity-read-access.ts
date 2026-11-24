@@ -1,0 +1,373 @@
+/**
+ * Whether a caller may read an entity, decided without a `Request`.
+ *
+ * `requireCollectionAccess` is the canonical answer, but it reads the incoming
+ * request to authenticate, so a dispatcher handler — which only receives the
+ * resolved identity — cannot call it. Anything needing the decision after
+ * dispatch previously had to approximate it, and the approximations were more
+ * permissive than the original.
+ *
+ * This module holds the decision itself, so both entry points share one rule
+ * rather than two that drift.
+ *
+ * @module auth/entity-read-access
+ */
+
+import { NextlyError } from "../errors/nextly-error";
+import { rethrowIfAnyRuleCouldNotRun } from "../errors/rule-could-not-run";
+import type { ReadCaller } from "../services/dashboard/readable-resources";
+
+import { isSuperAdmin } from "./access/actor";
+import { readsEntity } from "./access/entity-read";
+import { rememberRouteVerdict } from "./access/request-memo";
+import { actorForKey, userIsSuperAdmin } from "./access/resolve-actor";
+import { holdsPermissionAnswer } from "./access/route-gate-adapters";
+import { readOf, type FilteredRead } from "./access/rule-answer";
+import { currentRuleLanguage } from "./access/rule-language";
+import {
+  apiKeyScopeFrom,
+  scopeGrants,
+  scopeHoldsSuperAdmin,
+} from "./authenticated-scope";
+import {
+  codeAccessAllows,
+  getRBACService,
+  type ReadAccessCaller,
+} from "./code-access";
+
+// The shared halves of the decision keep their old address: every reader and
+// every test that mocks this module reaches them here.
+export { codeAccessAllows, getRBACService, type ReadAccessCaller };
+
+/**
+ * The same caller a read endpoint resolved, in the shape an ENTITY-LEVEL read
+ * decision reads.
+ *
+ * Derived from {@link ReadCaller} rather than rebuilt from the `AuthContext`,
+ * and that is the whole point: `readCaller` has already resolved role IDs to
+ * slugs, and resolving them a second time is both an extra database read per
+ * request and a second chance to resolve them differently. One question, one
+ * resolution — the narrower view is derived from the richer one.
+ *
+ * `authenticatedScope` is present only for an API key, so its presence IS the
+ * auth method. Reading `actorType` rather than mere presence keeps that true if
+ * a future actor kind starts carrying a scope: a non-key actor must not be
+ * judged by {@link canReadEntity}'s api-key branch, which reads `permissions` as
+ * the key's own `{action}-{resource}` grants.
+ *
+ * Here rather than in `api/authenticated-read`, where it began, because a DOMAIN
+ * module needs it too — `system:versions` bounds a cross-document read by what
+ * its caller may see — and `domains/` must not import from `api/`. Reproducing
+ * the conversion there instead would be a second implementation of an access
+ * decision, which is the failure this module exists to prevent.
+ */
+export function readAccessCaller(caller: ReadCaller): ReadAccessCaller {
+  const scope = caller.authenticatedScope;
+  if (scope?.actorType === "apiKey") {
+    return {
+      userId: caller.user.id,
+      authMethod: "api-key",
+      permissions: [...scope.permissions],
+      // The rows behind those slugs, where the scope carried them. A rule is
+      // handed each grant's stored slug either way.
+      ...(scope.grants ? { grants: scopeGrants(scope) } : {}),
+      // The key's OWN roles when authentication resolved them; a key judged
+      // on its owner's roles is the same defect as one judged on its owner's
+      // permissions, in the direction that denies.
+      roles: [...(scope.roles ?? caller.user.roles ?? [])],
+      // Present only where the key carries it, so every other key's caller
+      // is as it was.
+      ...(scopeHoldsSuperAdmin(scope) ? { keyHoldsSuperAdmin: true } : {}),
+    };
+  }
+  return {
+    userId: caller.user.id,
+    authMethod: "session",
+    // A session caller carries none here on purpose: the access decision
+    // resolves its grants from the database (`actorForUser`). Handing it the
+    // key vocabulary would answer "denied" for every check.
+    permissions: [],
+    roles: caller.user.roles ?? [],
+  };
+}
+
+/**
+ * Whether this caller may read the entity behind `slug`.
+ *
+ * Mirrors `requireCollectionAccess` branch for branch, including the parts that
+ * are easy to get wrong when reimplementing it:
+ *
+ * - An API key is judged on its OWN scope. Its owner's grants are irrelevant,
+ *   in both directions: a key without `read-{slug}` is denied however
+ *   privileged its owner, and a key with it is allowed however unprivileged.
+ * - **A super admin does not bypass an API key's scope.** The bypass belongs to
+ *   the session path; applying it to keys would make a read-only key issued by
+ *   an administrator equivalent to their full account.
+ * - Code-defined `access.read` is consulted on both paths.
+ *
+ * `slug` is entity-generic — `getRegisteredTarget` reads the collection and
+ * single maps alike, so a Single resolves its own rules with no branch here.
+ *
+ * A read rule's filter answers yes: the caller may read the entries it
+ * matches. See {@link entityReadFor}, which keeps the filter for the reads
+ * this answer lets run.
+ */
+export async function canReadEntity(
+  slug: string,
+  caller: ReadAccessCaller
+): Promise<boolean> {
+  const read = await entityReadFor(slug, caller);
+  return read.allowed || read.filter !== undefined;
+}
+
+/**
+ * What this caller may read of the entity behind `slug`: every entry, none,
+ * or the entries a read rule's filter matches.
+ *
+ * A filter is kept for the request, as a route keeps its verdict, so a read
+ * this answer lets run with `routeAuthorized` (a document's history, its
+ * lock, a worklist's list) applies it rather than reading every entry. A
+ * request that cannot keep it reads none, rather than let such a read run
+ * unfiltered.
+ */
+export async function entityReadFor(
+  slug: string,
+  caller: ReadAccessCaller
+): Promise<FilteredRead> {
+  if (!caller.userId || !slug) return readOf(false);
+  // Before the container is up there is no service to read rules from; the
+  // reader answers as it does without one, which refuses a signed-in user.
+  const read = await readsEntity(slug, caller, getRBACService());
+  if (read.filter === undefined) return read;
+  const kept = rememberRouteVerdict(
+    {
+      userId: caller.userId,
+      // A key's verdict is kept under the scope its rule is told, as a
+      // route keeps it, so the read the key's request then runs finds it.
+      ...(caller.authMethod === "api-key"
+        ? { scope: apiKeyScopeFrom(caller) }
+        : {}),
+      slug,
+      action: "read",
+      language: currentRuleLanguage(),
+    },
+    { filter: read.filter }
+  );
+  return kept ? read : readOf(false);
+}
+
+/**
+ * Whether this caller holds one named permission, by its `{action}-{resource}`
+ * slug.
+ *
+ * The general form of {@link canReadEntity}, which asks the same two-branch
+ * question about the fixed slug `read-{entity}`. They live side by side so the
+ * two branch structures cannot drift apart unnoticed.
+ *
+ * Asked of the one access decision, as a route gate asks it: a session is
+ * judged as `requirePermission` judges a route declaring the same slug, the
+ * super-admin bypass and any registered rule for the named resource
+ * included, and an API key on its own stamped slug alone. Where that differs
+ * from the decision, the answer is kept through a named deviation.
+ *
+ * Used to decide whether a dashboard widget declaring `requiredPermission` is
+ * even mentioned to this caller. That field was previously gated in the admin
+ * alone, which is a rendering decision rather than an access one -- a client
+ * that simply did not run the check saw every card's existence.
+ *
+ * Deny-by-default in both directions the way `canReadEntity` is: an empty
+ * caller id, an unparseable slug and an unreachable RBAC service each answer
+ * false.
+ */
+export function callerHoldsPermission(
+  slug: string,
+  caller: ReadAccessCaller
+): Promise<boolean> {
+  return holdsPermissionAnswer(slug, caller, getRBACService());
+}
+
+/**
+ * Whether the caller holds super-admin authority, asked of the one decision's
+ * actor, as the schema journal's route asks it: a session by the person's
+ * roles, and an API key by its own actor, so only a key carrying its maker's
+ * super-admin authority (`keyHoldsSuperAdmin`, which only authentication
+ * sets) answers yes, never a narrower key that super-admin made.
+ *
+ * For the surfaces only a super-admin is shown, such as System health. A
+ * session whose roles cannot be read answers false: `isSuperAdmin` fails
+ * closed.
+ */
+export function callerIsSuperAdmin(caller: ReadAccessCaller): Promise<boolean> {
+  if (!caller.userId) return Promise.resolve(false);
+  if (caller.authMethod === "api-key") {
+    const actor = actorForKey({
+      keyId: "",
+      userId: caller.userId,
+      grants: caller.grants ?? [],
+      roles: caller.roles,
+      superAdmin: caller.keyHoldsSuperAdmin === true,
+    });
+    return Promise.resolve(isSuperAdmin(actor));
+  }
+  return userIsSuperAdmin(caller.userId);
+}
+
+/**
+ * How many read decisions may be in flight at once.
+ *
+ * This bounds the cheap decision that PRECEDES a query rather than the queries
+ * themselves, and it exists for a different resource. {@link canReadEntity}
+ * resolves a session caller through `isSuperAdmin`, which is a per-user TTL
+ * cache: fired concurrently from a cold cache, every call misses before the
+ * first one populates it, so a site with a hundred entities opens a hundred
+ * simultaneous permission reads to answer one question a hundred times.
+ * Grouping them keeps the pool intact and lets the cache do its job.
+ */
+export const AUTHORIZATION_CONCURRENCY = 8;
+
+/**
+ * The order authorization decisions are taken in: one, then bounded groups.
+ *
+ * The lone first group is not a rounding artefact — it is the warm-up. The
+ * shared per-user caches (`isSuperAdmin`, and the role/permission reads behind
+ * it) are populated by whichever call resolves first, so letting one finish
+ * before the rest fan out converts N cold misses into one miss and N-1 hits.
+ * Fanning out immediately is what makes a cold cache expensive.
+ *
+ * Deliberately NOT a cap on how many entities are authorized. Every candidate
+ * still gets a decision, because one skipped without a verdict cannot be safely
+ * named as unconsulted (naming it discloses that it exists) nor safely omitted
+ * (that is the silent "nothing there" the callers of this exist to prevent).
+ * What is bounded here is concurrency, which is the resource that actually
+ * breaks.
+ */
+export function authorizationGroups(
+  slugs: readonly string[],
+  concurrency: number = AUTHORIZATION_CONCURRENCY
+): string[][] {
+  // A non-positive step never advances `i`, and a negative one walks it
+  // backwards: either spins forever on a non-empty list. Unreachable today —
+  // every caller takes the default — which is precisely what makes the guard
+  // cheap: it reads two values already in hand and its branch never runs.
+  //
+  // It THROWS rather than clamping because `concurrency` is a module constant
+  // no request can reach, so a bad one is a programming error;
+  // `INTERNAL_ERROR` is the honest classification, and the value travels in
+  // `logContext` where an operator can see it without it reaching the response.
+  if (!Number.isInteger(concurrency) || concurrency < 1) {
+    throw NextlyError.internal({
+      logContext: {
+        concurrency,
+        reason: "authorization concurrency must be a positive integer",
+      },
+    });
+  }
+  if (slugs.length === 0) return [];
+  const groups: string[][] = [[slugs[0]]];
+  const rest = slugs.slice(1);
+  for (let i = 0; i < rest.length; i += concurrency) {
+    groups.push(rest.slice(i, i + concurrency));
+  }
+  return groups;
+}
+
+/**
+ * The same order as {@link authorizationGroups}, for decisions that arrive one
+ * at a time rather than as a list known in advance: the first runs alone, as
+ * the warm-up, and then at most `AUTHORIZATION_CONCURRENCY` run at once, each
+ * waiting turn starting as one finishes.
+ *
+ * For a caller that learns what to authorize while it runs, such as a declared
+ * widget's data function reading collections nobody named beforehand, where
+ * grouping a list cannot apply. Each call hands back the decision's own
+ * promise, so a rejection still reaches only the caller that asked.
+ */
+export function authorizationScheduler(
+  concurrency: number = AUTHORIZATION_CONCURRENCY
+): <T>(decide: () => Promise<T>) => Promise<T> {
+  // The same guard as the grouping's, for the same reason.
+  if (!Number.isInteger(concurrency) || concurrency < 1) {
+    throw NextlyError.internal({
+      logContext: {
+        concurrency,
+        reason: "authorization concurrency must be a positive integer",
+      },
+    });
+  }
+  let running = 0;
+  let warmed = false;
+  const waiting: Array<() => void> = [];
+  const startWaiting = () => {
+    while (running < (warmed ? concurrency : 1) && waiting.length > 0) {
+      running += 1;
+      waiting.shift()?.();
+    }
+  };
+  return <T>(decide: () => Promise<T>) =>
+    new Promise<T>((resolve, reject) => {
+      waiting.push(() => {
+        decide()
+          .then(resolve, reject)
+          .finally(() => {
+            running -= 1;
+            warmed = true;
+            startWaiting();
+          });
+      });
+      startWaiting();
+    });
+}
+
+/**
+ * Which of `slugs` this caller may read, decided one entity at a time.
+ *
+ * The decision is {@link canReadEntity}'s, taken per entity, because that is
+ * the only thing that agrees with what a row read will answer. Deriving the set
+ * from permission SLUGS instead — filtering `read-{slug}` or `{slug}:read` —
+ * looks equivalent and is not: the access decision asks a code-defined
+ * `access.read` after the stored grant, and a collection REFUSED in code still
+ * has the row that a slug filter would admit it on.
+ *
+ * Coarse only in WHAT it decides — whether an entity is in reach at all. The
+ * per-row rules of whatever query follows still decide which documents come
+ * back.
+ */
+export async function readableEntities(
+  slugs: readonly string[],
+  caller: ReadAccessCaller
+): Promise<Set<string>> {
+  // DEDUPLICATED, because several callers name one entity more than once — a
+  // dashboard offering two cards per collection asks about each twice — and a
+  // permission decision resolves a session caller through a per-user TTL cache,
+  // so the repeat is a second database read for an answer already in hand.
+  const distinct = [
+    ...new Set(
+      slugs.filter(
+        (slug): slug is string => typeof slug === "string" && slug !== ""
+      )
+    ),
+  ];
+
+  const allowed = new Set<string>();
+  for (const group of authorizationGroups(distinct)) {
+    // 🔴 `allSettled`, not `all`. A single rejected decision used to reject the
+    // WHOLE calculation, so one unreachable RBAC lookup turned every surface
+    // built on this — the dashboard's readable resources, the widget layout,
+    // the workspace payload — into an error rather than a narrower answer. A
+    // check that threw has told us nothing, and "nothing" must not read as
+    // "allowed" either: the slug is denied and the rest of the set still
+    // answers. That is the direction `canReadEntity` itself takes when RBAC is
+    // unreachable.
+    const settled = await Promise.allSettled(
+      group.map(slug => canReadEntity(slug, caller))
+    );
+    // A rule that could not run never answered: the request ends with that,
+    // not with its entity left out of the set as though refused.
+    rethrowIfAnyRuleCouldNotRun(settled);
+    group.forEach((slug, index) => {
+      const outcome = settled[index];
+      if (outcome.status === "fulfilled" && outcome.value) allowed.add(slug);
+    });
+  }
+  return allowed;
+}

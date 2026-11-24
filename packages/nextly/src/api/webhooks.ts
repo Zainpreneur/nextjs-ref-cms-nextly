@@ -1,0 +1,738 @@
+/**
+ * Webhook endpoint REST handler functions.
+ *
+ * Named handlers for the six webhook endpoints. Each owns its full auth +
+ * validation + service-call cycle, and the main route handler calls them when
+ * it detects `service === "webhooks"` in the parsed route.
+ *
+ * Endpoints are global rather than per-user: `created_by` is
+ * `onDelete: "set null"` attribution, not ownership, so there is no
+ * owner-scoped filtering here and no super-admin widening. A caller who may
+ * read webhooks may read all of them.
+ *
+ * Mutations are session-only. Registering an endpoint is both an SSRF
+ * primitive (it names a URL the server will call) and an exfiltration
+ * primitive (it names a URL the server will send content to), so it is not
+ * something an API key should be able to do on its holder's behalf.
+ *
+ * Revealing a signing secret is treated as a write for the same reason it is a
+ * separate service method: the secret is what proves a request came from this
+ * install, so it requires the update permission rather than read. A read-only
+ * role that could read secrets could forge traffic every receiver would trust.
+ *
+ * The list endpoint is not server-paginated, so it ships the same synthetic
+ * single-page meta `api-keys` uses to stay on the canonical `respondList`
+ * envelope.
+ *
+ * @module api/webhooks
+ */
+
+import { z } from "zod";
+
+import { isErrorResponse, requireAnyPermission } from "../auth/middleware";
+import { toNextlyAuthError } from "../auth/middleware/to-nextly-error";
+import { container } from "../di";
+import { offsetPaginationToMeta } from "../dispatcher/helpers/service-envelope";
+import type { WebhookFastDrainScheduler } from "../domains/webhooks/after-drain";
+import { DRAIN_REQUEST_TIMEOUT_MS } from "../domains/webhooks/deliver";
+import {
+  runWebhookDrain,
+  SCHEDULED_DRAIN_BOUNDS,
+  type RunWebhookDrainOptions,
+  type WebhookDrainDatabase,
+} from "../domains/webhooks/drain-runner";
+import type { WebhookEndpointRegistry } from "../domains/webhooks/endpoint-registry";
+import { webhookEventTypes } from "../domains/webhooks/event-type-registry";
+import {
+  CreateWebhookRequestSchema,
+  UpdateWebhookRequestSchema,
+  type CreateWebhookRequest,
+  type UpdateWebhookRequest,
+} from "../domains/webhooks/request-schemas";
+import type { WebhookDeliveryQueryService } from "../domains/webhooks/services/webhook-delivery-query-service";
+import type { WebhookEndpointService } from "../domains/webhooks/services/webhook-endpoint-service";
+import { NextlyError } from "../errors/nextly-error";
+import { getCachedNextly } from "../init";
+import { RotateWebhookSchema } from "../schemas/_zod/webhooks";
+import { SKIP_TIMEZONE_FORMAT_HEADER } from "../shared/lib/date-formatting";
+
+import { readJsonBody } from "./read-json-body";
+import {
+  respondAction,
+  respondData,
+  respondDoc,
+  respondList,
+  respondMutation,
+} from "./response-shapes";
+import { authorizeTrigger } from "./trigger-auth";
+import { withErrorHandler } from "./with-error-handler";
+import { nextlyValidationFromZod } from "./zod-to-nextly-error";
+
+/**
+ * Applied to the secret response so it is never retained by a browser or a
+ * shared intermediary that caches authenticated GETs. Matches the header set
+ * the other secret-bearing reads in this package use.
+ */
+const PRIVATE_NO_STORE_HEADERS = {
+  "Cache-Control": "private, no-store",
+  Vary: "Cookie",
+} as const;
+
+async function getWebhookService(): Promise<WebhookEndpointService> {
+  await getCachedNextly();
+  return container.get<WebhookEndpointService>("webhookEndpointService");
+}
+
+async function getWebhookDeliveryService(): Promise<WebhookDeliveryQueryService> {
+  await getCachedNextly();
+  return container.get<WebhookDeliveryQueryService>(
+    "webhookDeliveryQueryService"
+  );
+}
+
+/** Delivery statuses a caller may filter on; matches the drain's vocabulary. */
+const DELIVERY_STATUSES = [
+  "pending",
+  "processing",
+  "delivered",
+  "retrying",
+  "failed",
+] as const;
+
+/**
+ * Query parameters for the delivery list. `page`/`limit` are coerced and
+ * bounded (a huge limit would let one request read the whole ledger); an
+ * unknown `status` is a client mistake rather than an empty result, so it is
+ * rejected. `eventType` is passed through — an unknown type simply matches
+ * nothing.
+ */
+const ListDeliveriesQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).catch(1),
+  limit: z.coerce.number().int().min(1).max(100).catch(20),
+  status: z.enum(DELIVERY_STATUSES).optional(),
+  eventType: z.string().min(1).max(100).optional(),
+});
+
+/**
+ * `update` is accepted for every action, matching how `api-keys` treats its
+ * update permission as the de-facto umbrella now that the explicit `manage-*`
+ * entry has been removed.
+ */
+async function requireWebhookPermission(
+  req: Request,
+  action: "create" | "read" | "update" | "delete"
+) {
+  return requireAnyPermission(req, [
+    { action, resource: "webhooks" },
+    { action: "update", resource: "webhooks" },
+  ]);
+}
+
+/**
+ * Refuse a session-only operation asked by an API key: only a signed-in
+ * person may manage webhooks. The refusal is about what kind of caller asked,
+ * not its permissions, so it says so; §13.8 keeps refusals for want of
+ * permission generic. The attempted action lives in `logContext`.
+ */
+function denySessionOnly(
+  action:
+    | "create"
+    | "update"
+    | "delete"
+    | "reveal"
+    | "test"
+    | "redeliver"
+    | "rotate"
+    | "expire-secrets"
+): never {
+  throw NextlyError.personOnly({
+    doing: "manage webhooks",
+    logContext: { reason: "session-only", action },
+  });
+}
+
+/**
+ * Per-invocation work bounds for the cron/manual drain trigger. A scheduler tick
+ * runs inside a platform execution limit (Vercel Cron functions default to tens
+ * of seconds), so one request must NOT try to drain an unbounded backlog: it
+ * does a bounded slice and returns, and the next tick continues where this one
+ * left off (the outbox is durable and claims are leased).
+ *
+ * The wall-clock budget is the real bound: the drain stops attempting new
+ * deliveries once it is spent, so even a batch of hung receivers extends the
+ * pass by at most one in-flight request rather than `batch × rounds × timeout`.
+ * The drain also uses a shorter per-request timeout than the engine default —
+ * 10s matches common webhook-receiver expectations (e.g. GitHub) — so that one
+ * in-flight overrun stays small. Together they keep a tick within roughly
+ * `budget + 10s`, comfortably inside a typical serverless window; the round and
+ * batch caps are secondary limits on a healthy, fast backlog.
+ */
+
+/**
+ * Authorize a webhook drain trigger.
+ *
+ * The posture — scheduler bearer secret, or a human with webhook-update through
+ * a POST from a same-origin context — is the one every trigger in this codebase
+ * shares, so it lives in `trigger-auth` and this names only what is specific to
+ * webhooks: the permission a human needs.
+ */
+async function authorizeDrain(request: Request): Promise<void> {
+  await authorizeTrigger(request, {
+    requirePermission: req => requireWebhookPermission(req, "update"),
+    reason: "drain",
+  });
+}
+
+/**
+ * Run one webhook drain: fan out due events into deliveries and attempt the due
+ * deliveries. Idempotent and safe to call repeatedly — a scheduler (e.g. Vercel
+ * Cron, which triggers with a GET) hits this on an interval; retries are
+ * advanced on later calls. Accepts GET or POST.
+ *
+ * Auth: a shared `NEXTLY_DRAIN_SECRET` or Vercel's `CRON_SECRET` (bearer,
+ * constant-time) OR an authenticated admin/API-key caller with
+ * `update-webhooks`. Not session-only: a scheduler has no session.
+ *
+ * Response: the canonical mutation envelope `{ message, item }`, where `item` is
+ * the drain summary (rounds, events processed, deliveries created,
+ * attempted/delivered/retried/failed).
+ */
+export const drainWebhooks = withErrorHandler(
+  async (request: Request): Promise<Response> => {
+    await authorizeDrain(request);
+
+    await getCachedNextly();
+    // The runtime adapter satisfies the fan-out + delivery database surfaces;
+    // resolve it as exactly that from the container.
+    const adapter = container.get<WebhookDrainDatabase>("adapter");
+    const registry = container.get<WebhookEndpointRegistry>(
+      "webhookEndpointRegistry"
+    );
+    // Retention runs after delivery so a cron-only install still prunes its
+    // event/delivery ledger and its audit trails. This is the only trigger with
+    // nobody waiting on it, so it is where the configured budget is spent. Every
+    // other one hangs off a request and is capped to keep that request short: a
+    // content mutation offers two batches, a sign-in one, since a sign-in is the
+    // more latency-sensitive of the two and its trail grows more slowly. An
+    // install with no webhooks at all reaches this by scheduling the route,
+    // which is what lets an auth-only deployment catch up. `undefined` when
+    // neither policy has anything to prune.
+    const retention = container.get<RunWebhookDrainOptions["retention"]>(
+      "webhookRetentionDeps"
+    );
+
+    const result = await runWebhookDrain(adapter, registry, {
+      // Bound the work one scheduler tick performs; the next tick continues.
+      // maxDurationMs is the hard bound (stops mid-batch when receivers hang);
+      // the shorter timeout caps the single in-flight overrun past it.
+      ...SCHEDULED_DRAIN_BOUNDS,
+      requestTimeoutMs: DRAIN_REQUEST_TIMEOUT_MS,
+      retention,
+    });
+    // A POST/GET trigger with fan-out + delivery side effects: return the
+    // canonical mutation envelope with the drain summary as the item.
+    return respondMutation("Webhook drain completed.", result);
+  }
+);
+
+/**
+ * List every registered webhook endpoint.
+ *
+ * Auth: session or API key + `read-webhooks` (or `update-webhooks`).
+ *
+ * Response: `{ items: WebhookEndpointSummary[], meta: PaginationMeta }`. No
+ * summary carries a secret or its ciphertext.
+ */
+export const listWebhooks = withErrorHandler(
+  async (req: Request): Promise<Response> => {
+    const authResult = await requireWebhookPermission(req, "read");
+    if (isErrorResponse(authResult)) throw toNextlyAuthError(authResult);
+
+    const service = await getWebhookService();
+    const endpoints = await service.listEndpoints();
+
+    // Synthetic single-page meta keeps the canonical list shape even though
+    // the underlying service does not paginate.
+    return respondList(endpoints, {
+      total: endpoints.length,
+      page: 1,
+      limit: endpoints.length,
+      totalPages: 1,
+      hasNext: false,
+      hasPrev: false,
+    });
+  }
+);
+
+/**
+ * List the event types an endpoint may subscribe to: core's and every enabled
+ * plugin's, each with its owner, from the one list subscriptions are judged
+ * against.
+ *
+ * Auth: session or API key + `read-webhooks`, `create-webhooks` or
+ * `update-webhooks`, through the permission gate every webhook route passes.
+ * Create is among them because the form that registers an endpoint offers
+ * these types, and a role that may only create must still be able to choose
+ * one; the list names types and owners, nothing about any endpoint.
+ *
+ * Response: `{ items: WebhookEventTypeEntry[], meta: PaginationMeta }`.
+ */
+export const listWebhookEventTypes = withErrorHandler(
+  async (req: Request): Promise<Response> => {
+    const authResult = await requireAnyPermission(req, [
+      { action: "read", resource: "webhooks" },
+      { action: "create", resource: "webhooks" },
+      { action: "update", resource: "webhooks" },
+    ]);
+    if (isErrorResponse(authResult)) throw toNextlyAuthError(authResult);
+
+    // Booted first, so the list includes the types plugins declare at boot.
+    await getCachedNextly();
+    const items = [...webhookEventTypes()];
+    return respondList(items, {
+      total: items.length,
+      page: 1,
+      limit: items.length,
+      totalPages: 1,
+      hasNext: false,
+      hasPrev: false,
+    });
+  }
+);
+
+/**
+ * Fetch a single webhook endpoint by id.
+ *
+ * Auth: session or API key + `read-webhooks` (or `update-webhooks`).
+ *
+ * Response: bare `WebhookEndpointSummary` document body via `respondDoc`.
+ */
+export function getWebhookById(req: Request, id: string): Promise<Response> {
+  return withErrorHandler(async (request: Request) => {
+    const authResult = await requireWebhookPermission(request, "read");
+    if (isErrorResponse(authResult)) throw toNextlyAuthError(authResult);
+
+    const service = await getWebhookService();
+    const endpoint = await service.getEndpoint(id);
+
+    if (!endpoint) {
+      throw NextlyError.notFound({
+        logContext: { entity: "webhook-endpoint", id },
+      });
+    }
+
+    return respondDoc(endpoint);
+  })(req);
+}
+
+/**
+ * List an endpoint's deliveries, newest first, with paging and optional
+ * status/event-type filters.
+ *
+ * Auth: session or API key + `read-webhooks` (or `update-webhooks`).
+ *
+ * Scoped by webhook id alone, so deliveries remain readable after an endpoint
+ * is retired (its history is kept deliberately). A delivery row carries no
+ * credential, so this is a plain read.
+ *
+ * Response: `{ items: WebhookDeliverySummary[], meta: PaginationMeta }`.
+ */
+export function listWebhookDeliveries(
+  req: Request,
+  webhookId: string
+): Promise<Response> {
+  return withErrorHandler(async (request: Request) => {
+    const authResult = await requireWebhookPermission(request, "read");
+    if (isErrorResponse(authResult)) throw toNextlyAuthError(authResult);
+
+    const url = new URL(request.url);
+    const parsed = ListDeliveriesQuerySchema.safeParse({
+      page: url.searchParams.get("page") ?? undefined,
+      limit: url.searchParams.get("limit") ?? undefined,
+      status: url.searchParams.get("status") ?? undefined,
+      eventType: url.searchParams.get("eventType") ?? undefined,
+    });
+    if (!parsed.success) throw nextlyValidationFromZod(parsed.error);
+    const { page, limit, status, eventType } = parsed.data;
+
+    const service = await getWebhookDeliveryService();
+    const { items, total } = await service.listDeliveries(webhookId, {
+      page,
+      limit,
+      status,
+      eventType,
+    });
+
+    // Opt this response out of timezone rewriting: a delivery's lastError and
+    // response snippet are opaque captured text that must survive verbatim.
+    return respondList(
+      items,
+      offsetPaginationToMeta({ total, limit, offset: (page - 1) * limit }),
+      { headers: { [SKIP_TIMEZONE_FORMAT_HEADER]: "1" } }
+    );
+  })(req);
+}
+
+/**
+ * Fetch one delivery (with its attempt history and response snippet) for an
+ * endpoint.
+ *
+ * Auth: session or API key + `read-webhooks` (or `update-webhooks`).
+ *
+ * Response: bare `WebhookDeliveryDetail` via `respondDoc`. 404 when no delivery
+ * with this id belongs to this endpoint.
+ */
+export function getWebhookDelivery(
+  req: Request,
+  webhookId: string,
+  deliveryId: string
+): Promise<Response> {
+  return withErrorHandler(async (request: Request) => {
+    const authResult = await requireWebhookPermission(request, "read");
+    if (isErrorResponse(authResult)) throw toNextlyAuthError(authResult);
+
+    const service = await getWebhookDeliveryService();
+    const delivery = await service.getDelivery(webhookId, deliveryId);
+
+    if (!delivery) {
+      throw NextlyError.notFound({
+        logContext: { entity: "webhook-delivery", webhookId, deliveryId },
+      });
+    }
+
+    // Opt out of timezone rewriting so the raw response snippet and attempt
+    // errors are returned exactly as the receiver sent them.
+    return respondDoc(delivery, {
+      headers: { [SKIP_TIMEZONE_FORMAT_HEADER]: "1" },
+    });
+  })(req);
+}
+
+/**
+ * Send a synthetic signed ping to an endpoint and report the outcome.
+ *
+ * A connectivity probe: it makes one outbound request and writes nothing to the
+ * outbox or the delivery queue, so an operator can verify a receiver (reachable
+ * + signature accepted) without producing a real event. Works on a disabled
+ * endpoint too, so a receiver can be verified before it is enabled.
+ *
+ * Auth: **session only** + `update-webhooks` (a side-effecting action, not a read).
+ *
+ * Response: `{ message, result: WebhookTestResult }` via `respondAction`.
+ */
+export function testWebhookEndpoint(
+  req: Request,
+  id: string
+): Promise<Response> {
+  return withErrorHandler(async (request: Request) => {
+    const authResult = await requireWebhookPermission(request, "update");
+    if (isErrorResponse(authResult)) throw toNextlyAuthError(authResult);
+
+    if (authResult.authMethod !== "session") denySessionOnly("test");
+
+    const service = await getWebhookService();
+    const result = await service.testEndpoint(id);
+
+    // The receiver's snippet is echoed verbatim; skip timezone rewriting.
+    // Spread into a fresh object so the typed result satisfies the action
+    // envelope's `Record<string, unknown>` shape.
+    return respondAction(
+      "Test event sent.",
+      { ...result },
+      { headers: { [SKIP_TIMEZONE_FORMAT_HEADER]: "1" } }
+    );
+  })(req);
+}
+
+/**
+ * Re-attempt a specific past delivery.
+ *
+ * Re-arms the existing delivery row for another attempt from its stored event
+ * payload (the unique `(webhook, event)` index forbids a duplicate row, so the
+ * delivery id — the Standard-Webhooks `webhook-id` — is reused and a receiver
+ * that already processed it dedupes), then nudges the drain so it goes out
+ * promptly. The outcome surfaces in the delivery log.
+ *
+ * Auth: **session only** + `update-webhooks`.
+ *
+ * Response: `{ message, item: WebhookDeliveryDetail }` via `respondMutation`.
+ */
+export function redeliverWebhookDelivery(
+  req: Request,
+  webhookId: string,
+  deliveryId: string
+): Promise<Response> {
+  return withErrorHandler(async (request: Request) => {
+    const authResult = await requireWebhookPermission(request, "update");
+    if (isErrorResponse(authResult)) throw toNextlyAuthError(authResult);
+
+    if (authResult.authMethod !== "session") denySessionOnly("redeliver");
+
+    const service = await getWebhookService();
+    await service.redeliverDelivery(webhookId, deliveryId);
+
+    // Offer the post-response fast drain so the re-armed delivery is attempted
+    // promptly; the scheduled drain is the backstop when no runtime `after()`
+    // is available.
+    if (container.has("webhookFastDrainScheduler")) {
+      container
+        .get<WebhookFastDrainScheduler>("webhookFastDrainScheduler")
+        .offer();
+    }
+
+    // Read back the re-armed delivery for the response so the operator sees its
+    // reset state (status `pending`, attempt count 0) and prior attempt history.
+    const deliveryService = await getWebhookDeliveryService();
+    const delivery = await deliveryService.getDelivery(webhookId, deliveryId);
+    if (!delivery) {
+      throw NextlyError.notFound({
+        logContext: { entity: "webhook-delivery", webhookId, deliveryId },
+      });
+    }
+
+    return respondMutation("Redelivery queued.", delivery, {
+      headers: { [SKIP_TIMEZONE_FORMAT_HEADER]: "1" },
+    });
+  })(req);
+}
+
+/**
+ * Register a webhook endpoint.
+ *
+ * The URL is resolved and checked by the service before it is stored, so a
+ * private, loopback or cloud-metadata target is refused here rather than
+ * failing silently on every later delivery.
+ *
+ * Auth: **session only** + `create-webhooks` (or `update-webhooks`).
+ *
+ * Response: `{ message, item: { doc: WebhookEndpointSummary, secret } }` via
+ * `respondMutation`, status 201. The secret is returned here so it can be
+ * copied into the receiver; it remains retrievable afterwards through the
+ * secret endpoint.
+ */
+export const createWebhook = withErrorHandler(
+  async (req: Request): Promise<Response> => {
+    const authResult = await requireWebhookPermission(req, "create");
+    if (isErrorResponse(authResult)) throw toNextlyAuthError(authResult);
+
+    if (authResult.authMethod !== "session") denySessionOnly("create");
+
+    // Booted before the body is judged, and only once the caller is: the event
+    // types an endpoint may subscribe to include the ones plugins declare at
+    // boot, so a cold process would otherwise refuse a plugin's type.
+    await getCachedNextly();
+    const body = await readJsonBody(req);
+
+    // The route's own schema: the published one, with a subscription list
+    // that also takes the types plugins declare.
+    let validated: CreateWebhookRequest;
+    try {
+      validated = CreateWebhookRequestSchema.parse(body);
+    } catch (err) {
+      if (err instanceof z.ZodError) throw nextlyValidationFromZod(err);
+      throw err;
+    }
+
+    const service = await getWebhookService();
+    const { endpoint, secret } = await service.createEndpoint(
+      validated,
+      authResult.userId
+    );
+
+    return respondMutation(
+      "Webhook endpoint created.",
+      { doc: endpoint, secret },
+      { status: 201 }
+    );
+  }
+);
+
+/**
+ * Change a webhook endpoint. Only the named fields move.
+ *
+ * A URL is re-validated on the way in, since an update is how an endpoint that
+ * passed at registration would be re-pointed. Setting `enabled` to false also
+ * ends the endpoint's outstanding deliveries, which is why disabling does not
+ * need its own route.
+ *
+ * Auth: **session only** + `update-webhooks`.
+ *
+ * Response: `{ message, item: WebhookEndpointSummary }` via `respondMutation`.
+ */
+export function updateWebhook(req: Request, id: string): Promise<Response> {
+  return withErrorHandler(async (request: Request) => {
+    const authResult = await requireWebhookPermission(request, "update");
+    if (isErrorResponse(authResult)) throw toNextlyAuthError(authResult);
+
+    if (authResult.authMethod !== "session") denySessionOnly("update");
+
+    // Booted before the body is judged, and only once the caller is: the event
+    // types an endpoint may subscribe to include the ones plugins declare at
+    // boot, so a cold process would otherwise refuse a plugin's type.
+    await getCachedNextly();
+    const body = await readJsonBody(request);
+
+    let validated: UpdateWebhookRequest;
+    try {
+      validated = UpdateWebhookRequestSchema.parse(body);
+    } catch (err) {
+      if (err instanceof z.ZodError) throw nextlyValidationFromZod(err);
+      throw err;
+    }
+
+    const service = await getWebhookService();
+    const updated = await service.updateEndpoint(id, validated);
+
+    return respondMutation("Webhook endpoint updated.", updated);
+  })(req);
+}
+
+/**
+ * Remove a webhook endpoint.
+ *
+ * This also discards its delivery history, because the delivery table's
+ * webhook foreign key cascades. Disabling is the reversible option and the one
+ * to reach for when the record of what was sent still matters.
+ *
+ * Auth: **session only** + `delete-webhooks` (or `update-webhooks`).
+ *
+ * Response: `{ message, id }` via `respondAction`. Deletion returns no
+ * document, so the action shape applies rather than `respondMutation`.
+ */
+export function deleteWebhook(req: Request, id: string): Promise<Response> {
+  return withErrorHandler(async (request: Request) => {
+    const authResult = await requireWebhookPermission(request, "delete");
+    if (isErrorResponse(authResult)) throw toNextlyAuthError(authResult);
+
+    if (authResult.authMethod !== "session") denySessionOnly("delete");
+
+    const service = await getWebhookService();
+    await service.deleteEndpoint(id);
+
+    return respondAction("Webhook endpoint deleted.", { id });
+  })(req);
+}
+
+/**
+ * Reveal an endpoint's active signing secrets.
+ *
+ * Separate from every other read so it can carry a stronger requirement: this
+ * asks for `update` rather than `read`, because the secret is what proves a
+ * request came from this install. More than one secret can be active at once
+ * during a rotation, and a caller reconciling their configuration needs to see
+ * all of them.
+ *
+ * Auth: **session only** + `update-webhooks`.
+ *
+ * Response: `{ secrets: string[] }` via `respondData`.
+ */
+export function revealWebhookSecret(
+  req: Request,
+  id: string
+): Promise<Response> {
+  return withErrorHandler(async (request: Request) => {
+    // Deliberately not `requireWebhookPermission`, which would also accept the
+    // read permission for a read action. Reading a signing secret is a
+    // privileged act and must not come with a read-only role.
+    const authResult = await requireAnyPermission(request, [
+      { action: "update", resource: "webhooks" },
+    ]);
+    if (isErrorResponse(authResult)) throw toNextlyAuthError(authResult);
+
+    if (authResult.authMethod !== "session") denySessionOnly("reveal");
+
+    const service = await getWebhookService();
+    const secrets = await service.revealSecrets(id);
+
+    return respondData({ secrets }, { headers: PRIVATE_NO_STORE_HEADERS });
+  })(req);
+}
+
+/**
+ * Rotate an endpoint's signing secret with an overlap window.
+ *
+ * A fresh secret becomes the primary; the previous one stays valid for
+ * `overlapSeconds` (default when omitted, 0 to retire it at once) so a receiver
+ * can switch over without dropping a delivery. Deliveries in the window carry a
+ * signature for both, so either secret verifies.
+ *
+ * Auth: **session only** + `update-webhooks` — rotation mints new key material.
+ *
+ * Response: `{ message, item: { doc, secret } }` via `respondMutation`. The new
+ * secret is returned here once, the same as on create, and is retrievable after
+ * through the reveal action until it is rotated away.
+ */
+export function rotateWebhookSecret(
+  req: Request,
+  id: string
+): Promise<Response> {
+  return withErrorHandler(async (request: Request) => {
+    const authResult = await requireWebhookPermission(request, "update");
+    if (isErrorResponse(authResult)) throw toNextlyAuthError(authResult);
+
+    if (authResult.authMethod !== "session") denySessionOnly("rotate");
+
+    // The body is optional: a rotate with no body takes the default overlap. An
+    // empty body reads as `{}` rather than failing JSON parsing.
+    const raw = await request.text();
+    let body: unknown = {};
+    if (raw.trim() !== "") {
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        throw NextlyError.validation({
+          errors: [
+            {
+              path: "",
+              code: "invalid_json",
+              message: "Request body is not valid JSON.",
+            },
+          ],
+          logContext: { reason: "invalid-json-body", entity: "webhook-rotate" },
+        });
+      }
+    }
+
+    let validated: z.infer<typeof RotateWebhookSchema>;
+    try {
+      validated = RotateWebhookSchema.parse(body);
+    } catch (err) {
+      if (err instanceof z.ZodError) throw nextlyValidationFromZod(err);
+      throw err;
+    }
+
+    const service = await getWebhookService();
+    const { endpoint, secret } = await service.rotateSecret(id, validated);
+
+    return respondMutation("Webhook signing secret rotated.", {
+      doc: endpoint,
+      secret,
+    });
+  })(req);
+}
+
+/**
+ * Retire every overlapping (rotated-away) signing secret immediately, leaving
+ * only the primary. The way to cut a rotation's overlap short once the receiver
+ * has switched to the new secret.
+ *
+ * Auth: **session only** + `update-webhooks`.
+ *
+ * Response: `{ message, item: WebhookEndpointSummary }` via `respondMutation`.
+ */
+export function expireWebhookOldSecrets(
+  req: Request,
+  id: string
+): Promise<Response> {
+  return withErrorHandler(async (request: Request) => {
+    const authResult = await requireWebhookPermission(request, "update");
+    if (isErrorResponse(authResult)) throw toNextlyAuthError(authResult);
+
+    if (authResult.authMethod !== "session") denySessionOnly("expire-secrets");
+
+    const service = await getWebhookService();
+    const updated = await service.expireOldSecrets(id);
+
+    return respondMutation("Old signing secrets expired.", updated);
+  })(req);
+}

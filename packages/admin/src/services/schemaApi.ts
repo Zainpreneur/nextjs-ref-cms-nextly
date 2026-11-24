@@ -1,0 +1,417 @@
+// API service for schema preview/apply endpoints.
+// Used by the visual schema builder save flow.
+import { protectedApi } from "@admin/lib/api/protectedApi";
+import { changedRowDeletesData } from "@admin/lib/builder/review-deletes-data";
+
+import type { ActionResponse } from "../lib/api/response-types";
+
+// Field change types returned by the preview endpoint
+export interface SchemaPreviewChange {
+  added: Array<{
+    name: string;
+    type: string;
+    required: boolean;
+    hasDefault: boolean;
+    classification: string;
+  }>;
+  removed: Array<{
+    name: string;
+    type: string;
+    rowCount: number;
+    classification: string;
+  }>;
+  changed: Array<{
+    name: string;
+    from: string;
+    to: string;
+    rowCount: number;
+    classification: string;
+    reason: string;
+  }>;
+  unchanged: string[];
+}
+
+// F4 Option E PR 5: rename candidates surfaced by the preview endpoint.
+// One candidate per (drop, add) pair the rename detector picks up. The
+// dialog renders these as radio buttons so the user picks "rename"
+// (preserve data) or "drop_and_add" (data lost) for each one.
+//
+// Cartesian: a single dropped column can appear in multiple candidates
+// when the same table has multiple new columns. The dialog handles the
+// shrinking-pool UX (a drop disappears once one of its targets is
+// chosen as a rename).
+export interface SchemaPreviewRenameCandidate {
+  table: string;
+  from: string;
+  to: string;
+  fromType: string;
+  toType: string;
+  typesCompatible: boolean;
+  /**
+   * Whether the rename leaves every stored value unchanged. Distinct from
+   * `typesCompatible`, which only says the pair can be read as a rename.
+   */
+  preservesValues: boolean;
+  /** What happens to the values when `preservesValues` is false. */
+  valueChangeReason?: string;
+  defaultSuggestion: "rename" | "drop_and_add";
+}
+
+// User's choice for one rename candidate, posted with apply().
+export interface SchemaRenameResolution {
+  tableName: string;
+  fromColumn: string;
+  toColumn: string;
+  choice: "rename" | "drop_and_add";
+}
+
+// A field that requires user input to resolve
+export interface InteractiveField {
+  name: string;
+  reason: "new_required_no_default" | "nullable_to_not_null_with_nulls";
+  tableRowCount: number;
+  nullCount?: number;
+  options: Array<"provide_default" | "mark_nullable" | "cancel">;
+}
+
+// A field that stops being translated in this change: what moves to the localization archive,
+// by language, and how to bring it back. Set by the preview; empty when no field leaves. Mirrors
+// the server's `LeavingTranslationPreview`, which the admin cannot import across the package
+// boundary, so the two are alike by design.
+// fallow-ignore-next-line code-duplication
+export interface SchemaPreviewLeavingTranslation {
+  name: string;
+  /** The field's column, which is how `interactiveFields` names it. */
+  column: string;
+  /** Values moving to the archive, by language; null when they could not be counted. */
+  byLocale: Record<string, number> | null;
+  total: number | null;
+  /** Entries with no default-language value, which keep another language's; null if unknown. */
+  entriesWithoutDefault: number | null;
+  /**
+   * Entries whose shared value comes from a language other than the default one, by that
+   * language: what their default-language readers will see. Null if unknown; absent from an
+   * older server.
+   */
+  sharedFrom?: Record<string, number> | null;
+  /** The language whose value becomes the shared one. */
+  defaultLocale: string;
+  restoreCommand: string;
+  /**
+   * Why the change will be refused, and the changes that get there instead, when it will be;
+   * Apply is not offered then.
+   */
+  refusal?: { reason: string; steps: string[] };
+}
+
+// Full response from the preview endpoint
+export interface SchemaPreviewResponse {
+  hasChanges: boolean;
+  hasDestructiveChanges: boolean;
+  classification: "safe" | "destructive" | "interactive";
+  changes: SchemaPreviewChange;
+  warnings: string[];
+  interactiveFields: InteractiveField[];
+  ddlPreview: string[];
+  schemaVersion: number;
+  // F4 Option E PR 5: empty for pure-additive changes; populated when the
+  // preview detects (drop, add) pairs that might be column renames.
+  renamed: SchemaPreviewRenameCandidate[];
+  leavingTranslation?: SchemaPreviewLeavingTranslation[];
+  joiningTranslation?: SchemaPreviewJoiningTranslation[];
+  /**
+   * What the save also brings up to date in a table an earlier Nextly version made, which it
+   * writes only once the apply confirms each by its key (`acknowledgedConversions`). Empty or
+   * absent when there is nothing to convert, and from an older server.
+   */
+  conversions?: SchemaPreviewConversion[];
+  /**
+   * The lines the save's own review gives beside the change, shown as they are: each conversion,
+   * fill and delete it writes, and each field it moves into or out of a group, with the column
+   * properties the move does not carry. Absent from an older server.
+   */
+  notices?: string[];
+}
+
+/** One field a save moves into or out of a group: its path as saved, and as the save leaves it. */
+export interface SchemaFieldMove {
+  from: string[];
+  to: string[];
+}
+
+/**
+ * What a save tells the server beyond its fields: each field it moves into or out of a group, so
+ * the migration it writes copies every value along the move rather than dropping the field.
+ */
+export interface SchemaSaveHints {
+  moves: SchemaFieldMove[];
+}
+
+/** The part of a preview's or an apply's body that carries the hints: nothing without them. */
+function saveHintsBody(hints: SchemaSaveHints | undefined): {
+  hints?: SchemaSaveHints;
+} {
+  return hints === undefined ? {} : { hints };
+}
+
+/** One conversion a save makes to a table an earlier Nextly version made, as the preview names it. */
+export interface SchemaPreviewConversion {
+  /** The table it converts. */
+  table: string;
+  /** The key the apply confirms it by. Opaque: a column's name, or the table's for an index. */
+  column: string;
+  from: string;
+  to: string;
+  /** What it does, in plain words ("adds an index on created_at"), shown as it is. */
+  change: string;
+  /** Whether it deletes stored values (it removes a column or a table): shown as data loss. */
+  deletesValues: boolean;
+}
+
+/**
+ * The part of an apply's body that confirms the reviewed conversions: their keys, or nothing when
+ * there are none, so a save with nothing to convert sends what it always has.
+ */
+/** A removed field's values the person confirmed deleting, as the review counted them. */
+export interface ConfirmedDeletion {
+  field: string;
+  count: number;
+}
+
+/**
+ * The values each field the reviewed preview removes, or changes so it loses them
+ * (`changedRowDeletesData`), holds, as it counted them: what the review's Save confirms deleting. The
+ * server deletes only where each count still holds when it deletes, and refuses, naming the new
+ * count, where one changed; a confirmed field whose column stays is not compared.
+ */
+export function confirmedDeletionsOf(
+  preview: Pick<SchemaPreviewResponse, "changes">
+): ConfirmedDeletion[] {
+  return [
+    ...preview.changes.removed,
+    ...preview.changes.changed.filter(changedRowDeletesData),
+  ].map(field => ({ field: field.name, count: field.rowCount }));
+}
+
+/** The apply body's confirmed counts, left out where the save removes no field. */
+function confirmedDeletionsBody(
+  confirmedDeletions: readonly ConfirmedDeletion[] | undefined
+): { confirmedDeletions?: readonly ConfirmedDeletion[] } {
+  return confirmedDeletions !== undefined && confirmedDeletions.length > 0
+    ? { confirmedDeletions }
+    : {};
+}
+
+function acknowledgedConversionsBody(
+  acknowledgedConversions: readonly string[] | undefined
+): { acknowledgedConversions?: readonly string[] } {
+  return acknowledgedConversions !== undefined &&
+    acknowledgedConversions.length > 0
+    ? { acknowledgedConversions }
+    : {};
+}
+
+/**
+ * A field becoming translated, as the schema preview reports it: its values become the default
+ * language's, and every other language falls back to them until translated.
+ */
+export interface SchemaPreviewJoiningTranslation {
+  name: string;
+  column: string;
+  /** How many entries hold a value in it; null if they could not be counted. */
+  values: number | null;
+  /** The language whose value each one becomes. */
+  defaultLocale: string;
+}
+
+// Response from the apply endpoint.
+// F1 PR 3: dropped the `restarting` field (single-process model means
+// no child to restart). The dispatcher no longer emits it; this interface
+// matches the new server shape.
+//
+// F10 PR 6: optional `toastSummary` carries a per-change-kind phrase
+// like "1 field added, 1 renamed" so the Schema Builder save handler
+// can render a contextual toast. Optional because older Nextly servers
+// don't emit it; the admin falls back to a generic "Schema updated".
+export interface SchemaApplyResponse {
+  success: boolean;
+  message: string;
+  newSchemaVersion: number;
+  toastSummary?: string;
+}
+
+// User resolution for an interactive field. "confirm_drop" acknowledges a
+// destructive column drop so the server may destroy that column's data; the
+// server fails the apply closed for any drop that is not acknowledged.
+export interface FieldResolution {
+  action: "provide_default" | "mark_nullable" | "cancel" | "confirm_drop";
+  value?: string;
+}
+
+/**
+ * What a Builder save is judged and applied with besides its fields, each sent only where given:
+ * the translation toggle and the Draft/Published toggle as the pending settings set them, and the
+ * fields it moves into or out of a group.
+ */
+interface SchemaSaveSettings {
+  localized?: boolean;
+  status?: boolean;
+  hints?: SchemaSaveHints;
+}
+
+function schemaSaveSettingsBody({
+  localized,
+  status,
+  hints,
+}: SchemaSaveSettings): Record<string, unknown> {
+  return {
+    ...(localized !== undefined ? { localized } : {}),
+    ...(status !== undefined ? { status } : {}),
+    ...saveHintsBody(hints),
+  };
+}
+
+/**
+ * A Builder save's preview at `address` (`/collections/schema/posts`): the same request for a
+ * collection, a Single and a field group. The dispatcher answers with the bare preview.
+ */
+export function previewSchemaAt(
+  address: string,
+  fields: unknown[],
+  settings: SchemaSaveSettings
+): Promise<SchemaPreviewResponse> {
+  return protectedApi.post<SchemaPreviewResponse>(`${address}/preview`, {
+    fields,
+    ...schemaSaveSettingsBody(settings),
+  });
+}
+
+/** What a Builder save's apply answers besides its fields: what its review asked and showed. */
+interface SchemaApplyAnswers {
+  schemaVersion: number;
+  resolutions?: Record<string, FieldResolution>;
+  renameResolutions?: SchemaRenameResolution[];
+  /** The keys of the conversions the review listed and its Save confirmed. */
+  acknowledgedConversions?: readonly string[];
+  /** The values of each removed field the review counted, which its Save confirmed deleting. */
+  confirmedDeletions?: readonly ConfirmedDeletion[];
+}
+
+/**
+ * A Builder save's apply at `address`, as every kind of entity sends it. The dispatcher answers
+ * with an action body (`{ message, newSchemaVersion, toastSummary? }`) and no boolean `success`:
+ * a 2xx response IS the success, so `success: true` is given here for the Builder, which reads
+ * `result.success`.
+ */
+export async function applySchemaAt(
+  address: string,
+  fields: unknown[],
+  answers: SchemaApplyAnswers,
+  settings: SchemaSaveSettings
+): Promise<SchemaApplyResponse> {
+  const result = await protectedApi.post<
+    ActionResponse<{ newSchemaVersion: number; toastSummary?: string }>
+  >(`${address}/apply`, {
+    fields,
+    confirmed: true,
+    schemaVersion: answers.schemaVersion,
+    resolutions: answers.resolutions,
+    renameResolutions: answers.renameResolutions,
+    ...schemaSaveSettingsBody(settings),
+    ...acknowledgedConversionsBody(answers.acknowledgedConversions),
+    ...confirmedDeletionsBody(answers.confirmedDeletions),
+  });
+  return {
+    success: true,
+    message: result.message,
+    newSchemaVersion: result.newSchemaVersion,
+    toastSummary: result.toastSummary,
+  };
+}
+
+/** A kind's preview of one entity's fields, with the toggles its save sends (`schemaPreviewFor`). */
+export type SchemaPreview = (
+  slug: string,
+  fields: unknown[],
+  localized?: boolean,
+  status?: boolean,
+  hints?: SchemaSaveHints
+) => Promise<SchemaPreviewResponse>;
+
+/**
+ * The preview of a kind whose saves send the translation and Draft/Published toggles (a
+ * collection, a Single), at its schema address (`/collections/schema`): one definition of what
+ * each sends.
+ */
+export function schemaPreviewFor(base: string): SchemaPreview {
+  return async (
+    slug: string,
+    fields: unknown[],
+    // i18n: the same toggle the apply will send. The preview is what collects
+    // the resolutions the apply then runs with, so a preview that diffs
+    // against a DIFFERENT localization state can miss a required-column
+    // prompt the apply turns out to need — the save then fails after the user
+    // already confirmed. Undefined leaves the persisted flag in charge.
+    localized?: boolean,
+    // The pending Draft/Published toggle, so a field taking one of the lifecycle's own names is
+    // refused when the same save turns the lifecycle on. Judged with, never applied: the settings
+    // save that follows the fields sets it. Undefined leaves the stored flag alone in charge.
+    status?: boolean,
+    // The fields the save moves into or out of a group, as its apply sends them.
+    hints?: SchemaSaveHints
+  ): Promise<SchemaPreviewResponse> =>
+    previewSchemaAt(`${base}/${slug}`, fields, { localized, status, hints });
+}
+
+// Apply schema changes (in-place update, no server restart).
+// renameResolutions carry one entry per rename candidate the user
+// picked in SchemaChangeDialog ("rename" preserves data;
+// "drop_and_add" lets the column drop and a new one create).
+async function applyCollectionSchema(
+  slug: string,
+  fields: unknown[],
+  schemaVersion: number,
+  resolutions?: Record<string, FieldResolution>,
+  renameResolutions?: SchemaRenameResolution[],
+  // i18n: the current Internationalization toggle (mirrors
+  // singleApi.applySchemaChanges), so an apply that flips i18n AND changes
+  // fields provisions the companion in the same request instead of diffing
+  // against the registry flag as it was before the save. Undefined leaves
+  // the persisted value untouched.
+  localized?: boolean,
+  // The pending Draft/Published toggle, judged with as the preview is (see above).
+  status?: boolean,
+  // The keys of the conversions the review listed and its Save confirmed.
+  acknowledgedConversions?: readonly string[],
+  // The values of each removed field the review counted, which its Save confirmed deleting.
+  confirmedDeletions?: readonly ConfirmedDeletion[],
+  // The fields the save moves into or out of a group, as its preview sent them.
+  hints?: SchemaSaveHints
+): Promise<SchemaApplyResponse> {
+  return applySchemaAt(
+    `/collections/schema/${slug}`,
+    fields,
+    {
+      schemaVersion,
+      resolutions,
+      renameResolutions,
+      acknowledgedConversions,
+      confirmedDeletions,
+    },
+    { localized, status, hints }
+  );
+}
+
+/**
+ * A collection's Builder save, at its schema address. Its type is declared: the package's published
+ * declarations are made from each module alone (`isolatedDeclarations`), which cannot infer the type
+ * of a property set by a call.
+ */
+export const schemaApi: {
+  /** Preview schema changes (dry-run, returns diff without applying). */
+  preview: SchemaPreview;
+  apply: typeof applyCollectionSchema;
+} = {
+  preview: schemaPreviewFor("/collections/schema"),
+  apply: applyCollectionSchema,
+};

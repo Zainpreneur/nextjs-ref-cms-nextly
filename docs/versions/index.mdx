@@ -1,0 +1,514 @@
+---
+title: Version History
+description: Nextly keeps a version history of each document, so you can see what changed, compare two versions of the same language, and put an earlier one back.
+---
+
+Version history is **opt-in per collection or single**. Turn it on and Nextly keeps a
+version history: by default the newest 50 per document, plus the versions [retention](#retention)
+always keeps, so "who changed this, and when" has an answer. Every save that changes the
+content records a version, including a save to a working draft that is not yet published
+(see [Working drafts](#working-drafts)). A save that leaves the content and its status
+as the newest version already holds them records none; a change of status, a restore and a named
+version always record one.
+
+```ts
+import { defineCollection, text } from "nextly/config";
+
+export const Posts = defineCollection({
+  slug: "posts",
+  versions: true,
+  fields: [text({ name: "title" })],
+});
+```
+
+`status: true` also switches history on by itself: an entity with the draft/publish lifecycle
+captures history even when `versions` is omitted.
+
+Working drafts need **both** halves — drafts-enabled versioning _and_ the lifecycle. Either
+one alone gives you history and edits that write the live row:
+
+| `versions`          | `status` | History | Working drafts                     |
+| ------------------- | -------- | ------- | ---------------------------------- |
+| omitted             | `false`  | No      | No                                 |
+| omitted             | `true`   | **Yes** | No                                 |
+| `true`              | `false`  | Yes     | **No** — the lifecycle is disabled |
+| `true`              | `true`   | Yes     | **Yes**                            |
+| `{ drafts: false }` | either   | Yes     | No                                 |
+
+One further gate: a collection with a reachable password field never gets working drafts,
+whatever the flags say. A snapshot strips passwords, so a draft could neither carry a password
+change nor preserve one made while it was open.
+
+<Callout type="warn">
+  An entity with neither flag is unversioned and captures nothing — and turning
+  versioning on later does not recover saves made before. Decide before you need
+  it, not after.
+</Callout>
+
+## Availability
+
+|            |                                                                                        |
+| ---------- | -------------------------------------------------------------------------------------- |
+| Built in   | No plugin required                                                                     |
+| Admin      | A **History** panel on the edit screen                                                 |
+| Permission | Reading history requires read access to the document; restoring requires update access |
+
+## How a version is recorded
+
+A version is written **inside the same database transaction as the content change**, using
+the caller's transaction handle. So a version and the content it describes commit together
+or not at all — there is no window where a document is saved and its history is not.
+
+The stored snapshot has the same shape the read path returns, which is what makes a
+restored version equal to a normal read rather than an approximation of one.
+
+History also shows events that are not versions. Taking over a document someone else is
+editing in the admin is one: it appears between the versions as "Took over from Ana", or "Took
+over (previous editor unavailable)" when that editor has no name or no account any more. Opening, leaving and
+asking for edit access are not recorded. See
+[Editing with others](/docs/admin/editing-together#taking-over).
+
+A save that chose to [overwrite](/docs/api-reference/rest-api#choosing-to-overwrite) is
+another, recorded whether or not the document keeps versions. When the version it was made from
+was out of date, it names whose changes it replaced: "Overwrote changes by Ben", or "by a
+member", "by an API key", "by a scheduled release", "by an agent", "by the system", or "Overwrote
+changes (previous editor unavailable)" for someone who can no longer be named. Otherwise it reads
+"Saved as an overwrite", or "Saved as an overwrite (no version given)" when the save sent no
+version.
+
+These version numbers are the history's own. A document's `_rev`, which a save sends back to
+show which version it was made from, is a different value (see
+[Versions and conflicts](/docs/api-reference/rest-api#versions-and-conflicts)).
+
+## Comparing two versions
+
+The diff compares two snapshots **against the current field definitions**, not against the
+schema as it was. That matters in practice: a field deleted since a snapshot was taken is
+reported as no longer part of the document, rather than silently reappearing in the
+comparison. Both versions must be of the same language: comparing two languages is refused.
+
+The comparison understands the shapes your content actually uses, including rich text and
+block documents, so a diff of a page shows which blocks moved rather than one opaque
+change.
+
+A comparison can name two versions (`?from=4&to=6`), or a version and a **baseline** the
+server works out (`?to=6&baseline=previous`). The baselines are `previous` (the version
+before it in the same language), `published` (what that language serves now: its latest
+published version, while it is published), `draft` (that language's current draft) and
+`last-viewed` (the version you last looked at in that language; see below).
+With no `from` and no `baseline`, the comparison opens on the current draft against what is
+published when the language is published and has a draft, and otherwise on a version
+against the one before it (`?locale=` picks the language when no version is named).
+
+Some comparisons have nothing to start from, and are refused with `NO_BASELINE`:
+
+- a language's first version has nothing before it;
+- a language that has been unpublished, or a translation never published, has nothing
+  published to compare with, even though its history records an earlier publish.
+
+The response says which baseline it used.
+
+### Comparing the shared fields
+
+Fields that are not translated are shared by every language (see
+[Languages in history](#languages-in-history)), and a save in any language records them. Add
+`?part=shared` to compare those fields alone, across languages:
+
+- The two versions may be in two languages (`?from=4&to=7&part=shared`, where version 4 is
+  English and version 7 Spanish). Only the shared fields are compared; no translated field is
+  shown.
+- Baselines resolve over every language's versions. `published` is the newest version
+  published in any language, `previous` the version before it in any language, and with
+  Workflows, `since-approved` and `since-submitted` the shared fields' own approval and
+  submission (`?to=7&baseline=since-approved&part=shared`).
+- Read access is unchanged: you need to be able to read both versions, each in its own
+  language.
+- `part` cannot be combined with `locale`, and `shared` is its only value.
+
+From server code, `nextly.versions.compare({ collection, id, from, to, part: "shared" })` takes
+the same `part`, refuses the same values, and answers as REST does.
+
+The response carries `part: "shared"`, and its `locale` is the language of the `to` version.
+Without `part`, a comparison is of one language as before, and two languages are refused.
+
+### The version you last looked at
+
+Nextly remembers, per person, document and language, the version each person last looked
+at, so a comparison can show what changed since then (`?to=9&baseline=last-viewed`).
+
+- **Only an explicit mark records it.** A client that shows a version or a comparison to a
+  signed-in person sends `PUT …/versions/{n}/seen` (on a collection entry,
+  `/collections/{slug}/entries/{id}/versions/{n}/seen`; on a Single,
+  `/singles/{slug}/versions/{n}/seen`). Reading a version, a comparison or the history
+  records nothing, so a prefetch or a second tab never moves it. The mark needs read access
+  to the document, and an API key or the system is refused: only a person's own screen
+  says what they saw. The admin's history screens send it for the version or comparison they
+  show.
+- **It counts by visit.** A mark more than 30 minutes after that marker's last one starts a
+  new visit. "Last looked at" is the furthest version of the previous visit, and within a
+  visit the marker only moves forward. Each language, and each document, keeps its own
+  visit.
+- **It survives retention.** When the version you looked at was removed, the comparison
+  starts from the nearest older version still kept, and the response's `baseline` names the
+  removed one as `replaces`.
+- **The history list shows it.** The row where you last looked carries `lastViewed: true`.
+
+A person who has not looked before, or a key, has no version they last looked at, and the
+comparison is refused with `NO_BASELINE` and a message saying why. These responses depend on
+who asks, so they are marked private to the session.
+
+Secret fields are masked in diffs. A password field's history never shows its values.
+
+### Field read rules in history
+
+Every field-level `access.read` rule applies to history as it applies to reading the
+document: a version, a comparison and a restore show a reader only what the rules let
+them read. That includes rules on fields inside groups and repeaters, and rules declared
+on a component's own fields, which are judged on each instance the version holds, at any
+depth. An API key is judged on its own grants, not its owner's.
+
+- A version read lists what it held back in `withheld`, by field name, or by a dotted
+  path below the top level (`banner.secret`). A field in a row of a list (a repeater or a
+  repeatable component) is named by that row's index in the version (`items.1.secret`),
+  so a rule that reads its row can hide a field in one row and show it in the next.
+- A comparison shows a held-back field as `hidden` in its place, with neither value, and
+  only in the row that held it back: the other rows' changes to that field still show.
+- A restore never writes back a field the restorer may not read; it is reported in
+  `droppedFields`.
+
+History fails closed. A rule that throws hides its own field. If the rules cannot be
+evaluated at all, a version read withholds every field that carries one, and a restore is
+refused.
+
+### Languages in history
+
+A document's read rules and hooks can answer differently per language, because a read in
+a language is handed that language's values. History asks them about each language it
+returns:
+
+- A read that names a language (`?locale=` on a listing or a comparison, `?part=` on
+  events, or a version, which is of its own language) needs read access to the document in
+  that language. Without it, the read answers not found.
+- A read that names none returns only the languages the reader may read the document in.
+  Versions with no language and events about the whole document stay. An event that
+  involved several languages lists only those the reader may read.
+- A language no longer in your localization config is never readable here, because a read
+  in it would answer for the default language instead. That includes history recorded in a
+  language before localization was removed.
+
+Fields that are not translated are shared by every language. A version or event with no
+language holds them: a document without languages, a publish of every language at once, or a
+change to the shared fields alone. In the admin, history opens on the language being edited
+together with these ("Spanish and shared fields"); **All languages** shows every language you
+may read.
+
+## Restoring
+
+A restore puts a version's values back into the document's **working draft**. It never
+publishes, never unpublishes and never changes what readers see: the version's status is not
+restored, and the published document stays as it is until someone publishes the draft.
+
+- **It writes the parts the version holds.** A version holds one language's translated values
+  and the shared fields, so restoring it writes that language's draft and the shared draft.
+  Every other language's draft is left as it is.
+- **You choose the fields.** Every field the version holds is restored by default; name some
+  with `fields` and only those are.
+- **It needs working drafts.** A collection or Single kept without drafts (`versions: { drafts:
+false }`, or no `status`) keeps versions as history only. It has no draft to write, so a restore
+  is refused with `422 BUSINESS_RULE_VIOLATION` before anything changes. In the admin, put the
+  values back by editing them.
+
+Restore writes **through the same update path a human edit uses**. Validation runs, hooks run,
+component and relationship writes happen, and events fire, exactly as if a person had saved
+the draft.
+
+Three consequences worth knowing:
+
+1. **Restoring destroys nothing.** The draft you are restoring over is itself captured as a
+   version first (named "Before restore"), so a restore can be undone.
+2. **A restore cannot resurrect a field the schema no longer has.** The payload is filtered by
+   the current schema, so restoring an old snapshot into a changed collection puts back what
+   still exists and reports the rest in `droppedFields`.
+3. **A restore writes only what the restorer may read and change.** A field hidden from them
+   or closed to their writes is left out and reported in `droppedFields`.
+
+System columns — creation timestamps, the creating user — are never carried back by a
+restore, so history cannot be used to forge them.
+
+A restore is judged like any other save. Send the `_rev` you read (or `_overwrite: true`), and
+the restore is refused with `409 STALE_VERSION` if the document changed since; its answer carries
+the new `_rev` (see [Which writes are judged](/docs/api-reference/rest-api#which-writes-are-judged)).
+
+### Through REST
+
+```http
+POST /api/collections/posts/entries/{id}/versions/{versionNo}/restore
+Content-Type: application/json
+
+{ "_rev": "12", "fields": ["title", "body"] }
+```
+
+A Single restores at `POST /api/singles/{slug}/versions/{versionNo}/restore`, with the same body.
+
+### From server code
+
+`nextly.versions` reads and restores a document's history from server code: `list`, `get`,
+`compare`, `name`, `restore` and `markSeen`. Name an entry as `{ collection, id }` or a Single as
+`{ single }`.
+
+```ts
+await nextly.versions.restore({
+  collection: "posts",
+  id,
+  versionNo: 3,
+  fields: ["title"],
+  _overwrite: true,
+});
+```
+
+Like the rest of the Direct API, a call is trusted unless it says otherwise. Pass
+`overrideAccess: false` and a `user` to have it judged as REST judges that person: `read-<slug>`
+for the reads, `update-<slug>` for naming and restoring. Marking a version seen needs a `user`
+either way.
+
+A plugin restores through `ctx.services.versions.restore(ref, versionNo, { fields, version },
+opts)`, trusted when it acts as itself and judged as a person when its options name one.
+
+### Where restored values came from
+
+Each restored value records the version it came from, so the history can say "Restored from".
+A restore records its own version for every field it writes. A save that follows a restore in
+the editor names its restored fields in `_restoredFrom`, a map of field name to version number:
+
+```json
+{ "_rev": "14", "title": "Launch notes", "_restoredFrom": { "title": 3 } }
+```
+
+A field is recorded only while the saved value is the one its version holds: a restored value
+edited again, or undone, before the save carries no source. `_restoredFrom` is never stored as a
+value of the document.
+
+## Working drafts
+
+A working draft holds edits in progress separately from the published document, so someone
+can work on a change over several days without it going live and without blocking anyone
+else from seeing the current published version.
+
+Each save of a working draft is also kept in the history as a draft version, credited to the
+person who saved it, so earlier saves and who made them are not lost when the next save
+replaces the draft. A save that changes nothing adds no version, and autosaves never appear
+in the history. Restoring any version puts its content back as the working draft;
+it does not publish it (see [Restoring](#restoring)).
+
+## The event record
+
+Beside its versions, each document keeps a record of what happened to it, written in the same
+transaction as the change, so a change never stands without its event. The history list reads
+from it.
+
+| Event              | Recorded when                                          |
+| ------------------ | ------------------------------------------------------ |
+| `created`          | The document is created                                |
+| `saved`            | A save is made                                         |
+| `published`        | The document, or a language of it, is published        |
+| `unpublished`      | The document, or a language of it, is unpublished      |
+| `restored`         | A version is restored (`from`, the version restored)   |
+| `named`            | A version is named                                     |
+| `draft-discarded`  | A working draft is discarded                           |
+| `overwritten`      | A save replaces a newer change it chose to overwrite   |
+| `field-rewritten`  | One field is rewritten on the live copy and its drafts |
+| `versions-removed` | Retention removes older versions (`count`)             |
+| `deleted`          | The document is deleted                                |
+
+Each event names who acted: a person, an API key by its own id and name, or the system.
+
+Read a document's events with `GET /collections/{slug}/entries/{id}/events` (a Single:
+`GET /singles/{slug}/events`), by anyone who may read the document; `?part=` narrows them to one
+language (see [Languages in history](#languages-in-history)). A document that has been deleted
+has no entry route, so its events, and a release's, are read by subject:
+`GET /content-events?subject=collection&slug={slug}&id={id}`, or from server code
+`nextly.contentEvents.list({ subject })`. Page with the `before` the response's
+`meta.nextBefore` gives: one page scans a bounded stretch of history, so it can come back short,
+or empty, while more remains.
+
+A document's events are kept while it exists, whatever its versions' limit. Once it is
+deleted, its events stay readable for the activity log's window, then are removed.
+
+## Retention
+
+History grows. Old versions are trimmed when a document is saved, keeping the newest 50
+per document by default (`versions.maxPerDoc`; `false` keeps everything), so the table does
+not grow without limit. Autosaves don't count toward that limit.
+
+Some versions are kept whatever the limit, even when they are older than the versions it
+keeps:
+
+- the newest version;
+- the latest published version of each language, and the latest published version with no
+  language (a document without languages, or a publish of every language at once);
+- every named version, including the "Before restore" version a restore records;
+- every version that records a restore, and the version it was restored from;
+- every version a saved field was restored from (see
+  [Where restored values came from](#where-restored-values-came-from));
+- every version a feature has pinned (see [Pinning a version](#pinning-a-version)).
+
+So a run of saves in one language never removes another language's published version, and
+"restored from" always points at a version that still exists.
+
+## Pinning a version
+
+A feature that refers to a version, such as the version an approval names, pins it so
+retention keeps it for as long as the feature needs it, whatever the limit.
+
+A feature registers itself once, as it loads, under a kebab-case name and a label a reader
+would recognise, and keeps the handle registration returns: it is the only way to pin under
+that name, so no other code can move or release the slots the feature relies on. It then
+points named slots at a document's versions. A slot holds one
+version: pointing it at another frees the one it left, so a feature never has to remember
+to release the old one. A version stays while any slot of any feature points at it, so one
+feature releasing never frees what another still holds.
+
+```ts
+import {
+  registerVersionPinHolder,
+  type TransactionContext,
+  type VersionRef,
+} from "nextly";
+
+const legal = registerVersionPinHolder({
+  name: "legal-review",
+  label: "Legal review",
+});
+
+// Record the approval and pin the version it names in one transaction.
+export async function approve(
+  tx: TransactionContext,
+  ref: VersionRef,
+  versionNo: number
+) {
+  await legal.pin(tx, { ref, slot: "approved", versionNo });
+}
+
+// The document no longer needs review: free every slot this feature holds on it.
+export async function clearReview(tx: TransactionContext, ref: VersionRef) {
+  await legal.releaseAll(tx, ref);
+}
+```
+
+- `pin`, `release` and `releaseAll` run on the transaction you pass, so a pin commits or
+  rolls back with the change it records. `pin` refuses a version the document does not have,
+  and waits for a save of the same document already under way.
+- `registerVersionPinHolder` refuses a name another feature registered. Registering the
+  same name and label again, as a module reloaded in development does, returns the same
+  handle.
+- `legal.list(db, ref)` reads the slots this feature holds on a document, taking a
+  transaction or the adapter. The read names the holder, so another feature's slots never
+  leave the database. `versionPins.list(db, ref)` reads every slot on a document, of every
+  feature.
+- Deleting a document, a collection or a Single removes its pins, and a pin waiting on one
+  being deleted is refused.
+
+### From a plugin
+
+A plugin pins through `ctx.services.versions.pins`, on its own transaction: the handle
+`ctx.db.transaction` passes its callback, or the transaction
+`ctx.services.collections.withTransaction` hands its work. The pin commits or rolls back
+with the plugin's own writes.
+
+```ts
+import type { PluginContext, VersionRef } from "@nextlyhq/plugin-sdk";
+
+// Record the approval in the plugin's own table, and pin the version it names,
+// in one transaction.
+export async function approve(
+  ctx: PluginContext,
+  ref: VersionRef,
+  versionNo: number
+) {
+  const approvals = ctx.services.versions.pins.registerHolder({
+    name: "approvals",
+    label: "Approvals",
+  });
+  await ctx.db.transaction(async tx => {
+    await approvals.pin(ref, { slot: "approved", versionNo }, { tx });
+  });
+}
+```
+
+- A plugin's holder is named in its own namespace, so two plugins can each register
+  `approvals` and hold apart, and no plugin can register or reach a holder of core's.
+- `pin`, `release`, `releaseAll` and `list` all take `{ tx }`, and refuse anything but an
+  open transaction of the plugin's. `list` returns the holder's own slots.
+- A plugin's pins take the same document lock and refusals as the ones above.
+
+## Renaming a collection or Single
+
+History is kept by the slug of the collection or Single it belongs to. When a Schema Builder
+collection or Single is renamed, its history moves to the new slug in the same transaction as
+the rename, so the two commit together or not at all. The Builder's settings don't offer a slug
+change after creation, so today that means a rename made through Nextly's collection service
+(`DynamicCollectionService.updateCollectionMetadata` with a new `slug`).
+
+What moves to the new slug:
+
+- versions, autosaves and working drafts;
+- version pins, and each person's "last looked at" marker;
+- content events and the languages each one involved;
+- the releases that hold its documents, and each release's history of them, so a release's
+  history keeps showing the document under its new name;
+- its schema events, its activity feed rows, and translations archived when localization was
+  turned off.
+
+A renamed collection or Single also keeps who may use it and where its webhooks go:
+
+- its permissions (`read-posts` becomes `read-articles`, and so on for each action) move to the
+  new slug, and every role that held one holds it under the new name. No other role's access
+  changes. A permission your application created for it moves too, and keeps the slug, name and
+  description you gave it, as does a name an administrator changed. A plugin's own permissions
+  stay as the plugin declares them;
+- a live webhook endpoint whose filter lists the collection now lists the new slug, and events
+  for the renamed collection reach it. Deleted endpoints are left as they are;
+- an event recorded before the rename and not yet sent to endpoints goes out under the new slug,
+  to the endpoints that listed the old one. An event already sent keeps the slug it was sent
+  under;
+- its choice to record webhook events or not carries over to the new slug.
+
+A renamed Single's document reads its new slug too, unless the document's own `slug` was set to
+something else. Pages cached under either slug are refreshed when the rename commits.
+
+What ends with the old slug: its document locks, its preview links and any kept answers about
+who may use it. A preview link names the slug it was made for, so a link made before the rename
+no longer opens; make a new one. Locks, preview links and kept answers that an earlier entity
+left under the new slug end too, so none of them applies to the renamed entity.
+
+So a collection or Single created later under the old slug starts clean: it gets the
+permissions any new entity gets, none of the renamed one's grants, history or webhook filters.
+The renamed entity keeps its database table, so a Schema Builder collection or Single can't be
+created under the old slug while that table carries the old name.
+
+A rename onto a slug that still holds an earlier collection or Single's records (its history, its
+permissions, or a webhook filter that lists it, for example after it was deleted) is refused,
+and nothing changes. Moving one entity's records in beside another's would merge the two.
+
+A new slug longer than 50 characters is refused too, on every database, with a validation error
+that names the limit: a permission's resource holds 50 characters.
+
+A collection on either side of a many-to-many relationship can't be renamed either. Its links live
+in a junction table spelled from both collections' slugs, which a rename doesn't change, so the
+relationship would read them as empty. The refusal names the fields; remove them, or keep the
+collection's name.
+
+A rename started while a migration or another schema change is running is refused at once, with
+nothing changed; try it again once that change ends.
+
+<Callout type="info">
+  Changing the `slug` of a code-first collection or Single in your config is not
+  a rename. Nextly cannot tell it from removing one entity and adding another,
+  so nothing is moved: the entity under the new slug starts with no history.
+</Callout>
+
+## Related
+
+- [Draft and published status](/docs/guides/draft-published-status)
+- [Content releases](/docs/releases)
+- [Audit log](/docs/audit-log) — who did what, across the system

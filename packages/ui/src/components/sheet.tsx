@@ -1,0 +1,575 @@
+"use client";
+
+import * as DialogPrimitive from "@radix-ui/react-dialog";
+import { cva, type VariantProps } from "class-variance-authority";
+import * as React from "react";
+
+import { cn } from "../lib/utils";
+import type { VariantsFn } from "../lib/variants";
+import { usePortalContainer } from "../providers/portal-provider";
+import type { SheetProps } from "../types/sheet";
+
+/**
+ * Whether the enclosing sheet is modal, published to its own parts.
+ *
+ * Radix takes `modal` at the root and uses it to decide focus trapping and
+ * whether the rest of the page is withdrawn from the accessibility tree. The
+ * scrim is that same decision expressed visually, and it is rendered a level
+ * down in `SheetContent`. Passing the root's answer down — rather than giving
+ * the content a second prop of its own — keeps one answer to one question: a
+ * caller cannot ask for a non-modal sheet and still get a scrim over the page
+ * it deliberately left interactive.
+ *
+ * Declared above the component doc blocks on purpose. The bundler attaches a
+ * doc comment to the declaration that follows it, so anything inserted between
+ * a tagged comment and its declaration silently steals the tag.
+ */
+const SheetModalContext = React.createContext(true);
+
+// Note: the close icon is not rendered by default here. Consumers should import and render their preferred icon with `SheetClose`.
+
+/** What `Sheet` is: a component taking {@link SheetProps}, with a `displayName`. */
+type SheetComponent = {
+  (props: SheetProps): React.JSX.Element;
+  displayName: string;
+};
+
+/**
+ * Sheet Component
+ *
+ * A dialog variant that slides in from the edges of the screen. Used for mobile
+ * navigation drawers, side panels, and contextual overlays.
+ *
+ * Built on Radix UI Dialog with slide-in animations and overlay backdrop.
+ *
+ * ## Design Specifications
+ *
+ * - **Width**: 320px (sm), 400px (default), 512px (lg), 672px (xl), 100% (full)
+ * - **Animation**: Slide-in from side (150ms duration)
+ * - **Backdrop**: the `--nx-overlay` scrim, with backdrop blur
+ * - **z-index**: 50 (both overlay and content - content renders on top via DOM order)
+ * - **Border-radius**: 0 (full-screen edges)
+ *
+ * ## Accessibility
+ *
+ * - **Focus Trapping**: Focus is trapped within the sheet when open
+ * - **Escape Key**: Closes sheet on Escape key press
+ * - **Overlay Click**: Closes sheet when clicking outside
+ * - **ARIA**: Proper dialog role and ARIA attributes
+ * - **Keyboard Navigation**: Tab/Shift+Tab to navigate, Enter to activate
+ *
+ * ## Usage Examples
+ *
+ * ### Basic Mobile Navigation Drawer
+ *
+ * ```tsx
+ * import { Sheet, SheetContent, SheetTrigger } from '@nextlyhq/ui';
+ * import { Menu } from 'lucide-react';
+ *
+ * function MobileNav() {
+ *   return (
+ *     <Sheet>
+ *       <SheetTrigger asChild>
+ *         <button className="h-11 w-11 md:hidden">
+ *           <Menu />
+ *         </button>
+ *       </SheetTrigger>
+ *       <SheetContent side="left" className="w-72">
+ *         <nav>
+ *           <a href="/dashboard">Dashboard</a>
+ *           <a href="/users">Users</a>
+ *         </nav>
+ *       </SheetContent>
+ *     </Sheet>
+ *   );
+ * }
+ * ```
+ *
+ * @see https://www.radix-ui.com/primitives/docs/components/dialog
+ * @public
+ */
+const Sheet: SheetComponent = ({
+  modal = true,
+  children,
+  ...props
+}: SheetProps) => (
+  <SheetModalContext.Provider value={modal}>
+    <DialogPrimitive.Root modal={modal} {...props}>
+      {children}
+    </DialogPrimitive.Root>
+  </SheetModalContext.Provider>
+);
+Sheet.displayName = "Sheet";
+
+/** @experimental */
+const SheetTrigger: typeof DialogPrimitive.Trigger = DialogPrimitive.Trigger;
+
+/** @experimental */
+const SheetClose: typeof DialogPrimitive.Close = DialogPrimitive.Close;
+
+/** @experimental */
+const SheetPortal: typeof DialogPrimitive.Portal = DialogPrimitive.Portal;
+
+type SheetOverlayProps = React.ComponentPropsWithoutRef<
+  typeof DialogPrimitive.Overlay
+>;
+
+/**
+ * SheetOverlay
+ *
+ * Semi-transparent backdrop that appears behind the sheet.
+ *
+ * - **Background**: the `--nx-overlay` scrim + backdrop blur
+ * - **Animation**: Fade in/out (150ms)
+ * - **z-index**: 50
+ * @experimental
+ */
+const SheetOverlay: React.ForwardRefExoticComponent<
+  React.PropsWithoutRef<SheetOverlayProps> &
+    React.RefAttributes<React.ElementRef<typeof DialogPrimitive.Overlay>>
+> = React.forwardRef<
+  React.ElementRef<typeof DialogPrimitive.Overlay>,
+  SheetOverlayProps
+>(({ className, ...props }, ref) => (
+  <DialogPrimitive.Overlay
+    data-slot="sheet-overlay"
+    className={cn(
+      // A modal scrim, from the `--nx-overlay` token rather than a surface
+      // token. A black wash is the point — painting it from `background` would
+      // make it a white veil in light mode — but the alpha still has to differ
+      // per mode, because what it composites over is white in one and mid-tone
+      // in the other.
+      "fixed inset-0 z-50 bg-overlay backdrop-blur-sm",
+      "data-[state=open]:animate-in data-[state=closed]:animate-out",
+      "data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+      className
+    )}
+    {...props}
+    ref={ref}
+  />
+));
+SheetOverlay.displayName = DialogPrimitive.Overlay.displayName;
+
+/** The arms `sheetVariants` is built from. Its type is read from them: {@link VariantsFn}. */
+export const SHEET_VARIANT_MAP = {
+  side: {
+    top: "inset-x-0 top-0  border-b border-border data-[state=closed]:slide-out-to-top data-[state=open]:slide-in-from-top",
+    bottom:
+      "inset-x-0 bottom-0  border-t border-border data-[state=closed]:slide-out-to-bottom data-[state=open]:slide-in-from-bottom",
+    left: "inset-y-0 left-0 h-full w-3/4  border-r border-border data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left sm:max-w-sm",
+    right:
+      "inset-y-0 right-0 h-full w-3/4  border-l border-border data-[state=closed]:slide-out-to-right data-[state=open]:slide-in-from-right sm:max-w-sm",
+  },
+};
+
+/**
+ * Sheet Content Variants
+ *
+ * Defines slide-in animations for each side and size options.
+ * @experimental
+ */
+const sheetVariants: VariantsFn<typeof SHEET_VARIANT_MAP> = cva(
+  "fixed z-50 gap-4 bg-background p-6 shadow-lg will-change-transform transition ease-in-out data-[state=closed]:duration-150 data-[state=open]:duration-150 data-[state=open]:animate-in data-[state=closed]:animate-out",
+  {
+    variants: SHEET_VARIANT_MAP,
+    defaultVariants: {
+      side: "right",
+    },
+  }
+);
+
+/** @public */
+export interface SheetContentProps
+  extends React.ComponentPropsWithoutRef<typeof DialogPrimitive.Content>,
+    VariantProps<typeof sheetVariants> {
+  /**
+   * For a bottom sheet: a grab strip at its top that drags the sheet down
+   * and closes it past a quarter of its height or on a quick flick. Escape
+   * and the sheet's own close control still close it, so the strip is a
+   * pointer affordance only and is hidden from assistive technology.
+   */
+  dragHandle?: boolean;
+}
+
+/** How far down, as a share of the sheet's height, a drag must go to close it. */
+const DISMISS_SHARE = 0.25;
+/** A release faster than this, in px per ms, closes it from a shorter drag. */
+const FLICK_SPEED = 0.6;
+/** The shortest drag a flick closes from, so a tap never closes the sheet. */
+const FLICK_MIN_DISTANCE = 24;
+
+/** Where a drag started, and the sheet it moves. */
+interface DragStart {
+  y: number;
+  time: number;
+  height: number;
+  sheet: HTMLElement;
+}
+
+/** Whether a drag released at `distance` after `elapsed` ms closes the sheet. */
+export function dragCloses(
+  distance: number,
+  elapsed: number,
+  height: number
+): boolean {
+  if (distance >= height * DISMISS_SHARE) return true;
+  return (
+    distance >= FLICK_MIN_DISTANCE &&
+    distance / Math.max(elapsed, 1) >= FLICK_SPEED
+  );
+}
+
+/**
+ * The grab strip: the sheet follows the pointer down (never up), and on
+ * release either closes or springs back. It moves the sheet with an inline
+ * transform, so the closing slide continues from where the finger let go.
+ */
+function SheetDragHandle({ onDismiss }: { onDismiss: () => void }) {
+  const drag = React.useRef<DragStart | null>(null);
+
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    const sheet = event.currentTarget.closest<HTMLElement>(
+      "[data-slot='sheet-content']"
+    );
+    if (!sheet) return;
+    // Captured, so the drag keeps arriving here once the finger leaves the
+    // strip. Absent where pointer capture is not implemented.
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    drag.current = {
+      y: event.clientY,
+      time: performance.now(),
+      height: sheet.getBoundingClientRect().height,
+      sheet,
+    };
+    sheet.style.transition = "none";
+  };
+
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const start = drag.current;
+    if (!start) return;
+    const distance = Math.max(0, event.clientY - start.y);
+    start.sheet.style.transform = `translateY(${distance}px)`;
+  };
+
+  const release = (
+    event: React.PointerEvent<HTMLDivElement>,
+    cancelled: boolean
+  ) => {
+    const start = drag.current;
+    if (!start) return;
+    drag.current = null;
+    start.sheet.style.transition = "";
+    const distance = Math.max(0, event.clientY - start.y);
+    if (
+      !cancelled &&
+      dragCloses(distance, performance.now() - start.time, start.height)
+    ) {
+      onDismiss();
+      return;
+    }
+    start.sheet.style.transform = "";
+  };
+
+  return (
+    <div
+      aria-hidden="true"
+      data-slot="sheet-drag-handle"
+      className="flex h-6 w-full shrink-0 cursor-grab touch-none items-center justify-center active:cursor-grabbing"
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={event => release(event, false)}
+      onPointerCancel={event => release(event, true)}
+    >
+      {/* A pill, outside the radius scale as a switch's track is. */}
+      <span className="h-1 w-10 rounded-full bg-border" />
+    </div>
+  );
+}
+
+/** What the keyboard can reach by Tab: enabled, not hidden, and in the tab order. */
+const TABBABLE =
+  'a[href], area[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex], [contenteditable="true"]';
+
+/**
+ * Whether an element is drawn: neither it nor a container it sits in is `display: none` or
+ * `visibility: hidden`. One that is not is no stop for the keyboard, and no edge of a sheet.
+ */
+function isRendered(element: HTMLElement): boolean {
+  for (
+    let node: HTMLElement | null = element;
+    node !== null;
+    node = node.parentElement
+  ) {
+    const style = getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+  }
+  return true;
+}
+
+function tabbablesIn(root: ParentNode): HTMLElement[] {
+  return Array.from(root.querySelectorAll<HTMLElement>(TABBABLE)).filter(
+    element =>
+      element.tabIndex >= 0 &&
+      !element.hidden &&
+      // `:disabled` also matches a control disabled by its `<fieldset disabled>`, which carries no
+      // `disabled` of its own for the selector above to see, and takes no focus.
+      !element.matches(":disabled") &&
+      // Radix's focus guards sit in the tab order at the page's edges, and are no control.
+      !element.hasAttribute("data-radix-focus-guard") &&
+      element.closest('[aria-hidden="true"], [inert]') === null &&
+      isRendered(element)
+  );
+}
+
+/**
+ * Tab at a non-modal sheet's edge, moved out of it as for any other part of the page.
+ *
+ * Radix's dialog keeps its focus scope looping even when it is not modal, so Tab from the
+ * sheet's last control would go round to its first, and Shift+Tab from its first to its last:
+ * a keyboard reader could not get from the sheet back to the page beside it. At those two edges
+ * this sends focus where the browser would: forward to the nearest control after the sheet in
+ * the document, back to the nearest before it. Anywhere else, Tab is left to the browser.
+ * Runs before the focus scope's own handler on the same element, which then finds focus already
+ * outside and does nothing.
+ */
+function leaveNonModalAtEdge(event: React.KeyboardEvent<HTMLElement>): void {
+  if (event.defaultPrevented) return;
+  if (event.key !== "Tab" || event.altKey || event.ctrlKey || event.metaKey) {
+    return;
+  }
+  const sheet = event.currentTarget;
+  const inside = tabbablesIn(sheet);
+  // The sheet itself holds focus as it opens. With controls inside, it is no edge: Tab goes in,
+  // to its first control, and Shift+Tab to its last, as the focus scope would take them.
+  if (document.activeElement === sheet && inside.length > 0) {
+    event.preventDefault();
+    (event.shiftKey ? inside[inside.length - 1] : inside[0])?.focus();
+    return;
+  }
+  const edge = event.shiftKey ? inside[0] : inside[inside.length - 1];
+  // An edge is the first or last control in the sheet, or the sheet itself while it holds focus
+  // and nothing inside it can (a loading or explanatory panel).
+  const atEdge =
+    document.activeElement === sheet ||
+    (edge !== undefined && document.activeElement === edge);
+  if (!atEdge) return;
+  const page = tabbablesIn(sheet.ownerDocument.body).filter(
+    element => !sheet.contains(element)
+  );
+  // The nearest stop on that side of the sheet in the document, as the browser would take:
+  // other popups' portals can follow the sheet, so "the page's last" is not "before the sheet".
+  // Round to the far end when nothing lies that way, as Tab goes round the page.
+  const before = page.filter(
+    element =>
+      (sheet.compareDocumentPosition(element) &
+        Node.DOCUMENT_POSITION_PRECEDING) !==
+      0
+  );
+  const after = page.filter(element => !before.includes(element));
+  const next = event.shiftKey
+    ? (before[before.length - 1] ?? page[page.length - 1])
+    : (after[0] ?? page[0]);
+  if (next === undefined) return;
+  event.preventDefault();
+  next.focus();
+}
+
+/**
+ * SheetContent
+ *
+ * Main content container for the sheet.
+ *
+ * - **Position**: Fixed to screen edge (side prop)
+ * - **Width**: Responsive (w-3/4 on mobile, max-w-sm on sm+)
+ * - **Padding**: 24px (p-6)
+ * - **Border**: On appropriate edge based on side
+ * - **Close Button**: Positioned in top-right corner (16px from edges)
+ *
+ * @param side - Which edge to slide in from: "left", "right", "top", "bottom"
+ * @public
+ */
+const SheetContent: React.ForwardRefExoticComponent<
+  React.PropsWithoutRef<SheetContentProps> &
+    React.RefAttributes<React.ElementRef<typeof DialogPrimitive.Content>>
+> = React.forwardRef<
+  React.ElementRef<typeof DialogPrimitive.Content>,
+  SheetContentProps
+>(
+  (
+    {
+      side = "right",
+      className,
+      children,
+      dragHandle = false,
+      onKeyDown,
+      ...props
+    },
+    ref
+  ) => {
+    const portalContainer = usePortalContainer();
+    // Taken from the root rather than from a prop here: the scrim and Radix's
+    // inerting are the same decision, and two places to state it would let a
+    // sheet scrim a page it had left interactive.
+    const modal = React.useContext(SheetModalContext);
+    // The drag closes the sheet through Radix's own Close, so the sheet's
+    // `onOpenChange` hears it exactly as it hears the close button.
+    const close = React.useRef<HTMLButtonElement>(null);
+    const draggable = dragHandle && side === "bottom";
+
+    return (
+      <SheetPortal container={portalContainer}>
+        {modal ? <SheetOverlay /> : null}
+        <DialogPrimitive.Content
+          ref={ref}
+          data-slot="sheet-content"
+          className={cn(sheetVariants({ side }), className)}
+          {...props}
+          onKeyDown={event => {
+            onKeyDown?.(event);
+            // A sheet beside the page lets the keyboard move between the two; a modal one
+            // holds focus, as Radix does.
+            if (!modal) leaveNonModalAtEdge(event);
+          }}
+        >
+          {draggable ? (
+            <>
+              <SheetDragHandle onDismiss={() => close.current?.click()} />
+              <DialogPrimitive.Close
+                ref={close}
+                hidden
+                tabIndex={-1}
+                aria-hidden="true"
+              />
+            </>
+          ) : null}
+          {children}
+        </DialogPrimitive.Content>
+      </SheetPortal>
+    );
+  }
+);
+SheetContent.displayName = DialogPrimitive.Content.displayName;
+
+/** What `SheetHeader` and `SheetFooter` are: a `div` component with a `displayName`. */
+type SheetSectionComponent = {
+  (props: React.HTMLAttributes<HTMLDivElement>): React.JSX.Element;
+  displayName: string;
+};
+
+/**
+ * SheetHeader
+ *
+ * Header section for sheet title and description.
+ *
+ * - **Layout**: Flex column with 6px gap
+ * - **Text Alignment**: Left (default) or center
+ * @public
+ */
+const SheetHeader: SheetSectionComponent = ({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLDivElement>) => (
+  <div
+    className={cn(
+      "flex flex-col space-y-2 text-center sm:text-left",
+      className
+    )}
+    {...props}
+  />
+);
+SheetHeader.displayName = "SheetHeader";
+
+/**
+ * SheetFooter
+ *
+ * Footer section for sheet actions (buttons, etc.).
+ *
+ * - **Layout**: Flex row on desktop, column on mobile
+ * - **Alignment**: Right-aligned on desktop, stretched on mobile
+ * @experimental
+ */
+const SheetFooter: SheetSectionComponent = ({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLDivElement>) => (
+  <div
+    className={cn(
+      "flex flex-col-reverse sm:flex-row sm:justify-end sm:space-x-2",
+      className
+    )}
+    {...props}
+  />
+);
+SheetFooter.displayName = "SheetFooter";
+
+type SheetTitleProps = React.ComponentPropsWithoutRef<
+  typeof DialogPrimitive.Title
+>;
+
+/**
+ * SheetTitle
+ *
+ * Title heading for the sheet (h2).
+ *
+ * - **Font**: text-lg font-semibold
+ * - **Color**: text-foreground
+ * - **Required**: For accessibility (screen readers)
+ * @public
+ */
+const SheetTitle: React.ForwardRefExoticComponent<
+  React.PropsWithoutRef<SheetTitleProps> &
+    React.RefAttributes<React.ElementRef<typeof DialogPrimitive.Title>>
+> = React.forwardRef<
+  React.ElementRef<typeof DialogPrimitive.Title>,
+  SheetTitleProps
+>(({ className, ...props }, ref) => (
+  <DialogPrimitive.Title
+    ref={ref}
+    className={cn("text-lg font-semibold text-foreground", className)}
+    {...props}
+  />
+));
+SheetTitle.displayName = DialogPrimitive.Title.displayName;
+
+type SheetDescriptionProps = React.ComponentPropsWithoutRef<
+  typeof DialogPrimitive.Description
+>;
+
+/**
+ * SheetDescription
+ *
+ * Description text for the sheet.
+ *
+ * - **Font**: text-sm
+ * - **Color**: text-muted-foreground
+ * - **Purpose**: Provide context for screen readers
+ * @public
+ */
+const SheetDescription: React.ForwardRefExoticComponent<
+  React.PropsWithoutRef<SheetDescriptionProps> &
+    React.RefAttributes<React.ElementRef<typeof DialogPrimitive.Description>>
+> = React.forwardRef<
+  React.ElementRef<typeof DialogPrimitive.Description>,
+  SheetDescriptionProps
+>(({ className, ...props }, ref) => (
+  <DialogPrimitive.Description
+    ref={ref}
+    className={cn("text-sm text-muted-foreground", className)}
+    {...props}
+  />
+));
+SheetDescription.displayName = DialogPrimitive.Description.displayName;
+
+export {
+  Sheet,
+  SheetPortal,
+  SheetOverlay,
+  SheetTrigger,
+  SheetClose,
+  SheetContent,
+  SheetHeader,
+  SheetFooter,
+  SheetTitle,
+  SheetDescription,
+  sheetVariants,
+};

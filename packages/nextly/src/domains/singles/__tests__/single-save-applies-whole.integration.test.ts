@@ -1,0 +1,542 @@
+/**
+ * A Single's schema save applies whole or fails whole, and says why, as a collection's save does.
+ *
+ * The save used to run its migration statement by statement and record a refusal as a failed
+ * migration status beside the new fields, so a change the database refused part-way was saved as
+ * if it had been made. It now asks what the stored value can take before any statement runs, runs
+ * the migration in one transaction where the dialect allows it, and on a refusal fails the save
+ * with the reason and leaves the registry as it was.
+ */
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
+
+import { dispatchSingles } from "../../../dispatcher/handlers/single-dispatcher";
+import { describeEachDialect } from "../../../plugins/__tests__/helpers/dialect-matrix";
+import {
+  createTestNextly,
+  type TestNextly,
+} from "../../../plugins/test-nextly";
+import {
+  indexNameForColumn,
+  uniqueIndexNameForColumn,
+} from "../../schema/services/index-name";
+import type { FieldDefinition } from "../../../schemas/dynamic-collections";
+import type { SingleEntryService } from "../services/single-entry-service";
+import type { SingleMetadataService } from "../services/single-metadata-service";
+import type { SingleRegistryService } from "../services/single-registry-service";
+
+/** A short text field, whose maximum length sets its column's width. */
+function shortText(name: string, maxLength: number) {
+  return {
+    name,
+    type: "text",
+    options: { variant: "short" },
+    validation: { maxLength },
+  };
+}
+
+describeEachDialect("a Single's schema save that cannot apply", dialect => {
+  let current: TestNextly;
+
+  beforeEach(async () => {
+    // The Builder's save runs its migration in development only.
+    vi.stubEnv("NODE_ENV", "development");
+    current = await createTestNextly({ dialect, collections: [] });
+  });
+
+  afterEach(async () => {
+    await current.destroy();
+    vi.unstubAllEnvs();
+  });
+
+  const q = (name: string) =>
+    dialect === "mysql" ? `\`${name}\`` : `"${name}"`;
+
+  async function query<T>(sql: string): Promise<T[]> {
+    return (
+      current.adapter as unknown as {
+        executeQuery<R>(statement: string): Promise<R[]>;
+      }
+    ).executeQuery<T>(sql);
+  }
+
+  async function columnsOf(table: string): Promise<string[]> {
+    const rows = await query<{ name: string }>(
+      dialect === "mysql"
+        ? `SELECT COLUMN_NAME AS name FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '${table}'`
+        : dialect === "sqlite"
+          ? `SELECT name FROM pragma_table_info('${table}')`
+          : `SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '${table}'`
+    );
+    return rows.map(row => row.name);
+  }
+
+  /** The fields the registry records for the Single, as stored. */
+  async function registeredFields(): Promise<Record<string, unknown>[]> {
+    const [row] = await query<{ fields: unknown }>(
+      `SELECT ${q("fields")} AS fields FROM ${q("dynamic_singles")} WHERE ${q("slug")} = 'hero'`
+    );
+    return (
+      typeof row?.fields === "string" ? JSON.parse(row.fields) : row?.fields
+    ) as Record<string, unknown>[];
+  }
+
+  /** A Single `hero` with the given fields, holding the given values. */
+  async function heroWith(
+    fields: Record<string, unknown>[],
+    values: Record<string, unknown>
+  ): Promise<void> {
+    await dispatchSingles(
+      "createSingle",
+      {},
+      { slug: "hero", label: "Hero", fields }
+    );
+    const singles: SingleEntryService =
+      current.getService("singleEntryService");
+    const written = await singles.update(
+      "hero",
+      { ...values, _overwrite: true },
+      { overrideAccess: true }
+    );
+    expect(written.success, JSON.stringify(written)).toBe(true);
+  }
+
+  /**
+   * The Builder's schema save, as the dispatcher makes it, with the renames it answers: the
+   * settings save renames a field only when the request says so.
+   */
+  function save(
+    fields: Record<string, unknown>[],
+    renames: { from: string; to: string }[] = []
+  ): Promise<unknown> {
+    return dispatchSingles(
+      "updateSingleSchema",
+      { slug: "hero" },
+      {
+        fields,
+        ...(renames.length === 0
+          ? {}
+          : {
+              renames: renames.map(pair => ({ ...pair, choice: "rename" })),
+            }),
+      }
+    );
+  }
+
+  /**
+   * The same save made on the service the dispatcher calls. A short text field's width is set by
+   * `options.variant`, which the Builder's fields payload does not carry for a Single, so a
+   * bounded text field reaches the save only from here.
+   */
+  async function saveThroughService(
+    fields: Record<string, unknown>[]
+  ): Promise<unknown> {
+    const registry: SingleRegistryService = current.getService(
+      "singleRegistryService"
+    );
+    const metadata: SingleMetadataService = current.getService(
+      "singleMetadataService"
+    );
+    const existing = await registry.getSingleBySlug("hero");
+    if (!existing) throw new Error("the Single hero is missing");
+    return metadata.updateSingleSchema({
+      slug: "hero",
+      existing,
+      updateData: { fields },
+      fields: fields as unknown as FieldDefinition[],
+      isLocalized: false,
+      wasLocalized: false,
+      localizedRequested: false,
+      hasStatus: false,
+      wasStatus: false,
+      statusRequested: false,
+    });
+  }
+
+  /** The error a refused save throws, or undefined when the save went through. */
+  function refusal(saved: Promise<unknown>): Promise<unknown> {
+    return saved.then(
+      () => undefined,
+      (error: unknown) => error
+    );
+  }
+
+  /** `hero` with a 20-character `heading` holding `value`. */
+  async function boundedHero(value: string): Promise<void> {
+    await heroWith([{ name: "heading", type: "text" }], {});
+    await saveThroughService([shortText("heading", 20)]);
+    const singles: SingleEntryService =
+      current.getService("singleEntryService");
+    const written = await singles.update(
+      "hero",
+      { heading: value, _overwrite: true },
+      { overrideAccess: true }
+    );
+    expect(written.success, JSON.stringify(written)).toBe(true);
+  }
+
+  it("refuses a length shorter than the value the Single holds, naming the field, and changes nothing", async () => {
+    await boundedHero("Long enough");
+    const fieldsBefore = await registeredFields();
+
+    const refused = await refusal(
+      saveThroughService([shortText("heading", 5)])
+    );
+
+    expect(refused).toMatchObject({
+      publicData: {
+        errors: [
+          expect.objectContaining({
+            path: "fields.heading",
+            message: expect.stringMatching(
+              /^1 entry holds a heading longer than 5 characters, the new length\./
+            ),
+          }),
+        ],
+      },
+    });
+    expect(await registeredFields()).toEqual(fieldsBefore);
+    const [row] = await query<{ heading: string }>(
+      `SELECT ${q("heading")} AS heading FROM ${q("single_hero")}`
+    );
+    expect(row?.heading).toBe("Long enough");
+  });
+
+  it("refuses a type the value the Single holds cannot be read as, naming the field, and changes nothing", async () => {
+    // "zzq" is no number, and no row id (a UUID is hex) can contain it: the database would refuse the cast (PostgreSQL) or keep a text in a
+    // number column (SQLite). The save is refused first, by field and code, with the value kept.
+    await heroWith([{ name: "heading", type: "text" }], { heading: "zzq" });
+    const fieldsBefore = await registeredFields();
+
+    const refused = await refusal(save([{ name: "heading", type: "number" }]));
+
+    expect(refused).toMatchObject({
+      publicData: {
+        errors: [
+          expect.objectContaining({
+            path: "fields.heading",
+            code: "TYPE_CHANGE_LOSES_VALUES",
+            message: expect.stringContaining(
+              "Single 'hero': field 'heading' cannot change from text to number"
+            ) as unknown,
+          }),
+        ],
+      },
+    });
+    expect(JSON.stringify(refused)).not.toContain("zzq");
+    expect(await registeredFields()).toEqual(fieldsBefore);
+    const [row] = await query<{ heading: string }>(
+      `SELECT ${q("heading")} AS heading FROM ${q("single_hero")}`
+    );
+    expect(row?.heading).toBe("zzq");
+  });
+
+  it("saves a length the value the Single holds still fits", async () => {
+    await boundedHero("Hi");
+
+    await saveThroughService([shortText("heading", 5)]);
+
+    expect(await registeredFields()).toEqual([
+      expect.objectContaining({
+        name: "heading",
+        validation: { maxLength: 5 },
+      }),
+    ]);
+  });
+
+  // Not on SQLite, whose unique index is created `IF NOT EXISTS`: a name already taken is skipped
+  // there rather than refused.
+  it.skipIf(dialect === "sqlite")(
+    "refuses as drift a save over a hand-made index in its table, changing nothing, and saves once it is gone",
+    async () => {
+      // A hand-made index in the Single's table, holding the name the new unique index takes. The
+      // save runs its own migration file, which finds the table differing from its snapshot, so it
+      // is refused as drift before anything runs, on every dialect.
+      await heroWith([{ name: "heading", type: "text" }], { heading: "One" });
+      const blocking = uniqueIndexNameForColumn("single_hero", "code");
+      await query(
+        `CREATE INDEX ${q(blocking)} ON ${q("single_hero")} (${q("id")})`
+      );
+      // A number, so MySQL can index it as the Builder sends it.
+      const fields = [
+        { name: "heading", type: "text" },
+        { name: "code", type: "number", unique: true },
+      ];
+
+      const refused = await refusal(save(fields));
+
+      expect(refused).toMatchObject({ code: "NEXTLY_MIGRATION_DRIFT" });
+      expect((await registeredFields()).map(f => f.name)).toEqual(["heading"]);
+      expect(await columnsOf("single_hero")).not.toContain("code");
+
+      await query(
+        dialect === "mysql"
+          ? `DROP INDEX ${q(blocking)} ON ${q("single_hero")}`
+          : `DROP INDEX ${q(blocking)}`
+      );
+      await save(fields);
+
+      expect(await columnsOf("single_hero")).toContain("code");
+      expect((await registeredFields()).map(f => f.name)).toEqual([
+        "heading",
+        "code",
+      ]);
+    }
+  );
+  // MySQL only, where it commits each schema statement. A hand-made index in the Single's table
+  // holds the name the save's unique index takes: the save's own migration file finds the table
+  // differing from its snapshot and is refused as drift before its rename runs, so nothing lands
+  // part-way, and the save goes through once the hand-made index is gone.
+  it.skipIf(dialect !== "mysql")(
+    "refuses as drift a rename beside a hand-made index, changing nothing, and saves it once the index is gone",
+    async () => {
+      await heroWith(
+        [
+          { name: "heading", type: "text" },
+          { name: "views", type: "number" },
+        ],
+        { heading: "Hello", views: 7 }
+      );
+      const blocking = uniqueIndexNameForColumn("single_hero", "views");
+      await query(
+        `CREATE INDEX ${q(blocking)} ON ${q("single_hero")} (${q("id")})`
+      );
+      // `heading` renamed to `headline`, and `views` made unique: the rename runs first, and the
+      // unique index is refused on the name another index holds.
+      const fields = [
+        { name: "headline", type: "text" },
+        { name: "views", type: "number", unique: true },
+      ];
+      const renamed = [{ from: "heading", to: "headline" }];
+
+      const refused = await refusal(save(fields, renamed));
+      expect(refused).toMatchObject({ code: "NEXTLY_MIGRATION_DRIFT" });
+      expect(await columnsOf("single_hero")).not.toContain("headline");
+
+      await query(`DROP INDEX ${q(blocking)} ON ${q("single_hero")}`);
+      await save(fields, renamed);
+
+      expect((await registeredFields()).map(f => f.name)).toEqual([
+        "headline",
+        "views",
+      ]);
+      const [row] = await query<{ headline: string }>(
+        `SELECT ${q("headline")} AS headline FROM ${q("single_hero")}`
+      );
+      expect(row?.headline).toBe("Hello");
+    }
+  );
+
+  // MySQL only, as above: a hand-made index holding the name the save's index takes refuses the
+  // save as drift before its rename runs. Once it is gone, the save renames the column and takes
+  // its Unique off, the index found on the renamed column under the name it was created with.
+  it.skipIf(dialect !== "mysql")(
+    "refuses as drift a rename turning Unique off beside a hand-made index, then turns it off once the index is gone",
+    async () => {
+      await heroWith(
+        [
+          { name: "code", type: "number", unique: true },
+          { name: "views", type: "number" },
+        ],
+        { code: 5, views: 7 }
+      );
+      const blocking = indexNameForColumn("single_hero", "views");
+      await query(
+        `CREATE INDEX ${q(blocking)} ON ${q("single_hero")} (${q("id")})`
+      );
+      // `code` renamed to `sku` with Unique off, and `views` indexed: refused at the index on the
+      // name another index holds.
+      const fields = [
+        { name: "sku", type: "number" },
+        { name: "views", type: "number", index: true },
+      ];
+      const renamed = [{ from: "code", to: "sku" }];
+
+      const refused = await refusal(save(fields, renamed));
+      expect(refused).toMatchObject({ code: "NEXTLY_MIGRATION_DRIFT" });
+      expect(await columnsOf("single_hero")).not.toContain("sku");
+
+      await query(`DROP INDEX ${q(blocking)} ON ${q("single_hero")}`);
+      await save(fields, renamed);
+
+      expect(
+        (await registeredFields()).map(f => [f.name, f.unique === true])
+      ).toEqual([
+        ["sku", false],
+        ["views", false],
+      ]);
+      // The registry says `sku` is not unique, so the database takes a repeated value.
+      const indexes = await query<{ name: string }>(
+        `SELECT INDEX_NAME AS name FROM information_schema.STATISTICS ` +
+          `WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'single_hero' AND NON_UNIQUE = 0 ` +
+          `AND COLUMN_NAME = 'sku'`
+      );
+      expect(indexes).toEqual([]);
+    }
+  );
+
+  // MySQL only: a unique text field is kept in a bounded column, since MySQL cannot index a whole
+  // TEXT, so turning Unique on narrows the column. The save judges the stored value against the
+  // new width before it writes or runs anything, as a shortened length is judged.
+  it.skipIf(dialect !== "mysql")(
+    "refuses turning Unique on for a text field whose value the bounded column cannot hold, changing nothing",
+    async () => {
+      const long = "x".repeat(300);
+      await heroWith([{ name: "heading", type: "text" }], { heading: long });
+      const fieldsBefore = await registeredFields();
+      const typeOf = async () =>
+        (
+          await query<{ type: string }>(
+            `SELECT COLUMN_TYPE AS type FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'single_hero' AND COLUMN_NAME = 'heading'`
+          )
+        )[0]?.type;
+      const typeBefore = await typeOf();
+
+      const refused = await refusal(
+        save([{ name: "heading", type: "text", unique: true }])
+      );
+
+      expect(refused).toMatchObject({
+        publicData: {
+          errors: [
+            expect.objectContaining({
+              code: "LENGTH_BELOW_VALUES",
+              path: "fields.heading",
+              message: expect.stringMatching(
+                /^1 entry holds a heading longer than 255 characters, the new length\./
+              ),
+            }),
+          ],
+        },
+      });
+      expect(await registeredFields()).toEqual(fieldsBefore);
+      expect(await typeOf()).toBe(typeBefore);
+      const [row] = await query<{ heading: string }>(
+        `SELECT ${q("heading")} AS heading FROM ${q("single_hero")}`
+      );
+      expect(row?.heading).toBe(long);
+    }
+  );
+
+  // PostgreSQL only, where a column's type changes only through a cast: a Single's text holding a
+  // whole number becomes a number field through its settings save, and its value is converted.
+  it.skipIf(dialect !== "postgresql")(
+    "turns a Single's text holding a whole number into a number field, its value converted",
+    async () => {
+      await heroWith([{ name: "heading", type: "text" }], { heading: "12" });
+
+      await save([{ name: "heading", type: "number" }]);
+
+      expect(await registeredFields()).toEqual([
+        expect.objectContaining({ name: "heading", type: "number" }),
+      ]);
+      const [row] = await query<{ heading: unknown }>(
+        `SELECT ${q("heading")} AS heading FROM ${q("single_hero")}`
+      );
+      expect(Number(row?.heading)).toBe(12);
+    }
+  );
+
+  it("saves a field whose default holds the statement separator's text", async () => {
+    // The separator is a line of its own between statements; the same text inside a quoted default
+    // is part of the value, and a statement cut there is no longer valid SQL.
+    await heroWith([{ name: "heading", type: "text" }], { heading: "Hello" });
+
+    await saveThroughService([
+      { name: "heading", type: "text" },
+      // Short, so the column is a varchar: MySQL takes no default on a text column.
+      { ...shortText("note", 64), default: "a --> statement-breakpoint b" },
+    ]);
+
+    expect(await columnsOf("single_hero")).toContain("note");
+  });
+});
+
+describeEachDialect(
+  "a translated Single's schema save that cannot apply",
+  dialect => {
+    let current: TestNextly;
+
+    beforeEach(async () => {
+      vi.stubEnv("NODE_ENV", "development");
+      current = await createTestNextly({
+        dialect,
+        collections: [],
+        localization: { locales: ["en", "es"], defaultLocale: "en" },
+      });
+    });
+
+    afterEach(async () => {
+      await current.destroy();
+      vi.unstubAllEnvs();
+    });
+
+    it("refuses a length shorter than a translation the Single holds, naming the field", async () => {
+      // A translated field's values are on the companion, one row per language: the narrower
+      // length is checked against those, not only against what the main table holds.
+      await dispatchSingles(
+        "createSingle",
+        {},
+        {
+          slug: "hero",
+          label: "Hero",
+          localized: true,
+          fields: [{ name: "heading", type: "text" }],
+        }
+      );
+      const registry: SingleRegistryService = current.getService(
+        "singleRegistryService"
+      );
+      const metadata: SingleMetadataService = current.getService(
+        "singleMetadataService"
+      );
+      const saveThroughService = async (fields: Record<string, unknown>[]) => {
+        const existing = await registry.getSingleBySlug("hero");
+        if (!existing) throw new Error("the Single hero is missing");
+        return metadata.updateSingleSchema({
+          slug: "hero",
+          existing,
+          updateData: { fields },
+          fields: fields as unknown as FieldDefinition[],
+          isLocalized: true,
+          wasLocalized: true,
+          localizedRequested: false,
+          hasStatus: false,
+          wasStatus: false,
+          statusRequested: false,
+        });
+      };
+      await saveThroughService([shortText("heading", 40)]);
+      const singles: SingleEntryService =
+        current.getService("singleEntryService");
+      for (const [locale, heading] of [
+        ["en", "Hi"],
+        ["es", "Una frase bastante larga"],
+      ]) {
+        const written = await singles.update(
+          "hero",
+          { heading, _overwrite: true },
+          { locale, overrideAccess: true }
+        );
+        expect(written.success, JSON.stringify(written)).toBe(true);
+      }
+
+      const refused = await saveThroughService([shortText("heading", 5)]).then(
+        () => undefined,
+        (error: unknown) => error
+      );
+
+      expect(refused).toMatchObject({
+        publicData: {
+          errors: [
+            expect.objectContaining({
+              path: "fields.heading",
+              message: expect.stringMatching(
+                /^1 entry holds a heading longer than 5 characters, the new length\./
+              ),
+            }),
+          ],
+        },
+      });
+    });
+  }
+);

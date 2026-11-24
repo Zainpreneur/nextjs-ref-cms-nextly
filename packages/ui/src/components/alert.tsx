@@ -1,0 +1,206 @@
+import { cva, type VariantProps } from "class-variance-authority";
+import {
+  forwardRef,
+  type HTMLAttributes,
+  type ForwardRefExoticComponent,
+  type PropsWithoutRef,
+  type RefAttributes,
+} from "react";
+
+import { cn } from "../lib/utils";
+import type { VariantsFn } from "../lib/variants";
+
+/** The arms `alertVariants` is built from. Its type is read from them: {@link VariantsFn}. */
+export const ALERT_VARIANT_MAP = {
+  variant: {
+    // Info and success are news, not trouble: a plain card, with the icon in
+    // the status's text colour. Warning and danger ask for attention, so they
+    // sit on their status surface inside its border. The text is always the
+    // page's own foreground, and no alert carries a coloured side bar.
+    info: "border-border bg-card text-foreground [&>svg]:text-info-text",
+    success: "border-border bg-card text-foreground [&>svg]:text-success-text",
+    warning:
+      "border-warning-border bg-warning-surface text-foreground [&>svg]:text-warning-text",
+    destructive:
+      "border-danger-border bg-danger-surface text-foreground [&>svg]:text-danger-text",
+  },
+};
+
+/**
+ * Alert Component - Design System Specification
+ *
+ * Alerts display important messages that require user attention or awareness.
+ * They are non-interactive callouts used for inline notifications and feedback.
+ *
+ * Design Specs:
+ * - Padding: 16px (p-4)
+ * - Border radius: `rounded-md`, one step tighter than Card's `rounded-lg`
+ *   for inline/flow content vs. larger container components
+ * - Border: 1px; the card border for info and success, the status border for
+ *   warning and destructive
+ * - Shadow: sm (subtle elevation)
+ * - Font: 14px (text-sm)
+ * - Layout: Flex with gap-3 for icon/content spacing
+ * - Colors: the page's foreground text; the icon in the status's text colour
+ *
+ * Variants (4 total):
+ * - info (default): Blue - informational messages, neutral announcements
+ * - success: Green - successful operations, confirmations
+ * - warning: Amber - cautions, warnings that need attention
+ * - destructive: Red - errors, critical issues, failures
+ *
+ * Structure:
+ * <Alert variant="info">
+ *   <InfoIcon className="h-4 w-4" />
+ *   <div>
+ *     <AlertTitle>Optional Title</AlertTitle>
+ *     <AlertDescription>Alert message content</AlertDescription>
+ *   </div>
+ * </Alert>
+ *
+ * Accessibility:
+ * - Defaults to role="alert" for assertive screen reader announcements
+ * - Override with role="status" for non-urgent updates (polite announcements)
+ * - Override with role={undefined} to remove ARIA role if needed
+ * - Color is not the only indicator - icons and text convey meaning
+ * - Supports rich content (links, lists) within AlertDescription
+ * - WCAG 2.2 AA compliant color contrast (4.5:1 minimum)
+ *
+ * Usage Examples:
+ *
+ * // Simple alert with icon and description (default role="alert")
+ * <Alert variant="success">
+ *   <CheckCircle2 className="h-4 w-4" />
+ *   <AlertDescription>User created successfully!</AlertDescription>
+ * </Alert>
+ *
+ * // Alert with title and description
+ * <Alert variant="warning">
+ *   <AlertTriangle className="h-4 w-4" />
+ *   <div>
+ *     <AlertTitle>Warning</AlertTitle>
+ *     <AlertDescription>This action cannot be undone.</AlertDescription>
+ *   </div>
+ * </Alert>
+ *
+ * // Non-urgent informational update
+ * <Alert variant="info" role="status">
+ *   <AlertCircle className="h-4 w-4" />
+ *   <AlertDescription>New features are now available.</AlertDescription>
+ * </Alert>
+ *
+ * Icons (from lucide-react):
+ * - Info: <AlertCircle className="h-4 w-4" />
+ * - Success: <CheckCircle2 className="h-4 w-4" />
+ * - Warning: <AlertTriangle className="h-4 w-4" />
+ * - Destructive: <XCircle className="h-4 w-4" />
+ * @experimental
+ */
+const alertVariants: VariantsFn<typeof ALERT_VARIANT_MAP> = cva(
+  "relative flex items-start gap-3 rounded-md  border border-border p-4 text-sm   transition-colors duration-150",
+  {
+    variants: ALERT_VARIANT_MAP,
+    defaultVariants: {
+      variant: "info",
+    },
+  }
+);
+
+/** @experimental */
+export type AlertProps = HTMLAttributes<HTMLDivElement> &
+  VariantProps<typeof alertVariants>;
+
+/**
+ * Alert - Root container for alert messages
+ *
+ * Defaults to role="alert" for screen reader announcements. Override with
+ * role="status" for non-urgent updates or role={undefined} to remove.
+ *
+ * @example
+ * <Alert variant="success">
+ *   <CheckCircle2 className="h-4 w-4" />
+ *   <AlertDescription>Operation completed successfully</AlertDescription>
+ * </Alert>
+ * @experimental
+ */
+const Alert: ForwardRefExoticComponent<
+  PropsWithoutRef<AlertProps> & RefAttributes<HTMLDivElement>
+> = forwardRef<HTMLDivElement, AlertProps>(
+  ({ className, variant = "info", role = "alert", ...props }, ref) => {
+    return (
+      <div
+        ref={ref}
+        role={role}
+        data-slot={`alert.${variant}`}
+        className={cn(alertVariants({ variant }), className)}
+        {...props}
+      />
+    );
+  }
+);
+Alert.displayName = "Alert";
+
+/** @experimental */
+export type AlertTitleProps = HTMLAttributes<HTMLHeadingElement>;
+
+/**
+ * AlertTitle - Heading text for alert message
+ *
+ * Renders as <h5> for semantic HTML structure. Use for brief, scannable
+ * alert headings that summarize the message (e.g., "Success", "Warning").
+ *
+ * @example
+ * <AlertTitle>Payment Successful</AlertTitle>
+ * @experimental
+ */
+const AlertTitle: ForwardRefExoticComponent<
+  PropsWithoutRef<AlertTitleProps> & RefAttributes<HTMLHeadingElement>
+> = forwardRef<HTMLHeadingElement, AlertTitleProps>(
+  ({ className, ...props }, ref) => {
+    return (
+      <h5
+        ref={ref}
+        data-slot="alert-title"
+        className={cn(
+          "mb-1 text-sm font-semibold leading-tight tracking-tight",
+          className
+        )}
+        {...props}
+      />
+    );
+  }
+);
+AlertTitle.displayName = "AlertTitle";
+
+/** @experimental */
+export type AlertDescriptionProps = HTMLAttributes<HTMLDivElement>;
+
+/**
+ * AlertDescription - Supporting detail text for alert message
+ *
+ * Renders as <div> to support rich content (links, lists, formatting).
+ * Use for detailed explanations, instructions, or contextual information.
+ *
+ * @example
+ * <AlertDescription>
+ *   Your changes have been saved. <a href="/view">View details</a>
+ * </AlertDescription>
+ * @experimental
+ */
+const AlertDescription: ForwardRefExoticComponent<
+  PropsWithoutRef<AlertDescriptionProps> & RefAttributes<HTMLDivElement>
+> = forwardRef<HTMLDivElement, AlertDescriptionProps>(
+  ({ className, ...props }, ref) => {
+    return (
+      <div
+        ref={ref}
+        data-slot="alert-description"
+        className={cn("text-sm leading-relaxed", className)}
+        {...props}
+      />
+    );
+  }
+);
+AlertDescription.displayName = "AlertDescription";
+
+export { Alert, AlertTitle, AlertDescription, alertVariants };

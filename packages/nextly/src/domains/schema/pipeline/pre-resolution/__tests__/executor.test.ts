@@ -1,0 +1,476 @@
+import type { SQL } from "drizzle-orm";
+import { MySqlDialect } from "drizzle-orm/mysql-core";
+import { describe, expect, it, vi } from "vitest";
+
+import type {
+  ChangeColumnTypeOp,
+  DropColumnOp,
+  DropIndexOp,
+  DropTableOp,
+  Operation,
+  RenameColumnOp,
+  RenameTableOp,
+} from "../../diff/types";
+import { executePreResolutionOps } from "../executor";
+
+// Mock tx that records the SQL strings it executed.
+function makeRecordingTx() {
+  const executed: string[] = [];
+  const tx = {
+    execute: vi.fn(async (sql: { _sql?: string } | string) => {
+      // Drizzle's sql.raw() yields a tagged value with chunks; we just record
+      // its toString() for assertion purposes.
+      executed.push(typeof sql === "string" ? sql : extractSqlString(sql));
+      return { rows: [] };
+    }),
+  };
+  return { tx, executed };
+}
+
+function extractSqlString(sql: unknown): string {
+  // drizzle's sql.raw(s) builds an SQL object with internal chunks. For
+  // testing we rely on the structural property: the executor passes its
+  // raw string to sql.raw(), which we can extract via the test-mode tag.
+  // The recorded shape is `{ queryChunks: [...], shouldInlineParams: ... }`.
+  // We just stringify and grep for the SQL command.
+  if (sql && typeof sql === "object" && "queryChunks" in sql) {
+    const chunks = (sql as { queryChunks: unknown[] }).queryChunks;
+    return chunks
+      .map(c => {
+        if (c && typeof c === "object" && "value" in c) {
+          const v = (c as { value: string[] }).value;
+          return Array.isArray(v) ? v.join("") : String(v);
+        }
+        return String(c);
+      })
+      .join("");
+  }
+  return String(sql);
+}
+
+describe("executePreResolutionOps - PG/MySQL", () => {
+  it("filters non-pre-resolution ops and runs nothing if list is empty", async () => {
+    const { tx, executed } = makeRecordingTx();
+    const addOnly: Operation[] = [
+      {
+        type: "add_column",
+        tableName: "dc_posts",
+        column: { name: "x", type: "text", nullable: true },
+      },
+    ];
+
+    const count = await executePreResolutionOps(tx, addOnly, "postgresql");
+
+    expect(count).toBe(0);
+    expect(tx.execute).not.toHaveBeenCalled();
+    expect(executed).toEqual([]);
+  });
+
+  it("runs renames before drops (so subsequent drops reference new names if needed)", async () => {
+    const { tx, executed } = makeRecordingTx();
+    const ops: Operation[] = [
+      {
+        type: "drop_column",
+        tableName: "dc_posts",
+        columnName: "body",
+        columnType: "text",
+      } satisfies DropColumnOp,
+      {
+        type: "rename_column",
+        tableName: "dc_posts",
+        fromColumn: "title",
+        toColumn: "name",
+        fromType: "text",
+        toType: "text",
+      } satisfies RenameColumnOp,
+    ];
+
+    const count = await executePreResolutionOps(tx, ops, "postgresql");
+
+    expect(count).toBe(2);
+    // Renames first, then drops.
+    expect(executed[0]).toContain("RENAME COLUMN");
+    expect(executed[1]).toContain("DROP COLUMN");
+  });
+
+  it("runs rename_table before rename_column (table renames first)", async () => {
+    const { tx, executed } = makeRecordingTx();
+    const ops: Operation[] = [
+      {
+        type: "rename_column",
+        tableName: "dc_new_posts", // already-renamed table name
+        fromColumn: "title",
+        toColumn: "name",
+        fromType: "text",
+        toType: "text",
+      } satisfies RenameColumnOp,
+      {
+        type: "rename_table",
+        fromName: "dc_posts",
+        toName: "dc_new_posts",
+      } satisfies RenameTableOp,
+    ];
+
+    const count = await executePreResolutionOps(tx, ops, "postgresql");
+
+    expect(count).toBe(2);
+    // Table rename before column rename.
+    expect(executed[0]).toContain("RENAME TO");
+    expect(executed[1]).toContain("RENAME COLUMN");
+  });
+
+  it("runs drop_column before drop_table (clean column-level state first)", async () => {
+    const { tx, executed } = makeRecordingTx();
+    const ops: Operation[] = [
+      {
+        type: "drop_table",
+        tableName: "dc_old",
+      } satisfies DropTableOp,
+      {
+        type: "drop_column",
+        tableName: "dc_other",
+        columnName: "body",
+        columnType: "text",
+      } satisfies DropColumnOp,
+    ];
+
+    const count = await executePreResolutionOps(tx, ops, "postgresql");
+
+    expect(count).toBe(2);
+    expect(executed[0]).toContain('DROP COLUMN "body"');
+    expect(executed[1]).toContain('DROP TABLE "dc_old"');
+  });
+
+  it("safe order: rename_table -> rename_column -> drop_index -> drop_column -> drop_table", async () => {
+    const { tx, executed } = makeRecordingTx();
+    const ops: Operation[] = [
+      {
+        type: "drop_table",
+        tableName: "dc_zombie",
+      } satisfies DropTableOp,
+      {
+        type: "rename_column",
+        tableName: "dc_new",
+        fromColumn: "a",
+        toColumn: "b",
+        fromType: "text",
+        toType: "text",
+      } satisfies RenameColumnOp,
+      {
+        type: "drop_column",
+        tableName: "dc_new",
+        columnName: "old",
+        columnType: "text",
+      } satisfies DropColumnOp,
+      {
+        type: "drop_index",
+        tableName: "dc_new",
+        index: { name: "idx_dc_new_old", columns: ["old"], unique: false },
+      } satisfies DropIndexOp,
+      {
+        type: "rename_table",
+        fromName: "dc_old",
+        toName: "dc_new",
+      } satisfies RenameTableOp,
+    ];
+
+    const count = await executePreResolutionOps(tx, ops, "postgresql");
+
+    expect(count).toBe(5);
+    expect(executed[0]).toContain("RENAME TO"); // rename_table
+    expect(executed[1]).toContain("RENAME COLUMN"); // rename_column
+    expect(executed[2]).toContain("DROP INDEX"); // drop_index
+    expect(executed[3]).toContain("DROP COLUMN"); // drop_column
+    expect(executed[4]).toContain("DROP TABLE"); // drop_table
+  });
+
+  it("runs drop_index before drop_column so an indexed column can be dropped on SQLite", async () => {
+    // Input order deliberately reversed: the diff can hand the executor a
+    // column drop first, but the index covering it must go first or SQLite
+    // rejects the ALTER TABLE ... DROP COLUMN.
+    const { tx, executed } = makeRecordingTx();
+    const ops: Operation[] = [
+      {
+        type: "drop_column",
+        tableName: "single_home",
+        columnName: "hero_image",
+        columnType: "text",
+      } satisfies DropColumnOp,
+      {
+        type: "drop_index",
+        tableName: "single_home",
+        index: {
+          name: "idx_single_home_hero_image",
+          columns: ["hero_image"],
+          unique: false,
+        },
+      } satisfies DropIndexOp,
+    ];
+
+    const count = await executePreResolutionOps(tx, ops, "postgresql");
+
+    expect(count).toBe(2);
+    expect(executed[0]).toContain(
+      'DROP INDEX IF EXISTS "idx_single_home_hero_image"'
+    );
+    expect(executed[1]).toContain('DROP COLUMN "hero_image"');
+  });
+
+  it("mysql drop_index names the table (DROP INDEX ... ON)", async () => {
+    const { tx, executed } = makeRecordingTx();
+    const ops: Operation[] = [
+      {
+        type: "drop_index",
+        tableName: "dc_posts",
+        index: { name: "uq_dc_posts_slug", columns: ["slug"], unique: true },
+      } satisfies DropIndexOp,
+    ];
+
+    await executePreResolutionOps(tx, ops, "mysql");
+
+    expect(executed[0]).toContain(
+      "DROP INDEX `uq_dc_posts_slug` ON `dc_posts`"
+    );
+  });
+
+  it("dialect quoting: mysql uses backticks", async () => {
+    const { tx, executed } = makeRecordingTx();
+    const ops: Operation[] = [
+      {
+        type: "rename_column",
+        tableName: "dc_posts",
+        fromColumn: "title",
+        toColumn: "name",
+        fromType: "text",
+        toType: "text",
+      } satisfies RenameColumnOp,
+    ];
+
+    await executePreResolutionOps(tx, ops, "mysql");
+
+    expect(executed[0]).toContain("`dc_posts`");
+    expect(executed[0]).toContain("`title`");
+    expect(executed[0]).toContain("`name`");
+  });
+});
+
+describe("executePreResolutionOps - SQLite", () => {
+  it("uses db.run instead of db.execute on SQLite (better-sqlite3 wrapper)", async () => {
+    const executed: string[] = [];
+    const db = {
+      run: vi.fn((sql: unknown) => {
+        executed.push(extractSqlString(sql));
+      }),
+    };
+    const ops: Operation[] = [
+      {
+        type: "rename_column",
+        tableName: "dc_posts",
+        fromColumn: "title",
+        toColumn: "name",
+        fromType: "text",
+        toType: "text",
+      } satisfies RenameColumnOp,
+    ];
+
+    const count = await executePreResolutionOps(db, ops, "sqlite");
+
+    expect(count).toBe(1);
+    expect(db.run).toHaveBeenCalledTimes(1);
+    expect(executed[0]).toContain("RENAME COLUMN");
+  });
+
+  it("drops a removed field's index before its column (SQLite rejects DROP COLUMN on an indexed column)", async () => {
+    const executed: string[] = [];
+    const db = {
+      run: vi.fn((sql: unknown) => {
+        executed.push(extractSqlString(sql));
+      }),
+    };
+    const ops: Operation[] = [
+      {
+        type: "drop_column",
+        tableName: "single_home",
+        columnName: "hero_image",
+        columnType: "text",
+      } satisfies DropColumnOp,
+      {
+        type: "drop_index",
+        tableName: "single_home",
+        index: {
+          name: "idx_single_home_hero_image",
+          columns: ["hero_image"],
+          unique: false,
+        },
+      } satisfies DropIndexOp,
+    ];
+
+    const count = await executePreResolutionOps(db, ops, "sqlite");
+
+    expect(count).toBe(2);
+    expect(executed[0]).toContain(
+      'DROP INDEX IF EXISTS "idx_single_home_hero_image"'
+    );
+    expect(executed[1]).toContain('DROP COLUMN "hero_image"');
+  });
+});
+
+// A MySQL string narrowing runs here, on the apply's own connection in strict mode, and only once
+// every value is known to fit — whether the narrowing is its own operation or the type change a
+// confirmed rename carries.
+describe("executePreResolutionOps - MySQL string narrowing", () => {
+  function countingTx(longer: number) {
+    const executed: string[] = [];
+    const tx = {
+      execute: vi.fn(async (sql: unknown) => {
+        const text = extractSqlString(sql);
+        executed.push(text);
+        return text.includes("COUNT(*)") ? [[{ count: longer }], []] : [[], []];
+      }),
+    };
+    return { tx, executed };
+  }
+
+  it("keeps the column's live nullability, leaving a pending NOT NULL to run after cleanup", async () => {
+    const { tx, executed } = countingTx(0);
+    await executePreResolutionOps(
+      tx,
+      [
+        {
+          type: "change_column_type",
+          tableName: "single_site",
+          columnName: "title",
+          fromType: "text",
+          toType: "varchar(255)",
+          nullable: false,
+          fromNullable: true,
+        },
+      ],
+      "mysql"
+    );
+    const modify = executed.find(s => s.includes("MODIFY COLUMN"));
+    expect(modify).toContain("MODIFY COLUMN `title` varchar(255) NULL");
+    expect(modify).not.toContain("NOT NULL");
+  });
+
+  const narrowingRename: RenameColumnOp = {
+    type: "rename_column",
+    tableName: "dc_posts",
+    fromColumn: "title",
+    toColumn: "name",
+    fromType: "text",
+    toType: "varchar(255)",
+  };
+
+  it("refuses a rename whose type change would cut a value, before any statement runs", async () => {
+    const { tx, executed } = countingTx(2);
+    await expect(
+      executePreResolutionOps(tx, [narrowingRename], "mysql")
+    ).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+      publicData: {
+        errors: [
+          expect.objectContaining({
+            code: "NARROWING_WOULD_TRUNCATE",
+            path: "schema.dc_posts.title",
+          }),
+        ],
+      },
+    });
+    expect(executed.filter(s => !s.includes("COUNT(*)"))).toEqual([]);
+  });
+
+  it("runs a rename's narrowing type change in strict mode once the values fit", async () => {
+    const { tx, executed } = countingTx(0);
+    await executePreResolutionOps(tx, [narrowingRename], "mysql");
+    const statements = executed.filter(s => !s.includes("COUNT(*)"));
+    const modify = statements.findIndex(s =>
+      s.includes("MODIFY COLUMN `name`")
+    );
+    expect(statements[0]).toContain("RENAME COLUMN");
+    expect(statements[modify - 1]).toContain("STRICT_ALL_TABLES");
+    expect(statements[modify + 1]).toBe(
+      "SET SESSION sql_mode = @nextly_sql_mode"
+    );
+  });
+});
+
+// On MySQL and SQLite each rename or drop commits as it runs: a run stopped part-way must know how
+// many finished, so it is told after each one, not only once the phase returns.
+describe("executePreResolutionOps - each finished statement told as it finishes", () => {
+  it("tells each leading statement and each op as it finishes, and none after a failure", async () => {
+    let sent = 0;
+    const tx = {
+      execute: vi.fn(async () => {
+        sent += 1;
+        if (sent === 3) throw new Error("lock wait timeout");
+        return { rows: [] };
+      }),
+    };
+    const ops: Operation[] = [
+      { type: "drop_table", tableName: "dc_a" } satisfies DropTableOp,
+      { type: "drop_table", tableName: "dc_b" } satisfies DropTableOp,
+    ];
+    const finished: string[] = [];
+    await expect(
+      executePreResolutionOps(
+        tx,
+        ops,
+        "mysql",
+        ["ALTER TABLE x DROP CHECK c"],
+        {
+          starting: () => undefined,
+          finished: statement => {
+            finished.push(statement);
+          },
+        }
+      )
+    ).rejects.toThrow("lock wait timeout");
+    // The leading statement and the first drop finished; the second drop failed.
+    expect(finished).toHaveLength(2);
+  });
+
+  // An operation can run several statements: on MySQL a reference-list conversion is three (the
+  // column made text, its values rewritten, the column made the list type). Each commits as it
+  // runs, so each is told as it finishes, not the operation once.
+  it("tells each statement of an operation that runs several, and none after the one that fails", async () => {
+    const started: string[] = [];
+    const finished: string[] = [];
+    // The conversion's second statement, the rewrite, is refused by its text, not by what the
+    // record was told, so the record under test cannot decide where the failure falls. The reads
+    // before it (the conversion's checks) and the column made text run.
+    const mysql = new MySqlDialect();
+    const tx = {
+      execute: vi.fn(async (query: SQL) => {
+        if (/^UPDATE /.test(mysql.sqlToQuery(query).sql.trim())) {
+          throw new Error("refused by a trigger");
+        }
+        // mysql2's [rows, fields] shape; no read returns rows here.
+        return [[], []];
+      }),
+    };
+    const conversion: ChangeColumnTypeOp = {
+      type: "change_column_type",
+      tableName: "dc_posts",
+      columnName: "author",
+      fromType: "varchar(36)",
+      toType: "json",
+      conversion: "referenceList",
+    };
+    await expect(
+      executePreResolutionOps(tx, [conversion], "mysql", [], {
+        starting: statement => {
+          started.push(statement);
+        },
+        finished: statement => {
+          finished.push(statement);
+        },
+      })
+    ).rejects.toThrow("refused by a trigger");
+    // Positive control: the operation reached its second statement, which failed.
+    expect(started).toHaveLength(2);
+    // The first, the column made text, finished and stays.
+    expect(finished).toEqual([started[0]]);
+    expect(finished[0]).toMatch(/MODIFY COLUMN `author` text/);
+  });
+});

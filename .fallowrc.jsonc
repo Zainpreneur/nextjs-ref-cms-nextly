@@ -1,0 +1,288 @@
+{
+  // Fallow configuration for Nextly
+  //
+  // Fallow reads the whole module graph at once and reports what nothing
+  // reaches: unused files, exports and dependencies, unresolved imports,
+  // import cycles, duplication and complexity. It answers questions lint
+  // cannot, because a lint rule sees one file at a time.
+  //
+  // Commands:
+  //   - pnpm fallow       = full-repo report, apps/playground included.
+  //   - pnpm fallow:audit = the diff, against origin/dev. Same check the
+  //                         agent gate runs before a commit.
+  //
+  // In CI, .github/workflows/code-hygiene.yml runs a changed-files audit
+  // gate (with inline annotations and PR review threads) alongside a
+  // full-repository scan combining dead-code, dupes, and health into one
+  // sticky PR comment (excluding apps/playground).
+  //
+  // The lists below exist because a static reader cannot see every way this
+  // repo reaches code: a path spelled inside a string, a package pulled in by
+  // a bundler rather than an import, a subpath resolved through an exports
+  // map. Each entry names one of those, and says which mechanism it is —
+  // an entry without a reason is indistinguishable from a silenced bug.
+  //
+  // Documentation: https://docs.fallow.tools
+
+  "$schema": "https://raw.githubusercontent.com/fallow-rs/fallow/main/schema.json",
+
+  // Trees that ship out of this repo rather than run inside it.
+  //
+  //   templates/ = source that create-nextly-app copies into a new user
+  //     project. `templates/blog` is an overlay onto `templates/base`, and
+  //     base holds the tsconfig that defines `@/*`, so a specifier like
+  //     `@/components/PostGrid` resolves only once the CLI has merged the
+  //     two. Read in place, every one of them is unresolvable.
+  //   docs/ = MDX for nextlyhq.com/docs, rendered by the site, not imported.
+  //   worktrees/ = AGENTS.md mandates a worktree per branch. Placed inside the
+  //     repository rather than beside it, each is a full second copy that
+  //     fallow walks as ordinary source, so every file, export and cycle is
+  //     counted twice and the report is dominated by another branch's tree.
+  "ignorePatterns": ["templates/**", "docs/**", "**/worktrees/**"],
+
+  // Reachable only through a string, so the graph has no edge leading to
+  // them. Left out, each reports as unused, and an unused file takes whatever
+  // it imports down with it.
+  "entry": [
+    // admin-css ships no vitest config, so its suite runs on the default
+    // include, which covers .mjs. These execute on every `pnpm test`.
+    "**/*.test.mjs",
+    // Spawned by the webServer command in e2e/playwright.config.ts.
+    "e2e/scripts/*.mjs",
+    // Loaded into the production server with `node --import` by
+    // e2e/admin-speed/measure.mjs, which names it only as a path.
+    "e2e/admin-speed/preload.mjs",
+    // Handed to the Tailwind CLI by packages/ui/scripts/build-css.mjs.
+    "packages/ui/src/styles/index.css",
+    // Passed as an argv path to the admin-css bin by its integration test.
+    "packages/admin-css/__fixtures__/**",
+    // Handed to oxlint by the templates pass in scripts/lint.mjs.
+    "oxlint.templates.config.mjs",
+    // Type-level tests, compiled by each package's `check-types` rather than
+    // run by Vitest, so no test runner names them as entries.
+    "**/*.test-d.ts",
+    // The playground's "use cache" read function, imported by its root layout
+    // for its side effect: `cachedRead` is exported as the app-side file every
+    // template ships it, and registered by the file itself, not imported. Its
+    // Cache Components off variant is reached only through the alias
+    // apps/playground/next.config.ts sets when that setting is off.
+    "apps/playground/src/nextly/cached-read.ts",
+    "apps/playground/src/nextly/cached-read.cache-components-off.ts",
+  ],
+
+  // A lazy import, an `import()` inside a function, loads nothing when the
+  // importing module loads, so it cannot take part in a load-order cycle; it
+  // is how a module that needs a heavy one on first use stays out of its
+  // import graph. Cycle detection skips those edges. A static import is still
+  // an edge, so a static cycle through the same files is still an error, as
+  // is a top-level `await import()`, which loads before the module finishes.
+  "circularDependencies": {
+    "ignoreLazyImports": true,
+  },
+
+  // Specifiers tsc and Node both resolve, and fallow does not.
+  //
+  //   nextly/field-catalog = a declared exports subpath of the nextly
+  //     package. Its `types` and `import` conditions point at different
+  //     paths (dist/field-catalog.d.ts and
+  //     dist/collections/fields/catalog.mjs); fallow follows neither. Drop
+  //     this once its exports resolver handles that shape.
+  //   ../dist/cli.mjs and ../dist/render/index.js = the only two specifiers
+  //     in the tree that reach build output directly — create-nextly-app's
+  //     bin shim and one page-builder spec. Present after `pnpm build` and
+  //     absent on a clean checkout, so gating on them would make the verdict
+  //     depend on build order.
+  //   @nextlyhq/ui/styles.css and @nextlyhq/builder/styles.css = declared
+  //     exports subpaths that resolve to build output — ./dist/styles.css and
+  //     ./dist/builder-chrome.css — and `dist` is gitignored. Same build-order
+  //     dependence as the two above, and measured as exactly that: a local
+  //     audit after `pnpm build` resolves both and reports no issue, while CI
+  //     audits after install and before build and reports both unresolved. The
+  //     harness routes that import them cannot drop the imports: the editor's
+  //     sheet ships neither the `--nx-*` tokens nor the base reset, because the
+  //     host owns both, so without them the shell renders with its colours
+  //     resolving to nothing — which is a bug the shell suite has a test for.
+  //   @nextlyhq/ui/color = the same shape again, and the same measurement. It
+  //     is a declared exports subpath resolving to `./dist/color.mjs`, so a
+  //     local audit after `pnpm build` reports nothing while CI, which audits
+  //     after install and before build, reports it unresolved. The editor's
+  //     colour control cannot drop the import: it is the WRITING half of hex
+  //     and `blocks-engine` owns the reading half, so composing the notation
+  //     inside `packages/builder` would put a third colour parser in the tree.
+  //   @nextlyhq/ui/utils = the same shape a third time, resolving to
+  //     `./dist/utils.mjs`, and measured the same way: a local audit after
+  //     `pnpm build` resolves it while CI, which audits after install and
+  //     before build, reports it unresolved. The import is `cn`, which is
+  //     `twMerge(clsx(...))`, and `packages/builder` cannot drop it: without
+  //     the merge, conflicting Tailwind classes are both present, so a
+  //     conditional `text-foreground` no longer overrides the
+  //     `text-muted-foreground` beside it and a selected control renders as
+  //     unselected.
+  //
+  // Every entry is an exact specifier rather than a prefix. These match the
+  // raw import string, so `../dist/**` would also swallow a typo like
+  // `../dist/render/missing.js`, and `nextly/field-catalog/**` a deep import
+  // below a subpath that exports nothing — the class of mistake this check
+  // exists to catch.
+  "ignoreUnresolvedImports": [
+    "nextly/field-catalog",
+    "../dist/cli.mjs",
+    "../dist/render/index.js",
+    "@nextlyhq/ui/styles.css",
+    "@nextlyhq/ui/color",
+    "@nextlyhq/ui/utils",
+    "@nextlyhq/builder/styles.css",
+  ],
+
+  // Three pnpm `overrides` entries pin a version of a package nothing here
+  // depends on directly: they exist to lift a transitive dependency off a
+  // vulnerable release. Fallow reports each as an unused override, which is
+  // accurate and permanent — the whole point of the pin is that no manifest
+  // asks for the package, so the finding can never be resolved by fixing
+  // anything. Verified for all three: no workspace manifest declares them and
+  // no source file imports them.
+  //
+  // Unlike `ignoreDependencies` below, this key does not leak. It matches one
+  // override entry by exact target name, narrowed further to the declaring
+  // file, so it cannot excuse a package anywhere else.
+  //
+  // The findings are warn-tier, so they never blocked anything. They were
+  // reported as INTRODUCED on this branch regardless, because attribution
+  // anchors a manifest finding to its file and this branch edits package.json
+  // to add the fallow devDependency. Left in place, every future change to
+  // package.json would inherit the same three phantom findings.
+  "ignoreDependencyOverrides": [
+    { "package": "fast-xml-builder", "source": "package.json" },
+    { "package": "fast-xml-parser", "source": "package.json" },
+    { "package": "uuid", "source": "package.json" },
+  ],
+
+  // NO `ignoreDependencies` HERE, deliberately. It matches by exact package
+  // NAME across the whole analysis and suppresses the unlisted-dependency
+  // finding as well as the unused one, so naming `cmdk` to excuse admin also
+  // excuses a future package that imports `cmdk` without declaring it — which
+  // is the missing-manifest case this gate exists to catch. Measured on fallow
+  // 3.15.0: nothing narrows it. A per-package `.fallowrc.jsonc` is not read
+  // during a root run, and an `overrides` entry scoped to
+  // `packages/admin/package.json` (or `packages/admin/**`) leaves the finding
+  // in place, because overrides re-severity rules over SOURCE files and a
+  // manifest finding is not one of those.
+  //
+  // The attribution does the job instead, and does it better. Both the local
+  // gate and the workflow run new-only against a base, so a dependency finding
+  // that predates the change is reported as inherited and does not block;
+  // a genuinely new one is not excused by a name and does block. Verified: with
+  // no suppressions at all the audit reports 40 findings and still exits 0,
+  // every one attributed to the base rather than to the change.
+  //
+  // Why those findings exist, so the next reader does not go looking for a bug:
+  //
+  //   packages/admin — the Radix, lexical, cmdk, tailwind-variants and
+  //     tailwindcss-animate entries are never imported by admin/src. They
+  //     arrive through @nextlyhq/ui and are inlined by the NO_EXTERNAL_DEPS
+  //     list in packages/admin/tsdown.config.ts, so a consumer installs
+  //     @nextlyhq/admin rather than two dozen UI libraries. Remove one and the
+  //     bundle loses the component that needed it.
+  //   packages/ui — @tailwindcss/cli is run as a shell command by
+  //     scripts/build-css.mjs, which is how the theme is compiled.
+  //   packages/telemetry — its tsdown config sets deps.alwaysBundle: [/(.*)/], so every
+  //     dependency is inlined. env-paths arrives through `conf`, which uses it
+  //     to pick the OS-appropriate config directory.
+  //   packages/plugin-page-builder — @tanstack/react-query is a peerDependency
+  //     mirrored into devDependencies so the peer resolves for this package's
+  //     own build and type-check.
+  //   e2e — the adapter and plugin entries are declared so turbo's
+  //     `dependsOn: ["^build"]` builds them before Playwright boots the
+  //     playground, which does use them. Without the declaration the suite
+  //     starts against a stale or missing dist.
+
+  // Clone groups that have been read and kept. A key is
+  // `<fingerprint>:<instance-count>`, and the fingerprint is derived from the
+  // tokens of the group itself, so editing either instance — or a third
+  // appearing — produces a different key and the group reports again. That
+  // self-invalidation is why this is preferred to a `duplicates.ignore` glob,
+  // which would blind a path permanently and silently.
+  //
+  // An entry without a reason is indistinguishable from a silenced bug, so
+  // each one names what the shared block is and why merging it would be worse
+  // than repeating it.
+  // What `fallow audit` compares complexity against.
+  //
+  // The audit gate is new-only, and for dead code and duplication that
+  // attribution is enough: a finding either exists on the base or it does
+  // not. Complexity is different. A function is attributed to the change
+  // whenever the diff touches a line inside it, so a change that REMOVES a
+  // branch from a large pre-existing function is reported as introducing its
+  // CRAP score — measured here on a pull request whose diff shrank
+  // `updateEntry` and was refused for its score of 1645, a number no single
+  // change produces. The gate then blocks precisely the changes that reduce
+  // the debt, and the way past it is a suppression comment on the function,
+  // which hides the number for good.
+  //
+  // A baseline keeps the number visible and stops it gating. It records, per
+  // file, how many findings of each severity `main` already carries; the
+  // audit suppresses findings up to that count and still fails on any the
+  // change adds beyond it. Regenerate it from a clean checkout of `main`
+  // when the counts drift:
+  //
+  //   fallow health --save-baseline fallow-health-baseline.json --workspace !playground
+  //
+  // It is deliberately generated from `main`, never from a branch: a branch
+  // that baselines its own findings has written itself a pass.
+  "audit": {
+    "healthBaseline": "fallow-health-baseline.json",
+  },
+
+  "duplicates": {
+    // Generated plugin migration modules. `nextly migrate:create --plugin`
+    // writes each with the whole schema snapshotted per dialect, so every
+    // new module repeats the tables the earlier ones created, by design: the
+    // next generation diffs against the latest snapshot. They are never edited
+    // by hand (a hand edit fails the module's own checksum), so there is no
+    // shared code to extract, and a clone key would change with every module
+    // generated. A glob is the honest form here, scoped to exactly these
+    // generated directories.
+    "ignore": ["packages/*/src/schema/migrations/*.ts"],
+    "ignoredClones": [
+      // collections/services/collection-mutation-service.ts — 17 lines shared
+      // by `createEntryWrite` and `updateEntryWrite`: the closing lines of the
+      // validation gate, then the collection-level and field-level
+      // beforeChange hook calls.
+      //
+      // These are not one decision written twice. The two differ in the
+      // operation they name, the validation mode they pass, whether an
+      // `originalData` accompanies the hook context, and whether the slug is
+      // re-sanitized afterwards — a create generates and dedupes one, an
+      // update does not. Sharing the block needs five discriminating
+      // parameters to carry seventeen lines of hook wiring, which reads worse
+      // at both call sites than the repetition does and buys no single source
+      // of truth: the parameters ARE the difference.
+      //
+      // The surrounding write pipeline that genuinely was one decision with
+      // two implementations is now shared — see `createEntryWrite`,
+      // `updateEntryWrite` and `deleteEntryWrite`, each of which the
+      // transaction API and the batch worker both delegate to.
+      "dup:c77b3abb6f87acd9-2:2",
+
+      // packages/{adapter-mysql,adapter-postgres,adapter-sqlite,storage-s3,
+      // storage-uploadthing,storage-vercel-blob}/tsdown.config.ts — the same
+      // 17-line build config: one ESM and CommonJS entry, the published file
+      // names, declarations without a type check.
+      //
+      // tsdown reads a config from each package's own directory, and turbo
+      // hashes a package's build by that directory's files. A shared module
+      // outside it would change all six builds without changing their hashes,
+      // so a cached build would survive an edit to how it is built. Six small
+      // copies that turbo can see are the safer repetition.
+      "dup:aecdfbd0:6",
+
+      // apps/playground/src/nextly/cached-read.ts and
+      // e2e/multi-instance/fixture/nextly/cached-read.cache-components.ts —
+      // the 20-line "use cache" read function an app compiles. Each is its own
+      // app's file: Next.js compiles the directive only in code the app itself
+      // builds, so neither can import the other's, and both copy the
+      // templates' file, which a create-nextly-app test holds them to.
+      "dup:12d5e42b:2",
+    ],
+  },
+}

@@ -1,0 +1,530 @@
+/**
+ * Tests for DrizzleAdapter base class.
+ *
+ * @remarks
+ * These tests verify the base adapter functionality using a mock implementation.
+ */
+
+import { describe, it, expect, beforeEach } from "vitest";
+
+import { DrizzleAdapter } from "../adapter";
+import { TABLE_NOT_REGISTERED_CODE } from "../types";
+import type {
+  SupportedDialect,
+  SqlParam,
+  TransactionContext,
+  TransactionOptions,
+  DatabaseCapabilities,
+} from "../types";
+
+/**
+ * Mock adapter implementation for testing.
+ */
+class MockAdapter extends DrizzleAdapter {
+  readonly dialect: SupportedDialect = "postgresql";
+  private connected = false;
+  private mockData: Map<string, unknown[]> = new Map();
+
+  async connect(): Promise<void> {
+    this.connected = true;
+  }
+
+  async disconnect(): Promise<void> {
+    this.connected = false;
+    this.mockData.clear();
+  }
+
+  override isConnected(): boolean {
+    return this.connected;
+  }
+
+  async executeQuery<T = unknown>(
+    sql: string,
+    params?: SqlParam[]
+  ): Promise<T[]> {
+    // Mock implementation - return mock data based on query
+    // For INSERT/UPDATE/DELETE with RETURNING, return a mock record
+    if (sql.includes("INSERT") || sql.includes("UPDATE")) {
+      return [{ id: "mock-id", ...params } as T];
+    }
+    // For SELECT queries, return empty array
+    return [];
+  }
+
+  async transaction<T>(
+    callback: (ctx: TransactionContext) => Promise<T>,
+    _options?: TransactionOptions
+  ): Promise<T> {
+    // Mock transaction context
+    const ctx: TransactionContext = {
+      execute: async <U = unknown>(
+        sql: string,
+        params?: SqlParam[]
+      ): Promise<U[]> => {
+        return this.executeQuery<U>(sql, params);
+      },
+      insert: async <U = unknown>(
+        table: string,
+        data: Record<string, unknown>,
+        options?: InsertOptions
+      ): Promise<U> => {
+        return this.insert<U>(table, data, options);
+      },
+      insertMany: async <U = unknown>(
+        table: string,
+        data: Record<string, unknown>[],
+        options?: InsertOptions
+      ): Promise<U[]> => {
+        return this.insertMany<U>(table, data, options);
+      },
+      select: async <U = unknown>(
+        table: string,
+        options?: SelectOptions
+      ): Promise<U[]> => {
+        return this.select<U>(table, options);
+      },
+      selectOne: async <U = unknown>(
+        table: string,
+        options?: SelectOptions
+      ): Promise<U | null> => {
+        return this.selectOne<U>(table, options);
+      },
+      update: async <U = unknown>(
+        table: string,
+        data: Record<string, unknown>,
+        where: Parameters<typeof this.update>[2],
+        options?: Parameters<typeof this.update>[3]
+      ): Promise<U[]> => {
+        return this.update<U>(table, data, where, options);
+      },
+      delete: async (
+        table: string,
+        where: Parameters<typeof this.delete>[1],
+        options?: Parameters<typeof this.delete>[2]
+      ): Promise<number> => {
+        return this.delete(table, where, options);
+      },
+      upsert: async <U = unknown>(
+        table: string,
+        data: Record<string, unknown>,
+        options: Parameters<typeof this.upsert>[2]
+      ): Promise<U> => {
+        return this.upsert<U>(table, data, options);
+      },
+      // Required by the TransactionContext contract; this mock does not run
+      // Drizzle queries, so return an empty stub.
+      getDrizzle: <U = unknown>(): U => ({}) as U,
+    };
+
+    return callback(ctx);
+  }
+
+  /** The protected error wrapper, reachable from the tests. */
+  queryError(error: unknown, operation: string, table: string) {
+    return this.handleQueryError(error, operation, table);
+  }
+
+  getCapabilities(): DatabaseCapabilities {
+    return {
+      dialect: "postgresql",
+      supportsJsonb: true,
+      supportsJson: true,
+      supportsArrays: true,
+      supportsGeneratedColumns: true,
+      supportsFts: true,
+      supportsIlike: true,
+      supportsReturning: true,
+      supportsSavepoints: true,
+      supportsOnConflict: true,
+      maxParamsPerQuery: 65535,
+      maxIdentifierLength: 63,
+    };
+  }
+}
+
+describe("DrizzleAdapter", () => {
+  let adapter: MockAdapter;
+
+  beforeEach(() => {
+    adapter = new MockAdapter();
+  });
+
+  describe("Connection Management", () => {
+    it("should connect successfully", async () => {
+      expect(adapter.isConnected()).toBe(false);
+      await adapter.connect();
+      expect(adapter.isConnected()).toBe(true);
+    });
+
+    it("should disconnect successfully", async () => {
+      await adapter.connect();
+      expect(adapter.isConnected()).toBe(true);
+      await adapter.disconnect();
+      expect(adapter.isConnected()).toBe(false);
+    });
+
+    it("should report correct dialect", () => {
+      expect(adapter.dialect).toBe("postgresql");
+    });
+  });
+
+  describe("Capabilities", () => {
+    it("should return database capabilities", () => {
+      const caps = adapter.getCapabilities();
+      expect(caps.dialect).toBe("postgresql");
+      expect(caps.supportsReturning).toBe(true);
+      expect(caps.supportsJsonb).toBe(true);
+      expect(caps.supportsSavepoints).toBe(true);
+    });
+
+    it("should have valid maxParamsPerQuery", () => {
+      const caps = adapter.getCapabilities();
+      expect(caps.maxParamsPerQuery).toBeGreaterThan(0);
+    });
+  });
+
+  describe("TableResolver requirement", () => {
+    it("should throw when select is called without TableResolver", async () => {
+      // CRUD methods refuse a table no resolver holds
+      await expect(adapter.select("users")).rejects.toThrow(
+        /not found in schema registry: this running instance has not registered it/
+      );
+    });
+
+    it("should throw when insert is called without TableResolver", async () => {
+      await expect(
+        adapter.insert("users", { email: "test@example.com" })
+      ).rejects.toThrow(
+        /not found in schema registry: this running instance has not registered it/
+      );
+    });
+
+    it("should throw when update is called without TableResolver", async () => {
+      await expect(
+        adapter.update(
+          "users",
+          { name: "Updated" },
+          { and: [{ column: "id", op: "=", value: "1" }] }
+        )
+      ).rejects.toThrow(
+        /not found in schema registry: this running instance has not registered it/
+      );
+    });
+
+    it("should throw when delete is called without TableResolver", async () => {
+      await expect(
+        adapter.delete("users", {
+          and: [{ column: "id", op: "=", value: "1" }],
+        })
+      ).rejects.toThrow(
+        /not found in schema registry: this running instance has not registered it/
+      );
+    });
+  });
+
+  describe("a table the resolver does not hold", () => {
+    // Every CRUD method answers it the same way: one code a caller can tell
+    // apart from any database failure, the table named, and nothing about how
+    // the adapter was wired, which is not what an operator can act on.
+    const where = { and: [{ column: "id", op: "=" as const, value: "1" }] };
+    const calls: Array<[string, () => Promise<unknown>]> = [
+      ["select", () => adapter.select("dc_posts")],
+      ["selectOne", () => adapter.selectOne("dc_posts")],
+      ["count", () => adapter.count("dc_posts")],
+      ["insert", () => adapter.insert("dc_posts", { title: "a" })],
+      ["update", () => adapter.update("dc_posts", { title: "b" }, where)],
+      [
+        "updateCount",
+        () => adapter.updateCount("dc_posts", { title: "b" }, where),
+      ],
+      ["delete", () => adapter.delete("dc_posts", where)],
+      [
+        "upsert",
+        () =>
+          adapter.upsert(
+            "dc_posts",
+            { id: "1", title: "a" },
+            { conflictColumns: ["id"] }
+          ),
+      ],
+    ];
+
+    it.each(calls)("%s refuses it as not registered", async (_name, call) => {
+      adapter.setTableResolver({ getTable: () => null });
+      const error = await call().then(
+        () => undefined,
+        (e: unknown) => e
+      );
+      expect(error).toMatchObject({
+        code: TABLE_NOT_REGISTERED_CODE,
+        table: "dc_posts",
+      });
+      const message = (error as Error).message;
+      expect(message).toContain('"dc_posts"');
+      expect(message).toContain("not registered");
+      expect(message).not.toContain("setTableResolver");
+      // Code that recognises the refusal by its message still does.
+      expect(message).toContain("not found in schema registry");
+    });
+  });
+
+  // Note: CRUD integration tests (insert, select, update, delete with actual Drizzle API)
+  // are in packages/nextly/src/database/__tests__/integration/schema-push.integration.test.ts
+  // Those tests run against a real PostgreSQL database with proper TableResolver setup.
+
+  describe("Transaction Support", () => {
+    beforeEach(async () => {
+      await adapter.connect();
+    });
+
+    it("should execute transaction callback", async () => {
+      const result = await adapter.transaction(async _ctx => {
+        return "transaction result";
+      });
+
+      expect(result).toBe("transaction result");
+    });
+
+    it("should provide transaction context with CRUD methods", async () => {
+      await adapter.transaction(async ctx => {
+        // Verify ctx has required methods
+        expect(typeof ctx.execute).toBe("function");
+        expect(typeof ctx.insert).toBe("function");
+        expect(typeof ctx.select).toBe("function");
+        expect(typeof ctx.update).toBe("function");
+        expect(typeof ctx.delete).toBe("function");
+      });
+    });
+  });
+
+  describe("Pool Statistics", () => {
+    it("should return null by default", () => {
+      const stats = adapter.getPoolStats();
+      expect(stats).toBeNull();
+    });
+  });
+
+  describe("Error Handling", () => {
+    it("should handle migration not implemented in base adapter", async () => {
+      await expect(adapter.migrate([])).rejects.toThrow(
+        "migrate() must be implemented by dialect-specific adapter"
+      );
+    });
+
+    it("should handle rollback not implemented in base adapter", async () => {
+      await expect(adapter.rollback()).rejects.toThrow(
+        "rollback() must be implemented by dialect-specific adapter"
+      );
+    });
+
+    it("should return empty migration status when no migrations table exists", async () => {
+      // getMigrationStatus now returns empty result instead of throwing
+      // when the __drizzle_migrations table doesn't exist
+      const result = await adapter.getMigrationStatus();
+      expect(result.applied).toEqual([]);
+      expect(result.pending).toEqual([]);
+      expect(result.current).toBeNull();
+    });
+  });
+
+  describe("a query error's context", () => {
+    const CONTEXT = "update operation failed on table 'posts'";
+
+    it("is attached to a driver message that quotes the failed statement", () => {
+      // Drizzle's own shape on PostgreSQL and MySQL: the statement, spelled in
+      // lower case, so the operation's name is in the message already.
+      const error = adapter.queryError(
+        new Error(
+          'Failed query: update "posts" set "ghost" = $1 where "id" = $2\nparams: x,1'
+        ),
+        "update",
+        "posts"
+      );
+      expect(error.message).toBe(
+        `${CONTEXT}: Failed query: update "posts" set "ghost" = $1 where "id" = $2\nparams: x,1`
+      );
+      expect(error.table).toBe("posts");
+    });
+
+    it("is attached when only a name in the message contains the operation", () => {
+      const error = adapter.queryError(
+        new Error('column "ghost" of relation "update_log" does not exist'),
+        "update",
+        "update_log"
+      );
+      expect(error.message).toBe(
+        'update operation failed on table \'update_log\': column "ghost" of relation "update_log" does not exist'
+      );
+    });
+
+    it("is attached once, however often the same error is handled", () => {
+      const first = adapter.queryError(
+        new Error("no such column: ghost"),
+        "update",
+        "posts"
+      );
+      const again = adapter.queryError(first, "update", "posts");
+      expect(again.message).toBe(`${CONTEXT}: no such column: ghost`);
+    });
+  });
+
+  describe("distinct", () => {
+    /** A Drizzle stub that records which select its query began with. */
+    class RecordingAdapter extends MockAdapter {
+      began: string[] = [];
+      override getDrizzle<U = unknown>(): U {
+        const chain: Record<string, unknown> = {};
+        const self = () => chain;
+        chain.select = () => {
+          this.began.push("select");
+          return chain;
+        };
+        chain.selectDistinct = () => {
+          this.began.push("selectDistinct");
+          return chain;
+        };
+        chain.from = self;
+        chain.where = self;
+        chain.orderBy = self;
+        chain.limit = self;
+        chain.offset = self;
+        chain.then = (resolve: (rows: unknown[]) => unknown) => resolve([]);
+        return chain as U;
+      }
+    }
+
+    it("selects each row once when asked, and every row otherwise", async () => {
+      const recording = new RecordingAdapter();
+      recording.setTableResolver({ getTable: () => ({}) } as never);
+
+      await recording.select("posts", { distinct: true });
+      await recording.select("posts", {});
+
+      expect(recording.began).toEqual(["selectDistinct", "select"]);
+    });
+  });
+
+  describe("forUpdate lock safety", () => {
+    // A SELECT ... FOR UPDATE row lock only holds for the life of a transaction.
+    // Requesting one on the pooled connection is silent false safety — the lock
+    // releases the instant the statement autocommits — so the adapter must reject
+    // it rather than let a caller believe a row is guarded when it is not.
+    class LockAdapter extends MockAdapter {
+      // Minimal Drizzle stub: the guard throws during query construction (before
+      // execution) in the rejection case, so select()/from() only need to be
+      // chainable; the resolve case awaits this same chainable stub.
+      override getDrizzle<U = unknown>(): U {
+        const chain: Record<string, unknown> = {};
+        const self = () => chain;
+        chain.select = self;
+        chain.from = self;
+        chain.where = self;
+        chain.orderBy = self;
+        chain.limit = self;
+        chain.offset = self;
+        chain.for = self;
+        return chain as U;
+      }
+    }
+
+    let lockAdapter: LockAdapter;
+
+    beforeEach(() => {
+      lockAdapter = new LockAdapter();
+      // Any non-null table object routes select() through the Drizzle query path,
+      // where the forUpdate handling lives.
+      lockAdapter.setTableResolver({ getTable: () => ({}) } as never);
+    });
+
+    it("rejects forUpdate on the pooled connection (no transaction executor)", async () => {
+      await expect(
+        lockAdapter.select("posts", { forUpdate: true })
+      ).rejects.toThrow(/forUpdate requires a transaction executor/);
+    });
+
+    it("allows forUpdate when a transaction executor is supplied", async () => {
+      // Same options, but with the transaction executor the lock is meaningful,
+      // so the guard passes and the query proceeds.
+      await expect(
+        lockAdapter.select(
+          "posts",
+          { forUpdate: true },
+          lockAdapter.getDrizzle()
+        )
+      ).resolves.toBeDefined();
+    });
+
+    it("rejects forUpdate on the pooled connection for SQLite too", async () => {
+      // On SQLite the lock IS the transaction (BEGIN IMMEDIATE), so a pooled
+      // forUpdate takes no lock at all — it must fail fast like the row-locking
+      // dialects rather than silently succeed with no serialization.
+      class SqliteLockAdapter extends LockAdapter {
+        override readonly dialect = "sqlite" as const;
+      }
+      const sqliteAdapter = new SqliteLockAdapter();
+      sqliteAdapter.setTableResolver({ getTable: () => ({}) } as never);
+      await expect(
+        sqliteAdapter.select("posts", { forUpdate: true })
+      ).rejects.toThrow(/forUpdate requires a transaction executor/);
+    });
+  });
+
+  describe("forShare lock", () => {
+    // The lock strength each select asked for, in order; an unlocked select
+    // records nothing, so the absence of a lock is observable too.
+    class ShareAdapter extends MockAdapter {
+      readonly strengths: string[] = [];
+      override getDrizzle<U = unknown>(): U {
+        const chain: Record<string, unknown> = {};
+        const self = () => chain;
+        chain.select = self;
+        chain.from = self;
+        chain.where = self;
+        chain.orderBy = self;
+        chain.limit = self;
+        chain.offset = self;
+        chain.for = (strength: string) => {
+          this.strengths.push(strength);
+          return chain;
+        };
+        return chain as U;
+      }
+    }
+
+    function shareAdapter(dialect?: "sqlite"): ShareAdapter {
+      class SqliteShareAdapter extends ShareAdapter {
+        override readonly dialect = "sqlite" as const;
+      }
+      const adapter =
+        dialect === "sqlite" ? new SqliteShareAdapter() : new ShareAdapter();
+      adapter.setTableResolver({ getTable: () => ({}) } as never);
+      return adapter;
+    }
+
+    it("rejects forShare on the pooled connection", async () => {
+      await expect(
+        shareAdapter().select("posts", { forShare: true })
+      ).rejects.toThrow(/forShare requires a transaction executor/);
+    });
+
+    it("takes FOR SHARE on a transaction executor, and FOR UPDATE when both are asked", async () => {
+      const adapter = shareAdapter();
+      await adapter.select("posts", { forShare: true }, adapter.getDrizzle());
+      await adapter.select(
+        "posts",
+        { forShare: true, forUpdate: true },
+        adapter.getDrizzle()
+      );
+      await adapter.select("posts", {}, adapter.getDrizzle());
+
+      expect(adapter.strengths).toEqual(["share", "update"]);
+    });
+
+    it("takes no lock on SQLite, which has none", async () => {
+      const adapter = shareAdapter("sqlite");
+      await adapter.select("posts", { forShare: true }, adapter.getDrizzle());
+
+      expect(adapter.strengths).toEqual([]);
+    });
+  });
+});

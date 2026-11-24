@@ -1,0 +1,1602 @@
+/**
+ * Nextly Config Types
+ *
+ * Canonical home for the public Nextly configuration interfaces and the
+ * pure sanitization helper that fills in defaults. User-facing modules
+ * like `src/collections/config/define-config.ts` re-export these types
+ * and delegate the "fill defaults" step to `sanitizeConfig()`.
+ *
+ * @module shared/types/config
+ * @since 1.0.0
+ */
+
+import {
+  DEFAULT_MIN_PASSWORD_LENGTH,
+  MAX_MIN_PASSWORD_LENGTH,
+  type PasswordHasher,
+} from "../../auth/password/policy";
+import type { AuthStrategy } from "../../auth/pipeline/types";
+import type { PresetRoleSlug } from "../../auth/role-presets";
+import type { CollectionConfig } from "../../collections/config/define-collection";
+import { resolveAuditRetentionConfig } from "../../domains/audit/retention-config";
+import type {
+  AuditRetentionConfig,
+  ResolvedAuditRetentionConfig,
+} from "../../domains/audit/retention-config";
+import {
+  resolveEmailRetentionConfig,
+  type ResolvedEmailRetentionConfig,
+} from "../../domains/email/retention-config";
+import { normalizeLocalization } from "../../domains/i18n/config/normalize";
+import type {
+  LanguageAddressRule,
+  LocalizationConfig,
+  SanitizedLocalizationConfig,
+} from "../../domains/i18n/config/types";
+import type { AnyJobDefinition } from "../../domains/jobs/job-registry";
+import {
+  resolveStoreSetting,
+  type LimitStoreSelection,
+  type RateLimitStoreSetting,
+} from "../../domains/limits/limit-store-setting";
+import type { PreviewConfig } from "../../domains/preview/route-config";
+import type { DrizzleSchemaHook } from "../../domains/schema/extension/after-drizzle";
+import type { SchemaHook } from "../../domains/schema/extension/draft";
+import { resolveWebhookRetentionConfig } from "../../domains/webhooks/retention-config";
+import type {
+  ResolvedWebhookRetentionConfig,
+  WebhookRetentionConfig,
+} from "../../domains/webhooks/retention-config";
+import type { AdminDashboardConfig } from "../../domains/widgets/declaration/dashboard";
+import { NextlyError } from "../../errors/nextly-error";
+import type { FieldGroupConfig } from "../../field-groups/config/types";
+import type { CorsConfig } from "../../middleware/cors";
+import {
+  RATE_LIMIT_DEFAULTS,
+  type RateLimitStore,
+} from "../../middleware/rate-limit";
+import type { SecurityHeadersConfig } from "../../middleware/security-headers";
+import type { AdminPlacement } from "../../plugins/admin-placement";
+import type { PluginPermission } from "../../plugins/contributions";
+import type {
+  PluginAdminAppearance,
+  PluginDefinition,
+} from "../../plugins/plugin-context";
+import type {
+  SanitizationConfigInput,
+  UploadSecurityConfigInput,
+} from "../../schemas/security-config";
+import type { EmailConfig } from "../../services/email/types";
+import type { SingleConfig } from "../../singles/config/types";
+import type { StoragePlugin } from "../../storage/types";
+import type { UserConfig } from "../../users/config/types";
+
+import { DEFAULT_MIGRATIONS_DIR } from "./migrations-dir-default";
+import {
+  perLanguageStorageWritten,
+  recordPerLanguageStorageWritten,
+} from "./per-language-storage-written";
+import { DEFAULT_TYPESCRIPT_CONFIG } from "./typescript-config-defaults";
+
+// ============================================================
+// TypeScript Configuration
+// ============================================================
+
+/**
+ * TypeScript code generation configuration.
+ *
+ * Controls how TypeScript types are generated for collections.
+ */
+export interface TypeScriptConfig {
+  /**
+   * Path to the generated TypeScript file.
+   * Can be absolute or relative to the project root.
+   *
+   * Left unset, an existing `payload-types.ts` beside the default, the name
+   * earlier versions used, is left as it is, and generating types says what
+   * to do with it: delete it once imports name `nextly-types`.
+   *
+   * @default './src/types/generated/nextly-types.ts'
+   */
+  outputFile?: string;
+
+  /**
+   * Whether to add module augmentation declarations.
+   * When `true`, generates `declare module` blocks for type inference.
+   *
+   * @default true
+   */
+  declare?: boolean;
+}
+
+// ============================================================
+// Database Configuration
+// ============================================================
+
+/**
+ * Database schema and migration configuration.
+ *
+ * Controls where Drizzle schemas and migration files are generated.
+ */
+export interface DatabaseConfig {
+  /**
+   * @experimental Tables, indexes and per-dialect shaping of your own.
+   *
+   * `extend` hooks run after every plugin's, so the app sees the whole schema
+   * and can react to it. `afterDrizzle` is the escape hatch for a column type
+   * the neutral model has no word for; anything it declares that migrations
+   * and drift detection cannot carry is refused at boot rather than lost
+   * silently.
+   */
+  schema?: {
+    extend?: SchemaHook[];
+    afterDrizzle?: DrizzleSchemaHook[];
+  };
+
+  /**
+   * @experimental PostgreSQL-only storage options.
+   */
+  postgres?: {
+    /**
+     * The schema every managed table, index and enum lives in.
+     *
+     * Defaults to `"public"`. A named schema holds every table Nextly
+     * manages, plus the tables plugins and `db.schema.extend` add. It is
+     * applied as `search_path` on every connection, so one setting covers
+     * everything that resolves a name. The name must be lower-case letters,
+     * digits and underscores, start with a letter or underscore, be at most
+     * 63 characters, and not begin with `pg_`; anything else is refused at
+     * boot.
+     *
+     * Moving the setting on an existing install is refused with
+     * `NEXTLY_POSTGRES_SCHEMA_MOVED`, because the new schema would start
+     * empty while the old one still holds the data. To start a second,
+     * separate installation in a new schema on purpose, set
+     * `NEXTLY_POSTGRES_SCHEMA_NEW_INSTALL=1` for its first start.
+     *
+     * MySQL and SQLite have no equivalent (MySQL's schema IS its database,
+     * SQLite is one file) and ignore it with a warning, so a config shared
+     * across dialects does not have to branch.
+     */
+    schema?: string;
+  };
+
+  /**
+   * Directory for generated Drizzle schema files.
+   * Each collection generates a separate schema file.
+   *
+   * @default './src/db/schemas/collections'
+   */
+  schemasDir?: string;
+
+  /**
+   * Directory for generated migration files.
+   * Migrations are created via CLI commands.
+   *
+   * @default './src/db/migrations'
+   */
+  migrationsDir?: string;
+
+  /**
+   * Path to the UI-schema manifest (`ui-schema.json`), relative to project
+   * root. Holds UI-built collections/singles/components (spec §4.12). When the
+   * file is absent it is treated as an empty manifest.
+   *
+   * @default './ui-schema.json'
+   */
+  uiSchemaFile?: string;
+
+  /**
+   * When true, pending migrations run on app boot — **production only** (no-op
+   * in development). Off by default; prefer running migrations in CI
+   * (`nextly migrate && build`). Safe across multiple instances via the migrate
+   * lock. May slow serverless cold starts — best for long-running
+   * servers/containers.
+   *
+   * @default false
+   */
+  runMigrationsOnBoot?: boolean;
+
+  /**
+   * The schema lock's lease, in seconds: how long the lock outlives a migration
+   * command that stopped without releasing it (killed, or its machine lost).
+   * A running holder renews the lock, so a migration of any length keeps it;
+   * this only bounds how long the next run waits on one that died.
+   *
+   * @default 120
+   */
+  migrateLockTtlSeconds?: number;
+
+  /**
+   * @experimental Plugins allowed the live database handle, by name.
+   *
+   * A plugin that declares `capabilities.db.rawSql` gets the live Drizzle
+   * instance at `ctx.db.raw`, which reaches every table, the users table's
+   * password hashes among them. Declaring it is not enough: the app lists the
+   * plugin here too, and an enabled plugin that declares it without being
+   * listed refuses the boot, naming the line to add. Every other plugin gets
+   * the restricted builder at `ctx.db.raw` and typed access to its own tables
+   * at `ctx.db`.
+   *
+   * Not a sandbox: a plugin is trusted code, and its own code can still reach
+   * core's internals. The listing keeps the grant in the app's code review,
+   * so a plugin update cannot add it quietly.
+   *
+   * @default []
+   * @example
+   * ```ts
+   * db: { rawSqlPlugins: ["@acme/nextly-reports"] }
+   * ```
+   */
+  rawSqlPlugins?: readonly string[];
+}
+
+// ============================================================
+// Rate Limiting Configuration
+// ============================================================
+
+/**
+ * Rate limiting configuration for API protection.
+ *
+ * Protects against abuse by limiting the number of requests
+ * per time window. Enabled by default (100 read / 30 write per minute).
+ * Opt out with `rateLimit: { enabled: false }`.
+ */
+export interface RateLimitingConfig {
+  /**
+   * Enable rate limiting. Optional, as its default says: only `false` turns
+   * it off, so a block that sets only the store keeps limiting.
+   * @default true
+   */
+  enabled?: boolean;
+
+  /**
+   * Maximum requests per window for read operations (GET).
+   * @default 100
+   */
+  readLimit?: number;
+
+  /**
+   * Maximum requests per window for write operations (POST, PATCH, PUT, DELETE).
+   * @default 30
+   */
+  writeLimit?: number;
+
+  /**
+   * Time window in milliseconds.
+   * @default 60000 (1 minute)
+   */
+  windowMs?: number;
+
+  /**
+   * Where limits keep their counts.
+   *
+   * - `"memory"` (the default): in each process, so on several instances each
+   *   budget is multiplied by their number.
+   * - `"database"`: in the site's database, shared by every instance.
+   * - An app's own store implementing the limit store contract
+   *   (`@experimental`).
+   * - An app's store of the earlier `RateLimitStore` contract, which keeps
+   *   serving core's own limits; limits built on the newer contract then
+   *   count in memory.
+   *
+   * @default "memory"
+   */
+  store?: RateLimitStoreSetting;
+
+  /**
+   * Says the site runs one instance, so limits counting in memory are not a
+   * gap. Silences the production warning about it.
+   *
+   * @default false
+   */
+  singleInstance?: boolean;
+
+  /**
+   * The most live entries the selected store holds: 100,000 for memory,
+   * 1,000,000 for the database by default. Once full, a store answers a new
+   * key as unavailable rather than dropping a live count, and warns before
+   * that.
+   *
+   * @experimental
+   */
+  maxEntries?: number;
+
+  /**
+   * Function to generate a unique key for rate limiting.
+   * Defaults to using the client IP address.
+   */
+  keyGenerator?: (request: Request) => string;
+
+  /**
+   * Function to skip rate limiting for certain requests.
+   * Returns true to skip rate limiting. No request is skipped by default, the
+   * admin API included.
+   */
+  skip?: (request: Request) => boolean | Promise<boolean>;
+
+  /**
+   * The budget a signed-in session spends per window, counted per user
+   * whatever address it comes from. A plugin's signed-in people each spend a
+   * budget of this size too.
+   *
+   * @default five times `readLimit` and `writeLimit`
+   */
+  sessions?: { readLimit?: number; writeLimit?: number };
+
+  /**
+   * The ceiling shared, per window, by requests that carry no session or API
+   * key and come from no address the server can resolve (see
+   * `security.trustProxy`). It never refuses a session, a key, or a request to
+   * an auth route.
+   *
+   * @default ten times `readLimit` and `writeLimit`
+   */
+  unresolvedCeiling?: { readLimit?: number; writeLimit?: number };
+
+  /**
+   * Per-collection rate limit overrides.
+   */
+  collections?: Record<
+    string,
+    {
+      readLimit?: number;
+      writeLimit?: number;
+    }
+  >;
+}
+
+/**
+ * Sanitized rate limiting configuration with defaults applied.
+ */
+export interface SanitizedRateLimitingConfig {
+  /**
+   * Whether the REST limiter runs.
+   *
+   * A real boolean rather than the literal `true` it used to be. The block was
+   * previously omitted entirely when a user disabled rate limiting, which had
+   * two consequences: `routeHandler` spread nothing over its own
+   * `enabled: true` default and kept limiting anyway, and `store` — which the
+   * AUTH limiter also reads — went with it. Disabling the public limiter must
+   * not silently disarm the one in front of credentials.
+   */
+  enabled: boolean;
+  /** Maximum requests per window for read operations (GET) */
+  readLimit: number;
+  /** Maximum requests per window for write operations (POST, PATCH, PUT, DELETE) */
+  writeLimit: number;
+  /** Time window in milliseconds */
+  windowMs: number;
+  /**
+   * An app's store of the earlier `RateLimitStore` contract, which core's own
+   * limits keep counting in. Absent for any other `rateLimit.store`.
+   */
+  store?: RateLimitStore;
+  /**
+   * The store limits on the newer contract count in. Optional, so a block
+   * built by hand without it still holds: absent means memory.
+   */
+  limitStore?: LimitStoreSelection;
+  /** Whether the site says it runs one instance; absent means not. */
+  singleInstance?: boolean;
+  /** The most live entries the selected store holds; its default when absent. */
+  maxEntries?: number;
+  /** Function to generate a unique key for rate limiting (optional) */
+  keyGenerator?: (request: Request) => string;
+  /** Function to skip rate limiting for certain requests (optional) */
+  skip?: (request: Request) => boolean | Promise<boolean>;
+  /** Per-collection rate limit overrides (optional) */
+  collections?: Record<string, { readLimit?: number; writeLimit?: number }>;
+  /** A session's own budget (optional); five times the per-address budgets when absent. */
+  sessions?: { readLimit?: number; writeLimit?: number };
+  /** The unresolved sources' ceiling (optional); ten times the per-address budgets when absent. */
+  unresolvedCeiling?: { readLimit?: number; writeLimit?: number };
+}
+
+// ============================================================
+// API Key Configuration
+// ============================================================
+
+/**
+ * API key configuration.
+ *
+ * Controls per-key rate limiting for API key authentication.
+ * All fields are optional — omitting the block entirely uses built-in defaults.
+ */
+export interface ApiKeysConfig {
+  /**
+   * Per-key rate limiting settings.
+   * Omit to use defaults (1 000 req/hour, 1-hour window).
+   */
+  rateLimit?: {
+    /**
+     * Maximum requests an API key may make per sliding window.
+     * Must be a positive integer.
+     * @default 1000
+     */
+    requestsPerHour?: number;
+
+    /**
+     * Sliding window duration in milliseconds.
+     * @default 3_600_000 (1 hour)
+     */
+    windowMs?: number;
+  };
+}
+
+/**
+ * Sanitized API key configuration with all defaults applied.
+ */
+export interface SanitizedApiKeysConfig {
+  rateLimit: {
+    /** Maximum requests per sliding window. */
+    requestsPerHour: number;
+    /** Sliding window duration in milliseconds. */
+    windowMs: number;
+  };
+}
+
+// ============================================================
+// Security Configuration
+// ============================================================
+
+/**
+ * Security configuration for Nextly.
+ *
+ * Controls security headers, CORS, file upload restrictions, and
+ * input sanitization. All sub-sections are optional — secure defaults
+ * are applied by the respective middleware factories at runtime.
+ */
+export interface SecurityConfig {
+  /**
+   * Security response headers configuration.
+   *
+   * Controls CSP, X-Content-Type-Options, X-Frame-Options, HSTS,
+   * Referrer-Policy, and Permissions-Policy headers on API responses.
+   * Each header can be set to a custom string or `false` to disable.
+   * Omitted headers use secure defaults.
+   */
+  headers?: SecurityHeadersConfig;
+
+  /**
+   * Cross-Origin Resource Sharing (CORS) configuration.
+   *
+   * Default: same-origin only (no CORS headers). Use `origin: ['*']`
+   * for development or provide an explicit allowlist for production.
+   */
+  cors?: CorsConfig;
+
+  /**
+   * File upload security configuration.
+   *
+   * Controls MIME type allowlist and SVG serving behaviour.
+   * Default: common safe MIME types allowed, HTML/JS blocked,
+   * SVG served with restrictive CSP.
+   */
+  uploads?: UploadSecurityConfigInput;
+
+  /**
+   * Input sanitization configuration.
+   *
+   * Controls HTML tag stripping for plain-text fields, CSS value
+   * validation in rich text, and URL protocol validation.
+   * All features enabled by default.
+   */
+  sanitization?: SanitizationConfigInput;
+
+  /**
+   * Request body / multipart size caps. Each numeric field accepts
+   * either a byte count or a human-readable suffix (`"1mb"`,
+   * `"500kb"`). Defaults: json 1mb / multipart 50mb / fileSize 10mb /
+   * fileCount 10 / fieldCount 50 / fieldSize 100kb.
+   */
+  limits?: {
+    json?: string | number;
+    multipart?: string | number;
+    fileSize?: string | number;
+    fileCount?: number;
+    fieldCount?: number;
+    fieldSize?: string | number;
+  };
+
+  /**
+   * Per-IP rate limit on `/auth/login`, `/auth/register`,
+   * `/auth/forgot-password`, `/auth/reset-password`. One shared
+   * bucket per IP across all four endpoints so credential-
+   * stuffing from a single source can't cycle paths to refill its
+   * budget. Layered on top of the per-user lockout, not in place of.
+   *
+   * Set `requestsPerHour: 0` to disable the per-IP envelope (test /
+   * dev only — leaves the deployment exposed to credential-stuffing).
+   *
+   * @default `{ requestsPerHour: 30, windowMs: 3_600_000 }`
+   */
+  authRateLimit?: {
+    requestsPerHour?: number;
+    windowMs?: number;
+  };
+
+  /**
+   * Trust reverse-proxy headers when resolving the client IP.
+   *
+   * When `true`, `X-Forwarded-For` (filtered through the
+   * `TRUSTED_PROXY_IPS` env-var CIDR list) is used to determine the
+   * client IP for rate limiting, refresh-token binding, and audit
+   * logging. When `false` (default), proxy headers are ignored —
+   * direct-internet deployments fall back to a single `unknown`
+   * bucket so an attacker cannot rotate `X-Forwarded-For` to bypass
+   * per-IP throttles.
+   *
+   * Audit: closes C4 (XFF blindly trusted across rate-limit / auth flows).
+   *
+   * @default false
+   */
+  trustProxy?: boolean;
+
+  /**
+   * @experimental Where a plugin's password check asks whether a password
+   * has appeared in a breach, when the plugin asks for that check.
+   *
+   * Unset, the check uses `"pwned-passwords"`. Only the first 5 hex digits of
+   * the password's SHA-1 (20 bits) ever leave the process.
+   */
+  breachedPasswords?: BreachedPasswordsConfig;
+}
+
+/**
+ * @experimental The site's breached-password source.
+ *
+ * A range service is asked for every known hash that starts with a 5-digit
+ * prefix, and answers with their suffixes; the password's own hash never
+ * leaves the process.
+ */
+export interface BreachedPasswordsConfig {
+  /**
+   * - `"pwned-passwords"`: Have I Been Pwned's range service at its public
+   *   address.
+   * - `{ url }`: a range service at this address, asked at `<url>/<prefix>`.
+   *   Must be `https`: any other address is sent nothing, every check answers
+   *   that it went unchecked, and boot warns.
+   * - `{ range }`: a list the site holds, read in the process. It receives the
+   *   5-digit prefix and answers with the known suffixes; the site answers
+   *   for its transport.
+   */
+  source:
+    | "pwned-passwords"
+    | { url: string }
+    | { range(prefix: string): Promise<readonly string[]> };
+  /**
+   * How long a check waits for the source before it answers that the
+   * password went unchecked: a whole number of milliseconds from 1 to 60000.
+   * Any other value is named at boot and replaced by the default.
+   *
+   * @default 2000
+   */
+  timeoutMs?: number;
+}
+
+// ============================================================
+// Admin Configuration
+// ============================================================
+
+/**
+ * Resolved (HSL-triplet) color overrides for the admin UI.
+ * These are derived from AdminBrandingColors after server-side hex conversion.
+ */
+export interface AdminBrandingColors {
+  /** Hex color for the primary brand color, e.g. "#6366f1". Replaces blue-500. */
+  primary?: string;
+  /** Hex color for the accent brand color, e.g. "#f59e0b". Replaces cyan-500. */
+  accent?: string;
+}
+
+/**
+ * Which deployment the admin is running in, as a badge beside the project's
+ * name on the dashboard, so nobody mistakes production for staging. Named by
+ * the site, never guessed from the process environment.
+ *
+ * @example
+ * // One config for every deployment: each sets its own label.
+ * admin: { environment: { label: process.env.NEXTLY_ENV_LABEL ?? "Production" } }
+ *
+ * @experimental While the dashboard's header is being built.
+ */
+export interface AdminEnvironmentConfig {
+  /** The badge's text, such as "Production" or "Staging": up to 24 characters. */
+  label: string;
+  /** How loudly the badge reads. Defaults to `"neutral"`. */
+  tone?: AdminEnvironmentTone;
+}
+
+/** The tones an environment badge may take. */
+export type AdminEnvironmentTone = "neutral" | "warning" | "critical";
+
+/** Every tone a badge may take, which the startup check holds a config to. */
+const ENVIRONMENT_TONES: readonly AdminEnvironmentTone[] = [
+  "neutral",
+  "warning",
+  "critical",
+];
+
+/** The most characters an environment label may hold: it is a badge. */
+const MAX_ENVIRONMENT_LABEL = 24;
+
+/**
+ * Branding configuration for the Nextly admin UI.
+ */
+export interface AdminBrandingConfig {
+  /**
+   * URL of a logo image to display in the sidebar.
+   * Can be an absolute URL or a path served from your Next.js public folder.
+   * When set, the logo image is shown instead of the text logo.
+   *
+   * @example "/logo.svg" or "https://cdn.example.com/logo.png"
+   */
+  logoUrl?: string;
+
+  /**
+   * URL of the light-mode logo image.
+   * Used when `logoUrl` is not set.
+   */
+  logoUrlLight?: string;
+
+  /**
+   * URL of the dark-mode logo image.
+   * Used when `logoUrl` is not set.
+   */
+  logoUrlDark?: string;
+
+  /**
+   * Text label shown in the sidebar header.
+   * Replaces the default "Nextly" label.
+   * Also used as the `alt` attribute when `logoUrl` is set.
+   *
+   * @default "Nextly"
+   */
+  logoText?: string;
+
+  /**
+   * URL of a custom favicon to inject into the admin page.
+   */
+  favicon?: string;
+
+  /**
+   * Custom brand colors for the admin UI.
+   * Accept 6-digit hex values only (e.g. "#6366f1").
+   * Foreground colors are calculated automatically to ensure WCAG AA contrast.
+   */
+  colors?: AdminBrandingColors;
+
+  /**
+   * Turn the schema builder (Collections, Singles and Field Groups builders) off outside
+   * production with `false`: its navigation is hidden and its schema writes are refused.
+   *
+   * The builder is always off in production, whatever this says: schema reaches production
+   * through migrations, and a production start that finds `true` here logs that it has no
+   * effect. Evaluated at runtime and sent to the admin in the `/api/admin-meta` response.
+   *
+   * @default on outside production
+   */
+  showBuilder?: boolean;
+}
+
+/**
+ * Per-plugin overrides for sidebar placement and appearance.
+ *
+ * The host developer can override any subset of a plugin's admin config
+ * without modifying the plugin's source code. Uses shallow merge —
+ * only specified fields override the plugin author's defaults.
+ */
+export interface PluginOverride {
+  /** Override the plugin's sidebar placement */
+  placement?: AdminPlacement;
+  /** Override the plugin's sort order */
+  order?: number;
+  /** Override the position anchor for standalone plugins (which built-in section to appear after) */
+  after?:
+    | "dashboard"
+    | "collections"
+    | "singles"
+    | "media"
+    | "plugins"
+    | "users"
+    | "settings";
+  /**
+   * Override where a standalone plugin's rail item goes, written as the
+   * plugin's own `admin.landing` is: one of its pages or one of its
+   * collections. The collection may be named by the slug the plugin declares
+   * or by the one this site renamed it to.
+   */
+  landing?: string;
+  /** Override or extend the plugin's sidebar appearance (shallow-merged) */
+  appearance?: Partial<PluginAdminAppearance>;
+}
+
+/**
+ * Top-level admin UI configuration for the Nextly admin panel.
+ */
+export interface AdminConfig {
+  /** Branding customizations: logo, colors, favicon. */
+  branding?: AdminBrandingConfig;
+
+  /**
+   * The deployment this admin runs in, shown as a badge beside the project's
+   * name. No badge without it.
+   *
+   * @experimental While the dashboard's header is being built.
+   */
+  environment?: AdminEnvironmentConfig;
+
+  /**
+   * How this site shapes its dashboard: its own widgets, widgets hidden for
+   * everyone, a widget's title, description, widths and starting settings,
+   * the default dashboard, and a plugin's alternative in a built-in's place.
+   * Checked at startup against every widget the install has.
+   *
+   * @experimental While the dashboard widget SDK is being built.
+   */
+  dashboard?: AdminDashboardConfig;
+
+  /**
+   * Per-plugin overrides for sidebar placement and appearance.
+   *
+   * Keys are plugin slugs (derived from plugin name, e.g., "form-builder").
+   * Values are partial overrides - only specified fields are changed.
+   */
+  pluginOverrides?: Record<string, PluginOverride>;
+
+  /**
+   * Development-only auto-login.
+   *
+   * When set in dev (NODE_ENV !== "production"), the admin auth gate
+   * issues a real session cookie for the named user on the first
+   * /admin visit if no session is present. Same JWT-signing codepath
+   * the real login flow uses; the only difference is the trigger.
+   *
+   * Hard-blocked when NODE_ENV === "production": Nextly's runtime
+   * ignores this field with a console warning so a misconfigured prod
+   * deploy can't silently auto-login users.
+   *
+   * Useful for the contributor playground and for local development
+   * of your own Nextly project to skip the manual login step.
+   *
+   * @example
+   * admin: {
+   *   devAutoLogin: { email: "dev@nextly.local", password: "dev" },
+   * }
+   *
+   * DO NOT enable in production deployments.
+   */
+  devAutoLogin?:
+    | false
+    | {
+        /** Email address of the user to auto-login as. The user must exist (auto-login does not create users). */
+        email: string;
+        /**
+         * Optional. Used only as a label in dev logs. Auto-login does
+         * not verify the password - it bypasses the password-check
+         * codepath entirely since the contributor configured this.
+         */
+        password?: string;
+      };
+}
+
+// ============================================================
+// Auth Configuration
+// ============================================================
+
+/**
+ * Authentication configuration for Nextly.
+ *
+ * PR 5 (unified-error-system): introduces the `revealRegistrationConflict`
+ * opt-in flag. Default behaviour is silent-success on duplicate-email
+ * registration to prevent account enumeration via the registration form
+ * (spec §13.2). Some products (e.g. internal admin tools where every user
+ * is known) prefer an explicit "email already in use" message — flip this
+ * to `true` to opt into the legacy reveal-on-conflict behaviour.
+ */
+export interface AuthConfig {
+  /**
+   * Whether `/auth/register` should respond with an explicit
+   * `DUPLICATE` / "An account already exists for this email." error when
+   * the submitted email is already registered.
+   *
+   * Default: `false`. The registration endpoint instead returns the same
+   * "If this email is available, we've sent a confirmation link." success
+   * shape it would on a fresh signup, regardless of whether the email
+   * existed. The duplicate is logged for operators.
+   *
+   * Set to `true` only if your threat model genuinely doesn't care about
+   * email enumeration (e.g. a closed admin tool with controlled signup).
+   */
+  revealRegistrationConflict?: boolean;
+
+  /**
+   * Whether strangers may create an account through the registration route.
+   *
+   * Default: `false`. While it is off, a registration is refused before any
+   * account is created or any email sent. An account still awaiting
+   * verification from before can still complete it by its link. Turn it on
+   * only for an app whose users sign themselves up; an account registered this
+   * way gets no role, and never becomes the install's first administrator.
+   */
+  allowRegistration?: boolean;
+
+  /**
+   * Minimum password length for staff accounts.
+   * Default is 8 characters. Apps can raise this to 15 (NIST SP 800-63B-4).
+   *
+   * @default 8
+   */
+  minPasswordLength?: number;
+
+  /**
+   * @experimental Opt-in auth strategies (D71). A plugin may *provide* a
+   * strategy, but it only authenticates anyone once listed here. Strategies run
+   * in order; the built-in `password` strategy always runs last.
+   */
+  strategies?: AuthStrategy[];
+
+  /**
+   * @experimental Plugins allowed to finish logins, by name.
+   *
+   * A plugin that declares `capabilities.auth.login` — or contributes a
+   * `determineUser` auth hook, which decides who is signed in — finishes
+   * logins with `ctx.auth.completeLogin`, which signs in whichever account it
+   * names. Declaring it is not enough: the app lists the plugin here too, and
+   * an enabled plugin that declares it without being listed refuses the boot,
+   * naming the line to add.
+   *
+   * Not a sandbox: a plugin is trusted code, and its own code can still reach
+   * core's internals. The listing keeps the grant in the app's code review,
+   * so a plugin update cannot add it quietly.
+   *
+   * @default []
+   * @example
+   * ```ts
+   * auth: { loginPlugins: ["@acme/google-auth"] }
+   * ```
+   */
+  loginPlugins?: readonly string[];
+
+  /**
+   * Your own password hasher, for every account password: creating an
+   * account, setting, changing and resetting one, an invite, the first
+   * password, and every sign-in. Without one, core hashes with bcrypt.
+   *
+   * Set here, every way Nextly starts uses it: `getNextly`, the first request
+   * to the route handler, and the CLI. Accounts that hold a bcrypt password
+   * keep signing in, and the first sign-in stores the password again with
+   * this hasher.
+   *
+   * @example
+   * ```ts
+   * auth: {
+   *   passwordHasher: {
+   *     hash: password => argon2.hash(password),
+   *     verify: (password, stored) => argon2.verify(stored, password),
+   *     reach: "unbounded",
+   *     isHash: stored => stored.startsWith("$argon2"),
+   *   },
+   * }
+   * ```
+   */
+  passwordHasher?: PasswordHasher;
+}
+
+/**
+ * Sanitized auth configuration with all defaults applied.
+ */
+export interface SanitizedAuthConfig {
+  /** Whether to reveal duplicate-email registrations on the wire. Defaults to false. */
+  revealRegistrationConflict: boolean;
+  /** Whether strangers may register. Defaults to false. */
+  allowRegistration: boolean;
+  /** Minimum password length for staff accounts. Defaults to 8. */
+  minPasswordLength: number;
+  /** @experimental Opt-in auth strategies (D71); built-in password runs last. */
+  strategies?: AuthStrategy[];
+  /**
+   * @experimental Plugins allowed to finish logins (`auth.loginPlugins`).
+   * Optional here so a consumer's existing `auth` object stays assignable;
+   * sanitization always fills it, defaulting to `[]`.
+   */
+  loginPlugins?: readonly string[];
+  /** The app's password hasher (`auth.passwordHasher`), when it brings one. */
+  passwordHasher?: PasswordHasher;
+}
+
+/**
+ * Default auth configuration values.
+ */
+export const DEFAULT_AUTH_CONFIG: SanitizedAuthConfig = {
+  revealRegistrationConflict: false,
+  allowRegistration: false,
+  minPasswordLength: 8,
+  loginPlugins: [],
+};
+
+// ============================================================
+// Nextly Config
+// ============================================================
+
+/**
+ * Complete Nextly configuration interface.
+ *
+ * This is the main configuration object for a Nextly application,
+ * typically exported from `nextly.config.ts` at the project root.
+ */
+export interface NextlyConfig {
+  /** Array of collection configurations. */
+  collections?: CollectionConfig[];
+
+  /** Array of Single configurations. */
+  singles?: SingleConfig[];
+
+  /** Array of Field Group configurations. */
+  fieldGroups?: FieldGroupConfig[];
+
+  /** User model extension configuration. */
+  users?: UserConfig;
+
+  /** Email provider and template configuration. */
+  email?: EmailConfig;
+
+  /** TypeScript type generation configuration. */
+  typescript?: TypeScriptConfig;
+
+  /** Database schema and migration configuration. */
+  db?: DatabaseConfig;
+
+  /**
+   * Rate limiting configuration for API protection.
+   *
+   * Enabled by default (100 read / 30 write per minute). Opt out with `enabled: false`.
+   */
+  rateLimit?: RateLimitingConfig;
+
+  /**
+   * API key authentication configuration.
+   *
+   * Controls per-key rate limiting applied when requests authenticate via
+   * `Authorization: Bearer nx_live_...`. Session-based requests are unaffected.
+   */
+  apiKeys?: ApiKeysConfig;
+
+  /**
+   * Authentication configuration.
+   *
+   * Currently exposes the `revealRegistrationConflict` opt-in flag (PR 5,
+   * spec §13.2). Future auth-related options (token TTLs, lockout policy,
+   * etc.) will land here so the wire surface has a single canonical home.
+   */
+  auth?: AuthConfig;
+
+  /** Storage plugins for cloud storage providers. */
+  storage?: StoragePlugin[];
+
+  /** Plugins to extend Nextly functionality. */
+  plugins?: PluginDefinition[];
+
+  /**
+   * @experimental Background job types this application declares itself.
+   *
+   * Each entry is a `defineJob(...)` result, registered with the job runner at
+   * boot alongside anything a plugin contributes. Declared here rather than only
+   * on the internal service config so an application using `defineConfig` can
+   * actually reach it — a definition the public type does not admit is an option
+   * nobody can set.
+   */
+  jobs?: AnyJobDefinition[];
+
+  /** @experimental Custom permissions declared by the app (seeded like plugin permissions, D36). */
+  permissions?: PluginPermission[];
+
+  /**
+   * Opens collections to the built-in preset roles (Admin, Editor, Author,
+   * Viewer) by slug: any collection, a plugin's or one made in the Schema
+   * Builder included, and it wins over a collection's own
+   * `grants.presets`. A collection reaches a preset only once it is opened
+   * to it by name; `[]` keeps one closed to every preset.
+   *
+   * @example
+   * ```typescript
+   * presetGrants: { pages: ["admin", "editor", "author", "viewer"] }
+   * ```
+   *
+   * @experimental
+   */
+  presetGrants?: Readonly<Record<string, readonly PresetRoleSlug[]>>;
+
+  /** Security configuration for headers, CORS, uploads, and sanitization. */
+  security?: SecurityConfig;
+
+  /** Admin UI customization. */
+  admin?: AdminConfig;
+
+  /**
+   * Draft-preview wiring.
+   *
+   * Declares where this application mounts `createPreviewRoute`, so the server
+   * can assemble a shareable preview link instead of the admin guessing a path
+   * it has no way to learn.
+   */
+  preview?: PreviewConfig;
+
+  /**
+   * Multilingual content configuration. Omit to keep the CMS single-language.
+   * See docs/superpowers/specs/2026-07-08-multilingual-i18n-design.md.
+   */
+  localization?: LocalizationConfig;
+
+  /**
+   * How each language's public address is formed: under a prefix
+   * (`/de/about`) or on a domain of its own. Kept apart from `localization`
+   * so a site whose languages are managed in Settings can declare it too.
+   * Omitted, a site with several languages has every language prefixed.
+   * @experimental
+   */
+  languageAddresses?: LanguageAddressRule;
+
+  /** Outbound webhook configuration. */
+  webhooks?: WebhookConfig;
+  /** Audit and activity trail policy. */
+  audit?: AuditConfig;
+
+  /**
+   * Settings that are not stable yet: each may change or be removed in a later release.
+   *
+   * @experimental
+   */
+  experimental?: ExperimentalConfig;
+}
+
+/**
+ * Settings that are not stable yet.
+ *
+ * @experimental
+ */
+export interface ExperimentalConfig {
+  /**
+   * Keep every translatable field in its per-language table from the start, for every collection,
+   * Single and component, whether or not it is marked translatable and whether or not the site
+   * declares languages; a site that declares none has one implicit language. Adding a language is
+   * then data only. Chosen when the site starts: a running site refuses a change until it is
+   * restarted, and a database that still keeps translatable values on its main tables is refused
+   * while it is on. Off by default.
+   *
+   * @experimental
+   */
+  perLanguageStorage?: boolean;
+}
+
+/**
+ * Audit trail configuration.
+ *
+ * Retention lives here rather than under `webhooks` because these windows bound
+ * a record of who did what, not a delivery ledger, and an operator setting how
+ * long activity is kept would not think to look under webhooks for it.
+ */
+export interface AuditConfig {
+  /**
+   * How long the two trails are kept.
+   *
+   * Enabled by default: content activity for 90 days, auth events for 180.
+   * `false` keeps everything forever and accepts the growth. Each window can
+   * also be set to `false` on its own.
+   */
+  retention?: AuditRetentionConfig | false;
+}
+
+/**
+ * Outbound webhook configuration.
+ *
+ * Only retention is configurable today; endpoints are registered as rows rather
+ * than declared here, so this is where operational policy lives rather than the
+ * subscription list.
+ */
+export interface WebhookConfig {
+  /**
+   * How long recorded events and delivery attempts are kept.
+   *
+   * Enabled by default. Events are recorded only when the install has an enabled
+   * endpoint (or the audit seam is on), so an install with no webhooks writes
+   * nothing to bound; when recording is active, this limits how long the rows
+   * are kept. `false` keeps everything forever and accepts that growth.
+   */
+  retention?: WebhookRetentionConfig | false;
+
+  /**
+   * Force-record every content event to the outbox even when no webhook
+   * endpoint is configured. Off by default: with no endpoints and this off,
+   * writes record nothing. The org-wide audit log turns this on so it captures
+   * events regardless of delivery subscriptions.
+   */
+  audit?: boolean;
+}
+
+/**
+ * Normalized Nextly configuration with all defaults applied.
+ *
+ * This type represents the config after `sanitizeConfig()` has processed it,
+ * with all array-valued and default-bearing fields filled in.
+ *
+ * Returned by `defineConfig()` and consumed by `getNextly()`, the DI
+ * registration pipeline, and downstream services.
+ */
+export interface SanitizedNextlyConfig {
+  /** Array of collection configurations (empty array if none provided). */
+  collections: CollectionConfig[];
+
+  /** Array of Single configurations (empty array if none provided). */
+  singles: SingleConfig[];
+
+  /** Array of Component configurations (empty array if none provided). */
+  fieldGroups: FieldGroupConfig[];
+
+  /** User model extension configuration. Undefined if no user config provided. */
+  users?: UserConfig;
+
+  /** Email provider and template configuration. Undefined if no email config provided. */
+  email?: EmailConfig;
+
+  /** TypeScript configuration with defaults applied. */
+  typescript: Required<TypeScriptConfig>;
+
+  /** Database configuration with defaults applied. */
+  db: Required<DatabaseConfig>;
+
+  /**
+   * Rate limiting configuration.
+   * Built automatically unless `rateLimit: { enabled: false }` is set.
+   */
+  rateLimit?: SanitizedRateLimitingConfig;
+
+  /**
+   * API key configuration with defaults applied.
+   * Undefined if omitted from defineConfig() (built-in defaults used).
+   */
+  apiKeys?: SanitizedApiKeysConfig;
+
+  /**
+   * Auth configuration with defaults applied. Always present after
+   * sanitization; the `revealRegistrationConflict` flag falls back to
+   * `false` (silent-success on duplicate email).
+   */
+  auth: SanitizedAuthConfig;
+
+  /** Storage plugins for cloud storage providers (empty array if none configured). */
+  storage: StoragePlugin[];
+
+  /** Plugins to extend Nextly functionality (empty array if none configured). */
+  plugins: PluginDefinition[];
+
+  /**
+   * @experimental Background job types the application declared, carried through
+   * sanitisation so the collector that registers them can see them.
+   */
+  jobs?: AnyJobDefinition[];
+
+  /** @experimental App-declared custom permissions (undefined if none). Seeded like plugin permissions (D36). */
+  permissions?: PluginPermission[];
+
+  /** @experimental The collections the app opens to the preset roles, by slug (undefined if none). */
+  presetGrants?: Readonly<Record<string, readonly PresetRoleSlug[]>>;
+
+  /** Security configuration for headers, CORS, uploads, and sanitization. */
+  security?: SecurityConfig;
+
+  /** Admin UI customization config. */
+  admin?: AdminConfig;
+
+  /** Draft-preview wiring. */
+  preview?: PreviewConfig;
+
+  /** Normalized multilingual content configuration (undefined when i18n is off). */
+  localization?: SanitizedLocalizationConfig;
+
+  /** How each language's public address is formed, as declared. */
+  languageAddresses?: LanguageAddressRule;
+
+  /**
+   * Resolved webhook retention policy, or null when retention is switched off.
+   * Always present after sanitization so consumers never re-resolve it.
+   */
+  webhookRetention: ResolvedWebhookRetentionConfig | null;
+  /**
+   * Resolved audit-trail retention windows.
+   *
+   * Always a policy after sanitization, since both windows have defaults — 90
+   * days of content activity, 180 of auth events. Either may be `false`, which
+   * is how keeping that trail forever is expressed; `audit: { retention: false }`
+   * sets both.
+   */
+  auditRetention: ResolvedAuditRetentionConfig;
+
+  /**
+   * Resolved delivery-log retention.
+   *
+   * Always a policy after sanitization, since the window has a default. The
+   * window itself may be `false`, which is how keeping the log indefinitely is
+   * expressed.
+   */
+  emailRetention: ResolvedEmailRetentionConfig;
+
+  /**
+   * Whether the audit seam forces outbox recording regardless of endpoints.
+   * Always present after sanitization; defaults to false.
+   */
+  webhookAuditEnabled: boolean;
+
+  /**
+   * Always `true`: every installation keeps its translatable fields per language, and
+   * `experimental.perLanguageStorage` no longer chooses a layout. Kept, required, so code that
+   * reads it as a boolean goes on compiling.
+   *
+   * @deprecated Has no effect; every installation stores translatable fields per language.
+   */
+  perLanguageStorage: boolean;
+}
+
+// ============================================================
+// Default Values
+// ============================================================
+
+// Default TypeScript configuration values, defined in a module that imports
+// nothing at run time so a command's help can name them cheaply.
+export { DEFAULT_TYPESCRIPT_CONFIG };
+
+/**
+ * Default database configuration values.
+ */
+export const DEFAULT_DB_CONFIG: Required<DatabaseConfig> = {
+  // An empty object rather than undefined, so a caller can read
+  // `db.schema.extend` without a guard and get an empty list.
+  schema: {},
+  // Likewise: `db.postgres.schema` reads as undefined rather than throwing,
+  // and undefined is what "public" means here.
+  postgres: {},
+  schemasDir: "./src/db/schemas/collections",
+  // Read from its own module, which `withNextly` reads without this one.
+  migrationsDir: DEFAULT_MIGRATIONS_DIR,
+  uiSchemaFile: "./ui-schema.json",
+  runMigrationsOnBoot: false,
+  // The schema lock's lease. A holder renews it, so it no longer has to outlast the longest
+  // migration; it bounds only how long a run that died keeps the lock.
+  migrateLockTtlSeconds: 120,
+  rawSqlPlugins: [],
+};
+
+/**
+ * Default rate limiting configuration values.
+ * Only applied when rate limiting is enabled.
+ *
+ * The limiter's own defaults, not a copy of them: two copies once said 100
+ * and 600 reads, and an app got one while a limiter built without values got
+ * the other.
+ */
+export const DEFAULT_RATE_LIMIT_CONFIG = RATE_LIMIT_DEFAULTS;
+
+/**
+ * Default API key rate limiting values.
+ * Applied when `apiKeys.rateLimit` fields are omitted.
+ */
+export const DEFAULT_API_KEYS_CONFIG = {
+  requestsPerHour: 1_000,
+  windowMs: 3_600_000,
+} as const;
+
+// ============================================================
+// sanitizeConfig
+// ============================================================
+
+/**
+ * Fill defaults on a raw `NextlyConfig` and return a `SanitizedNextlyConfig`.
+ *
+ * This is a pure transformation — it does **not** validate slug uniqueness,
+ * component nesting depth, or user-field constraints. Callers that need
+ * validation (like `defineConfig()`) should validate first and then call
+ * this helper.
+ *
+ * After this step, downstream code can rely on `collections`, `singles`,
+ * `components`, `storage`, `plugins`, `typescript`, and `db` being present
+ * and nil-check-free.
+ *
+ * Validates that `apiKeys.rateLimit.requestsPerHour` and `apiKeys.rateLimit.windowMs`
+ * are positive, because accepting those values without a bound would silently
+ * disable rate limiting in production.
+ *
+ * @param config - Raw Nextly configuration
+ * @returns Sanitized configuration with defaults applied
+ * @throws Error if `apiKeys.rateLimit` values are invalid
+ */
+/**
+ * The stores `rateLimit.store` selects: the earlier contract's for core's own
+ * limits, under the key it always had, and the newer contract's selection.
+ */
+function rateLimitStores(
+  setting: unknown
+): Pick<SanitizedRateLimitingConfig, "store" | "limitStore"> {
+  const { selection, legacy } = resolveStoreSetting(setting);
+  return { store: legacy, limitStore: selection };
+}
+
+/**
+ * `rateLimit.maxEntries`, checked: a positive whole number, or absent.
+ *
+ * @throws {NextlyError} `VALIDATION_ERROR` naming the setting otherwise
+ */
+function rateLimitMaxEntries(value: number | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  if (Number.isSafeInteger(value) && value > 0) return value;
+  throw NextlyError.validation({
+    errors: [
+      {
+        path: "rateLimit.maxEntries",
+        code: "INVALID_VALUE",
+        message: "Must be a positive whole number.",
+      },
+    ],
+  });
+}
+
+/**
+ * `auth.minPasswordLength`, checked: a whole number from the policy's floor
+ * (8) through its documented ceiling (15, NIST SP 800-63B-4), or absent.
+ * Anything else is a contract the policy does not implement: a smaller value
+ * would weaken the staff minimum, a non-integer or `NaN` bypasses the
+ * comparison entirely, and a value past the digester's reach would make every
+ * password impossible to set — refused at boot rather than at submission.
+ *
+ * @throws {NextlyError} `VALIDATION_ERROR` naming the setting otherwise
+ */
+function authMinPasswordLength(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_AUTH_CONFIG.minPasswordLength;
+  if (
+    Number.isSafeInteger(value) &&
+    value >= DEFAULT_MIN_PASSWORD_LENGTH &&
+    value <= MAX_MIN_PASSWORD_LENGTH
+  ) {
+    return value;
+  }
+  throw NextlyError.validation({
+    errors: [
+      {
+        path: "auth.minPasswordLength",
+        code: "INVALID_VALUE",
+        message: `Must be a whole number from ${DEFAULT_MIN_PASSWORD_LENGTH} to ${MAX_MIN_PASSWORD_LENGTH}.`,
+      },
+    ],
+  });
+}
+
+/**
+ * `admin.environment`, checked: a label of 1 to 24 characters with text in it,
+ * and a tone this version draws, or absent.
+ *
+ * @throws {NextlyError} `VALIDATION_ERROR` naming the setting otherwise
+ */
+function checkedAdminEnvironment(environment: unknown): void {
+  if (environment === undefined) return;
+  const problems = adminEnvironmentProblems(environment);
+  if (problems.length === 0) return;
+  throw NextlyError.validation({ errors: problems });
+}
+
+/** Each fault in `admin.environment`, as a validation error naming its path. */
+function adminEnvironmentProblems(
+  environment: unknown
+): { path: string; code: "INVALID_VALUE"; message: string }[] {
+  const fault = (path: string, message: string) => ({
+    path,
+    code: "INVALID_VALUE" as const,
+    message,
+  });
+  if (
+    typeof environment !== "object" ||
+    environment === null ||
+    Array.isArray(environment)
+  ) {
+    return [fault("admin.environment", "Must be { label, tone? }.")];
+  }
+  const { label, tone } = environment as Record<string, unknown>;
+  return [
+    ...(typeof label === "string" && label.trim().length > 0
+      ? label.length > MAX_ENVIRONMENT_LABEL
+        ? [
+            fault(
+              "admin.environment.label",
+              `Must be at most ${MAX_ENVIRONMENT_LABEL} characters: it is drawn as a badge.`
+            ),
+          ]
+        : []
+      : [fault("admin.environment.label", "Must be text, not empty.")]),
+    ...(tone === undefined ||
+    ENVIRONMENT_TONES.includes(tone as AdminEnvironmentTone)
+      ? []
+      : [
+          fault(
+            "admin.environment.tone",
+            `Must be one of ${ENVIRONMENT_TONES.map(each => `"${each}"`).join(", ")}.`
+          ),
+        ]),
+  ];
+}
+
+export function sanitizeConfig(config: NextlyConfig): SanitizedNextlyConfig {
+  // The environment badge's label and tone, refused at boot rather than drawn
+  // wrong on every dashboard.
+  checkedAdminEnvironment(config.admin?.environment);
+  // Validate apiKeys.rateLimit bounds — these are runtime-critical.
+  if (config.apiKeys?.rateLimit?.requestsPerHour !== undefined) {
+    if (
+      !Number.isInteger(config.apiKeys.rateLimit.requestsPerHour) ||
+      config.apiKeys.rateLimit.requestsPerHour <= 0
+    ) {
+      throw new Error(
+        `apiKeys.rateLimit.requestsPerHour must be a positive integer (got ${config.apiKeys.rateLimit.requestsPerHour})`
+      );
+    }
+  }
+
+  if (config.apiKeys?.rateLimit?.windowMs !== undefined) {
+    if (
+      typeof config.apiKeys.rateLimit.windowMs !== "number" ||
+      config.apiKeys.rateLimit.windowMs <= 0
+    ) {
+      throw new Error(
+        `apiKeys.rateLimit.windowMs must be a positive number (got ${config.apiKeys.rateLimit.windowMs})`
+      );
+    }
+  }
+
+  // Build rate limit config — enabled by default (opt-out with `enabled: false`).
+  // Emitted whether or not the REST limiter is on. `store` lives on this block
+  // and the AUTH limiter reads it from here, so dropping the block for
+  // `enabled: false` would disable a limiter the user never mentioned.
+  const rateLimit: SanitizedRateLimitingConfig = {
+    enabled: config.rateLimit?.enabled !== false,
+    readLimit:
+      config.rateLimit?.readLimit ?? DEFAULT_RATE_LIMIT_CONFIG.readLimit,
+    writeLimit:
+      config.rateLimit?.writeLimit ?? DEFAULT_RATE_LIMIT_CONFIG.writeLimit,
+    windowMs: config.rateLimit?.windowMs ?? DEFAULT_RATE_LIMIT_CONFIG.windowMs,
+    ...rateLimitStores(config.rateLimit?.store),
+    singleInstance: config.rateLimit?.singleInstance === true,
+    maxEntries: rateLimitMaxEntries(config.rateLimit?.maxEntries),
+    keyGenerator: config.rateLimit?.keyGenerator,
+    skip: config.rateLimit?.skip,
+    collections: config.rateLimit?.collections,
+    sessions: config.rateLimit?.sessions,
+    unresolvedCeiling: config.rateLimit?.unresolvedCeiling,
+  };
+
+  // Build apiKeys config only if the block is provided; omitting it entirely
+  // is valid — the auth middleware falls back to built-in defaults.
+  const apiKeys: SanitizedApiKeysConfig | undefined = config.apiKeys
+    ? {
+        rateLimit: {
+          requestsPerHour:
+            config.apiKeys.rateLimit?.requestsPerHour ??
+            DEFAULT_API_KEYS_CONFIG.requestsPerHour,
+          windowMs:
+            config.apiKeys.rateLimit?.windowMs ??
+            DEFAULT_API_KEYS_CONFIG.windowMs,
+        },
+      }
+    : undefined;
+
+  const sanitized: SanitizedNextlyConfig = {
+    collections: config.collections ?? [],
+    singles: config.singles ?? [],
+    fieldGroups: config.fieldGroups ?? [],
+    users: config.users,
+    email: config.email,
+    typescript: {
+      outputFile:
+        config.typescript?.outputFile ?? DEFAULT_TYPESCRIPT_CONFIG.outputFile,
+      declare: config.typescript?.declare ?? DEFAULT_TYPESCRIPT_CONFIG.declare,
+    },
+    db: {
+      schema: {
+        extend: config.db?.schema?.extend ?? [],
+        afterDrizzle: config.db?.schema?.afterDrizzle ?? [],
+      },
+      postgres: {
+        // Left undefined rather than defaulted to "public": the resolver
+        // treats absent as the default, and a value present here would make
+        // "the operator chose public" and "the operator said nothing"
+        // indistinguishable — which is the difference the non-PG warning
+        // depends on.
+        ...(config.db?.postgres?.schema !== undefined
+          ? { schema: config.db.postgres.schema }
+          : {}),
+      },
+      schemasDir: config.db?.schemasDir ?? DEFAULT_DB_CONFIG.schemasDir,
+      migrationsDir:
+        config.db?.migrationsDir ?? DEFAULT_DB_CONFIG.migrationsDir,
+      uiSchemaFile: config.db?.uiSchemaFile ?? DEFAULT_DB_CONFIG.uiSchemaFile,
+      runMigrationsOnBoot:
+        config.db?.runMigrationsOnBoot ?? DEFAULT_DB_CONFIG.runMigrationsOnBoot,
+      migrateLockTtlSeconds:
+        config.db?.migrateLockTtlSeconds ??
+        DEFAULT_DB_CONFIG.migrateLockTtlSeconds,
+      // Copied, so the sanitized config never shares the app's or the
+      // default's array, and frozen: the boot and the CLI read the app's
+      // grants from here, and plugin code that could add a name to this list
+      // would grant itself on the next read.
+      rawSqlPlugins: Object.freeze([...(config.db?.rawSqlPlugins ?? [])]),
+    },
+    rateLimit,
+    apiKeys,
+    // PR 5 (unified-error-system): always present after sanitization so
+    // downstream code can read `config.auth.revealRegistrationConflict`
+    // without nil checks. Defaults to silent-success per spec §13.2.
+    auth: {
+      revealRegistrationConflict:
+        config.auth?.revealRegistrationConflict ??
+        DEFAULT_AUTH_CONFIG.revealRegistrationConflict,
+      // Only `true` opens registration; anything else leaves it closed.
+      allowRegistration:
+        config.auth?.allowRegistration === true ||
+        DEFAULT_AUTH_CONFIG.allowRegistration,
+      minPasswordLength: authMinPasswordLength(config.auth?.minPasswordLength),
+      // Pass opt-in auth strategies through unchanged (D71).
+      strategies: config.auth?.strategies,
+      // Copied and frozen like `db.rawSqlPlugins`: the boot and the CLI read
+      // the app's login grants from here, and plugin code that could add a
+      // name to this list would grant itself on the next read.
+      loginPlugins: Object.freeze([...(config.auth?.loginPlugins ?? [])]),
+      // Passed through as given: its contract is asserted where the services
+      // register it, the one place every start path meets.
+      ...(config.auth?.passwordHasher
+        ? { passwordHasher: config.auth.passwordHasher }
+        : {}),
+    },
+    storage: config.storage ?? [],
+    plugins: config.plugins ?? [],
+    // Carried explicitly. This function names every field it returns, so a field
+    // added to the type and not to this literal is accepted by the compiler and
+    // dropped at runtime — the option would validate and do nothing.
+    jobs: config.jobs ?? [],
+    permissions: config.permissions,
+    presetGrants: config.presetGrants,
+    security: config.security,
+    admin: config.admin,
+    // Carried explicitly, because this object is ENUMERATED rather than spread:
+    // a field the sanitizer does not name is dropped before anything downstream
+    // can read it, and the omission is silent — the option typechecks, the app
+    // sets it, and the value simply never arrives.
+    preview: config.preview,
+    localization: config.localization
+      ? normalizeLocalization(config.localization)
+      : undefined,
+    languageAddresses: config.languageAddresses,
+    // Resolved once at boot so nothing downstream re-derives it. Null means the
+    // user switched retention off; an absent `webhooks` key resolves to the
+    // defaults, since the event ledger fills whether or not webhooks are used.
+    webhookRetention: resolveWebhookRetentionConfig(config.webhooks?.retention),
+    // Resolved rather than passed through, and the resolution is the part that
+    // matters: omitting `audit` entirely produces the default windows, which
+    // DELETE rows past them. Keeping everything is `false` — at a single window
+    // or at the whole block — so it is stated rather than implied by absence.
+    auditRetention: resolveAuditRetentionConfig(config.audit?.retention),
+    // Resolved here for the same reason as the two above: omitting `email`
+    // entirely still produces a window, so a delivery log is bounded by default
+    // rather than growing until someone notices the column that governs it was
+    // never read.
+    emailRetention: resolveEmailRetentionConfig(config.email?.retention),
+    // Off unless explicitly enabled; the org-wide audit log flips this to keep
+    // recording events when an install has no delivery endpoints.
+    webhookAuditEnabled: config.webhooks?.audit ?? false,
+    // Always true: the setting chooses no layout any longer (see the property's doc).
+    perLanguageStorage: true,
+  };
+  // What the configuration wrote of the deprecated setting, kept off the published type for the
+  // start's warning alone. A config sanitized already, as the CLI sanitizes an export written with
+  // `defineConfig` again, carries it under the symbol and keeps it.
+  return recordPerLanguageStorageWritten(
+    sanitized,
+    config.experimental?.perLanguageStorage ?? perLanguageStorageWritten(config)
+  );
+}

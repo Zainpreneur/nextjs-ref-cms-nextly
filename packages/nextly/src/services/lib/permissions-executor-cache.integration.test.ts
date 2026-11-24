@@ -1,0 +1,183 @@
+/**
+ * A permission check that runs on a caller-supplied transaction executor reads
+ * through that caller's still-open (uncommitted) transaction, so its result must
+ * be neither served from nor promoted into the process-wide permission cache: if
+ * the transaction rolled back, a grant or denial that never committed would
+ * otherwise be reused by later, non-transactional requests for the cache TTL.
+ *
+ * This pins that on a real database. The cache is exercised directly: a decision
+ * is cached through a pooled check, the underlying grant is then removed WITHOUT
+ * invalidating the cache (a raw row delete, not the role service), and:
+ *   - a pooled check still returns the stale cached decision (cache is live), but
+ *   - an executor-backed check recomputes fresh (bypasses the cache read), and
+ *   - it does NOT overwrite the cache (a later pooled check is still the stale
+ *     value), proving the executor path skips the cache write too.
+ */
+import { eq } from "drizzle-orm";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import { getDialectTables } from "../../database/index";
+import { companionReadinessWarmedForTests } from "../../init/warm-companion-readiness";
+import { createTestNextly, type TestNextly } from "../../plugins/test-nextly";
+
+import { hasPermission, isSuperAdmin } from "./permissions";
+import { resetEpochForTests } from "./rbac-epoch";
+
+let harness: TestNextly | undefined;
+
+// A raw Drizzle handle for seeding/removing role rows without going through the
+// role service, whose mutations invalidate the permission cache — the whole
+// point here is to leave a stale cache entry in place.
+function rawDb() {
+  return harness!.adapter.getDrizzle() as unknown as {
+    insert: (table: unknown) => { values: (row: unknown) => Promise<unknown> };
+    delete: (table: unknown) => {
+      where: (cond: unknown) => Promise<unknown>;
+    };
+  };
+}
+
+afterEach(async () => {
+  await harness?.destroy();
+  harness = undefined;
+});
+
+beforeEach(async () => {
+  harness = await createTestNextly();
+});
+
+describe("permission cache — transaction executor bypass (integration)", () => {
+  it("bypasses the process-wide cache for executor-backed checks (read and write)", async () => {
+    const db = rawDb();
+    const tables = getDialectTables();
+
+    // A permission and a role that grants it.
+    const readPosts = await harness!.nextly.permissions.create({
+      data: {
+        action: "read",
+        resource: "posts",
+        name: "Read posts",
+        slug: "read-posts",
+      },
+    });
+    const viewer = await harness!.nextly.roles.create({
+      data: {
+        name: "Viewer",
+        slug: "viewer",
+        permissionIds: [readPosts.item.id],
+      },
+    });
+
+    // A unique user id: the permission cache is process-wide and outlives a
+    // single harness, so a shared id could collide with another test's entry.
+    const userId = "cache-exec-user";
+    await db.insert(tables.users).values({
+      id: userId,
+      email: "cache-exec@example.com",
+      name: "cache-exec",
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(tables.userRoles).values({
+      id: "cache-exec-user-role",
+      userId,
+      roleId: viewer.item.id,
+      createdAt: new Date(),
+    });
+
+    // 1. Pooled check grants and caches the decision.
+    expect(await hasPermission(userId, "read", "posts")).toBe(true);
+
+    // 2. Remove the grant WITHOUT invalidating the cache (raw delete).
+    await db
+      .delete(tables.userRoles)
+      .where(eq(tables.userRoles.userId, userId));
+
+    // 3. A pooled check still returns the stale cached grant — the cache is live.
+    expect(await hasPermission(userId, "read", "posts")).toBe(true);
+
+    // 4. An executor-backed check bypasses the cache READ and recomputes against
+    //    the current rows: the grant is gone, so it is denied.
+    const executor = harness!.adapter.getDrizzle();
+    expect(await hasPermission(userId, "read", "posts", executor)).toBe(false);
+
+    // 5. The executor-backed check must NOT have written its `false` into the
+    //    cache: a later pooled check still sees the earlier stale grant, proving
+    //    the executor path skips the cache write too.
+    expect(await hasPermission(userId, "read", "posts")).toBe(true);
+  });
+});
+
+/**
+ * An executor-backed check must reach its answer WITHOUT the pooled connection.
+ *
+ * The caller passing an executor is inside its own open transaction. Where the
+ * pool holds a single connection that transaction is holding it, so any query
+ * this check issues on the pool waits for a connection that cannot be released
+ * until the check returns: the write deadlocks and both sides wait out the
+ * pool timeout. `domains/collections/__tests__/publish-enforcement-pool-reentry.integration.test.ts`
+ * reproduces the deadlock itself, but needs a real `pool.max = 1` Postgres and
+ * self-skips without one. What is portable, and what actually regresses, is the
+ * cause: a pooled checkout taken from inside the transaction at all.
+ */
+describe("an executor-backed check and the connection pool", () => {
+  /** Count checkouts of the pooled connection, leaving the adapter otherwise real. */
+  function countPooledCheckouts(): {
+    count: () => number;
+    restore: () => void;
+  } {
+    const adapter = harness!.adapter as unknown as Record<string, unknown>;
+    const own = Object.getOwnPropertyDescriptor(adapter, "getDrizzle");
+    const original = (
+      adapter.getDrizzle as (...args: unknown[]) => unknown
+    ).bind(harness!.adapter);
+    let checkouts = 0;
+    adapter.getDrizzle = (...args: unknown[]) => {
+      checkouts += 1;
+      return original(...args);
+    };
+    return {
+      count: () => checkouts,
+      restore: () => {
+        if (own) Object.defineProperty(adapter, "getDrizzle", own);
+        else delete adapter.getDrizzle;
+      },
+    };
+  }
+
+  it("takes no pooled connection, and a pooled check proves the count is live", async () => {
+    const userId = "pool-exec-user";
+    // Obtained BEFORE the count starts: this stands in for the executor a
+    // caller already holds from its own transaction.
+    const executor = harness!.adapter.getDrizzle();
+    // The boot resolves each translation table in the background, on the
+    // pool and outside any caller's transaction; settled first, so the count
+    // is the checks' own and not that warm-up's.
+    await companionReadinessWarmedForTests();
+    // The epoch read is rate-limited to one a second, so an unreset module
+    // would skip it and the check would take no connection either way.
+    resetEpochForTests();
+
+    const pool = countPooledCheckouts();
+    try {
+      await hasPermission(userId, "read", "posts", executor);
+      await isSuperAdmin(userId, executor);
+      expect(pool.count(), "executor-backed checks").toBe(0);
+    } finally {
+      pool.restore();
+    }
+
+    // The control. Without it, "took no connection" is equally satisfied by a
+    // counter that never increments, and by a check that stopped reading the
+    // database at all.
+    resetEpochForTests();
+    const pooled = countPooledCheckouts();
+    try {
+      await hasPermission(userId, "read", "posts");
+      expect(pooled.count(), "pooled check").toBeGreaterThan(0);
+    } finally {
+      pooled.restore();
+    }
+  });
+});

@@ -1,0 +1,1461 @@
+/**
+ * Define Collection Helper
+ *
+ * Provides the `defineCollection()` function for creating code-first collection
+ * configurations with full TypeScript support. This is the primary API for
+ * defining collections in TypeScript files.
+ *
+ * @module collections/config/define-collection
+ * @since 1.0.0
+ *
+ * @example
+ * ```typescript
+ * import { defineCollection, text, relationship } from '@nextly/core';
+ *
+ * export default defineCollection({
+ *   slug: 'posts',
+ *   labels: {
+ *     singular: 'Post',
+ *     plural: 'Posts',
+ *   },
+ *   fields: [
+ *     text({ name: 'title', required: true }),
+ *     text({ name: 'slug', unique: true }),
+ *     relationship({ name: 'author', relationTo: 'users' }),
+ *   ],
+ *   access: {
+ *     read: true,
+ *     create: ({ roles }) => roles.includes('editor') || roles.includes('admin'),
+ *   },
+ * });
+ * ```
+ */
+
+import type { BeforeOperationHandler, HookHandler } from "@nextly/hooks/types";
+
+import type { CollectionGrants } from "../../auth/preset-reach";
+import type { CollectionAccessControl } from "../../domains/auth/services/access-control-types";
+import type { CollectionDbOptions } from "../../domains/collections/services/collection-db-options";
+import type { PreviewViewportsDeclaration } from "../../domains/collections/services/preview-viewports";
+import { ownAddressOf } from "../../domains/public-addresses/public-address-template";
+import type { WebhookEventType } from "../../domains/webhooks/types";
+import type { Workflow } from "../../domains/workflows/types";
+import type { RevalidateConfig } from "../../revalidation/types";
+import type { VersionsConfig } from "../../schemas/versions/types";
+import { markDeclaredByDefine } from "../../shared/lib/config-problems";
+import { simplePluralize } from "../../shared/lib/pluralization";
+import type { CollectionFilterRuleInput } from "../../shared/types/rule-filter";
+import type { AuthorableFieldConfig, FieldConfig } from "../fields/types";
+import type { TextFieldConfig } from "../fields/types/text";
+
+import {
+  fileSystemFields,
+  type CollectionFilesConfig,
+} from "./collection-files";
+import {
+  asDeclaredFields,
+  toTitleCase,
+  systemFieldsBeside,
+} from "./declared-config";
+// Import validation conditionally - only in server environments
+// This prevents client-side bundlers from including the validation code
+import { validateCollectionConfig } from "./validate-config";
+
+// ============================================================
+// Collection Labels
+// ============================================================
+
+/**
+ * Display labels for a collection.
+ *
+ * Used in the Admin UI to display human-readable names for the collection.
+ * If not provided, labels are auto-generated from the slug.
+ *
+ * @example
+ * ```typescript
+ * const labels: CollectionLabels = {
+ *   singular: 'Blog Post',
+ *   plural: 'Blog Posts',
+ * };
+ * ```
+ */
+export interface CollectionLabels {
+  /**
+   * Singular form of the collection name.
+   * Used when referring to a single document (e.g., "Create Post").
+   */
+  singular?: string;
+
+  /**
+   * Plural form of the collection name.
+   * Used when referring to multiple documents (e.g., "All Posts").
+   */
+  plural?: string;
+}
+
+// ============================================================
+// Admin Options
+// ============================================================
+
+/**
+ * Pagination configuration for the collection list view.
+ *
+ * @example
+ * ```typescript
+ * const pagination: CollectionPagination = {
+ *   defaultLimit: 25,
+ *   limits: [10, 25, 50, 100],
+ * };
+ * ```
+ */
+export interface CollectionPagination {
+  /**
+   * Default number of documents per page.
+   * @default 10
+   */
+  defaultLimit?: number;
+
+  /**
+   * Available page size options.
+   * @default [10, 25, 50, 100]
+   */
+  limits?: number[];
+}
+
+/**
+ * Preview URL configuration for content preview workflows.
+ *
+ * Enables editors to preview entries before publishing by generating
+ * preview URLs that can be opened in a new tab or iframe.
+ *
+ * @example Function-based URL
+ * ```typescript
+ * const preview: CollectionPreviewConfig = {
+ *   url: (entry) => `/preview/posts/${entry.slug}`,
+ *   label: "Preview Post",
+ * };
+ * ```
+ *
+ * @example Conditional preview availability
+ * ```typescript
+ * const preview: CollectionPreviewConfig = {
+ *   url: (entry) => entry.slug ? `/preview/${entry.slug}` : null,
+ *   openInNewTab: true,
+ * };
+ * ```
+ */
+export interface CollectionPreviewConfig {
+  /**
+   * Function to generate preview URL from entry data.
+   *
+   * Receives the current entry data (which may include unsaved changes)
+   * and should return a URL string or null if preview is not available.
+   *
+   * @param entry - The entry data (may be unsaved/draft)
+   * @returns Preview URL string or null if preview not available
+   *
+   * @example
+   * ```typescript
+   * url: (entry) => `/preview/posts/${entry.slug}`
+   * url: (entry) => entry.status === 'draft' ? `/api/preview?id=${entry.id}` : null
+   * ```
+   */
+  url: (entry: Record<string, unknown>) => string | null;
+
+  /**
+   * Whether to open preview in a new browser tab.
+   * @default true
+   */
+  openInNewTab?: boolean;
+
+  /**
+   * Custom label for the preview button.
+   * @default "Preview"
+   */
+  label?: string;
+
+  /**
+   * The viewport widths the preview pane offers, as a list or as a function.
+   *
+   * Declared rather than inferred: nothing in this system can know the widths a
+   * site's CSS actually breaks at, so a shipped phone/tablet/desktop list would
+   * be a claim about somebody else's stylesheet.
+   *
+   * The function form is evaluated per mint, on the server, so a source that
+   * CHANGES — a site's stored breakpoints, edited in the page builder — stays
+   * current instead of being captured once at boot. Only the resolved list ever
+   * reaches the browser.
+   *
+   * @example
+   * ```typescript
+   * breakpoints: [
+   *   { label: "Phone", width: 390 },
+   *   { label: "Desktop", width: 1280 },
+   * ]
+   * ```
+   */
+  breakpoints?: PreviewViewportsDeclaration;
+}
+
+/**
+ * Component path string format.
+ *
+ * Uses the format: `"package-name/path#ExportName"` where:
+ * - `package-name/path` is the module path (e.g., `@nextly/plugin-form-builder/admin`)
+ * - `#ExportName` is the named export (e.g., `#FormBuilderView`)
+ *
+ * @example
+ * ```typescript
+ * // Named export from package subpath
+ * "@nextlyhq/plugin-form-builder/admin#FormBuilderView"
+ *
+ * // Default export (no hash)
+ * "@nextlyhq/plugin-form-builder/admin/FormBuilderView"
+ * ```
+ */
+export type ComponentPath = string;
+
+/**
+ * Custom view configuration for replacing default admin views.
+ *
+ * @example
+ * ```typescript
+ * const editView: CollectionAdminViewConfig = {
+ *   Component: "@nextlyhq/plugin-form-builder/admin#FormBuilderView",
+ * };
+ * ```
+ */
+export interface CollectionAdminViewConfig {
+  /**
+   * Component path to the custom view component.
+   * Format: `"package-name/path#ExportName"`
+   */
+  Component: ComponentPath;
+}
+
+/**
+ * Custom components configuration for collection admin UI.
+ *
+ * Allows overriding default admin views and injecting custom components
+ * at specific locations in the admin interface.
+ *
+ * @example
+ * ```typescript
+ * const components: CollectionAdminComponents = {
+ *   views: {
+ *     Edit: {
+ *       Component: "@nextlyhq/plugin-form-builder/admin#FormBuilderView",
+ *     },
+ *   },
+ *   BeforeListTable: "@nextlyhq/plugin-form-builder/admin#CreateFormButton",
+ * };
+ * ```
+ */
+export interface CollectionAdminComponents {
+  /**
+   * Custom views to replace default admin views.
+   */
+  views?: {
+    /**
+     * Custom Edit view component.
+     * Replaces the default entry edit form with a custom view.
+     */
+    Edit?: CollectionAdminViewConfig;
+
+    /**
+     * Custom List view component.
+     * Replaces the default entry list view with a custom view.
+     */
+    List?: CollectionAdminViewConfig;
+  };
+
+  /**
+   * Component to render before the list table.
+   * Useful for custom action buttons or filters.
+   */
+  BeforeListTable?: ComponentPath;
+
+  /**
+   * Component to render after the list table.
+   */
+  AfterListTable?: ComponentPath;
+
+  /**
+   * Component to render before the edit form.
+   */
+  BeforeEdit?: ComponentPath;
+
+  /**
+   * Component to render after the edit form.
+   */
+  AfterEdit?: ComponentPath;
+}
+
+/**
+ * Admin panel configuration options for a collection.
+ *
+ * Controls how the collection appears and behaves in the Admin UI.
+ *
+ * @example
+ * ```typescript
+ * const admin: CollectionAdminOptions = {
+ *   group: 'Content',
+ *   icon: 'FileText',
+ *   useAsTitle: 'title',
+ *   pagination: {
+ *     defaultLimit: 25,
+ *   },
+ * };
+ * ```
+ *
+ * @example Custom edit view
+ * ```typescript
+ * const admin: CollectionAdminOptions = {
+ *   group: 'Forms',
+ *   useAsTitle: 'name',
+ *   components: {
+ *     views: {
+ *       Edit: {
+ *         Component: "@nextlyhq/plugin-form-builder/admin#FormBuilderView",
+ *       },
+ *     },
+ *   },
+ * };
+ * ```
+ */
+export interface CollectionAdminOptions {
+  /**
+   * Group name for organizing collections in the sidebar.
+   * Collections with the same group appear together.
+   *
+   * @example 'Content', 'Settings', 'Commerce'
+   */
+  group?: string;
+
+  /**
+   * Which fields the admin's entry list shows as columns, and in what order.
+   *
+   * Omitted, the list picks its own columns. Naming them is how a collection
+   * whose useful fields are not its first few becomes readable — a posts list
+   * is far more use showing status and publish date than the next two fields
+   * that happen to be declared.
+   *
+   * Names are field keys. A key that does not exist is ignored rather than
+   * erroring, so a rename leaves a shorter list rather than an unusable screen.
+   *
+   * This mirrors the same option in the visual schema
+   * (`schemas/_zod/ui-schema.ts`), which is what the admin has always read.
+   * Declaring it here lets a code-first collection reach a feature the two
+   * authoring paths were otherwise split on.
+   */
+  defaultColumns?: string[];
+
+  /**
+   * Whether this collection is provided by a plugin.
+   *
+   * When `true`, the collection appears in the "Plugins" section of the sidebar
+   * instead of under "Collections". This helps users distinguish between
+   * their own collections and plugin-provided functionality.
+   *
+   * @default false
+   *
+   * @example
+   * ```typescript
+   * admin: {
+   *   isPlugin: true,
+   *   group: 'Forms', // Groups within the Plugins section
+   * }
+   * ```
+   */
+  isPlugin?: boolean;
+
+  /**
+   * Hide the admin's "New …" affordances for this collection.
+   *
+   * For collections whose entries are machine-created (form submissions,
+   * logs, webhooks), a create button offers a fiction — nothing a human
+   * types there is a real event. The API surface is unaffected; only the
+   * admin UI stops offering creation.
+   *
+   * @default false
+   */
+  disableCreate?: boolean;
+
+  /**
+   * Hide the admin's own Delete for this collection's entries: in the
+   * editor's menu, on a list row and in the selection bar.
+   *
+   * For collections whose entries are deleted through an action of their
+   * own, which a plugin draws instead, such as one that must first take an
+   * entry out of the documents that use it. Offering the plain Delete there
+   * offers a button the server refuses. The API surface is unaffected; the
+   * server still decides every delete.
+   *
+   * @default false
+   */
+  disableDelete?: boolean;
+
+  /**
+   * @experimental Where the admin opens this collection's entries: `"form"`,
+   * or the path of a full-screen document view the collection has (a plugin's
+   * view on this collection, or one offered on a field type this collection
+   * holds at its top level).
+   *
+   * Every admin link meant to open an entry follows it: a list row, a
+   * dashboard card's row. The form keeps its own address whatever this says,
+   * and the admin opens the form instead for a reader who may not update the
+   * entry, and for an entry opened in a language other than the default.
+   *
+   * Without it, an entry opens in a view that asks to open first for the
+   * collection's main field (the first top-level field that is not hidden,
+   * not the title and not `slug`), and in the form otherwise.
+   *
+   * A path no view answers, or a field-type view whose field type is not
+   * among the collection's top-level fields, stops the boot.
+   *
+   * @example
+   * ```typescript
+   * admin: { opensIn: "form" }
+   * ```
+   */
+  opensIn?: string;
+
+  /**
+   * Icon identifier for the collection.
+   * Should be a valid icon name from the icon library (e.g., Lucide).
+   *
+   * @example 'FileText', 'Users', 'ShoppingCart'
+   */
+  icon?: string;
+
+  /**
+   * Hide the collection from the Admin UI navigation.
+   * The collection is still accessible via direct URL and API.
+   *
+   * @default false
+   */
+  hidden?: boolean;
+
+  /** Sort order within sidebar group (lower = higher position, default: 100) */
+  order?: number;
+
+  /** Custom sidebar group slug. When set, item moves from its default section to this custom group */
+  sidebarGroup?: string;
+
+  /**
+   * Field name to use as the document title in the Admin UI.
+   * This value is displayed in lists, breadcrumbs, and relationships.
+   * If not specified, the document ID is used.
+   *
+   * @example 'title', 'name', 'email'
+   */
+  useAsTitle?: string;
+
+  /**
+   * Pagination configuration for the list view.
+   */
+  pagination?: CollectionPagination;
+
+  /**
+   * Description text displayed below the collection title.
+   * Use this to provide helpful context for editors.
+   */
+  description?: string;
+
+  /**
+   * Preview URL configuration for content preview workflows.
+   *
+   * When configured, a "Preview" button appears in the entry form
+   * that opens the generated URL in a new tab (or same tab if configured).
+   *
+   * @example
+   * ```typescript
+   * preview: {
+   *   url: (entry) => `/preview/posts/${entry.slug}`,
+   *   label: "Preview Post",
+   * }
+   * ```
+   */
+  preview?: CollectionPreviewConfig;
+
+  /**
+   * Custom components configuration for the admin UI.
+   *
+   * Allows overriding default views (Edit, List) and injecting
+   * custom components at specific locations.
+   *
+   * @example
+   * ```typescript
+   * components: {
+   *   views: {
+   *     Edit: {
+   *       Component: "@nextlyhq/plugin-form-builder/admin#FormBuilderView",
+   *     },
+   *   },
+   *   BeforeListTable: "@nextlyhq/plugin-form-builder/admin#CreateFormButton",
+   * }
+   * ```
+   */
+  components?: CollectionAdminComponents;
+}
+
+// ============================================================
+// Access Control
+// ============================================================
+
+// CollectionAccessControl is imported from domains/auth/services/access-control-types
+// and re-exported from this module for convenience.
+// See access-control-types.ts for the full interface definition.
+
+// ============================================================
+// Collection Hooks
+// ============================================================
+
+/**
+ * Collection-level lifecycle hooks configuration.
+ *
+ * Hooks allow custom logic to run at specific points in a document's lifecycle.
+ * All hooks receive a `HookContext` with operation metadata and can optionally
+ * modify the data (for `before*` hooks).
+ *
+ * **Hook Execution Order:**
+ * 1. `beforeOperation` - Before any operation begins
+ * 2. `beforeValidate` - Before validation (create/update)
+ * 3. `beforeChange` - Before database write (create/update)
+ * 4. Database operation executes
+ * 5. `afterChange` - After database write (create/update)
+ * 6. `afterRead` - After reading from database
+ * 7. `afterDelete` - After deletion
+ *
+ * @example
+ * ```typescript
+ * const hooks: CollectionHooks = {
+ *   beforeChange: [
+ *     async ({ data, operation }) => {
+ *       if (operation === 'create') {
+ *         return { ...data, slug: slugify(data.title) };
+ *       }
+ *       return data;
+ *     },
+ *   ],
+ *   afterChange: [
+ *     async ({ data }) => {
+ *       await invalidateCache(`posts:${data.id}`);
+ *     },
+ *   ],
+ * };
+ * ```
+ */
+export interface CollectionHooks {
+  /**
+   * Runs before any operation begins.
+   * Can modify operation arguments or execute side effects.
+   *
+   * Handlers receive the operation's `args` -- the data, id or where clause it
+   * is about to use -- and returning a modified set replaces them. This is the
+   * only phase shaped that way; every other one receives `data`.
+   */
+  beforeOperation?: BeforeOperationHandler[];
+
+  /**
+   * Runs before validation during create/update.
+   * Can transform data before validation rules are applied.
+   */
+  beforeValidate?: HookHandler[];
+
+  /**
+   * Runs before the database write during create/update.
+   * Can transform the final data to be stored.
+   */
+  beforeChange?: HookHandler[];
+
+  /**
+   * Runs after the database write during create/update.
+   * Useful for side effects like sending notifications.
+   */
+  afterChange?: HookHandler[];
+
+  /**
+   * Runs before reading from the database.
+   * Can modify query parameters.
+   */
+  beforeRead?: HookHandler[];
+
+  /**
+   * Runs after reading from the database.
+   * Can transform the data before it's returned.
+   */
+  afterRead?: HookHandler[];
+
+  /**
+   * Runs before deleting a document.
+   * Can prevent deletion by throwing an error.
+   */
+  beforeDelete?: HookHandler[];
+
+  /**
+   * Runs after deleting a document.
+   * Useful for cleanup or cascading deletes.
+   */
+  afterDelete?: HookHandler[];
+}
+
+// ============================================================
+// Custom Endpoints
+// ============================================================
+
+/**
+ * HTTP method types for custom endpoints.
+ */
+export type HttpMethod = "get" | "post" | "put" | "patch" | "delete";
+
+/**
+ * Custom REST API endpoint configuration.
+ *
+ * Allows defining additional endpoints on the collection's API namespace.
+ * Endpoints are mounted at `/api/[collection-slug]/[path]`.
+ *
+ * @example
+ * ```typescript
+ * const publishEndpoint: CustomEndpoint = {
+ *   path: '/publish',
+ *   method: 'post',
+ *   handler: async (req) => {
+ *     const { id } = await req.json();
+ *     // Publish logic here
+ *     return Response.json({ success: true });
+ *   },
+ * };
+ * ```
+ */
+export interface CustomEndpoint {
+  /**
+   * URL path for the endpoint (relative to collection namespace).
+   * Must start with '/'.
+   *
+   * @example '/publish', '/export', '/bulk-update'
+   */
+  path: string;
+
+  /**
+   * HTTP method for the endpoint.
+   */
+  method: HttpMethod;
+
+  /**
+   * Handler function that processes the request.
+   * Receives a standard Web API Request and returns a Response.
+   *
+   * @param req - The incoming HTTP request
+   * @returns A Response object (or Promise thereof)
+   */
+  handler: (req: Request) => Promise<Response> | Response;
+}
+
+// ============================================================
+// Index Configuration
+// ============================================================
+
+/**
+ * Configuration for a database index.
+ *
+ * Indexes improve query performance for frequently searched or sorted fields.
+ * Use compound indexes when queries filter or sort by multiple fields together.
+ *
+ * @example Single compound index
+ * ```typescript
+ * const config: IndexConfig = {
+ *   fields: ['authorId', 'createdAt'],
+ * };
+ * ```
+ *
+ * @example Unique compound index
+ * ```typescript
+ * const config: IndexConfig = {
+ *   fields: ['slug', 'locale'],
+ *   unique: true,
+ *   name: 'uq_slug_locale',
+ * };
+ * ```
+ */
+export interface IndexConfig {
+  /**
+   * Fields to include in the index.
+   *
+   * For compound indexes, the order of fields matters for query optimization.
+   * Place the most selective (highest cardinality) fields first.
+   *
+   * @example ['authorId', 'createdAt'] - Optimizes queries like `WHERE authorId = ? ORDER BY createdAt`
+   */
+  fields: string[];
+
+  /**
+   * Whether this is a unique index.
+   *
+   * Unique indexes enforce that no two documents have the same combination
+   * of values for the indexed fields.
+   *
+   * @default false
+   */
+  unique?: boolean;
+
+  /**
+   * Optional custom index name.
+   *
+   * Must start with `idx_` (or `uq_` for a unique index): those are the names
+   * schema changes manage, so an index removed from the config is dropped
+   * from the database. If not provided, one is derived from the table and
+   * columns with the same prefixes.
+   *
+   * @example 'idx_posts_author_status'
+   */
+  name?: string;
+}
+
+// ============================================================
+// Search Config
+// ============================================================
+
+/**
+ * Configuration for full-text search on collection entries.
+ *
+ * Defines which fields are searchable and how search should behave.
+ * When not configured, search will auto-detect searchable fields
+ * (text, textarea, email types).
+ *
+ * @example
+ * ```typescript
+ * const config: CollectionConfig = {
+ *   slug: 'posts',
+ *   search: {
+ *     searchableFields: ['title', 'content', 'excerpt'],
+ *   },
+ *   fields: [
+ *     { type: 'text', name: 'title' },
+ *     { type: 'textarea', name: 'content' },
+ *     { type: 'textarea', name: 'excerpt' },
+ *   ],
+ * };
+ * ```
+ */
+export interface SearchConfig {
+  /**
+   * Fields to include in search queries.
+   *
+   * If not specified, automatically includes all text, textarea,
+   * and email fields from the collection schema.
+   *
+   * @example ['title', 'content', 'author.name']
+   */
+  searchableFields?: string[];
+
+  /**
+   * Minimum query length required to trigger search.
+   * Queries shorter than this will return empty results.
+   *
+   * @default 2
+   */
+  minSearchLength?: number;
+}
+
+// ============================================================
+// Collection Config
+// ============================================================
+
+/**
+ * Complete collection configuration interface.
+ *
+ * This is the main interface for defining a collection in code.
+ * Only `slug` and `fields` are required; all other properties have defaults.
+ *
+ * @example
+ * ```typescript
+ * const PostsConfig: CollectionConfig = {
+ *   slug: 'posts',
+ *   labels: {
+ *     singular: 'Post',
+ *     plural: 'Posts',
+ *   },
+ *   fields: [
+ *     { type: 'text', name: 'title', required: true },
+ *     { type: 'textarea', name: 'content' },
+ *     { type: 'select', name: 'status', options: [
+ *       { label: 'Draft', value: 'draft' },
+ *       { label: 'Published', value: 'published' },
+ *     ]},
+ *   ],
+ *   timestamps: true,
+ *   admin: {
+ *     group: 'Content',
+ *     useAsTitle: 'title',
+ *   },
+ *   access: {
+ *     read: true,
+ *     create: ({ roles }) => roles.includes('editor') || roles.includes('admin'),
+ *   },
+ * };
+ * ```
+ */
+export interface CollectionConfig {
+  /**
+   * Unique identifier for the collection.
+   *
+   * Used as the database table name, API endpoint, and internal reference.
+   * Must be:
+   * - Unique across all collections
+   * - URL-friendly (lowercase, no spaces)
+   * - Not a reserved name (e.g., 'users', 'media' if used by system)
+   *
+   * @example 'posts', 'products', 'blog-posts', 'order_items'
+   */
+  slug: string;
+
+  /**
+   * Field definitions for the collection.
+   *
+   * An array of field configurations that define the document structure.
+   * Must contain at least one data-storing field.
+   */
+  fields: FieldConfig[];
+
+  /**
+   * @experimental Where each entry is served on the site, as a path template
+   * with `{field}` placeholders: `"/blog/{slug}"`.
+   *
+   * One answer for every reader that needs an entry's public address, read
+   * through `publicAddressOf`. A collection without one is not public yet: it
+   * gets no address, never a guessed one.
+   *
+   * The template starts with `/`, has no trailing `/`, query or fragment, and
+   * names at least one placeholder. Each placeholder is a whole segment
+   * naming a field of the collection (or `id`); a slug of several segments
+   * (`db.slugPaths`) stands under one. Literal segments are spelled as a
+   * browser sends them, and nothing may sit under `/admin`, `/api` or another
+   * path the runtime keeps. A declaration breaking any of these is refused
+   * when the collection is defined.
+   *
+   * @example "/blog/{slug}", "/{slug}", "/docs/{category}/{slug}"
+   */
+  publicAddress?: string;
+
+  /**
+   * @experimental A text field whose value, where an entry has one, is that
+   * entry's own public address, for a collection whose entries are not all
+   * served under one pattern: most at `/features/{slug}`, one at
+   * `/brand-voice`. An entry whose field is empty is served at
+   * `publicAddress`, which this needs.
+   *
+   * The value is judged as a template's result is: an address on this site
+   * from its root (`/brand-voice`), with no other host, query, fragment or
+   * trailing `/`, and nothing under a path the runtime keeps. A save with
+   * any other value is refused on the field. Changing it moves the entry's
+   * address, as changing its slug would.
+   *
+   * @example "address"
+   */
+  publicAddressField?: string;
+
+  /**
+   * @experimental On a collection a plugin contributes: it holds the site's
+   * own content, such as its pages, so a plugin that extends every content
+   * type (`contributes.extend` with a scope) reaches it as it reaches the
+   * site's own collections. A plugin's other collections, such as form
+   * submissions or internal records, are never reached by a scope. Read only
+   * on a plugin's collection; the site's own are reached without it.
+   */
+  siteContent?: boolean;
+
+  /**
+   * Makes each entry of this collection one file, kept so that no public
+   * address ever serves it: the accepted types, the largest size, and how a
+   * download is answered. The collection gains the fields every file needs
+   * (`filename`, `mimeType`, `size`, `sha256`, `storageKey`, `fileStatus`,
+   * `rejectReason`, `uploadedByKind`, `uploadedById`), which only Nextly
+   * writes; `storageKey` is never returned to a caller. Who may upload or
+   * open a file is this collection's `access`. It has no drafts, versions,
+   * localization or public address, and is hidden in the admin unless
+   * `admin.hidden` says otherwise.
+   *
+   * @example
+   * ```typescript
+   * files: { visibility: "private", accept: ["application/pdf"], maxSize: 10 * 1024 * 1024 }
+   * ```
+   *
+   * @experimental
+   */
+  files?: CollectionFilesConfig;
+
+  /**
+   * @experimental Internal/private storage (D30). The collection stays in the
+   * merged schema — relatable and accessible via `ctx.services` / `ctx.db.raw` —
+   * but is hidden from the content-admin navigation (implies `admin.hidden`).
+   * Intended for plugin-private collections (e.g. a plugin's internal records).
+   */
+  internal?: boolean;
+
+  /**
+   * Display labels for the Admin UI.
+   * If not provided, labels are auto-generated from the slug.
+   */
+  labels?: CollectionLabels;
+
+  /**
+   * Whether to automatically add `createdAt` and `updatedAt` timestamp fields.
+   *
+   * When `true`, documents will have:
+   * - `createdAt`: Set once when document is created
+   * - `updatedAt`: Updated on every modification
+   *
+   * @default true
+   */
+  timestamps?: boolean;
+
+  /**
+   * Enable the Draft / Published lifecycle for this collection.
+   *
+   * When `true`, Nextly injects a `status` system column on the data table
+   * (NOT NULL, default `'draft'`) and the admin entry create/edit page
+   * shows separate Save Draft / Publish buttons. Public callers querying
+   * with `{ status: { equals: "published" } }` will only see published
+   * entries; drafts remain admin-only.
+   *
+   * Mirrors the Schema Builder's Advanced tab "Status (Draft / Published)"
+   * toggle so code-first and Builder configurations converge on the same
+   * underlying behaviour.
+   *
+   * @default false
+   */
+  status?: boolean;
+
+  /**
+   * Enable content versioning (revision history) for this collection.
+   *
+   * Currently active: when enabled, every create/update records a restorable
+   * snapshot of the assembled document in the global `nextly_versions` table,
+   * written inside the same transaction as the write. Omitted = unversioned
+   * (zero cost).
+   *
+   * The draft/publish split is active when the collection sets `status: true`
+   * and versioning resolves `drafts.enabled` to true (`versions: true`, where
+   * drafts default on, or `versions: { drafts: true }`; `versions: { drafts:
+   * false }` and `status: true` on its own stay history-only). A status-less
+   * update to a currently published document is then stored as a single
+   * coalesced working draft in `nextly_versions` and the live row is left
+   * unchanged instead of overwriting the published content; a later publish
+   * promotes that draft onto the live row. The split additionally requires the
+   * collection to be non-localized, every reachable component schema to resolve
+   * and be non-localized, and no reachable field to be a password; otherwise a
+   * status-less write goes straight to the live row as before.
+   *
+   * Still accepted but NOT yet enforced: `autosave` coalescing and the
+   * `maxPerDoc` retention pruning on {@link VersionsConfig} are parsed and
+   * persisted for forward compatibility.
+   *
+   * @default undefined (unversioned)
+   */
+  versions?: boolean | VersionsConfig;
+
+  /**
+   * The editorial workflow this collection's documents move through on their way
+   * to publishing, from `defineWorkflow` or `reviewWorkflow`. One workflow may
+   * serve any number of collections and Singles; each has at most one. It
+   * needs drafts kept beside the live version: `status` on and drafts enabled
+   * in `versions`, or the configuration is refused, saying which is missing.
+   * Declaring it changes nothing at runtime yet.
+   *
+   * @experimental
+   */
+  workflow?: Workflow;
+
+  /**
+   * Enable multilingual content for this collection. When `true`, translatable
+   * fields store a value per configured locale (text-like fields localize by
+   * default; override per field with the field's `localized` flag). Requires a
+   * `localization` block in the app config.
+   *
+   * @default false
+   */
+  localized?: boolean;
+
+  /**
+   * Require every language to hold its own value for each required translated field before that
+   * language is published. Without it, a language whose required field is empty publishes and
+   * shows the value it falls back to. Applies to a translated collection with Draft/Published.
+   *
+   * @default false
+   * @experimental
+   */
+  requireEveryLanguage?: boolean;
+
+  /**
+   * Webhook recording policy for this collection. When `false` (or
+   * `{ record: false }`), writes to this collection record NO `entry.*` event to
+   * the webhook outbox, so nothing is ever delivered to subscribed endpoints.
+   * Used to keep PII-bearing content — form submissions carry
+   * `ipAddress`/`userAgent` and free-form answers — out of the delivery path.
+   *
+   * `emit` replaces the suppressed default event with a curated, metadata-only
+   * one: pair `record: false` with `emit` on a PII collection so subscribers
+   * still learn a row was created, carrying only the allowlisted fields.
+   *
+   * @default true (writes are recorded)
+   */
+  webhooks?:
+    | boolean
+    | {
+        /** Whether the default `entry.*` events record. @default true */
+        record?: boolean;
+        /**
+         * Emit a curated event on create instead of relying on the default
+         * `entry.created`. The event carries only the allowlisted `fields`
+         * (default-deny), so a PII collection can notify subscribers of a new
+         * row without ever shipping the row's sensitive content.
+         */
+        emit?: {
+          /** A declared webhook event type, e.g. `"form.submission.created"`. */
+          event: WebhookEventType;
+          /**
+           * Allowlist of document keys copied into the event payload. Only
+           * these keys ship (default-deny); the created row's id is always
+           * included in the event resource. Omit to ship id only.
+           */
+          fields?: readonly string[];
+        };
+      };
+
+  /**
+   * Admin panel configuration options.
+   */
+  admin?: CollectionAdminOptions;
+
+  /**
+   * @experimental Per-collection database options.
+   *
+   * Storage-level choices that no field expresses: which id a create
+   * generates, and whether a create may supply one. Both leave the column
+   * unchanged — every id here is 36 characters — so neither needs a
+   * migration, and relations pointing at this collection are unaffected.
+   */
+  db?: CollectionDbOptions;
+
+  /**
+   * Collection-level access control.
+   * Defines who can perform CRUD operations.
+   *
+   * Each operation can be:
+   * - A **function** receiving `AccessControlContext` (user, roles, permissions) → returns boolean
+   * - A **boolean** for simple allow/deny
+   * - **Omitted** to fall back to database role/permission checks
+   *
+   * A signed-in user or an API key needs the database permission first;
+   * code-defined access only narrows it, allowing only on `true`.
+   * Super-admin always bypasses all access checks.
+   *
+   * @example
+   * ```typescript
+   * access: {
+   *   create: ({ roles }) => roles.includes('admin') || roles.includes('editor'),
+   *   read: true,
+   *   update: ({ roles }) => roles.includes('admin') || roles.includes('editor'),
+   *   delete: ({ roles }) => roles.includes('admin'),
+   * }
+   * ```
+   */
+  access?: CollectionAccessControl;
+
+  /**
+   * Refuses this collection's entries to every caller holding super-admin
+   * authority: a super-admin person, and a full-access API key carrying its
+   * maker's super-admin authority, at every way in, whatever other
+   * permissions they hold. For data the site's administrators must not read
+   * through the admin, such as health or pay records. Trusted server code
+   * (`overrideAccess: true`) is not a caller and is unaffected.
+   *
+   * Set here, it is shown in the admin and cannot be changed there; left
+   * out, a super-admin can set it in the admin, entering their password
+   * again, and every change is written to the audit log.
+   *
+   * @default undefined (open to super-admin)
+   * @experimental
+   */
+  closedToSuperAdmin?: boolean;
+
+  /**
+   * Which built-in preset roles (Admin, Editor, Author, Viewer) this
+   * collection is opened to. A collection reaches a preset only once it is
+   * opened to it by name, so adding one never widens what an existing role
+   * can do; super-admins reach every collection whatever this says, except one
+   * closed to them (`closedToSuperAdmin`).
+   *
+   * @example
+   * ```typescript
+   * grants: { presets: ["admin", "editor", "author", "viewer"] }
+   * ```
+   *
+   * @experimental
+   */
+  grants?: CollectionGrants;
+
+  /**
+   * Collection-level lifecycle hooks.
+   * Custom logic that runs during document operations.
+   */
+  hooks?: CollectionHooks;
+
+  /**
+   * Custom REST API endpoints.
+   * Additional endpoints mounted on the collection's API namespace.
+   */
+  endpoints?: CustomEndpoint[];
+
+  /**
+   * Cache-revalidation configuration. When a Next cache adapter is registered,
+   * every write to this collection busts the derived `nextly:*` cache tags
+   * (collection, id, id+locale, slug), so tagged reads refresh on publish. Use
+   * `tags` to bust extra shared tags on every write, or `disable` to opt this
+   * collection out of automatic revalidation entirely.
+   *
+   * @default undefined (automatic revalidation on when a cache adapter exists)
+   */
+  revalidate?: RevalidateConfig;
+
+  /**
+   * Custom metadata for plugins and extensions.
+   * Store arbitrary data that can be accessed by hooks, plugins, or custom code.
+   */
+  custom?: Record<string, unknown>;
+
+  /**
+   * Custom database table name.
+   * If not specified, the slug is used as the table name.
+   *
+   * Useful when you need a specific table name for legacy databases
+   * or when the slug doesn't match your naming convention.
+   *
+   * @example 'wp_posts', 'tbl_products'
+   */
+  dbName?: string;
+
+  /**
+   * Description of the collection.
+   * Displayed in the Admin UI and used for documentation.
+   */
+  description?: string;
+
+  /**
+   * Search configuration for this collection.
+   *
+   * Defines which fields are searchable when using the search parameter
+   * in list queries. If not configured, search auto-detects searchable
+   * fields (text, textarea, email types).
+   *
+   * @example
+   * ```typescript
+   * search: {
+   *   searchableFields: ['title', 'content'],
+   *   minSearchLength: 3,
+   * }
+   * ```
+   */
+  search?: SearchConfig;
+
+  /**
+   * Database indexes for query performance optimization.
+   *
+   * Use this to define compound indexes (indexes on multiple fields).
+   * For single-field indexes, use `index: true` on the field itself.
+   *
+   * The `id`, `createdAt`, and `updatedAt` fields are indexed by default.
+   *
+   * @example
+   * ```typescript
+   * indexes: [
+   *   // Compound index for filtering by author and sorting by date
+   *   { fields: ['authorId', 'createdAt'] },
+   *
+   *   // Unique compound index for slug + locale
+   *   { fields: ['slug', 'locale'], unique: true },
+   *
+   *   // Custom named index
+   *   { fields: ['status', 'publishedAt'], name: 'posts_published_idx' },
+   * ]
+   * ```
+   */
+  indexes?: IndexConfig[];
+
+  /**
+   * Whether to enable automatic input sanitization for this collection.
+   *
+   * When `true` (default), the global sanitization hook strips HTML tags
+   * from plain-text fields (text, textarea, email) before database storage.
+   *
+   * Set to `false` to disable automatic HTML tag stripping for text fields.
+   * Use with caution — only disable if this collection intentionally stores
+   * HTML in text fields.
+   *
+   * @default true
+   */
+  sanitize?: boolean;
+}
+
+// ============================================================
+// Utility Functions
+// ============================================================
+
+// ============================================================
+// defineCollection Function
+// ============================================================
+
+/**
+ * Define a code-first collection with full type safety.
+ *
+ * This is the primary API for creating collection configurations in TypeScript.
+ * It validates the configuration, applies sensible defaults, and returns a
+ * normalized `CollectionConfig` object.
+ *
+ * **Defaults Applied:**
+ * - `labels.singular`: Generated from slug (e.g., 'blog-posts' → 'Blog Posts')
+ * - `labels.plural`: Generated from singular + 's'
+ * - `timestamps`: `true`
+ * - `admin.pagination.defaultLimit`: `10`
+ * - `admin.pagination.limits`: `[10, 25, 50, 100]`
+ *
+ * **Validation:**
+ * - Slug must be valid (lowercase, URL-friendly, not reserved)
+ * - Fields array must be non-empty
+ *
+ * @param config - The collection configuration
+ * @returns Normalized collection configuration with defaults applied
+ * @throws Error if configuration is invalid
+ *
+ * @example
+ * ```typescript
+ * import { defineCollection, text, textarea, select, relationship } from '@nextly/core';
+ *
+ * export default defineCollection({
+ *   slug: 'posts',
+ *   labels: {
+ *     singular: 'Post',
+ *     plural: 'Posts',
+ *   },
+ *   fields: [
+ *     text({ name: 'title', required: true }),
+ *     text({ name: 'slug', unique: true }),
+ *     textarea({ name: 'excerpt' }),
+ *     select({
+ *       name: 'status',
+ *       options: [
+ *         { label: 'Draft', value: 'draft' },
+ *         { label: 'Published', value: 'published' },
+ *       ],
+ *       defaultValue: 'draft',
+ *     }),
+ *     relationship({ name: 'author', relationTo: 'users' }),
+ *   ],
+ *   timestamps: true,
+ *   admin: {
+ *     group: 'Content',
+ *     icon: 'FileText',
+ *     useAsTitle: 'title',
+ *   },
+ *   access: {
+ *     read: () => true,
+ *     create: ({ req }) => !!req.user,
+ *     update: ({ req }) => req.user?.role === 'admin' || req.user?.role === 'editor',
+ *     delete: ({ req }) => req.user?.role === 'admin',
+ *   },
+ *   hooks: {
+ *     beforeChange: [
+ *       async ({ data, operation }) => {
+ *         if (operation === 'create' && !data.slug) {
+ *           return { ...data, slug: slugify(data.title) };
+ *         }
+ *         return data;
+ *       },
+ *     ],
+ *   },
+ * });
+ * ```
+ */
+/**
+ * A collection as `defineCollection` takes it.
+ *
+ * Identical to `CollectionConfig` except for the fields array, which also
+ * admits a contributed type declared through `pluginField()`, and the access
+ * rules, typed by those fields. The widening lives here rather than in
+ * `FieldConfig` because a union member carrying an index signature widens
+ * property access for every internal reader of that union.
+ *
+ * `Fields` is the declared fields as written, so a rule's filter is typed by
+ * their names (see `CollectionRuleFilter`); each `…Answer` is what that rule
+ * answers, inferred so each key of a filter it returns is checked. All
+ * default to what they were before they were inferred, so a config annotated
+ * with this type reads as it did.
+ */
+export type CollectionConfigInput<
+  Fields extends readonly AuthorableFieldConfig[] = AuthorableFieldConfig[],
+  ReadAnswer = boolean,
+  UpdateAnswer = boolean,
+  DeleteAnswer = boolean,
+  PublishAnswer = boolean,
+  UnpublishAnswer = boolean,
+> = Omit<CollectionConfig, "fields" | "access"> & {
+  fields: Fields;
+  access?: Omit<
+    CollectionAccessControl,
+    "read" | "update" | "delete" | "publish" | "unpublish"
+  > & {
+    read?: CollectionFilterRuleInput<Fields, ReadAnswer>;
+    update?: CollectionFilterRuleInput<Fields, UpdateAnswer>;
+    delete?: CollectionFilterRuleInput<Fields, DeleteAnswer>;
+    publish?: CollectionFilterRuleInput<Fields, PublishAnswer>;
+    unpublish?: CollectionFilterRuleInput<Fields, UnpublishAnswer>;
+  };
+};
+
+/**
+ * `fields`, the one `publicAddressField` names judged on every save as an
+ * entry's own address, before any rule of its own: so a value no visitor
+ * could be served at is refused on the field, in the words the address
+ * itself is judged by.
+ */
+function withOwnAddressRule(
+  fields: FieldConfig[],
+  name: string | undefined
+): FieldConfig[] {
+  if (name === undefined) return fields;
+  return fields.map(field => {
+    if (field.type !== "text" || field.name !== name) return field;
+    const own = field.validate;
+    const text: TextFieldConfig = {
+      ...field,
+      validate: (value, context) => {
+        const address = ownAddressOf(value);
+        if (address.status === "invalid") return address.problem;
+        return own === undefined ? true : own(value, context);
+      },
+    };
+    return text;
+  });
+}
+
+export function defineCollection<
+  const Fields extends
+    readonly AuthorableFieldConfig[] = AuthorableFieldConfig[],
+  ReadAnswer = boolean,
+  UpdateAnswer = boolean,
+  DeleteAnswer = boolean,
+  PublishAnswer = boolean,
+  UnpublishAnswer = boolean,
+>(
+  config: CollectionConfigInput<
+    Fields,
+    ReadAnswer,
+    UpdateAnswer,
+    DeleteAnswer,
+    PublishAnswer,
+    UnpublishAnswer
+  >
+): CollectionConfig {
+  // ============================================================
+  // Comprehensive Validation
+  // ============================================================
+
+  // Use the comprehensive validator that checks:
+  // - Slug format, reserved names, SQL keywords
+  // - Field names (format, duplicates, SQL keywords)
+  // - Field-specific validation (select options, relationship targets, etc.)
+  // - Nested field validation (array, group, blocks)
+  // - Access function type validation
+  // Validated as declared; the fields are narrowed to the shared union only
+  // after, which is what makes the narrowing safe to make at all.
+  // Judged, not thrown: a configuration's load and the start judge every entity in it by the
+  // same rules (`configurationProblems`) and report every problem, where a throw here would stop
+  // at the first one, during the import. The entity is normalized all the same, since a plugin's
+  // setup may repair the problem and must leave what a valid declaration gives; only where the
+  // problem makes normalizing itself throw is the entry returned as declared. Either way it is
+  // marked (`markDeclaredByDefine`), which tells the start to refuse it rather than warn.
+  // A collection of files is judged with the fields it gains for them, as the
+  // start judges it, so a field of the author's taking one of their names is
+  // refused here too.
+  const fileFields = config.files === undefined ? [] : fileSystemFields();
+  const accepted = validateCollectionConfig({
+    ...config,
+    fields: [...fileFields, ...asDeclaredFields(config.fields)],
+  }).valid;
+  try {
+    // ============================================================
+    // Auto-inject system fields (title, slug)
+    // ============================================================
+    // Every collection has title and slug as system-level fields,
+    // matching the Schema Builder behavior. If the user already defined
+    // fields with these names, their definitions take priority.
+
+    // A collection of files also carries each file's own fields, after
+    // title and slug. Unlike those, an author's field never replaces one:
+    // these are written only by Nextly, and one withholds the storage key.
+    const systemFields = [...systemFieldsBeside(config.fields), ...fileFields];
+
+    // Prepend system fields so they appear first in the form
+    const fieldsWithSystem = withOwnAddressRule(
+      [...systemFields, ...asDeclaredFields(config.fields)],
+      config.publicAddressField
+    );
+
+    // ============================================================
+    // Apply Defaults
+    // ============================================================
+
+    // Generate labels from slug if not provided
+    const singularLabel = config.labels?.singular ?? toTitleCase(config.slug);
+    const pluralLabel = config.labels?.plural ?? simplePluralize(singularLabel);
+
+    // Build normalized config with defaults
+    const normalized: CollectionConfig = {
+      ...config,
+      fields: fieldsWithSystem,
+      labels: {
+        singular: singularLabel,
+        plural: pluralLabel,
+      },
+      timestamps: config.timestamps ?? true,
+      admin: {
+        ...config.admin,
+        // `internal: true` implies hidden-from-nav (D30); explicit admin.hidden
+        // still wins if set. The collection remains fully functional otherwise.
+        // A collection of files has no admin screen of its own yet, so it is
+        // hidden unless the config says otherwise.
+        hidden:
+          config.internal === true
+            ? true
+            : (config.admin?.hidden ??
+              (config.files === undefined ? undefined : true)),
+        pagination: {
+          defaultLimit: config.admin?.pagination?.defaultLimit ?? 10,
+          limits: config.admin?.pagination?.limits ?? [10, 25, 50, 100],
+        },
+      },
+    };
+
+    // Marked as declared through this function, so a start refuses it should the configuration's
+    // load find a problem this call could not, such as a field type nothing registers.
+    // Recorded as they leave normalization: the address rule may have wrapped the system `slug`
+    // (`withOwnAddressRule`), and that wrapped field is the one the collection carries. They
+    // come first, in the order added.
+    return markDeclaredByDefine(
+      normalized,
+      fieldsWithSystem.slice(0, systemFields.length)
+    );
+  } catch (error) {
+    if (accepted) throw error;
+    return markDeclaredByDefine({ ...config }) as unknown as CollectionConfig;
+  }
+}
+
+// ============================================================
+// Re-exports for Convenience
+// ============================================================
+
+export type { FieldConfig };
+export type { BeforeOperationHandler, HookHandler };
+export type { CollectionAccessControl };

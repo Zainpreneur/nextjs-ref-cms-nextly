@@ -1,0 +1,1916 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// `isErrorResponse` keeps its real shape (a plain predicate, not a vi.fn())
+// so the mock survives strict typing at the call site the same way
+// `plugins/routes/dispatch-auth.test.ts` does -- casting a type-predicate
+// import to `ReturnType<typeof vi.fn>` does not type-check.
+vi.mock("../auth/middleware", () => ({
+  requireAuthentication: vi.fn(),
+  isErrorResponse: (x: unknown) =>
+    !!x && typeof x === "object" && "statusCode" in x,
+}));
+vi.mock("../auth/middleware/to-nextly-error", () => ({
+  toNextlyAuthError: vi.fn((e: unknown) => new Error(String(e))),
+}));
+vi.mock("../init", () => ({
+  getCachedNextly: vi.fn().mockResolvedValue(undefined),
+}));
+
+// `vi.hoisted` (rather than a bare top-level `const`) so these survive
+// Vitest hoisting `vi.mock` calls above every other statement in the file --
+// a bare const referenced inside a factory below its own declaration is a
+// TDZ access at the point the hoisted mock runs.
+const { executeWidgetQuery } = vi.hoisted(() => ({
+  executeWidgetQuery: vi.fn(),
+}));
+vi.mock("../domains/widgets/execute", () => ({ executeWidgetQuery }));
+
+// `readCaller` resolves role slugs from the database. Mocked so this handler
+// test exercises the batching and error isolation, not the auth stack.
+const { readCaller } = vi.hoisted(() => ({ readCaller: vi.fn() }));
+// Partial: the caller is stood in for, and the rest of the module (its response headers) is real.
+vi.mock("./authenticated-read", async importOriginal => ({
+  ...(await importOriginal<typeof import("./authenticated-read")>()),
+  readCaller,
+  readAccessCaller: (caller: { user: { id: string } }) => ({
+    userId: caller.user.id,
+    authMethod: "session" as const,
+    permissions: [],
+    roles: [],
+  }),
+}));
+
+// The collection registry is reached through the DI container, so the
+// container module is the seam -- the same one `dashboard-scope.test.ts` uses
+// for `DashboardService`.
+const { containerGet, containerHas } = vi.hoisted(() => ({
+  containerGet: vi.fn(),
+  containerHas: vi.fn(),
+}));
+vi.mock("../di/container", () => ({
+  container: { get: containerGet, has: containerHas },
+}));
+
+// The entity-level read decision. Mocked so this handler test can put a caller
+// on either side of it without standing up the RBAC stack.
+const { canReadEntity } = vi.hoisted(() => ({ canReadEntity: vi.fn() }));
+// `importOriginal` rather than a bare factory: the handler now also imports
+// `authorizationScheduler` from this module, and that one must stay REAL. It is
+// the bound the product enforces, so a stand-in would make the batching test
+// assert against the test's own arithmetic instead.
+vi.mock("../auth/entity-read-access", async importOriginal => {
+  const actual =
+    await importOriginal<typeof import("../auth/entity-read-access")>();
+  return { ...actual, canReadEntity };
+});
+
+// Watched, not replaced: the batch's cards are prepared by the real function,
+// and a case reads the card batch it was handed.
+vi.mock("./widget-cards", async importOriginal => {
+  const actual = await importOriginal<typeof import("./widget-cards")>();
+  return { ...actual, prepareCards: vi.fn(actual.prepareCards) };
+});
+
+import { requireAuthentication } from "../auth/middleware";
+import {
+  clearResolvers,
+  registerResolvedSource,
+} from "../domains/widgets/resolved-sources";
+import { clearSources, registerSource } from "../domains/widgets/sources";
+import {
+  clearSystemResolvers,
+  registerSystemSource,
+} from "../domains/widgets/system-sources";
+import { NextlyError } from "../errors/nextly-error";
+import { setNextlyLogger } from "../observability/logger";
+import { withTimezoneFormatting } from "../shared/lib/date-formatting";
+
+import { prepareCards } from "./widget-cards";
+import { postWidgetQuery } from "./widget-query";
+
+const reqAuth = vi.mocked(requireAuthentication);
+const preparedCards = vi.mocked(prepareCards);
+
+/** Captures what the boundary logs, so "it was logged" is observed, not assumed. */
+const logged: object[] = [];
+const testLogger = {
+  error: (p: object) => void logged.push(p),
+  warn: (p: object) => void logged.push(p),
+  info: () => {},
+  debug: () => {},
+};
+
+/** Reads the slots out of a batch response. */
+async function slotsOf(
+  res: Response
+): Promise<Array<{ ok: boolean; error?: string; code?: string }>> {
+  const body = (await res.json()) as {
+    results: Array<{ ok: boolean; error?: string; code?: string }>;
+  };
+  return body.results;
+}
+
+function makeReq(body: unknown): Request {
+  return new Request("http://localhost/api/dashboard/query", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  // `readCaller` is mocked below, so this auth context is never inspected
+  // beyond `isErrorResponse`; shaped fully anyway so the mock stays typed.
+  reqAuth.mockResolvedValue({
+    userId: "user-1",
+    permissions: [],
+    roles: [],
+    authMethod: "session",
+  });
+  readCaller.mockResolvedValue({ user: { id: "user-1", roles: ["editor"] } });
+  executeWidgetQuery.mockResolvedValue({ op: "count", total: 3 });
+  canReadEntity.mockResolvedValue(true);
+  clearSources();
+  clearSystemResolvers();
+  logged.length = 0;
+  setNextlyLogger(testLogger);
+  // No general settings unless a case configures them: dates stay in UTC.
+  containerHas.mockReturnValue(false);
+  containerGet.mockImplementation((name: string) => {
+    if (name === "collectionRegistryService") {
+      return { getAllCollectionsForRead: async () => registeredCollections };
+    }
+    if (name === "singleRegistryService") {
+      return { getAllSinglesForRead: async () => registeredSingles };
+    }
+    throw new Error(`unexpected container.get("${name}") in this test`);
+  });
+  // The endpoint derives its collection sources from the live collection
+  // registry, so the fixture describes what that registry holds rather than
+  // pre-registering a source the handler would replace anyway.
+  registeredCollections = [
+    {
+      slug: "posts",
+      fields: [{ name: "status", type: "text" }],
+      timestamps: true,
+    },
+  ];
+  registeredSingles = [];
+});
+
+/** What the live collection registry answers with for the case under test. */
+let registeredCollections: Array<{
+  slug: string;
+  fields: Array<{ name: string; type: string }>;
+  timestamps: boolean;
+}> = [];
+
+/** What the live singles registry answers with; the same seam, other kind. */
+let registeredSingles: Array<{
+  slug: string;
+  fields: Array<{ name: string; type: string }>;
+  status?: boolean;
+}> = [];
+
+afterEach(() => {
+  setNextlyLogger(undefined);
+});
+
+describe("POST /api/dashboard/query", () => {
+  it("returns one result per query, positionally", async () => {
+    const res = await postWidgetQuery(
+      makeReq({
+        queries: [
+          { source: "collection:posts", op: "count" },
+          { source: "collection:posts", op: "count" },
+        ],
+      })
+    );
+    const body = (await res.json()) as { results: unknown[] };
+    expect(res.status).toBe(200);
+    expect(body.results).toHaveLength(2);
+  });
+
+  it("passes the resolved caller to every execution, resolving it ONCE", async () => {
+    await postWidgetQuery(
+      makeReq({
+        queries: [
+          { source: "collection:posts", op: "count" },
+          { source: "collection:posts", op: "count" },
+        ],
+      })
+    );
+
+    // Role-slug resolution is a database read; a 20-widget dashboard must not
+    // pay for it 20 times.
+    expect(readCaller).toHaveBeenCalledTimes(1);
+    expect(executeWidgetQuery).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        user: expect.objectContaining({ id: "user-1" }),
+      }),
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
+  });
+
+  it("isolates one failing query instead of failing the batch", async () => {
+    executeWidgetQuery
+      .mockResolvedValueOnce({ op: "count", total: 1 })
+      .mockRejectedValueOnce(new Error("boom"));
+
+    const res = await postWidgetQuery(
+      makeReq({
+        queries: [
+          { source: "collection:posts", op: "count" },
+          { source: "collection:posts", op: "count" },
+        ],
+      })
+    );
+    const body = (await res.json()) as {
+      results: Array<{ ok: boolean; error?: string }>;
+    };
+    expect(body.results[0].ok).toBe(true);
+    expect(body.results[1].ok).toBe(false);
+    // A widget's failure is its own card's problem, not the dashboard's.
+    expect(res.status).toBe(200);
+  });
+
+  it("reports an invalid query as that query's failure, not a 400 for the batch", async () => {
+    const res = await postWidgetQuery(
+      makeReq({ queries: [{ source: "collection:nope", op: "count" }] })
+    );
+    const slots = await slotsOf(res);
+    expect(res.status).toBe(200);
+    expect(slots[0].ok).toBe(false);
+    expect(slots[0].error).toBeTruthy();
+  });
+
+  it("refuses a batch larger than the cap", async () => {
+    const queries = Array.from({ length: 40 }, () => ({
+      source: "collection:posts",
+      op: "count",
+    }));
+    const res = await postWidgetQuery(makeReq({ queries }));
+    expect(res.status).toBe(400);
+  });
+
+  it("serves a collection that exists only in the Schema Builder", async () => {
+    // A Builder-authored collection lives in `dynamic_collections` and is
+    // ABSENT from `transformedConfig.collections`, so a source registry built
+    // from the static config has no entry for it -- and the widget surface
+    // silently refuses one of the framework's two schema modes while the
+    // Direct API and the dashboard both read it fine. The registry is the
+    // source of truth both of those already use.
+    registeredCollections = [
+      {
+        slug: "reports",
+        fields: [{ name: "title", type: "text" }],
+        timestamps: true,
+      },
+    ];
+
+    const res = await postWidgetQuery(
+      makeReq({ queries: [{ source: "collection:reports", op: "count" }] })
+    );
+
+    const slots = await slotsOf(res);
+    expect(slots[0].error).toBeUndefined();
+    expect(slots[0].ok).toBe(true);
+  });
+
+  describe("a source the caller may not read is indistinguishable from one that does not exist", () => {
+    // `validateWidgetQuery` used to run in full BEFORE anything authorized the
+    // source, so the two answers diverged on the first field-level check: a
+    // source that EXISTS returned `where references undeclared field "zzz" on
+    // "collection:salaries"`, and one that does not returned the generic
+    // unavailable-source refusal. Diffing the two walks an install's schema
+    // one collection name at a time.
+    const probe = (source: string) => ({
+      queries: [{ source, op: "list", where: { zzz: { equals: 1 } } }],
+    });
+
+    beforeEach(() => {
+      registeredCollections = [
+        {
+          slug: "salaries",
+          fields: [{ name: "amount", type: "number" }],
+          timestamps: true,
+        },
+      ];
+      canReadEntity.mockResolvedValue(false);
+    });
+
+    it("answers the same for a forbidden source and an unknown one", async () => {
+      const forbidden = await postWidgetQuery(
+        makeReq(probe("collection:salaries"))
+      );
+      const unknown = await postWidgetQuery(makeReq(probe("collection:nope")));
+
+      const a = (await slotsOf(forbidden))[0];
+      const b = (await slotsOf(unknown))[0];
+
+      expect(a.ok).toBe(false);
+      expect(b.ok).toBe(false);
+      expect(a.error).toBe(b.error);
+      expect(a.error).not.toContain("salaries");
+      expect(a.error).not.toContain("zzz");
+    });
+
+    it("answers the same for a forbidden source whose op IS supported", async () => {
+      // `count` is supported by every collection source, so a query that is
+      // otherwise well-formed reaches execution -- where a permission error
+      // would name the refusal and confirm the collection is real.
+      const forbidden = await postWidgetQuery(
+        makeReq({ queries: [{ source: "collection:salaries", op: "count" }] })
+      );
+      const unknown = await postWidgetQuery(
+        makeReq({ queries: [{ source: "collection:nope", op: "count" }] })
+      );
+
+      const a = (await slotsOf(forbidden))[0];
+      const b = (await slotsOf(unknown))[0];
+      expect(a.error).toBe(b.error);
+      // Nothing ran: the refusal is taken before the query is compiled.
+      expect(executeWidgetQuery).not.toHaveBeenCalled();
+    });
+
+    it("marks a forbidden source and an unknown one with the same typed code", async () => {
+      // The card tells "not available" from "couldn't load" by a code rather than by matching
+      // the sentence. Compared as WHOLE slots, so a code given to one and not the other -- or
+      // any other field that differs -- fails here rather than reopening the oracle.
+      const forbidden = await postWidgetQuery(
+        makeReq({ queries: [{ source: "collection:salaries", op: "count" }] })
+      );
+      const unknown = await postWidgetQuery(
+        makeReq({ queries: [{ source: "collection:nope", op: "count" }] })
+      );
+
+      const a = (await slotsOf(forbidden))[0];
+      const b = (await slotsOf(unknown))[0];
+      expect(a).toEqual({ ok: false, error: a.error, code: "unavailable" });
+      expect(b).toEqual(a);
+    });
+
+    it("takes a read decision for an unknown source as it does for a forbidden one", async () => {
+      // The answers were already alike; the WORK was not. A forbidden source cost a permission
+      // decision before its refusal and an invented one cost nothing, so timing told them
+      // apart. Asserted as "both paths ask", not as elapsed time, which would be flaky.
+      await postWidgetQuery(
+        makeReq({
+          queries: [
+            { source: "collection:salaries", op: "count" },
+            { source: "collection:nope", op: "count" },
+            { source: "single:also-nope", op: "list" },
+          ],
+        })
+      );
+
+      const asked = canReadEntity.mock.calls.map(call => call[0]);
+      expect(asked).toEqual(
+        expect.arrayContaining(["salaries", "nope", "also-nope"])
+      );
+    });
+
+    it("gives the field-level detail no code: it is an error in the widget, not an absence", async () => {
+      // The control for the code. A caller who MAY read the source gets the specific message,
+      // and the card shows it as an error with Retry rather than as "not available".
+      canReadEntity.mockResolvedValue(true);
+
+      const res = await postWidgetQuery(makeReq(probe("collection:salaries")));
+      const slot = (await slotsOf(res))[0];
+
+      expect(slot.ok).toBe(false);
+      expect(slot.code).toBeUndefined();
+    });
+
+    it("takes ONE read decision per entity for the whole batch", async () => {
+      // The batch runs concurrently and a dashboard asks the same few
+      // collections repeatedly, so a decision per SLOT fans out simultaneous
+      // permission reads from a cold cache -- the pathology
+      // `AUTHORIZATION_CONCURRENCY` exists to bound. Caching the promise, not
+      // its result, is what makes concurrent slots share one decision.
+      canReadEntity.mockResolvedValue(true);
+      await postWidgetQuery(
+        makeReq({
+          queries: [
+            { source: "collection:salaries", op: "count" },
+            { source: "collection:salaries", op: "count" },
+            { source: "collection:salaries", op: "count" },
+          ],
+        })
+      );
+
+      expect(canReadEntity).toHaveBeenCalledTimes(1);
+      expect(canReadEntity).toHaveBeenCalledWith(
+        "salaries",
+        expect.objectContaining({ userId: "user-1" })
+      );
+    });
+
+    it("resolves 30 DISTINCT sources in bounded rounds, not all at once", async () => {
+      // The promise cache deduplicates repeated slugs and does nothing for
+      // distinct ones, so a legal 30-query batch naming 30 collections opened
+      // 30 cold permission decisions simultaneously -- exactly the fan-out
+      // `AUTHORIZATION_CONCURRENCY` exists to bound, reached by going around
+      // it. `canReadEntity` resolves a session caller through a per-user TTL
+      // cache, so firing them together makes every one of them a miss.
+      //
+      // Asserted on the GROUPING rather than on elapsed time: each decision is
+      // held open, and what is checked is how many are in flight before any of
+      // them answers. The schedule prescribes one warm-up decision and then at
+      // most eight at once, so as each round is answered the count must climb
+      // 1, 9, 17, 25, 30 -- and the unbounded version dispatches all 30 from a
+      // single synchronous `.map`, so its very first observable count is 30.
+      registeredCollections = Array.from({ length: 30 }, (_, i) => ({
+        slug: `c${i}`,
+        fields: [{ name: "title", type: "text" }],
+        timestamps: true,
+      }));
+
+      const release: Array<(allowed: boolean) => void> = [];
+      canReadEntity.mockImplementation(
+        () => new Promise<boolean>(resolve => release.push(resolve))
+      );
+
+      const pending = postWidgetQuery(
+        makeReq({
+          queries: registeredCollections.map(c => ({
+            source: `collection:${c.slug}`,
+            op: "count",
+          })),
+        })
+      );
+
+      /** Lets every decision taken so far answer. */
+      function answerEveryDecisionSoFar(): void {
+        for (const resolve of release.splice(0, release.length)) resolve(true);
+      }
+
+      // The warm-up: ONE decision populates the shared per-user caches before
+      // anything fans out. `waitFor` stops at the FIRST count that matches, so
+      // this cannot be satisfied by a build that dispatched all 30 -- their
+      // first observable count is already 30 and 1 never occurs.
+      await vi.waitFor(() => expect(canReadEntity).toHaveBeenCalledTimes(1));
+
+      for (const expected of [9, 17, 25, 30]) {
+        answerEveryDecisionSoFar();
+        await vi.waitFor(() =>
+          expect(canReadEntity).toHaveBeenCalledTimes(expected)
+        );
+      }
+
+      // Every distinct slug still gets its own decision -- bounding concurrency
+      // must not become a cap on how many entities are authorized.
+      expect(new Set(canReadEntity.mock.calls.map(c => c[0])).size).toBe(30);
+
+      answerEveryDecisionSoFar();
+      const slots = await slotsOf(await pending);
+      expect(slots).toHaveLength(30);
+      expect(slots.every(slot => slot.ok)).toBe(true);
+    });
+
+    it("keeps the reason in the log", async () => {
+      await postWidgetQuery(makeReq(probe("collection:salaries")));
+      expect(JSON.stringify(logged)).toContain("collection:salaries");
+    });
+
+    it("still gives a caller who MAY read the source the field-level detail", async () => {
+      // The control. Flattening every pre-authorization answer is only correct
+      // because the detail comes back once the caller has been authorized --
+      // otherwise the fix is indistinguishable from deleting the messages, and
+      // a widget author debugging a typo gets nothing to act on.
+      canReadEntity.mockResolvedValue(true);
+
+      const res = await postWidgetQuery(makeReq(probe("collection:salaries")));
+      const slot = (await slotsOf(res))[0];
+
+      expect(slot.ok).toBe(false);
+      expect(slot.error).toContain("zzz");
+    });
+  });
+
+  describe("a system source is admitted, and authorized where its rows live", () => {
+    // Registered directly rather than through `registerSystemSource`, because
+    // `executeWidgetQuery` is mocked in this file: what is under test is the
+    // ENDPOINT's gate, and a resolver would only be consulted past it.
+    // `refreshCollectionSources` replaces sources by KIND, so this survives it.
+    beforeEach(() => {
+      // Through `registerSystemSource`, because the gate now asks the executor
+      // whether anything ANSWERS this source rather than admitting on its kind.
+      // `executeWidgetQuery` is mocked here, so the resolver is never called --
+      // what is under test is the endpoint's gate.
+      registerSystemSource(
+        {
+          id: "system:releases",
+          label: "Releases",
+          kind: "system",
+          supports: ["count"],
+          fields: [{ name: "title", type: "string" }],
+        },
+        vi.fn()
+      );
+    });
+
+    it("reaches execution rather than being refused as an unexecutable kind", async () => {
+      // 🔴 The gate refused every kind but `collection`, so a registered system
+      // source was unreachable through the only production caller: the whole
+      // mechanism answered "unavailable source" to every reader.
+      const res = await postWidgetQuery(
+        makeReq({ queries: [{ source: "system:releases", op: "count" }] })
+      );
+
+      const [slot] = await slotsOf(res);
+      expect(slot.ok).toBe(true);
+      expect(executeWidgetQuery).toHaveBeenCalledWith(
+        expect.objectContaining({ source: "system:releases" }),
+        expect.anything(),
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      );
+    });
+
+    it("takes NO entity read decision of its own", async () => {
+      // 🔴 The property that keeps this from becoming a second access
+      // implementation. A system source's rows are not an entity the permission
+      // table names, and the service that owns them authorizes this same caller
+      // -- a decision invented here would be a coarser rule shadowing that one,
+      // free to drift from it. A `mayRead` added for these sources fails here.
+      await postWidgetQuery(
+        makeReq({ queries: [{ source: "system:releases", op: "count" }] })
+      );
+
+      expect(canReadEntity).not.toHaveBeenCalled();
+    });
+
+    it("refuses a system source NOTHING ANSWERS before field validation", async () => {
+      // 🔴 The kind alone was not enough to admit on. A resolver-less system
+      // source -- registrable through the generic `registerSource` door, which
+      // checks only that the kind agrees with the namespace -- reached
+      // `validateReadWidgetQuery`, and every message from there down is
+      // specific. An undeclared `select` was answered "field ... on
+      // system:orphan", while an invented id got the generic sentence, so the
+      // pair told a caller which system sources exist.
+      registerSource({
+        id: "system:orphan",
+        label: "Orphan",
+        kind: "system",
+        supports: ["count"],
+        fields: [{ name: "title", type: "string" }],
+      });
+
+      const res = await postWidgetQuery(
+        makeReq({
+          queries: [
+            { source: "system:orphan", op: "count", select: ["nope"] },
+            { source: "system:not-registered", op: "count", select: ["nope"] },
+          ],
+        })
+      );
+
+      const [orphan, absent] = await slotsOf(res);
+      expect(orphan.ok).toBe(false);
+      expect(absent.ok).toBe(false);
+      expect(orphan.error).toBe(absent.error);
+      expect(executeWidgetQuery).not.toHaveBeenCalled();
+    });
+
+    it("still refuses a kind nothing executes", async () => {
+      // The control. A gate that admitted everything but collections would
+      // satisfy both cases above while opening every unimplemented kind.
+      registerSource({
+        id: "plugin:stripe/revenue",
+        label: "Revenue",
+        kind: "plugin",
+        supports: ["count"],
+        fields: [{ name: "title", type: "string" }],
+      });
+
+      const res = await postWidgetQuery(
+        makeReq({ queries: [{ source: "plugin:stripe/revenue", op: "count" }] })
+      );
+
+      const [slot] = await slotsOf(res);
+      expect(slot.ok).toBe(false);
+      expect(executeWidgetQuery).not.toHaveBeenCalled();
+    });
+
+    it("refuses an unregistered system source the SAME WAY as a collection the caller may not read", async () => {
+      // 🔴 Admitting the kind must not make the id an oracle. Both dead ends
+      // answer with the one shared string, so "no such system source" cannot be
+      // told from "not yours".
+      canReadEntity.mockResolvedValue(false);
+
+      const res = await postWidgetQuery(
+        makeReq({
+          queries: [
+            { source: "system:nothing-here", op: "count" },
+            { source: "collection:posts", op: "count" },
+          ],
+        })
+      );
+
+      const [absent, forbidden] = await slotsOf(res);
+      expect(absent.ok).toBe(false);
+      expect(forbidden.ok).toBe(false);
+      expect(absent.error).toBe(forbidden.error);
+    });
+  });
+
+  describe("a single source is admitted the way a collection is", () => {
+    // 🔴 The domain made `single` executable while this endpoint -- the only
+    // production caller -- went on refusing every `single:` query as "not
+    // executable yet", because the gate restated the kinds it would admit
+    // instead of asking the executor. Three properties, each of which the
+    // collection path already has, each of which the single path lacked.
+    beforeEach(() => {
+      registeredSingles = [
+        {
+          slug: "settings",
+          fields: [{ name: "siteName", type: "text" }],
+          status: true,
+        },
+      ];
+      executeWidgetQuery.mockResolvedValue({
+        op: "list",
+        items: [{ siteName: "Acme" }],
+      });
+    });
+
+    it("reaches execution when the caller may read the single", async () => {
+      const res = await postWidgetQuery(
+        makeReq({
+          queries: [
+            { source: "single:settings", op: "list", select: ["siteName"] },
+          ],
+        })
+      );
+
+      const [slot] = await slotsOf(res);
+      expect(slot.error).toBeUndefined();
+      expect(slot.ok).toBe(true);
+      expect(executeWidgetQuery).toHaveBeenCalledWith(
+        expect.objectContaining({ source: "single:settings" }),
+        expect.anything(),
+        expect.objectContaining({ signal: expect.any(AbortSignal) })
+      );
+    });
+
+    it("is published by the batch's OWN refresh, from the live singles registry", async () => {
+      // 🔴 Boot publishes no source, and the endpoint refreshed the
+      // collections alone -- so a `single:` query was answered "unknown
+      // source" on a cold process unless some earlier layout request had
+      // happened to refresh the singles. Seeded with a STALE single the
+      // registry no longer holds: a refresh that replaces the kind from the
+      // registry drops it and publishes the live one; a refresh of the
+      // collections alone leaves the stale entry standing and never learns of
+      // the live one.
+      registerSource({
+        id: "single:stale",
+        label: "Stale",
+        kind: "single",
+        supports: ["list"],
+        fields: [{ name: "siteName", type: "string" }],
+      });
+
+      const res = await postWidgetQuery(
+        makeReq({
+          queries: [
+            { source: "single:settings", op: "list", select: ["siteName"] },
+            { source: "single:stale", op: "list", select: ["siteName"] },
+          ],
+        })
+      );
+
+      const [live, stale] = await slotsOf(res);
+      expect(live.ok).toBe(true);
+      expect(stale.ok).toBe(false);
+    });
+
+    it("refuses a caller who may not read the single, indistinguishably from an unknown source", async () => {
+      // The same entity read decision a collection is gated on, put to the
+      // same seam with the single's slug -- and the same one shared sentence
+      // when it refuses, so "not yours" cannot be told from "not there".
+      canReadEntity.mockResolvedValue(false);
+
+      const res = await postWidgetQuery(
+        makeReq({
+          queries: [
+            { source: "single:settings", op: "list", select: ["siteName"] },
+            { source: "single:nope", op: "list", select: ["siteName"] },
+          ],
+        })
+      );
+
+      const [forbidden, unknown] = await slotsOf(res);
+      expect(forbidden.ok).toBe(false);
+      expect(unknown.ok).toBe(false);
+      expect(forbidden.error).toBe(unknown.error);
+      expect(forbidden.error).not.toContain("settings");
+      expect(canReadEntity).toHaveBeenCalledWith(
+        "settings",
+        expect.objectContaining({ userId: "user-1" })
+      );
+      expect(executeWidgetQuery).not.toHaveBeenCalled();
+    });
+
+    it("takes the singles' read decisions in the same bounded rounds as the collections'", async () => {
+      // The warm-up collected the collections alone, so a batch of distinct
+      // singles reached `mayRead` from the slots -- every cold decision at
+      // once, around the bound `authorizationGroups` prescribes. The same
+      // grouping assertion as the collection case: counts climb 1, 9, 17, 25,
+      // 30, and the unbounded build's first observable count is 30.
+      registeredSingles = Array.from({ length: 30 }, (_, i) => ({
+        slug: `s${i}`,
+        fields: [{ name: "title", type: "text" }],
+      }));
+
+      const release: Array<(allowed: boolean) => void> = [];
+      canReadEntity.mockImplementation(
+        () => new Promise<boolean>(resolve => release.push(resolve))
+      );
+
+      const pending = postWidgetQuery(
+        makeReq({
+          queries: registeredSingles.map(single => ({
+            source: `single:${single.slug}`,
+            op: "list",
+            select: ["title"],
+          })),
+        })
+      );
+
+      function answerEveryDecisionSoFar(): void {
+        for (const resolve of release.splice(0, release.length)) resolve(true);
+      }
+
+      await vi.waitFor(() => expect(canReadEntity).toHaveBeenCalledTimes(1));
+      for (const expected of [9, 17, 25, 30]) {
+        answerEveryDecisionSoFar();
+        await vi.waitFor(() =>
+          expect(canReadEntity).toHaveBeenCalledTimes(expected)
+        );
+      }
+      expect(new Set(canReadEntity.mock.calls.map(c => c[0])).size).toBe(30);
+
+      answerEveryDecisionSoFar();
+      const slots = await slotsOf(await pending);
+      expect(slots).toHaveLength(30);
+      expect(slots.every(slot => slot.ok)).toBe(true);
+    });
+  });
+
+  describe("a malformed body answers in the canonical error envelope", () => {
+    // Both refusals used to hand-build `{ error: "some sentence" }` and return
+    // it directly, bypassing `withErrorHandler`. A client parsing
+    // `{ error: { code, message, requestId } }` -- which is what every other
+    // endpoint in this package answers with, and what `parseApiError` reads --
+    // sees `error` as a STRING here and cannot read a code off it.
+    async function envelopeOf(body: unknown) {
+      const res = await postWidgetQuery(makeReq(body));
+      return {
+        status: res.status,
+        body: (await res.json()) as {
+          error?: { code?: string; message?: string; requestId?: string };
+        },
+      };
+    }
+
+    it("answers a missing queries array with a coded error object", async () => {
+      const { status, body } = await envelopeOf({});
+      expect(status).toBe(400);
+      expect(typeof body.error).toBe("object");
+      expect(body.error?.code).toBe("VALIDATION_ERROR");
+      expect(body.error?.requestId).toEqual(expect.any(String));
+    });
+
+    it("rejects an oversized batch WITHOUT reading the collection registry", async () => {
+      // The refusal is a quota, so it is a precondition and runs first. It ran
+      // last: the handler refreshed the collection sources -- a live
+      // `getAllCollections()` read against `dynamic_collections` -- before it
+      // had looked at the body at all, so repeating an invalid request bought
+      // a database round trip per attempt while executing no query.
+      //
+      // Asserted on what the handler CONSUMED rather than on the 400, because
+      // the status was already correct while the read was still happening: a
+      // fix that only moved the message would leave this green.
+      const queries = Array.from({ length: 40 }, () => ({
+        source: "collection:posts",
+        op: "count",
+      }));
+      const { status } = await envelopeOf({ queries });
+
+      expect(status).toBe(400);
+      expect(containerGet).not.toHaveBeenCalledWith(
+        "collectionRegistryService"
+      );
+    });
+
+    it("rejects a missing queries array WITHOUT reading the collection registry", async () => {
+      const { status } = await envelopeOf({});
+
+      expect(status).toBe(400);
+      expect(containerGet).not.toHaveBeenCalledWith(
+        "collectionRegistryService"
+      );
+    });
+
+    it("rejects a body that is not JSON at all, and reads no registry for it", async () => {
+      // `readJsonBody`'s refusal is the third way this body can be invalid,
+      // and it too used to arrive after the read.
+      const res = await postWidgetQuery(
+        new Request("http://localhost/api/dashboard/query", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{ not json",
+        })
+      );
+
+      expect(res.status).toBe(400);
+      expect(containerGet).not.toHaveBeenCalledWith(
+        "collectionRegistryService"
+      );
+    });
+
+    it("DOES read the registry for a well-formed batch", async () => {
+      // The control. Every assertion above is satisfied by a handler that
+      // never reads the registry under any circumstances, which would break
+      // the Schema-Builder collections this endpoint exists to serve.
+      await postWidgetQuery(
+        makeReq({ queries: [{ source: "collection:posts", op: "count" }] })
+      );
+
+      expect(containerGet).toHaveBeenCalledWith("collectionRegistryService");
+    });
+
+    it("answers an oversized batch with a coded error object", async () => {
+      const queries = Array.from({ length: 40 }, () => ({
+        source: "collection:posts",
+        op: "count",
+      }));
+      const { status, body } = await envelopeOf({ queries });
+      expect(status).toBe(400);
+      expect(typeof body.error).toBe("object");
+      expect(body.error?.code).toBe("VALIDATION_ERROR");
+      expect(body.error?.requestId).toEqual(expect.any(String));
+    });
+  });
+
+  describe("a failed slot says nothing internal and is never swallowed", () => {
+    it("does not put a non-NextlyError's own text on the wire", async () => {
+      // The realistic shape: a driver or DbError message carrying SQL
+      // fragments and column names, reaching any authenticated caller
+      // verbatim under HTTP 200. Everywhere else the boundary maps a
+      // non-NextlyError to `NextlyError.internal`, whose public message is
+      // generic; this slot must answer the same way.
+      const leak =
+        'SQLITE_ERROR: no such column: posts.secret_salary in "SELECT ..."';
+      executeWidgetQuery.mockRejectedValueOnce(new Error(leak));
+
+      const res = await postWidgetQuery(
+        makeReq({ queries: [{ source: "collection:posts", op: "count" }] })
+      );
+
+      const slots = await slotsOf(res);
+      expect(slots[0].ok).toBe(false);
+      expect(slots[0].error).not.toContain("SQLITE_ERROR");
+      expect(slots[0].error).not.toContain("secret_salary");
+      expect(slots[0].error).toBe("An unexpected error occurred.");
+    });
+
+    it("LOGS the original error the caller never sees", async () => {
+      // The other half of the same catch: it swallowed the failure entirely,
+      // so nothing in the observability stack ever learned a widget query
+      // broke. Redacting the wire without logging would trade one defect for
+      // a blinder one.
+      const leak = "SQLITE_ERROR: no such column: posts.secret_salary";
+      executeWidgetQuery.mockRejectedValueOnce(new Error(leak));
+
+      await postWidgetQuery(
+        makeReq({ queries: [{ source: "collection:posts", op: "count" }] })
+      );
+
+      expect(JSON.stringify(logged)).toContain("widget-query-failed");
+      expect(JSON.stringify(logged)).toContain("secret_salary");
+    });
+
+    it("passes a NextlyError's public message through", async () => {
+      // A named refusal is the whole value of the error to the caller -- a
+      // widget filtering on a read-ruled field must be told which guard
+      // refused it, not handed "an unexpected error occurred".
+      executeWidgetQuery.mockRejectedValueOnce(NextlyError.forbidden());
+
+      const res = await postWidgetQuery(
+        makeReq({ queries: [{ source: "collection:posts", op: "count" }] })
+      );
+
+      const slots = await slotsOf(res);
+      expect(slots[0].error).toBe(
+        "You don't have permission to perform this action."
+      );
+    });
+
+    it("answers the same for an unknown source and an unsupported op", async () => {
+      // Distinguishable refusals make the endpoint a source-enumeration
+      // oracle: "does not support op" confirms the source EXISTS, so a caller
+      // can walk collection names and learn the schema of an install it was
+      // never shown. The detail belongs in the log, not the reply.
+      const unknownSource = await postWidgetQuery(
+        makeReq({ queries: [{ source: "collection:salaries", op: "count" }] })
+      );
+      // The unsupported pair is unsupported BY CONSTRUCTION: a source
+      // registered here declaring only `list`, asked for `count`. Naming an op
+      // that no source happened to declare yet tied this test to the op
+      // vocabulary, so implementing one turned it red for a reason that has
+      // nothing to do with the property under test -- which is that the two
+      // refusals are indistinguishable, not which op is unimplemented.
+      registerSystemSource(
+        {
+          id: "system:listing-only",
+          label: "Listing only",
+          kind: "system",
+          supports: ["list"],
+          fields: [{ name: "title", type: "string" }],
+        },
+        vi.fn()
+      );
+      const unsupportedOp = await postWidgetQuery(
+        makeReq({
+          queries: [{ source: "system:listing-only", op: "count" }],
+        })
+      );
+
+      const a = (await slotsOf(unknownSource))[0];
+      const b = (await slotsOf(unsupportedOp))[0];
+
+      expect(a.ok).toBe(false);
+      expect(b.ok).toBe(false);
+      expect(a.error).toBe(b.error);
+      // The whole slot, code included: a code on the unknown id alone would confirm that
+      // `system:listing-only` exists just as a different sentence would.
+      expect(b).toEqual(a);
+      expect(a.error).not.toContain("salaries");
+      expect(b.error).not.toContain("listing-only");
+    });
+
+    it("keeps the source/op detail in the log", async () => {
+      // The negative control for the test above: made indistinguishable to
+      // the caller, NOT thrown away. An operator debugging a broken dashboard
+      // still needs to know which source was named.
+      await postWidgetQuery(
+        makeReq({ queries: [{ source: "collection:salaries", op: "count" }] })
+      );
+
+      expect(JSON.stringify(logged)).toContain("collection:salaries");
+    });
+  });
+});
+
+describe("the batch's one instant", () => {
+  it("measures every query in a batch from the same moment, each handed its own copy", async () => {
+    const res = await postWidgetQuery(
+      makeReq({
+        queries: [
+          { source: "collection:posts", op: "count" },
+          {
+            source: "collection:posts",
+            op: "count",
+            where: { status: { equals: "a" } },
+          },
+          {
+            source: "collection:posts",
+            op: "count",
+            where: { status: { equals: "b" } },
+          },
+        ],
+      })
+    );
+    expect(res.status).toBe(200);
+    const instants = executeWidgetQuery.mock.calls.map(
+      call => (call[2] as { now?: Date } | undefined)?.now
+    );
+    expect(instants).toHaveLength(3);
+    const [first, ...rest] = instants;
+    expect(first).toBeInstanceOf(Date);
+    // The same moment for all three: a "last 30 days" and its neighbour
+    // cannot straddle two instants.
+    for (const instant of rest) {
+      expect(instant?.getTime()).toBe(first?.getTime());
+      // A copy each, so a resolver that moves its own cannot move the next.
+      expect(instant).not.toBe(first);
+    }
+  });
+});
+
+describe("a body that is not JSON at all", () => {
+  /** A request whose body the JSON parser cannot finish reading. */
+  function makeRawReq(raw: string): Request {
+    return new Request("http://localhost/api/dashboard/query", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: raw,
+    });
+  }
+
+  it("answers 400 in the canonical validation envelope", async () => {
+    // `req.json()` throws a raw `SyntaxError`, which `withErrorHandler`
+    // classifies as internal -- so a truncated body answered 500 while the
+    // body-SHAPE failures right below it answered with the canonical envelope.
+    // Two refusals about the same request body, told two different ways.
+    const res = await postWidgetQuery(makeRawReq('{"queries": ['));
+
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as {
+      error: { code: string; data?: { errors: Array<{ code: string }> } };
+    };
+    expect(body.error.code).toBe("VALIDATION_ERROR");
+    expect(body.error.data?.errors[0].code).toBe("invalid_json");
+  });
+
+  it("answers the same way as a well-formed body of the wrong shape", async () => {
+    // The property that was missing: both are refusals about the request body,
+    // so a client has one envelope to parse and one code to branch on.
+    const malformed = await postWidgetQuery(makeRawReq("not json"));
+    const wrongShape = await postWidgetQuery(makeReq({ queries: "nope" }));
+
+    expect(malformed.status).toBe(wrongShape.status);
+    const a = (await malformed.json()) as { error: { code: string } };
+    const b = (await wrongShape.json()) as { error: { code: string } };
+    expect(a.error.code).toBe(b.error.code);
+  });
+
+  it("refuses the REQUEST rather than reporting a per-slot failure", async () => {
+    // The batch shape isolates one query's failure into its own slot under a
+    // 200, so "did not execute" alone does not separate the two outcomes -- a
+    // 500 does not execute either. What separates them is that the body is a
+    // canonical error envelope rather than a `results` array.
+    const res = await postWidgetQuery(makeRawReq("{"));
+    const body = (await res.json()) as { results?: unknown; error?: unknown };
+    expect(body.results).toBeUndefined();
+    expect(body.error).toBeDefined();
+    expect(res.status).toBe(400);
+    expect(executeWidgetQuery).not.toHaveBeenCalled();
+  });
+});
+
+describe("the dashboard load a batch names", () => {
+  const count = { source: "collection:posts", op: "count" };
+
+  /** The card batch each request handed `prepareCards`, in order. */
+  function cardBatches() {
+    return preparedCards.mock.calls.map(([, batch]) => batch);
+  }
+
+  it("hands its cards the load the body names, as that load's batch, and none when it names none", async () => {
+    const named = await postWidgetQuery(
+      makeReq({ queries: [count], readAheadToken: "load-1" })
+    );
+    const unnamed = await postWidgetQuery(makeReq({ queries: [count] }));
+
+    expect(named.status).toBe(200);
+    expect(unnamed.status).toBe(200);
+    const [asNamed, asUnnamed] = cardBatches();
+    expect(asNamed?.readAhead).toEqual({ side: "batch", token: "load-1" });
+    // A batch of no load takes nothing read ahead for any.
+    expect(asUnnamed).toBeDefined();
+    expect(asUnnamed).not.toHaveProperty("readAhead");
+  });
+
+  it("takes a token as long as the longest it accepts", async () => {
+    const longest = "x".repeat(64);
+    const res = await postWidgetQuery(
+      makeReq({ queries: [count], readAheadToken: longest })
+    );
+
+    expect(res.status).toBe(200);
+    expect(cardBatches()[0]?.readAhead).toEqual({
+      side: "batch",
+      token: longest,
+    });
+  });
+
+  it.each([
+    ["not a string", 7],
+    ["null", null],
+    ["empty", ""],
+    ["longer than the longest it accepts", "x".repeat(65)],
+  ])(
+    "refuses a token that is %s, as a malformed field of the body, before any read",
+    async (_, readAheadToken) => {
+      const res = await postWidgetQuery(
+        makeReq({ queries: [count], readAheadToken })
+      );
+
+      expect(res.status).toBe(400);
+      const body = (await res.json()) as {
+        error: { code: string; data?: { errors: Array<{ path: string }> } };
+      };
+      expect(body.error.code).toBe("VALIDATION_ERROR");
+      expect(body.error.data?.errors[0].path).toBe("readAheadToken");
+      // A validity check, so a precondition: refused before the registry read.
+      expect(containerGet).not.toHaveBeenCalledWith(
+        "collectionRegistryService"
+      );
+      expect(preparedCards).not.toHaveBeenCalled();
+    }
+  );
+});
+
+describe("a slot that never settles", () => {
+  /**
+   * A source answered by a resolver, registered the way boot registers one.
+   *
+   * The kind matters to the assertion rather than to the timer: a
+   * resolver-answered source is the one that can make a network call, and a
+   * dead outbound connection does not reject -- it hangs. That is the shape
+   * the bound exists for.
+   */
+  function registerHangingSource(id: string): void {
+    registerSystemSource(
+      {
+        id,
+        label: "Slow",
+        kind: "system",
+        supports: ["count"],
+        fields: [{ name: "total", type: "number" }],
+      },
+      () => new Promise<never>(() => {})
+    );
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("fails the hung slot alone, and the rest of the batch still answers", async () => {
+    // 🔴 The defect: the batch aggregates with `Promise.all`, so it is only as
+    // fast as its slowest slot. One query that never settles held every other
+    // card behind it and the reader saw NOTHING -- not seven cards and one
+    // error, which is what the per-slot shape exists to produce.
+    vi.useFakeTimers();
+    registerHangingSource("system:slow");
+    executeWidgetQuery.mockImplementation((query: { source: string }) =>
+      query.source === "system:slow"
+        ? new Promise(() => {})
+        : Promise.resolve({ op: "count", total: 7 })
+    );
+
+    const pending = postWidgetQuery(
+      makeReq({
+        queries: [
+          { source: "system:slow", op: "count" },
+          { source: "collection:posts", op: "count" },
+        ],
+      })
+    );
+
+    // Past the bound. `Async` because the race settles on a microtask that a
+    // synchronous timer advance would never let run.
+    await vi.advanceTimersByTimeAsync(31_000);
+    const slots = await slotsOf(await pending);
+
+    expect(slots[0].ok).toBe(false);
+    expect(slots[0].error).toMatch(/took too long/i);
+    // The control, and the whole point: the sibling was not held behind it.
+    expect(slots[1].ok).toBe(true);
+  });
+
+  it("names the source in the log, where an operator can act on it", async () => {
+    // The caller is told their card timed out; only the log says WHICH source
+    // is hanging, which is the half an operator needs.
+    vi.useFakeTimers();
+    registerHangingSource("system:slow");
+    executeWidgetQuery.mockImplementation(() => new Promise(() => {}));
+
+    const pending = postWidgetQuery(
+      makeReq({ queries: [{ source: "system:slow", op: "count" }] })
+    );
+    await vi.advanceTimersByTimeAsync(31_000);
+    await pending;
+
+    expect(
+      logged.some(
+        entry =>
+          JSON.stringify(entry).includes("widget-slot-timeout") &&
+          JSON.stringify(entry).includes("system:slow")
+      )
+    ).toBe(true);
+  });
+
+  it("does not fail a slot that answers within the bound", async () => {
+    // The must-differ half. Without it a bound of zero -- or one that fired
+    // unconditionally -- satisfies both cases above.
+    vi.useFakeTimers();
+    registerHangingSource("system:slow");
+    executeWidgetQuery.mockResolvedValue({ op: "count", total: 4 });
+
+    const pending = postWidgetQuery(
+      makeReq({ queries: [{ source: "system:slow", op: "count" }] })
+    );
+    await vi.advanceTimersByTimeAsync(29_000);
+    const slots = await slotsOf(await pending);
+
+    expect(slots[0].ok).toBe(true);
+  });
+
+  it("aborts the signal it handed the resolver when the budget expires", async () => {
+    // 🔴 Giving up on the race does not stop the work: a promise has no
+    // cancellation, so a hung resolver kept its connection and its memory while
+    // the next request started up to thirty more. The signal is how it is told,
+    // and a resolver that passes it to `fetch` or a database client stops
+    // rather than merely stops being awaited.
+    vi.useFakeTimers();
+    registerHangingSource("system:slow");
+    let handed: AbortSignal | undefined;
+    executeWidgetQuery.mockImplementation(
+      (
+        _query: unknown,
+        _caller: unknown,
+        opts?: { signal?: AbortSignal }
+      ): Promise<never> => {
+        handed = opts?.signal;
+        return new Promise<never>(() => {});
+      }
+    );
+
+    const pending = postWidgetQuery(
+      makeReq({ queries: [{ source: "system:slow", op: "count" }] })
+    );
+
+    // The must-differ half, and it has to be asserted INSIDE the budget: a
+    // signal aborted unconditionally would satisfy the check below on its own.
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(handed).toBeInstanceOf(AbortSignal);
+    expect(handed?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await pending;
+
+    expect(handed?.aborted).toBe(true);
+  });
+
+  it("leaves the signal alone for a slot that answers in time", async () => {
+    // The abandoned work is what gets cancelled, never the work that finished.
+    // A resolver that returned inside the budget must not see its signal abort
+    // afterwards -- it may still be holding it open for its own cleanup.
+    vi.useFakeTimers();
+    registerHangingSource("system:slow");
+    let handed: AbortSignal | undefined;
+    executeWidgetQuery.mockImplementation(
+      (_query: unknown, _caller: unknown, opts?: { signal?: AbortSignal }) => {
+        handed = opts?.signal;
+        return Promise.resolve({ op: "count", total: 4 });
+      }
+    );
+
+    const pending = postWidgetQuery(
+      makeReq({ queries: [{ source: "system:slow", op: "count" }] })
+    );
+    await vi.advanceTimersByTimeAsync(31_000);
+    const slots = await slotsOf(await pending);
+
+    expect(slots[0].ok).toBe(true);
+    expect(handed?.aborted).toBe(false);
+  });
+});
+
+describe("a resolver that returns something the response cannot encode", () => {
+  it("fails that slot alone, and the rest of the batch still answers", async () => {
+    // 🔴 `respondData` calls `JSON.stringify` over the WHOLE results array,
+    // after `Promise.all` and outside every slot's catch. So a value the
+    // encoder refuses used to throw at the response and answer 500 with every
+    // sibling's rows discarded -- one plugin's bad row blanking the dashboard,
+    // which is the outcome the per-slot shape exists to prevent.
+    // Both slots name the SAME registered source, dispatching on the op. An
+    // earlier revision used a second, unregistered source for the bad slot --
+    // which failed as "unavailable source" before the executor ran at all, so
+    // the case passed with this guard removed.
+    executeWidgetQuery.mockImplementation((query: { op: string }) => {
+      if (query.op === "list") {
+        const cyclic: Record<string, unknown> = { name: "loop" };
+        cyclic.self = cyclic;
+        return Promise.resolve({ op: "list", items: [cyclic] });
+      }
+      return Promise.resolve({ op: "count", total: 5 });
+    });
+
+    const res = await postWidgetQuery(
+      makeReq({
+        queries: [
+          { source: "collection:posts", op: "list" },
+          { source: "collection:posts", op: "count" },
+        ],
+      })
+    );
+
+    // A 200 with slots, not a request-level failure.
+    expect(res.status).toBe(200);
+    const slots = await slotsOf(res);
+    expect(slots[0].ok).toBe(false);
+    // The control, and the whole point: the sibling was not blanked.
+    expect(slots[1].ok).toBe(true);
+  });
+
+  it("says so in the log, naming the source", async () => {
+    executeWidgetQuery.mockImplementation(() =>
+      Promise.resolve({ op: "list", items: [{ big: BigInt(1) }] })
+    );
+
+    await postWidgetQuery(
+      makeReq({ queries: [{ source: "collection:posts", op: "list" }] })
+    );
+
+    expect(
+      logged.some(entry =>
+        JSON.stringify(entry).includes("widget-result-unserialisable")
+      )
+    ).toBe(true);
+  });
+
+  it("passes an ordinary result through unchanged", async () => {
+    // The must-differ half. Without it a guard that failed every slot -- or
+    // one that quietly emptied results -- satisfies both cases above.
+    executeWidgetQuery.mockResolvedValue({ op: "count", total: 11 });
+
+    const res = await postWidgetQuery(
+      makeReq({ queries: [{ source: "collection:posts", op: "count" }] })
+    );
+    const body = (await res.json()) as {
+      results: Array<{ ok: boolean; result?: { total?: number } }>;
+    };
+    expect(body.results[0].ok).toBe(true);
+    expect(body.results[0].result?.total).toBe(11);
+  });
+});
+
+describe("a batch that asks one source several times", () => {
+  const ISSUES = "plugin:acme/issues";
+  const info: object[] = [];
+
+  /** A plugin source that answers several queries in one call, with `resolveMany` as given. */
+  function registerManySource(resolveMany: unknown) {
+    registerResolvedSource(
+      {
+        id: ISSUES,
+        label: "Issues",
+        kind: "plugin",
+        supports: ["count"],
+        fields: [{ name: "issue", type: "string" }],
+      },
+      vi.fn(),
+      resolveMany as never
+    );
+  }
+
+  const count = (issue: string) => ({
+    source: ISSUES,
+    op: "count",
+    where: { issue: { equals: issue } },
+  });
+
+  beforeEach(() => {
+    info.length = 0;
+    setNextlyLogger({ ...testLogger, info: (p: object) => void info.push(p) });
+  });
+
+  it("asks a source with resolveMany ONCE for all its queries, and maps the answers back by position", async () => {
+    const resolveMany = vi.fn(async (queries: unknown[]) =>
+      queries.map((_, i) => ({ op: "count", total: (i + 1) * 10 }))
+    );
+    registerManySource(resolveMany);
+
+    const res = await postWidgetQuery(
+      makeReq({ queries: [count("a"), count("b"), count("c")] })
+    );
+    const slots = (await res.json()) as {
+      results: Array<{ ok: boolean; result?: { total: number } }>;
+    };
+
+    expect(resolveMany).toHaveBeenCalledTimes(1);
+    expect(executeWidgetQuery).not.toHaveBeenCalled();
+    expect(slots.results.map(slot => slot.result?.total)).toEqual([10, 20, 30]);
+    // Handed this source's own view of the batch's shared work, and the group's signal.
+    expect(resolveMany).toHaveBeenCalledWith(
+      expect.any(Array),
+      expect.anything(),
+      expect.objectContaining({
+        signal: expect.any(AbortSignal),
+        scope: expect.objectContaining({ getOrCompute: expect.any(Function) }),
+      })
+    );
+    expect(info).toContainEqual(
+      expect.objectContaining({
+        kind: "widget-source-asked-several",
+        source: ISSUES,
+        queries: 3,
+        grouped: true,
+      })
+    );
+  });
+
+  /**
+   * A batch with a collection query ahead of `queries`, whose read decision --
+   * taken once every query is prepared and before any is answered -- runs
+   * `meanwhile` first, as a source registry changing mid-batch would.
+   */
+  async function askWhileDeciding(meanwhile: () => void, queries: object[]) {
+    canReadEntity.mockImplementationOnce(async () => {
+      meanwhile();
+      return true;
+    });
+    const res = await postWidgetQuery(
+      makeReq({
+        queries: [{ source: "collection:posts", op: "count" }, ...queries],
+      })
+    );
+    return (await res.json()) as {
+      results: Array<{ ok: boolean; result?: { total: number } }>;
+    };
+  }
+
+  const answering = (total: number) =>
+    vi.fn(async (queries: unknown[]) =>
+      queries.map(() => ({ op: "count", total }))
+    );
+
+  it("answers a source replaced while the batch awaited its read decisions through the replacement", async () => {
+    const replaced = answering(1);
+    const replacement = answering(2);
+    registerManySource(replaced);
+
+    // A source id is registered once, so a replacement is the old source
+    // removed and a new one registered under its id.
+    const slots = await askWhileDeciding(() => {
+      clearSources();
+      clearResolvers();
+      registerManySource(replacement);
+    }, [count("a"), count("b")]);
+
+    expect(replaced).not.toHaveBeenCalled();
+    expect(replacement).toHaveBeenCalledTimes(1);
+    expect(slots.results.slice(1).map(slot => slot.result?.total)).toEqual([
+      2, 2,
+    ]);
+  });
+
+  it("refuses a source removed while the batch awaited its read decisions, as one query would be", async () => {
+    const removed = answering(1);
+    registerManySource(removed);
+
+    const slots = await askWhileDeciding(
+      () => clearResolvers(),
+      [count("a"), count("b")]
+    );
+
+    expect(removed).not.toHaveBeenCalled();
+    expect(slots.results.slice(1).map(slot => slot.ok)).toEqual([false, false]);
+  });
+
+  it("logs the live decision: a group whose source lost resolveMany meanwhile is answered per query", async () => {
+    const replaced = answering(1);
+    registerManySource(replaced);
+
+    await askWhileDeciding(() => {
+      clearSources();
+      clearResolvers();
+      // The same source again, answering one query at a time.
+      registerResolvedSource(
+        {
+          id: ISSUES,
+          label: "Issues",
+          kind: "plugin",
+          supports: ["count"],
+          fields: [{ name: "issue", type: "string" }],
+        },
+        vi.fn()
+      );
+    }, [count("a"), count("b")]);
+
+    expect(replaced).not.toHaveBeenCalled();
+    expect(executeWidgetQuery).toHaveBeenCalledTimes(3);
+    expect(info).toContainEqual(
+      expect.objectContaining({
+        kind: "widget-source-asked-several",
+        source: ISSUES,
+        grouped: false,
+      })
+    );
+    expect(info).not.toContainEqual(
+      expect.objectContaining({ source: ISSUES, grouped: true })
+    );
+  });
+
+  it("fails only the query whose answer is an Error", async () => {
+    registerManySource(async () => [
+      { op: "count", total: 4 },
+      new Error("cannot answer this one"),
+    ]);
+
+    const slots = await slotsOf(
+      await postWidgetQuery(makeReq({ queries: [count("a"), count("b")] }))
+    );
+
+    expect(slots[0].ok).toBe(true);
+    expect(slots[1].ok).toBe(false);
+    // A plain Error's message is not put on the wire.
+    expect(slots[1].error).toBe("An unexpected error occurred.");
+  });
+
+  it.each([
+    ["one too few", 1],
+    ["one too many", 3],
+  ])("fails the whole group when it answers %s", async (_, answers) => {
+    registerManySource(async () =>
+      Array.from({ length: answers }, () => ({ op: "count", total: 1 }))
+    );
+
+    const slots = await slotsOf(
+      await postWidgetQuery(makeReq({ queries: [count("a"), count("b")] }))
+    );
+
+    expect(slots.map(slot => slot.ok)).toEqual([false, false]);
+    expect(
+      logged.some(
+        entry =>
+          JSON.stringify(entry).includes("widget-resolve-many-length") &&
+          JSON.stringify(entry).includes(ISSUES)
+      )
+    ).toBe(true);
+  });
+
+  it("holds the group to ONE budget: a group that hangs times out together, and is told to stop", async () => {
+    vi.useFakeTimers();
+    let handed: AbortSignal | undefined;
+    registerManySource(
+      async (_queries: unknown, _caller: unknown, opts: unknown) => {
+        handed = (opts as { signal: AbortSignal }).signal;
+        return new Promise(() => {});
+      }
+    );
+
+    const pending = postWidgetQuery(
+      makeReq({ queries: [count("a"), count("b")] })
+    );
+    await vi.advanceTimersByTimeAsync(31_000);
+    const slots = await slotsOf(await pending);
+    vi.useRealTimers();
+
+    expect(slots.map(slot => slot.error)).toEqual([
+      "This widget took too long to answer",
+      "This widget took too long to answer",
+    ]);
+    expect(handed?.aborted).toBe(true);
+  });
+
+  it("answers ONE query from such a source on its own, through the one-query path", async () => {
+    const resolveMany = vi.fn();
+    registerManySource(resolveMany);
+
+    await postWidgetQuery(makeReq({ queries: [count("a")] }));
+
+    expect(resolveMany).not.toHaveBeenCalled();
+    expect(executeWidgetQuery).toHaveBeenCalledTimes(1);
+  });
+
+  it("answers a source WITHOUT resolveMany per query, as before, and says so in the log", async () => {
+    registerSystemSource(
+      {
+        id: "system:releases",
+        label: "Releases",
+        kind: "system",
+        supports: ["count"],
+        fields: [{ name: "title", type: "string" }],
+      },
+      vi.fn()
+    );
+
+    await postWidgetQuery(
+      makeReq({
+        queries: [
+          { source: "system:releases", op: "count" },
+          { source: "system:releases", op: "count" },
+        ],
+      })
+    );
+
+    expect(executeWidgetQuery).toHaveBeenCalledTimes(2);
+    expect(info).toContainEqual(
+      expect.objectContaining({
+        kind: "widget-source-asked-several",
+        source: "system:releases",
+        queries: 2,
+        grouped: false,
+      })
+    );
+  });
+
+  it("checks each query first: one that fails validation is refused alone and never joins the group", async () => {
+    const resolveMany = vi.fn(async (queries: unknown[]) =>
+      queries.map(() => ({ op: "count", total: 1 }))
+    );
+    registerManySource(resolveMany);
+
+    const slots = await slotsOf(
+      await postWidgetQuery(
+        makeReq({
+          queries: [
+            count("a"),
+            {
+              source: ISSUES,
+              op: "count",
+              where: { undeclared: { equals: 1 } },
+            },
+            count("c"),
+          ],
+        })
+      )
+    );
+
+    expect(slots.map(slot => slot.ok)).toEqual([true, false, true]);
+    expect(resolveMany).toHaveBeenCalledTimes(1);
+    expect((resolveMany.mock.calls[0]?.[0] as unknown[]).length).toBe(2);
+  });
+});
+
+describe("the streamed answer", () => {
+  /** A batch request asking for each slot as it settles. */
+  function streamReq(body: unknown): Request {
+    return new Request("http://localhost/api/dashboard/query", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/x-ndjson",
+      },
+      body: JSON.stringify(body),
+    });
+  }
+
+  interface Line {
+    index: number;
+    slot: { ok: boolean; error?: string; code?: string; result?: unknown };
+  }
+
+  /** Every line of a finished stream, parsed. */
+  async function linesOf(res: Response): Promise<Line[]> {
+    const text = await res.text();
+    return text
+      .split("\n")
+      .filter(line => line.length > 0)
+      .map(line => JSON.parse(line) as Line);
+  }
+
+  /** Reads the stream one write at a time, each write as the lines it carried. */
+  function writesOf(res: Response) {
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    return {
+      async next(): Promise<Line[] | undefined> {
+        const { done, value } = await reader.read();
+        if (done) return undefined;
+        return decoder
+          .decode(value)
+          .split("\n")
+          .filter(line => line.length > 0)
+          .map(line => JSON.parse(line) as Line);
+      },
+      cancel: () => reader.cancel(),
+    };
+  }
+
+  /** A promise this test settles when it chooses. */
+  function held<T>() {
+    let release!: (value: T) => void;
+    const promise = new Promise<T>(resolve => {
+      release = resolve;
+    });
+    return { promise, release };
+  }
+
+  function registerResolverSource(id: string, resolve: unknown) {
+    registerSystemSource(
+      {
+        id,
+        label: id,
+        kind: "system",
+        supports: ["count", "list"],
+        fields: [{ name: "total", type: "number" }],
+      },
+      resolve as never
+    );
+  }
+
+  it("answers with today's JSON when the client does not ask for the stream", async () => {
+    const res = await postWidgetQuery(
+      makeReq({ queries: [{ source: "collection:posts", op: "count" }] })
+    );
+
+    expect(res.headers.get("content-type")).toMatch(/application\/json/);
+    // Two encodings of one URL: a cache keyed without `Accept` would hand one to the other.
+    expect(res.headers.get("vary")).toMatch(/Accept/);
+    expect(await slotsOf(res)).toEqual([
+      { ok: true, result: { op: "count", total: 3 } },
+    ]);
+  });
+
+  it("writes one line per slot, each the slot the JSON answer holds and nothing more", async () => {
+    // One readable query, one the caller may not read, one invalid for its source, and one
+    // whose execution fails with an internal message that must never reach the wire.
+    registeredCollections = [
+      ...registeredCollections,
+      {
+        slug: "salaries",
+        fields: [{ name: "amount", type: "number" }],
+        timestamps: true,
+      },
+    ];
+    canReadEntity.mockImplementation(
+      async (slug: string) => slug !== "salaries"
+    );
+    executeWidgetQuery.mockImplementation((query: { op: string }) =>
+      query.op === "list"
+        ? Promise.reject(new Error('relation "posts_internal" does not exist'))
+        : Promise.resolve({ op: "count", total: 4 })
+    );
+    const body = {
+      queries: [
+        { source: "collection:posts", op: "count" },
+        { source: "collection:salaries", op: "count" },
+        {
+          source: "collection:posts",
+          op: "count",
+          where: { zzz: { equals: 1 } },
+        },
+        { source: "collection:posts", op: "list" },
+      ],
+    };
+
+    const json = await slotsOf(await postWidgetQuery(makeReq(body)));
+    const res = await postWidgetQuery(streamReq(body));
+    const lines = await linesOf(res);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/x-ndjson");
+    expect(res.headers.get("cache-control")).toBe(
+      "private, no-store, no-transform"
+    );
+    expect(res.headers.get("x-accel-buffering")).toBe("no");
+    expect(res.headers.get("vary")).toMatch(/Accept/);
+    // Every slot exactly once, each exactly as the JSON answer holds it.
+    expect(lines.map(line => line.index).sort()).toEqual([0, 1, 2, 3]);
+    for (const line of lines) {
+      expect(Object.keys(line).sort()).toEqual(["index", "slot"]);
+      expect(line.slot).toEqual(json[line.index]);
+    }
+    // The control: the four slots differ, so a line carrying another's slot would show.
+    expect(json.map(slot => slot.ok)).toEqual([true, false, false, false]);
+    expect(json[1]).toMatchObject({ code: "unavailable" });
+    expect(JSON.stringify(lines)).not.toContain("posts_internal");
+  });
+
+  it("writes a slot as soon as it settles, ahead of a slower one", async () => {
+    const slow = held<{ op: string; total: number }>();
+    registerResolverSource("system:slow", vi.fn());
+    executeWidgetQuery.mockImplementation((query: { source: string }) =>
+      query.source === "system:slow"
+        ? slow.promise
+        : Promise.resolve({ op: "count", total: 9 })
+    );
+
+    const writes = writesOf(
+      await postWidgetQuery(
+        streamReq({
+          queries: [
+            { source: "system:slow", op: "count" },
+            { source: "collection:posts", op: "count" },
+          ],
+        })
+      )
+    );
+
+    // The fast slot arrives while the slow one is still held: the batch did not wait for it.
+    expect(await writes.next()).toEqual([
+      { index: 1, slot: { ok: true, result: { op: "count", total: 9 } } },
+    ]);
+    slow.release({ op: "count", total: 2 });
+    expect(await writes.next()).toEqual([
+      { index: 0, slot: { ok: true, result: { op: "count", total: 2 } } },
+    ]);
+    expect(await writes.next()).toBeUndefined();
+  });
+
+  it("writes the slots one many-query call answered together, in one write", async () => {
+    const ISSUES = "plugin:acme/issues";
+    registerResolvedSource(
+      {
+        id: ISSUES,
+        label: "Issues",
+        kind: "plugin",
+        supports: ["count"],
+        fields: [{ name: "issue", type: "string" }],
+      },
+      vi.fn(),
+      (async (queries: unknown[]) =>
+        queries.map((_, i) => ({ op: "count", total: i + 1 }))) as never
+    );
+
+    const writes = writesOf(
+      await postWidgetQuery(
+        streamReq({
+          queries: [
+            { source: ISSUES, op: "count", where: { issue: { equals: "a" } } },
+            { source: ISSUES, op: "count", where: { issue: { equals: "b" } } },
+          ],
+        })
+      )
+    );
+
+    expect(await writes.next()).toEqual([
+      { index: 0, slot: { ok: true, result: { op: "count", total: 1 } } },
+      { index: 1, slot: { ok: true, result: { op: "count", total: 2 } } },
+    ]);
+    expect(await writes.next()).toBeUndefined();
+  });
+
+  it("keeps a whole-batch refusal in the error envelope, never a stream", async () => {
+    const res = await postWidgetQuery(streamReq({ notQueries: true }));
+
+    expect(res.status).toBe(400);
+    // The canonical error envelope, served as problem JSON, never as lines.
+    expect(res.headers.get("content-type")).toMatch(/json/);
+    expect(res.headers.get("content-type")).not.toMatch(/ndjson/);
+    expect(
+      ((await res.json()) as { error?: { code?: string } }).error?.code
+    ).toBeDefined();
+  });
+
+  it("formats a streamed slot's dates exactly as the JSON answer's are formatted", async () => {
+    // A configured timezone, so the formatting pass has something to change: the raw value
+    // passing through untouched would otherwise look like agreement.
+    containerHas.mockImplementation(
+      (name: string) => name === "generalSettingsService"
+    );
+    const settings = { getTimezone: async () => "Asia/Karachi" };
+    const registry = containerGet.getMockImplementation()!;
+    containerGet.mockImplementation((name: string) =>
+      name === "generalSettingsService" ? settings : registry(name)
+    );
+    const stored = "2026-10-21T06:00:00.000Z";
+    executeWidgetQuery.mockResolvedValue({
+      op: "list",
+      items: [{ id: "p1", createdAt: stored }],
+    });
+    const body = { queries: [{ source: "collection:posts", op: "list" }] };
+
+    const formatted = await withTimezoneFormatting(
+      await postWidgetQuery(makeReq(body))
+    );
+    const json = await slotsOf(formatted);
+    const [line] = await linesOf(await postWidgetQuery(streamReq(body)));
+
+    expect(line?.slot).toEqual(json[0]);
+    expect(JSON.stringify(line?.slot)).not.toContain(stored);
+  });
+
+  it("gives the batch up when the reader cancels: running work is told, and nothing more is written", async () => {
+    let handed: AbortSignal | undefined;
+    registerResolverSource("system:slow", vi.fn());
+    executeWidgetQuery.mockImplementation(
+      (
+        query: { source: string },
+        _caller: unknown,
+        opts?: { signal?: AbortSignal }
+      ) => {
+        if (query.source !== "system:slow") {
+          return Promise.resolve({ op: "count", total: 1 });
+        }
+        handed = opts?.signal;
+        return new Promise<never>(() => {});
+      }
+    );
+
+    const writes = writesOf(
+      await postWidgetQuery(
+        streamReq({
+          queries: [
+            { source: "system:slow", op: "count" },
+            { source: "collection:posts", op: "count" },
+          ],
+        })
+      )
+    );
+    expect((await writes.next())?.[0]?.index).toBe(1);
+    // The must-differ half: the slow slot's work is still running before the reader leaves.
+    expect(handed?.aborted).toBe(false);
+
+    await writes.cancel();
+
+    expect(handed?.aborted).toBe(true);
+    // Given up, not failed: a departing reader's cards are not logged as broken. A turn of
+    // the event loop first, so the abandoned slot has finished settling.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(
+      logged.some(entry =>
+        JSON.stringify(entry).includes("widget-query-failed")
+      )
+    ).toBe(false);
+  });
+});

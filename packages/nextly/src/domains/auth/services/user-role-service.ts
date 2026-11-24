@@ -1,0 +1,444 @@
+import { randomUUID } from "crypto";
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import { and, eq, inArray, not } from "drizzle-orm";
+
+import type {
+  RBACDatabaseInstance,
+  UserRoleInsertData,
+} from "@nextly/types/rbac-operations";
+
+import { getDialectTables } from "../../../database";
+import { toDbError } from "../../../database/errors";
+import { NextlyError } from "../../../errors";
+import { BaseService } from "../../../services/base-service";
+import { invalidatePermissionCache } from "../../../services/lib/permissions";
+import {
+  roleAssignmentInForce,
+  userRoleAssignmentsInForce,
+} from "../../../services/lib/role-assignments";
+import type { Logger } from "../../../services/shared";
+import { affectedRowCount } from "../../../shared/lib/affected-row-count";
+import { requireFilterValue } from "../../../shared/lib/require-filter-value";
+import { isUniqueViolation } from "../../../shared/lib/unique-violation";
+import { stopReleasesHolding } from "../../releases/early-stop";
+import {
+  refuseRemovingLastSuperAdmin,
+  type LastSuperAdminTx,
+} from "../../users/services/last-super-admin";
+
+import { invalidateApiKeyPermissionsCache } from "./api-key-service";
+import { refuseLinkingPublicRole } from "./public-role";
+import { refuseGrantingSuperAdmin } from "./super-admin-grant";
+
+/**
+ * UserRoleService handles user-role assignment management.
+ *
+ * Responsibilities:
+ * - Assign roles to users (with optional expiration)
+ * - Remove role assignments from users
+ * - List all roles assigned to a user
+ * - List role names for a user
+ *
+ * @example
+ * ```typescript
+ * const service = new UserRoleService(adapter, logger);
+ * await service.assignRoleToUser(userId, roleId, { expiresAt: new Date('2025-12-31') });
+ * ```
+ */
+/** Lazily-resolved apiKeys table for the configured dialect. Matches the pattern in services/lib/permissions.ts. */
+let _apiKeysTable: ReturnType<typeof getDialectTables>["apiKeys"] | null = null;
+function getApiKeysTable() {
+  if (!_apiKeysTable) {
+    _apiKeysTable = getDialectTables().apiKeys;
+  }
+  return _apiKeysTable;
+}
+
+export class UserRoleService extends BaseService {
+  constructor(adapter: DrizzleAdapter, logger: Logger) {
+    super(adapter, logger);
+  }
+
+  /**
+   * Assign a role to a user.
+   *
+   * @param userId - User ID to assign role to
+   * @param roleId - Role ID to assign
+   * @param opts - Optional expiration date
+   * @returns Success/failure status
+   */
+  async assignRoleToUser(
+    userId: string,
+    roleId: string,
+    opts?: { expiresAt?: Date | string }
+  ): Promise<{ success: boolean; statusCode: number; message: string }> {
+    try {
+      const { roles } = this.tables;
+
+      const user = await (
+        this.db as RBACDatabaseInstance
+      ).query.users.findFirst({
+        columns: { id: true },
+        where: { id: requireFilterValue(userId, "userId") },
+      });
+
+      if (!user) {
+        return { success: false, statusCode: 404, message: "User not found" };
+      }
+
+      const roleRow = await this.db
+        .select({ id: roles.id, slug: roles.slug })
+        .from(roles)
+        .where(eq(roles.id, roleId))
+        .limit(1);
+
+      if (!roleRow || roleRow.length === 0) {
+        return { success: false, statusCode: 404, message: "Role not found" };
+      }
+
+      // Written as the rows spell them. MySQL matches ids case-insensitively,
+      // so the request's spelling can differ from the row's own, and a stored
+      // assignment is read back by comparing ids.
+      const storedUserId = String(user.id);
+      const storedRoleId = String(roleRow[0].id);
+      // The Public role is what visitors hold, never anyone's role.
+      await refuseLinkingPublicRole(
+        this.db as LastSuperAdminTx,
+        this.dialect,
+        [storedRoleId],
+        "assign",
+        { userId: storedUserId }
+      );
+      const { userRoles } = this.tables;
+      const userRoleData: UserRoleInsertData = {
+        id: randomUUID(),
+        userId: storedUserId,
+        roleId: storedRoleId,
+        expiresAt: opts?.expiresAt ?? null,
+      };
+
+      // One transaction for the decision and the write. Whether this role
+      // confers super-admin is asked under the lock every change to that takes,
+      // so a concurrent change to the role's inheritance can't land between the
+      // answer and the insert. On SQLite it goes through the adapter: a plain
+      // insert made while another request's transaction is open would run
+      // inside it and be undone by its rollback.
+      const alreadyHeld = await this.withTransaction(async tx => {
+        const txDb = tx as RBACDatabaseInstance;
+        await refuseGrantingSuperAdmin(
+          tx as LastSuperAdminTx,
+          this.dialect,
+          [storedRoleId],
+          { userId: storedUserId, roleId: storedRoleId }
+        );
+        // One moment for the check and the replacement below, so the row this
+        // request found lapsed is the row it replaces. Taken once the lock is
+        // held: a role that lapsed while this request waited for it grants
+        // nothing, and is given again rather than answered as held.
+        const now = new Date();
+
+        // "Already assigned" means held now. An assignment that has lapsed
+        // grants nothing, so answering 409 for it left the role impossible to
+        // give again while every check refused it.
+        const held = await (tx as LastSuperAdminTx)
+          .select({ id: userRoles.id })
+          .from(userRoles)
+          .where(
+            and(
+              userRoleAssignmentsInForce(userRoles, storedUserId, now),
+              eq(userRoles.roleId, storedRoleId)
+            )
+          )
+          .limit(1);
+        if (held.length > 0) return true;
+
+        // A lapsed assignment of this role is replaced rather than kept beside
+        // the new one, since one pair holds one row. Only a lapsed one: on
+        // PostgreSQL and MySQL another request can grant the role between the
+        // read above and this delete. Deleting every row for the pair removed
+        // that completed grant and put this request's expiry in its place; now
+        // it stands, and the pair's unique index keeps the insert below from
+        // adding a second row beside it.
+        await txDb
+          .delete(userRoles)
+          .where(
+            and(
+              eq(userRoles.userId, storedUserId),
+              eq(userRoles.roleId, storedRoleId),
+              not(roleAssignmentInForce(userRoles, now))
+            )
+          );
+        // A grant another request made since the read above is kept, and this
+        // one then wrote nothing: the user holds the role already, answered
+        // the same on every dialect. PostgreSQL and SQLite skip the row;
+        // MySQL, which has no such clause, refuses it on the pair's index.
+        let written: number;
+        try {
+          const insert = txDb
+            .insert(this.tables.userRoles)
+            .values(userRoleData);
+          written = affectedRowCount(
+            typeof insert.onConflictDoNothing === "function"
+              ? await insert.onConflictDoNothing()
+              : await insert,
+            this.dialect
+          );
+        } catch (error) {
+          if (!isUniqueViolation(error)) throw error;
+          written = 0;
+        }
+        return written === 0;
+      });
+
+      if (alreadyHeld) {
+        return {
+          success: false,
+          statusCode: 409,
+          message: "Role already assigned to this user",
+        };
+      }
+
+      // Once the grant commits: inside an enclosing transaction that is its
+      // commit. Flushed before it, a check on another connection could cache
+      // the user without the role, and keep that answer.
+      await this.afterCommit(() => this.invalidateRoleCaches(storedUserId));
+
+      return {
+        success: true,
+        statusCode: 201,
+        message: "Role assigned successfully",
+      };
+    } catch (error) {
+      // Thrown, not reported as a failed result: a refused grant, or a read
+      // the decision needed that failed, must refuse the request. A database
+      // failure gets the typed error every other write reports.
+      if (NextlyError.is(error)) throw error;
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, error));
+    }
+  }
+
+  /**
+   * Remove a role assignment from a user.
+   *
+   * @param userId - User ID to remove role from
+   * @param roleId - Role ID to remove
+   * @returns Success/failure status
+   */
+  async unassignRoleFromUser(
+    userId: string,
+    roleId: string
+  ): Promise<{ success: boolean; statusCode: number; message: string }> {
+    try {
+      // In a transaction of its own, which on SQLite goes through the adapter:
+      // a plain delete made while another request's transaction is open runs
+      // inside it, and that transaction's rollback would hand the user back
+      // the role just taken away. The last active super-admin keeps the role,
+      // asked under the lock every removal of one takes, before the delete,
+      // and the assignment is looked for under it too, so what was found is
+      // what is removed.
+      const assigned = await this.withTransaction(async tx => {
+        await refuseRemovingLastSuperAdmin(
+          tx as LastSuperAdminTx,
+          this.tables,
+          this.dialect,
+          { kind: "unassignRole", userId, roleId }
+        );
+        const existing = await (tx as LastSuperAdminTx)
+          .select({ id: this.tables.userRoles.id })
+          .from(this.tables.userRoles)
+          .where(
+            and(
+              eq(this.tables.userRoles.userId, userId),
+              eq(this.tables.userRoles.roleId, roleId)
+            )
+          )
+          .limit(1);
+        if (existing.length === 0) return false;
+        await (tx as RBACDatabaseInstance)
+          .delete(this.tables.userRoles)
+          .where(
+            and(
+              eq(this.tables.userRoles.userId, userId),
+              eq(this.tables.userRoles.roleId, roleId)
+            )
+          );
+        return true;
+      });
+
+      if (!assigned) {
+        return {
+          success: false,
+          statusCode: 404,
+          message: "Role is not assigned to this user",
+        };
+      }
+
+      // Once the removal commits, for the same reason as a grant: flushed
+      // before it, a check could cache the role as still held.
+      await this.afterCommit(() => this.invalidateRoleCaches(userId));
+
+      return {
+        success: true,
+        statusCode: 200,
+        message: "Role unassigned successfully",
+      };
+    } catch (error) {
+      // Thrown, not reported as a failed result: the dispatcher answers any
+      // result as a success, so a refusal, or a failed read that rolled the
+      // removal back, would tell the caller the role was taken when it was
+      // not. A refusal keeps its own status and message; a database failure
+      // gets the typed error every other write reports.
+      if (NextlyError.is(error)) throw error;
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, error));
+    }
+  }
+
+  /**
+   * Replace the roles a user holds with `roleIds`, inside the caller's
+   * transaction `tx`, so the removal and the re-assignment commit or roll
+   * back together. Ids that name no role are skipped. Leaves the caches to
+   * the caller, which flushes them with {@link invalidateRoleCaches} once the
+   * transaction has committed.
+   *
+   * @returns Whether the user's roles changed.
+   */
+  async replaceUserRoles(
+    userId: string,
+    roleIds: readonly string[],
+    tx: unknown
+  ): Promise<boolean> {
+    const db = tx as typeof this.db;
+    const { roles, userRoles } = this.tables;
+    // The Public role is what visitors hold, never anyone's role.
+    await refuseLinkingPublicRole(
+      tx as LastSuperAdminTx,
+      this.dialect,
+      roleIds,
+      "assign",
+      { userId }
+    );
+    // Compared against the roles held now. A lapsed assignment counted as
+    // held made re-granting that role look like no change, so nothing was
+    // written and the role stayed lapsed while the caller believed it given.
+    const current = await db
+      .select({ roleId: userRoles.roleId })
+      .from(userRoles)
+      .where(userRoleAssignmentsInForce(userRoles, userId, new Date()));
+    const requested = new Set(roleIds);
+    const held = new Set(
+      (current as Array<{ roleId: unknown }>).map(row => String(row.roleId))
+    );
+    if (
+      held.size === requested.size &&
+      [...held].every(id => requested.has(id))
+    ) {
+      return false;
+    }
+    const existing =
+      requested.size > 0
+        ? ((await db
+            .select({ id: roles.id })
+            .from(roles)
+            .where(inArray(roles.id, [...requested]))) as Array<{
+            id: unknown;
+          }>)
+        : [];
+    await db.delete(userRoles).where(eq(userRoles.userId, userId));
+    if (existing.length > 0) {
+      const rows: UserRoleInsertData[] = existing.map(role => ({
+        id: randomUUID(),
+        userId,
+        roleId: String(role.id),
+        expiresAt: null,
+      }));
+      await (db as RBACDatabaseInstance).insert(userRoles).values(rows);
+    }
+    return true;
+  }
+
+  /**
+   * What follows a committed change to a user's roles. Evict what is cached
+   * from them: their permissions, and those of their read-only and
+   * full-access API keys, which resolve from the creator's role set. Then
+   * check the scheduled releases holding documents this user added, judged
+   * on the roles they now hold, so one whose author may no longer publish or
+   * unpublish a document stops now rather than at its instant.
+   */
+  async invalidateRoleCaches(userId: string): Promise<void> {
+    await invalidatePermissionCache({ userId });
+    await this.invalidateApiKeyCachesForUser(userId);
+    await stopReleasesHolding({ authors: [userId] });
+  }
+
+  /**
+   * List the role IDs a user holds now: assignments with no expiry, or one
+   * still ahead. A lapsed assignment grants nothing, so listing it would say
+   * the user holds a role that no check gives them.
+   *
+   * @param userId - User ID to list roles for
+   * @returns Array of role IDs
+   */
+  async listUserRoles(userId: string): Promise<string[]> {
+    const { userRoles } = this.tables;
+    const rows = await this.db
+      .select({ roleId: userRoles.roleId })
+      .from(userRoles)
+      .where(userRoleAssignmentsInForce(userRoles, userId, new Date()));
+    return (rows as Array<{ roleId: unknown }>).map(row => String(row.roleId));
+  }
+
+  /**
+   * List the names of the roles a user holds now, on the same terms as
+   * {@link listUserRoles}.
+   *
+   * @param userId - User ID to list role names for
+   * @returns Array of role names
+   */
+  async listUserRoleNames(userId: string): Promise<string[]> {
+    const { roles, userRoles } = this.tables;
+    const rows = await this.db
+      .select({ name: roles.name })
+      .from(userRoles)
+      .innerJoin(roles, eq(userRoles.roleId, roles.id))
+      .where(userRoleAssignmentsInForce(userRoles, userId, new Date()));
+    return (rows as Array<{ name: string | null }>).map(row => row.name ?? "");
+  }
+
+  /**
+   * Invalidate API key permission caches for all active read-only and full-access
+   * keys owned by a user.
+   *
+   * Called after `assignRoleToUser()` and `unassignRoleFromUser()` because those
+   * token types resolve permissions from the creator's current role set. When the
+   * role set changes, the cached permission slugs must be evicted so the next
+   * request re-resolves them from the updated roles.
+   *
+   * Role-based keys are NOT invalidated here — their cache is keyed to the assigned
+   * role, not to the creator, and is invalidated via RolePermissionService instead.
+   *
+   * @param userId - The user whose read-only and full-access API key caches to evict
+   */
+  private async invalidateApiKeyCachesForUser(userId: string): Promise<void> {
+    try {
+      const apiKeysTable = getApiKeysTable();
+      const rows = await this.db
+        .select({ id: apiKeysTable.id })
+        .from(apiKeysTable)
+        .where(
+          and(
+            eq(apiKeysTable.userId, userId),
+            inArray(apiKeysTable.tokenType, ["read-only", "full-access"]),
+            eq(apiKeysTable.isActive, true)
+          )
+        );
+
+      for (const row of rows as Array<{ id: string }>) {
+        invalidateApiKeyPermissionsCache(row.id);
+      }
+    } catch {
+      // Cache invalidation failures must never break the mutation path.
+      // The 5-minute TTL on the API key cache is the safety net.
+    }
+  }
+}

@@ -1,0 +1,193 @@
+/**
+ * Read-side helpers: `nextlyTags` builds the same `nextly:*` scheme the write
+ * side busts, and `cachedFind`/`applyCache` cache a read under a caller-scoped
+ * key. Includes the two-user leak guard the F1 read-path design requires:
+ * distinct callers must not share a cache entry.
+ */
+import { describe, expect, it, vi } from "vitest";
+
+import { applyCache, type UnstableCache } from "../cached-find";
+import { nextlySingleTags, nextlyTags } from "../nextly-tags";
+
+describe("nextlyTags", () => {
+  it("returns the collection tag for a listing read", () => {
+    expect(nextlyTags("posts")).toEqual(["nextly:posts"]);
+  });
+
+  it("adds the id tag for an entry detail read (tagged by immutable id)", () => {
+    expect(nextlyTags("posts", "42")).toEqual([
+      "nextly:posts",
+      "nextly:posts:id:42",
+    ]);
+  });
+
+  it("adds the per-locale id tag when a locale is given", () => {
+    expect(nextlyTags("posts", "42", "en")).toEqual([
+      "nextly:posts",
+      "nextly:posts:id:42",
+      "nextly:posts:id:42:en",
+    ]);
+  });
+
+  it("ignores a blank id / locale", () => {
+    expect(nextlyTags("posts", "   ")).toEqual(["nextly:posts"]);
+    expect(nextlyTags("posts", "42", "  ")).toEqual([
+      "nextly:posts",
+      "nextly:posts:id:42",
+    ]);
+  });
+
+  it("builds the single tag", () => {
+    expect(nextlySingleTags("header")).toEqual(["nextly:single:header"]);
+  });
+});
+
+describe("applyCache (passthrough without Next)", () => {
+  it("runs the reader directly and returns its result when no cache is present", async () => {
+    const reader = vi.fn(async () => ({ id: "x" }));
+    const result = await applyCache(null, reader, {
+      tags: nextlyTags("posts"),
+      keyParts: ["posts", "list"],
+    });
+    expect(result).toEqual({ id: "x" });
+    expect(reader).toHaveBeenCalledTimes(1);
+  });
+
+  it("runs the reader UNCACHED when unstable_cache throws the missing-scope invariant", async () => {
+    // Outside a Next request/build scope `unstable_cache` throws this invariant;
+    // the read must still succeed uncached rather than surface a framework error.
+    const reader = vi.fn(async () => ({ id: "y" }));
+    const missingScope: UnstableCache = () => () => {
+      throw new Error("Invariant: incrementalCache missing in unstable_cache");
+    };
+    const result = await applyCache(missingScope, reader, {
+      tags: nextlyTags("posts"),
+      keyParts: ["posts", "detail"],
+    });
+    expect(result).toEqual({ id: "y" });
+    expect(reader).toHaveBeenCalledTimes(1);
+  });
+
+  it("rethrows a genuine reader error rather than swallowing it", async () => {
+    const boom = new Error("db exploded");
+    const passthrough: UnstableCache = <T>(cb: () => Promise<T>) => cb;
+    await expect(
+      applyCache(
+        passthrough,
+        async () => {
+          throw boom;
+        },
+        { tags: nextlyTags("posts"), keyParts: ["posts", "detail"] }
+      )
+    ).rejects.toBe(boom);
+  });
+
+  it("propagates an unrelated error that merely mentions incrementalCache", async () => {
+    // A bare `incrementalCache` substring must NOT be mistaken for Next's
+    // missing-scope invariant, or a real failure would be retried and masked.
+    const boom = new Error("failed to warm the incrementalCache for posts");
+    const reader = vi.fn(async () => ({ id: "z" }));
+    const throwsUnrelated: UnstableCache = () => () => {
+      throw boom;
+    };
+    await expect(
+      applyCache(throwsUnrelated, reader, {
+        tags: nextlyTags("posts"),
+        keyParts: ["posts", "detail"],
+      })
+    ).rejects.toBe(boom);
+    expect(reader).not.toHaveBeenCalled();
+  });
+});
+
+describe("applyCache — the tags handed to the cache", () => {
+  it("leaves out tags too long for Next.js, so they cannot crowd out a valid one", async () => {
+    let handed: string[] | undefined;
+    const capture: UnstableCache = (cb, _keyParts, options) => {
+      handed = options.tags;
+      return cb;
+    };
+    // Each one over the 256 characters Next.js accepts on a tag.
+    const overlong = Array.from(
+      { length: 200 },
+      (_, i) => `app:${"x".repeat(256)}-${i}`
+    );
+    await applyCache(capture, async () => ({ id: "x" }), {
+      tags: [...overlong, "nextly:posts"],
+      keyParts: ["posts", "list"],
+    });
+    expect(handed).toEqual(["nextly:posts"]);
+  });
+});
+
+describe("applyCache — key forwarding and per-caller isolation", () => {
+  // A fake unstable_cache that memoises by keyParts, so the test can observe
+  // exactly how cache identity is derived (the real thing needs a Next runtime).
+  function memoizingUnstableCache(): {
+    fn: UnstableCache;
+    calls: { keyParts: string[]; tags?: string[] }[];
+  } {
+    const store = new Map<string, unknown>();
+    const calls: { keyParts: string[]; tags?: string[] }[] = [];
+    const fn: UnstableCache = <T>(
+      cb: () => Promise<T>,
+      keyParts: string[],
+      options: { tags?: string[]; revalidate?: number | false }
+    ) => {
+      calls.push({ keyParts, tags: options.tags });
+      return async (): Promise<T> => {
+        const key = JSON.stringify(keyParts);
+        if (!store.has(key)) store.set(key, await cb());
+        return store.get(key) as T;
+      };
+    };
+    return { fn, calls };
+  }
+
+  it("forwards keyParts and tags to unstable_cache", async () => {
+    const cache = memoizingUnstableCache();
+    await applyCache(cache.fn, async () => 1, {
+      tags: ["nextly:posts"],
+      keyParts: ["posts", "list", "user-a"],
+      revalidate: 60,
+    });
+    // The caller's parts, in order, then the part naming the shape the entry
+    // holds.
+    expect(cache.calls[0]).toEqual({
+      keyParts: ["posts", "list", "user-a", "nextly:kept-v2"],
+      tags: ["nextly:posts"],
+    });
+  });
+
+  it("isolates two callers whose keyParts include their own id", async () => {
+    const cache = memoizingUnstableCache();
+    const opts = (userId: string) => ({
+      tags: nextlyTags("orders"),
+      keyParts: ["orders", "list", userId],
+    });
+
+    const a = await applyCache(cache.fn, async () => "a-rows", opts("user-a"));
+    const b = await applyCache(cache.fn, async () => "b-rows", opts("user-b"));
+
+    // Different keys → each caller sees only their own rows.
+    expect(a).toBe("a-rows");
+    expect(b).toBe("b-rows");
+  });
+
+  it("SHARES a cache entry when the caller is omitted — the leak the key guards against", async () => {
+    const cache = memoizingUnstableCache();
+    // Both callers use a stable key with no user id: the classic footgun.
+    const sharedKey = {
+      tags: nextlyTags("orders"),
+      keyParts: ["orders", "list"],
+    };
+
+    const a = await applyCache(cache.fn, async () => "a-rows", sharedKey);
+    const b = await applyCache(cache.fn, async () => "b-rows", sharedKey);
+
+    // User B is served User A's cached rows — proving why an owner-scoped read
+    // MUST put the caller's identity in keyParts.
+    expect(a).toBe("a-rows");
+    expect(b).toBe("a-rows");
+  });
+});

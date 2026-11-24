@@ -1,0 +1,318 @@
+// Unit tests for runDriftCheck — F8 PR 6 (refactored after review).
+//
+// Two cases: drift / clean. First-run setup moved to ensureFirstRunSetup
+// (see first-run.test.ts) per review #2 — first-run must run BEFORE
+// registerServices' dynamic-table probing, not after.
+
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+import { runDriftCheck } from "../drift-check";
+
+interface FakeAdapter {
+  dialect: "postgresql" | "mysql" | "sqlite";
+  getDrizzle: () => unknown;
+}
+
+function makeAdapter(
+  dialect: "postgresql" | "mysql" | "sqlite" = "sqlite"
+): FakeAdapter {
+  return {
+    dialect,
+    getDrizzle: () => ({}),
+  };
+}
+
+const fakeLogger = {
+  debug: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+};
+
+describe("runDriftCheck", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe("drift (live DB diverges from config)", () => {
+    it("logs one warning line and returns kind='drift'", async () => {
+      const previewDesiredSchema = vi.fn().mockResolvedValue({
+        operations: [
+          { type: "add_column", tableName: "dc_posts", column: { name: "x" } },
+          { type: "add_column", tableName: "dc_posts", column: { name: "y" } },
+        ],
+        events: [],
+        candidates: [],
+        classification: "safe",
+        liveSnapshot: { tables: [] },
+      });
+
+      const result = await runDriftCheck({
+        adapter: makeAdapter(),
+        collections: [{ slug: "posts", tableName: "dc_posts", fields: [] }],
+        logger: fakeLogger,
+        deps: { previewDesiredSchema },
+      });
+
+      expect(result.kind).toBe("drift");
+      expect((result as { pending: number }).pending).toBe(2);
+      const warnCalls = fakeLogger.warn.mock.calls
+        .map(args => args[0] as string)
+        .filter(line => /schema drift/i.test(line));
+      expect(warnCalls.length).toBe(1);
+    });
+
+    it("aggregates operations across multiple collections", async () => {
+      // Each preview reports an operation on the table it was asked about.
+      const previewDesiredSchema = vi
+        .fn()
+        .mockImplementation(
+          (args: { desired: { collections: Record<string, unknown> } }) =>
+            Promise.resolve({
+              operations: Object.keys(args.desired.collections).map(slug => ({
+                type: "add_column",
+                tableName: `dc_${slug}`,
+                column: { name: "x" },
+              })),
+              events: [],
+              candidates: [],
+              classification: "safe",
+              liveSnapshot: { tables: [] },
+            })
+        );
+
+      const result = await runDriftCheck({
+        adapter: makeAdapter(),
+        collections: [
+          { slug: "a", tableName: "dc_a", fields: [] },
+          { slug: "b", tableName: "dc_b", fields: [] },
+        ],
+        logger: fakeLogger,
+        deps: { previewDesiredSchema },
+      });
+
+      expect(result.kind).toBe("drift");
+      expect((result as { pending: number }).pending).toBe(2);
+      expect(previewDesiredSchema).toHaveBeenCalledTimes(2);
+    });
+
+    it("counts once an operation every preview reports", async () => {
+      // Every preview also compares the tables plugins declare, so a plugin
+      // table the database lacks reaches the preview of each collection.
+      const previewDesiredSchema = vi.fn().mockResolvedValue({
+        operations: [
+          { type: "add_table", table: { name: "fx__notes", columns: [] } },
+        ],
+        events: [],
+        candidates: [],
+        classification: "safe",
+        liveSnapshot: { tables: [] },
+      });
+
+      const result = await runDriftCheck({
+        adapter: makeAdapter(),
+        collections: [
+          { slug: "a", tableName: "dc_a", fields: [] },
+          { slug: "b", tableName: "dc_b", fields: [] },
+        ],
+        logger: fakeLogger,
+        deps: { previewDesiredSchema },
+      });
+
+      expect(previewDesiredSchema).toHaveBeenCalledTimes(2);
+      expect(result).toEqual({ kind: "drift", pending: 1 });
+    });
+
+    it("runs previews in parallel (review #4)", async () => {
+      let active = 0;
+      let maxConcurrent = 0;
+      const previewDesiredSchema = vi.fn().mockImplementation(async () => {
+        active += 1;
+        maxConcurrent = Math.max(maxConcurrent, active);
+        await new Promise(r => setTimeout(r, 10));
+        active -= 1;
+        return {
+          operations: [],
+          events: [],
+          candidates: [],
+          classification: "safe",
+          liveSnapshot: { tables: [] },
+        };
+      });
+
+      await runDriftCheck({
+        adapter: makeAdapter(),
+        collections: [
+          { slug: "a", tableName: "dc_a", fields: [] },
+          { slug: "b", tableName: "dc_b", fields: [] },
+          { slug: "c", tableName: "dc_c", fields: [] },
+        ],
+        logger: fakeLogger,
+        deps: { previewDesiredSchema },
+      });
+
+      expect(maxConcurrent).toBeGreaterThan(1);
+    });
+  });
+
+  describe("clean (live DB matches config)", () => {
+    it("logs nothing and returns kind='clean'", async () => {
+      const previewDesiredSchema = vi.fn().mockResolvedValue({
+        operations: [],
+        events: [],
+        candidates: [],
+        classification: "safe",
+        liveSnapshot: { tables: [] },
+      });
+
+      const result = await runDriftCheck({
+        adapter: makeAdapter(),
+        collections: [{ slug: "posts", tableName: "dc_posts", fields: [] }],
+        logger: fakeLogger,
+        deps: { previewDesiredSchema },
+      });
+
+      expect(result.kind).toBe("clean");
+      expect(fakeLogger.info).not.toHaveBeenCalled();
+      expect(fakeLogger.warn).not.toHaveBeenCalled();
+    });
+
+    // Every preview also compares the tables plugins and the app declare, so
+    // with no collection to ask about, one preview of none still compares them.
+    it("with no collections, compares the plugin and app tables in one preview of none", async () => {
+      const previewDesiredSchema = vi.fn().mockResolvedValue({
+        operations: [],
+        events: [],
+        candidates: [],
+      });
+      const result = await runDriftCheck({
+        adapter: makeAdapter(),
+        collections: [],
+        logger: fakeLogger,
+        deps: { previewDesiredSchema },
+      });
+
+      expect(result.kind).toBe("clean");
+      expect(previewDesiredSchema).toHaveBeenCalledTimes(1);
+      expect(previewDesiredSchema.mock.calls[0]?.[0].desired).toEqual({
+        collections: {},
+        singles: {},
+        components: {},
+      });
+    });
+
+    it("with no collections, reports drift in a plugin or app table", async () => {
+      const previewDesiredSchema = vi.fn().mockResolvedValue({
+        operations: [{ type: "add_column", table: "plugin_rows" }],
+        events: [],
+        candidates: [],
+      });
+      const result = await runDriftCheck({
+        adapter: makeAdapter(),
+        collections: [],
+        logger: fakeLogger,
+        deps: { previewDesiredSchema },
+      });
+
+      expect(result).toEqual({ kind: "drift", pending: 1 });
+    });
+  });
+
+  describe("runDriftCheck — bounded concurrency", () => {
+    it("never runs more than 3 previewDesiredSchema calls concurrently", async () => {
+      let inFlight = 0;
+      let maxInFlight = 0;
+      const previewDesiredSchema = vi.fn(async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        // Force overlap: hold each call briefly so we can observe concurrency.
+        await new Promise(r => setTimeout(r, 20));
+        inFlight--;
+        return { operations: [], candidates: [] };
+      });
+
+      const collections = Array.from({ length: 10 }, (_, i) => ({
+        slug: `c${i}`,
+        tableName: `t${i}`,
+        fields: [],
+        status: false,
+      }));
+
+      await runDriftCheck({
+        adapter: makeAdapter("postgresql") as never,
+        collections,
+        logger: fakeLogger,
+        deps: { previewDesiredSchema: previewDesiredSchema as never },
+      });
+
+      expect(previewDesiredSchema).toHaveBeenCalledTimes(10);
+      expect(maxInFlight).toBeLessThanOrEqual(3);
+    });
+  });
+
+  describe("failure handling", () => {
+    it("logs aggregate failure count when previews fail (review #5)", async () => {
+      const previewDesiredSchema = vi
+        .fn()
+        .mockRejectedValue(new Error("introspect failed"));
+
+      const result = await runDriftCheck({
+        adapter: makeAdapter(),
+        collections: [
+          { slug: "a", tableName: "dc_a", fields: [] },
+          { slug: "b", tableName: "dc_b", fields: [] },
+        ],
+        logger: fakeLogger,
+        deps: { previewDesiredSchema },
+      });
+
+      // All previews failed → no drift detected, but a summary warning fires.
+      expect(result.kind).toBe("clean");
+      const summaryWarn = fakeLogger.warn.mock.calls
+        .map(args => args[0] as string)
+        .filter(line => /drift previews failed/i.test(line));
+      expect(summaryWarn.length).toBe(1);
+      // No "schema drift" warning because no drift was actually detected.
+      const driftWarn = fakeLogger.warn.mock.calls
+        .map(args => args[0] as string)
+        .filter(line => /detected schema drift/i.test(line));
+      expect(driftWarn.length).toBe(0);
+    });
+
+    it("partial success: counts the successful drift", async () => {
+      let callIndex = 0;
+      const previewDesiredSchema = vi.fn().mockImplementation(() => {
+        callIndex += 1;
+        if (callIndex === 1) {
+          return Promise.resolve({
+            operations: [
+              {
+                type: "add_column",
+                tableName: "dc_a",
+                column: { name: "x" },
+              },
+            ],
+            events: [],
+            candidates: [],
+            classification: "safe",
+            liveSnapshot: { tables: [] },
+          });
+        }
+        return Promise.reject(new Error("introspect failed"));
+      });
+
+      const result = await runDriftCheck({
+        adapter: makeAdapter(),
+        collections: [
+          { slug: "a", tableName: "dc_a", fields: [] },
+          { slug: "b", tableName: "dc_b", fields: [] },
+        ],
+        logger: fakeLogger,
+        deps: { previewDesiredSchema },
+      });
+
+      expect(result.kind).toBe("drift");
+      expect((result as { pending: number }).pending).toBe(1);
+    });
+  });
+});

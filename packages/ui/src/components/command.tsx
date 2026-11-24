@@ -1,0 +1,660 @@
+"use client";
+
+import * as DialogPrimitive from "@radix-ui/react-dialog";
+import {
+  Command as CommandPrimitive,
+  defaultFilter,
+  useCommandState as useCommandStatePrimitive,
+} from "cmdk";
+import { Search } from "lucide-react";
+import {
+  createContext,
+  forwardRef,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  type Dispatch,
+  type ElementRef,
+  type ReactNode,
+  type SetStateAction,
+  type ComponentPropsWithoutRef,
+  type HTMLAttributes,
+  type ForwardRefExoticComponent,
+  type PropsWithoutRef,
+  type RefAttributes,
+  type JSX,
+} from "react";
+
+import { cn } from "../lib/utils";
+import { usePortalContainer } from "../providers/portal-provider";
+
+/**
+ * Command Component
+ *
+ * A command palette component built on cmdk for fast, keyboard-driven navigation and actions.
+ * Supports fuzzy search, keyboard navigation, and WCAG 2.2 AA accessibility.
+ *
+ * @example
+ * ```tsx
+ * <Command>
+ *   <CommandInput placeholder="Type a command or search..." />
+ *   <CommandList>
+ *     <CommandEmpty>No results found.</CommandEmpty>
+ *     <CommandGroup heading="Navigation">
+ *       <CommandItem>
+ *         <Home className="mr-2 h-4 w-4" />
+ *         Dashboard
+ *       </CommandItem>
+ *     </CommandGroup>
+ *   </CommandList>
+ * </Command>
+ * ```
+ *
+ * @design-spec
+ * - Input height: 48px (h-12) - larger for prominence
+ * - Item height: 36px (h-9) desktop, 44px (h-11) mobile for touch
+ * - Border radius: `rounded-lg` for the panel, `rounded-sm` for items
+ * - Max list height: 400px (max-h-[400px])
+ * - Transition: 150ms per design system
+ *
+ * @accessibility
+ * - Full keyboard navigation (Arrow keys, Enter, Escape, Home, End)
+ * - ARIA attributes (role="combobox", role="listbox", role="option")
+ * - Screen reader announcements for results
+ * - Focus management and visual focus indicators
+ * - WCAG 2.2 AA compliant (verified contrast ratios)
+ * @experimental
+ */
+
+export type CommandProps = ComponentPropsWithoutRef<typeof CommandPrimitive>;
+
+/**
+ * Command - Root container for the command palette.
+ * Handles filtering, keyboard navigation, and accessibility.
+ * @experimental
+ */
+const Command: ForwardRefExoticComponent<
+  PropsWithoutRef<CommandProps> &
+    RefAttributes<ElementRef<typeof CommandPrimitive>>
+> = forwardRef<ElementRef<typeof CommandPrimitive>, CommandProps>(
+  ({ className, ...props }, ref) => (
+    <CommandPrimitive
+      ref={ref}
+      className={cn(
+        "flex h-full w-full flex-col overflow-hidden rounded-lg bg-background text-foreground",
+        className
+      )}
+      {...props}
+    />
+  )
+);
+Command.displayName = "Command";
+
+/** @experimental */
+export interface CommandDialogProps extends DialogPrimitive.DialogProps {
+  /**
+   * The dialog's accessible name, drawn visually hidden: the search field is what the eye
+   * reads, but a dialog without a name is announced as "dialog" and nothing more, and the
+   * field's placeholder names the INPUT, not the dialog around it. Defaults to "Command
+   * palette"; a caller whose palette searches something narrower says what.
+   */
+  title?: string;
+  /**
+   * What the dialog is for, drawn visually hidden and read after its name. Optional: without
+   * one the dialog points at no description, rather than at an element that is not there.
+   */
+  description?: string;
+  /**
+   * Passed to the command root this dialog renders internally.
+   *
+   * A seam rather than a list of forwarded props, because the settings a caller needs from the
+   * root are the ones this component happens not to have thought of: `label`, which supplies the
+   * search input's accessible name (cmdk renders an EMPTY hidden label without it, and an empty
+   * `aria-labelledby` reference is worse than none — it stops the placeholder naming the field);
+   * `filter` and `shouldFilter`, which decide match order; and `vimBindings`, which claims Ctrl+K
+   * and Ctrl+N inside the list.
+   *
+   * `children` is excluded because this component owns the dialog's contents.
+   */
+  commandProps?: Omit<ComponentPropsWithoutRef<typeof Command>, "children">;
+  /**
+   * Passed to the dialog content this component renders internally.
+   *
+   * The seam that matters here is `onCloseAutoFocus`: this dialog has no trigger, so Radix has
+   * nothing to hand focus back to, and it fires this at the point focus is actually being
+   * returned — after the exit animation, which a timer set at close time cannot know the length
+   * of. `className` is excluded because this component owns the dialog's own layout.
+   */
+  contentProps?: Omit<
+    ComponentPropsWithoutRef<typeof DialogPrimitive.Content>,
+    "children" | "className"
+  >;
+}
+
+/**
+ * CommandDialogOverlay - Custom overlay for CommandDialog with proper z-index.
+ * Uses z-[99] to stay below CommandDialog content (z-[100]) but above regular dialogs.
+ */
+const CommandDialogOverlay = forwardRef<
+  ElementRef<typeof DialogPrimitive.Overlay>,
+  ComponentPropsWithoutRef<typeof DialogPrimitive.Overlay>
+>(({ className, ...props }, ref) => (
+  <DialogPrimitive.Overlay
+    ref={ref}
+    className={cn(
+      // A modal scrim, from the `--nx-overlay` token rather than a surface
+      // token. A black wash is the point — painting it from `background` would
+      // make it a white veil in light mode — but the alpha still has to differ
+      // per mode, because what it composites over is white in one and mid-tone
+      // in the other.
+      "fixed inset-0 z-[99] bg-overlay backdrop-blur-sm",
+      "data-[state=open]:animate-in data-[state=closed]:animate-out",
+      "data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+      "transition-opacity duration-200",
+      className
+    )}
+    {...props}
+  />
+));
+CommandDialogOverlay.displayName = "CommandDialogOverlay";
+
+/**
+ * CommandDialog - Command palette in a modal dialog.
+ * Use this variant for Cmd+K keyboard shortcut pattern.
+ *
+ * @example
+ * ```tsx
+ * const [open, setOpen] = useState(false)
+ *
+ * useEffect(() => {
+ *   const down = (e: KeyboardEvent) => {
+ *     if (e.key === "k" && (e.metaKey || e.ctrlKey)) {
+ *       e.preventDefault()
+ *       setOpen((open) => !open)
+ *     }
+ *   }
+ *   document.addEventListener("keydown", down)
+ *   return () => document.removeEventListener("keydown", down)
+ * }, [])
+ *
+ * return (
+ *   <CommandDialog open={open} onOpenChange={setOpen}>
+ *     <CommandInput placeholder="Type a command..." />
+ *     <CommandList>...</CommandList>
+ *   </CommandDialog>
+ * )
+ * ```
+ * @experimental
+ */
+const CommandDialog = ({
+  children,
+  title = "Command palette",
+  description,
+  commandProps,
+  contentProps,
+  ...props
+}: CommandDialogProps): JSX.Element => {
+  const portalContainer = usePortalContainer();
+
+  return (
+    <DialogPrimitive.Root {...props}>
+      <DialogPrimitive.Portal container={portalContainer}>
+        <CommandDialogOverlay />
+        <DialogPrimitive.Content
+          // Radix points the dialog at its description's id whether or not one is drawn, and
+          // warns when the id names nothing; with no description, it points at none. Before
+          // `contentProps`, so a caller describing the dialog by an element of its own still can.
+          {...(description === undefined
+            ? { "aria-describedby": undefined }
+            : {})}
+          {...contentProps}
+          data-slot="command-content"
+          className={cn(
+            // Position: pinned near the top rather than centred, so the search
+            // box stays where the eye is as the results grow and shrink. A
+            // centred dialog re-centres on every keystroke and moves the input
+            // out from under the cursor.
+            "fixed left-[50%] top-[13vh] z-[100] translate-x-[-50%]",
+            // Size - responsive
+            "w-full max-w-lg",
+            // What is left below the pinned top, less a margin at the bottom.
+            "max-h-[80vh]",
+            // Mobile adjustments
+            "sm:max-w-lg", // 512px on desktop
+            "max-w-full", // Full width on mobile
+            // Spacing
+            "m-4 sm:m-0", // 16px margin on mobile, no margin on desktop
+            // Visual
+            "overflow-hidden rounded-lg  border border-border bg-background shadow-xl",
+            // Animation
+            "duration-200",
+            "data-[state=open]:animate-in data-[state=closed]:animate-out",
+            "data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0",
+            "data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95",
+            "data-[state=closed]:slide-out-to-top-2 data-[state=open]:slide-in-from-top-2"
+          )}
+        >
+          {/* Named as the kit's `Dialog` is, from a Radix title the dialog is labelled by;
+              hidden, since the search field is what the eye reads. Outside the command root,
+              so the list never takes them for items. */}
+          <DialogPrimitive.Title className="sr-only">
+            {title}
+          </DialogPrimitive.Title>
+          {description === undefined ? null : (
+            <DialogPrimitive.Description className="sr-only">
+              {description}
+            </DialogPrimitive.Description>
+          )}
+          <Command
+            {...commandProps}
+            className={cn(
+              "[&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:py-2 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:text-muted-foreground [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group]:not([hidden])_~[cmdk-group]]:pt-0 [&_[cmdk-group]]:mb-2 [&_[cmdk-input-wrapper]_svg]:h-5 [&_[cmdk-input-wrapper]_svg]:w-5 [&_[cmdk-input]]:h-12 [&_[cmdk-item]]:px-3 [&_[cmdk-item]]:py-2 [&_[cmdk-item]_svg]:h-4 [&_[cmdk-item]_svg]:w-4",
+              // Merged rather than overridden: a caller passing `className` for its own reason
+              // would otherwise silently drop every layout rule this dialog depends on.
+              commandProps?.className
+            )}
+          >
+            {children}
+          </Command>
+        </DialogPrimitive.Content>
+      </DialogPrimitive.Portal>
+    </DialogPrimitive.Root>
+  );
+};
+
+/** @experimental */
+export type CommandInputProps = ComponentPropsWithoutRef<
+  typeof CommandPrimitive.Input
+>;
+
+/**
+ * CommandInput - Search input field for filtering commands.
+ * Includes search icon and styled per design system.
+ * @experimental
+ */
+const CommandInput: ForwardRefExoticComponent<
+  PropsWithoutRef<CommandInputProps> &
+    RefAttributes<ElementRef<typeof CommandPrimitive.Input>>
+> = forwardRef<ElementRef<typeof CommandPrimitive.Input>, CommandInputProps>(
+  ({ className, ...props }, ref) => (
+    <div
+      className="flex items-center  border-b border-border px-4"
+      // cmdk-input-wrapper is the attribute the cmdk library targets
+      // in its built-in stylesheet to scope wrapper-level styles.
+      // Required by the library; not a typo.
+      // eslint-disable-next-line react/no-unknown-property
+      cmdk-input-wrapper=""
+    >
+      <Search className="mr-3 h-5 w-5 shrink-0 text-muted-foreground" />
+      <CommandPrimitive.Input
+        ref={ref}
+        className={cn(
+          // Size
+          "flex h-12 w-full",
+          // Visual
+          "bg-transparent text-base",
+          "outline-none",
+          // Typography
+          "placeholder:text-muted-foreground",
+          // States
+          "disabled:cursor-not-allowed disabled:opacity-50",
+          // Prevent iOS zoom on focus
+          "text-base md:text-sm",
+          className
+        )}
+        {...props}
+      />
+    </div>
+  )
+);
+CommandInput.displayName = "CommandInput";
+
+/**
+ * What a `CommandEmpty` inside a `CommandList` hands the list: `hold` while it
+ * is mounted, so the list draws its status line, and `say`, the message the
+ * line reads while a search finds nothing. `null` outside a list.
+ */
+interface EmptyNotice {
+  readonly hold: Dispatch<SetStateAction<number>>;
+  readonly say: Dispatch<SetStateAction<ReactNode>>;
+}
+
+const EmptyNoticeContext = createContext<EmptyNotice | null>(null);
+
+/** Says `notice` from the list's status line while it is mounted. */
+function SayEmpty({
+  say,
+  notice,
+}: {
+  say: EmptyNotice["say"];
+  notice: ReactNode;
+}): null {
+  useEffect(() => {
+    // A function, so a node is never taken for an updater.
+    say(() => notice);
+    return () => say(null);
+  }, [say, notice]);
+  return null;
+}
+
+/** @experimental */
+export type CommandListProps = ComponentPropsWithoutRef<
+  typeof CommandPrimitive.List
+>;
+
+/**
+ * CommandList - Scrollable container for command results.
+ * Max height 400px per design spec to prevent tall dialogs.
+ * @experimental
+ */
+const CommandList: ForwardRefExoticComponent<
+  PropsWithoutRef<CommandListProps> &
+    RefAttributes<ElementRef<typeof CommandPrimitive.List>>
+> = forwardRef<ElementRef<typeof CommandPrimitive.List>, CommandListProps>(
+  ({ className, children, ...props }, ref) => {
+    // How many `CommandEmpty`s the list holds, and what one says while a
+    // search finds nothing.
+    const [emptyHeld, holdEmpty] = useState(0);
+    const [emptyNotice, setEmptyNotice] = useState<ReactNode>(null);
+    const notice = useMemo<EmptyNotice>(
+      () => ({ hold: holdEmpty, say: setEmptyNotice }),
+      []
+    );
+    return (
+      <>
+        <CommandPrimitive.List
+          ref={ref}
+          className={cn(
+            // Scroll
+            "max-h-[400px] overflow-y-auto overflow-x-hidden",
+            // Spacing
+            "p-2",
+            className
+          )}
+          {...props}
+        >
+          <EmptyNoticeContext.Provider value={notice}>
+            {children}
+          </EmptyNoticeContext.Provider>
+        </CommandPrimitive.List>
+        {/* The empty message, said outside the list, where a status may be;
+            mounted with the `CommandEmpty`, before it has anything to say, so
+            its first words are announced. A list without one, whose caller
+            draws and says its own, gets no second status line. */}
+        {emptyHeld > 0 ? (
+          <p role="status" data-slot="command-empty-status" className="sr-only">
+            {emptyNotice}
+          </p>
+        ) : null}
+      </>
+    );
+  }
+);
+CommandList.displayName = "CommandList";
+
+/** @experimental */
+export type CommandEmptyProps = ComponentPropsWithoutRef<
+  typeof CommandPrimitive.Empty
+>;
+
+/**
+ * CommandEmpty - Empty state message when no results found.
+ * Centered text with muted color per design spec.
+ *
+ * A message of plain text inside a `CommandList` is drawn in the list but hidden from screen
+ * readers, and the list says it from its own status line outside the list. The list is a
+ * `listbox`, which may own only options and their groups: the library gives the message
+ * `role="presentation"`, set after the props it is given, so the list would own its words, and
+ * axe-core's `aria-required-children` fails a list a search found nothing in. A message holding
+ * anything else, a "Try again" button say, stays where it is, so what it holds can still be
+ * reached; so does one outside a list.
+ * @experimental
+ */
+const CommandEmpty: ForwardRefExoticComponent<
+  PropsWithoutRef<CommandEmptyProps> &
+    RefAttributes<ElementRef<typeof CommandPrimitive.Empty>>
+> = forwardRef<ElementRef<typeof CommandPrimitive.Empty>, CommandEmptyProps>(
+  ({ children, "aria-hidden": ariaHidden, ...props }, ref) => {
+    const notice = useContext(EmptyNoticeContext);
+    // Said from the list's line only when it is words alone: a copy of a
+    // control there would be one nobody can see.
+    const words =
+      typeof children === "string" || typeof children === "number"
+        ? String(children)
+        : null;
+    const sayer = words === null ? undefined : notice?.say;
+    const hold = sayer === undefined ? undefined : notice?.hold;
+    useEffect(() => {
+      if (hold === undefined) return undefined;
+      hold(count => count + 1);
+      return () => hold(count => count - 1);
+    }, [hold]);
+    return (
+      <CommandPrimitive.Empty
+        ref={ref}
+        className="py-8 px-4 text-center text-sm text-muted-foreground"
+        aria-hidden={ariaHidden ?? (sayer === undefined ? undefined : true)}
+        {...props}
+      >
+        {children}
+        {/* Mounted only while the library draws the message, so the status
+            line speaks exactly while the list is empty. */}
+        {sayer === undefined ? null : <SayEmpty say={sayer} notice={words} />}
+      </CommandPrimitive.Empty>
+    );
+  }
+);
+CommandEmpty.displayName = "CommandEmpty";
+
+/** @experimental */
+export type CommandGroupProps = ComponentPropsWithoutRef<
+  typeof CommandPrimitive.Group
+>;
+
+/**
+ * CommandGroup - Grouped section of commands with optional heading.
+ * Heading styled as uppercase, small, semibold per design spec.
+ * @experimental
+ */
+const CommandGroup: ForwardRefExoticComponent<
+  PropsWithoutRef<CommandGroupProps> &
+    RefAttributes<ElementRef<typeof CommandPrimitive.Group>>
+> = forwardRef<ElementRef<typeof CommandPrimitive.Group>, CommandGroupProps>(
+  ({ className, ...props }, ref) => (
+    <CommandPrimitive.Group
+      ref={ref}
+      className={cn(
+        // Spacing
+        "space-y-1 mb-2",
+        // Heading styling applied via parent Command className
+        "[&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:py-2 [&_[cmdk-group-heading]]:text-xs [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:text-muted-foreground [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide",
+        className
+      )}
+      {...props}
+    />
+  )
+);
+CommandGroup.displayName = "CommandGroup";
+
+/** @experimental */
+export type CommandSeparatorProps = ComponentPropsWithoutRef<
+  typeof CommandPrimitive.Separator
+>;
+
+/**
+ * CommandSeparator - Visual divider between command groups.
+ * 1px line in the border colour, 8px margin top/bottom.
+ *
+ * Hidden from screen readers by default. It usually sits inside the list, which is a `listbox`,
+ * and a listbox may own only options and their groups: the library's separator sets
+ * `role="separator"` after the props it is given, so the role cannot be swapped out, and a
+ * screen reader meeting it there finds a child the list should not have (axe-core's
+ * `aria-required-children`). Groups already carry their own headings, so the line adds nothing
+ * to what is announced. Placed outside the list, pass `aria-hidden={false}` to announce it.
+ * @experimental
+ */
+const CommandSeparator: ForwardRefExoticComponent<
+  PropsWithoutRef<CommandSeparatorProps> &
+    RefAttributes<ElementRef<typeof CommandPrimitive.Separator>>
+> = forwardRef<
+  ElementRef<typeof CommandPrimitive.Separator>,
+  CommandSeparatorProps
+>(({ className, "aria-hidden": ariaHidden = true, ...props }, ref) => (
+  <CommandPrimitive.Separator
+    ref={ref}
+    className={cn("h-px bg-border my-2", className)}
+    aria-hidden={ariaHidden}
+    {...props}
+  />
+));
+CommandSeparator.displayName = "CommandSeparator";
+
+/** @experimental */
+export type CommandItemProps = ComponentPropsWithoutRef<
+  typeof CommandPrimitive.Item
+>;
+
+/**
+ * CommandItem - Individual selectable command item.
+ * Height: 36px desktop, 44px mobile per design spec.
+ * Includes hover, focus, and selected states.
+ * @experimental
+ */
+const CommandItem: ForwardRefExoticComponent<
+  PropsWithoutRef<CommandItemProps> &
+    RefAttributes<ElementRef<typeof CommandPrimitive.Item>>
+> = forwardRef<ElementRef<typeof CommandPrimitive.Item>, CommandItemProps>(
+  ({ className, ...props }, ref) => (
+    <CommandPrimitive.Item
+      ref={ref}
+      className={cn(
+        // Layout
+        "relative flex cursor-pointer select-none items-center gap-3",
+        // Size
+        "min-h-[44px] sm:min-h-[36px]", // Flexible height with minimal touch targets
+        // Spacing
+        "px-3 py-2.5",
+        // Visual
+        "rounded-sm text-base sm:text-sm outline-none",
+        // Transitions
+        "transition-all duration-200 ease-(--ease-premium)",
+        // Hover state - shared dashboard hover treatment
+        "hover-unified",
+        // Selected/focused state (keyboard navigation): the primary's tint
+        // marks it and the label stays the foreground colour, because the
+        // primary is a fill colour and a mid-tone brand primary falls short of
+        // AA as small text.
+        "aria-selected:bg-primary/5 aria-selected:text-foreground",
+        "data-[selected=true]:bg-primary/5 data-[selected=true]:text-foreground",
+        // Disabled state
+        "data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50",
+        className
+      )}
+      {...props}
+    />
+  )
+);
+CommandItem.displayName = "CommandItem";
+
+/** @experimental */
+export type CommandShortcutProps = HTMLAttributes<HTMLSpanElement>;
+
+/**
+ * CommandShortcut - Keyboard shortcut display (e.g., "⌘K", "↵ Enter").
+ * Monospace font, subtle background, right-aligned per design spec.
+ * @experimental
+ */
+const CommandShortcut: ForwardRefExoticComponent<
+  PropsWithoutRef<CommandShortcutProps> & RefAttributes<HTMLSpanElement>
+> = forwardRef<HTMLSpanElement, CommandShortcutProps>(
+  ({ className, ...props }, ref) => {
+    return (
+      <span
+        ref={ref}
+        className={cn(
+          // Position
+          "ml-auto",
+          // Typography
+          "text-xs font-mono",
+          // Visual
+          "text-muted-foreground bg-primary/5",
+          "border border-border rounded-md",
+          // Spacing
+          "px-1.5 py-0.5",
+          className
+        )}
+        {...props}
+      />
+    );
+  }
+);
+CommandShortcut.displayName = "CommandShortcut";
+
+export {
+  Command,
+  CommandDialog,
+  CommandInput,
+  CommandList,
+  CommandEmpty,
+  CommandGroup,
+  CommandItem,
+  CommandSeparator,
+  CommandShortcut,
+};
+
+/**
+ * The command palette's default match scorer, re-exported.
+ *
+ * A caller that overrides `filter` — to keep an opaque item value out of the scoring, say — still
+ * wants the ranking that comes for free, and reaching for `cmdk` directly is not open to every
+ * package here.
+ *
+ * Bound to a declaration rather than re-exported with `export { x as y }`: the bundler keeps a doc
+ * comment attached to a declaration and drops one attached to an export statement, so the release
+ * tag would not reach the published types.
+ *
+ * @experimental
+ */
+export const commandDefaultFilter: typeof defaultFilter = defaultFilter;
+
+/**
+ * The value of the item the palette has HIGHLIGHTED, from a component inside
+ * it.
+ *
+ * The palette owns which item is highlighted, and it moves that highlight for
+ * reasons a caller never sees: a pointer crossing an item, an arrow key, and a
+ * filter that removes the item the highlight was on. Anything outside wanting
+ * to follow it — a preview pane, a description strip, a status line — needs to
+ * read that rather than keep a copy.
+ *
+ * Reading beats mirroring here for a specific reason rather than on principle.
+ * The palette's controlled `value` sets which item is MARKED, and does not move
+ * the internal cursor that `aria-activedescendant` and the scroll follow. So a
+ * caller that writes the value to steer the highlight desynchronises the two:
+ * the item drawn as current and the option announced as current stop agreeing,
+ * and after a filter the announcement can name an element that has been
+ * removed. A read leaves one owner and takes a derived view.
+ *
+ * NARROWED to the one field deliberately. The underlying library exposes its
+ * whole store through a selector — the raw search text, its internal item and
+ * group maps, the id it uses for `aria-activedescendant` — and publishing that
+ * selector would make every one of those part of this kit's public API and its
+ * generated declarations. A dependency upgrade could then reshape what callers
+ * can reach without any export changing name, which is exactly what the
+ * surface snapshot cannot see. This returns a string.
+ *
+ * Empty string means nothing is highlighted, which is the library's own
+ * spelling and a different answer from "an item whose value is unknown".
+ *
+ * Must be called from inside the palette, since that is where the state lives.
+ *
+ * Bound to a declaration rather than re-exported with `export { x as y }`: the
+ * bundler keeps a doc comment attached to a declaration and drops one attached
+ * to an export statement, so the release tag would not reach the published
+ * types.
+ *
+ * @experimental
+ */
+export const useCommandHighlight = (): string =>
+  useCommandStatePrimitive(state => state.value);

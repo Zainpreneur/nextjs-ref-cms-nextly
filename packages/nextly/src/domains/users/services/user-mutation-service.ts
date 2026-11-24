@@ -1,0 +1,3638 @@
+/**
+ * UserMutationService - Write operations for users
+ *
+ * Handles user creation, updates, and deletion with validation,
+ * role assignment, and email service integration.
+ *
+ * This service uses the database adapter pattern for multi-database support
+ * (PostgreSQL, MySQL, SQLite). For complex queries, it uses direct Drizzle
+ * access via the compatibility layer until the adapter is enhanced.
+ *
+ * @example
+ * ```typescript
+ * const mutationService = new UserMutationService(adapter, logger);
+ *
+ * const newUser = await mutationService.createLocalUser({ email: 'user@example.com', name: 'John' });
+ * await mutationService.updateUser(userId, { name: 'Jane' });
+ * await mutationService.deleteUser(userId);
+ * ```
+ */
+
+import { randomUUID } from "crypto";
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import type { Table, Column } from "drizzle-orm";
+import { eq, inArray, isNotNull, sql } from "drizzle-orm";
+
+import {
+  CreateLocalUserSchema,
+  UpdateUserSchema,
+} from "@nextly/schemas/_zod/user";
+import { createPasswordSchema } from "@nextly/schemas/_zod/validation";
+import {
+  buildCreateUserSchema,
+  buildUpdateUserSchema,
+} from "@nextly/schemas/user-fields";
+import type { MinimalUser } from "@nextly/types/auth";
+import type {
+  UserInsertData,
+  UserUpdateData,
+} from "@nextly/types/database-operations";
+
+// PR 4 of unified-error-system migration: ServiceError result-shapes →
+// NextlyError throws. Methods now return data directly or throw.
+import { actorForWrite, type RequestActor } from "../../../auth/request-actor";
+import { toDbError } from "../../../database/errors";
+import {
+  firstIdentifierNamed,
+  missingSchemaObject,
+} from "../../../database/missing-column";
+import { appPasswordDigester } from "../../../di/password-digester";
+import { NextlyError } from "../../../errors";
+import { safeEmit } from "../../../events/domain-events";
+import {
+  UserEvents,
+  type UserCreatedPayload,
+  type UserDeletedPayload,
+} from "../../../events/event-names";
+import {
+  RETIRED_ACCOUNTS_TABLE,
+  RETIRED_SESSIONS_TABLE,
+  retiredAccountsTable,
+  retiredSessionsTable,
+} from "../../../init/retired-accounts-erasure";
+import {
+  ERASE_RETIRED_AUTH_TABLES_ENV,
+  hasRetiredShape,
+  liveColumnsOf,
+  retiredTablesNamedForErasure,
+} from "../../../init/retired-auth-tables";
+import { env } from "../../../lib/env";
+import {
+  CONTENT_EVENTS_TABLE,
+  contentEventsTables,
+} from "../../../schemas/content-events";
+import { DELETED_PRINCIPALS_TABLE } from "../../../schemas/deleted-principals/table-name";
+import {
+  EXTERNAL_IDENTITIES_TABLE,
+  externalIdentitiesTables,
+  newExternalIdentityRow,
+  type ExternalIdentityFacts,
+} from "../../../schemas/external-identities";
+import { NOTICES_TABLE, noticesTables } from "../../../schemas/notices";
+import { PLUGIN_SETTINGS_TABLE } from "../../../schemas/plugin-settings/table-name";
+import {
+  VERSION_VIEWS_TABLE,
+  versionViewsTables,
+} from "../../../schemas/version-views";
+import {
+  layoutRowId,
+  widgetLayoutTables,
+  WIDGET_LAYOUT_TABLE,
+} from "../../../schemas/widget-layout";
+import { BaseService } from "../../../services/base-service";
+import type { EmailService } from "../../../services/email/email-service";
+// Built per call from this service's adapter, and loaded then: the container
+// imports every core service.
+import { serviceContainerFor } from "../../../services/service-container-for";
+import type { Logger } from "../../../services/shared";
+import { affectedRowCount } from "../../../shared/lib/affected-row-count";
+import { storageTypeToken } from "../../../shared/lib/plugin-storage";
+import { requireFilterValue } from "../../../shared/lib/require-filter-value";
+import { isUniqueViolation } from "../../../shared/lib/unique-violation";
+import type { UserConfig, UserFieldConfig } from "../../../users/config/types";
+import { eraseActorPersonalData } from "../../audit/erase-actor-personal-data";
+import { beginStaffUserDeletion } from "../../audit/erase-principal";
+import {
+  buildAcceptInviteLink,
+  generateInviteTokenValue,
+} from "../../auth/lib/invite-token";
+import { refuseLinkingPublicRole } from "../../auth/services/public-role";
+import {
+  refuseGrantingSuperAdmin,
+  rolesConferSuperAdmin,
+} from "../../auth/services/super-admin-grant";
+import {
+  revokeAccountTokens,
+  TOKEN_TABLE_NAMES,
+  tokenTable,
+  type TokenTable,
+} from "../../auth/services/token-account-binding";
+import {
+  entryStillReferenced,
+  referrersHolding,
+} from "../../collections/services/entry-still-referenced";
+import { deliveriesTableFor } from "../../email/deliveries-table";
+import {
+  eraseRecipientDeliveries,
+  eraseUnnamedRecipientDeliveries,
+} from "../../email/erase-recipient";
+import { revalidateMedia } from "../../media/revalidate-media";
+import { pluginSettingsSecrets } from "../../plugins/settings-service";
+import { stopReleasesHolding } from "../../releases/early-stop";
+import { introspectLiveSnapshot } from "../../schema/pipeline/diff/introspect-live";
+import { VersionsRepository } from "../../versions/versions-repository";
+import { recordMutationEventInTx } from "../../webhooks/record-mutation-event";
+import { assertNoInterfaceLanguage } from "../interface-language";
+
+import { emailVerificationColumns } from "./email-verification-write";
+import {
+  firstAdministratorTaken,
+  type FirstAdministratorTx,
+  grantFirstAdministratorInTx,
+  type LastSuperAdminTx,
+  lockSuperAdminRole,
+  refuseRemovingLastSuperAdmin,
+  superAdminRoleHeld,
+} from "./last-super-admin";
+import { passwordColumns, updateUserEndingSessions } from "./password-write";
+import { activationChanges } from "./user-activation";
+import type { UserExtSchemaService } from "./user-ext-schema-service";
+
+/**
+ * Who a user write is made for.
+ *
+ * `"app"` is core and the app's own code: the admin, the Direct API, setup and
+ * the seeders. `"plugin"` is a plugin through `ctx.services.users`, which may
+ * create and update accounts but may not decide who administers the site: it
+ * cannot create an install's first account (which core makes super-admin),
+ * cannot give a role that reaches `super-admin`, directly or by inheritance,
+ * and cannot take over or remove an account that already reaches it: no
+ * change to its password, email, activation, verification or roles, and no
+ * deletion. An address it vouches for is recorded as verified by `"plugin"`.
+ * `"setup"` is the setup route's own provisioning: like `"app"`, except that
+ * the account must become the install's first administrator or is not created
+ * at all (firstAdministratorTaken).
+ */
+export type UserWriteCaller = "app" | "plugin" | "self-registration" | "setup";
+
+// ============================================================
+// Drizzle Runtime Types
+// ============================================================
+
+/** The column whose presence means this database can erase an identity. */
+/**
+ * What a database can record about an erasure.
+ *
+ * `false` means the table is absent, so there is nothing to erase.
+ * `"unstamped"` means the table is there on its pre-erasure shape: the
+ * identifying columns exist and are scrubbed, but the column that records when
+ * does not, so that evidence is unavailable until the schema is upgraded.
+ */
+type ErasureShape = "stamped" | "unstamped" | false;
+
+const ERASURE_STAMP_COLUMN = "identity_erased_at";
+
+/**
+ * Runtime-generated Drizzle table object (e.g., from `pgTable()` / `mysqlTable()` / `sqliteTable()`).
+ * The exact type depends on the dialect; property access (e.g., `table.user_id`) is needed,
+ * so we use `Record<string, unknown>` with an intersection of `Table` for Drizzle API compat.
+ */
+type DrizzleRuntimeTable = Table & Record<string, unknown>;
+
+/**
+ * Lint-safe replacement for the unsafe built-in `Function` type used as a
+ * callable property holder. The Drizzle query builder methods we access
+ * (insert/update/delete/...) return chainable thenables whose static types
+ * we deliberately drop. The method type returns the same chainable shape
+ * so dot-chaining keeps typing, and awaits resolve to
+ * `Record<string, unknown>[]` (a row list) since that is the only shape
+ * we ever consume here.
+ */
+interface DrizzleChain {
+  [key: string]: DrizzleChainMethod;
+}
+type DrizzleChainMethod = (
+  ...args: unknown[]
+) => DrizzleChain & PromiseLike<Record<string, unknown>[]>;
+
+/**
+ * Minimal interface for the Drizzle transaction object returned by
+ * BaseService.withTransaction. The real type is dialect-specific
+ * (NodePgTransaction / MySql2Transaction / BetterSQLite3Database),
+ * but the fluent query API is identical across all three.
+ */
+interface DrizzleTransactionLike {
+  insert(table: unknown): { values(data: unknown): Promise<unknown> };
+  update(table: unknown): {
+    set(data: unknown): { where(condition: unknown): Promise<unknown> };
+  };
+  delete(table: unknown): { where(condition: unknown): Promise<unknown> };
+  // Whole-row read, which Drizzle spells as `select()` with no projection.
+  // Named as its own overload rather than widening the one below: the
+  // projected form ends in `.limit()`, and collapsing the two would make a
+  // caller that forgot the limit type-check.
+  select(): {
+    from(table: unknown): {
+      // Awaitable as-is, and lockable where the dialect has row locks — the
+      // same shape the projected form carries below, for the same reason.
+      where(condition: unknown): Promise<Record<string, unknown>[]> & {
+        for(strength: "update"): Promise<Record<string, unknown>[]>;
+      };
+    };
+  };
+  select(fields: unknown): {
+    from(table: unknown): {
+      where(condition: unknown): {
+        // `.for("update")` exists on the Postgres/MySQL builders (SQLite has no
+        // row lock); it is only invoked off SQLite, and the query is awaitable
+        // either way.
+        limit(count: number): Promise<Record<string, unknown>[]> & {
+          for(strength: "update"): Promise<Record<string, unknown>[]>;
+        };
+      };
+    };
+  };
+}
+
+/**
+ * The single capability the user write paths need from the webhook fast-path
+ * drain: a synchronous, self-gating kick that runs a bounded delivery after the
+ * response. Declared as this narrow interface — which `WebhookFastDrainScheduler`
+ * satisfies — rather than the concrete scheduler so the dependency is exactly
+ * the method called, and a test can supply a spy without reconstructing the
+ * scheduler's private state.
+ */
+interface WebhookDrainOffer {
+  offer(): void;
+}
+
+/**
+ * The single capability the user write paths need from the webhook retention
+ * runner: a bounded, self-gating prune offered after a committed write. Narrow
+ * (which `RetentionRunner` satisfies) for the same reason as
+ * {@link WebhookDrainOffer}.
+ */
+interface WebhookRetentionOffer {
+  maybeRun(maxBatches?: number): Promise<void>;
+}
+
+/**
+ * Data for creating a new local user.
+ * Index signature allows custom field values from UserConfig.fields to pass through.
+ */
+export interface CreateLocalUserData {
+  email: string;
+  name: string;
+  image?: string | null;
+  /**
+   * Omit (or leave empty) to create the account in invite mode: no credential
+   * is set and a single-use set-password link is returned for the admin to
+   * deliver. Provide a password to set the credential directly.
+   */
+  password?: string | null;
+  roles?: string[];
+  isActive?: boolean;
+  /**
+   * Force the user to replace this password on first sign-in (ASVS 6.4.1).
+   * Set by the admin create path when an admin types a password for someone
+   * else; NOT derived from password presence, so self-registration and the
+   * setup flow (where the person chooses their own password) never trip it.
+   */
+  mustChangePassword?: boolean;
+  /**
+   * Whether anything has established that this address belongs to whoever is
+   * getting the account.
+   *
+   * `"admin-vouched"` — an operator typed the password for someone else, so
+   * the address was established out of band and the account is verified at
+   * creation. `"pending"` — nobody has vouched, so the address stays unproven
+   * until a verification link is followed.
+   *
+   * Defaults to `"pending"`, because the caller that forgets to say is
+   * precisely the one whose claim should not be believed. Self-registration
+   * relies on that default being the safe one.
+   */
+  emailVerification?: "admin-vouched" | "pending";
+  /** Custom field values from user_ext */
+  [key: string]: unknown;
+}
+
+/** An identity a trusted provider has already verified. */
+export interface CreateExternalUserData {
+  /** Normalized by the same schema as every other create. */
+  email: string;
+  name: string;
+  image?: string | null;
+  /**
+   * Roles to assign. Required and non-empty: an account created by a login
+   * provider must carry an explicit privilege decision rather than inheriting
+   * whatever "no roles" happens to mean.
+   */
+  roleIds: string[];
+  /** When the provider verified the address; stored as `emailVerified`. */
+  emailVerifiedAt: Date;
+  /**
+   * The external identity the account is provisioned for, where the caller
+   * is the sign-in path that owns one: attached IN this creation's
+   * transaction, so the identity table's unique index decides the whole
+   * creation when two first sign-ins race each other past the read — the
+   * loser's account and its roles roll back with the refused insert rather
+   * than standing as an account no identity will ever resolve to. A caller
+   * creating an external account without an identity omits it.
+   */
+  identity?: ExternalIdentityFacts;
+}
+
+/**
+ * Data for updating an existing user.
+ * Index signature allows custom field values from UserConfig.fields to pass through.
+ */
+export interface UpdateUserData {
+  email?: string;
+  name?: string;
+  image?: string;
+  password?: string | null;
+  emailVerified?: Date | null;
+  roles?: string[];
+  isActive?: boolean;
+  sendWelcomeEmail?: boolean;
+  /** Custom field values from user_ext */
+  [key: string]: unknown;
+}
+
+/**
+ * The set-password link handed back when a user is created in invite mode
+ * (no password): the copyable link is the artifact, and delivery by email is
+ * an optional convenience on top of it.
+ */
+export interface InviteArtifact {
+  /** The copyable set-password link to give to the new user. */
+  link: string;
+  /** When the link stops working. */
+  expiresAt: Date;
+}
+
+/**
+ * Response type for user mutation operations.
+ *
+ * Post-migration (PR 4): no `success`/`statusCode`/`message` envelope —
+ * methods return the user directly on success or throw NextlyError.
+ *
+ * `invite` is present only when the account was created in invite mode; the
+ * admin needs the link back to deliver it however they choose.
+ */
+export type UserMutationResponse = MinimalUser & { invite?: InviteArtifact };
+
+/**
+ * Whether `error` says the user fields' own table does not exist: the one
+ * failure of a custom-field write that the create and update paths step around
+ * (a fresh database before the table is made). A missing table it names must
+ * be `user_ext` itself, so a trigger or key on it that reaches another missing
+ * table fails the write instead of being read as no custom fields at all.
+ */
+function userExtTableMissing(error: unknown): boolean {
+  const missing = missingSchemaObject(error);
+  return (
+    missing?.object === "table" &&
+    firstIdentifierNamed(missing.text, ["user_ext"]) === "user_ext"
+  );
+}
+
+/**
+ * A user-field value shaped for the `user_ext` column its field maps to.
+ *
+ * The column builder maps a `date` field, and a plugin type storing as
+ * `timestamp`, to a real timestamp column on every dialect, and Drizzle
+ * refuses to bind a string to one. The failure surfaces as a `user_ext` insert
+ * error, which the create path treats as the table being absent: it disables
+ * the extension for the process and writes the user without the value, so a
+ * wrong shape is lost rather than reported.
+ */
+export function coerceUserExtValue(
+  value: unknown,
+  field: { name?: unknown; type?: unknown },
+  maxLength?: number | null
+): unknown {
+  const token = storageTypeToken(field);
+  const name = typeof field.name === "string" ? field.name : "input";
+
+  // A plugin user field validates through `z.unknown()`, so nothing upstream
+  // has looked at the value at all. Whatever reaches here goes straight to the
+  // driver, and a failed `user_ext` insert is read as the table being absent —
+  // the extension is disabled for the process and the user is written without
+  // the value. So the shape is answered for here, where it can still be
+  // reported, rather than at the column where it is silently lost.
+  if (value !== null && value !== undefined) {
+    if (token === "number" && !Number.isFinite(value)) {
+      // Not just the type: `NaN` and `Infinity` are numbers that no dialect's
+      // numeric column stores faithfully, and the built-in `z.number()` path
+      // refuses them too.
+      throw userExtValueError(name, "a number");
+    }
+    if (token === "checkbox" && typeof value !== "boolean") {
+      throw userExtValueError(name, "true or false");
+    }
+    if (token === "date" && value instanceof Date) {
+      // An Invalid Date binds as NULL on some drivers and throws on others.
+      if (Number.isNaN(value.getTime())) {
+        throw userExtValueError(name, "a valid date");
+      }
+      return value;
+    }
+    if (token === "date" && typeof value !== "string") {
+      throw userExtValueError(name, "a date");
+    }
+    // Text and long text both hold a string. An object bound to a plain text
+    // column fails on SQLite, and that failure is read as the extension table
+    // being absent — so without this the value is dropped rather than refused.
+    if (
+      (token === "text" || token === "textarea") &&
+      typeof value !== "string"
+    ) {
+      throw userExtValueError(name, "text");
+    }
+    // A varchar column holds so many characters, and a longer value fails at
+    // the driver, where it is read as the extension table being absent.
+    // Counted as the column counts them, by character rather than by UTF-16
+    // code unit.
+    if (
+      typeof maxLength === "number" &&
+      typeof value === "string" &&
+      Array.from(value).length > maxLength
+    ) {
+      throw userExtValueError(name, `text of at most ${maxLength} characters`);
+    }
+    // A JSON column stores what `JSON.stringify` can represent. A BigInt or a
+    // cycle throws there, a function or symbol silently becomes `undefined`,
+    // and either way the failure is read as the extension table being absent —
+    // so the value is answered for here instead of vanishing.
+    if (token === "json") {
+      try {
+        if (JSON.stringify(value) === undefined) {
+          throw userExtValueError(name, "a JSON value");
+        }
+      } catch (error) {
+        if (NextlyError.isValidation(error)) throw error;
+        throw userExtValueError(name, "a JSON value");
+      }
+    }
+  }
+
+  if (typeof value !== "string") return value;
+  if (token !== "date") return value;
+  const parsed = new Date(value);
+  if (!Number.isNaN(parsed.getTime())) return parsed;
+
+  // Refused rather than forwarded. Nothing upstream rejects it — a `date`
+  // field validates as `z.union([z.date(), z.string()])` and a plugin type
+  // falls to `z.unknown()` — so passing it on reaches the driver, and the
+  // caller is told the value was stored when it was not.
+  throw userExtValueError(name, "a valid date");
+}
+
+/** A refusal naming the field and what its column can hold. */
+function userExtValueError(name: string, expected: string): NextlyError {
+  return NextlyError.validation({
+    errors: [
+      {
+        path: name,
+        code: "INVALID_USER_FIELD_VALUE",
+        message: `${name} must be ${expected}.`,
+      },
+    ],
+  });
+}
+
+/**
+ * The media columns the detach reads back.
+ *
+ * Deliberately loose: the row is forwarded whole as the event's `previous` and,
+ * with two fields overlaid, as its `data`. Naming each column here would be a
+ * second declaration of the media shape that nothing keeps in step with the
+ * schema — the event only needs the id and the identity of the row.
+ */
+interface MediaRow {
+  id: string;
+  [column: string]: unknown;
+}
+
+/**
+ * The validation refusal for a user input that failed its schema: one error
+ * per issue, at the field it names — or `input` for an issue about the whole
+ * value. One spelling for every user write, so a client reads the same shape
+ * whichever write it made.
+ */
+function userValidationError(
+  issues: ReadonlyArray<{
+    path: readonly PropertyKey[];
+    code: string;
+    message: string;
+  }>,
+  logContext: Record<string, unknown>
+): NextlyError {
+  return NextlyError.validation({
+    errors: issues.map(i => ({
+      path: i.path.join(".") || "input",
+      code: i.code.toUpperCase(),
+      message: i.message,
+    })),
+    logContext,
+  });
+}
+
+/**
+ * Whether an account has the shape core gives an identity another system has
+ * verified: active, with a verified address, and no password. Such an account
+ * is signed in to only through that system, and only core makes one, from an
+ * app's login plugin. One definition for every plugin write that is refused
+ * for producing it.
+ */
+function isExternalIdentityShape(account: {
+  isActive: boolean;
+  verified: boolean;
+  hasPassword: boolean;
+}): boolean {
+  return account.isActive && account.verified && !account.hasPassword;
+}
+
+/**
+ * `schema` with its password judged by the app's hasher: its `reach`, or its
+ * own `validate`, in place of core bcrypt's 72 bytes. The input schemas are
+ * where every account write judges a password, so the hasher's contract is
+ * applied there, before anything is hashed, and the same password is taken or
+ * refused on create and update as on a change or a reset. Without a hasher the
+ * schema is core's, unchanged.
+ */
+function withAppPasswordRule<
+  S extends typeof CreateLocalUserSchema | typeof UpdateUserSchema,
+>(schema: S): S {
+  const { hasher } = appPasswordDigester();
+  if (!hasher) return schema;
+  return schema.extend({
+    password: createPasswordSchema({ hasher }).optional(),
+  }) as S;
+}
+
+/** Whether a stored value is a password the app's sign-in takes. */
+function storesPassword(value: unknown): boolean {
+  // With core's hashing only its hash, since a stored value that is not one
+  // signs nobody in; with the app's own hasher, any value it recognises.
+  return appPasswordDigester().isHash(value);
+}
+
+/**
+ * Whether a verification date names the moment already stored. Compared by
+ * instant: two `Date`s for one moment are never the same object, so a
+ * full-object update passing back the date it read would otherwise count as
+ * verifying the address again, and restamp who vouched for it.
+ */
+function sameVerificationInstant(next: Date, stored: unknown): boolean {
+  if (!(stored instanceof Date || typeof stored === "string")) return false;
+  return new Date(stored).getTime() === next.getTime();
+}
+
+export class UserMutationService extends BaseService {
+  private readonly userConfig?: UserConfig;
+  private readonly userExtSchemaService?: UserExtSchemaService;
+
+  /** Last known merged field count — used to detect stale caches */
+  private lastMergedFieldCount = -1;
+
+  /** Cached runtime Drizzle table object for user_ext (regenerated when fields change) */
+  private userExtTable: DrizzleRuntimeTable | null = null;
+
+  /** Cached set of custom field names for quick lookup (regenerated when fields change) */
+  private customFieldNames: Set<string> | null = null;
+
+  /** Set to true when a user_ext query fails (table missing), disabling ext operations */
+  private userExtDisabled = false;
+
+  /**
+   * Audit tables already confirmed to carry the erasure stamp, by table name.
+   *
+   * Only a confirmed stamp is cached. A table that is absent, or present on its
+   * pre-erasure shape, is the state an operator fixes by upgrading, so those
+   * are re-probed on each deletion: that costs one catalogue lookup on a rare
+   * operation, where caching them would keep answering with a shape the
+   * database has since left for the life of the process.
+   */
+  private readonly erasableTables = new Set<string>();
+
+  /** Cached merged Zod schemas (lazy, rebuilt when merged fields are available) */
+  private createSchema: typeof CreateLocalUserSchema;
+  private updateSchema: typeof UpdateUserSchema;
+  private schemasBuiltWithMerged = false;
+
+  /**
+   * Creates a new UserMutationService instance.
+   *
+   * @param adapter - Database adapter for multi-database support
+   * @param logger - Logger instance
+   * @param userConfig - Optional user extension configuration
+   * @param userExtSchemaService - Optional schema service for generating runtime user_ext table
+   * @param emailService - Optional email service for sending welcome emails
+   */
+  constructor(
+    adapter: DrizzleAdapter,
+    logger: Logger,
+    userConfig?: UserConfig,
+    userExtSchemaService?: UserExtSchemaService,
+    emailService?: EmailService,
+    // Optional so a bare service (CLI, seed, unit test) still records events and
+    // simply relies on the scheduled drain; wired from DI on the request paths.
+    fastDrainScheduler?: WebhookDrainOffer,
+    // Optional bounded retention pass offered after committed writes. The
+    // shared runner carries both the webhook outbox and the audit trails, each
+    // on its own window and gate; absent only when neither has anything to
+    // prune, where the scheduled drain does the work instead.
+    retentionRunner?: WebhookRetentionOffer
+  ) {
+    super(adapter, logger);
+
+    this.userConfig = userConfig;
+    this.userExtSchemaService = userExtSchemaService;
+    this.emailService = emailService;
+    this.fastDrainScheduler = fastDrainScheduler;
+    this.retentionRunner = retentionRunner;
+
+    // Build merged Zod schemas when custom fields are configured
+    if (userConfig?.fields && userConfig.fields.length > 0) {
+      this.createSchema = buildCreateUserSchema(userConfig.fields);
+      this.updateSchema = buildUpdateUserSchema(userConfig.fields);
+    } else {
+      this.createSchema = CreateLocalUserSchema;
+      this.updateSchema = UpdateUserSchema;
+    }
+  }
+
+  // ============================================================
+  // User Extension Helpers
+  // ============================================================
+
+  /**
+   * Get the effective custom fields for this service.
+   *
+   * Prefers merged fields from `UserExtSchemaService` (code + UI sources,
+   * loaded via `loadMergedFields()` at startup) and falls back to
+   * `userConfig.fields` (code-only from `defineConfig()`).
+   */
+  private getEffectiveFields(): UserFieldConfig[] {
+    if (this.userExtSchemaService?.hasMergedFields()) {
+      return this.userExtSchemaService.getMergedFieldConfigs();
+    }
+    return this.userConfig?.fields ?? [];
+  }
+
+  /**
+   * Check if custom user fields are configured (from either source).
+   */
+  private hasCustomFields(): boolean {
+    return this.getEffectiveFields().length > 0;
+  }
+
+  /**
+   * What this database can record about erasing a trail.
+   *
+   * Reports the SHAPE rather than a yes/no, because the two callers answer a
+   * pre-erasure shape differently and only they can decide that.
+   *
+   * `false` — the table is absent, so there is no trail and no identifying data
+   * to leave behind. `"unstamped"` — the table is there on its pre-erasure
+   * shape, on a database whose upgrade did not reach it: the core reconcile
+   * pushes only the static tables, and drizzle-kit's SQLite entrypoint takes no
+   * table filter, so an ordinary `dc_*` content table reads as an orphan and
+   * trips its rename resolver — after which the recovery pass can create
+   * missing tables but never alters an existing one. The identifying columns
+   * exist there; only the column recording WHEN an erasure happened does not.
+   *
+   * Neither answer fails the deletion. An account holder's right to have their
+   * account removed does not depend on the state of a table they never saw, so
+   * a shape that cannot be fully erased is reported and said out loud rather
+   * than made a reason to refuse. What the caller does with
+   * `"unstamped"` depends on the table: an un-erased `activity_log` row is
+   * carried away by its cascading key, while an `audit_log` row has no key and
+   * would keep its identifiers indefinitely, so that one is scrubbed without
+   * the stamp rather than skipped.
+   *
+   * A probe that cannot run answers `"stamped"`, so an unreadable catalogue
+   * leaves the erasure in place and the deletion fails loudly rather than
+   * quietly skipping it.
+   */
+  private async supportsErasure(
+    table: string,
+    whatIsLost: string
+  ): Promise<ErasureShape> {
+    if (this.erasableTables.has(table)) return "stamped";
+
+    let tableExists: boolean;
+    try {
+      tableExists = await this.adapter.tableExists(table);
+    } catch {
+      return "stamped";
+    }
+    if (!tableExists) return false;
+
+    // Introspection rather than a probe query, because this needs an answer
+    // and a failed statement is not one. A SELECT that throws cannot say
+    // whether the column is missing or the connection blinked, and reading a
+    // blink as "legacy shape" would delete an account without erasing it —
+    // permanently, since the table no longer cascades. This asks the catalogue
+    // directly and propagates anything that goes wrong, so an unanswerable
+    // question fails the deletion instead of silently skipping the erasure.
+    const snapshot = await introspectLiveSnapshot(this.db, this.dialect, [
+      table,
+    ]);
+    const columns = snapshot.tables.find(t => t.name === table)?.columns ?? [];
+    if (!columns.some(c => c.name === ERASURE_STAMP_COLUMN)) {
+      this.logger.warn(
+        `${table} predates identity erasure (no ${ERASURE_STAMP_COLUMN} ` +
+          `column); deleting a user cannot record WHEN ${whatIsLost} was ` +
+          "scrubbed from it. Run `nextly migrate` to apply the core schema " +
+          "change."
+      );
+      return "unstamped";
+    }
+
+    this.erasableTables.add(table);
+    return "stamped";
+  }
+
+  /**
+   * Check if cached ext data is stale (merged fields changed since last cache).
+   * If stale, clear caches so they are regenerated on next access.
+   */
+  private ensureCachesFresh(): void {
+    const currentCount = this.getEffectiveFields().length;
+    if (currentCount !== this.lastMergedFieldCount) {
+      this.userExtTable = null;
+      this.customFieldNames = null;
+      this.schemasBuiltWithMerged = false;
+      this.userExtDisabled = false;
+      this.lastMergedFieldCount = currentCount;
+    }
+  }
+
+  /**
+   * Get or lazily create the runtime Drizzle table object for user_ext.
+   * Automatically invalidated when merged fields change.
+   */
+  private getUserExtTable(): DrizzleRuntimeTable | null {
+    this.ensureCachesFresh();
+    if (this.userExtDisabled) return null;
+    if (this.userExtTable) return this.userExtTable;
+    if (!this.hasCustomFields() || !this.userExtSchemaService) return null;
+
+    this.userExtTable = this.userExtSchemaService.generateRuntimeSchema(
+      this.getEffectiveFields()
+    );
+    return this.userExtTable;
+  }
+
+  /**
+   * Get the set of custom field names for quick lookup.
+   * Automatically invalidated when merged fields change.
+   */
+  private getCustomFieldNames(): Set<string> {
+    this.ensureCachesFresh();
+    if (this.customFieldNames) return this.customFieldNames;
+
+    this.customFieldNames = new Set<string>();
+    for (const field of this.getEffectiveFields()) {
+      if ("name" in field && field.name) {
+        this.customFieldNames.add(field.name);
+      }
+    }
+    return this.customFieldNames;
+  }
+
+  /**
+   * Get the Zod create schema, rebuilding with merged fields if needed.
+   */
+  private getCreateSchema(): typeof CreateLocalUserSchema {
+    this.ensureSchemasUpToDate();
+    return withAppPasswordRule(this.createSchema);
+  }
+
+  /**
+   * Get the Zod update schema, rebuilding with merged fields if needed.
+   */
+  private getUpdateSchema(): typeof UpdateUserSchema {
+    this.ensureSchemasUpToDate();
+    return withAppPasswordRule(this.updateSchema);
+  }
+
+  /**
+   * Rebuild Zod validation schemas if merged fields are available
+   * and haven't been incorporated yet.
+   */
+  private ensureSchemasUpToDate(): void {
+    if (this.schemasBuiltWithMerged) return;
+    if (!this.userExtSchemaService?.hasMergedFields()) return;
+
+    const fields = this.getEffectiveFields();
+    if (fields.length > 0) {
+      this.createSchema = buildCreateUserSchema(fields);
+      this.updateSchema = buildUpdateUserSchema(fields);
+    }
+    this.schemasBuiltWithMerged = true;
+  }
+
+  /**
+   * Extract custom field values from input data.
+   * Returns an object with only the keys that match configured custom field names.
+   * Values are included even if null/undefined (to ensure user_ext row has all columns).
+   */
+  private extractCustomFieldValues(
+    input: Record<string, unknown>
+  ): Record<string, unknown> {
+    const values: Record<string, unknown> = {};
+    const shape = this.customFieldShaper();
+    for (const fieldName of this.getCustomFieldNames()) {
+      const raw = fieldName in input ? (input[fieldName] ?? null) : null;
+      values[fieldName] = shape(fieldName, raw);
+    }
+    return values;
+  }
+
+  /**
+   * Shapes a custom field's value for the `user_ext` column its field maps to:
+   * its kind, and its length where the column has one. One rule for the create
+   * and update paths, which bind to the same columns, and whose failure is
+   * read the same way, as the extension table being absent, so an unshaped
+   * value would be dropped rather than refused.
+   */
+  private customFieldShaper(): (fieldName: string, raw: unknown) => unknown {
+    const byName = new Map(
+      this.getEffectiveFields()
+        .filter(
+          (field): field is typeof field & { name: string } =>
+            "name" in field && typeof field.name === "string"
+        )
+        .map(field => [field.name, field])
+    );
+    return (fieldName, raw) => {
+      const field = byName.get(fieldName);
+      return field
+        ? coerceUserExtValue(
+            raw,
+            { name: fieldName, type: field.type },
+            this.userExtSchemaService?.textColumnLength(field)
+          )
+        : raw;
+    };
+  }
+
+  private readonly emailService?: EmailService;
+
+  // Post-commit fast-path drain kick, shared with the collection/single/media
+  // write paths. Absent on bare services, where the scheduled drain delivers.
+  private readonly fastDrainScheduler?: WebhookDrainOffer;
+
+  // Post-commit bounded retention pass, shared with the same write paths. It
+  // offers both the webhook outbox and the audit trails; absent only when
+  // neither has anything to prune, where the scheduled drain does the work.
+  private readonly retentionRunner?: WebhookRetentionOffer;
+
+  // Cap the write-path prune so a user write that happens to win the retention
+  // gate is never held up by a large backlog; the scheduled drain owns bulk
+  // pruning. Matches the collection/single write-path bound.
+  private static readonly WRITE_PATH_PRUNE_BATCHES = 2;
+
+  /**
+   * Record `user.created` in the SAME transaction that inserts the account.
+   *
+   * One implementation for both creation paths. They had diverged: the local
+   * path recorded and emitted, the external path did nothing, so an account
+   * provisioned by a login provider was invisible to every subscriber that
+   * observes the ordinary one — and a plugin initialising per-user state saw
+   * no such user exist.
+   *
+   * The payload is identity only, never a password or token hash. Roles are
+   * omitted deliberately: the local path assigns them after this transaction
+   * commits, so no committed role state exists to report without a false
+   * claim. Returns whether a row was written, so the caller offers the drain
+   * only for a real event.
+   */
+  private async recordUserCreatedInTx(
+    txDb: DrizzleTransactionLike,
+    created: {
+      userId: string;
+      email: string;
+      name: string | null;
+      actor: RequestActor | null;
+    }
+  ): Promise<boolean> {
+    return recordMutationEventInTx(txDb, this.dialect, {
+      type: "user.created",
+      resource: { kind: "user", id: created.userId },
+      data: {
+        id: created.userId,
+        email: created.email,
+        name: created.name,
+      },
+      fields: [],
+      actor: created.actor,
+    });
+  }
+
+  /**
+   * The post-commit half, once the account and its outbox row are durable.
+   *
+   * `recorded` answers whether the WEBHOOK OUTBOX accepted a row, which is a
+   * different question from whether the account was created. Gating the
+   * in-process event on it meant that an install with no enabled endpoint —
+   * the common one — emitted no `user.created` at all, so plugins never
+   * initialized per-user state unless unrelated webhook recording happened to
+   * be switched on. Only the drain, which exists to deliver that row, belongs
+   * behind it.
+   */
+  private async afterUserCreated(
+    recorded: boolean,
+    userId: string
+  ): Promise<void> {
+    // Once the account is durable: inside an enclosing transaction on SQLite
+    // that is its commit, and a rolled-back account is never announced.
+    await this.afterCommit(async () => {
+      await this.retentionRunner?.maybeRun(
+        UserMutationService.WRITE_PATH_PRUNE_BATCHES
+      );
+      // Only the delivery of the outbox row depends on there being one.
+      if (recorded) this.fastDrainScheduler?.offer();
+      // The account exists either way, so in-process subscribers are told.
+      const payload: UserCreatedPayload = { userId };
+      safeEmit(UserEvents.Created, payload);
+    });
+  }
+
+  /**
+   * Create an active, email-verified user with no password, for an identity a
+   * trusted provider has already verified.
+   *
+   * Distinct from a passwordless {@link createLocalUser}, which creates an
+   * INACTIVE invite carrying a set-password link — an external identity needs
+   * neither, and the account must be usable the moment the provider vouches
+   * for it.
+   *
+   * Two refusals are policy rather than validation. It will not create the
+   * FIRST account on an install, because that account decides who administers
+   * the site and a login provider must never be what mints it. And it will not
+   * assign the super-admin role, because the privileges of the highest role
+   * should never be reachable by arriving through a provider.
+   *
+   * Roles are validated and assigned INSIDE the insert's transaction, unlike
+   * `createLocalUser`, which assigns them afterwards and swallows failures —
+   * that would leave an active account with fewer privileges than it was
+   * created with, and nothing to say so. An `identity` the caller brings is
+   * attached in that same transaction, for the same reason: an account the
+   * identity table refused must not stand.
+   */
+  async createExternalUser(
+    input: CreateExternalUserData,
+    _context?: RequestActor
+  ): Promise<UserMutationResponse> {
+    // The CORE schema, not the merged one. `getCreateSchema()` includes the
+    // install's custom user fields, and this path has no way to supply them:
+    // the input type carries only what a provider asserts. An install that
+    // declared any REQUIRED custom field therefore failed every external
+    // login on a field the caller could not have sent.
+    //
+    // Validating narrowly rather than widening the input is deliberate. A
+    // value a provider never asserted would have to be invented here, and a
+    // custom field an operator marked required is exactly the kind of thing
+    // that should not be filled in with a guess. Accounts created this way
+    // carry the core fields; anything else is set afterwards, by an admin or
+    // by the account itself.
+    const validation = CreateLocalUserSchema.safeParse({
+      email: input.email,
+      name: input.name,
+      image: input.image ?? null,
+      isActive: true,
+    });
+    if (!validation.success) {
+      throw userValidationError(validation.error.issues, {
+        entity: "user",
+        email: input.email,
+      });
+    }
+    const email = validation.data.email;
+
+    if (input.roleIds.length === 0) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path: "roleIds",
+            code: "REQUIRED",
+            message: "At least one role is required.",
+          },
+        ],
+      });
+    }
+
+    const { users, roles, userRoles } = this.tables;
+
+    // A cheap refusal before any work, and NOT the one that decides: the
+    // binding check runs inside the transaction below, holding the row it
+    // found. This one only saves the round trips when the install is plainly
+    // empty.
+    const existingUser = await this.db.query.users.findFirst({
+      columns: { id: true },
+    });
+    if (!existingUser) {
+      throw NextlyError.forbidden({
+        logContext: {
+          reason: "external-user-on-empty-install",
+          email,
+        },
+      });
+    }
+
+    // CASE-INSENSITIVE, because the spellings are unbounded. `email` here is
+    // the canonical form the schema produced, and probing the canonical form
+    // plus the caller's exact spelling still missed a legacy row stored in a
+    // THIRD capitalization — `User@Example.com` against a provider that had
+    // already sent `user@example.com` made both probe values identical, and
+    // the case-sensitive unique index admitted a second account for the same
+    // mailbox. One lowercased comparison is the whole mailbox's identity,
+    // whichever spelling a pre-normalization row keeps.
+    const duplicate = await (this.db as unknown as DrizzleChain)
+      .select({ id: users.id })
+      .from(users)
+      .where(sql`lower(${users.email}) = lower(${email})`)
+      .limit(1);
+    if (duplicate.length > 0) {
+      throw NextlyError.duplicate({
+        logContext: { entity: "user", email },
+      });
+    }
+
+    // Read rather than ensure: `ensureSuperAdminRole` CREATES the role, and a
+    // refusal must not bring into existence the thing it refuses.
+    const namedRoles = (await this.db
+      .select({ id: roles.id, slug: roles.slug })
+      .from(roles)
+      .where(inArray(roles.id, input.roleIds))) as Array<{
+      id: string;
+      slug: string;
+    }>;
+
+    if (namedRoles.length !== new Set(input.roleIds).size) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path: "roleIds",
+            code: "INVALID",
+            message: "One or more roles do not exist.",
+          },
+        ],
+        logContext: { entity: "user", email },
+      });
+    }
+    // INHERITED as well as direct. A role whose own slug is something else
+    // can still inherit `super-admin`, and the permission system resolves
+    // exactly that way — so a direct-slug test refused the obvious attempt and
+    // let a provider mint a full super-admin through one indirection. The
+    // descendant walk is the same one `getAllRoleIdsForUser` and the RBAC
+    // services resolve through, rather than a second reading of the graph.
+    // A cheap refusal before any further work. It is NOT the one that decides:
+    // the binding check runs inside the transaction, immediately before the
+    // roles are assigned.
+    await this.refuseSuperAdminRoles(
+      namedRoles.map(r => r.id),
+      { reason: "external-user-super-admin-refused", email }
+    );
+    // The Public role is what visitors hold, never anyone's role.
+    await refuseLinkingPublicRole(
+      this.db as LastSuperAdminTx,
+      this.dialect,
+      namedRoles.map(r => r.id),
+      "assign",
+      { email }
+    );
+
+    const now = new Date();
+    const newUserId = randomUUID();
+
+    let userCreatedRecorded = false;
+    // The duplicate lookup above is a READ, so it cannot settle a race: two
+    // provider callbacks for the same new address both pass it, and the loser's
+    // insert violates the unique index. Untranslated, that surfaced as an
+    // untyped 500, and the provider could not tell "already exists" — the case
+    // it recovers from by loading the account — from a real failure. Classified
+    // the same way `createLocalUser` and `updateUser` classify it, because it
+    // is the same outcome reached by a different route.
+    try {
+      await this.withTransaction(async tx => {
+        const txDb = tx as DrizzleTransactionLike;
+
+        // Re-checked HERE, holding whatever account it finds: the check above
+        // is a read, and the last remaining user could be deleted between it
+        // and this insert.
+        await this.requireExistingAccountInTx(txDb, {
+          reason: "external-user-on-empty-install",
+          email,
+        });
+
+        // The roles RE-READ here, holding what exists. MySQL's `user_roles`
+        // carries no foreign key, so a role deleted between the pre-flight
+        // lookup and these inserts would have committed an active external
+        // account with a dangling — effectively empty — required role set,
+        // with `isSuperAdmin` seeing nothing to refuse. The count is the
+        // whole validation: every requested id answered a row, or the
+        // transaction refuses. SQLite needs no lock (BEGIN IMMEDIATE
+        // serializes writers), matching the anchor probe above; the limit is
+        // the requested count, which is every row the ids can answer.
+        const txRoles = await this.lockExistingRoles(txDb, input.roleIds);
+        if (txRoles.length !== new Set(input.roleIds).size) {
+          throw NextlyError.validation({
+            errors: [
+              {
+                path: "roleIds",
+                code: "INVALID",
+                message: "One or more roles do not exist.",
+              },
+            ],
+            logContext: { entity: "user", email },
+          });
+        }
+
+        await txDb.insert(users).values({
+          id: newUserId,
+          email,
+          name: input.name,
+          passwordHash: null,
+          // The provider established the address, so it is verified at
+          // creation and the account is usable at once.
+          ...emailVerificationColumns(input.emailVerifiedAt, "external"),
+          image: input.image ?? null,
+          isActive: true,
+          mustChangePassword: false,
+          createdAt: now,
+          updatedAt: now,
+        });
+
+        // In the same transaction as the account: an active user missing the
+        // roles it was created with is a worse outcome than no user at all.
+        for (const role of txRoles) {
+          await txDb.insert(userRoles).values({
+            id: randomUUID(),
+            userId: newUserId,
+            roleId: role.id,
+            createdAt: now,
+          });
+        }
+
+        // The identity the account is provisioned for, when the caller
+        // brought one, in the same transaction as the account it belongs to:
+        // two first sign-ins for one identity both pass the read that
+        // precedes them, and the table's unique index is what actually
+        // refuses the second — so its refusal must take the account and its
+        // roles with it rather than leaving an account no identity will ever
+        // resolve to. The row is built by the one builder the explicit link
+        // writes through, so both attaching doors store one shape.
+        if (input.identity !== undefined) {
+          await txDb
+            .insert(
+              externalIdentitiesTables(this.dialect).nextlyExternalIdentities
+            )
+            .values(newExternalIdentityRow(input.identity, newUserId));
+        }
+
+        // The CANONICAL decision, asked about the account that now exists,
+        // on this transaction, after its roles are assigned.
+        //
+        // The refusal before the transaction reads a graph an administrator
+        // can change: an inheritance edge added between that read and these
+        // inserts would have committed an account reaching `super-admin`
+        // after the check had already passed. Asking `isSuperAdmin` here
+        // answers about the rows this transaction actually wrote, using the
+        // same resolution the request-time gate uses — so a graph that
+        // changed underneath it is seen, and the insert rolls back.
+        //
+        // The executor matters twice: it reads through this transaction's
+        // uncommitted rows, which is the only way to see roles not yet
+        // committed, and it bypasses the super-admin cache in both
+        // directions, so nothing here can poison a later request's answer.
+        //
+        // The THROWING form: this is a refusal gate, so a read that fails
+        // must fail the creation. The access-check form answers a failure
+        // with `false`, which here would mean "allow", and on MySQL and
+        // SQLite the failed read does not abort the transaction.
+        const { isSuperAdminOrThrow } = await import(
+          "../../../services/lib/permissions"
+        );
+        if (await isSuperAdminOrThrow(newUserId, txDb)) {
+          throw NextlyError.forbidden({
+            logContext: {
+              reason: "external-user-super-admin-refused",
+              email,
+            },
+          });
+        }
+
+        // Inside the transaction, like the local path: a subscriber observes
+        // the account exactly when it becomes real, and never for a
+        // rolled-back one.
+        userCreatedRecorded = await this.recordUserCreatedInTx(txDb, {
+          userId: newUserId,
+          email,
+          name: input.name,
+          actor: _context ?? null,
+        });
+      });
+    } catch (err) {
+      if (NextlyError.is(err)) throw err;
+      // `fromDatabaseError` already maps a unique violation to DUPLICATE, so
+      // there is no second branch here spelling that out: the local path keeps
+      // one only because it attaches a different logContext, and restating the
+      // mapping is how two answers to one question start to drift.
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, err));
+    }
+
+    await this.afterUserCreated(userCreatedRecorded, newUserId);
+
+    return {
+      id: newUserId,
+      email,
+      emailVerified: input.emailVerifiedAt,
+      name: input.name,
+      image: input.image ?? null,
+      roles: input.roleIds,
+    };
+  }
+
+  /**
+   * Create a new local user with password authentication.
+   *
+   * §13.8 + spec note: "User with this email already exists" is sensitive
+   * (account enumeration) and now surfaces as a generic
+   * NextlyError.duplicate(). Validation errors carry per-field paths but
+   * never echo values; identifiers go to logContext.
+   *
+   * @param actor - Who initiated the write, recorded for event attribution.
+   *   Omitted for genuinely internal calls (seed, self-registration), which
+   *   record no actor.
+   * @param caller - Who the write is made for; see {@link UserWriteCaller}.
+   * @throws NextlyError(VALIDATION_ERROR) on input validation / invalid role ids.
+   * @throws NextlyError(DUPLICATE) when the email is already registered.
+   * @throws NextlyError(FORBIDDEN) for a `"plugin"` caller on an empty
+   *   install, or with a role that reaches `super-admin`.
+   * @throws NextlyError on DB errors via fromDatabaseError.
+   */
+  async createLocalUser(
+    userData: CreateLocalUserData,
+    actor?: RequestActor,
+    caller: UserWriteCaller = "app"
+  ): Promise<UserMutationResponse> {
+    try {
+      // Whether the install has any account yet (existence check).
+      const anyAccount = await this.db.query.users.findFirst({
+        columns: { id: true },
+      });
+      // A plugin never creates the install's first account: that one is the
+      // app's to provision. A cheap refusal before any work; the binding one
+      // runs inside the insert's transaction.
+      if (caller === "plugin" && !anyAccount) {
+        throw NextlyError.forbidden({
+          logContext: {
+            reason: "plugin-user-on-empty-install",
+            email: userData.email,
+          },
+        });
+      }
+
+      // Validate input (merged schema includes custom field validators when configured)
+      const validation = this.getCreateSchema().safeParse(userData);
+      if (!validation.success) {
+        // Email goes to logContext only — never echoed in the public message.
+        throw userValidationError(validation.error.issues, {
+          entity: "user",
+          email: userData.email,
+        });
+      }
+
+      // The create schema already validated the address and normalized it
+      // (EmailSchema lowercases and trims). From here on the normalized value
+      // is the only spelling this method stores or compares: the login lookup
+      // finds accounts with a case-sensitive `=` on that same spelling, so
+      // carrying the raw input forward would save an address no sign-in can
+      // ever match.
+      const email = validation.data.email;
+
+      const { users } = this.tables;
+
+      // 🔴 Derive the hash BEFORE the duplicate lookup, and keep it that way.
+      //
+      // The obvious reordering -- look the address up first, and skip a
+      // deliberately expensive key derivation for a request that is going to be
+      // rejected -- was applied here and then reverted, so the reasoning is
+      // recorded rather than left to be rediscovered by whoever tries it next.
+      //
+      // It creates an ACCOUNT-ENUMERATION ORACLE. `/api/auth/register` answers
+      // a taken address and a free one with byte-identical responses on purpose
+      // (spec §13.2 silent-success), so duration is the only channel left --
+      // and `stallResponse` is a FLOOR, not a fixed duration: it pads a fast
+      // response up to `loginStallTimeMs` (500ms) and does nothing to a slow
+      // one. Check-first therefore returns a taken address at ~500ms and a free
+      // one at however long bcrypt takes, measured here at ~2.9s locally and
+      // ~9.8s on a loaded runner. The two identical responses become trivially
+      // distinguishable by a stopwatch.
+      //
+      // And it buys almost nothing against the availability concern it was
+      // written for. An attacker burning CPU has no reason to send a REGISTERED
+      // address: unregistered ones still reach the hash on every request, so
+      // check-first only avoids the work in the case nobody attacking would
+      // choose. What actually bounds that cost is the per-IP limiter, which
+      // already covers this route -- `register` is in the shared auth bucket in
+      // `auth/handlers/router.ts` and is checked before dispatch.
+      //
+      // So both paths pay the hash, both leave at the same time, and the
+      // enumeration property the endpoint is designed around holds.
+      // Every password given here is a raw one, and is hashed whatever it
+      // looks like. Guessing from its shape whether it was already a hash
+      // stored a long password containing a colon as plain text. A caller
+      // holding a real hash sets it through `updatePasswordHash`, the one
+      // write that takes a hash, and which refuses anything else.
+      let passwordHash: string | null = null;
+      if (userData.password && userData.password.length > 0) {
+        passwordHash = await appPasswordDigester().hash(userData.password);
+      }
+
+      // Account-enumeration sensitive: the public message stays generic
+      // ("Resource already exists.") via NextlyError.duplicate; the email and
+      // entity travel only through logContext.
+      //
+      // CASE-INSENSITIVE, for the same reason the external path's probe is:
+      // the canonical form and the caller's exact spelling together still
+      // missed a legacy row in a third capitalization, and the
+      // case-sensitive unique index would admit a second account for the
+      // same address.
+      const existingUser = await (this.db as unknown as DrizzleChain)
+        .select({ id: users.id, email: users.email })
+        .from(users)
+        .where(sql`lower(${users.email}) = lower(${email})`)
+        .limit(1);
+      if (existingUser.length > 0) {
+        throw NextlyError.duplicate({
+          logContext: { entity: "user", email },
+        });
+      }
+
+      // If roles are provided, validate they all exist before creating the user.
+      // Post-migration: services.roles.getRoleById throws NextlyError(NOT_FOUND)
+      // when missing rather than returning {success, data} — catch and treat
+      // any thrown error as "role not found" so we batch them into one
+      // VALIDATION_ERROR for the caller.
+      if (userData.roles && userData.roles.length > 0) {
+        const uniqueRoleIds = Array.from(new Set(userData.roles));
+        const services = await serviceContainerFor(this.adapter);
+        const invalidRoleIds: string[] = [];
+        for (const rid of uniqueRoleIds) {
+          try {
+            await services.roles.getRoleById(rid);
+          } catch (err) {
+            // Only treat NOT_FOUND as the expected "invalid role id" case.
+            // Re-throw anything else (transient DB outages, validation
+            // failures, etc.) so they surface as 5xx instead of being
+            // silently classified as bad role ids.
+            if (NextlyError.isNotFound(err)) {
+              invalidRoleIds.push(rid);
+              continue;
+            }
+            throw err;
+          }
+        }
+        if (invalidRoleIds.length > 0) {
+          // §13.8: per-error message names the field (`roles`) but not the
+          // bad values; the invalid ids go to logContext.
+          throw NextlyError.validation({
+            errors: [
+              {
+                path: "roles",
+                code: "INVALID_ROLE_ID",
+                message: "One or more role ids are invalid.",
+              },
+            ],
+            logContext: { invalidRoleIds },
+          });
+        }
+        // Before the insert: the roles are assigned after the account is
+        // committed, so a refusal there would leave the account behind.
+        // The Public role is what visitors hold, never anyone's role.
+        await refuseLinkingPublicRole(
+          this.db as LastSuperAdminTx,
+          this.dialect,
+          uniqueRoleIds,
+          "assign",
+          { email }
+        );
+        if (caller === "plugin") {
+          await this.refuseSuperAdminRoles(uniqueRoleIds, {
+            reason: "plugin-user-super-admin-refused",
+            email,
+          });
+        } else if (caller === "app") {
+          // Early, before the account exists. Asked again where the roles are
+          // written, under the lock, so a change between the two counts.
+          await refuseGrantingSuperAdmin(
+            this.db as LastSuperAdminTx,
+            this.dialect,
+            uniqueRoleIds,
+            { email }
+          );
+        }
+      }
+
+      // Two ways to provision sign-in, decided by whether a password was
+      // given. No password → invite mode: the account is created without a
+      // credential and a single-use set-password link is minted in the same
+      // transaction, so an admin can never be handed a user that has no way
+      // in. A password → the admin set it directly and the account is usable
+      // at once. The link is the artifact; delivering it by email is optional
+      // and left to the caller, so nothing about creation depends on mail.
+      const isInvite = passwordHash === null;
+
+      // Absent means "nobody vouched", so an un-updated caller outside this
+      // package gets the unproven account rather than the trusted one.
+      const adminVouched = userData.emailVerification === "admin-vouched";
+
+      // Insert new user (and user_ext if custom fields are configured)
+      const now = new Date();
+      const newUserId = randomUUID();
+      const values: UserInsertData = {
+        id: newUserId,
+        email,
+        name: userData.name,
+        passwordHash,
+        // An invited account has not proven its address yet; accepting the
+        // invite (which requires receiving the link) sets emailVerified in the
+        // same step. An admin-set password vouches for the account, so it is
+        // verified at creation.
+        //
+        // Having a password is NOT on its own evidence of anything: a person
+        // registering themselves also supplies one, and treating that as proof
+        // let anyone claim any address. Only a caller that explicitly vouches
+        // gets a verified account, recorded as vouched for by whoever it is.
+        ...emailVerificationColumns(
+          isInvite || !adminVouched ? null : now,
+          caller === "plugin" ? "plugin" : "admin"
+        ),
+        image: userData.image ?? null,
+        isActive: userData.isActive ?? false,
+        // Only true when an admin typed the password for someone else; the
+        // caller decides, so self-registration/setup never force a change.
+        mustChangePassword: userData.mustChangePassword === true,
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      // Over the row about to be written, before it is: a plugin never
+      // creates the account core makes for an externally verified identity.
+      // An invite is never verified at creation, so today this cannot fire;
+      // it costs nothing, and holds if the rule above it changes.
+      if (
+        caller === "plugin" &&
+        isExternalIdentityShape({
+          isActive: values.isActive === true,
+          verified: values.emailVerified != null,
+          hasPassword: storesPassword(values.passwordHash),
+        })
+      ) {
+        throw NextlyError.forbidden({
+          logContext: { reason: "plugin-external-identity-refused", email },
+        });
+      }
+
+      // Mint the invite token value up front (pure computation) so the hash can
+      // be written inside the same transaction as the account. Storing only the
+      // hash, atomically with the user, guarantees the two never diverge:
+      // either the user and their live link both exist, or neither does.
+      const inviteValue = isInvite ? generateInviteTokenValue() : null;
+
+      // Extract custom field values before the transaction
+      const hasExt = this.hasCustomFields();
+      const userExtTable = hasExt ? this.getUserExtTable() : null;
+      let customFieldValues: Record<string, unknown> = {};
+      if (hasExt) {
+        customFieldValues = this.extractCustomFieldValues(userData);
+      }
+
+      // Write the invite-token row alongside the user. Shared by the main path
+      // and the user_ext self-healing retry so an invited account keeps its
+      // link whichever path commits it.
+      const insertInviteToken = async (txDb: DrizzleTransactionLike) => {
+        if (!inviteValue) return;
+        await txDb.insert(this.tables.userInviteTokens).values({
+          userId: newUserId,
+          tokenHash: inviteValue.tokenHash,
+          expires: inviteValue.expiresAt,
+        });
+      };
+
+      // Recorded through the shared helper, which the external creation path
+      // also uses — the two had drifted, and only one of them told anybody a
+      // user existed.
+      let userCreatedRecorded = false;
+      const recordCreatedEvent = async (txDb: DrizzleTransactionLike) => {
+        userCreatedRecorded = await this.recordUserCreatedInTx(txDb, {
+          userId: newUserId,
+          email,
+          name: userData.name ?? null,
+          actor: actor ?? null,
+        });
+      };
+
+      // A plugin's create holds an existing account for the length of the
+      // insert, so it can never become the install's first; see
+      // requireExistingAccountInTx. Run by both inserts below.
+      const requireExistingAccount = async (txDb: DrizzleTransactionLike) => {
+        if (caller !== "plugin") return;
+        await this.requireExistingAccountInTx(txDb, {
+          reason: "plugin-user-on-empty-install",
+          email,
+        });
+      };
+
+      // Only an account the app itself provisions can become the install's
+      // first administrator: never a stranger's self-registration, and never a
+      // plugin's. The app's own provisioning (its admin, its server code) does
+      // so only for the install's very first account; once any account
+      // exists, even a role-less sign-up, an account it creates is never
+      // promoted, so a stranger who registered first cannot turn the app's
+      // next account into a super-admin. Setup alone creates the administrator
+      // whenever nobody holds the role. Granted inside the insert's own
+      // transaction, under the role row's lock, so two accounts provisioned at
+      // once leave exactly one (grantFirstAdministratorInTx). The role is
+      // ensured before the transaction opens, and only while no administrator
+      // is seen: once one exists, nothing here can grant.
+      const provisionsFirstAdministrator =
+        (caller === "app" && !anyAccount) || caller === "setup";
+      const bootstrapRoleReady =
+        provisionsFirstAdministrator &&
+        (await this.mayBootstrapFirstAdministrator());
+      // A sign-up takes the same lock, first, while nobody holds the role,
+      // though it is never granted: on PostgreSQL the app's check for other
+      // accounts cannot see a sign-up still uncommitted beside it, so the two
+      // must run one after the other. Judged by the role's holders rather than
+      // by whether any account exists, since an account seen here can be gone
+      // by the time the transaction opens, while a holder cannot drop to none
+      // (refuseRemovingLastSuperAdmin). The role row is ensured so that it
+      // exists to be locked, as a fresh install has none until its first
+      // administrator; a sign-up never fails for it (roleForSignUpToWaitOn).
+      const signUpWaitsForFirstAdministrator =
+        caller === "self-registration" &&
+        !(await superAdminRoleHeld(this.db, this.tables));
+      if (signUpWaitsForFirstAdministrator) {
+        await this.roleForSignUpToWaitOn();
+      }
+      // Setup creates the install's first administrator or nothing: refused
+      // here once one is seen, and inside the insert's transaction when another
+      // wins the grant, so a setup that lost a race publishes no account.
+      if (caller === "setup" && !bootstrapRoleReady) {
+        throw firstAdministratorTaken();
+      }
+      let grantedFirstAdministrator = false;
+      // First, before the transaction writes anything: the role row's lock.
+      const lockForBootstrap = async (
+        txDb: DrizzleTransactionLike
+      ): Promise<string | undefined> =>
+        bootstrapRoleReady || signUpWaitsForFirstAdministrator
+          ? lockSuperAdminRole(
+              txDb as unknown as FirstAdministratorTx,
+              this.tables,
+              this.dialect
+            )
+          : undefined;
+      // Then, once the account is inserted: the grant, if nobody holds it.
+      const bootstrapFirstAdministrator = async (
+        txDb: DrizzleTransactionLike,
+        superAdminRoleId: string | undefined
+      ) => {
+        if (superAdminRoleId === undefined || !provisionsFirstAdministrator) {
+          return;
+        }
+        grantedFirstAdministrator = await grantFirstAdministratorInTx(
+          txDb as unknown as FirstAdministratorTx,
+          this.tables,
+          this.dialect,
+          superAdminRoleId,
+          newUserId,
+          // The app's own provisioning promotes only the very first account,
+          // decided again here: a sign-up that committed after the check
+          // above was made still stops it.
+          { onlyAsFirstAccount: caller === "app" }
+        );
+      };
+
+      // The account's own rows, in the order both inserts below take them: the
+      // role row's lock before any write, then the plugin guard, the account,
+      // and the first-administrator grant.
+      // The roles asked for, written with the account so that one which fails
+      // to be written fails the account too, rather than leaving it created
+      // without them. Their ids were checked above.
+      const requestedRoleIds = userData.roles?.length
+        ? Array.from(new Set(userData.roles.map(String)))
+        : [];
+      // Asked again in the account's transaction, so the roles are judged as
+      // they stand when they are written. It takes the `super-admin` row's
+      // lock, so it runs first in that transaction, before the account's row
+      // and the roles' rows are written or locked: the order every change to
+      // who is a super-admin takes them in. A role deletion, say, takes that
+      // lock first and then reads the accounts holding roles; taken after the
+      // account's own row here, the two could deadlock.
+      const judgeRequestedRoles = async (txDb: DrizzleTransactionLike) => {
+        if (requestedRoleIds.length === 0 || caller !== "app") return;
+        await refuseGrantingSuperAdmin(
+          txDb as unknown as LastSuperAdminTx,
+          this.dialect,
+          requestedRoleIds,
+          { email }
+        );
+      };
+      const insertRequestedRoles = async (txDb: DrizzleTransactionLike) => {
+        if (requestedRoleIds.length === 0) return;
+        // RE-READ here, holding what exists: a role deleted since the early
+        // lookup would otherwise be assigned as a dangling row on MySQL,
+        // whose `user_roles` carries no foreign key, and the account would
+        // report a role it does not have.
+        const existing = await this.lockExistingRoles(txDb, requestedRoleIds);
+        if (existing.length !== requestedRoleIds.length) {
+          throw NextlyError.validation({
+            errors: [
+              {
+                path: "roles",
+                code: "INVALID_ROLE_ID",
+                message: "One or more role ids are invalid.",
+              },
+            ],
+            logContext: { email },
+          });
+        }
+        // Written as the role rows spell them. MySQL matches ids
+        // case-insensitively, so a requested id can differ in case from its
+        // row's own, and a stored assignment is read back by comparing ids.
+        await txDb.insert(this.tables.userRoles).values(
+          existing.map(role => ({
+            id: randomUUID(),
+            userId: newUserId,
+            roleId: String(role.id),
+            expiresAt: null,
+          }))
+        );
+      };
+
+      const insertAccount = async (txDb: DrizzleTransactionLike) => {
+        const superAdminRoleId = await lockForBootstrap(txDb);
+        await judgeRequestedRoles(txDb);
+        await requireExistingAccount(txDb);
+        await txDb.insert(users).values(values);
+        // Before the first-administrator grant, which then finds an account
+        // already a super-admin through them and grants nothing more.
+        await insertRequestedRoles(txDb);
+        await bootstrapFirstAdministrator(txDb, superAdminRoleId);
+        // Thrown inside the transaction, so the account and its `user.created`
+        // outbox row roll back and nothing after the commit runs for it.
+        if (caller === "setup" && !grantedFirstAdministrator) {
+          throw firstAdministratorTaken();
+        }
+      };
+
+      // Wrap user + user_ext + invite inserts in a transaction for atomicity.
+      // tx is a Drizzle transaction (NodePgTransaction / MySql2Transaction /
+      // BetterSQLite3Transaction depending on dialect) that exposes the same
+      // fluent query API as this.db. See BaseService.withTransaction.
+      //
+      // Only the user_ext insert self-heals (a missing user_ext table on a fresh
+      // DB). A flag records that it was the failing statement, so an unrelated
+      // failure — the invite token or the outbox event — propagates as a real
+      // error instead of being misdiagnosed as schema drift and silently retried
+      // WITHOUT the custom-field data (which would report a created user while
+      // dropping its custom fields).
+      let userExtInsertFailed = false;
+      // The account as stored, read inside its own transaction, on that
+      // transaction's connection. Called inside an enclosing transaction (a
+      // plugin's `ctx.db.transaction`, another service's), this one joins it
+      // and the insert is not committed yet, so a read on another pooled
+      // connection would not find the row.
+      const pooled = this.db;
+      const readCreatedUser = (txDb: typeof pooled) =>
+        txDb.query.users.findFirst({
+          where: { email: requireFilterValue(email, "email") },
+          columns: {
+            id: true,
+            email: true,
+            emailVerified: true,
+            name: true,
+            image: true,
+            isActive: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        });
+      let user: Awaited<ReturnType<typeof readCreatedUser>>;
+      try {
+        await this.withTransaction(async tx => {
+          const txDb = tx as DrizzleTransactionLike;
+          await insertAccount(txDb);
+
+          // Always create a user_ext row when custom fields are configured
+          if (hasExt && userExtTable) {
+            try {
+              await txDb.insert(userExtTable).values({
+                id: randomUUID(),
+                user_id: newUserId,
+                ...customFieldValues,
+                created_at: now,
+                updated_at: now,
+              });
+            } catch (extErr) {
+              // Mark user_ext as the failing statement and abort the transaction
+              // so the outer catch retries without it. Aborting rather than
+              // continuing is required: PostgreSQL poisons the whole transaction
+              // after any statement error.
+              userExtInsertFailed = true;
+              throw extErr;
+            }
+          }
+
+          await insertInviteToken(txDb);
+          await recordCreatedEvent(txDb);
+          user = await readCreatedUser(tx as typeof pooled);
+        });
+      } catch (txErr) {
+        // A unique custom field's value already held by another user: refuse
+        // the account. It is not a missing table, and retrying without the
+        // custom fields would create the user without them, in silence.
+        if (userExtInsertFailed && isUniqueViolation(txErr)) {
+          throw takenUserFieldValue(txErr);
+        }
+        // Self-healing is scoped to the user_ext table being absent (a fresh
+        // database before it is made): disable user_ext for this process and
+        // retry the user insert alone so the caller still gets a created user.
+        // Any other failure of that insert, a missing column or a value its
+        // column refuses, fails the create: retrying without it would create
+        // the user with every custom field dropped, in silence.
+        if (userExtInsertFailed && userExtTable && userExtTableMissing(txErr)) {
+          const cause = txErr instanceof Error ? txErr.message : String(txErr);
+          this.logger.warn(
+            `user_ext insert failed during createLocalUser; disabling user_ext for this process: ${cause}`
+          );
+          this.userExtDisabled = true;
+          await this.withTransaction(async tx => {
+            const txDb = tx as DrizzleTransactionLike;
+            await insertAccount(txDb);
+            await insertInviteToken(txDb);
+            await recordCreatedEvent(txDb);
+            user = await readCreatedUser(tx as typeof pooled);
+          });
+        } else {
+          throw txErr;
+        }
+      }
+
+      // The grant and the roles were written in the insert's transaction; the
+      // role caches that answered for this account before it existed are
+      // flushed once they commit. Inside an enclosing transaction that is its
+      // commit: flushed before it, a permission check on another connection
+      // could cache the account as holding no role, and keep that answer.
+      // Registered before the `user.created` announcement below, since
+      // after-commit effects run in the order they were registered: a
+      // subscriber asking what the new account may do is answered from the
+      // committed roles, not from what was cached before them.
+      if (grantedFirstAdministrator || requestedRoleIds.length > 0) {
+        const userRoles = (await serviceContainerFor(this.adapter)).userRoles;
+        await this.afterCommit(() => userRoles.invalidateRoleCaches(newUserId));
+      }
+
+      // With the account and its outbox row committed, offer the shared
+      // post-commit hooks, mirroring the collection/single/media write paths: a
+      // bounded retention pass trims old outbox rows even on a
+      // user-management-only install that relies on write-triggered maintenance,
+      // and the fast-path drain delivers the recorded event immediately instead
+      // of at the next scheduled trigger. Both are no-ops when unconfigured;
+      // retention runs regardless of a recording, the drain only when one
+      // happened.
+      await this.afterUserCreated(userCreatedRecorded, newUserId);
+
+      if (!user) {
+        // We just inserted; if we cannot read the row back, something is
+        // genuinely wrong with the connection or the schema. Surface as an
+        // internal error with the email captured in logContext.
+        throw NextlyError.internal({
+          logContext: {
+            reason: "post-insert-readback-missing",
+            email,
+          },
+        });
+      }
+
+      // Hand the invite link back to the admin. The token was committed with
+      // the account, so the raw value generated up front is guaranteed to
+      // match a live row — building the link here is pure string work that
+      // cannot fail. Delivery (email, chat, read it aloud) is the admin's
+      // choice; the artifact is the link itself.
+      const invite = inviteValue
+        ? {
+            link: buildAcceptInviteLink(inviteValue.token),
+            expiresAt: inviteValue.expiresAt,
+          }
+        : undefined;
+
+      return {
+        id: user.id,
+        email: user.email,
+        emailVerified: user.emailVerified ?? null,
+        name: user.name ?? null,
+        image: user.image ?? null,
+        roles: userData.roles ?? null,
+        isActive: user.isActive ?? undefined,
+        createdAt: user.createdAt ?? undefined,
+        updatedAt: user.updatedAt ?? undefined,
+        // Merge custom field values as top-level properties
+        ...(hasExt && !this.userExtDisabled ? customFieldValues : {}),
+        ...(invite ? { invite } : {}),
+      };
+    } catch (err) {
+      // Re-throw NextlyError unchanged (validation, duplicate, internal, ...).
+      // Pattern B: classify DB unique-violations as DUPLICATE so the public
+      // message stays generic; everything else routes through fromDatabaseError.
+      // Normalise raw driver errors first so the unique-violation branch
+      // sees the right kind (otherwise PG 23505 collapses to INTERNAL_ERROR).
+      if (NextlyError.is(err)) throw err;
+      const dbErr = toDbError(this.dialect, err);
+      if (dbErr.kind === "unique-violation") {
+        throw NextlyError.duplicate({
+          logContext: { entity: "user", email: userData.email },
+        });
+      }
+      throw NextlyError.fromDatabaseError(dbErr);
+    }
+  }
+
+  /**
+   * Update an existing user's data.
+   *
+   * @throws NextlyError(VALIDATION_ERROR) on schema-validation failure or
+   *   when no actionable changes are provided.
+   * @throws NextlyError(NOT_FOUND) when the user does not exist.
+   * @throws NextlyError(DUPLICATE) on email conflicts.
+   * @throws NextlyError(FORBIDDEN) for a `"plugin"` caller giving a role that
+   *   reaches `super-admin`.
+   * @throws NextlyError on DB errors via fromDatabaseError.
+   *
+   * @param caller - Who the write is made for; see {@link UserWriteCaller}.
+   */
+  async updateUser(
+    userId: number | string,
+    changes: UpdateUserData,
+    caller: UserWriteCaller = "app"
+  ): Promise<UserMutationResponse> {
+    try {
+      // The person's own to set, through their profile: refused here, first,
+      // for every door this edit is reached through.
+      assertNoInterfaceLanguage(changes, { entity: "user", userId });
+      // Validate input (merged schema includes custom field validators when configured)
+      const validation = this.getUpdateSchema().safeParse(changes);
+      if (!validation.success) {
+        throw userValidationError(validation.error.issues, {
+          entity: "user",
+          userId,
+        });
+      }
+
+      const { users } = this.tables;
+
+      // 1) Load current user. §13.8 + spec note: user existence is sensitive
+      // (account enumeration); the public message stays generic.
+      const currentUser = await this.db.query.users.findFirst({
+        where: { id: requireFilterValue(userId, "userId") },
+        columns: {
+          id: true,
+          email: true,
+          name: true,
+          image: true,
+          emailVerified: true,
+          isActive: true as unknown as boolean,
+          deactivatedAt: true,
+        },
+      });
+
+      if (!currentUser) {
+        throw NextlyError.notFound({
+          logContext: { entity: "user", id: userId },
+        });
+      }
+
+      // Before any write: the fields below are written before the roles, so a
+      // refusal at the role step would leave the rest of the update applied.
+      // The Public role is what visitors hold, never anyone's role.
+      await refuseLinkingPublicRole(
+        this.db as LastSuperAdminTx,
+        this.dialect,
+        changes.roles ?? [],
+        "assign",
+        { userId: currentUser.id }
+      );
+      if (caller === "plugin" && changes.roles && changes.roles.length > 0) {
+        await this.refuseSuperAdminRoles(Array.from(new Set(changes.roles)), {
+          reason: "plugin-user-super-admin-refused",
+          userId: currentUser.id,
+        });
+      } else if (
+        caller === "app" &&
+        changes.roles &&
+        changes.roles.length > 0
+      ) {
+        // Early, before anything runs for the update. Asked again inside the
+        // transaction that writes the roles, under the lock.
+        await refuseGrantingSuperAdmin(
+          this.db as LastSuperAdminTx,
+          this.dialect,
+          Array.from(new Set(changes.roles)),
+          { userId: currentUser.id }
+        );
+      }
+      // The fields that control an account: whoever sets its password, email,
+      // activation, verification or roles controls it. A plugin may not set
+      // them on an account that reaches super-admin. Checked here, before any
+      // write, and again inside the transaction that writes the fields and the
+      // roles, holding the account's row.
+      const guardsAdministrator =
+        caller === "plugin" &&
+        ((typeof changes.password === "string" &&
+          changes.password.trim().length > 0) ||
+          changes.email !== undefined ||
+          typeof changes.isActive === "boolean" ||
+          changes.emailVerified !== undefined ||
+          (changes.roles !== undefined && changes.roles.length > 0));
+      const administratorRefusal = {
+        reason: "plugin-super-admin-account-refused",
+        userId: currentUser.id,
+      };
+      if (guardsAdministrator) {
+        await this.refuseSuperAdminAccount(
+          currentUser.id,
+          administratorRefusal
+        );
+      }
+
+      // 2) Build updateData (only include fields that actually change)
+      const updateData: UserUpdateData = {};
+
+      // Whether the account moves to another address. An update that carries
+      // the address it already has, as a full-object update does, moves
+      // nothing, and is not judged as a move.
+      let addressMoves = false;
+
+      // EMAIL
+      if (typeof changes.email !== "undefined") {
+        const normalizedNewEmail = (changes.email ?? "").trim().toLowerCase();
+        const currentEmailNormalized = (currentUser.email ?? "").toLowerCase();
+        addressMoves =
+          normalizedNewEmail !== "" &&
+          normalizedNewEmail !== currentEmailNormalized;
+
+        if (addressMoves) {
+          const existing = await this.db.query.users.findFirst({
+            where: { email: requireFilterValue(normalizedNewEmail, "email") },
+            columns: { id: true, email: true },
+          });
+
+          if (existing && existing.id !== currentUser.id) {
+            // §13.8 + account-enumeration: generic public message; the
+            // conflict reason + the user/target ids go to logContext.
+            throw NextlyError.duplicate({
+              logContext: {
+                entity: "user",
+                reason: "email-conflict",
+                userId: currentUser.id,
+              },
+            });
+          }
+        }
+
+        // Written when its stored spelling would change: a move, or a row
+        // stored before addresses were lowercased, which sign-in can only find
+        // once rewritten. The same spelling writes nothing, so a stale
+        // full-object update cannot put back an address another request moved
+        // the account from; whether a written one moves the account is asked
+        // again in the transaction, against the row as it is then.
+        if (
+          normalizedNewEmail !== "" &&
+          normalizedNewEmail !== (currentUser.email ?? "")
+        ) {
+          updateData.email = normalizedNewEmail;
+        }
+      }
+
+      if (
+        typeof changes.name !== "undefined" &&
+        changes.name !== currentUser.name
+      ) {
+        updateData.name = changes.name;
+      }
+
+      // PASSWORD: hash plain-text password before storing
+      if (Object.prototype.hasOwnProperty.call(changes, "password")) {
+        const rawPassword =
+          typeof changes.password === "string" ? changes.password : "";
+        // Only whitespace sets nothing, as an empty value does. Anything else
+        // is hashed exactly as given, as account creation and sign-in use it:
+        // a space at either end can be the password's symbol, and hashing the
+        // trimmed form would store a password nobody typed.
+        if (rawPassword.trim().length > 0) {
+          Object.assign(
+            updateData,
+            passwordColumns(await appPasswordDigester().hash(rawPassword))
+          );
+        }
+      }
+
+      // IMAGE: only update if provided in body
+      if (Object.prototype.hasOwnProperty.call(changes, "image")) {
+        const nextImage = changes.image;
+        if (nextImage !== currentUser.image) {
+          updateData.image = nextImage;
+        }
+      }
+      if (
+        Object.prototype.hasOwnProperty.call(changes, "emailVerified") &&
+        changes.emailVerified !== currentUser.emailVerified
+      ) {
+        if (changes.emailVerified === undefined) {
+          // Present but undefined: a caller passing through a field it was not
+          // given, as the Direct API and `UserService.update` do. Drizzle
+          // writes nothing for it, and keeping the key keeps such an update
+          // counting as one.
+          updateData.emailVerified = undefined;
+        } else {
+          // Read as a Date, once: the update schema accepts an ISO string as
+          // well, and the column takes a Date on every dialect.
+          const verifiedAt =
+            changes.emailVerified === null
+              ? null
+              : new Date(changes.emailVerified);
+          // A date carried with a new address is the old address's: the
+          // move makes it stale, so it is written as this caller's vouching
+          // rather than kept as whoever verified the old one.
+          if (
+            verifiedAt === null ||
+            addressMoves ||
+            !sameVerificationInstant(verifiedAt, currentUser.emailVerified)
+          ) {
+            // With how it was verified, in the same statement: whoever is
+            // updating the account is who vouched for the address.
+            Object.assign(
+              updateData,
+              emailVerificationColumns(
+                verifiedAt,
+                caller === "plugin" ? "plugin" : "admin"
+              )
+            );
+          }
+        }
+      }
+
+      // ✅ Handle isActive. A boolean only: callers such as the Direct API
+      // pass the key with `undefined` when the caller left it out, and reading
+      // that as `false` would deactivate every account they update.
+      if (typeof changes.isActive === "boolean") {
+        Object.assign(
+          updateData,
+          activationChanges(changes.isActive, {
+            isActive: Boolean(currentUser.isActive),
+            deactivatedAt: currentUser.deactivatedAt ?? null,
+          })
+        );
+      }
+
+      const hasFieldUpdates = Object.keys(updateData).length > 0;
+
+      // A plugin may not turn the account into an externally verified
+      // identity's (active, verified, no password), nor move one to another
+      // address; see the method. Asked in the transaction below, holding the
+      // account's row, before the write. Activating or verifying can bring an
+      // account into that shape, and an address change keeps it there under
+      // an address no provider asserted; a password takes it out. No other
+      // update pays for the locking read. A written address is asked about
+      // there, since only the locked row says whether it moves the account.
+      const guardsExternalIdentity =
+        caller === "plugin" &&
+        (updateData.isActive !== undefined ||
+          updateData.emailVerified !== undefined ||
+          updateData.email !== undefined);
+
+      // 2b) Extract custom field values from changes (only fields present in payload)
+      const hasExt = this.hasCustomFields();
+      const customFieldUpdates: Record<string, unknown> = {};
+      let hasCustomFieldChanges = false;
+
+      if (hasExt) {
+        // Shaped by the same rule the create path uses.
+        const shape = this.customFieldShaper();
+        for (const fieldName of this.getCustomFieldNames()) {
+          if (fieldName in changes) {
+            const raw = (changes as Record<string, unknown>)[fieldName] ?? null;
+            customFieldUpdates[fieldName] = shape(fieldName, raw);
+            hasCustomFieldChanges = true;
+          }
+        }
+      }
+
+      // The roles the update asks for; equal to the ones held, nothing is
+      // written for them.
+      const requestedRoleIds =
+        changes.roles && changes.roles.length > 0
+          ? Array.from(new Set(changes.roles))
+          : undefined;
+      let hasRoleUpdates = false;
+      const services = requestedRoleIds
+        ? await serviceContainerFor(this.adapter)
+        : undefined;
+
+      // 2c) The custom fields' user_ext row, written in the account's own
+      // transaction below so the two commit together: a unique custom field's
+      // value another user holds refuses the whole update, rather than
+      // refusing it after the account's other fields and roles had committed.
+      const customFieldTable = hasCustomFieldChanges
+        ? this.getUserExtTable()
+        : null;
+      let userExtWriteFailed = false;
+      const writeCustomFields = async (txDb: DrizzleTransactionLike) => {
+        if (!customFieldTable) return;
+        try {
+          const now = new Date();
+          // Required by Drizzle ORM — runtime-generated tables need untyped db access
+          const db = txDb as unknown as DrizzleChain;
+          // Check if user_ext row exists. DrizzleChain await resolves
+          // to Record<string, unknown>[] already.
+          const existingExt = await db
+            .select({ id: customFieldTable.id })
+            .from(customFieldTable)
+            .where(eq(customFieldTable.user_id as Column, currentUser.id))
+            .limit(1);
+
+          if (existingExt.length > 0) {
+            // UPDATE existing row with changed fields only
+            await db
+              .update(customFieldTable)
+              .set({ ...customFieldUpdates, updated_at: now })
+              .where(eq(customFieldTable.user_id as Column, currentUser.id));
+          } else {
+            // INSERT new row (upsert: row was somehow missing)
+            await db.insert(customFieldTable).values({
+              id: randomUUID(),
+              user_id: currentUser.id,
+              ...customFieldUpdates,
+              created_at: now,
+              updated_at: now,
+            });
+          }
+        } catch (err) {
+          // Mark user_ext as the failing statement and abort the transaction,
+          // so the caller below tells a taken value from a missing table.
+          // Aborting rather than continuing is required: PostgreSQL poisons
+          // the whole transaction after any statement error.
+          userExtWriteFailed = true;
+          throw err;
+        }
+      };
+
+      if (hasFieldUpdates || requestedRoleIds || customFieldTable) {
+        if (hasFieldUpdates) updateData.updatedAt = new Date();
+        // A deactivation, or a password an administrator set, ends every
+        // session the account holds. The refresh rows are what a session is
+        // renewed from; left in place, a deactivated account's sessions
+        // came back the moment it was reactivated, and a password reset for
+        // a compromised account left the attacker's session renewing. In the
+        // same transaction, so the account never has the new state with the
+        // old sessions still valid.
+        const endsSessions =
+          changes.isActive === false || updateData.passwordHash !== undefined;
+        // The token tables to revoke the account's links in, when the update
+        // writes its address; asked before the transaction, as the deletion's
+        // presence checks are.
+        const revokesTokens =
+          updateData.email !== undefined
+            ? await this.presentTokenTables()
+            : undefined;
+        // One transaction for the fields and the roles. A plugin's write to
+        // an account-controlling field asks about the account again in it,
+        // holding its row, immediately before writing. Removing the roles and
+        // assigning the new ones commit together, and on SQLite the
+        // transaction queues behind any other request's open one rather than
+        // running inside it, where that one's rollback would undo the write
+        // and hand back the roles just removed. The custom fields' row is
+        // written last in it, when asked for.
+        const writeAccount = (withCustomFields: boolean) =>
+          this.withTransaction(async tx => {
+            const txDb = tx as DrizzleTransactionLike;
+            // Giving a role that confers super-admin, decided in the same
+            // transaction as the roles' write, under the lock it takes first.
+            if (caller === "app" && requestedRoleIds) {
+              await refuseGrantingSuperAdmin(
+                tx as LastSuperAdminTx,
+                this.dialect,
+                requestedRoleIds,
+                { userId: currentUser.id }
+              );
+            }
+            // A deactivation or a role replacement may not leave the install
+            // without an active super-admin. First, before any row lock, for
+            // the lock order `refuseRemovingLastSuperAdmin` describes. Each is
+            // judged when one request makes both: a role replacement that
+            // takes super-admin from someone is a super-admin's to make, even
+            // beside a deactivation.
+            if (requestedRoleIds) {
+              await refuseRemovingLastSuperAdmin(
+                tx as LastSuperAdminTx,
+                this.tables,
+                this.dialect,
+                {
+                  kind: "replaceRoles",
+                  userId: currentUser.id,
+                  roleIds: requestedRoleIds,
+                }
+              );
+            }
+            // Only when this update writes the deactivation: an account that
+            // is already inactive, sent `isActive: false` again as the edit
+            // form resends it, loses nothing, so nothing is asked of the
+            // caller for it.
+            if (updateData.isActive === false) {
+              await refuseRemovingLastSuperAdmin(
+                tx as LastSuperAdminTx,
+                this.tables,
+                this.dialect,
+                { kind: "deactivate", userId: currentUser.id }
+              );
+            }
+            if (guardsAdministrator) {
+              await this.refuseSuperAdminAccount(
+                currentUser.id,
+                administratorRefusal,
+                txDb
+              );
+            }
+            if (guardsExternalIdentity) {
+              await this.refuseExternalIdentityShape(
+                currentUser.id,
+                updateData,
+                txDb
+              );
+            }
+            if (hasFieldUpdates && endsSessions) {
+              await updateUserEndingSessions(txDb, this.tables, this.dialect, {
+                userId: currentUser.id,
+                set: updateData,
+                adapter: this.adapter,
+              });
+            } else if (hasFieldUpdates) {
+              await txDb
+                .update(users)
+                .set(updateData)
+                .where(eq(users.id, currentUser.id));
+            }
+            // A link sent to the address the account is leaving must not reset
+            // or verify it, now or after it returns to that address. After the
+            // write above, which holds the account's row: a link being issued
+            // for the old address either committed first and is removed here,
+            // or finds the account no longer there.
+            if (revokesTokens) {
+              // Kept: a link already bound to the address this write leaves
+              // the account at. The snapshot above may be older than the row,
+              // so a concurrent change may already have moved the account
+              // there and a link been issued for it since; this write moves
+              // nothing then.
+              await revokeAccountTokens(txDb, revokesTokens, {
+                userId: String(currentUser.id),
+                addresses:
+                  typeof currentUser.email === "string"
+                    ? [currentUser.email]
+                    : [],
+                keepAddress: updateData.email,
+              });
+            }
+            if (requestedRoleIds && services) {
+              hasRoleUpdates = await services.userRoles.replaceUserRoles(
+                String(currentUser.id),
+                requestedRoleIds,
+                tx
+              );
+            }
+            if (withCustomFields) await writeCustomFields(txDb);
+          });
+        try {
+          await writeAccount(customFieldTable !== null);
+        } catch (txErr) {
+          // A unique custom field's value already held by another user is
+          // refused, and the transaction took the rest of the update with it.
+          // It is not a missing table: skipping would drop the change and turn
+          // custom fields off.
+          if (userExtWriteFailed && isUniqueViolation(txErr)) {
+            throw takenUserFieldValue(txErr);
+          }
+          // Any failure other than the user_ext write is a real error, and so
+          // is a user_ext write that failed with its table there: skipping it
+          // would drop the custom changes and turn custom fields off.
+          if (!userExtWriteFailed) throw txErr;
+          if (!userExtTableMissing(txErr)) throw txErr;
+          // The user_ext table does not exist yet: disable it for this
+          // process and write the rest of the update without it.
+          const cause = txErr instanceof Error ? txErr.message : String(txErr);
+          this.logger.warn(
+            `user_ext upsert skipped during updateUser: ${cause}`
+          );
+          this.userExtDisabled = true;
+          hasCustomFieldChanges = false;
+          if (hasFieldUpdates || requestedRoleIds) await writeAccount(false);
+        }
+        if (hasRoleUpdates && services) {
+          await this.afterCommit(() =>
+            services.userRoles.invalidateRoleCaches(String(currentUser.id))
+          );
+        } else if (updateData.isActive === false) {
+          // A deactivated account's kept access is retired with it, here and
+          // in every other instance, so the next request reads it afresh.
+          await this.afterCommit(async () => {
+            const { invalidatePermissionCache } = await import(
+              "../../../services/lib/permissions"
+            );
+            await invalidatePermissionCache({ userId: String(currentUser.id) });
+          });
+        }
+        // A deactivated author can no longer be acted as, and a changed email
+        // or name is what a code-defined rule judging the author may read, so
+        // a scheduled release holding a document they added is checked again
+        // and stopped now rather than at its instant. After the commit,
+        // outside the update's transaction; the early stop logs its own
+        // failures and never throws, so this update cannot fail over a
+        // release.
+        if (
+          updateData.isActive === false ||
+          updateData.email !== undefined ||
+          updateData.name !== undefined
+        ) {
+          await this.afterCommit(() =>
+            stopReleasesHolding({ authors: [String(currentUser.id)] })
+          );
+        }
+      }
+
+      // If no valid changes provided, throw a validation error so callers
+      // can surface a 400. §13.8: per-error message names the (synthetic)
+      // field but never the value.
+      if (
+        !hasFieldUpdates &&
+        !hasRoleUpdates &&
+        !hasCustomFieldChanges &&
+        !changes.sendWelcomeEmail
+      ) {
+        throw NextlyError.validation({
+          errors: [
+            {
+              path: "input",
+              code: "NO_CHANGES",
+              message: "At least one updatable field must be provided.",
+            },
+          ],
+          logContext: { entity: "user", userId: currentUser.id },
+        });
+      }
+
+      // Fetch updated user
+      const user = await this.db.query.users.findFirst({
+        where: { id: requireFilterValue(currentUser.id, "userId") },
+        columns: {
+          id: true,
+          email: true,
+          emailVerified: true,
+          name: true,
+          image: true,
+          isActive: true as unknown as boolean,
+        },
+      });
+
+      // Fetch custom fields for response
+      const responseCustomFields: Record<string, unknown> = {};
+      if (hasExt) {
+        const userExtTable = this.getUserExtTable();
+        if (userExtTable) {
+          try {
+            // Required by Drizzle ORM — runtime-generated tables need
+            // untyped db access. DrizzleChain await resolves to row list.
+            const extDb = this.db as unknown as DrizzleChain;
+            const extRows = await extDb
+              .select()
+              .from(userExtTable)
+              .where(eq(userExtTable.user_id as Column, currentUser.id))
+              .limit(1);
+
+            if (extRows.length > 0) {
+              const fieldNames = this.getCustomFieldNames();
+              for (const fieldName of fieldNames) {
+                if (fieldName in extRows[0]) {
+                  responseCustomFields[fieldName] = extRows[0][fieldName];
+                }
+              }
+            }
+          } catch (err) {
+            // user_ext table may not exist — self-heal by disabling ext for
+            // the rest of this process (matches the established pattern in
+            // createLocalUser). Log the cause so a real outage isn't silent;
+            // the caller still gets a successful user response since the
+            // primary user row already updated.
+            const cause = err instanceof Error ? err.message : String(err);
+            this.logger.warn(
+              `user_ext read failed during updateUser; disabling user_ext for this process: ${cause}`
+            );
+            this.userExtDisabled = true;
+          }
+        }
+      }
+
+      // ✅ Send welcome email if requested and service is available.
+      // Deliberately fire-and-forget: a welcome message is a courtesy, and
+      // failing user creation because it could not be delivered would be worse
+      // than not sending it. Both failure shapes are logged rather than
+      // dropped, since an undelivered message comes back as an unsuccessful
+      // result rather than as a throw -- and that covers a provider that
+      // failed outright as well as one that accepted the message and refused
+      // this recipient.
+      if (changes.sendWelcomeEmail && this.emailService) {
+        await this.emailService
+          .sendWelcomeEmail(
+            user!.email,
+            { name: user!.name ?? null, email: user!.email },
+            // Names the staff user on the delivery records.
+            { staffUserId: String(user!.id) }
+          )
+          .then(result => {
+            if (!result.success) {
+              this.logger.warn("Welcome email was not delivered", {
+                event: "user.welcome_email_failed",
+                reason: "not-delivered-to-recipient",
+              });
+            }
+          })
+          .catch((error: unknown) => {
+            this.logger.warn("Welcome email could not be sent", {
+              event: "user.welcome_email_failed",
+              error: error instanceof Error ? error.message : String(error),
+            });
+          });
+      }
+
+      return {
+        id: user!.id,
+        email: user!.email,
+        emailVerified: user!.emailVerified ?? null,
+        name: user!.name ?? null,
+        image: user!.image ?? null,
+        roles: changes.roles ?? null,
+        isActive: user!.isActive ?? undefined,
+        // Merge custom field values as top-level properties
+        ...(hasExt ? responseCustomFields : {}),
+      };
+    } catch (err) {
+      // Re-throw NextlyError (validation, not-found, duplicate) unchanged.
+      // Pattern B: classify DB unique-violations as DUPLICATE so the public
+      // message stays generic; everything else routes through fromDatabaseError.
+      // Normalise raw driver errors first so the unique-violation branch
+      // sees the right kind.
+      if (NextlyError.is(err)) throw err;
+      const dbErr = toDbError(this.dialect, err);
+      if (dbErr.kind === "unique-violation") {
+        throw NextlyError.duplicate({
+          logContext: { entity: "user", reason: "email-conflict", userId },
+        });
+      }
+      throw NextlyError.fromDatabaseError(dbErr);
+    }
+  }
+
+  /**
+   * Delete the rows a person owns in a table keyed by their id (their notices,
+   * their "last looked at" markers), inside the deletion's transaction so the
+   * two stand or fall together. `tableExists` is probed before the
+   * transaction.
+   */
+  private async eraseOwnedRows(
+    txDb: DrizzleTransactionLike,
+    table: { userId: Column },
+    userId: string,
+    tableExists: boolean
+  ): Promise<void> {
+    // An installation that has not run `nextly migrate` has no table, and a
+    // delete against it would abort the transaction and the deletion with it.
+    if (!tableExists) return;
+    await txDb.delete(table).where(eq(table.userId, userId));
+  }
+
+  /**
+   * Whether the delivery log has its person columns, which a database that
+   * has not run `nextly migrate` since they arrived lacks. Treated as present
+   * when the catalogue cannot be read, as a table is by `tablePresent`.
+   */
+  private async deliveriesNamePeople(): Promise<boolean> {
+    try {
+      const columns = await liveColumnsOf(
+        this.db,
+        this.dialect
+      )("email_deliveries");
+      return columns.includes("principal_kind");
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * Whether a table is present, for a probe taken BEFORE the delete
+   * transaction opens.
+   *
+   * Asked out here because a failed statement aborts an open Postgres
+   * transaction and there would be no way back.
+   *
+   * An unanswerable probe is treated as PRESENT, so the erasure is ATTEMPTED.
+   * The other direction is worse in a way that is hard to see later: reading a
+   * transient metadata failure as "no such table" would delete the account and
+   * leave its rows behind, silently and permanently, since no later run
+   * revisits a deletion that has happened. Attempting it against a genuinely
+   * absent table fails the statement and takes the deletion with it, which is
+   * the invariant the audit erasure protects.
+   *
+   * Databases missing one of these exist: the SQLite fallback bootstrap in
+   * earlier releases created a subset of the core tables, and neither
+   * first-run setup nor boot repairs an existing database that lacks one.
+   *
+   * One helper rather than four copies of the same `try`/`catch`: they only
+   * ever differed by the name, and each copy was another branch in a method
+   * already over its complexity budget.
+   */
+  private async tablePresent(table: string): Promise<boolean> {
+    try {
+      return await this.adapter.tableExists(table);
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * The reset and verification token tables this database has. An install
+   * created by an earlier release may lack either, as it may lack media.
+   */
+  private async presentTokenTables(): Promise<TokenTable[]> {
+    const present: TokenTable[] = [];
+    for (const kind of ["password-reset", "email-verification"] as const) {
+      if (await this.tablePresent(TOKEN_TABLE_NAMES[kind])) {
+        present.push(tokenTable(this.tables, kind));
+      }
+    }
+    return present;
+  }
+
+  /**
+   * Refuse a role set that reaches `super-admin`, directly or by inheritance.
+   *
+   * Neither a login provider nor a plugin may create an administrator.
+   * Checking the requested roles' own slugs answers a narrower question than
+   * the one that decides at request time: `isSuperAdmin` resolves the user's
+   * full role set, inheritance included, so a role built on top of
+   * `super-admin` carries the bypass while naming itself something else
+   * entirely.
+   *
+   * @param logContext - Where the refusal came from, for the log only.
+   */
+  /**
+   * The roles among `roleIds` that exist, read inside `txDb`'s transaction
+   * and held until it ends, so none can be deleted before the rows that
+   * name them are written. SQLite takes no lock: its write transactions run
+   * one at a time already.
+   */
+  private async lockExistingRoles(
+    txDb: DrizzleTransactionLike,
+    roleIds: readonly string[]
+  ): Promise<Array<{ id: string; slug: string }>> {
+    const { roles } = this.tables;
+    const query = txDb
+      .select({ id: roles.id, slug: roles.slug })
+      .from(roles)
+      .where(inArray(roles.id, [...roleIds]))
+      .limit(roleIds.length);
+    return (
+      this.dialect === "sqlite" ? await query : await query.for("update")
+    ) as Array<{ id: string; slug: string }>;
+  }
+
+  private async refuseSuperAdminRoles(
+    roleIds: string[],
+    logContext: Record<string, unknown>
+  ): Promise<void> {
+    // The same question every role change asks, answered the same way: the
+    // requested roles and everything they inherit.
+    if (
+      await rolesConferSuperAdmin(
+        this.db as LastSuperAdminTx,
+        this.dialect,
+        roleIds
+      )
+    ) {
+      throw NextlyError.forbidden({ logContext });
+    }
+  }
+
+  /**
+   * Refuse, inside `txDb`'s transaction, when the install has no account, and
+   * otherwise hold one until the transaction ends.
+   *
+   * For the creates that must never make an install's FIRST account (a login
+   * provider's, a plugin's): that account decides who administers the site.
+   * A read before the transaction cannot settle it, because the last account
+   * could be deleted between the read and the insert; setup would then see a
+   * non-empty table and decline to make the super-admin, leaving the install
+   * with no administrator. Locking the found row makes a concurrent deletion
+   * WAIT until the new account is committed beside it. SQLite takes no lock:
+   * its write transactions are serialized already.
+   *
+   * @param logContext - Where the refusal came from, for the log only.
+   */
+  /**
+   * The administrator role's row, ensured for a sign-up to lock while nobody
+   * holds the role, so that it waits for an account the app is provisioning
+   * as the install's first.
+   */
+  private async roleForSignUpToWaitOn(): Promise<void> {
+    try {
+      await (
+        await serviceContainerFor(this.adapter)
+      ).roles.ensureSuperAdminRole();
+    } catch {
+      // Refused when a role of the install's own already holds the
+      // administrator role's name: then no administrator role can exist, so
+      // no account can be granted it and the sign-up has nothing to wait for.
+      // It goes on unlocked (lockSuperAdminRole finds no row) rather than
+      // failing for a role it is never given; a database that is failing
+      // fails the sign-up's own insert instead.
+    }
+  }
+
+  /**
+   * Whether an account created now could be the install's first
+   * administrator: true when nobody holds the `super-admin` role yet, in which
+   * case the role is ensured, so the grant inside the insert's transaction has
+   * a row to lock. Read without a lock; the grant decides under one.
+   */
+  private async mayBootstrapFirstAdministrator(): Promise<boolean> {
+    if (await superAdminRoleHeld(this.db, this.tables)) {
+      return false;
+    }
+    await (
+      await serviceContainerFor(this.adapter)
+    ).roles.ensureSuperAdminRole();
+    return true;
+  }
+
+  private async requireExistingAccountInTx(
+    txDb: DrizzleTransactionLike,
+    logContext: Record<string, unknown>
+  ): Promise<void> {
+    const { users } = this.tables;
+    const anchorQuery = txDb
+      .select({ id: users.id })
+      .from(users)
+      .where(isNotNull(users.id))
+      .limit(1);
+    const anchor = (
+      this.dialect === "sqlite"
+        ? await anchorQuery
+        : await anchorQuery.for("update")
+    )[0];
+    if (!anchor) {
+      throw NextlyError.forbidden({ logContext });
+    }
+  }
+
+  /**
+   * Refuse a plugin's update that would turn an account into an externally
+   * verified identity's: active, verified and without a password.
+   *
+   * That is the account core provisions for an identity another system has
+   * verified, and only core makes one, when an app's login plugin hands it a
+   * sign-in. A plugin reaching the same account through its users service,
+   * by verifying an active invite say, would mint one outside that hand-off.
+   * Judged on the account the write leaves: one already in that shape, made
+   * by a login plugin's sign-in, still takes a plugin's other edits, and may
+   * be deactivated or given a password, but not re-verified, reactivated or
+   * moved to another address while it stays in that shape. Each would
+   * restate on the plugin's word what the provider asserted; a new address
+   * kept verified is one a login plugin's sign-in could then be matched to.
+   *
+   * Asked inside the write's transaction, before the write, holding the
+   * account's row on PostgreSQL and MySQL as the super-admin check beside it
+   * does, so a concurrent write cannot change the answer before it lands.
+   * SQLite serializes write transactions.
+   */
+  private async refuseExternalIdentityShape(
+    userId: string | number,
+    set: UserUpdateData,
+    txDb: DrizzleTransactionLike
+  ): Promise<void> {
+    const { users } = this.tables;
+    const read = txDb
+      .select({
+        email: users.email,
+        isActive: users.isActive,
+        emailVerified: users.emailVerified,
+        passwordHash: users.passwordHash,
+      })
+      .from(users)
+      .where(eq(users.id, String(userId)))
+      .limit(1);
+    const [row] = (
+      this.dialect === "sqlite" ? await read : await read.for("update")
+    ) as Array<{
+      email: unknown;
+      isActive: unknown;
+      emailVerified: unknown;
+      passwordHash: unknown;
+    }>;
+    // Gone since the update read it: the write that follows changes no row.
+    if (!row) return;
+    // A written address moves the account only when it differs from the one
+    // the row holds now; rewriting a stored spelling in lowercase does not.
+    const moves =
+      set.email !== undefined &&
+      set.email !==
+        (typeof row.email === "string" ? row.email : "").trim().toLowerCase();
+    // Nothing that shapes the account changes: keep its other edits.
+    if (
+      !moves &&
+      set.isActive === undefined &&
+      set.emailVerified === undefined
+    ) {
+      return;
+    }
+    // A column this update leaves alone keeps the value the row holds.
+    const after = {
+      isActive:
+        set.isActive !== undefined
+          ? Boolean(set.isActive)
+          : Boolean(row.isActive),
+      verified:
+        set.emailVerified !== undefined
+          ? set.emailVerified != null
+          : row.emailVerified != null,
+      // A password as the app's sign-in would take one.
+      hasPassword: storesPassword(
+        set.passwordHash !== undefined ? set.passwordHash : row.passwordHash
+      ),
+    };
+    if (isExternalIdentityShape(after)) {
+      throw NextlyError.forbidden({
+        logContext: { reason: "plugin-external-identity-refused", userId },
+      });
+    }
+  }
+
+  /**
+   * Refuse when the account reaches `super-admin`, directly or by
+   * inheritance, through the same resolution the request-time gate uses.
+   *
+   * For a plugin's writes to an administrator's account. Given `txDb`, it asks
+   * inside that transaction, after locking the account's row on PostgreSQL and
+   * MySQL. On PostgreSQL the lock is what makes a concurrent role grant wait:
+   * `user_roles.user_id` references the account, so inserting a grant takes a
+   * key-share lock on the row that this lock excludes, and a grant committed
+   * first is seen by the read after it. MySQL's `user_roles` carries no
+   * foreign key, so there a grant committed between this read and the write is
+   * not excluded. SQLite serializes write transactions.
+   *
+   * The THROWING form of the check, so a read that fails refuses rather than
+   * allows; with an executor it also bypasses the super-admin cache.
+   *
+   * @param logContext - Where the refusal came from, for the log only.
+   */
+  private async refuseSuperAdminAccount(
+    userId: string | number,
+    logContext: Record<string, unknown>,
+    txDb?: DrizzleTransactionLike
+  ): Promise<void> {
+    if (txDb && this.dialect !== "sqlite") {
+      const { users } = this.tables;
+      await txDb
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.id, String(userId)))
+        .limit(1)
+        .for("update");
+    }
+    const { isSuperAdminOrThrow } = await import(
+      "../../../services/lib/permissions"
+    );
+    if (await isSuperAdminOrThrow(String(userId), txDb ?? this.db)) {
+      throw NextlyError.forbidden({ logContext });
+    }
+  }
+
+  /**
+   * Remove the deleted account's rows from the RETIRED `accounts` and
+   * `sessions` tables, each when the database still has it in the shape
+   * Nextly created.
+   *
+   * Neither is created any more and nothing reads them, but an upgraded
+   * database keeps them until the operator drops them — and on Postgres and
+   * MySQL their `user_id` carried no cascade, so provider identifiers, stored
+   * access, refresh and ID tokens, and session tokens outlive the account
+   * unless they are removed here. No later run revisits a deletion that has
+   * already happened.
+   *
+   * Runs in the deletion transaction, so the credentials go with the account
+   * rather than in a step a failure could skip. Its own method for the reason
+   * the other erasures have one: the transaction reads as the sequence it
+   * enforces rather than as the detail of each step.
+   */
+  private async eraseRetiredAccountRows(
+    txDb: DrizzleTransactionLike,
+    userId: string | number,
+    present: { accounts: boolean; sessions: boolean }
+  ): Promise<void> {
+    if (present.accounts) {
+      const accounts = retiredAccountsTable(this.dialect);
+      await txDb.delete(accounts).where(eq(accounts.userId, String(userId)));
+    }
+    if (present.sessions) {
+      const sessions = retiredSessionsTable(this.dialect);
+      await txDb.delete(sessions).where(eq(sessions.userId, String(userId)));
+    }
+  }
+
+  /**
+   * Whether the operator has named a retired table as Nextly's, and it is
+   * present in the shape Nextly created.
+   *
+   * The name comes first because nothing else tells Nextly's table from a
+   * host app's: no record says Nextly created it, and an Auth.js table has the
+   * same name and shape, so erasing by shape deleted another app's sign-in
+   * links on every user deletion. Unnamed, nothing is asked of the database,
+   * and the startup report says the rows stay. Named, presence is asked the
+   * fail-safe way the other erasures ask it, and the shape still has to match,
+   * since a DELETE against columns the table lacks fails the deletion.
+   */
+  private async retiredTableErasable(table: string): Promise<boolean> {
+    const named = retiredTablesNamedForErasure(
+      process.env[ERASE_RETIRED_AUTH_TABLES_ENV]
+    );
+    if (!named.has(table)) return false;
+    if (!(await this.tablePresent(table))) return false;
+    return hasRetiredShape(
+      table,
+      await liveColumnsOf(this.db, this.dialect)(table)
+    );
+  }
+
+  /**
+   * Forget who edited a plugin's settings, without forgetting the settings.
+   *
+   * `updated_by` keeps the editing user's id and nothing else erases it, so a
+   * deleted account went on being identified by core-owned rows indefinitely.
+   * The row itself stays: it is the plugin's configuration rather than the
+   * user's data, and removing it would reconfigure the install.
+   *
+   * Its own step so the deletion transaction reads as the sequence it
+   * enforces rather than as the detail of each erasure.
+   *
+   * `tableExists` is asked by the caller, before the transaction opens, and
+   * passed in. The declaration being registered says only that this build
+   * knows the table; it says nothing about the database in front of it, and a
+   * statement against an absent table aborts the whole deletion — every
+   * account deletion, permanently, on any install whose database predates the
+   * table.
+   */
+  private async scrubPluginSettingsActor(
+    txDb: DrizzleTransactionLike,
+    userId: string | number,
+    settingsExist: boolean
+  ): Promise<void> {
+    const { nextlyPluginSettings } = this.tables;
+    if (!nextlyPluginSettings || !settingsExist) return;
+    await txDb
+      .update(nextlyPluginSettings)
+      .set({ updatedBy: null })
+      .where(
+        eq((nextlyPluginSettings as { updatedBy: Column }).updatedBy, userId)
+      );
+  }
+
+  /**
+   * Delete a user and all related data (roles, media ownership).
+   *
+   * Their email delivery records are erased: every record naming them,
+   * whatever address it went to, and the unnamed records sent to their current
+   * address; a record written for them afterwards is written erased. An email
+   * the provider had already accepted may still be delivered.
+   *
+   * §13.8 + spec note: user existence is sensitive (account enumeration);
+   * the public message stays generic. The id flows only through logContext.
+   *
+   * @param actor - Who initiated the delete, recorded for event attribution.
+   * @throws NextlyError(NOT_FOUND) when the user does not exist.
+   * @throws NextlyError on DB errors via fromDatabaseError.
+   */
+  async deleteUser(
+    userId: number | string,
+    actor?: RequestActor,
+    caller: UserWriteCaller = "app"
+  ): Promise<void> {
+    const { users, userRoles, media } = this.tables;
+    // A plugin may not remove an account that reaches super-admin. Checked
+    // before any work, and again inside the deletion's transaction.
+    const administratorRefusal = {
+      reason: "plugin-super-admin-account-refused",
+      userId,
+    };
+    if (caller === "plugin") {
+      await this.refuseSuperAdminAccount(userId, administratorRefusal);
+    }
+    // The same refusal, asked again inside the deletion's transaction.
+    const refuseAdministratorInTx = async (txDb: DrizzleTransactionLike) => {
+      if (caller !== "plugin") return;
+      await this.refuseSuperAdminAccount(userId, administratorRefusal, txDb);
+    };
+
+    // Asked once, before the transaction opens, because a failed statement
+    // aborts an open Postgres transaction and there would be no way back.
+    //
+    // The answer is allowed to be "no". A database whose `activity_log` has
+    // never been created carries no trail, and therefore no identifying data
+    // for the erasure to remove — the invariant that an account is never
+    // deleted while data identifying its owner remains is satisfied by there
+    // being none. That is a different thing from an erasure that fails, which
+    // still takes the deletion down with it. Databases in this state exist:
+    // the SQLite fallback bootstrap in earlier releases created a subset of
+    // the core tables, and neither first-run setup nor boot repairs an
+    // existing database that is missing one — they only warn.
+    // Asked per table rather than once for all of them. A database can carry
+    // one and not the other — the SQLite fallback bootstrap created a subset of
+    // the core tables — and answering for the pair would let a missing auth log
+    // suppress the activity erasure, leaving behind exactly the names and
+    // emails the deletion exists to remove.
+    const auditTables = this.tables;
+    // Normalized here rather than left to the caller: the probes read the
+    // catalogue, and a transient metadata failure is a database error like any
+    // other. Outside this the raw driver exception would escape ahead of the
+    // block that converts one, and the caller would get an untyped throw from
+    // an operation whose whole surface is typed.
+    let activityShape: ErasureShape;
+    let authShape: ErasureShape;
+    try {
+      activityShape = await this.supportsErasure(
+        "activity_log",
+        "their name and email"
+      );
+      authShape = await this.supportsErasure(
+        "audit_log",
+        "the address and client they connected from"
+      );
+    } catch (err) {
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, err));
+    }
+    // Asked out here for the same reason as the two above: a failed statement
+    // aborts an open Postgres transaction, and there would be no way back.
+    //
+    // A probe that cannot answer is treated as "present" so the erasure is
+    // ATTEMPTED. The alternative direction is worse in a way that is hard to
+    // see later: reading a transient metadata failure as "no such table" would
+    // delete the account and leave its delivery rows behind, silently and
+    // permanently, since no later run revisits a deletion that has happened.
+    // If the table really is absent, the UPDATE fails and takes the deletion
+    // with it, which is the same invariant the audit erasure protects.
+    // Read from the preimage inside the transaction and used again after it
+    // commits, so it is declared out here rather than in the closure.
+    let deletedAddress: string | undefined;
+    const deliveriesExist = await this.tablePresent("email_deliveries");
+    // The deleted-people list, which a database that has not run
+    // `nextly migrate` since it arrived may lack, as it may lack media.
+    const deletedPeopleExist = await this.tablePresent(
+      DELETED_PRINCIPALS_TABLE
+    );
+    // And whether the delivery log has its person columns yet, which arrive
+    // with that list: on a database without them, no record names anyone.
+    const personColumnsExist =
+      deliveriesExist && (await this.deliveriesNamePeople());
+    // With the columns but not the list, records can name this user and
+    // nothing can erase them by person, and the address pass leaves every
+    // record that names someone. Refused before anything is written, rather
+    // than deleting the account and keeping those records.
+    if (personColumnsExist && !deletedPeopleExist) {
+      throw new NextlyError({
+        code: "INTERNAL_ERROR",
+        publicMessage: "An unexpected error occurred.",
+        logMessage:
+          `email_deliveries names people but ${DELETED_PRINCIPALS_TABLE} ` +
+          "is missing, so deleting a user would keep the records that name " +
+          "them. Run `nextly migrate` to apply the core schema.",
+        logContext: { operation: "deleteUser" },
+      });
+    }
+    const tokenTables = await this.presentTokenTables();
+
+    // Asked out here for the same reason, and treated as present when the
+    // probe cannot answer, for the same reason too. `media.uploaded_by`
+    // cascades, so skipping the detach on a transient metadata failure would
+    // delete the account and let the database destroy its files — silently and
+    // permanently, since no later run revisits a deletion that has happened.
+    // Attempting it against a genuinely absent table fails the UPDATE and takes
+    // the deletion with it, which is the invariant the audit erasure protects:
+    // an account is never removed while data belonging to it is left behind.
+    //
+    // Databases without the table exist. The SQLite fallback bootstrap in
+    // earlier releases created a subset of the core tables, and neither
+    // first-run setup nor boot repairs an existing database that is missing
+    // one.
+    const mediaExists = await this.tablePresent("media");
+
+    // The account's dashboard arrangement, probed out here for the same reason
+    // as the three above: a failed statement aborts an open Postgres
+    // transaction and there would be no way back.
+    //
+    // The row carries the account's identifier and its opaque per-placement
+    // configuration, and nothing else removes it — `scope_id` holds a user id
+    // by convention rather than by a foreign key, precisely so a future role
+    // scope can share the table. Left behind, that configuration outlives the
+    // person indefinitely, and an external identity provider that reuses an
+    // identifier hands the replacement account its predecessor's dashboard.
+    //
+    // An unanswerable probe is treated as PRESENT, matching the media and
+    // deliveries decisions above: attempting the delete against a genuinely
+    // absent table fails the statement and takes the deletion with it, which is
+    // the invariant those two protect — an account is never removed while data
+    // belonging to it is left behind. Databases without the table exist, since
+    // the SQLite fallback bootstrap created a subset of the core tables.
+    const widgetLayoutExists = await this.tablePresent(WIDGET_LAYOUT_TABLE);
+
+    // A person's notices are theirs alone and carry their account's id and
+    // snapshots of what they worked on, so they go with the account. Probed
+    // out here for the reason the tables above are: an installation that has
+    // not run `nextly migrate` has no notices table, and a delete against it
+    // would abort the transaction and the deletion with it.
+    const noticesExist = await this.tablePresent(NOTICES_TABLE);
+
+    // Which version of each document the person last looked at: theirs alone,
+    // keyed by their id, so it goes with the account. Probed out here for the
+    // reason notices are.
+    const versionViewsExist = await this.tablePresent(VERSION_VIEWS_TABLE);
+
+    // The person's external identities: theirs alone, so they go with the
+    // account rather than waiting for a provider to hand the next account the
+    // same subject. Probed out here for the reason notices are: an
+    // installation that has not run `nextly migrate` has no identities table,
+    // and a delete against it would abort the transaction and the deletion
+    // with it.
+    const identitiesExist = await this.tablePresent(EXTERNAL_IDENTITIES_TABLE);
+
+    // The record of content events names each event's actor; the name goes
+    // with the account. Probed for the reason the tables above are.
+    const contentEventsExist = await this.tablePresent(CONTENT_EVENTS_TABLE);
+
+    // Who last edited a plugin's settings, probed out here for the reason the
+    // three above are: a failed statement aborts an open Postgres transaction
+    // and there would be no way back.
+    //
+    // An unanswerable probe is treated as PRESENT, matching them: `updated_by`
+    // holds the editing account's id and nothing else erases it, so skipping
+    // the scrub on a transient metadata failure would delete the account and
+    // leave it identified by core-owned rows indefinitely. Attempting it
+    // against a genuinely absent table fails the UPDATE and takes the deletion
+    // with it, which is the invariant those three protect.
+    //
+    // Databases without the table exist, and not only historic ones: the table
+    // arrives with the plugin runtime, so any database reconciled before it
+    // lacks the table while this build's declaration is present either way.
+    const settingsExist = await this.tablePresent(PLUGIN_SETTINGS_TABLE);
+    // The RETIRED `accounts` and `sessions` tables, erased from only when the
+    // operator has named them as Nextly's, and then probed for the same reason
+    // and by their shape, since either name may belong to the host app.
+    const retiredTables = {
+      accounts: await this.retiredTableErasable(RETIRED_ACCOUNTS_TABLE),
+      sessions: await this.retiredTableErasable(RETIRED_SESSIONS_TABLE),
+    };
+    // The two answer a legacy shape differently, because what happens to an
+    // un-erased row differs. A legacy `activity_log` still cascades from the
+    // account, so its rows go with the deletion and there is nothing left to
+    // scrub. `audit_log.actor_user_id` carries no key at all — deliberately, so
+    // the trail outlives the account — so an un-erased row keeps the address
+    // and client indefinitely, and no later migration can revisit a deletion
+    // that has already happened. It is erased either way; only the record of
+    // when is lost on a schema with nowhere to put it.
+    const erasableAuditTables = {
+      ...(activityShape === "stamped" && {
+        activityLog: auditTables.activityLog,
+      }),
+      ...(authShape !== false && { auditLog: auditTables.auditLog }),
+      ...(contentEventsExist && {
+        contentEvents: contentEventsTables(this.dialect).nextlyContentEvents,
+      }),
+    };
+    const unstampedAuditTables = new Set<"activityLog" | "auditLog">(
+      authShape === "unstamped" ? ["auditLog"] : []
+    );
+
+    // Delete user and related data in a single Drizzle transaction so that
+    // partial deletes can't leave orphaned rows. The tx alias is a structural
+    // type because BaseService.withTransaction yields `unknown` (it can't
+    // reference the dialect-specific Drizzle transaction type without binding to
+    // all three driver packages); the fluent query API is identical across
+    // dialects.
+    let userDeletedRecorded = false;
+    /** Whether THIS transaction removed the account, regardless of webhooks. */
+    let userWasDeleted = false;
+    // Collected inside the transaction, used after it commits: the cache bust
+    // must not run until the detach is durable, and the rows cannot be found
+    // afterwards because the column that named them is exactly what changed.
+    let detachedMediaIds: string[] = [];
+    try {
+      await this.withTransaction(async tx => {
+        const txDb = tx as DrizzleTransactionLike;
+
+        // The deleted-people lock, before every other lock this deletion takes
+        // and before it writes to the delivery log: a write naming a person
+        // holds it shared and may then need this user's row or a gap in the
+        // delivery log's index, so taking it any later could deadlock against
+        // such a write (`beginStaffUserDeletion`).
+        const staffDeletion =
+          personColumnsExist && deletedPeopleExist
+            ? await beginStaffUserDeletion(
+                txDb,
+                this.adapter,
+                pluginSettingsSecrets(env)
+              )
+            : undefined;
+
+        // Never the last active super-admin, whoever asks. First of the
+        // removal's own locks: its lock is the one every removal takes, so it
+        // comes before the row lock below, in the same order everywhere.
+        await refuseRemovingLastSuperAdmin(
+          tx as LastSuperAdminTx,
+          this.tables,
+          this.dialect,
+          { kind: "delete", userId }
+        );
+
+        // Read the removed account's identity INSIDE the transaction, right
+        // before the delete, so the event reports the row actually being
+        // removed. Email and name are read (external systems key on email, not
+        // an opaque id). On Postgres/MySQL the read takes a FOR UPDATE row lock,
+        // so a concurrent `updateUser` cannot commit between this read and the
+        // delete and make the event advertise a stale address; the lock is held
+        // until this transaction commits with the removal. SQLite has no row
+        // lock, but a write transaction serializes writers, so its transaction
+        // already excludes that race. Absence is the NOT_FOUND case — thrown
+        // inside the tx, which rolls back and surfaces unchanged through the
+        // catch below.
+        const preimageQuery = txDb
+          .select({ id: users.id, email: users.email, name: users.name })
+          .from(users)
+          .where(eq(users.id, userId))
+          .limit(1);
+        const preimage = (
+          this.dialect === "sqlite"
+            ? await preimageQuery
+            : await preimageQuery.for("update")
+        )[0];
+        if (!preimage) {
+          throw NextlyError.notFound({
+            logContext: { entity: "user", id: userId },
+          });
+        }
+        await refuseAdministratorInTx(txDb);
+
+        // A required relationship the Schema Builder keyed to this account refuses the deletion.
+        // Asked before anything of the account is removed (its roles, media ownership, email
+        // records, its row), so the refusal leaves the account whole and says what still points at it.
+        // An optional relationship is emptied by the database when the row goes. Read through
+        // `txDb`: inside a caller's transaction this one joins, the reads see what it already
+        // wrote (a referring entry it deleted is gone) and run on its connection, not a second
+        // one from the pool; and after the row lock above, no new reference can commit between
+        // the count and the delete on PostgreSQL.
+        const referrers = await referrersHolding(
+          txDb,
+          this.dialect,
+          "users",
+          String(userId)
+        );
+        if (referrers.length > 0) {
+          throw entryStillReferenced(
+            referrers,
+            { operation: "deleteUser", userId },
+            "user"
+          );
+        }
+
+        // Delete user_ext row if custom fields are configured
+        if (this.hasCustomFields()) {
+          const userExtTable = this.getUserExtTable();
+          if (userExtTable) {
+            try {
+              await txDb
+                .delete(userExtTable)
+                .where(eq(userExtTable.user_id as Column, userId));
+            } catch (err) {
+              // user_ext table may not exist on this dialect — skip and disable
+              // ext for the rest of this process so subsequent calls don't retry.
+              const cause = err instanceof Error ? err.message : String(err);
+              this.logger.warn(
+                `user_ext delete skipped during deleteUser: ${cause}`
+              );
+              this.userExtDisabled = true;
+            }
+          }
+        }
+
+        // Delete user roles
+        await txDb.delete(userRoles).where(eq(userRoles.userId, userId));
+
+        // And the dashboard arrangement, addressed by the SAME derivation the
+        // layout service writes with rather than by a second spelling of the
+        // key — two derivations of one identifier agree until one is edited,
+        // and the failure here is silent: the delete matches no row, the
+        // account goes, and the layout stays.
+        await this.eraseOwnedRows(
+          txDb,
+          noticesTables(this.dialect).nextlyNotices,
+          String(userId),
+          noticesExist
+        );
+        await this.eraseOwnedRows(
+          txDb,
+          versionViewsTables(this.dialect).nextlyVersionViews,
+          String(userId),
+          versionViewsExist
+        );
+        // Their external identities, in the same transaction: the foreign key
+        // on `user_id` would take them with the row, but the delete says so
+        // where the deletion is read rather than leaving it to a cascade a
+        // database built without key enforcement would not run.
+        await this.eraseOwnedRows(
+          txDb,
+          externalIdentitiesTables(this.dialect).nextlyExternalIdentities,
+          String(userId),
+          identitiesExist
+        );
+        if (widgetLayoutExists) {
+          const layoutTable = widgetLayoutTables(this.dialect)
+            .nextlyWidgetLayout as unknown as { id: Column };
+          await txDb
+            .delete(layoutTable)
+            .where(eq(layoutTable.id, layoutRowId("user", String(userId))));
+        }
+
+        // Strip the person out of the audit trail while leaving the trail
+        // standing. `activity_log.user_id` carries no foreign key precisely so
+        // these rows outlive the account; without this they would outlive it
+        // still carrying the name and email of someone who asked to be erased.
+        // Inside the transaction, so a failed erasure takes the deletion with
+        // it rather than leaving the two out of step.
+        if (Object.keys(erasableAuditTables).length > 0) {
+          await eraseActorPersonalData(
+            txDb,
+            erasableAuditTables,
+            String(userId),
+            new Date(),
+            unstampedAuditTables
+          );
+        }
+
+        // Detach the account's uploads before the row goes.
+        //
+        // `media.uploaded_by` declares ON DELETE CASCADE, so without this the
+        // database destroys every image, document and video the account ever
+        // added — beneath every service, hook and access check, with nothing
+        // able to intercept it and nothing to warn the admin who asked only to
+        // remove a person. An asset library is shared property: a logo uploaded
+        // by someone who has since left is still the site's logo, and the
+        // attribution is the only part that belonged to them.
+        //
+        // Nulling the column first leaves the cascade nothing to act on, which
+        // is why this is a write rather than a change to the constraint: the
+        // rule itself cannot be altered on an existing PostgreSQL database
+        // without resolver support the schema pipeline does not have yet.
+        // Inside the transaction, so files are never detached from an account
+        // whose removal then rolls back.
+        // OUTSIDE the media guard: a database with no media table still has
+        // plugin settings, and the scrub was skipped entirely on one — leaving
+        // the deleted user's id in `updated_by` on exactly the installs least
+        // likely to notice. The helper already handles the settings table
+        // being absent, so it needs no guard of its own.
+        await this.scrubPluginSettingsActor(txDb, userId, settingsExist);
+
+        await this.eraseRetiredAccountRows(txDb, userId, retiredTables);
+
+        // Every reset and verification link of the account, whatever address
+        // it was sent to, and any from before links recorded their account
+        // that went to the address it holds. The bound ones would also go
+        // with the row through their foreign key; this says so where the
+        // deletion is read, and reaches the unbound ones the key cannot.
+        // Under the preimage's row lock, so a link being issued for the
+        // account now either lands first and is removed here, or finds the
+        // account gone.
+        await revokeAccountTokens(txDb, tokenTables, {
+          userId: String(userId),
+          addresses: typeof preimage.email === "string" ? [preimage.email] : [],
+        });
+
+        if (mediaExists) {
+          // Read before writing: the event carries a before and an after, and
+          // the ids cannot be recovered once the column naming them is null.
+          // Under a row lock, for the same reason the canonical media write
+          // takes one before recording. Read unlocked, a concurrent
+          // `updateMedia` or `deleteMedia` can commit between this snapshot and
+          // the write below — and the events would then carry state already
+          // superseded: metadata a subscriber would roll back, or an update for
+          // a row that has since been deleted, which downstream reads as the
+          // file coming back. The lock makes the snapshot the rows are updated
+          // FROM the same one they are evented from.
+          //
+          // SQLite has no row lock and needs none: its write transaction
+          // serialises writers, which is the argument the preimage read above
+          // already makes.
+          const detachQuery = txDb
+            .select()
+            .from(media)
+            .where(eq(media.uploadedBy as Column, userId));
+          const detaching = (this.dialect === "sqlite"
+            ? await detachQuery
+            : await detachQuery.for("update")) as unknown[] as MediaRow[];
+
+          if (detaching.length > 0) {
+            const detachedAt = new Date();
+            await txDb
+              .update(media)
+              .set({ uploadedBy: null, updatedAt: detachedAt })
+              .where(eq(media.uploadedBy as Column, userId));
+
+            // `updatedAt` and the outbox row are what `updateMedia` emits for
+            // any other metadata change, and a detach is one. Without them a
+            // timestamp-based sync sees an unchanged row and media subscribers
+            // are never told, so a downstream replica keeps serving the
+            // attribution of an account that no longer exists — the erasure
+            // holding on this side and not on the other.
+            for (const row of detaching) {
+              await recordMutationEventInTx(txDb, this.dialect, {
+                type: "media.updated",
+                resource: { kind: "media", id: String(row.id) },
+                data: { ...row, uploadedBy: null, updatedAt: detachedAt },
+                previous: row,
+                fields: [],
+                // Normalised the way every canonical media write normalises
+                // it: a deletion reaching this without an explicit actor is a
+                // write nobody initiated, which `actorForWrite` represents as
+                // `system`. Passing null instead would attribute the same media
+                // change differently depending on whether it arrived here or
+                // through `updateMedia`, in the durable audit as well as to
+                // subscribers.
+                actor: actorForWrite(actor, null),
+              });
+            }
+
+            detachedMediaIds = detaching.map(row => String(row.id));
+          }
+        }
+
+        // Strip the person out of the delivery log for the same reason, and in
+        // the same transaction: those rows carry a keyed hash of the address,
+        // and an install holds the key — so they go on answering "was this
+        // person written to, and when" for an account that no longer exists.
+        // The row itself stays, because "how many sends failed last week"
+        // belongs to the install rather than to the recipient.
+        //
+        // Keyed on the ADDRESS, not the user id: the table records every
+        // recipient, and most of them never had an account. This call therefore
+        // covers the deleted account's own address and nothing else — someone
+        // who was only ever a recipient is erased by calling
+        // `eraseRecipientDeliveries` directly, since no account deletion will
+        // ever fire for them.
+        //
+        // Narrowed rather than asserted, because the preimage select resolves
+        // to an untyped row. An account carrying no address has no delivery
+        // rows keyed to it, so there is nothing here to erase — which is a
+        // different outcome from an erasure that was skipped, and this is the
+        // only shape that produces it.
+        deletedAddress =
+          typeof preimage.email === "string" ? preimage.email : undefined;
+        // By person, every record that names this user, whatever address it
+        // went to: the user goes on the deleted-people list, and their records
+        // lose the address digest and name them by the keyed digest instead.
+        // By the id as stored, which on MySQL's case-insensitive collation can
+        // differ in spelling from the one the caller passed.
+        await staffDeletion?.complete(String(preimage.id));
+        // By address, the records written before sends named their person. A
+        // record naming a person is that person's, and someone else who holds
+        // or held the address keeps theirs. A database still waiting for
+        // `nextly migrate` has no person columns yet, so every record there
+        // names nobody.
+        if (deliveriesExist && deletedAddress !== undefined) {
+          await (
+            personColumnsExist
+              ? eraseUnnamedRecipientDeliveries
+              : eraseRecipientDeliveries
+          )(txDb, deliveriesTableFor(this.dialect), deletedAddress);
+        }
+
+        // Delete user, capturing how many rows it removed.
+        const deleteResult = await txDb
+          .delete(users)
+          .where(eq(users.id, userId));
+
+        // Record `user.deleted` only when THIS transaction actually removed the
+        // account, in the same transaction so it commits with the removal and
+        // never fires for a rolled-back delete. Two concurrent deletes both read
+        // the identity above, but only one deletes a row; without this guard the
+        // loser would emit a duplicate event with a fresh id that downstream
+        // idempotency cannot collapse. PII-safe identity only.
+        if (affectedRowCount(deleteResult, this.dialect) > 0) {
+          // Two DIFFERENT facts, and conflating them suppressed the in-process
+          // event on every install without an enabled webhook endpoint: this
+          // one says the account is gone, the assignment below says the outbox
+          // accepted a row to deliver.
+          userWasDeleted = true;
+          userDeletedRecorded = await recordMutationEventInTx(
+            txDb,
+            this.dialect,
+            {
+              type: "user.deleted",
+              resource: { kind: "user", id: String(userId) },
+              data: {
+                id: preimage.id,
+                email: preimage.email ?? null,
+                name: preimage.name ?? null,
+              },
+              fields: [],
+              actor: actor ?? null,
+            }
+          );
+        }
+      });
+    } catch (err) {
+      if (NextlyError.is(err)) throw err;
+      // Normalise raw driver errors so fk/etc. produce the right NextlyError kind.
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, err));
+    }
+
+    // After the transaction commits, and only for a delete that removed a row.
+    // In-process subscribers are how a plugin cleans up what it stored against
+    // this user; the webhook outbox event recorded above is durable but
+    // reaches nothing inside this process — and whether that outbox accepted a
+    // row says nothing about whether the account is gone, so this asks the
+    // question it actually means.
+    // Inside an enclosing transaction on SQLite, "after the commit" is that
+    // transaction's commit, so neither runs for a deletion it rolls back.
+    await this.afterCommit(async () => {
+      if (userWasDeleted) {
+        // Their kept access goes with the account, here and in every other
+        // instance.
+        const { invalidatePermissionCache } = await import(
+          "../../../services/lib/permissions"
+        );
+        await invalidatePermissionCache({ userId: String(userId) });
+        const payload: UserDeletedPayload = { userId: String(userId) };
+        safeEmit(UserEvents.Deleted, payload);
+      }
+
+      // The detached files changed, so anything cached against them is stale
+      // — `uploadedBy` is part of the media shape a read returns. AFTER the
+      // commit, because a bust for a detach that then rolled back would be a
+      // lie about rows that never moved; best-effort, because the deletion has
+      // already happened and reporting it as failed would invite a retry that
+      // answers not-found.
+      if (detachedMediaIds.length > 0) {
+        await revalidateMedia(detachedMediaIds, this.logger);
+      }
+    });
+
+    // The removed account's recovery points, swept once the deletion is
+    // visible. Deliberately a DELETE rather than the scrub the audit surfaces
+    // receive: an audit row is a record, and stripping the person from it
+    // keeps a trail worth keeping, whereas a recovery point is that person's
+    // unsaved draft. Scrubbing its author would strand the snapshot with
+    // nobody able to claim it, and nothing else collects autosave rows -- they
+    // are excluded from history listings, version reads and retention alike.
+    //
+    // AFTER the commit rather than before it. Sweeping first would destroy a
+    // living person's unsaved work whenever the deletion itself then failed,
+    // which is a user-visible loss for an account that still exists. Sweeping
+    // here can instead leave rows behind if this pass fails after the account
+    // is gone; that is the same window the erasure below already accepts, and
+    // the delete is idempotent, so a later pass costs nothing.
+    //
+    // Atomicity would beat both orderings. It is not available cheaply here:
+    // `withTransaction` yields a raw Drizzle handle rather than the adapter
+    // surface this repository is built on, so joining the transaction would
+    // mean a second implementation of which rows are autosaves.
+    //
+    // Both sweeps wait for the outermost commit (`afterCommit`): run as the deletion returns
+    // inside a caller's transaction, they took another connection while that transaction
+    // was still open, destroyed a draft its rollback would have kept, and on MySQL waited for
+    // the rows the in-transaction erasure had just locked, which only the caller's commit
+    // releases. Outside any transaction they run at once, as before. A held sweep that fails
+    // is logged here like one that runs at once, so neither fails a committed deletion.
+    await this.afterCommit(async () => {
+      try {
+        await new VersionsRepository(this.adapter).deleteAutosavesByAuthor(
+          String(userId)
+        );
+      } catch (err) {
+        // Never fail the deletion for this. The account is already gone; a
+        // surviving recovery point is dead weight rather than a live risk, and
+        // reporting the removal as failed would invite a retry that now answers
+        // not-found.
+        this.logger.error("Failed to remove deleted user's recovery points", {
+          userId: String(userId),
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+
+      // Sweep once more now the removal is visible. The erasure inside the
+      // transaction cannot reach an entry that landed after it ran but before the
+      // commit — an activity write already in flight when the deletion started —
+      // and such an entry carries the identity of an account that no longer
+      // exists. Erasing is idempotent, so a second pass over rows already erased
+      // costs one indexed update and changes nothing.
+      try {
+        if (Object.keys(erasableAuditTables).length > 0) {
+          await eraseActorPersonalData(
+            this.db as Parameters<typeof eraseActorPersonalData>[0],
+            erasableAuditTables,
+            String(userId),
+            new Date(),
+            unstampedAuditTables
+          );
+        }
+        // The delivery log needs the same second pass and for the same reason: a
+        // send already in flight when the deletion started can insert its row
+        // after the in-transaction erasure has chosen its matches, leaving a live
+        // digest for an account that no longer exists. Erasing is idempotent —
+        // an already-erased row holds the sentinel, which no address hashes to —
+        // so a second pass over untouched rows costs one indexed update.
+        if (deliveriesExist && deletedAddress !== undefined) {
+          await (
+            personColumnsExist
+              ? eraseUnnamedRecipientDeliveries
+              : eraseRecipientDeliveries
+          )(
+            this.db as Parameters<typeof eraseRecipientDeliveries>[0],
+            deliveriesTableFor(this.dialect),
+            deletedAddress
+          );
+        }
+      } catch (err) {
+        // The account is already gone and the caller has been served; failing
+        // here would report a completed deletion as an error and invite a retry
+        // that finds nothing to delete. Loud enough to act on, quiet enough not
+        // to undo a committed write.
+        this.logger.error(
+          `audit erasure sweep after deleteUser failed for ${Object.keys(
+            erasableAuditTables
+          ).join(", ")}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+    });
+
+    // With the removal and its outbox row committed, offer the same post-commit
+    // hooks as createLocalUser: a bounded retention prune (so user churn on a
+    // write-triggered-maintenance install still trims the outbox) and the
+    // fast-path drain for the recorded event (same rationale as createLocalUser).
+    // Retention runs regardless of a recording, the drain only when one happened.
+    // A drain started before an enclosing SQLite transaction commits would read
+    // and deliver the outbox row that transaction may still roll back.
+    await this.afterCommit(async () => {
+      await this.retentionRunner?.maybeRun(
+        UserMutationService.WRITE_PATH_PRUNE_BATCHES
+      );
+      if (userDeletedRecorded) this.fastDrainScheduler?.offer();
+    });
+  }
+}
+
+/**
+ * The refusal for a unique custom field's value another user already holds.
+ * Generic in public, as an existing email is: naming the field would say that
+ * some account holds that value. The log gets the constraint or column only:
+ * the database's message, and a wrapped query's parameters, carry the value
+ * itself, and a custom field may hold personal data.
+ */
+function takenUserFieldValue(error: unknown): NextlyError {
+  return NextlyError.duplicate({
+    logContext: {
+      reason: "user-field-value-taken",
+      constraint: uniqueConstraintIn(error),
+    },
+  });
+}
+
+/**
+ * The `user_ext` constraint or column a unique violation names, read from the
+ * error or its causes: `uq_user_ext_<column>` on PostgreSQL and MySQL,
+ * `user_ext.<column>` on SQLite. Undefined when none is named.
+ */
+function uniqueConstraintIn(error: unknown): string | undefined {
+  let cursor: unknown = error;
+  for (let depth = 0; depth < 6 && cursor != null; depth++) {
+    const message = cursor instanceof Error ? cursor.message : "";
+    const found =
+      /uq_user_ext_[a-z0-9_]+/.exec(message) ??
+      /user_ext\.[a-z0-9_]+/.exec(message);
+    if (found) return found[0];
+    cursor = (cursor as { cause?: unknown }).cause;
+  }
+  return undefined;
+}

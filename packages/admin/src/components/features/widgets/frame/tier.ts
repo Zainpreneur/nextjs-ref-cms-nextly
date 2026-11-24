@@ -1,0 +1,212 @@
+/**
+ * A card's size tier, from the width it is actually drawn at.
+ *
+ * The tier decides how a figure is written: only a small card compacts "1,248" to "1.2k",
+ * because only there does the full value not fit. It is measured from the card's rendered width
+ * rather than from its grid width setting, because the same setting draws narrow on a phone
+ * and wide on a desktop, and what decides whether a number fits is the space it has.
+ *
+ * The frame measures once and provides the tier to everything inside it through context, so a
+ * figure anywhere in a card's body -- a count, a bar's value, a table cell -- reads the same tier
+ * without each archetype being handed it.
+ *
+ * @module components/features/widgets/frame/tier
+ */
+
+import type { SizeTier } from "@nextlyhq/ui/format";
+import { cardTierAt, tierOfWidth } from "nextly/card-geometry";
+import { GRID_COLUMNS, listEntries } from "nextly/config";
+import { createContext, useContext, type RefObject, type Context } from "react";
+
+import { useMeasuredWidth } from "@admin/components/shared/preview/useMeasuredWidth";
+
+// The outer width a card of `w` columns is drawn at on a dashboard of a given width: twelve
+// columns with a gap between each, at the span its band draws it across and the gap that width
+// draws. Core's own (`nextly/card-geometry`), the rule the layout read reads a card's tier by.
+export { cardOuterWidth } from "nextly/card-geometry";
+
+/**
+ * The tier for a rendered width, or `undefined` before the card has one: core's rule for a
+ * width (`tierOfWidth`), the one a predicted tier and the layout read's tier read too.
+ */
+export function tierForWidth(width: number | null): SizeTier | undefined {
+  return width === null ? undefined : tierOfWidth(width);
+}
+
+/**
+ * A card's tier before it is drawn: the tier its predicted outer width reads as.
+ *
+ * What a card's first query is sized by, since the query is asked before the card can measure
+ * itself. Only a prediction: once drawn, the card's tier is the one its own rendered width
+ * reads as, never the window's. Core's one rule for it (`cardTierAt`), which reads the width
+ * through the rule the measured tier uses, so the two cannot disagree about a width, and which
+ * the layout read judges a card that hides while empty by, at the dashboard width the layout
+ * read was sent; `undefined` while the dashboard itself has no width yet.
+ */
+export function predictedTier(
+  w: number,
+  dashboardWidth: number | null | undefined
+): SizeTier | undefined {
+  if (dashboardWidth === null || dashboardWidth === undefined) return undefined;
+  return cardTierAt(w, dashboardWidth);
+}
+
+/**
+ * The tier a card of each span, one column to all of them, is drawn at on a dashboard
+ * `dashboardWidth` wide (`cardTierAt` of each), as one key. Two widths with the same key draw
+ * every card at the same tier, so what was judged of a card at its tier on one holds on the other;
+ * two with different keys draw some card at another tier.
+ */
+export function tierBandAt(dashboardWidth: number): string {
+  return Array.from({ length: GRID_COLUMNS }, (_, index) =>
+    cardTierAt(index + 1, dashboardWidth)
+  ).join(" ");
+}
+
+/**
+ * The rows a list card draws when its "Number of entries" setting asks for `items`: core's rule
+ * (`listEntries`), the one a card's `load` asks its rows by, so the rows read and the rows drawn
+ * are one count. Never the card's size: a card is as tall as its content.
+ *
+ * One answer for every reader of it: the list and table displays draw this
+ * many, the query asks for one more (to learn whether more exist), and the
+ * loading card holds this many rows' place. A second copy anywhere would hold
+ * a place for rows the display then does not draw, which is the jump the
+ * reservation exists to prevent.
+ *
+ * `items` is read through core's own rule, so a missing or garbage setting
+ * means what it means to the query: five rows, never NaN.
+ */
+export function rowsDrawn(items: unknown): number {
+  return listEntries(items);
+}
+
+/**
+ * How a list or table card lays its rows out at `tier`, given how many columns it has.
+ *
+ * - `table`: a heading row and the rows, at the large tier when there are columns to head.
+ * - `list-detail`: a label and a detail line per row, from the medium tier when there is a second
+ *   column to make the detail of.
+ * - `list`: label lines only; a small card has room for nothing more.
+ *
+ * One answer for the rows a card draws and the skeleton that holds their place before they
+ * arrive, so the two lay out alike: a skeleton drawn as a list for a card that then draws a
+ * table would change height the moment the answer lands.
+ */
+export type RowsLayout =
+  | { kind: "list" }
+  | { kind: "list-detail" }
+  | { kind: "table"; columns: number };
+
+export function rowsLayout(tier: SizeTier, columns: number): RowsLayout {
+  if (tier === "large" && columns > 0) return { kind: "table", columns };
+  return tier !== "small" && columns > 1
+    ? { kind: "list-detail" }
+    : { kind: "list" };
+}
+
+/** Where the one card-tier context is kept, across every copy of this module. */
+const CARD_TIER_CONTEXT_KEY = Symbol.for("nextly.admin.card-tier-context");
+
+/** Whether a second copy has been named already, across every copy. */
+const SECOND_COPY_WARNED_KEY = Symbol.for(
+  "nextly.admin.card-tier-context.second-copy-warned"
+);
+
+const contexts = globalThis as {
+  [CARD_TIER_CONTEXT_KEY]?: Context<SizeTier | undefined>;
+  [SECOND_COPY_WARNED_KEY]?: true;
+};
+
+/** What the console is told when a second copy of the kit is loaded. */
+const SECOND_ADMIN_COPY_WARNING =
+  "[nextly] A second copy of @nextlyhq/admin's widget kit was loaded. " +
+  "A plugin likely bundles the admin: import the kit from " +
+  "@nextlyhq/plugin-sdk/admin and leave @nextlyhq/admin to the host.";
+
+/**
+ * The card-tier context, one for the whole page however many copies of the
+ * admin are loaded.
+ *
+ * 🔴 A plugin that bundles its own copy of the admin, rather than importing the
+ * kit through `@nextlyhq/plugin-sdk/admin` with the admin left to the host,
+ * would otherwise make a second context: its card states would read the tier
+ * of a provider that is never drawn, `undefined`, and draw at the wrong size
+ * with nothing saying why. Kept on a global key, the second copy reads the
+ * host's, and the console is told once that a second copy was loaded.
+ *
+ * 🔴 Once, and in every environment, with no `NODE_ENV` test: the admin is
+ * built as a library with `NODE_ENV` set to production, so a development-only
+ * guard is folded away and the published package would never say it. Loading
+ * the admin twice is a mistake wherever it happens, and the one line is the
+ * only sign of it. The flag lives on a global key too, so a third copy says
+ * nothing more.
+ */
+function sharedCardTierContext(): Context<SizeTier | undefined> {
+  const existing = contexts[CARD_TIER_CONTEXT_KEY];
+  if (existing !== undefined) {
+    if (contexts[SECOND_COPY_WARNED_KEY] !== true) {
+      contexts[SECOND_COPY_WARNED_KEY] = true;
+      console.warn(SECOND_ADMIN_COPY_WARNING);
+    }
+    return existing;
+  }
+  const created = createContext<SizeTier | undefined>(undefined);
+  contexts[CARD_TIER_CONTEXT_KEY] = created;
+  return created;
+}
+
+/** The tier of the card being drawn; `undefined` outside a card or before it is measured. */
+export const CardTierContext: Context<SizeTier | undefined> =
+  sharedCardTierContext();
+
+/** The tier of the card this is drawn in. */
+export function useCardTier(): SizeTier | undefined {
+  return useContext(CardTierContext);
+}
+
+/** The height of the card being drawn, in grid rows; `undefined` for a card with none. */
+export const CardHeightContext: Context<number | undefined> = createContext<
+  number | undefined
+>(undefined);
+
+/** What an answer was fetched with: the "Number of entries" its card asked for then. */
+export interface AnswerSize {
+  items: unknown;
+}
+
+/**
+ * What the answer a card shows was fetched with; `undefined` where it is not known. A card whose
+ * reader asked for more entries keeps its smaller answer on screen until a larger one lands, and
+ * that answer holds only the rows it was asked for, and the one more that says more exist.
+ */
+export const AnswerSizeContext: Context<AnswerSize | undefined> = createContext<
+  AnswerSize | undefined
+>(undefined);
+
+/**
+ * The rows a card draws (`rowsDrawn`): its "Number of entries", or the number its answer was
+ * fetched with when that is fewer. Counted at the new setting, a smaller answer would draw its
+ * extra row as one more item and lose the sign that more exist.
+ */
+export function useRowsDrawn(items: unknown): number {
+  const answer = useContext(AnswerSizeContext);
+  const drawn = rowsDrawn(items);
+  return answer === undefined
+    ? drawn
+    : Math.min(drawn, rowsDrawn(answer.items));
+}
+
+/**
+ * Measures the card at `ref` and answers its tier, which the frame then provides.
+ *
+ * A tier the caller states wins over the measured one, so a card drawn somewhere without a
+ * layout of its own -- a preview, a test -- can still be given one.
+ */
+export function useMeasuredTier(
+  ref: RefObject<HTMLElement | null>,
+  stated?: SizeTier
+): SizeTier | undefined {
+  const measured = tierForWidth(useMeasuredWidth(ref));
+  return stated ?? measured;
+}

@@ -1,0 +1,87 @@
+import { Button, PageHeader } from "@nextlyhq/ui";
+import type React from "react";
+
+import { Plus } from "@admin/components/icons";
+import { PageContainer } from "@admin/components/layout/page-container";
+import { Breadcrumbs } from "@admin/components/shared";
+import { PageErrorFallback } from "@admin/components/shared/error-fallbacks";
+import { QueryErrorBoundary } from "@admin/components/shared/query-error-boundary";
+import { Link } from "@admin/components/ui/link";
+import { ROUTES } from "@admin/constants/routes";
+import { useCurrentUserPermissions } from "@admin/hooks/useCurrentUserPermissions";
+import { READ_SETTINGS } from "@admin/lib/permissions/system-policy";
+
+import RoleTable from "./roles/components/RoleTable";
+
+/**
+ * RolesPage Component
+ *
+ * Main page for role management with CRUD operations.
+ * Displays page header, "Add Role" button, and role table with search, pagination, and actions.
+ *
+ * ## Features
+ * - Page header with title, description, "Add Role" button
+ * - RoleTable component with DataTableView (mobile card view, desktop table view)
+ * - Consistent spacing via PageContainer
+ * - Mobile responsive layout
+ *
+ * ## Design System Alignment (Sprint 2)
+ * - PageContainer wrapper for consistent spacing (16px → 24px → 32px)
+ * - Badge variants for role type and status
+ * - TanStack Query integration (automatic caching, loading/error states)
+ * - DataTableView container queries for mobile optimization
+ *
+ * @example
+ * ```tsx
+ * <RolesPage />
+ * ```
+ */
+const RolesPage: React.FC = () => {
+  // Roles live under Settings (User Management) now. A roles-only user can't
+  // open the read-settings-guarded General page, so the Settings crumb points
+  // at the first reachable Settings subpage (Roles) — same logic as RoleBreadcrumbs.
+  const { hasPermission } = useCurrentUserPermissions();
+  const settingsHref = hasPermission(READ_SETTINGS)
+    ? ROUTES.SETTINGS
+    : ROUTES.SECURITY_ROLES;
+
+  return (
+    <QueryErrorBoundary fallback={<PageErrorFallback />}>
+      <PageContainer>
+        {/* Breadcrumb navigation */}
+        <div className="mb-6 empty:hidden">
+          <Breadcrumbs
+            items={[
+              { label: "Dashboard", href: ROUTES.DASHBOARD, isDashboard: true },
+              { label: "Settings", href: settingsHref },
+              { label: "Role Management" },
+            ]}
+          />
+        </div>
+
+        {/* Page header */}
+        <PageHeader
+          title="Roles"
+          description="Manage roles and permissions"
+          actions={
+            <>
+              <div className="flex items-center gap-2">
+                <Link href={ROUTES.SECURITY_ROLES_CREATE}>
+                  <Button size="md" className="flex items-center gap-1">
+                    <Plus className="h-4 w-4" />
+                    <span>Add Role</span>
+                  </Button>
+                </Link>
+              </div>
+            </>
+          }
+        />
+
+        {/* Role table */}
+        <RoleTable />
+      </PageContainer>
+    </QueryErrorBoundary>
+  );
+};
+
+export default RolesPage;

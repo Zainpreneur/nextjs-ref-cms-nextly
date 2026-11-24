@@ -1,0 +1,149 @@
+/**
+ * Media tables — MySQL.
+ *
+ * Tables: media, mediaFolders.
+ * Moved verbatim from packages/nextly/src/database/schema/mysql.ts as part of
+ * Plan A schemas consolidation. No behavior change.
+ *
+ * Cross-table `relations()` blocks live in `../_dialect-bundles/mysql.relations.ts` and are
+ * re-exported at the bottom of this file. See `./postgres.ts` for the
+ * rationale.
+ *
+ * @module schemas/media/mysql
+ * @since v0.0.3-alpha (Plan A — schemas consolidation)
+ */
+
+import type { BuildColumns } from "drizzle-orm";
+import { sql } from "drizzle-orm";
+import {
+  mysqlTable,
+  int,
+  varchar,
+  datetime,
+  json,
+  index,
+  text,
+  type AnyMySqlColumn,
+} from "drizzle-orm/mysql-core";
+
+import { MEDIA_INDEXES, mysqlIndexes } from "../_internal/core-indexes";
+import { users } from "../users/mysql";
+
+/** `media` columns, a fresh builder record per call (see `core-table-contributions`). */
+export function mediaColumns() {
+  return {
+    id: varchar("id", { length: 36 })
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+
+    // File identification
+    filename: varchar("filename", { length: 255 }).notNull(),
+    originalFilename: varchar("original_filename", { length: 255 }).notNull(),
+    mimeType: varchar("mime_type", { length: 100 }).notNull(),
+    size: int("size").notNull(),
+
+    // Image/video dimensions
+    width: int("width"),
+    height: int("height"),
+    duration: int("duration"),
+
+    // Storage URLs
+    url: text("url").notNull(),
+    thumbnailUrl: text("thumbnail_url"),
+
+    // Crop point for smart image cropping (percentage from top-left, 0-100)
+    focalX: int("focal_x"),
+    focalY: int("focal_y"),
+
+    // Metadata
+    altText: text("alt_text"),
+    caption: text("caption"),
+    tags: json("tags"), // MySQL uses JSON type for arrays
+
+    // Folder organization (null for root/unorganized files)
+    folderId: varchar("folder_id", { length: 255 }).references(
+      // The self-referencing FK requires an explicit return type to
+      // break TS's circular inference; AnyMySqlColumn matches what
+      // Drizzle's references() callback expects without the bare any.
+      (): AnyMySqlColumn => mediaFolders.id,
+      { onDelete: "set null" }
+    ),
+
+    // Ownership and timestamps
+    // Nullable: CLI seeds, data imports, and other system-context uploads
+    // may not have a user to attribute the upload to.
+    uploadedBy: varchar("uploaded_by", { length: 255 }).references(
+      () => users.id,
+      { onDelete: "cascade" }
+    ),
+    // DDL-side CURRENT_TIMESTAMP (matching postgres's defaultNow()):
+    // a JavaScript `new Date()` default bakes one module-load-time literal
+    // into the emitted DDL, so every boot saw a different default and v1's
+    // differ emitted MODIFY COLUMN churn forever (the pre-v1 MySQL differ
+    // returned empty statement lists and masked this).
+    uploadedAt: datetime("uploaded_at")
+      .notNull()
+      .default(sql`CURRENT_TIMESTAMP`),
+    updatedAt: datetime("updated_at")
+      .notNull()
+      .default(sql`CURRENT_TIMESTAMP`),
+  };
+}
+
+/** `media` indexes, from `MEDIA_INDEXES`. */
+export function mediaExtraConfig(
+  t: BuildColumns<"media", ReturnType<typeof mediaColumns>, "mysql">
+) {
+  return mysqlIndexes(MEDIA_INDEXES, t);
+}
+
+/**
+ * Media table for storing uploaded files and images
+ *
+ * Supports various storage backends (Vercel Blob, S3, R2, local filesystem)
+ * Stores file metadata in database, actual files in configured storage
+ *
+ * MySQL variant - uses JSON instead of JSONB for tags
+ */
+export const media = mysqlTable("media", mediaColumns(), mediaExtraConfig);
+
+/**
+ * Media Folders table for organizing media files (MySQL)
+ */
+export const mediaFolders = mysqlTable(
+  "media_folders",
+  {
+    id: varchar("id", { length: 255 })
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+
+    // Folder information
+    name: varchar("name", { length: 255 }).notNull(),
+    description: text("description"),
+
+    // Hierarchy
+    parentId: varchar("parent_id", { length: 255 }).references(
+      // The self-referencing FK requires an explicit return type to
+      // break TS's circular inference; AnyMySqlColumn matches what
+      // Drizzle's references() callback expects without the bare any.
+      (): AnyMySqlColumn => mediaFolders.id,
+      { onDelete: "cascade" }
+    ),
+
+    // Ownership and timestamps
+    createdBy: varchar("created_by", { length: 191 })
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    createdAt: datetime("created_at")
+      .notNull()
+      .default(sql`CURRENT_TIMESTAMP`),
+    updatedAt: datetime("updated_at")
+      .notNull()
+      .default(sql`CURRENT_TIMESTAMP`),
+  },
+  t => [
+    index("media_folders_parent_id_idx").on(t.parentId),
+    index("media_folders_created_by_idx").on(t.createdBy),
+    index("media_folders_created_at_idx").on(t.createdAt),
+  ]
+);

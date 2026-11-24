@@ -1,0 +1,665 @@
+// Regression tests for the email-dispatcher op-types. Pin the canonical
+// Response shapes per spec §5.1 so the handlers cannot regress.
+//
+// The dispatcher hosts TWO entrypoints (providers + templates), so the
+// coverage target spans both.
+//
+// Provider coverage (one representative test per op-type):
+//   respondData:     listProviders (non-paginated array)
+//   respondDoc:      getProvider
+//   respondMutation: createProvider (201), updateProvider (200)
+//   respondAction:   deleteProvider, setDefault, testProvider
+//
+// Template coverage:
+//   respondData:     listTemplates, previewTemplate
+//   respondDoc:      getTemplate
+//   respondMutation: createTemplate (201), updateTemplate (200)
+//   respondAction:   deleteTemplate
+
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../../helpers/di", () => ({
+  getEmailProviderServiceFromDI: vi.fn(),
+  getEmailTemplateServiceFromDI: vi.fn(),
+}));
+
+import {
+  getEmailProviderServiceFromDI,
+  getEmailTemplateServiceFromDI,
+} from "../../helpers/di";
+import {
+  dispatchEmailProviders,
+  dispatchEmailTemplates,
+} from "../email-dispatcher";
+
+type ProviderService = {
+  listProviders: ReturnType<typeof vi.fn>;
+  createProvider: ReturnType<typeof vi.fn>;
+  getProvider: ReturnType<typeof vi.fn>;
+  updateProvider: ReturnType<typeof vi.fn>;
+  deleteProvider: ReturnType<typeof vi.fn>;
+  setDefault: ReturnType<typeof vi.fn>;
+  testProvider: ReturnType<typeof vi.fn>;
+  domainStatus: ReturnType<typeof vi.fn>;
+  getProviderWithDomainStatus: ReturnType<typeof vi.fn>;
+  checkConfiguration: ReturnType<typeof vi.fn>;
+};
+
+type TemplateService = {
+  listTemplates: ReturnType<typeof vi.fn>;
+  createTemplate: ReturnType<typeof vi.fn>;
+  getTemplate: ReturnType<typeof vi.fn>;
+  updateTemplate: ReturnType<typeof vi.fn>;
+  deleteTemplate: ReturnType<typeof vi.fn>;
+  previewTemplate: ReturnType<typeof vi.fn>;
+  previewDraft: ReturnType<typeof vi.fn>;
+  keptOnOldEngineIds: ReturnType<typeof vi.fn>;
+  ownerSentBy: ReturnType<typeof vi.fn>;
+};
+
+function makeProviderService(
+  overrides: Partial<ProviderService> = {}
+): ProviderService {
+  return {
+    listProviders: vi.fn(),
+    createProvider: vi.fn(),
+    getProvider: vi.fn(),
+    updateProvider: vi.fn(),
+    deleteProvider: vi.fn(),
+    setDefault: vi.fn(),
+    testProvider: vi.fn(),
+    domainStatus: vi.fn().mockResolvedValue(null),
+    getProviderWithDomainStatus: vi.fn(),
+    checkConfiguration: vi.fn(),
+    ...overrides,
+  };
+}
+
+function makeTemplateService(
+  overrides: Partial<TemplateService> = {}
+): TemplateService {
+  return {
+    listTemplates: vi.fn(),
+    createTemplate: vi.fn(),
+    getTemplate: vi.fn(),
+    updateTemplate: vi.fn(),
+    deleteTemplate: vi.fn(),
+    previewTemplate: vi.fn(),
+    previewDraft: vi.fn(),
+    keptOnOldEngineIds: vi.fn().mockResolvedValue(new Set()),
+    // The senders column reads each slug's owner declarations; empty is
+    // the honest answer for a mock that declares none.
+    ownerSentBy: vi.fn().mockReturnValue([]),
+    ...overrides,
+  };
+}
+
+function wireProviders(svc: ProviderService) {
+  vi.mocked(getEmailProviderServiceFromDI).mockReturnValue(
+    svc as unknown as ReturnType<typeof getEmailProviderServiceFromDI>
+  );
+}
+
+function wireTemplates(svc: TemplateService) {
+  vi.mocked(getEmailTemplateServiceFromDI).mockReturnValue(
+    svc as unknown as ReturnType<typeof getEmailTemplateServiceFromDI>
+  );
+}
+
+beforeEach(() => {
+  vi.mocked(getEmailProviderServiceFromDI).mockReset();
+  vi.mocked(getEmailTemplateServiceFromDI).mockReset();
+});
+
+// ============================================================
+// Email providers
+// ============================================================
+
+describe("dispatchEmailProviders, non-paginated reads (respondData)", () => {
+  it("listProviders returns { providers: [...] } body and 200 status", async () => {
+    const fakeProviders = [
+      { id: "p1", name: "Resend" },
+      { id: "p2", name: "SES" },
+    ];
+    wireProviders(
+      makeProviderService({
+        listProviders: vi.fn().mockResolvedValue(fakeProviders),
+      })
+    );
+
+    const result = await dispatchEmailProviders("listProviders", {}, undefined);
+
+    expect(result).toBeInstanceOf(Response);
+    const response = result as Response;
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/json");
+    const body = await response.json();
+    expect(body).toEqual({ providers: fakeProviders });
+    expect(body).not.toHaveProperty("data");
+    expect(body).not.toHaveProperty("items");
+  });
+});
+
+describe("dispatchEmailProviders, single-doc reads (respondDoc)", () => {
+  it("getProvider returns bare doc body", async () => {
+    const fakeProvider = { id: "p1", name: "Resend" };
+    const domainStatus = {
+      domain: "example.com",
+      status: "verified",
+      records: [],
+    };
+    wireProviders(
+      makeProviderService({
+        // One read for both, so a change between two reads can't pair one
+        // configuration's record with another's status.
+        getProviderWithDomainStatus: vi
+          .fn()
+          .mockResolvedValue({ ...fakeProvider, domainStatus }),
+      })
+    );
+
+    const result = await dispatchEmailProviders(
+      "getProvider",
+      { providerId: "p1" },
+      undefined
+    );
+
+    const response = result as Response;
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    // The provider, with its sending domain's status beside it where the
+    // provider reports one.
+    expect(body).toEqual({ ...fakeProvider, domainStatus });
+    expect(body).not.toHaveProperty("data");
+  });
+});
+
+describe("dispatchEmailProviders, mutations (respondMutation)", () => {
+  it("createProvider returns { message, item } body and 201 status", async () => {
+    const fakeProvider = { id: "p1", name: "Resend" };
+    wireProviders(
+      makeProviderService({
+        createProvider: vi.fn().mockResolvedValue(fakeProvider),
+      })
+    );
+
+    const result = await dispatchEmailProviders(
+      "createProvider",
+      {},
+      {
+        name: "Resend",
+        type: "resend",
+        fromEmail: "no-reply@example.com",
+        configuration: {},
+      }
+    );
+    const response = result as Response;
+    expect(response.status).toBe(201);
+    const body = await response.json();
+    expect(body).toEqual({
+      message: "Email provider created.",
+      item: fakeProvider,
+    });
+  });
+
+  it("refuses a create whose booleans are not booleans, before any default is touched", async () => {
+    // `{"isDefault":true,"isActive":0}` once reached the service as-is: the
+    // strict `isActive === false` guard does not match `0`, SQLite stores the
+    // 0 as an off provider, and the transaction demoted the working default
+    // to promote it. The body is parsed before the service sees it, so a
+    // number where a boolean belongs is a validation refusal and the service
+    // is never called.
+    const createProvider = vi.fn().mockResolvedValue({ id: "p1" });
+    wireProviders(makeProviderService({ createProvider }));
+
+    await expect(
+      dispatchEmailProviders(
+        "createProvider",
+        {},
+        {
+          name: "Resend",
+          type: "resend",
+          fromEmail: "no-reply@example.com",
+          configuration: {},
+          isDefault: true,
+          isActive: 0,
+        }
+      )
+    ).rejects.toThrow();
+    expect(createProvider).not.toHaveBeenCalled();
+  });
+
+  it("updateProvider returns { message, item } body and 200 status", async () => {
+    const fakeProvider = { id: "p1", name: "Resend (updated)" };
+    wireProviders(
+      makeProviderService({
+        updateProvider: vi.fn().mockResolvedValue(fakeProvider),
+      })
+    );
+
+    const result = await dispatchEmailProviders(
+      "updateProvider",
+      { providerId: "p1" },
+      { name: "Resend (updated)" }
+    );
+
+    const response = result as Response;
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({
+      message: "Email provider updated.",
+      item: fakeProvider,
+    });
+  });
+});
+
+describe("dispatchEmailProviders, actions (respondAction)", () => {
+  it("deleteProvider returns { message, providerId } body and 200 status", async () => {
+    wireProviders(
+      makeProviderService({
+        deleteProvider: vi.fn().mockResolvedValue(undefined),
+      })
+    );
+
+    const result = await dispatchEmailProviders(
+      "deleteProvider",
+      { providerId: "p1" },
+      undefined
+    );
+
+    const response = result as Response;
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({
+      message: "Email provider deleted.",
+      providerId: "p1",
+    });
+  });
+
+  it("setDefault returns { message, provider } body and 200 status", async () => {
+    const fakeProvider = { id: "p1", name: "Resend", isDefault: true };
+    wireProviders(
+      makeProviderService({
+        setDefault: vi.fn().mockResolvedValue(fakeProvider),
+      })
+    );
+
+    const result = await dispatchEmailProviders(
+      "setDefault",
+      { providerId: "p1" },
+      undefined
+    );
+
+    const response = result as Response;
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({
+      message: "Default email provider updated.",
+      provider: fakeProvider,
+    });
+  });
+});
+
+// ============================================================
+// Email templates
+// ============================================================
+
+describe("dispatchEmailTemplates, non-paginated reads (respondData)", () => {
+  it("listTemplates returns { templates: [...], referencesComplete } body and 200 status", async () => {
+    const fakeTemplates = [
+      { id: "t1", slug: "welcome" },
+      { id: "t2", slug: "password-reset" },
+    ];
+    const keptOnOldEngineIds = vi.fn().mockResolvedValue(new Set(["t2"]));
+    wireTemplates(
+      makeTemplateService({
+        listTemplates: vi.fn().mockResolvedValue(fakeTemplates),
+        keptOnOldEngineIds,
+      })
+    );
+
+    const result = await dispatchEmailTemplates("listTemplates", {}, undefined);
+
+    const response = result as Response;
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    // Each row says whether it is kept on the previous engine, asked of the
+    // service once for the whole list.
+    expect(body).toEqual({
+      templates: [
+        {
+          id: "t1",
+          slug: "welcome",
+          keptOnOldEngine: false,
+          // No owner declarations and no references: both lists empty.
+          sentBy: { declared: [], referenced: [] },
+        },
+        {
+          id: "t2",
+          slug: "password-reset",
+          keptOnOldEngine: true,
+          sentBy: { declared: [], referenced: [] },
+        },
+      ],
+      // No plugin reported references here, and none threw, so the list is
+      // complete.
+      referencesComplete: true,
+    });
+    expect(keptOnOldEngineIds).toHaveBeenCalledTimes(1);
+    expect(keptOnOldEngineIds).toHaveBeenCalledWith(fakeTemplates);
+    expect(body).not.toHaveProperty("data");
+    expect(body).not.toHaveProperty("items");
+  });
+
+  it("previewTemplate returns bare { subject, html } body", async () => {
+    const fakePreview = {
+      subject: "Welcome, Alice",
+      html: "<p>Hello Alice</p>",
+    };
+    wireTemplates(
+      makeTemplateService({
+        previewTemplate: vi.fn().mockResolvedValue(fakePreview),
+      })
+    );
+
+    const result = await dispatchEmailTemplates(
+      "previewTemplate",
+      { templateId: "t1" },
+      { data: { name: "Alice" } }
+    );
+
+    const response = result as Response;
+    const body = await response.json();
+    expect(body).toEqual(fakePreview);
+    expect(body).not.toHaveProperty("data");
+  });
+
+  /*
+   * The editor's live preview reaches this through the catch-all a generated
+   * app mounts, not through the standalone route module. Asserted here because
+   * the two are separate wirings and only one of them is what consumers get.
+   */
+  it("previewDraft renders unsaved fields and returns the text part", async () => {
+    const rendered = {
+      subject: "Welcome, Alice",
+      html: "<p>Hello Alice</p>",
+      text: "Hello Alice",
+    };
+    const previewDraft = vi.fn().mockResolvedValue(rendered);
+    wireTemplates(makeTemplateService({ previewDraft }));
+
+    const result = await dispatchEmailTemplates(
+      "previewDraft",
+      {},
+      {
+        template: {
+          subject: "Welcome, {{name}}",
+          htmlContent: "<p>Hello {{name}}</p>",
+          plainTextContent: null,
+          preheader: null,
+          useLayout: false,
+          kind: "template",
+          layoutId: null,
+        },
+        data: { name: "Alice" },
+      }
+    );
+
+    const response = result as Response;
+    expect(response.status).toBe(200);
+    // `text` is the field the deleted browser-side render could only guess at.
+    expect(await response.json()).toEqual(rendered);
+    // A render, not stored data: preview text that reads as a date is shown
+    // as the email renders it, not rewritten to the installation's timezone.
+    expect(response.headers.get("x-nextly-skip-date-formatting")).toBe("1");
+    // Addressed by FIELDS, never by a row id — an unsaved draft has none.
+    expect(previewDraft.mock.calls[0][0]).toMatchObject({
+      subject: "Welcome, {{name}}",
+    });
+  });
+
+  it("previewDraft refuses a body that is not the contract", async () => {
+    const previewDraft = vi.fn();
+    wireTemplates(makeTemplateService({ previewDraft }));
+
+    // `useLayout` missing: the schema requires it, and a render that guessed
+    // would silently preview the wrong composition.
+    await expect(
+      dispatchEmailTemplates(
+        "previewDraft",
+        {},
+        {
+          template: {
+            subject: "s",
+            htmlContent: "<p>x</p>",
+            kind: "template",
+          },
+          data: {},
+        }
+      )
+    ).rejects.toThrow();
+    expect(previewDraft).not.toHaveBeenCalled();
+  });
+});
+
+describe("dispatchEmailTemplates, single-doc reads (respondDoc)", () => {
+  it("getTemplate returns the doc with what sends it", async () => {
+    const fakeTemplate = { id: "t1", slug: "welcome" };
+    wireTemplates(
+      makeTemplateService({
+        getTemplate: vi.fn().mockResolvedValue(fakeTemplate),
+        ownerSentBy: vi.fn().mockReturnValue(["Form: Contact us"]),
+      })
+    );
+
+    const result = await dispatchEmailTemplates(
+      "getTemplate",
+      { templateId: "t1" },
+      undefined
+    );
+
+    const response = result as Response;
+    const body = await response.json();
+    // What the list rows carry, for the one record the workbench edits: its
+    // owner's declarations and the settings that send it, and whether every
+    // plugin answered.
+    expect(body).toEqual({
+      ...fakeTemplate,
+      sentBy: { declared: ["Form: Contact us"], referenced: [] },
+      referencesComplete: true,
+    });
+    expect(body).not.toHaveProperty("data");
+  });
+});
+
+describe("dispatchEmailTemplates, mutations (respondMutation)", () => {
+  it("createTemplate returns { message, item } body and 201 status", async () => {
+    const fakeTemplate = { id: "t1", slug: "welcome" };
+    wireTemplates(
+      makeTemplateService({
+        createTemplate: vi.fn().mockResolvedValue(fakeTemplate),
+      })
+    );
+
+    const result = await dispatchEmailTemplates(
+      "createTemplate",
+      {},
+      { slug: "welcome" }
+    );
+
+    const response = result as Response;
+    expect(response.status).toBe(201);
+    const body = await response.json();
+    expect(body).toEqual({
+      message: "Email template created.",
+      item: fakeTemplate,
+    });
+  });
+
+  it("updateTemplate returns { message, item } body and 200 status", async () => {
+    const fakeTemplate = { id: "t1", slug: "welcome" };
+    wireTemplates(
+      makeTemplateService({
+        updateTemplate: vi.fn().mockResolvedValue(fakeTemplate),
+      })
+    );
+
+    const result = await dispatchEmailTemplates(
+      "updateTemplate",
+      { templateId: "t1" },
+      { subject: "Hello" }
+    );
+
+    const response = result as Response;
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({
+      message: "Email template updated.",
+      item: fakeTemplate,
+    });
+  });
+});
+
+describe("dispatchEmailTemplates, actions (respondAction)", () => {
+  it("deleteTemplate returns { message, templateId } body and 200 status", async () => {
+    wireTemplates(
+      makeTemplateService({
+        deleteTemplate: vi.fn().mockResolvedValue(undefined),
+      })
+    );
+
+    const result = await dispatchEmailTemplates(
+      "deleteTemplate",
+      { templateId: "t1" },
+      undefined
+    );
+
+    const response = result as Response;
+    const body = await response.json();
+    expect(body).toEqual({
+      message: "Email template deleted.",
+      templateId: "t1",
+    });
+  });
+});
+
+describe("dispatchEmailProviders, the setup's check and settings", () => {
+  it("checkProvider answers with the check's result", async () => {
+    const checkConfiguration = vi.fn().mockResolvedValue({
+      checked: true,
+      success: false,
+      setup: "credentials",
+    });
+    wireProviders(makeProviderService({ checkConfiguration }));
+
+    const result = await dispatchEmailProviders(
+      "checkProvider",
+      {},
+      {
+        type: "smtp",
+        configuration: { host: "smtp.example.com" },
+      }
+    );
+
+    const response = result as Response;
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.result).toEqual({
+      checked: true,
+      success: false,
+      setup: "credentials",
+    });
+    expect(checkConfiguration).toHaveBeenCalledWith({
+      type: "smtp",
+      configuration: { host: "smtp.example.com" },
+    });
+  });
+
+  it("checkProvider refuses a body without a type, naming the field", async () => {
+    wireProviders(makeProviderService());
+    await expect(
+      dispatchEmailProviders("checkProvider", {}, { configuration: {} })
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+  });
+
+  it("checkProvider refuses any provider id, so new settings never reach a saved provider's secrets", async () => {
+    const checkConfiguration = vi.fn();
+    wireProviders(makeProviderService({ checkConfiguration }));
+    await expect(
+      dispatchEmailProviders(
+        "checkProvider",
+        {},
+        {
+          type: "smtp",
+          configuration: {},
+          providerId: "3f2b8c1e-6d4a-4f7b-9a0e-1c2d3e4f5a6b",
+        }
+      )
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(checkConfiguration).not.toHaveBeenCalled();
+  });
+
+  it("checkSavedProvider refuses a provider id that is not one, before any read", async () => {
+    const checkConfiguration = vi.fn();
+    wireProviders(makeProviderService({ checkConfiguration }));
+    await expect(
+      dispatchEmailProviders(
+        "checkSavedProvider",
+        { providerId: "not-an-id" },
+        { type: "smtp", configuration: {} }
+      )
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(checkConfiguration).not.toHaveBeenCalled();
+  });
+
+  it("checkSavedProvider checks the route's provider with the fields its edit clears", async () => {
+    const checkConfiguration = vi
+      .fn()
+      .mockResolvedValue({ checked: true, success: true });
+    wireProviders(makeProviderService({ checkConfiguration }));
+    const providerId = "3f2b8c1e-6d4a-4f7b-9a0e-1c2d3e4f5a6b";
+    await dispatchEmailProviders(
+      "checkSavedProvider",
+      { providerId },
+      { type: "smtp", configuration: {}, unsetConfiguration: ["replyTo"] }
+    );
+    expect(checkConfiguration).toHaveBeenCalledWith({
+      type: "smtp",
+      configuration: {},
+      unsetConfiguration: ["replyTo"],
+      providerId,
+    });
+  });
+
+  it("checkSavedProvider takes the provider from the route, never the body", async () => {
+    wireProviders(makeProviderService());
+    await expect(
+      dispatchEmailProviders(
+        "checkSavedProvider",
+        { providerId: "3f2b8c1e-6d4a-4f7b-9a0e-1c2d3e4f5a6b" },
+        {
+          type: "smtp",
+          configuration: {},
+          providerId: "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+        }
+      )
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+  });
+
+  it("getSendingSettings answers with the settings, never configuration", async () => {
+    wireProviders(makeProviderService());
+    const result = await dispatchEmailProviders(
+      "getSendingSettings",
+      {},
+      undefined
+    );
+    const response = result as Response;
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(Object.keys(body.settings).sort()).toEqual([
+      "codeProvider",
+      "development",
+      "from",
+    ]);
+  });
+});

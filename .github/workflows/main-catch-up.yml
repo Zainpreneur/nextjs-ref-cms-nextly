@@ -1,0 +1,63 @@
+name: Main catch-up
+
+# Every two hours, starts CI and Integration on the newest commit of `main`
+# and of `dev` (the branch pull requests merge into) when no run has tested
+# it, each branch looked at on its own. On a busy day each push supersedes the
+# one before and skips its tests (its gate then refuses rather than passes), so
+# without this
+# a branch could go untested for as long as merges keep coming. A look that
+# finds the commit tested, or a run still on its way, starts nothing, unless
+# the branch's last verdict is over three hours old: under runner starvation
+# every push's run is still queued when this looks, so it then tests the
+# branch anyway.
+# `scripts/main-catch-up.mjs` has the rule.
+#
+# Also on every push to either branch: under load GitHub delays or drops
+# scheduled runs (three of about six ran in one ten-hour stretch), and a look
+# costs a few seconds. The concurrency group keeps at most one look waiting.
+on:
+  schedule:
+    - cron: "23 */2 * * *"
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: main-catch-up
+  cancel-in-progress: false
+
+jobs:
+  catch-up:
+    name: Test the newest commits if no run has
+    if: github.repository == 'nextlyhq/nextly'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            scripts
+            .nvmrc
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - name: Start what main's newest commit is missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/main-catch-up.mjs main
+      # Whatever main's look concluded, so one branch's failure to read or
+      # dispatch does not leave the other unlooked at.
+      - name: Start what dev's newest commit is missing
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/main-catch-up.mjs dev

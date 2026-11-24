@@ -1,0 +1,1171 @@
+/**
+ * The promotion resolver, exercised directly.
+ *
+ * It is a pure function answering an intricate question over four documents,
+ * and the integration suites reach it only through a whole publish, one shape
+ * per test at considerable cost. The hard cases are shapes a caller cannot
+ * see: a `Date` that must not be rebuilt as `{}`, a container whose contents
+ * have two authors, a property present only on the live side. Those belong
+ * here, where a shape costs three lines.
+ *
+ * @module shared/lib/__tests__/denied-change.test
+ */
+import { describe, expect, it } from "vitest";
+
+import { currentFieldGroupTypeKey } from "../../../domains/field-groups/storage/field-group-type-key";
+import { NextlyError } from "../../../errors";
+import {
+  declaredFieldNames,
+  keepDeniedAtStored,
+  keepPendingWhereDenied,
+  pathsKeptFromCaller,
+  resolvePromotedDocument,
+  storedProvenance,
+} from "../denied-change";
+
+/** Removes the named top-level or nested paths, as the field rules would. */
+function denies(...paths: string[]) {
+  return (document: Record<string, unknown>): Promise<void> => {
+    for (const path of paths) {
+      const segments = path.split(".");
+      let cursor: Record<string, unknown> | undefined = document;
+      for (const segment of segments.slice(0, -1)) {
+        const next: unknown = cursor?.[segment];
+        cursor =
+          typeof next === "object" && next !== null
+            ? (next as Record<string, unknown>)
+            : undefined;
+      }
+      const last = segments[segments.length - 1];
+      if (cursor && last) delete cursor[last];
+    }
+    return Promise.resolve();
+  };
+}
+
+const allow = (): Promise<void> => Promise.resolve();
+
+/** Denies `guarded` while `kind` is private: a rule that reads a sibling. */
+function deniesGuardedWhilePrivate(
+  document: Record<string, unknown>
+): Promise<void> {
+  if (document.kind === "private") delete document.guarded;
+  return Promise.resolve();
+}
+
+function resolve(
+  input: Partial<Parameters<typeof resolvePromotedDocument>[0]> & {
+    before: Record<string, unknown>;
+    live: Record<string, unknown>;
+  }
+) {
+  return resolvePromotedDocument({
+    applyRules: allow,
+    slug: "posts",
+    ...input,
+  });
+}
+
+describe("resolvePromotedDocument", () => {
+  it("returns the promotion unchanged when nothing is denied", async () => {
+    const out = await resolve({
+      before: { title: "new", body: "new body" },
+      live: { title: "old", body: "old body" },
+    });
+    expect(out).toEqual({ title: "new", body: "new body" });
+  });
+
+  it("holds a denied field at its live value rather than dropping it", async () => {
+    const out = await resolve({
+      before: { title: "new", guarded: "live" },
+      live: { title: "old", guarded: "live" },
+      applyRules: denies("guarded"),
+    });
+    // Present, and at what the row already holds. Dropped instead, the write
+    // clears a column nobody asked it to.
+    expect(out).toEqual({ title: "new", guarded: "live" });
+  });
+
+  it("refuses when the promotion CHANGES a denied field", async () => {
+    await expect(
+      resolve({
+        before: { guarded: "edited" },
+        live: { guarded: "live" },
+        applyRules: denies("guarded"),
+      })
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+  });
+
+  it("keeps a denied child inside an allowed container", async () => {
+    const out = await resolve({
+      before: { seo: { title: "new", secret: "live" } },
+      live: { seo: { title: "old", secret: "live" } },
+      applyRules: denies("seo.secret"),
+    });
+    expect(out).toEqual({ seo: { title: "new", secret: "live" } });
+  });
+
+  it("treats a Date as a value, not a container to rebuild", async () => {
+    const when = new Date("2026-09-09T09:09:09.000Z");
+    const out = await resolve({
+      before: { goesLive: when, guarded: "live" },
+      live: { goesLive: new Date("2026-01-01T00:00:00.000Z"), guarded: "live" },
+      applyRules: denies("guarded"),
+    });
+    // Rebuilt as an object it becomes `{}`, and the driver refuses the write
+    // with "value.getTime is not a function".
+    expect(out.goesLive).toBeInstanceOf(Date);
+    expect((out.goesLive as Date).toISOString()).toBe(
+      "2026-09-09T09:09:09.000Z"
+    );
+  });
+
+  it("does not read a Date as an edit when both sides mean the same instant", async () => {
+    // A pending change is JSON, so it carries the ISO string; the row comes
+    // back from the driver as a Date.
+    const out = await resolve({
+      before: { guarded: "2026-01-02T03:04:05.000Z" },
+      live: { guarded: new Date("2026-01-02T03:04:05.000Z") },
+      applyRules: denies("guarded"),
+    });
+    expect(out).toBeDefined();
+  });
+
+  it("drops the CALLER's own denied edit back to live instead of refusing", async () => {
+    // Allowed on the caller's payload alone, which carries no `kind`, and
+    // denied once the pending change's `kind` is folded in: the caller's own
+    // input, which the publish may drop.
+    const out = await resolve({
+      before: { kind: "private", guarded: "caller wrote this" },
+      live: { kind: "private", guarded: "live" },
+      callerSupplied: { guarded: "caller wrote this" },
+      applyRules: deniesGuardedWhilePrivate,
+    });
+    expect(out).toEqual({ kind: "private", guarded: "live" });
+  });
+
+  it("does not credit the caller with a value the rules deny them", async () => {
+    // The field gate keeps a protected child of a group the caller sent at its
+    // stored value, so their payload carries it although they may not write
+    // it. Credited, the pending change's edit of it would be dropped to live
+    // while the publish consumes the draft.
+    await expect(
+      resolve({
+        before: { seo: { title: "caller", secret: "live" } },
+        live: { seo: { title: "old", secret: "live" } },
+        callerSupplied: { seo: { title: "caller", secret: "live" } },
+        pending: { seo: { title: "draft", secret: "pending" } },
+        applyRules: denies("seo.secret"),
+      })
+    ).rejects.toMatchObject({
+      publicData: { errors: [{ path: "seo.secret" }] },
+    });
+  });
+
+  it("judges a denied value the caller's group replaced as the PENDING change holds it", async () => {
+    // The caller's group carries the protected child at its live value, and
+    // the pending change left it alone: nothing the caller is denied changes.
+    const out = await resolve({
+      before: { seo: { title: "caller", secret: "live" } },
+      live: { seo: { title: "old", secret: "live" } },
+      callerSupplied: { seo: { title: "caller", secret: "live" } },
+      pending: { seo: { title: "draft", secret: "live" } },
+      applyRules: denies("seo.secret"),
+    });
+    expect(out).toEqual({ seo: { title: "caller", secret: "live" } });
+  });
+
+  it("refuses a protected value the pending change ADDS inside a group the caller replaced", async () => {
+    // Neither the promoted document nor live holds it, so only the pending
+    // change on its own names it.
+    await expect(
+      resolve({
+        before: { seo: { title: "caller" } },
+        live: { seo: { title: "old" } },
+        callerSupplied: { seo: { title: "caller" } },
+        pending: { seo: { title: "draft", secret: "pending" } },
+        applyRules: denies("seo.secret"),
+      })
+    ).rejects.toMatchObject({
+      publicData: { errors: [{ path: "seo.secret" }] },
+    });
+  });
+
+  it("still refuses a sibling the caller did NOT supply, inside the same container", async () => {
+    // The removal is reported at the container, and its contents have two
+    // authors: exempting the whole subtree loses the pending change's sibling.
+    // The rule reads the pending change's `kind`, so the caller's payload alone
+    // is allowed and the folded document is not.
+    await expect(
+      resolve({
+        before: {
+          kind: "private",
+          promo: { label: "caller", tagline: "draft" },
+        },
+        live: {
+          kind: "private",
+          promo: { label: "live", tagline: "live tagline" },
+        },
+        callerSupplied: { promo: { label: "caller" } },
+        applyRules: document => {
+          if (document.kind === "private") delete document.promo;
+          return Promise.resolve();
+        },
+      })
+    ).rejects.toMatchObject({
+      publicData: { errors: [{ path: "promo.tagline" }] },
+    });
+  });
+
+  it("refuses a denied property the promotion DELETES", async () => {
+    // Absent from the promotion, so the rules never judged it there: it is the
+    // live-side pass that puts it in the denied set at all.
+    await expect(
+      resolve({
+        before: { seo: { title: "new" } },
+        live: { seo: { title: "old", secret: "live" } },
+        applyRules: denies("seo.secret"),
+      })
+    ).rejects.toMatchObject({
+      publicData: { errors: [{ path: "seo.secret" }] },
+    });
+  });
+
+  it("refuses when a stale live verdict denies a field the final document allows", async () => {
+    // A KNOWN over-refusal, pinned so it cannot change unnoticed. Live says
+    // `kind: "private"`, which denies `guarded`; the pending change sets `kind`
+    // to `public` and edits `guarded`, which the final document would allow.
+    // The live verdict is kept whole because a path is a position, so this
+    // refuses. It fails closed: nothing is lost, the publish is refused and the
+    // pending change is kept. Judging rows by identity and siblings on the final
+    // document is what would allow it.
+    await expect(
+      resolve({
+        before: { kind: "public", guarded: "edited" },
+        live: { kind: "private", guarded: "live" },
+        applyRules: deniesGuardedWhilePrivate,
+      })
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+  });
+
+  it("refuses deleting a field the final document's siblings would allow", async () => {
+    // A KNOWN over-refusal, pinned so it cannot change unnoticed: the same rule,
+    // with the pending change deleting `guarded` rather than editing it. A
+    // deleted field is absent from the promotion, so the live row's verdict is
+    // the only one that names it, and that verdict reads the live siblings. It
+    // fails closed: the publish is refused and the pending change is kept.
+    // Judging a deleted field against the promoted siblings is what would allow
+    // it.
+    await expect(
+      resolve({
+        before: { kind: "public" },
+        live: { kind: "private", guarded: "live" },
+        applyRules: deniesGuardedWhilePrivate,
+      })
+    ).rejects.toMatchObject({
+      publicData: { errors: [{ path: "guarded" }] },
+    });
+  });
+
+  it("refuses a deleted child even when the live rule denies its whole container", async () => {
+    // The live rule removes `seo` entirely, so the live denial names the
+    // container while the promotion keeps `seo` and drops `secret` from it. The
+    // dropped child must be judged. Its sibling `title` is refused as well, since
+    // the whole-container verdict is not narrowed by what the final document
+    // would allow, which fails closed; this asserts the child it exists for.
+    const rulesByKind = (document: Record<string, unknown>): Promise<void> => {
+      if (document.kind === "private") delete document.seo;
+      return Promise.resolve();
+    };
+    let paths: string[] = [];
+    await resolve({
+      before: { kind: "public", seo: { title: "new" } },
+      live: { kind: "private", seo: { title: "old", secret: "live" } },
+      applyRules: rulesByKind,
+    }).catch((error: { publicData?: { errors?: Array<{ path: string }> } }) => {
+      paths = (error.publicData?.errors ?? []).map(issue => issue.path);
+    });
+    expect(paths).toContain("seo.secret");
+  });
+
+  it("refuses deleting a protected repeater row when a later row takes its index", async () => {
+    // Paths are positions. The pending change deletes live row 0, which is
+    // private and so denies `secret`, and the public row shifts into index 0.
+    // `rows[0].secret` still exists in the promotion, so a check asking only
+    // whether a denied path survived would let the protected row's deletion
+    // through; the refusal comes from the live verdict kept whole.
+    const rowRule = (document: Record<string, unknown>): Promise<void> => {
+      const rows = document.rows;
+      if (Array.isArray(rows)) {
+        for (const row of rows) {
+          if (
+            row &&
+            typeof row === "object" &&
+            (row as Record<string, unknown>).kind === "private"
+          ) {
+            delete (row as Record<string, unknown>).secret;
+          }
+        }
+      }
+      return Promise.resolve();
+    };
+    await expect(
+      resolve({
+        before: { rows: [{ kind: "public", secret: "s1" }] },
+        live: {
+          rows: [
+            { kind: "private", secret: "s0" },
+            { kind: "public", secret: "s1" },
+          ],
+        },
+        applyRules: rowRule,
+      })
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+  });
+
+  it("keeps an own __proto__ key instead of invoking the prototype setter", async () => {
+    const before: Record<string, unknown> = { guarded: "live" };
+    Object.defineProperty(before, "__proto__", {
+      value: { evil: true },
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+    const out = await resolve({
+      before,
+      live: { guarded: "live" },
+      applyRules: denies("guarded"),
+    });
+    expect(Object.prototype.hasOwnProperty.call(out, "__proto__")).toBe(true);
+    expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+  });
+
+  it("judges a declared field named like a store column", async () => {
+    // `id` is one of the store's own column names, and the name list exists so
+    // a denied component's own row identity and timestamps do not refuse every
+    // publish. A collection that DECLARES a field called `id` means it, and
+    // skipping that one lets an edit the rules deny reach the row.
+    await expect(
+      resolve({
+        before: { meta: { id: "draft wrote this" } },
+        live: { meta: { id: "live" } },
+        authoredFieldNames: new Set(["meta", "id"]),
+        applyRules: denies("meta.id"),
+      })
+    ).rejects.toMatchObject({
+      publicData: { errors: [{ path: "meta.id" }] },
+    });
+  });
+
+  it("still skips a store column the schema does NOT declare", async () => {
+    // The control for the test above. A component row carries its own `id` and
+    // timestamps beside the author's fields, and a snapshot's never match the
+    // row's, so counted as content a denied component refuses every publish.
+    const out = await resolve({
+      before: { promo: { label: "live", id: "row-1", updated_at: "T1" } },
+      live: { promo: { label: "live", id: "row-1", updated_at: "T2" } },
+      authoredFieldNames: new Set(["promo", "label"]),
+      applyRules: denies("promo"),
+    });
+    expect(out).toBeDefined();
+  });
+
+  it("collects a name declared inside a NAMED container", async () => {
+    // `addressableFields` pushes a named field and stops, so a set built from
+    // it holds the top level only, and the nested name the metadata list is
+    // meant to defer to is exactly the one it misses.
+    const names = declaredFieldNames([
+      { name: "title", type: "text" },
+      { name: "meta", type: "group", fields: [{ name: "id", type: "text" }] },
+      {
+        type: "row",
+        fields: [
+          {
+            name: "rows",
+            type: "repeater",
+            fields: [{ name: "updatedAt", type: "text" }],
+          },
+        ],
+      },
+    ]);
+    expect(names.has("meta")).toBe(true);
+    expect(names.has("id")).toBe(true);
+    expect(names.has("updatedAt")).toBe(true);
+  });
+
+  it("leaves an allowed deletion deleted", async () => {
+    const out = await resolve({
+      before: { title: "new" },
+      live: { title: "old", subtitle: "going away" },
+    });
+    expect(Object.prototype.hasOwnProperty.call(out, "subtitle")).toBe(false);
+  });
+});
+
+describe("keepDeniedAtStored", () => {
+  /** Removes `locked` from every row of `rows`, as a rule denying it would. */
+  const deniesLockedRows = (document: Record<string, unknown>) => {
+    const rows = document.rows;
+    for (const row of Array.isArray(rows) ? rows : []) {
+      delete (row as Record<string, unknown>).locked;
+    }
+    return Promise.resolve();
+  };
+
+  it("keeps each denied value on its own row when the rows are reordered", async () => {
+    // A container written whole: the update swaps the rows and sends a
+    // forged `locked` on one. Each row keeps its own stored value.
+    const { kept } = await keepDeniedAtStored({
+      update: {
+        rows: [
+          { id: "b", heading: "b2", locked: "forged" },
+          { id: "a", heading: "a2" },
+        ],
+      },
+      stored: {
+        rows: [
+          { id: "a", heading: "a", locked: "locked-a" },
+          { id: "b", heading: "b", locked: "locked-b" },
+        ],
+      },
+      applyRules: deniesLockedRows,
+    });
+
+    expect(kept.rows).toEqual([
+      { id: "b", heading: "b2", locked: "locked-b" },
+      { id: "a", heading: "a2", locked: "locked-a" },
+    ]);
+  });
+
+  it("gives a row repeating another's id no stored value", async () => {
+    // One id names one stored row: the first row sent with it is that row,
+    // and a later one repeating it is new, so it takes none of its values.
+    const { kept } = await keepDeniedAtStored({
+      update: {
+        rows: [
+          { id: "a", heading: "a2" },
+          { id: "a", heading: "copy" },
+        ],
+      },
+      stored: { rows: [{ id: "a", heading: "a", locked: "locked-a" }] },
+      applyRules: deniesLockedRows,
+    });
+
+    expect(kept.rows).toEqual([
+      { id: "a", heading: "a2", locked: "locked-a" },
+      { id: "a", heading: "copy" },
+    ]);
+  });
+
+  it("pairs rows sharing an id with stored rows sharing it, in order", async () => {
+    // A list already stored with a repeated id: the first row naming it is
+    // the first stored row with it, the second the second. Neither stored row
+    // is left over to be put back beside the rows sent.
+    const { kept } = await keepDeniedAtStored({
+      update: {
+        rows: [
+          { id: "a", heading: "x" },
+          { id: "a", heading: "y" },
+        ],
+      },
+      stored: {
+        rows: [
+          { id: "a", heading: "a", locked: "locked-1" },
+          { id: "a", heading: "copy", locked: "locked-2" },
+        ],
+      },
+      applyRules: deniesLockedRows,
+    });
+
+    expect(kept.rows).toEqual([
+      { id: "a", heading: "x", locked: "locked-1" },
+      { id: "a", heading: "y", locked: "locked-2" },
+    ]);
+  });
+
+  it("judges a row by its own siblings when the update repeats another's id", async () => {
+    // `child` may not change while its row is closed. The update sends the
+    // open row twice and the closed one without its child: the closed row is
+    // judged as the update leaves it, not with the siblings of whichever row
+    // sits at its index, so its child stays.
+    const { kept } = await keepDeniedAtStored({
+      update: {
+        rows: [
+          { id: "a", mode: "open" },
+          { id: "a", mode: "open" },
+          { id: "b", mode: "closed" },
+        ],
+      },
+      stored: {
+        rows: [
+          { id: "a", mode: "open" },
+          { id: "b", mode: "closed", child: "keep" },
+        ],
+      },
+      applyRules: document => {
+        const rows = document.rows;
+        for (const row of Array.isArray(rows) ? rows : []) {
+          const record = row as Record<string, unknown>;
+          if (record.mode === "closed") delete record.child;
+        }
+        return Promise.resolve();
+      },
+    });
+
+    expect(kept.rows).toEqual([
+      { id: "a", mode: "open" },
+      { id: "a", mode: "open" },
+      { id: "b", mode: "closed", child: "keep" },
+    ]);
+  });
+
+  it("gives a new row no stored value when the stored rows carry ids", async () => {
+    // A row without an id, added ahead of rows that keep theirs, is new: the
+    // stored row at its index is the one the next row names, not this one.
+    const { kept } = await keepDeniedAtStored({
+      update: {
+        rows: [
+          { heading: "new" },
+          { id: "a", heading: "a2" },
+          { id: "b", heading: "b2" },
+        ],
+      },
+      stored: {
+        rows: [
+          { id: "a", heading: "a", locked: "locked-a" },
+          { id: "b", heading: "b", locked: "locked-b" },
+        ],
+      },
+      applyRules: deniesLockedRows,
+    });
+
+    expect(kept.rows).toEqual([
+      { heading: "new" },
+      { id: "a", heading: "a2", locked: "locked-a" },
+      { id: "b", heading: "b2", locked: "locked-b" },
+    ]);
+  });
+
+  it("judges a container with the siblings the update adds to it", async () => {
+    // `a` is writable only while `b` is not "x". The update writes the group
+    // whole with `b` set and `a` left out, which as the update leaves it the
+    // rule denies, so the stored `a` stays rather than being cleared.
+    const { kept } = await keepDeniedAtStored({
+      update: { g: { b: "x" } },
+      stored: { g: { a: "old" } },
+      applyRules: document => {
+        const group = document.g as Record<string, unknown> | undefined;
+        if (group?.b === "x") delete group.a;
+        return Promise.resolve();
+      },
+    });
+
+    expect(kept.g).toEqual({ b: "x", a: "old" });
+  });
+
+  it("keeps a branch the update leaves out when it holds a denied value", async () => {
+    // The group is written whole without `inner`, whose `locked` the writer
+    // may not change: leaving `inner` out would delete it.
+    const { kept } = await keepDeniedAtStored({
+      update: { g: { other: "x" } },
+      stored: { g: { other: "o", inner: { heading: "h", locked: "L" } } },
+      applyRules: document => {
+        const group = document.g as Record<string, unknown> | undefined;
+        const inner = group?.inner as Record<string, unknown> | undefined;
+        if (inner) delete inner.locked;
+        return Promise.resolve();
+      },
+    });
+
+    expect(kept.g).toEqual({
+      other: "x",
+      inner: { heading: "h", locked: "L" },
+    });
+  });
+
+  it("keeps a row the update leaves out when it holds a denied value", async () => {
+    // `b` holds a value the writer may not change, so leaving it out of a
+    // list written whole would delete it; `c` holds none, and goes.
+    const { kept } = await keepDeniedAtStored({
+      update: { rows: [{ id: "a", heading: "a2" }] },
+      stored: {
+        rows: [
+          { id: "a", heading: "a", locked: "locked-a" },
+          { id: "b", heading: "b", locked: "locked-b" },
+          { id: "c", heading: "c" },
+        ],
+      },
+      applyRules: deniesLockedRows,
+    });
+
+    expect(kept.rows).toEqual([
+      { id: "a", heading: "a2", locked: "locked-a" },
+      { id: "b", heading: "b", locked: "locked-b" },
+    ]);
+  });
+
+  it("judges a stored row with its own siblings when an id-less row is inserted ahead of it", async () => {
+    // `child` may be written only while its row's `mode` is open. The update
+    // inserts a new row first and closes `a`'s mode, leaving `child` out of a
+    // list written whole: judged with `a`'s own new mode, it is denied and
+    // stays, rather than judged with the inserted row's.
+    const { kept } = await keepDeniedAtStored({
+      update: {
+        rows: [{ heading: "new" }, { id: "a", mode: "closed" }],
+      },
+      stored: { rows: [{ id: "a", mode: "open", child: "keep" }] },
+      applyRules: document => {
+        const rows = document.rows;
+        for (const row of Array.isArray(rows) ? rows : []) {
+          const record = row as Record<string, unknown>;
+          if (record.mode !== "open") delete record.child;
+        }
+        return Promise.resolve();
+      },
+    });
+
+    expect(kept.rows).toEqual([
+      { heading: "new" },
+      { id: "a", mode: "closed", child: "keep" },
+    ]);
+  });
+
+  it("lets a write drop a row whose denied field holds nothing", async () => {
+    // `c` carries `locked` only as an empty value: there is nothing the writer
+    // may not change, so leaving `c` out removes it.
+    const { kept } = await keepDeniedAtStored({
+      update: { rows: [{ id: "a", heading: "a2" }] },
+      stored: {
+        rows: [
+          { id: "a", heading: "a" },
+          { id: "c", heading: "c", locked: null },
+        ],
+      },
+      applyRules: deniesLockedRows,
+    });
+
+    expect(kept.rows).toEqual([{ id: "a", heading: "a2" }]);
+  });
+
+  it("pairs rows by position when they carry no id", async () => {
+    // The control: rows that cannot be told apart keep the value at their
+    // index, as they always have.
+    const { kept } = await keepDeniedAtStored({
+      update: {
+        rows: [{ heading: "x2" }, { heading: "y2", locked: "forged" }],
+      },
+      stored: {
+        rows: [
+          { heading: "x", locked: "locked-x" },
+          { heading: "y", locked: "locked-y" },
+        ],
+      },
+      applyRules: deniesLockedRows,
+    });
+
+    expect(kept.rows).toEqual([
+      { heading: "x2", locked: "locked-x" },
+      { heading: "y2", locked: "locked-y" },
+    ]);
+  });
+});
+
+it("storedProvenance marks the restored paths, with the values the row holds", async () => {
+  const { kept, permitted } = await keepDeniedAtStored({
+    update: { meta: { label: "edited" }, rows: [{ id: "b", n: 2 }] },
+    stored: {
+      meta: { label: "kept", rating: 2.5 },
+      rows: [
+        { id: "a", n: 2.5 },
+        { id: "b", n: 2 },
+      ],
+    },
+    applyRules: document => {
+      const meta = document.meta as Record<string, unknown> | undefined;
+      if (meta) delete meta.rating;
+      const rows = document.rows as Array<Record<string, unknown>> | undefined;
+      if (rows) {
+        document.rows = rows.filter(row => row.id !== "a");
+      }
+      return Promise.resolve();
+    },
+  });
+  const { paths, values } = storedProvenance(kept, permitted);
+  expect(paths.has("meta.rating")).toBe(true);
+  expect(values.get("meta.rating")).toBe(2.5);
+  // The restored row among kept ones is its own path; the kept row is
+  // not marked — it is the caller's own.
+  expect(paths.has("rows[0]")).toBe(true);
+  expect(values.get("rows[0]")).toEqual({ id: "a", n: 2.5 });
+  expect(paths.has("rows[1]")).toBe(false);
+  expect(paths.has("meta.label")).toBe(false);
+});
+
+it("pathsKeptFromCaller names the values kept over a different one, or over none", async () => {
+  const update = {
+    card: { label: "new", locked: "taken" },
+    other: { label: "new", sealed: "same" },
+  };
+  const { kept, permitted } = await keepDeniedAtStored({
+    update,
+    stored: {
+      card: { label: "old", locked: "keep", hidden: "keep" },
+      other: { label: "old", sealed: "same" },
+    },
+    applyRules: document => {
+      const card = document.card as Record<string, unknown> | undefined;
+      if (card) {
+        delete card.locked;
+        delete card.hidden;
+      }
+      const other = document.other as Record<string, unknown> | undefined;
+      if (other) delete other.sealed;
+      return Promise.resolve();
+    },
+  });
+  // POPULATION CONTROL: every denied path holds the row's own value.
+  const { paths, values } = storedProvenance(kept, permitted);
+  expect([...paths].sort()).toEqual([
+    "card.hidden",
+    "card.locked",
+    "other.sealed",
+  ]);
+  // Changed (`locked`) and left out (`hidden`) are kept from the caller; a
+  // value sent as the row holds it (`sealed`) is no change of theirs.
+  expect(pathsKeptFromCaller({ paths, values }, update)).toEqual([
+    "card.hidden",
+    "card.locked",
+  ]);
+});
+
+// A save held over another writer's pending change keeps that change's value of each field the
+// writer may not write, and refuses a value there that neither the live row nor the change holds.
+describe("keepPendingWhereDenied", () => {
+  const live = { note: "live-note", runbook: "live-runbook" };
+  const pending = { ops: { note: "live-note", runbook: "author-runbook" } };
+  const run = (sentRunbook: string | undefined) => {
+    const sent: Record<string, unknown> = {
+      ops:
+        sentRunbook === undefined
+          ? { note: "editor-note" }
+          : { note: "editor-note", runbook: sentRunbook },
+    };
+    // As the rules leave the held save: the denied child at the live value.
+    const document = { ops: { note: "editor-note", runbook: live.runbook } };
+    keepPendingWhereDenied({
+      slug: "posts",
+      document,
+      pending,
+      kept: {
+        paths: new Set(["ops.runbook"]),
+        values: new Map([["ops.runbook", live.runbook]]),
+        sent,
+      },
+    });
+    return document;
+  };
+
+  it("keeps the pending value where the save sent the pending one, the live one, or none", () => {
+    for (const sentRunbook of ["author-runbook", "live-runbook", undefined]) {
+      expect(run(sentRunbook)).toEqual({
+        ops: { note: "editor-note", runbook: "author-runbook" },
+      });
+    }
+  });
+
+  it("refuses a value that neither the live row nor the pending change holds", () => {
+    let refused: unknown;
+    try {
+      run("editor-runbook");
+    } catch (error) {
+      refused = error;
+    }
+    expect(NextlyError.isValidation(refused)).toBe(true);
+    expect(
+      (
+        refused as {
+          publicData?: { errors?: { path: string; code: string }[] };
+        }
+      ).publicData?.errors
+    ).toEqual([
+      expect.objectContaining({ path: "ops.runbook", code: "FORBIDDEN" }),
+    ]);
+  });
+
+  it("leaves a path inside a list, and one the pending change does not hold, at the live value", () => {
+    const document = {
+      rows: [{ secret: "live" }],
+      ops: { runbook: "live-runbook" },
+    };
+    keepPendingWhereDenied({
+      slug: "posts",
+      document,
+      pending: { rows: [{ secret: "pending" }] },
+      kept: {
+        paths: new Set(["rows[0].secret", "ops.runbook"]),
+        values: new Map<string, unknown>([
+          ["rows[0].secret", "live"],
+          ["ops.runbook", "live-runbook"],
+        ]),
+        sent: {},
+      },
+    });
+    expect(document).toEqual({
+      rows: [{ secret: "live" }],
+      ops: { runbook: "live-runbook" },
+    });
+  });
+});
+
+// A rule reads the document's other fields. A pending value is judged on the document the
+// publish produces, so a sibling the publish itself changes is read as the publish writes it.
+describe("resolvePromotedDocument judges a pending value by the document it produces", () => {
+  // `guarded` may be written only where `kind` is "public".
+  const kindRule = (document: Record<string, unknown>): Promise<void> => {
+    if (document.kind !== "public") delete document.guarded;
+    return Promise.resolve();
+  };
+  const live = { kind: "public", guarded: "old" };
+
+  it("allows a pending value the produced document allows, though the draft alone denies it", async () => {
+    const pending = { kind: "private", guarded: "new" };
+    const callerSupplied = { kind: "public" };
+    const out = await resolvePromotedDocument({
+      slug: "posts",
+      applyRules: kindRule,
+      before: { ...pending, ...callerSupplied },
+      live,
+      pending,
+      callerSupplied,
+    });
+    expect(out).toEqual({ kind: "public", guarded: "new" });
+  });
+
+  it("refuses a pending value the produced document denies, though the draft alone allows it", async () => {
+    const pending = { kind: "public", guarded: "new" };
+    const callerSupplied = { kind: "private" };
+    let refused: unknown;
+    try {
+      await resolvePromotedDocument({
+        slug: "posts",
+        applyRules: kindRule,
+        before: { ...pending, ...callerSupplied },
+        live,
+        pending,
+        callerSupplied,
+      });
+    } catch (error) {
+      refused = error;
+    }
+    expect(NextlyError.isValidation(refused)).toBe(true);
+    expect(
+      (
+        refused as { publicData?: { errors?: { path: string }[] } }
+      ).publicData?.errors?.map(e => e.path)
+    ).toEqual(["guarded"]);
+  });
+
+  it("still refuses a protected value the caller's group replaced, which the rule denies wherever it is", async () => {
+    // The rule denies `ops.runbook` to this caller whatever its siblings say.
+    const denyRunbook = (document: Record<string, unknown>): Promise<void> => {
+      const ops = document.ops as Record<string, unknown> | undefined;
+      if (ops) delete ops.runbook;
+      return Promise.resolve();
+    };
+    const pending = { ops: { note: "n", runbook: "author" } };
+    const callerSupplied = { ops: { note: "caller" } };
+    let refused: unknown;
+    try {
+      await resolvePromotedDocument({
+        slug: "posts",
+        applyRules: denyRunbook,
+        // The caller's group replaced the pending one; the gate kept the live runbook there.
+        before: { ops: { note: "caller", runbook: "live" } },
+        live: { ops: { note: "n", runbook: "live" } },
+        pending,
+        callerSupplied,
+      });
+    } catch (error) {
+      refused = error;
+    }
+    expect(
+      (
+        refused as { publicData?: { errors?: { path: string }[] } }
+      ).publicData?.errors?.map(e => e.path)
+    ).toEqual(["ops.runbook"]);
+  });
+  it("refuses a protected child inside a container the produced document allows, though the draft alone denied the container", async () => {
+    // `ops` may be written only where `kind` is "public"; `ops.runbook` is always denied.
+    const rules = (document: Record<string, unknown>): Promise<void> => {
+      if (document.kind !== "public") delete document.ops;
+      const ops = document.ops as Record<string, unknown> | undefined;
+      if (ops) delete ops.runbook;
+      return Promise.resolve();
+    };
+    const pending = {
+      kind: "private",
+      ops: { note: "draft", runbook: "protected edit" },
+    };
+    const callerSupplied = { kind: "public", ops: { note: "caller" } };
+    let refused: unknown;
+    try {
+      await resolvePromotedDocument({
+        slug: "posts",
+        applyRules: rules,
+        before: { kind: "public", ops: { note: "caller" } },
+        live: { kind: "public", ops: { note: "live" } },
+        pending,
+        callerSupplied,
+      });
+    } catch (error) {
+      refused = error;
+    }
+    expect(
+      (
+        refused as { publicData?: { errors?: { path: string }[] } }
+      ).publicData?.errors?.map(e => e.path)
+    ).toEqual(["ops.runbook"]);
+  });
+  it("refuses a pending child whose return makes the rules remove its container", async () => {
+    // `ops.secret` is always denied; `ops` is denied where `kind` is not "public" and it holds one.
+    const rules = (document: Record<string, unknown>): Promise<void> => {
+      const ops = document.ops as Record<string, unknown> | undefined;
+      if (ops && document.kind !== "public" && "secret" in ops) {
+        delete document.ops;
+      } else if (ops) {
+        delete ops.secret;
+      }
+      return Promise.resolve();
+    };
+    const pending = {
+      kind: "public",
+      ops: { note: "draft", secret: "pending edit" },
+    };
+    const callerSupplied = { kind: "private", ops: { note: "caller" } };
+    let refused: unknown;
+    try {
+      await resolvePromotedDocument({
+        slug: "posts",
+        applyRules: rules,
+        before: { kind: "private", ops: { note: "caller" } },
+        live: { kind: "public", ops: { note: "live" } },
+        pending,
+        callerSupplied,
+      });
+    } catch (error) {
+      refused = error;
+    }
+    expect(
+      (
+        refused as { publicData?: { errors?: { path: string }[] } }
+      ).publicData?.errors?.map(e => e.path)
+    ).toEqual(["ops.secret"]);
+  });
+  it("judges a pending child against the siblings the publish writes, not the pending change's", async () => {
+    // `ops` needs `kind` "public"; `ops.secret` needs its sibling `mode` to be "allow".
+    const rules = (document: Record<string, unknown>): Promise<void> => {
+      const ops = document.ops as Record<string, unknown> | undefined;
+      if (!ops) return Promise.resolve();
+      if (document.kind !== "public") delete document.ops;
+      else if (ops.mode !== "allow") delete ops.secret;
+      return Promise.resolve();
+    };
+    const pending = {
+      kind: "private",
+      ops: { mode: "allow", secret: "protected edit" },
+    };
+    const callerSupplied = { kind: "public", ops: { mode: "deny" } };
+    let refused: unknown;
+    try {
+      await resolvePromotedDocument({
+        slug: "posts",
+        applyRules: rules,
+        before: { kind: "public", ops: { mode: "deny" } },
+        live: { kind: "public", ops: { mode: "deny" } },
+        pending,
+        callerSupplied,
+      });
+    } catch (error) {
+      refused = error;
+    }
+    expect(
+      (
+        refused as { publicData?: { errors?: { path: string }[] } }
+      ).publicData?.errors?.map(e => e.path)
+    ).toEqual(["ops.secret"]);
+  });
+  // The pending change's group is denied on its own, so every change it makes inside it is refused:
+  // the deletion of the protected value, and the sibling it changed.
+  it("refuses a pending deletion of a protected value inside a group the pending change is denied", async () => {
+    // `ops` needs `kind` "public"; `ops.secret` needs its sibling `mode` to be "allow".
+    const rules = (document: Record<string, unknown>): Promise<void> => {
+      const ops = document.ops as Record<string, unknown> | undefined;
+      if (!ops) return Promise.resolve();
+      if (document.kind !== "public") delete document.ops;
+      else if (ops.mode !== "allow") delete ops.secret;
+      return Promise.resolve();
+    };
+    const pending = { kind: "private", ops: { mode: "deny" } };
+    const callerSupplied = { kind: "public" };
+    let refused: unknown;
+    try {
+      await resolvePromotedDocument({
+        slug: "posts",
+        applyRules: rules,
+        before: { kind: "public", ops: { mode: "deny" } },
+        live: { kind: "public", ops: { mode: "allow", secret: "live secret" } },
+        pending,
+        callerSupplied,
+      });
+    } catch (error) {
+      refused = error;
+    }
+    expect(
+      (
+        refused as { publicData?: { errors?: { path: string }[] } }
+      ).publicData?.errors?.map(e => e.path)
+    ).toEqual(["ops.mode", "ops.secret"]);
+  });
+
+  it("never writes a pending value's __proto__ key onto the shared prototype", async () => {
+    const rules = (document: Record<string, unknown>): Promise<void> => {
+      if (document.kind !== "public") delete document.payload;
+      return Promise.resolve();
+    };
+    const pending = JSON.parse(
+      '{"kind":"private","payload":{"__proto__":{"reviewProbe":"injected"}}}'
+    ) as Record<string, unknown>;
+    const callerSupplied = { kind: "public", payload: {} };
+    const refused = await resolvePromotedDocument({
+      slug: "posts",
+      applyRules: rules,
+      before: { kind: "public", payload: {} },
+      live: { kind: "public", payload: {} },
+      pending,
+      callerSupplied,
+    }).catch((error: unknown) => error);
+    expect(NextlyError.isValidation(refused)).toBe(true);
+    expect(({} as Record<string, unknown>).reviewProbe).toBeUndefined();
+  });
+  // Live's sibling is not put back: the group the pending change is denied stays denied, so its
+  // protected child, and the sibling it deleted, are refused.
+  it("refuses a pending child whose sibling the pending change deleted, though live holds it", async () => {
+    // `ops` needs `kind` "public"; `ops.secret` needs its sibling `mode` to be "allow".
+    const rules = (document: Record<string, unknown>): Promise<void> => {
+      const ops = document.ops as Record<string, unknown> | undefined;
+      if (!ops) return Promise.resolve();
+      if (document.kind !== "public") delete document.ops;
+      else if (ops.mode !== "allow") delete ops.secret;
+      return Promise.resolve();
+    };
+    const pending = { kind: "private", ops: { secret: "pending edit" } };
+    const callerSupplied = { kind: "public", ops: { note: "caller" } };
+    let refused: unknown;
+    try {
+      await resolvePromotedDocument({
+        slug: "posts",
+        applyRules: rules,
+        before: { kind: "public", ops: { note: "caller" } },
+        live: { kind: "public", ops: { mode: "allow" } },
+        pending,
+        callerSupplied,
+      });
+    } catch (error) {
+      refused = error;
+    }
+    expect(
+      (
+        refused as { publicData?: { errors?: { path: string }[] } }
+      ).publicData?.errors?.map(e => e.path)
+    ).toEqual(["ops.mode", "ops.secret"]);
+  });
+
+  it("refuses a pending value whose component the publish replaces with another type", async () => {
+    const type = currentFieldGroupTypeKey;
+    // A `secure` component's `secret` may never be written; an `open` component has no such rule.
+    const rules = (document: Record<string, unknown>): Promise<void> => {
+      const zone = (document.box as Record<string, unknown> | undefined)
+        ?.zone as Record<string, unknown> | undefined;
+      if (zone?.[type] === "secure") delete zone.secret;
+      return Promise.resolve();
+    };
+    const pending = { box: { zone: { [type]: "secure", secret: "pending" } } };
+    const callerSupplied = { box: { zone: { [type]: "open" } } };
+    let refused: unknown;
+    try {
+      await resolvePromotedDocument({
+        slug: "posts",
+        applyRules: rules,
+        before: { box: { zone: { [type]: "open" } } },
+        live: { box: { zone: { [type]: "open" } } },
+        pending,
+        callerSupplied,
+      });
+    } catch (error) {
+      refused = error;
+    }
+    expect(
+      (
+        refused as { publicData?: { errors?: { path: string }[] } }
+      ).publicData?.errors?.map(e => e.path)
+    ).toContain("box.zone.secret");
+  });
+
+  it("does not judge again a pending value the row already holds", async () => {
+    // `guarded` may be written only where `kind` is "public".
+    let passes = 0;
+    const rules = (document: Record<string, unknown>): Promise<void> => {
+      passes++;
+      if (document.kind !== "public") delete document.guarded;
+      return Promise.resolve();
+    };
+    const pending = { kind: "private", guarded: "old" };
+    const callerSupplied = { kind: "public" };
+    const out = await resolvePromotedDocument({
+      slug: "posts",
+      applyRules: rules,
+      before: { kind: "public", guarded: "old" },
+      live: { kind: "public", guarded: "old" },
+      pending,
+      callerSupplied,
+    });
+    expect(out).toEqual({ kind: "public", guarded: "old" });
+    // The produced document, live, the pending change and the caller's payload: one pass each.
+    expect(passes).toBe(4);
+  });
+
+  it("refuses a pending value whose allowing sibling the publish puts back at live", async () => {
+    // `kind` may be written only while `guarded` is empty; a `guarded` value needs `kind` "public".
+    const rules = (document: Record<string, unknown>): Promise<void> => {
+      const guardedSet = document.guarded != null;
+      const kindDenied = guardedSet && "kind" in document;
+      const guardedDenied = guardedSet && document.kind !== "public";
+      if (kindDenied) delete document.kind;
+      if (guardedDenied) delete document.guarded;
+      return Promise.resolve();
+    };
+    const pending = { kind: "private", guarded: "new" };
+    const callerSupplied = { kind: "public" };
+    let refused: unknown;
+    let written: unknown;
+    try {
+      written = await resolvePromotedDocument({
+        slug: "posts",
+        applyRules: rules,
+        before: { kind: "public", guarded: "new" },
+        live: { kind: "private", guarded: null },
+        pending,
+        callerSupplied,
+      });
+    } catch (error) {
+      refused = error;
+    }
+    // The publish would write `kind` back at live "private", where `guarded` is denied.
+    expect(written).toBeUndefined();
+    expect(
+      (
+        refused as { publicData?: { errors?: { path: string }[] } }
+      ).publicData?.errors?.map(e => e.path)
+    ).toContain("guarded");
+  });
+});

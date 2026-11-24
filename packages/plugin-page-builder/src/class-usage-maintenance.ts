@@ -1,0 +1,680 @@
+/**
+ * Keeping the class-usage index in agreement with the documents it describes.
+ *
+ * The index answers "which documents reference this class" as a lookup rather
+ * than a scan, which is only worth anything if it is current. This is what makes
+ * it current: on every write to a document that can hold a block tree, derive
+ * the rows that document should have and apply the difference.
+ *
+ * ## Why this runs AFTER the write, and why it does not throw
+ *
+ * A collection's row id does not exist until the insert has happened — nothing
+ * on the create path assigns one before `beforeChange` — so a pre-write phase
+ * cannot name the document it would be indexing. The `after*` phases can.
+ *
+ * They run POST-COMMIT: `committedWrite` is set before `afterCreate` is
+ * executed, so the author's document is already saved by the time this runs.
+ * That decides the failure policy. Throwing here cannot roll the document back;
+ * it would report a failed save for a save that succeeded, which is the most
+ * confusing direction a failure can take — an author would retry a write that
+ * already landed. So a failure is REPORTED and swallowed.
+ *
+ * A swallowed failure needs something that repairs the record, and
+ * `rebuildClassUsageIndex` is it — a walk over a collection's documents that
+ * brings each one's rows back into agreement. It is exported from the package,
+ * so a host can run it.
+ *
+ * Its reach is narrower than "the index", and the write path should be wired
+ * knowing that rather than assuming a total repair. It rebuilds one
+ * collection, one field, one locale and one variant per invocation, so rows
+ * whose subject names a collection that no longer exists, or whose columns a
+ * restore corrupted, are unreachable by every query it makes. Singles have no
+ * rebuild at all, because a plugin has no supported way to read a Single's
+ * document.
+
+ *
+ * That is not the same as the event bus, which was rejected for this job: an
+ * event handler's failure is never surfaced to anybody, while this one reaches
+ * the host's logger with the subject that failed.
+ *
+ * ## Why the document is RE-READ rather than taken from the hook
+ *
+ * The hook is handed the row its own operation wrote. Two writes to one
+ * document can interleave, and the one that wrote second is the one the site
+ * now serves — so a hook deriving from its own operation's data can write rows
+ * describing a document that is no longer live. Reading the row back at least
+ * derives from whatever is stored at that moment.
+ *
+ * It does NOT make concurrent writes converge, and this module must not be read
+ * as claiming so. Starting from rows {a,b}: hook A can read live revision {a}
+ * before hook B commits {b}; both then read the same index and independently
+ * plan to remove the other's class; if both removals land after B commits, the
+ * live document uses `b` and neither row remains. That is an under-count, which
+ * is the direction safe-delete reads as permission.
+ *
+ * Nothing available here closes that. Reconciliation is sound only when its
+ * CALLER serialises it per subject, or re-checks the document revision before
+ * applying removals — a property of the write path, recorded here because this
+ * is where the diff is computed and where the assumption would otherwise be
+ * made silently.
+ *
+ * @module class-usage-maintenance
+ */
+import { isPlainRecord } from "@nextlyhq/blocks-engine";
+import type { DocumentLimits } from "@nextlyhq/blocks-engine";
+
+import {
+  classUsageIndex,
+  deriveUsageRows,
+  reconcileUsage,
+  type ClassUsageSubject,
+} from "./class-usage-reconcile";
+import type {
+  ClassUsageScope,
+  ClassUsageVariant,
+} from "./collections/class-usage-index";
+import { lastIdOf, walkPages } from "./paged-walk";
+import { readStoredJson } from "./stored-json";
+import type { UsageIndex, UsageSubject } from "./usage-index";
+
+/**
+ * The store operations maintenance needs, declared structurally.
+ *
+ * Not the generated Direct API types: those describe the HOST app's
+ * collections, which may not have been generated when this plugin is wired.
+ * The index collection is this plugin's own to know.
+ */
+/**
+ * The index, as everything above it sees it.
+ *
+ * No method names a collection. The store IS the index — it is constructed
+ * knowing which one, so nothing above it can point a write at the wrong table,
+ * and the plugin's `.rename()` support has exactly one place to be honoured.
+ * Naming the slug at every call site meant four literals inside this module
+ * alone, each of which would have kept writing to the declared name on an
+ * installation that renamed it.
+ */
+export interface ClassUsageIndexStore {
+  find(args: {
+    where: Record<string, { equals: string }>;
+    limit: number;
+    page: number;
+    /**
+     * Required, and it must be a column the writes here cannot move.
+     *
+     * These are OFFSET queries, and the query service emits `ORDER BY` only
+     * when a sort is supplied — so without one, successive pages have no
+     * guaranteed order and a row can be skipped or returned twice. A skipped
+     * row reads as a reference the document has dropped and is deleted; a
+     * repeated one reads as a duplicate and is also deleted.
+     */
+    sort: string;
+    /**
+     * The id of the last row the previous page held, absent on the first
+     * page. A store that pages by an id keyset starts after it, so a row
+     * removed from a page already read moves no later row out of reach; one
+     * that pages by offset may ignore it.
+     */
+    after?: string;
+  }): Promise<{ items: unknown[]; meta: { hasNext: boolean } }>;
+  create(args: { data: Record<string, unknown> }): Promise<unknown>;
+  delete(args: { id: string }): Promise<unknown>;
+}
+
+/** How many index rows one query asks for. */
+const PAGE_SIZE = 200;
+
+/**
+ * A runaway guard on the paging loop, and NOT a claim about the data.
+ *
+ * Three earlier shapes were each wrong, and each was wrong the same way: it
+ * tried to make the bound MEAN something about how many rows a subject should
+ * have. A round number chosen by eye rejected a valid document. Deriving it
+ * from the current limits rejected rows written under different limits.
+ * Budgeting two row sets rejected a subject that had accumulated more, because
+ * repeated failed removals stack another set each time and the next pass does
+ * not necessarily clear the pair.
+ *
+ * Every one of those rejected the state the walk existed to repair, and the
+ * rejection is permanent: once a subject is past the bound, maintenance throws
+ * before reaching the reconciler that would have cleared it.
+ *
+ * So the bound expresses nothing about rows. It is a flat, generous ceiling
+ * whose only job is to stop an unterminated loop, matching the one the
+ * document walk already uses, and reaching it is evidence about the STORE
+ * rather than about the site.
+ */
+const MAX_PAGES = 10_000;
+
+/** Whether a stored value could be a block document at all. */
+export function looksLikeBlockDocument(value: unknown): boolean {
+  const document = readStoredJson(value);
+  return isPlainRecord(document) && Array.isArray(document.nodes);
+}
+
+/**
+ * The columns EVERY stored row must carry as a string.
+ *
+ * The row's own columns are not here: an index reads those itself, through
+ * `readOwn`, because a bare list of names cannot validate a closed set — and
+ * the component index carries one beside its reference.
+ */
+const ROW_STRING_COLUMNS = ["id", "entity", "entityKey", "field"] as const;
+
+/**
+ * Read every named key as a string, or nothing if any is not one.
+ *
+ * One loop rather than a branch per column. A list of identical checks grows a
+ * branch each time the row does, and the branch that gets forgotten is the one
+ * that lets an unvalidated value through.
+ */
+function readStrings(
+  item: Record<string, unknown>,
+  keys: readonly string[]
+): string[] | null {
+  const values: string[] = [];
+  for (const key of keys) {
+    const value = item[key];
+    if (typeof value !== "string") return null;
+    values.push(value);
+  }
+  return values;
+}
+
+/** Whether a stored value is one of the two scopes a row may carry. */
+function readScope(value: unknown): ClassUsageScope | null {
+  return value === "collection" || value === "single" ? value : null;
+}
+
+/**
+ * Whether a stored value is one of the two variants a row may carry.
+ *
+ * Checked against the set rather than accepted as any string, because `variant`
+ * partitions the index the way `scope` does: every query binds one value, so a
+ * row carrying anything else belongs to a family no real subject can name. It
+ * would be neither reconciled nor swept, and would count towards a class for
+ * ever.
+ */
+function readVariant(value: unknown): ClassUsageVariant | null {
+  return value === "published" || value === "draft" ? value : null;
+}
+
+/**
+ * One stored row, or null when it cannot be read as one.
+ *
+ * Every column comes from the ROW. Stamping the expected subject onto whatever
+ * came back would make `reconcileClassUsage`'s mismatch guard unfalsifiable —
+ * that guard exists to catch a query which misbound one of the four predicates,
+ * and overwriting the evidence is exactly the operation that hides it.
+ *
+ * A row missing a column is SKIPPED rather than counted or deleted. Persisted
+ * data arrives unvalidated, one unreadable row must not stop the subject being
+ * reconciled, and nothing here knows enough about it to remove it.
+ */
+function storedRowReader<TRow extends UsageSubject>(
+  index: UsageIndex<TRow>
+): (item: unknown) => (TRow & { id: string }) | null {
+  return item => readStoredRow(index, item);
+}
+
+/**
+ * One stored row under any index, or null when it cannot be read as one.
+ *
+ * The subject columns and the row id are read here because every index has
+ * them; whatever else a row carries is the index's own and it reads that
+ * itself. See {@link UsageIndex.readOwn}.
+ */
+function readStoredRow<TRow extends UsageSubject>(
+  index: UsageIndex<TRow>,
+  item: unknown
+): (TRow & { id: string }) | null {
+  if (!isPlainRecord(item)) return null;
+
+  const scope = readScope(item.scope);
+  if (scope === null) return null;
+
+  // A row written before the locale column existed carries NULL rather than
+  // the empty-string sentinel, because the column was ADDED to a live table
+  // and a new column is nullable. Rejecting it would make those rows invisible
+  // to every query AND to the sweep, so they could never be read or repaired.
+  // Absent means "not localized", which is what the sentinel means.
+  const locale = item.locale ?? "";
+  if (typeof locale !== "string") return null;
+
+  const variant = readVariant(item.variant);
+  if (variant === null) return null;
+
+  const parts = readStrings(item, ROW_STRING_COLUMNS);
+  if (parts === null) return null;
+  const own = index.readOwn(item);
+  if (own === null) return null;
+  const [id, entity, entityKey, field] = parts;
+
+  // Asserted because TypeScript cannot see that the subject columns plus the
+  // index's own columns are exactly `TRow`: `Omit` erased the relationship it
+  // would need to check the spread. The two halves are each checked above —
+  // every subject column against its own rule, and `own` by the index — so
+  // what is unchecked here is only that they SUM to the row, which the
+  // descriptor's type states.
+  return {
+    id,
+    scope,
+    entity,
+    entityKey,
+    field,
+    locale,
+    variant,
+    ...own,
+  } as TRow & { id: string };
+}
+
+/**
+ * The rows the index currently holds for one subject.
+ *
+ * Every column is read from the ROW rather than stamped from the subject, and
+ * that is the whole point. Spreading the expected subject onto each row would
+ * make `reconcileClassUsage`'s mismatch guard unfalsifiable — the guard exists
+ * to catch a query that misbound one of the four predicates, and stamping the
+ * expected values onto whatever came back is precisely the operation that hides
+ * that. Its removals would then delete another document's rows.
+ */
+async function storedRowsWhere<TRow extends UsageSubject>(
+  index: UsageIndex<TRow>,
+  store: ClassUsageIndexStore,
+  where: Record<string, { equals: string }>,
+  describe: string
+): Promise<(TRow & { id: string })[]> {
+  return rowsWhere(store, where, describe, storedRowReader(index));
+}
+
+/**
+ * The identity of a stored row, without decoding the columns it is not keyed by.
+ *
+ * A row whose `variant` is NULL — written before that column existed, or left
+ * that way by a restore — is rejected by `readStoredRow`, which is right for
+ * reconciliation: that walk binds a variant, so a row carrying none belongs to
+ * no subject it could be compared against, and nothing there knows enough to
+ * remove it.
+ *
+ * A document-wide DELETE knows enough. It binds only the document, the document
+ * is gone, and every row keyed to it goes with it whatever else the row says.
+ * Decoding the variant there would silently spare exactly the rows no subject
+ * can reach and no sweep visits — they would outlive their document and count
+ * towards their classes for ever, with nothing able to remove them.
+ */
+interface ClassUsageRowIdentity {
+  id: string;
+  scope: string;
+  entity: string;
+  entityKey: string;
+}
+
+/**
+ * Read only the columns a document-wide removal is keyed by.
+ *
+ * A row that answers the document's predicates but carries no readable `id`
+ * RAISES rather than being skipped. Skipping is right for a row this walk
+ * cannot recognise at all — that row is another query's business — but a row
+ * that IS this document's and cannot be addressed is the one case where
+ * silence strands it: the document is gone, so no reconciliation will visit it
+ * again, and it counts towards its class for ever.
+ *
+ * The id can go missing for a real reason. `afterRead` may reshape a list
+ * response, and the Direct API applies those transformations even for a
+ * trusted caller — so a host that projects this plugin's own index collection
+ * can drop the column the rows are addressed by. Raising reports that; the
+ * alternative reported a clean deletion that had not happened.
+ */
+function readRowIdentity(item: unknown): ClassUsageRowIdentity | null {
+  if (!isPlainRecord(item)) return null;
+  const keyed = readStrings(item, ["scope", "entity", "entityKey"]);
+  if (keyed === null) return null;
+  const [scope, entity, entityKey] = keyed;
+
+  const id = item.id;
+  if (typeof id !== "string" || id.length === 0) {
+    throw new Error(
+      `Class-usage row for ${scope}:${entity}:${entityKey} has no readable ` +
+        `id, so it cannot be removed with the document it belongs to; it ` +
+        `would count towards its class until a rebuild runs.`
+    );
+  }
+  return { id, scope, entity, entityKey };
+}
+
+/**
+ * Every row matching a query, decoded by the caller's reader.
+ *
+ * The reader is a parameter because two walks need different amounts of the
+ * row: reconciliation compares whole subjects, while a removal needs only what
+ * it is keyed by. Sharing the paging and the misbinding check keeps them from
+ * drifting apart, which is how one of them would stop refusing foreign rows.
+ */
+async function rowsWhere<T extends { id: string }>(
+  store: ClassUsageIndexStore,
+  where: Record<string, { equals: string }>,
+  describe: string,
+  decode: (item: unknown) => T | null
+): Promise<T[]> {
+  const rows: T[] = [];
+  // Where the last page ended, which the next one starts after.
+  let after: string | undefined;
+  await walkPages({
+    maxPages: MAX_PAGES,
+    describe,
+    fetchPage: page =>
+      store.find({
+        where,
+        limit: PAGE_SIZE,
+        page,
+        ...(after === undefined ? {} : { after }),
+        // Ordered by a column these writes cannot move. Offset paging reads
+        // position N of an ordered set, so ordering by anything this
+        // maintenance rewrites would reshuffle rows between queries and skip
+        // some — and a skipped row reads as a reference the document dropped.
+        sort: "id",
+      }),
+    onPage: items => {
+      after = lastIdOf(items) ?? after;
+      for (const item of items) {
+        const row = decode(item);
+        if (row === null) continue;
+        // Validated HERE rather than by each consumer. Every path that reads
+        // rows goes on to delete some of them, and a row outside the requested
+        // predicates is another document's.
+        assertRowMatches(row, where, describe);
+        rows.push(row);
+      }
+    },
+  });
+  return rows;
+}
+
+/**
+ * Refuse a row the query did not ask for.
+ *
+ * Compared against the PREDICATES rather than against a subject, so it holds
+ * for a document-wide read as well as a per-subject one — the two differ in
+ * which columns they bind, and a check written against a subject could not
+ * express the wider query at all.
+ *
+ * Thrown rather than skipped. Every caller of this goes on to delete rows, so
+ * silently dropping a foreign one would correct a misbound query's damage
+ * invisibly on every call and nothing would ever report it.
+ */
+function assertRowMatches(
+  row: { id: string },
+  where: Record<string, { equals: string }>,
+  describe: string
+): void {
+  for (const [column, predicate] of Object.entries(where)) {
+    const actual = (row as unknown as Record<string, unknown>)[column];
+    if (actual === predicate.equals) continue;
+    throw new Error(
+      `Class-usage row ${row.id} has ${column}="${String(actual)}" but the ` +
+        `query asked for "${predicate.equals}" while reading ${describe}; ` +
+        `the query is misbound and its rows must not be deleted.`
+    );
+  }
+}
+
+/** Every column that identifies one subject, as a query. */
+function subjectWhere(
+  subject: ClassUsageSubject
+): Record<string, { equals: string }> {
+  return {
+    scope: { equals: subject.scope },
+    entity: { equals: subject.entity },
+    entityKey: { equals: subject.entityKey },
+    field: { equals: subject.field },
+    locale: { equals: subject.locale },
+    variant: { equals: subject.variant },
+  };
+}
+
+/** How a subject reads in an error, so a refusal names what it was reading. */
+function describeSubject(subject: ClassUsageSubject): string {
+  return `${subject.scope}:${subject.entity}:${subject.entityKey}:${subject.field}`;
+}
+
+/**
+ * The rows an index currently holds for one subject.
+ *
+ * Kept as the one place that knows how a subject becomes a query, rather than
+ * inlined at each caller: the six predicates have to be bound TOGETHER, and a
+ * caller that assembled its own could bind five and silently read another
+ * document's rows — which the reconciler would then return as removals.
+ */
+async function storedRowsFor<TRow extends UsageSubject>(
+  index: UsageIndex<TRow>,
+  store: ClassUsageIndexStore,
+  subject: UsageSubject
+): Promise<(TRow & { id: string })[]> {
+  return rowsWhere(
+    store,
+    subjectWhere(subject),
+    describeSubject(subject),
+    storedRowReader(index)
+  );
+}
+
+/** What one subject's maintenance did, in the terms a caller can report. */
+export interface ClassUsageMaintenanceReport {
+  inserted: number;
+  removed: number;
+  /** True when the document could not be read whole and a marker was written. */
+  undetermined: boolean;
+}
+
+/**
+ * Bring one subject's index rows into agreement with its document.
+ *
+ * The document is passed in rather than read here, so the caller decides which
+ * revision is authoritative — and so this stays testable against values.
+ */
+export async function maintainClassUsage(args: {
+  store: ClassUsageIndexStore;
+  subject: ClassUsageSubject;
+  document: unknown;
+  limits: DocumentLimits;
+}): Promise<ClassUsageMaintenanceReport> {
+  return maintainUsage(classUsageIndex, args);
+}
+
+/**
+ * Bring one subject's rows into agreement with its document, under any index.
+ *
+ * The generic beneath {@link maintainClassUsage}, which is a call to it. The
+ * named function keeps its signature so its tests stay the oracle for this
+ * refactor rather than being edited alongside the code they check.
+ */
+export async function maintainUsage<TRow extends UsageSubject>(
+  index: UsageIndex<TRow>,
+  args: {
+    store: ClassUsageIndexStore;
+    subject: UsageSubject;
+    document: unknown;
+    limits: DocumentLimits;
+  }
+): Promise<ClassUsageMaintenanceReport> {
+  const { store, subject } = args;
+  const derivation = deriveUsageRows(
+    index,
+    subject,
+    args.document,
+    args.limits
+  );
+
+  // An incomplete read contributes its marker and nothing else. Reconciling
+  // against the prefix it managed to read would remove the rows for every
+  // reference past the bound, which is the answer that licences deleting a
+  // class the document still applies.
+  const derived: TRow[] = derivation.complete
+    ? derivation.rows
+    : [derivation.undetermined];
+
+  const stored = await storedRowsFor(index, store, subject);
+  const { insert, remove } = reconcileUsage(index, subject, derived, stored);
+
+  // Inserts before removals. Between the two statements the index reports the
+  // subject as referencing both what it did and what it now does — an
+  // over-count, which warns about a delete that was safe. The other ordering
+  // reports it as referencing neither, which permits one that was not.
+  for (const row of insert) {
+    await store.create({
+      data: { ...row },
+    });
+  }
+  for (const id of remove) {
+    await store.delete({ id });
+  }
+
+  return {
+    inserted: insert.length,
+    removed: remove.length,
+    undetermined: !derivation.complete,
+  };
+}
+
+/**
+ * Drop every row a deleted document owned.
+ *
+ * This is the one place in the write path where absence is DEFINITE. Every
+ * other question about whether a document is there is asked by reading, and a
+ * read cannot answer it: `listEntries` applies `beforeOperation` and
+ * `beforeRead` regardless of access override, so a tenant scope or a
+ * soft-delete filter withholds a live row and the page comes back empty,
+ * indistinguishable from a document that is gone. That is why an absent
+ * document leaves its rows alone everywhere else.
+ *
+ * Here nothing is inferred. The hook IS the notification that the row was
+ * removed, and it runs after the delete committed — so the rows can be dropped
+ * outright, and the usual asymmetry does not apply because there is no reading
+ * to be wrong about.
+ *
+ * Bound on the document and NOT on field, locale or variant. A delete removes
+ * the document in every language and both lifecycle states at once, so every
+ * subject it owned goes with it. Binding the other three would need the caller
+ * to enumerate subjects from configuration that may since have changed —
+ * and a blocks field REMOVED from a collection after its rows were written
+ * would then be unnameable, leaving those rows behind for ever with no live
+ * document to reconcile them against and no sweep that visits them.
+ *
+ * Rows are read whole before any is deleted. These are offset queries, so
+ * deleting while paging shifts later rows behind the cursor and skips them.
+ *
+ * Only the identity columns are decoded, so a row whose `variant` or `locale`
+ * is unreadable still goes. Those are precisely the rows no subject can name
+ * and no sweep visits, so sparing them here would strand them for ever.
+ */
+export async function forgetDeletedDocument(args: {
+  store: ClassUsageIndexStore;
+  scope: ClassUsageScope;
+  entity: string;
+  entityKey: string;
+}): Promise<{ removed: number }> {
+  const where = {
+    scope: { equals: args.scope },
+    entity: { equals: args.entity },
+    entityKey: { equals: args.entityKey },
+  };
+  const rows = await rowsWhere(
+    args.store,
+    where,
+    `${args.scope}:${args.entity}:${args.entityKey}:*`,
+    readRowIdentity
+  );
+
+  let removed = 0;
+  for (const row of rows) {
+    await args.store.delete({ id: row.id });
+    removed += 1;
+  }
+  return { removed };
+}
+
+/**
+ * Drop rows belonging to documents that no longer exist.
+ *
+ * A walk over live documents can only reconcile the ones it finds. A document
+ * deleted through a path that did not maintain the index — a direct database
+ * edit, a restore, a bulk operation — never appears in that walk, so its rows
+ * survive a rebuild that reports success. The class it referenced then reads as
+ * used by a document nobody can open, and can never be deleted.
+ *
+ * Answerable only by comparing the index against the set of documents actually
+ * seen, which is why the caller supplies that set rather than this reading it
+ * again: the two must be the same walk, or a document created between them is
+ * read as absent and loses rows it should keep.
+ *
+ * Scoped to one entity, field and locale, so a rebuild of one blocks field
+ * cannot remove rows belonging to another.
+ */
+export async function forgetAbsentDocuments<TRow extends UsageSubject>(args: {
+  /**
+   * The index whose rows are being swept.
+   *
+   * Required, and not inferable from the store. Rows are decoded through this
+   * descriptor, and one index's reader answers null for another's rows — the
+   * class reader needs a `classId`, so sweeping the component index through it
+   * examines no rows at all and reports a clean pass having removed nothing.
+   */
+  index: UsageIndex<TRow>;
+  store: ClassUsageIndexStore;
+  scope: ClassUsageScope;
+  entity: string;
+  field: string;
+  locale: string;
+  variant: ClassUsageVariant;
+  /** Every `entityKey` the walk actually visited. */
+  visited: ReadonlySet<string>;
+  /**
+   * Confirm a document really is gone before its rows are removed.
+   *
+   * The visited set is built by an offset-paginated walk over a collection
+   * other writers can change, so a LIVE document can be missing from it — a
+   * deletion ahead of the cursor shifts a later document behind the next
+   * offset, and one created after its position was passed is never reached.
+   *
+   * Consulted only for documents the walk did not see, and answering `true`
+   * KEEPS the rows. The asymmetry is deliberate: a kept stale row over-counts
+   * and blocks a delete that was safe, while a wrongly removed one
+   * under-counts and permits deleting a class a live document still renders.
+   */
+  stillExists: (entityKey: string) => Promise<boolean>;
+}): Promise<{ removed: number }> {
+  const where = {
+    scope: { equals: args.scope },
+    entity: { equals: args.entity },
+    field: { equals: args.field },
+    locale: { equals: args.locale },
+    variant: { equals: args.variant },
+  };
+  const rows = await storedRowsWhere(
+    args.index,
+    args.store,
+    where,
+    `${args.scope}:${args.entity}:*:${args.field}`
+  );
+
+  let removed = 0;
+  // Cached per document rather than per row: one document contributes a row
+  // per class it references, and asking the store once per row would multiply
+  // the check by a factor that has nothing to do with how many are orphaned.
+  const confirmedGone = new Map<string, boolean>();
+
+  for (const row of rows) {
+    if (args.visited.has(row.entityKey)) continue;
+
+    let gone = confirmedGone.get(row.entityKey);
+    if (gone === undefined) {
+      gone = !(await args.stillExists(row.entityKey));
+      confirmedGone.set(row.entityKey, gone);
+    }
+    if (!gone) continue;
+
+    await args.store.delete({ id: row.id });
+    removed += 1;
+  }
+  return { removed };
+}

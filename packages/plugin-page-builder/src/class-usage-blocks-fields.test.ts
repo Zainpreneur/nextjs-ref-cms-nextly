@@ -1,0 +1,770 @@
+/**
+ * Whether the write path's filter finds the fields it is responsible for, and
+ * only those.
+ *
+ * Both directions cost something specific. A field missed is a field whose
+ * classes are never counted, so they read as unused and can be deleted while a
+ * page still renders them. A field wrongly included writes rows under a subject
+ * no document backs, and nothing downstream can tell them from real ones.
+ *
+ * @module class-usage-blocks-fields.test
+ */
+import { describe, expect, it } from "vitest";
+
+import {
+  blocksFieldReach,
+  blocksFieldSurvey,
+  blocksFieldsOf,
+} from "./class-usage-blocks-fields";
+
+describe("finding the blocks fields on a collection", () => {
+  it("returns the blocks fields and ignores every other type", () => {
+    const fields = blocksFieldsOf({
+      fields: [
+        { type: "text", name: "title" },
+        { type: "blocks", name: "content" },
+        { type: "richText", name: "summary" },
+        { type: "blocks", name: "sidebar" },
+      ],
+    });
+
+    expect(fields).toEqual([
+      { name: "content", localized: false },
+      { name: "sidebar", localized: false },
+    ]);
+  });
+
+  it("returns nothing for a collection that declares none", () => {
+    // The common case. The hook fires for EVERY collection, so most calls reach
+    // here with nothing to do, and an empty list is what makes the filter live
+    // in one place instead of in every caller.
+    expect(
+      blocksFieldsOf({ fields: [{ type: "text", name: "title" }] })
+    ).toEqual([]);
+  });
+
+  it("carries a field's own localized flag on a localized collection", () => {
+    const fields = blocksFieldsOf({
+      localized: true,
+      fields: [
+        { type: "blocks", name: "content", localized: true },
+        { type: "blocks", name: "sidebar", localized: false },
+      ],
+    });
+
+    expect(fields).toEqual([
+      { name: "content", localized: true },
+      { name: "sidebar", localized: false },
+    ]);
+  });
+});
+
+describe("the collection's localization master switch", () => {
+  it("reads a localized FIELD as shared when the COLLECTION is not localized", () => {
+    // The switch is what storage obeys: a collection that stores no
+    // translations keeps one value for this field under the empty locale key,
+    // whatever the field declares. Reading the field flag alone would enumerate
+    // a subject per configured language and leave the one subject a read
+    // resolves to holding no rows — so the document's classes would be absent
+    // from every count that matters.
+    const fields = blocksFieldsOf({
+      localized: false,
+      fields: [{ type: "blocks", name: "content", localized: true }],
+    });
+
+    expect(fields).toEqual([{ name: "content", localized: false }]);
+  });
+
+  it("treats an ABSENT switch as off, which is the schema's default", () => {
+    const fields = blocksFieldsOf({
+      fields: [{ type: "blocks", name: "content", localized: true }],
+    });
+
+    expect(fields).toEqual([{ name: "content", localized: false }]);
+  });
+
+  it("leaves an unflagged field shared even when the collection is localized", () => {
+    // The control on the pair above: a switch that simply overwrote the field's
+    // answer would satisfy those two and this one would come out localized.
+    // A blocks field has no per-type default, so it stays shared until asked.
+    const fields = blocksFieldsOf({
+      localized: true,
+      fields: [{ type: "blocks", name: "content" }],
+    });
+
+    expect(fields).toEqual([{ name: "content", localized: false }]);
+  });
+});
+
+describe("configuration that did not come from TypeScript", () => {
+  it('reads a STRING "true" as not localized rather than as localized', () => {
+    // Config reaches a hook as whatever the host wrote, and the Schema
+    // Builder's stored payloads are JSON. A truthiness check would read this as
+    // localized and file one document's classes under every language, leaving
+    // the subject a read actually resolves holding none.
+    const fields = blocksFieldsOf({
+      localized: true,
+      fields: [{ type: "blocks", name: "content", localized: "true" }],
+    });
+
+    expect(fields).toEqual([{ name: "content", localized: false }]);
+  });
+
+  it("reads a STRING master switch as off rather than as on", () => {
+    const fields = blocksFieldsOf({
+      localized: "true",
+      fields: [{ type: "blocks", name: "content", localized: true }],
+    });
+
+    expect(fields).toEqual([{ name: "content", localized: false }]);
+  });
+
+  it("skips a field with no usable name", () => {
+    // The name IS the `field` column of every row. Defaulting it would collect
+    // every unnamed field's rows into one subject, and the reconciler would
+    // then delete each field's rows on behalf of the others.
+    const fields = blocksFieldsOf({
+      fields: [
+        { type: "blocks" },
+        { type: "blocks", name: "" },
+        { type: "blocks", name: 42 },
+        { type: "blocks", name: "content" },
+      ],
+    });
+
+    expect(fields).toEqual([{ name: "content", localized: false }]);
+  });
+
+  it("survives entries that are not objects at all", () => {
+    const fields = blocksFieldsOf({
+      fields: [
+        null,
+        undefined,
+        "blocks",
+        7,
+        { type: "blocks", name: "content" },
+      ],
+    });
+
+    expect(fields).toEqual([{ name: "content", localized: false }]);
+  });
+
+  it("returns nothing when the collection or its `fields` is absent", () => {
+    expect(blocksFieldsOf(undefined)).toEqual([]);
+    expect(blocksFieldsOf(null)).toEqual([]);
+    expect(blocksFieldsOf({})).toEqual([]);
+    expect(blocksFieldsOf({ fields: "content" })).toEqual([]);
+  });
+});
+
+describe("two fields declared under one name", () => {
+  it("yields ONE subject rather than two", () => {
+    // A duplicate name addresses one subject. Enumerating it twice reconciles
+    // the same rows twice in a single pass, and the second pass reads the
+    // first's inserts as rows the document no longer justifies — so a correct
+    // document would end with its own classes deleted.
+    const fields = blocksFieldsOf({
+      localized: true,
+      fields: [
+        { type: "blocks", name: "content" },
+        { type: "blocks", name: "content", localized: true },
+      ],
+    });
+
+    expect(fields).toEqual([{ name: "content", localized: false }]);
+  });
+});
+
+describe("a blocks field inside a group", () => {
+  it("is FOUND when the group is presentational (nameless)", () => {
+    // A group without a `name` stores nothing of its own — its children live at
+    // the parent path. So `item.content` resolves this exactly as it would a
+    // top-level declaration, and skipping it would leave the document's classes
+    // out of the index entirely: a class the page still renders would read as
+    // unused and could be deleted.
+    const fields = blocksFieldsOf({
+      fields: [
+        { type: "text", name: "title" },
+        { type: "group", fields: [{ type: "blocks", name: "content" }] },
+      ],
+    });
+
+    expect(fields).toEqual([{ name: "content", localized: false }]);
+  });
+
+  it("is FOUND when the group's name is the empty string", () => {
+    // An empty name is what a host writes for a layout group it gave no key,
+    // and core resolves references and redacts paths through such a group at
+    // the PARENT level. Treating it as named here would put the child behind a
+    // path storage never uses, so the document's classes would be missing from
+    // the index while the page still renders them.
+    const fields = blocksFieldsOf({
+      fields: [
+        {
+          type: "group",
+          name: "",
+          fields: [{ type: "blocks", name: "content" }],
+        },
+      ],
+    });
+
+    expect(fields).toEqual([{ name: "content", localized: false }]);
+  });
+
+  it("is NOT found when the group is named", () => {
+    // A named group nests its data under its own key, so the child is reachable
+    // only through a path neither this nor the rebuild resolves. Indexing it
+    // would file rows no rebuild could reconcile or sweep — the permanently
+    // stranded state.
+    //
+    // This is the control on the cases above: without it, a walk that descended
+    // into EVERY group would satisfy those assertions just as well.
+    const fields = blocksFieldsOf({
+      fields: [
+        {
+          type: "group",
+          name: "seo",
+          fields: [{ type: "blocks", name: "body" }],
+        },
+      ],
+    });
+
+    expect(fields).toEqual([]);
+  });
+
+  it("descends through presentational groups nested in each other", () => {
+    const fields = blocksFieldsOf({
+      fields: [
+        {
+          type: "group",
+          fields: [
+            { type: "group", fields: [{ type: "blocks", name: "deep" }] },
+          ],
+        },
+      ],
+    });
+
+    expect(fields).toEqual([{ name: "deep", localized: false }]);
+  });
+
+  it("does not descend into a repeater", () => {
+    // A repeater's children are per-row, so there is no single parent path.
+    const fields = blocksFieldsOf({
+      fields: [{ type: "repeater", fields: [{ type: "blocks", name: "row" }] }],
+    });
+
+    expect(fields).toEqual([]);
+  });
+});
+
+describe("a group that contains itself", () => {
+  it("still returns the sibling declared AFTER the cycle", () => {
+    // Configuration is author-supplied and can be cyclic. Terminating is not
+    // enough on its own: a walk that only counted iterations would put the
+    // group back at the front of the queue every time, exhaust its bound
+    // without ever reaching this sibling, and return an empty list — which is
+    // indistinguishable from a collection that declares no blocks field, so
+    // every class the document applies would read as unused.
+    //
+    // The cycle is listed FIRST deliberately. Behind it, the sibling is only
+    // reachable once the group stops being re-expanded.
+    const cyclic: Record<string, unknown> = { type: "group" };
+    cyclic.fields = [cyclic, { type: "blocks", name: "content" }];
+
+    const fields = blocksFieldsOf({ fields: [cyclic] });
+
+    expect(fields).toEqual([{ name: "content", localized: false }]);
+  });
+
+  it("terminates rather than throwing", () => {
+    const cyclic: Record<string, unknown> = { type: "group" };
+    cyclic.fields = [cyclic];
+
+    expect(() => blocksFieldsOf({ fields: [cyclic] })).not.toThrow();
+  });
+
+  it("finds a field through two groups that contain each other", () => {
+    const outer: Record<string, unknown> = { type: "group" };
+    const inner: Record<string, unknown> = { type: "group" };
+    outer.fields = [inner];
+    inner.fields = [outer, { type: "blocks", name: "content" }];
+
+    expect(blocksFieldsOf({ fields: [outer] })).toEqual([
+      { name: "content", localized: false },
+    ]);
+  });
+});
+
+describe("a presentational group with a very large field list", () => {
+  it("reads it without throwing, and still returns the field inside", () => {
+    // The bound cannot protect a list that fails while being MOVED. Passing a
+    // group's children as arguments reaches the engine's argument limit — a
+    // measured 125,000 on the supported runtime — and the throw happens before
+    // any visit is counted. This runs after the document has committed, so a
+    // throw there reports a failed save for one that succeeded.
+    //
+    // Asserting the field is returned rather than only that nothing threw: a
+    // walk that gave up on the group would satisfy `not.toThrow` while leaving
+    // the document's classes out of the index entirely.
+    const filler = { type: "text", name: "filler" };
+    const wide = {
+      type: "group",
+      fields: [
+        { type: "blocks", name: "content" },
+        ...new Array<unknown>(200_000).fill(filler),
+      ],
+    };
+
+    expect(blocksFieldsOf({ fields: [wide] })).toEqual([
+      { name: "content", localized: false },
+    ]);
+  });
+
+  it("returns a field declared AFTER the wide filler, not only before it", () => {
+    // The case a visit bound silently loses. Nothing validates a field count,
+    // so a long list is legal configuration, and a walk that stops partway
+    // returns fewer descriptors while reporting nothing — the document's
+    // classes are then absent from the index and read as unused.
+    //
+    // Placing the field last is the whole point: with it first, a truncating
+    // walk satisfies the assertion above and the loss is invisible.
+    const filler = { type: "text", name: "filler" };
+    const wide = {
+      type: "group",
+      fields: [
+        ...new Array<unknown>(200_000).fill(filler),
+        { type: "blocks", name: "content" },
+      ],
+    };
+
+    expect(blocksFieldsOf({ fields: [wide] })).toEqual([
+      { name: "content", localized: false },
+    ]);
+  });
+});
+
+/**
+ * What the collection declares that this index cannot reach.
+ *
+ * Excluding a nested blocks field is deliberate and stays; the defect was that
+ * it was excluded SILENTLY, so a collection whose only blocks field is nested
+ * contributed no scope, "every scope walked" was vacuously true, and health
+ * reported an index that had never seen those references as exact.
+ */
+describe("noticing a blocks field this index cannot address", () => {
+  it("reports a named group's blocks field as unaddressable, and does not enumerate it", () => {
+    const survey = blocksFieldSurvey({
+      fields: [
+        { type: "text", name: "title" },
+        {
+          type: "group",
+          name: "hero",
+          fields: [{ type: "blocks", name: "content" }],
+        },
+      ],
+    });
+
+    // Both halves: still excluded from the scopes, and no longer silent.
+    expect(survey.addressable).toEqual([]);
+    expect(survey.unaddressable).toBe(true);
+  });
+
+  it("reports it even when an addressable field sits beside it", () => {
+    // The case a "does this collection have any scopes" check cannot catch: the
+    // collection DOES get scopes, walks them, and the nested field is still
+    // never indexed.
+    const survey = blocksFieldSurvey({
+      fields: [
+        { type: "blocks", name: "body" },
+        {
+          type: "group",
+          name: "hero",
+          fields: [{ type: "blocks", name: "content" }],
+        },
+      ],
+    });
+
+    expect(survey.addressable).toEqual([{ name: "body", localized: false }]);
+    expect(survey.unaddressable).toBe(true);
+  });
+
+  it("finds one nested arbitrarily deep, through a container of any type", () => {
+    // Asked structurally — any container of declarations — rather than by
+    // listing type names, so a repeater or a container this package has not met
+    // is noticed too.
+    const survey = blocksFieldSurvey({
+      fields: [
+        {
+          type: "repeater",
+          name: "rows",
+          fields: [
+            {
+              type: "group",
+              name: "inner",
+              fields: [{ type: "blocks", name: "c" }],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(survey.addressable).toEqual([]);
+    expect(survey.unaddressable).toBe(true);
+  });
+
+  it("reports a field-group REFERENCE as unaddressable, since it may hide one", () => {
+    /*
+     * A `fieldGroup` field carries only the slug it points at — the definition
+     * lives elsewhere and there is no inline `fields` array to descend into. So
+     * a blocks field inside that definition was reported as neither a scope nor
+     * unreachable, which is the vacuous completeness this survey exists to stop.
+     *
+     * The plugin context publishes no field-group registry, so it cannot be
+     * resolved from here and is treated as possibly holding blocks.
+     */
+    const survey = blocksFieldSurvey({
+      fields: [
+        { type: "text", name: "title" },
+        { type: "fieldGroup", name: "seo", fieldGroup: "seo" },
+      ],
+    });
+
+    expect(survey.addressable).toEqual([]);
+    expect(survey.unaddressable).toBe(true);
+  });
+
+  it("reports a component REFERENCE the same way", () => {
+    const survey = blocksFieldSurvey({
+      fields: [{ type: "component", name: "hero", component: "hero" }],
+    });
+
+    expect(survey.unaddressable).toBe(true);
+  });
+
+  it("CONTROL: an ordinary field is not mistaken for a reference", () => {
+    // Without this, treating every unrecognised type as unresolvable would mark
+    // a text field unreachable and withhold completeness from every site.
+    const survey = blocksFieldSurvey({
+      fields: [
+        { type: "text", name: "title" },
+        { type: "number", name: "n" },
+        { type: "blocks", name: "body" },
+      ],
+    });
+
+    expect(survey.addressable).toEqual([{ name: "body", localized: false }]);
+    expect(survey.unaddressable).toBe(false);
+  });
+
+  it("reports a SHARED group reached both ways, not only the first way", async () => {
+    /*
+     * One declaration object, two occurrences. A nameless group is declared once
+     * and referenced at the top level AND beneath a named group — which a host
+     * gets for free by hoisting the group into a constant and using it twice.
+     *
+     * The two occurrences store their data under DIFFERENT keys, so the blocks
+     * field inside is addressable through the top-level path and not through the
+     * nested one. Keyed by identity alone, the first visit claimed the object and
+     * the second was skipped: the field was enumerated as a scope and never
+     * reported as unreachable, so the survey said nothing was out of reach while
+     * half of that field's content was — and health could call the index exact.
+     */
+    const shared = {
+      type: "group",
+      fields: [{ type: "blocks", name: "content" }],
+    };
+    const survey = blocksFieldSurvey({
+      fields: [shared, { type: "group", name: "hero", fields: [shared] }],
+    });
+
+    // Both halves: still enumerated for the reachable path, and no longer silent
+    // about the hidden one.
+    expect(survey.addressable).toEqual([{ name: "content", localized: false }]);
+    expect(survey.unaddressable).toBe(true);
+  });
+
+  it("still terminates when a shared group contains ITSELF", async () => {
+    // Two sets means two rounds, not unbounded ones. Without a bound per mode a
+    // self-listing group reached both ways would never finish.
+    const cyclic: { type: string; fields: unknown[] } = {
+      type: "group",
+      fields: [],
+    };
+    cyclic.fields.push(cyclic, { type: "blocks", name: "content" });
+    const survey = blocksFieldSurvey({
+      fields: [cyclic, { type: "group", name: "hero", fields: [cyclic] }],
+    });
+
+    expect(survey.addressable).toEqual([{ name: "content", localized: false }]);
+    expect(survey.unaddressable).toBe(true);
+  });
+
+  it("CONTROL: a presentational group's blocks field is addressable, not unreachable", () => {
+    // Without this, reporting every group as unaddressable would satisfy the
+    // cases above and withhold completeness from every site that uses a layout
+    // group — completeness that could then never be earned.
+    const survey = blocksFieldSurvey({
+      fields: [
+        { type: "group", fields: [{ type: "blocks", name: "content" }] },
+      ],
+    });
+
+    expect(survey.addressable).toEqual([{ name: "content", localized: false }]);
+    expect(survey.unaddressable).toBe(false);
+  });
+
+  it("CONTROL: a collection with no nested blocks field reports none", () => {
+    const survey = blocksFieldSurvey({
+      fields: [
+        { type: "blocks", name: "body" },
+        { type: "group", name: "meta", fields: [{ type: "text", name: "x" }] },
+      ],
+    });
+
+    expect(survey.addressable).toEqual([{ name: "body", localized: false }]);
+    expect(survey.unaddressable).toBe(false);
+  });
+
+  it("agrees with blocksFieldsOf, which is derived from it", () => {
+    const collection = {
+      fields: [
+        { type: "blocks", name: "body" },
+        {
+          type: "group",
+          name: "hero",
+          fields: [{ type: "blocks", name: "c" }],
+        },
+      ],
+    };
+
+    expect(blocksFieldsOf(collection)).toEqual(
+      blocksFieldSurvey(collection).addressable
+    );
+  });
+});
+
+describe("reaching blocks fields through named groups", () => {
+  it("reaches a field under a named group at the path its value is stored", () => {
+    const reach = blocksFieldReach({
+      fields: [
+        { type: "blocks", name: "content" },
+        {
+          type: "group",
+          name: "hero",
+          fields: [
+            { type: "blocks", name: "body" },
+            {
+              type: "group",
+              name: "",
+              fields: [{ type: "blocks", name: "aside" }],
+            },
+            {
+              type: "group",
+              name: "inner",
+              fields: [{ type: "blocks", name: "deep" }],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(reach.fields.map(field => field.path)).toEqual([
+      ["content"],
+      ["hero", "body"],
+      ["hero", "aside"],
+      ["hero", "inner", "deep"],
+    ]);
+    expect(reach.unreachable).toBe(false);
+  });
+
+  it("reports a field in a repeater as unreachable rather than reaching it", () => {
+    const reach = blocksFieldReach({
+      fields: [
+        {
+          type: "repeater",
+          name: "rows",
+          fields: [{ type: "blocks", name: "body" }],
+        },
+        {
+          type: "group",
+          name: "hero",
+          fields: [
+            {
+              type: "repeater",
+              name: "slides",
+              fields: [{ type: "blocks", name: "slide" }],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(reach.fields).toEqual([]);
+    expect(reach.unreachable).toBe(true);
+  });
+
+  it("reaches one group declared in two places at both of its paths", () => {
+    const shared = {
+      type: "group",
+      name: "",
+      fields: [{ type: "blocks", name: "body" }],
+    };
+    const reach = blocksFieldReach({
+      fields: [shared, { type: "group", name: "hero", fields: [shared] }],
+    });
+
+    expect(reach.fields.map(field => field.path)).toEqual([
+      ["body"],
+      ["hero", "body"],
+    ]);
+  });
+
+  it("stops a named group that lists itself, reporting it as unreachable", () => {
+    const loop: { type: string; name: string; fields: unknown[] } = {
+      type: "group",
+      name: "loop",
+      fields: [{ type: "blocks", name: "body" }],
+    };
+    loop.fields.push(loop);
+
+    const reach = blocksFieldReach({ fields: [loop] });
+
+    expect(reach.unreachable).toBe(true);
+    expect(reach.fields[0]?.path).toEqual(["loop", "body"]);
+  });
+
+  it("is what the survey derives from: top-level fields only, nested ones as unaddressable", () => {
+    const collection = {
+      fields: [
+        { type: "blocks", name: "content" },
+        {
+          type: "group",
+          name: "hero",
+          fields: [{ type: "blocks", name: "body" }],
+        },
+      ],
+    };
+
+    expect(blocksFieldSurvey(collection)).toEqual({
+      addressable: [{ name: "content", localized: false }],
+      unaddressable: true,
+    });
+  });
+
+  it("stops a branching cycle of named groups within a fixed budget, reporting it unreachable", () => {
+    // Ten named groups, each listing the root group back: every trip round the
+    // cycle is a new path, so only a total budget bounds the work.
+    const root: { type: string; name: string; fields: unknown[] } = {
+      type: "group",
+      name: "root",
+      fields: [{ type: "blocks", name: "body" }],
+    };
+    for (let branch = 0; branch < 10; branch += 1) {
+      root.fields.push({
+        type: "group",
+        name: `b${String(branch)}`,
+        fields: [root],
+      });
+    }
+
+    const started = Date.now();
+    const reach = blocksFieldReach({ fields: [root] });
+
+    expect(reach.unreachable).toBe(true);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(reach.fields[0]?.path).toEqual(["root", "body"]);
+  });
+
+  it("reports what lies past its expansion budget as unreachable", () => {
+    // Three nested named groups, no cycle: a budget of two expands the first
+    // two only, and the field in the third is reported, not dropped.
+    const reach = blocksFieldReach(
+      {
+        fields: [
+          {
+            type: "group",
+            name: "a",
+            fields: [
+              {
+                type: "group",
+                name: "b",
+                fields: [
+                  {
+                    type: "group",
+                    name: "c",
+                    fields: [{ type: "blocks", name: "body" }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      2
+    );
+
+    expect(reach.fields).toEqual([]);
+    expect(reach.unreachable).toBe(true);
+    // CONTROL: with room, the field is reached.
+    expect(
+      blocksFieldReach({
+        fields: [
+          {
+            type: "group",
+            name: "a",
+            fields: [
+              {
+                type: "group",
+                name: "b",
+                fields: [
+                  {
+                    type: "group",
+                    name: "c",
+                    fields: [{ type: "blocks", name: "body" }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      }).fields.map(field => field.path)
+    ).toEqual([["a", "b", "c", "body"]]);
+  });
+});
+
+describe("reading a field group through the site's definitions", () => {
+  const groups = new Map<string, { fields: unknown[] }>([
+    ["seo", { fields: [{ type: "text", name: "metaTitle" }] }],
+    ["hero", { fields: [{ type: "blocks", name: "body" }] }],
+    // A group holding only a reference to the one holding blocks.
+    [
+      "band",
+      { fields: [{ type: "component", name: "inner", component: "hero" }] },
+    ],
+  ]);
+  const resolve = (slug: string) => groups.get(slug);
+  const reachOf = (component: string, withGroups = true) =>
+    blocksFieldReach(
+      { fields: [{ type: "component", name: "group", component }] },
+      undefined,
+      withGroups ? resolve : undefined
+    );
+
+  it("finds no possible copy in a known group of plain fields", () => {
+    expect(reachOf("seo")).toEqual({ fields: [], unreachable: false });
+  });
+
+  it("keeps a known group holding a blocks field, directly or nested, as possibly holding one", () => {
+    // Stored apart from the row, so noticed, never reached.
+    expect(reachOf("hero")).toEqual({ fields: [], unreachable: true });
+    expect(reachOf("band")).toEqual({ fields: [], unreachable: true });
+  });
+
+  it("keeps a group the definitions do not know as possibly holding one", () => {
+    expect(reachOf("never-made").unreachable).toBe(true);
+  });
+
+  it("CONTROL: without the site's definitions, every group may hold one", () => {
+    expect(reachOf("seo", false).unreachable).toBe(true);
+  });
+});

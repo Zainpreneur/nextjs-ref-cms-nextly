@@ -1,0 +1,775 @@
+// Shared drop-guard for drizzle-kit pushSchema output.
+//
+// drizzle-kit's pushSchema can emit DROP TABLE / DROP SEQUENCE / DROP INDEX
+// for any object that exists in the live DB but is absent from the desired
+// schema it was handed. Both PushSchemaPipeline (dev server / HMR) and
+// freshPushSchema (`nextly migrate` Phase 1, ensureCoreTables) run pushSchema
+// against a desired schema that is narrower than the live DB, so both MUST
+// strip drops of objects the caller never asked about — otherwise user
+// content tables (dc_/single_/comp_) get destroyed as collateral.
+//
+// The desired set is compared by SQL table name. Callers that hold a Drizzle
+// schema bundle MUST derive names via `drizzleTableNames` (Symbol-based),
+// NOT Object.keys() — bundle keys are JS export names (e.g. dynamicCollections),
+// not SQL names (dynamic_collections), and include non-table exports.
+
+import type { SupportedDialect } from "../../../database/schema-registry";
+import { consoleLogger } from "../../../shared/types";
+import { dropsPluginMigratedTable } from "../ownership/drop-guard";
+
+import { isCompanionTable, isManagedTable } from "./managed-tables";
+
+const ORPHAN_DROP_PATTERNS: ReadonlyArray<{
+  kind: "SEQUENCE" | "INDEX";
+  re: RegExp;
+}> = [
+  {
+    kind: "SEQUENCE",
+    re: /^DROP\s+SEQUENCE\s+(?:IF\s+EXISTS\s+)?(?:["`]?\w+["`]?\.)?["`]?(\w+)["`]?/i,
+  },
+  {
+    kind: "INDEX",
+    re: /^DROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?(?:["`]?\w+["`]?\.)?["`]?(\w+)["`]?/i,
+  },
+];
+
+/**
+ * A `DROP SCHEMA`, in any spelling the kit or a dialect produces.
+ *
+ * Nextly never drops a schema — not the one it runs in, not any other — so
+ * this is refused whatever the desired set says. drizzle-kit emits one when
+ * the schema it was asked to reconcile holds nothing it recognises as wanted,
+ * which is a disagreement about where the tables live, never an instruction.
+ * Executed, it removes the namespace every later statement resolves in.
+ * MySQL's `DROP DATABASE` is the same act under its other name.
+ */
+const DROP_SCHEMA = /^\s*DROP\s+(?:SCHEMA|DATABASE)\b/i;
+
+/** Whether a statement drops a schema (or, on MySQL, a database). */
+export function isDropSchemaStatement(statement: string): boolean {
+  return DROP_SCHEMA.test(statement);
+}
+
+/** Cheap structural check for Drizzle tables (carry Symbol.for("drizzle:Name")). */
+export function isDrizzleTable(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  // Drizzle tables carry Symbol.for("drizzle:Name") — the simplest
+  // stable cross-dialect check.
+  return Symbol.for("drizzle:Name") in value;
+}
+
+/** Extract a Drizzle table's SQL name, falling back to the export key. */
+export function getDrizzleTableName(value: unknown, fallback: string): string {
+  const named = (value as Record<symbol, unknown>)[Symbol.for("drizzle:Name")];
+  return typeof named === "string" ? named : fallback;
+}
+
+/**
+ * SQL table names of every Drizzle table in a schema bundle. Skips non-table
+ * exports (relations). This is the correct allow-list for
+ * `filterUnsafeStatements` — NEVER use `Object.keys(schema)`, which yields JS
+ * export keys (camelCase) rather than the SQL names the filter compares against.
+ */
+export function drizzleTableNames(schema: Record<string, unknown>): string[] {
+  const names: string[] = [];
+  for (const [exportKey, value] of Object.entries(schema)) {
+    if (isDrizzleTable(value))
+      names.push(getDrizzleTableName(value, exportKey));
+  }
+  return names;
+}
+
+/**
+ * Infers the owner table of a sequence or index from its name using
+ * Postgres's default naming conventions:
+ *   - SERIAL / IDENTITY sequences: `<table>_<col>_seq`
+ *   - Indexes:                      `<table>_<col(s)>_idx | _key | _pkey | _unique`
+ *
+ * Strategy: walk underscore-delimited prefixes from longest to shortest
+ * and return the first candidate found in `desiredSet`. Longest-first
+ * ensures multi-word table names like `email_templates` are preferred
+ * over the shorter prefix `email`.
+ *
+ * Returns the matched table name (lowercased) or `null` if no prefix in
+ * `desiredSet` was found. A `null` result means we can't identify the
+ * owner, and the caller should treat the statement as unsafe.
+ */
+function inferOwnerTableFromObjectName(
+  objectName: string,
+  desiredSet: ReadonlySet<string>
+): string | null {
+  const lower = objectName.toLowerCase();
+  const parts = lower.split("_");
+  // Walk from the longest prefix down to a single part.
+  for (let i = parts.length - 1; i > 0; i--) {
+    const candidate = parts.slice(0, i).join("_");
+    if (desiredSet.has(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Strip data-losing drops drizzle-kit emits for objects outside the desired
+ * schema.
+ *
+ * SQLite can't ALTER COLUMN type, so drizzle-kit emits a CREATE/COPY/DROP/RENAME
+ * sequence for type changes (renames included):
+ *   1. CREATE TABLE __new_dc_job (...)
+ *   2. INSERT INTO __new_dc_job SELECT ... FROM dc_job
+ *   3. DROP TABLE dc_job          ← intentional, NOT accidental
+ *   4. ALTER TABLE __new_dc_job RENAME TO dc_job
+ * A strict block-all-DROPs rule breaks step 3 → step 4 then fails with
+ * "table dc_job already exists".
+ *
+ * Refined rule:
+ *   - DROP TABLE for a table IN the desired schema → ALLOW (part of an
+ *     intentional rebuild — the table is recreated by a subsequent
+ *     CREATE/RENAME).
+ *   - DROP TABLE for a table NOT in the desired schema → BLOCK (drizzle-kit
+ *     thinks it's orphaned; this is the scenario where a narrow desired
+ *     schema would otherwise destroy admin-UI / user content tables).
+ *
+ * The same policy extends to DROP SEQUENCE / DROP INDEX: `tablesFilter`
+ * restricts which TABLES drizzle-kit inspects but does NOT suppress its
+ * emission of DROP SEQUENCE / DROP INDEX for "orphan" objects whose owner
+ * table isn't in the scoped schema (e.g. desired = {posts} but the live DB
+ * has `accounts_id_seq` → drizzle-kit emits `DROP SEQUENCE accounts_id_seq`,
+ * which fails with PG 2BP01 because `accounts.id` still depends on it). We
+ * infer the owner table from the object name; custom-named objects that don't
+ * share a prefix with any managed table are blocked + warned (fail-safe).
+ *
+ * Plugin-migrated tables: when the caller passes them, with the dialect the
+ * statements will run on, any statement that drops one is refused, whatever
+ * the desired set says. Dev push reconciles what the CONFIG describes, and a
+ * plugin removed from config is exactly the moment its tables' data is most
+ * at risk — removing its tables is a decision for its migrations or
+ * `nextly plugins uninstall`, not a side effect of a reload. The question is
+ * answered by `dropsPluginMigratedTable`, the reader the fast path and the
+ * migration guard use, so both push routes give it the same answer: that
+ * includes withholding a statement the reader cannot read. Absent (or empty)
+ * = no stream has claimed anything, which is the pre-registry behaviour
+ * exactly.
+ */
+export function filterUnsafeStatements(
+  statements: string[],
+  desiredTableNames: string[]
+): string[];
+export function filterUnsafeStatements(
+  statements: string[],
+  desiredTableNames: string[],
+  /** Tables whose owner rows name a plugin migration stream, lower-cased. */
+  pluginMigratedTables: ReadonlySet<string> | undefined,
+  dialect: SupportedDialect
+): string[];
+export function filterUnsafeStatements(
+  statements: string[],
+  desiredTableNames: string[],
+  pluginMigratedTables?: ReadonlySet<string>,
+  dialect?: SupportedDialect
+): string[] {
+  const desiredSet = new Set(desiredTableNames.map(t => t.toLowerCase()));
+
+  // Each rule either decides a statement or passes it on; the first rule
+  // that decides wins, and a statement no rule decides passes through.
+  return statements.filter(
+    stmt =>
+      dropSchemaVerdict(stmt) ??
+      pluginTableVerdict(stmt, pluginMigratedTables, dialect) ??
+      dropTableVerdict(stmt, desiredSet) ??
+      orphanDropVerdict(stmt, desiredSet) ??
+      true
+  );
+}
+
+/**
+ * Whether one rule keeps (true) or blocks (false) a statement; undefined when
+ * the rule does not apply to it.
+ */
+type Verdict = boolean | undefined;
+
+/** DROP SCHEMA: first and unconditional, since no desired set makes it intended. */
+function dropSchemaVerdict(stmt: string): Verdict {
+  if (!isDropSchemaStatement(stmt)) return undefined;
+  consoleLogger.warn(
+    `[Nextly schema] Blocked a statement that drops a schema, emitted by drizzle-kit pushSchema: ${stmt}. Nextly never drops a schema; if one should go, drop it manually.`
+  );
+  return false;
+}
+
+/** A drop of a plugin-migrated table, or one the drop reader cannot read. */
+function pluginTableVerdict(
+  stmt: string,
+  pluginMigratedTables: ReadonlySet<string> | undefined,
+  dialect: SupportedDialect | undefined
+): Verdict {
+  if (
+    pluginMigratedTables === undefined ||
+    dialect === undefined ||
+    !dropsPluginMigratedTable(stmt, pluginMigratedTables, dialect)
+  ) {
+    return undefined;
+  }
+  consoleLogger.warn(
+    `[Nextly schema] Blocked a statement that drops a table whose owner row names a plugin migration stream, or that the drop reader cannot read: ${stmt}. Plugin tables are removed by the plugin's migrations or \`nextly plugins uninstall\`, never by dev push.`
+  );
+  return false;
+}
+
+/** DROP TABLE: allowed for a desired table, blocked for any other. */
+function dropTableVerdict(
+  stmt: string,
+  desiredSet: ReadonlySet<string>
+): Verdict {
+  const dropMatch = stmt.match(
+    /^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:["`]?\w+["`]?\.)?["`]?(\w+)["`]?/i
+  );
+  if (!dropMatch) return undefined;
+  const tableName = dropMatch[1] ?? "<unknown>";
+
+  if (desiredSet.has(tableName.toLowerCase())) {
+    // Intentional drop — rebuild pattern, system-table refresh, etc.
+    return true;
+  }
+
+  // Internal framework tables (nextly_ prefix: ledger, migrate lock, meta)
+  // are bootstrapped out-of-band and never part of the desired schema. Block
+  // their drop SILENTLY — they must never be dropped, and warning on every
+  // reconcile is just noise. (User/collection slugs can't start with
+  // `nextly_` — the slug validator reserves that prefix.)
+  if (tableName.toLowerCase().startsWith("nextly_")) {
+    return false;
+  }
+
+  // Localized companion tables are migration-owned (Option B) and never part
+  // of the desired schema. Block their drop SILENTLY — the localization
+  // migration layer owns their lifecycle; warning on every reconcile is noise.
+  if (isCompanionTable(tableName)) {
+    return false;
+  }
+
+  // Accidental drop — table not in desired schema. Block and log so
+  // operators see the protection.
+  consoleLogger.warn(
+    `[Nextly schema] Blocked DROP TABLE "${tableName}" emitted by ` +
+      `drizzle-kit pushSchema (table not in current desired schema). ` +
+      `If this drop was intentional, route it through the ` +
+      `pre-resolution executor with explicit user confirmation. ` +
+      `(managed=${isManagedTable(tableName)})`
+  );
+  return false;
+}
+
+/**
+ * DROP SEQUENCE / DROP INDEX: blocked when the inferred owner table is not in
+ * desiredSet (longest-prefix match — see inferOwnerTableFromObjectName).
+ */
+function orphanDropVerdict(
+  stmt: string,
+  desiredSet: ReadonlySet<string>
+): Verdict {
+  for (const { kind, re } of ORPHAN_DROP_PATTERNS) {
+    const m = stmt.match(re);
+    if (!m) continue;
+    const objectName = m[1] ?? "";
+    if (inferOwnerTableFromObjectName(objectName, desiredSet) !== null) {
+      return true;
+    }
+    consoleLogger.warn(
+      `[Nextly schema] Blocked DROP ${kind} "${objectName}" emitted by ` +
+        `drizzle-kit pushSchema (owner table not in current desired ` +
+        `schema or name is non-conventional). If this drop was ` +
+        `intentional, route it through the pre-resolution executor ` +
+        `with explicit user confirmation, or drop it manually before ` +
+        `re-running if the ${kind.toLowerCase()} name is custom.`
+    );
+    return false;
+  }
+  return undefined;
+}
+
+/**
+ * Strip the kit's DROP INDEX emissions for indexes the desired snapshot
+ * DECLARES.
+ *
+ * The Drizzle tables handed to drizzle-kit declare no dynamic-table indexes
+ * (see index-restore.ts), so v1's differ reads every live secondary index on
+ * a declared table as undeclared and emits `DROP INDEX` for it — even on a
+ * no-op apply (probe-verified on the sqlite payload). The ownership-based
+ * drop-guard deliberately allows drops whose owner table is in the desired
+ * set, so these emissions would strip a managed table's tracked indexes with
+ * nothing putting them back (the restore step replays only rebuilt tables
+ * and standalone add_index ops). An index the snapshot tracks can only be
+ * dropped by Nextly's own diff (a drop_index op), never by the kit.
+ *
+ * Applied on every dialect. PostgreSQL scopes the kit's introspection with
+ * `tablesFilter`, which narrows but does not remove the emission: the kit
+ * has been observed there dropping a managed table's `<table>_pkey` after a
+ * metadata-only field-type change (see the routing docblock in
+ * `ddl-emitter/index.ts`). Since the guard only ever removes a drop of an
+ * index the desired snapshot itself declares, covering PG costs nothing and
+ * closes that case on the kit route too.
+ *
+ * Returns the stripped count so the caller can report it once per apply
+ * rather than per statement: this decides, per apply, that a destructive
+ * statement from the kit is wrong, and that decision should be observable.
+ */
+export function stripKitDropsOfDeclaredIndexes(
+  statements: string[],
+  desired: NextlySnapshotLike,
+  /**
+   * Live indexes that stand in for a declared one under another name
+   * (`liveIndexesStandingInForDeclared`). Kept like a declared index: the
+   * diff reads each as the declared index it matches, plans nothing for it,
+   * and so nothing would put that index back once the kit dropped it.
+   */
+  standingIn: ReadonlyArray<{ tableName: string; indexName: string }> = []
+): { kept: string[]; strippedCount: number } {
+  // Two keys per declared index: the bare name, and the name qualified by
+  // its table. MySQL scopes index names per table and spells the table in
+  // the statement (`DROP INDEX x ON t`), so its drops are matched on the
+  // qualified key and a same-named index on another table is left alone.
+  // SQLite (global index namespace) and PostgreSQL (schema-scoped) name no
+  // table in the statement, so those match on the bare name — which is
+  // unambiguous exactly because the name is unique in that scope.
+  const declaredNames = new Set<string>();
+  const declaredQualified = new Set<string>();
+  const declare = (tableName: string, indexName: string): void => {
+    declaredNames.add(indexName.toLowerCase());
+    declaredQualified.add(
+      `${tableName.toLowerCase()}.${indexName.toLowerCase()}`
+    );
+  };
+  for (const table of desired.tables) {
+    for (const index of table.indexes ?? []) {
+      declare(table.name, index.name);
+    }
+    // A primary key is declared on the COLUMN, never in `indexes`, but
+    // PostgreSQL materialises it as an index named `<table>_pkey` and the kit
+    // has been observed emitting a drop for exactly that. The ownership
+    // filter would allow it — the owner table is in the desired schema — and
+    // executing it fails on the dependent constraint. Declaring the
+    // convention name here is what puts a primary key under the same
+    // protection as the indexes beside it.
+    if (desired.tables.length > 0 && table.columns?.some(c => c.primaryKey)) {
+      declare(table.name, `${table.name}_pkey`);
+    }
+  }
+  // The rule for a live index that IS wanted: one the diff matches to a
+  // declared index by key, whatever its name (a unique index an earlier
+  // release created under drizzle's `<table>_<column>_unique`, say), is that
+  // declared index as far as every plan is concerned, so only a planned
+  // drop_index may remove it. A live index NOT wanted is the diff's to drop,
+  // through its own op, and is not among these.
+  for (const { tableName, indexName } of standingIn) {
+    declare(tableName, indexName);
+  }
+  if (declaredNames.size === 0) {
+    return { kept: statements, strippedCount: 0 };
+  }
+
+  let strippedCount = 0;
+  const kept = statements.filter(stmt => {
+    // A quoted identifier holding anything outside [A-Za-z0-9_] does not
+    // match, and a non-match KEEPS the statement — the fail-safe direction:
+    // an unrecognised drop is left for the drop-guard to judge rather than
+    // silently removed here. `pinned-fail-safe` in the tests locks that in.
+    const m = stmt.match(
+      /^DROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?(?:["`]?\w+["`]?\.)?["`]?(\w+)["`]?(?:\s+ON\s+(?:["`]?\w+["`]?\.)?["`]?(\w+)["`]?)?/i
+    );
+    if (!m) return true;
+    const name = (m[1] ?? "").toLowerCase();
+    const onTable = m[2]?.toLowerCase();
+    const isDeclared = onTable
+      ? declaredQualified.has(`${onTable}.${name}`)
+      : declaredNames.has(name);
+    if (isDeclared) strippedCount++;
+    return !isDeclared;
+  });
+  return { kept, strippedCount };
+}
+
+/**
+ * Remove drizzle-kit's drops of the checks and foreign keys the desired
+ * schema declares.
+ *
+ * The same reasoning as {@link stripKitDropsOfDeclaredIndexes}, for the other
+ * two kinds of element the snapshot tracks. On PostgreSQL and MySQL the
+ * runtime tables carry no constraints — they are created by their own
+ * statements — so the kit reads every live check and foreign key on a table
+ * it compares as undeclared and drops it. Only this pipeline's own
+ * `drop_check` / `drop_foreign_key` removes one. MySQL also backs a foreign
+ * key with an index of the same name, and the kit drops that alongside it.
+ *
+ * Matched per table, because a constraint name is only unique within one on
+ * MySQL. A statement this does not recognise is KEPT, the same fail-safe
+ * direction as the index guard.
+ */
+export function stripKitDropsOfDeclaredConstraints(
+  statements: string[],
+  desired: NextlyConstraintSnapshotLike
+): { kept: string[]; strippedCount: number } {
+  const declared = new Set<string>();
+  const foreignKeyNames = new Set<string>();
+  for (const table of desired.tables) {
+    const tableName = table.name.toLowerCase();
+    for (const check of table.checks ?? []) {
+      declared.add(`${tableName}.${check.name.toLowerCase()}`);
+    }
+    for (const fk of table.foreignKeys ?? []) {
+      declared.add(`${tableName}.${fk.name.toLowerCase()}`);
+      foreignKeyNames.add(`${tableName}.${fk.name.toLowerCase()}`);
+    }
+  }
+  if (declared.size === 0) return { kept: statements, strippedCount: 0 };
+
+  let strippedCount = 0;
+  const kept = statements.filter(stmt => {
+    const drop = constraintDropOf(stmt);
+    const isDeclared =
+      drop !== null &&
+      (drop.form === "alter" ? declared : foreignKeyNames).has(drop.key);
+    if (isDeclared) strippedCount++;
+    return !isDeclared;
+  });
+  return { kept, strippedCount };
+}
+
+/**
+ * The `table.name` key, lower-cased, of a drizzle-kit drop of a constraint or
+ * of an index, in the spelling it came in: PostgreSQL's and MySQL's `ALTER
+ * TABLE ... DROP CONSTRAINT | FOREIGN KEY | CHECK` (`alter`), and MySQL's
+ * `DROP INDEX ... ON` (`index`). `null` for any other statement, which
+ * every strip keeps. One reading, shared by every strip, so they cannot
+ * disagree about what a statement drops.
+ */
+function constraintDropOf(
+  stmt: string
+): { key: string; form: "alter" | "index" } | null {
+  const alter = stmt.match(
+    /^ALTER\s+TABLE\s+(?:["`]?\w+["`]?\.)?["`]?(\w+)["`]?\s+DROP\s+(?:CONSTRAINT|FOREIGN\s+KEY|CHECK)\s+(?:IF\s+EXISTS\s+)?["`]?(\w+)["`]?\s*;?\s*$/i
+  );
+  if (alter) {
+    return {
+      key: `${alter[1].toLowerCase()}.${alter[2].toLowerCase()}`,
+      form: "alter",
+    };
+  }
+  const index = stmt.match(
+    /^DROP\s+INDEX\s+["`]?(\w+)["`]?\s+ON\s+(?:["`]?\w+["`]?\.)?["`]?(\w+)["`]?\s*;?\s*$/i
+  );
+  return index
+    ? {
+        key: `${index[2].toLowerCase()}.${index[1].toLowerCase()}`,
+        form: "index",
+      }
+    : null;
+}
+
+/**
+ * Remove drizzle-kit's drops of the columns a push keeps for a plugin that is
+ * no longer configured (`ownership/kept-elements.ts`).
+ *
+ * The kit's runtime tables are built from the configuration, which no longer
+ * declares those columns, so it reads each as removed and drops it with its
+ * values. The desired snapshot keeps them, and only this pipeline's own
+ * `drop_column` removes a column. Matched only as a statement that drops one
+ * column and does nothing else, per table; any other spelling is KEPT, for
+ * the destructive scan to refuse.
+ */
+export function stripKitDropsOfKeptColumns(
+  statements: string[],
+  kept: ReadonlyArray<{ table: string; name: string }>
+): { kept: string[]; strippedCount: number } {
+  if (kept.length === 0) return { kept: statements, strippedCount: 0 };
+  const keys = new Set(
+    kept.map(c => `${c.table.toLowerCase()}.${c.name.toLowerCase()}`)
+  );
+  let strippedCount = 0;
+  const out = statements.filter(stmt => {
+    const m = stmt.match(
+      /^ALTER\s+TABLE\s+(?:["`]?\w+["`]?\.)?["`]?(\w+)["`]?\s+DROP\s+(?:COLUMN\s+)?["`]?(\w+)["`]?\s*;?\s*$/i
+    );
+    if (!m) return true;
+    const isKept = keys.has(`${m[1].toLowerCase()}.${m[2].toLowerCase()}`);
+    if (isKept) strippedCount++;
+    return !isKept;
+  });
+  return { kept: out, strippedCount };
+}
+
+/**
+ * Remove drizzle-kit's drops of the live UNIQUE constraints a save keeps.
+ *
+ * A Schema Builder table gets one inline from its own DDL, on a one-to-one
+ * relationship's column, and the snapshot tracks it only as the live unique
+ * index backing it. The kit's runtime tables carry no constraints on
+ * PostgreSQL and MySQL, so on any apply it handles the kit reads the
+ * constraint as undeclared and drops it, and the column then takes
+ * duplicates. Which constraints are kept is decided by
+ * `liveUniqueConstraintsToKeep`: those a desired field still makes unique,
+ * less any this apply drops itself. SQLite's runtime tables declare theirs
+ * instead (`uniqueColumns`), since a rebuild there recreates the table.
+ *
+ * Both spellings of the drop are matched, per table: PostgreSQL's `ALTER
+ * TABLE ... DROP CONSTRAINT` and MySQL's `DROP INDEX ... ON`, as
+ * {@link stripKitDropsOfDeclaredConstraints} reads them. A statement this
+ * does not recognise is KEPT.
+ */
+export function stripKitDropsOfLiveUniqueConstraints(
+  statements: string[],
+  /** `table.constraint` keys, lower-cased, of the constraints to keep. */
+  keep: ReadonlySet<string>
+): { kept: string[]; strippedCount: number } {
+  if (keep.size === 0) return { kept: statements, strippedCount: 0 };
+
+  let strippedCount = 0;
+  const kept = statements.filter(stmt => {
+    const drop = constraintDropOf(stmt);
+    const isKept = drop !== null && keep.has(drop.key);
+    if (isKept) strippedCount++;
+    return !isKept;
+  });
+  return { kept, strippedCount };
+}
+
+/** The snapshot slice {@link stripKitDropsOfDeclaredConstraints} reads. */
+interface NextlyConstraintSnapshotLike {
+  tables: ReadonlyArray<{
+    name: string;
+    checks?: ReadonlyArray<{ name: string }>;
+    foreignKeys?: ReadonlyArray<{ name: string }>;
+  }>;
+}
+
+/** The snapshot slice {@link stripKitDropsOfDeclaredIndexes} reads. */
+interface NextlySnapshotLike {
+  tables: ReadonlyArray<{
+    name: string;
+    indexes?: ReadonlyArray<{ name: string }>;
+    columns?: ReadonlyArray<{ primaryKey?: boolean }>;
+  }>;
+}
+
+/**
+ * Statement patterns that name the table they act on directly. Used to decide
+ * which table a statement belongs to when filtering by ownership.
+ *
+ * Identifiers are captured as `[\w-]+` rather than `\w+`: a collection may
+ * declare a custom `dbName` containing hyphens, which the runtime and
+ * `resolveCollectionTableName` both keep verbatim. Capturing only up to the
+ * hyphen would yield a prefix that matches no locked table, so a statement
+ * against `dc_my-table` would slip through the ownership filter entirely.
+ */
+const STATEMENT_TABLE_PATTERNS: ReadonlyArray<RegExp> = [
+  /^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:["`]?[\w-]+["`]?\.)?["`]?([\w-]+)["`]?/i,
+  /^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:["`]?[\w-]+["`]?\.)?["`]?([\w-]+)["`]?/i,
+  /^DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:["`]?[\w-]+["`]?\.)?["`]?([\w-]+)["`]?/i,
+  /^INSERT\s+INTO\s+(?:["`]?[\w-]+["`]?\.)?["`]?([\w-]+)["`]?/i,
+  /^CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:["`]?[\w-]+["`]?\s+)?ON\s+(?:["`]?[\w-]+["`]?\.)?["`]?([\w-]+)["`]?/i,
+];
+
+/**
+ * Resolve the table a statement acts on, or `null` when it can't be determined.
+ *
+ * SQLite rebuilds a table by building a `__new_<table>` twin and renaming it
+ * over the original, so a statement naming `__new_dc_posts` is really a
+ * statement about `dc_posts`. Stripping the prefix keeps every step of a
+ * rebuild block attributed to the same table — filtering only some of them
+ * would leave a half-applied rebuild behind.
+ */
+function statementTargetTable(stmt: string): string | null {
+  for (const re of STATEMENT_TABLE_PATTERNS) {
+    const m = stmt.match(re);
+    if (!m?.[1]) continue;
+    return m[1].toLowerCase().replace(/^__new_/, "");
+  }
+  return null;
+}
+
+/**
+ * Drop statements that would modify a table the caller does not own.
+ *
+ * A Schema Builder save must only ever touch the entity being edited. The
+ * pipeline already filters its own operations by lock, but drizzle-kit is
+ * handed the full desired schema and re-derives drift independently, so on
+ * dialects where the kit path runs (SQLite and MySQL always; PostgreSQL when
+ * the emitter can't fast-path) it can still emit DDL for a locked, code-first
+ * or plugin-owned table. This is the backstop that makes the guarantee hold on
+ * every dialect rather than only where scope reduction happens to apply.
+ *
+ * Statements whose table cannot be identified pass through: they are almost
+ * always schema-wide (sequences, enums) and blocking an unrecognized statement
+ * would break applies that are otherwise legitimate. The unsafe-statement
+ * filter remains the guard against destructive emissions.
+ */
+export function excludeLockedTableStatements(
+  statements: string[],
+  lockedTableNames: ReadonlySet<string>
+): { kept: string[]; skipped: string[] } {
+  if (lockedTableNames.size === 0) {
+    return { kept: statements, skipped: [] };
+  }
+  const locked = new Set([...lockedTableNames].map(t => t.toLowerCase()));
+
+  const kept: string[] = [];
+  const skipped: string[] = [];
+  for (const stmt of statements) {
+    const table = statementTargetTable(stmt);
+    if (table !== null && locked.has(table)) skipped.push(stmt);
+    else kept.push(stmt);
+  }
+  return { kept, skipped };
+}
+
+/**
+ * Lower-cased names of tables a statement set rebuilds.
+ *
+ * SQLite cannot alter most of a column in place, so drizzle-kit emits
+ * CREATE `__new_x` → INSERT SELECT → DROP `x` → RENAME `__new_x` TO `x`. The
+ * closing rename identifies the table, and only when it renames back to the
+ * name it replaced: `ALTER TABLE __new_g1 RENAME TO other` is not a rebuild
+ * of `g1` and must not be read as one.
+ *
+ * Shared rather than re-derived. The destructive scanner uses it to know
+ * which DROPs are part of a rebuild; the index restore uses it to know which
+ * tables lost their indexes to one. A second pattern that disagreed with this
+ * one would make the two answer differently about the same batch.
+ */
+export function rebuiltTableNames(statements: readonly string[]): Set<string> {
+  // The replacement table has to have been built in this same batch. A rename
+  // on its own proves only that something took the table's name: for
+  // `DROP TABLE posts; ALTER TABLE __new_posts RENAME TO posts` there is no
+  // create and no copy, so the rows are gone and the drop is a real one that
+  // the destructive guard must still refuse. Pairing the rename with its
+  // create is what makes this the rebuild it claims to be.
+  const created = new Set<string>();
+  for (const s of statements) {
+    const m = s.match(
+      /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:[`"]?[A-Za-z0-9_]+[`"]?\.)?[`"]?__new_([A-Za-z0-9_]+)[`"]?/i
+    );
+    if (m) created.add((m[1] ?? "").toLowerCase());
+  }
+
+  const targets = new Set<string>();
+  for (const s of statements) {
+    const m = s.match(
+      // Optionally schema-qualified and/or quoted: `__new_x`, "__new_x",
+      // "main"."__new_x", main.__new_x.
+      /ALTER\s+TABLE\s+(?:[`"]?[A-Za-z0-9_]+[`"]?\.)?[`"]?__new_([A-Za-z0-9_]+)[`"]?\s+RENAME\s+TO\s+(?:[`"]?[A-Za-z0-9_]+[`"]?\.)?[`"]?([A-Za-z0-9_]+)[`"]?/i
+    );
+    if (!m) continue;
+    const from = (m[1] ?? "").toLowerCase();
+    const to = (m[2] ?? "").toLowerCase();
+    if (from === to && created.has(from)) targets.add(from);
+  }
+  return targets;
+}
+
+/**
+ * A statement with the contents of every single-quoted string literal
+ * removed, the quotes kept. A doubled quote inside a literal is part of it.
+ * Identifiers are quoted with `"` or backticks and are left as they are.
+ */
+function withoutStringLiterals(statement: string): string {
+  return statement.replace(/'(?:[^']|'')*'/g, "''");
+}
+
+/**
+ * v1 drizzle-kit INCLUDES destructive statements in sqlStatements (hints are
+ * empty even for drops — observed on SQLite, Postgres and MySQL, 2026-07).
+ * By the time the pipeline's Phase D runs, every user-approved destructive
+ * operation has already been executed by the pre-resolution executor, so any
+ * DROP TABLE / DROP COLUMN remaining in the kit's additive remainder is
+ * unexpected and must fail the apply.
+ *
+ * Exception: SQLite's table-rebuild block (CREATE `__new_x` → INSERT SELECT →
+ * DROP TABLE x → RENAME `__new_x` TO x) is data-preserving — its internal
+ * DROP targets a table that is being rebuilt, identified by a matching
+ * `__new_<table>` RENAME in the same statement set.
+ */
+export function findUnexpectedDestructiveStatements(
+  statements: string[],
+  // When provided (the pipeline's Phase D, which KNOWS the approved
+  // operations), a rebuild block is only exempt if Nextly's own diff
+  // approved a rebuild-justifying change for that table. This closes the
+  // hole where the kit encodes a column DROP as a "rebuild" (CREATE __new_
+  // without the column + INSERT of survivors + DROP + RENAME — verified
+  // rc.4 emission): text-level the block looks data-preserving, but if
+  // Nextly approved no change to that table, the kit's differ disagrees
+  // with ours and the block must fail the apply. The boot-time fresh-push
+  // path passes nothing here (it has no op context) and keeps the
+  // exemption — its reconcile legitimately rebuilds drifted core tables.
+  allowedRebuildTables?: Set<string>,
+  // When provided, restrict the scan to destructive statements that target a
+  // MANAGED table (a table in the desired schema). This lets the caller run
+  // the scan on the RAW kit output — BEFORE filterUnsafeStatements — so the
+  // guarantee no longer rests on the filter having correctly stripped every
+  // orphan drop first. Drops of tables/objects
+  // outside the desired schema are the expected orphan emission the filter
+  // handles separately; identifying them by table membership here (rather than
+  // by "the filter already removed it") makes the destructive-on-managed
+  // guard independent of the filter. Omitted on the fresh-push boot path,
+  // which has no desired-table context and scans everything.
+  managedTables?: Set<string>
+): string[] {
+  // A statement only counts as an offender when it hits a table we manage.
+  // With no managed set, every table is in scope (fresh-push boot path).
+  const targetsManaged = (table: string): boolean =>
+    managedTables === undefined || managedTables.has(table.toLowerCase());
+
+  const rebuildTargets = rebuiltTableNames(statements);
+  const offenders: string[] = [];
+  for (const statement of statements) {
+    // Matched with its string literals blanked, so the text inside one — a
+    // check admitting the value 'drop off' — is never read as a statement's
+    // own verb. Reported as written.
+    const s = withoutStringLiterals(statement);
+    // Whatever `managedTables` says: a schema is not a table, and dropping one
+    // takes every managed table in it along.
+    if (isDropSchemaStatement(s)) {
+      offenders.push(statement);
+      continue;
+    }
+    const dropTable = s.match(
+      // Skip an optional schema qualifier so `DROP TABLE "main"."posts"`
+      // captures `posts`, not `main`.
+      /\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:[`"]?[A-Za-z0-9_]+[`"]?\.)?[`"]?([A-Za-z0-9_]+)[`"]?/i
+    );
+    if (dropTable) {
+      const target = (dropTable[1] ?? "").toLowerCase();
+      // A drop of a non-managed table is the expected orphan emission
+      // (stripped by filterUnsafeStatements); it is never an offender here.
+      if (!targetsManaged(target)) continue;
+      const isRebuild = rebuildTargets.has(target);
+      const rebuildApproved =
+        allowedRebuildTables === undefined || allowedRebuildTables.has(target);
+      if (!isRebuild || !rebuildApproved) offenders.push(statement);
+      continue;
+    }
+    // The COLUMN keyword is OPTIONAL in both PG and MySQL
+    // (`ALTER TABLE t DROP "body"` drops the column) — match both forms,
+    // scoped to ALTER TABLE so DROP INDEX/CONSTRAINT statements aren't
+    // misclassified. TRUNCATE is destructive by definition and must never
+    // appear on an additive remainder — fail closed on it too.
+    const alterDropColumn = s.match(
+      /\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:[`"]?[A-Za-z0-9_]+[`"]?\.)?[`"]?([A-Za-z0-9_]+)[`"]?[^;]*\bDROP\s+(?:COLUMN\s+)?[`"]?[A-Za-z0-9_]+[`"]?/i
+    );
+    // Judged per DROP clause: one ALTER can drop a constraint AND a column,
+    // and excluding the whole statement for its constraint clause let the
+    // column drop through.
+    const dropsAColumn =
+      /\bDROP\s+(?!(?:CONSTRAINT|INDEX|KEY|FOREIGN\s+KEY|PRIMARY\s+KEY|CHECK|DEFAULT|NOT\s+NULL)\b)(?:COLUMN\b|[`"]?[A-Za-z0-9_]+)/i.test(
+        s
+      );
+    if (alterDropColumn && dropsAColumn) {
+      if (targetsManaged(alterDropColumn[1] ?? "")) offenders.push(statement);
+      continue;
+    }
+    const truncate = s.match(
+      /\bTRUNCATE\s+(?:TABLE\s+)?(?:[`"]?[A-Za-z0-9_]+[`"]?\.)?[`"]?([A-Za-z0-9_]+)[`"]?/i
+    );
+    if (truncate && targetsManaged(truncate[1] ?? ""))
+      offenders.push(statement);
+  }
+  return offenders;
+}

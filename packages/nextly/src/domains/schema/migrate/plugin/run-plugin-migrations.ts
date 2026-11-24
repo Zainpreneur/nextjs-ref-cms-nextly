@@ -1,0 +1,1491 @@
+/**
+ * Applying each plugin's migrations, in resolver order, under the one lock.
+ *
+ * Runs between the core reconcile and the app's own files. Plugins go first
+ * because app migrations may index entity tables that plugins contribute, and
+ * an index on a table that does not exist is not a recoverable error.
+ *
+ * ## The three-way decision is `reconcileFile`'s, not a second one
+ *
+ * Each module goes through the SAME state machine the app's files do
+ * (`reconcileFile`): live == before runs the UP, live == target records the
+ * module as already applied (the dev-push adoption case), and neither is a
+ * drift error naming the difference. Adoption is not re-implemented here,
+ * because a second comparison would eventually disagree with the first about
+ * what "equal" means, and the disagreement would surface as a plugin module
+ * that refuses a database the app path would accept.
+ *
+ * What this adds is a question the snapshots cannot answer: whether a module
+ * the database already holds the result of may be recorded at all
+ * (`pastModuleRuns`). Asked with the reconcile's own equivalence over the
+ * same sides, so the two never disagree about where the database stands.
+ *
+ * ## The first failure stops everything
+ *
+ * Later plugins and the app phase do not run. That is today's behaviour for
+ * app files, and the reason is the same: migrations after a failed one assume
+ * a database state that was never reached.
+ *
+ * @module domains/schema/migrate/plugin/run-plugin-migrations
+ * @since 1.0.0
+ */
+import { CORE_TABLE_NAMES } from "../../../../schemas/core-schema";
+import type { SupportedDialect } from "../../../../database/schema-registry";
+import { pluginCollectionSources } from "./plugin-collection-sources";
+import { describeError } from "../../../../errors/describe-error";
+import { NextlyError } from "../../../../errors/nextly-error";
+import { newestEvent, newestEventsByFilename } from "../../events/newest-event";
+import type { SchemaEventRow } from "../../events/schema-events-repository";
+import {
+  assertNotPartiallyApplied,
+  attemptCleared,
+  reconcileFile,
+  recordAlreadyApplied,
+  snapshotsEquivalent,
+  type ReconcileFileArgs,
+  type ReconcileRepo,
+} from "../drift-reconcile";
+import { assertRunnableStatements, statementRefusals } from "../split-sql";
+import type { ServerConstructCapabilities } from "../../extension/build-extension-schema";
+import {
+  constructsAdded,
+  refuseUnitTheServerCannotHold,
+  type AddedConstructs,
+} from "../server-constructs";
+import type { NextlySchemaSnapshot } from "../../pipeline/diff/types";
+
+import { assertModuleForeignKeysResolve } from "./module-foreign-keys";
+import {
+  assertAppliedUnchanged,
+  assertModuleIntact,
+  moduleSql,
+  orderedMigrations,
+  pluginModuleStatements,
+  qualifiedFilename,
+  type PluginMigration,
+  type PluginMigrationSnapshot,
+} from "./plugin-migration";
+import type { PluginDefinition } from "../../../../plugins/plugin-context";
+import {
+  assertNoForeignDrops,
+  type LiveColumns,
+  type LiveElements,
+} from "../../ownership/drop-guard";
+import {
+  assertNoOwnerChange,
+  type OwnerRecord,
+} from "../../ownership/owner-registry";
+import {
+  mergeContributions,
+  narrowToContributions,
+  NO_ELEMENTS,
+} from "../../migrate-create/app-stream";
+import { upRendersItsSides } from "../../migrate-create/generate-plugin";
+
+import { moduleEffects } from "./module-effects";
+import { assertPluginHistories } from "./plugin-history";
+import { recordedContributions } from "./recorded-contributions";
+
+/** One plugin's migrations, in the order the resolver placed the plugin. */
+export interface PluginMigrationSet {
+  pluginName: string;
+  pluginVersion: string;
+  migrations: readonly PluginMigration[];
+}
+
+export interface RunPluginMigrationsDeps {
+  dialect: SupportedDialect;
+  /** Applied `file_apply` rows keyed by qualified filename. */
+  appliedShas: ReadonlyMap<string, string | null>;
+  /**
+   * The connected server's construct capabilities, from the adapter's
+   * `getCapabilities()`. Set by callers with a server behind them, so a
+   * shipped module whose snapshot declares a check the server will not
+   * enforce, or an expression index it cannot build, is refused before any
+   * module runs — the apply-side judgement for modules generated for every
+   * dialect with no one server to ask at generation.
+   */
+  serverConstructs?: ServerConstructCapabilities;
+  /**
+   * Every table the database holds before the run. A module's key may reach a
+   * table that already exists — an installed dependency's, one the app
+   * adopted, any the database held — as well as one an earlier stream of the
+   * run creates. Absent, only core tables and earlier streams' count.
+   */
+  existingTables?: () => Promise<ReadonlySet<string>>;
+  /**
+   * Every plugin the configuration declares, a plugin whose list is empty
+   * included, so a module the ledger records applied for it is found missing
+   * (`assertPluginHistories`). Absent, only the plugins in the sets are
+   * judged.
+   */
+  declaredPlugins?: ReadonlySet<string>;
+  /** The live tables for a set of names, as a snapshot. */
+  /**
+   * The live tables for a set of names, as THIS stream should see them:
+   * elements another stream owns are the caller's to exclude, which is why
+   * the stream identity travels with the call.
+   */
+  introspect: (
+    tableNames: readonly string[],
+    stream: string
+  ) => Promise<NextlySchemaSnapshot>;
+  /**
+   * Execute one module's UP — in one transaction unless the module is marked
+   * `transaction: false` — then `after` with the handle it ran on, inside
+   * that transaction when there is one; returns statements run.
+   */
+  executeSql: ReconcileFileArgs["executeSql"];
+  /** See `ReconcileFileArgs.recordStopped`: a module's busy-table stop, recorded within a bound. */
+  recordStopped?: ReconcileFileArgs["recordStopped"];
+  /** Ledger rows are recorded through this — `reconcileFile`'s own repo. */
+  repo: ReconcileRepo;
+  /**
+   * Table-level owner records for the drop guard. Absent (or empty) when no
+   * registry is available, which reads as "no table is claimed": a module
+   * may then drop only tables it creates itself.
+   */
+  owners?: ReadonlyMap<string, OwnerRecord>;
+  /**
+   * Every owner record, element rows included, for the drop guard's column
+   * check.
+   */
+  elementOwners?: readonly OwnerRecord[];
+  /**
+   * The live columns of the tables a module's statements rebuild, read just
+   * before that module is judged (`readLiveColumns`). Absent, a rebuild is
+   * read as the drop it would otherwise be.
+   */
+  liveColumns?: (statements: readonly string[]) => Promise<LiveColumns>;
+  /**
+   * The live indexes, foreign keys and checks of the tables a module's
+   * statements rebuild, read just before that module is judged
+   * (`readLiveElements`). Absent, a rebuild is read as the drop it would
+   * otherwise be.
+   */
+  liveElements?: (statements: readonly string[]) => Promise<LiveElements>;
+  /**
+   * The tables a module's statements create that exist already, read just
+   * before that module is judged (`readLiveTables`), so a table an earlier
+   * module of the run made counts. Absent, the guard credits a module with
+   * no table it creates.
+   */
+  liveTables?: (statements: readonly string[]) => Promise<ReadonlySet<string>>;
+  /**
+   * The table each index a module's statements name without one is on, read
+   * just before that module is judged (`readLiveIndexTables`). Absent, such
+   * an index is judged as one on a table no record claims.
+   */
+  liveIndexTables?: (
+    statements: readonly string[]
+  ) => Promise<ReadonlyMap<string, string>>;
+  /**
+   * Refuses a module whose statements make a column required over rows that would break it,
+   * counted just before that module runs and before the ledger records an attempt
+   * (`refuseRequiredColumnsOverNulls`, as an app file is judged). `source` is the module's
+   * qualified name. Absent, such a change is left to the per-statement count and the database.
+   */
+  refuseRequiredColumns?: (
+    statements: readonly string[],
+    source: string
+  ) => Promise<void>;
+  /**
+   * At most this many modules are applied or adopted, across every plugin,
+   * in run order. Absent, or not a positive number, every pending module is.
+   *
+   * The plugin phase's share of `nextly migrate --step N`, which counts a
+   * plugin's modules as it counts the app's files — including one recorded
+   * as applied because the database already stands where it leads, as an
+   * adopted app file is.
+   */
+  limit?: number;
+  /** Owner-registry upsert after a module lands or is adopted. */
+  recordOwner: (args: {
+    pluginName: string;
+    pluginVersion: string;
+    schemaVersion: number;
+    tables: readonly string[];
+    adopted: boolean;
+    /**
+     * The handle to write through: the one the module's statements ran on,
+     * so in a transaction its owner rows commit or roll back with them.
+     * Absent, the run's own.
+     */
+    db?: unknown;
+  }) => Promise<void>;
+}
+
+export interface PluginMigrationRunResult {
+  applied: number;
+  adopted: number;
+  skipped: number;
+}
+
+/**
+ * The sets one run should apply, from the config's plugin list, in the order
+ * the resolver produces.
+ *
+ * Every caller — the CLI command, production boot and development boot —
+ * reaches it through `pluginMigrationArgs` and builds nothing of its own, so
+ * none can disagree about which plugins ship migrations or the order they run
+ * in.
+ */
+export async function pluginMigrationSetsFrom(
+  plugins: readonly PluginDefinition[]
+): Promise<PluginMigrationSet[]> {
+  // Dynamic for the same cycle reason the CLI command loads it: the module
+  // sits on a cycle that closes through the commands.
+  const { topoSortPlugins } = await import("../../../../plugins/topo-sort");
+  return (
+    topoSortPlugins([...plugins])
+      // DISABLED plugins included, matching the compile side. `enabled: false`
+      // stops a plugin running, not its tables existing: its schema stays in the
+      // compiled model, so its modules have to be applied or production would
+      // hold a shape the model says is there and the database does not. The
+      // asymmetry was the bug — dev push created the tables from the model while
+      // production skipped the modules that create them.
+      .filter(
+        plugin => (plugin.contributes?.schema?.migrations?.length ?? 0) > 0
+      )
+      .map(plugin => ({
+        pluginName: plugin.name,
+        pluginVersion: plugin.version,
+        migrations: plugin.contributes!.schema!.migrations!,
+      }))
+  );
+}
+
+/**
+ * The two arguments `migrateCore` takes about plugin migrations, from one read
+ * of the config's plugin list.
+ *
+ * `pluginsWithMigrations` is not optional: `migrateCore` checks every active
+ * plugin table against it BEFORE its plugin phase can apply anything, so an
+ * empty set makes it reject every such table as having no production migration
+ * path — with the modules sitting right there in `pluginMigrationSets`. Passing
+ * one without the other, or neither, is how a caller stops migrating; deriving
+ * both here, for every caller, is what keeps them together.
+ */
+export async function pluginMigrationArgs(
+  plugins: readonly PluginDefinition[]
+): Promise<{
+  pluginMigrationSets: PluginMigrationSet[];
+  pluginsWithMigrations: Set<string>;
+  declaredPlugins: Set<string>;
+  collectionSources: Map<string, `plugin:${string}`>;
+}> {
+  const sets = await pluginMigrationSetsFrom(plugins);
+  return {
+    pluginMigrationSets: sets,
+    pluginsWithMigrations: new Set(sets.map(set => set.pluginName)),
+    // Every declared plugin, one shipping no modules included: the history
+    // check finds a module the ledger records applied for a plugin whose
+    // list has since emptied, which the sets above leave out.
+    declaredPlugins: new Set(plugins.map(plugin => plugin.name)),
+    // Who contributed each plugin collection, for a registry row the run
+    // creates: from the same plugin list, so the command and the boot agree.
+    collectionSources: pluginCollectionSources(plugins),
+  };
+}
+
+/**
+ * Apply every pending module for every plugin, stopping at the first failure.
+ *
+ * The order is the one the resolver produced, and it is the whole contract of
+ * this function: a plugin's migration may reference a table a dependency
+ * created.
+ */
+export async function runPluginMigrations(
+  sets: readonly PluginMigrationSet[],
+  deps: RunPluginMigrationsDeps
+): Promise<PluginMigrationRunResult> {
+  // Every plugin's whole history, before any module of any of them runs: a
+  // refusal in a later plugin would otherwise be found only after the
+  // earlier ones had applied. Over values in hand, so asked here as well as
+  // by `migrateCore` before its core reconcile.
+  assertPluginHistories({
+    lists: sets,
+    appliedShas: deps.appliedShas,
+    declaredPlugins: deps.declaredPlugins,
+  });
+  // The same whole-history discipline for the chain's own order: a module's
+  // key may not reach a table only one of the plugin's LATER modules
+  // creates, and finding that after earlier modules ran is finding it too
+  // late. Asked over each plugin's modules in run order, before any of them
+  // executes; a target no module of the owner names is another owner's or
+  // one the database already held, judged for reach at the declaration
+  // compile rather than by arrival.
+  await assertStreamKeysResolve(
+    sets,
+    deps.dialect,
+    deps.existingTables,
+    deps.appliedShas
+  );
+  // And for what the server itself can hold: a module generated for every
+  // dialect had no one server to be judged against, so pending modules are
+  // judged here, against the one about to run them — before any module of any
+  // plugin applies a check this server ignores or an expression index it
+  // cannot build. Already-applied modules are left alone so a pending module
+  // that removes an unsupported historical construct is not blocked by it.
+  if (deps.serverConstructs !== undefined) {
+    refusePendingConstructsTheServerCannotHold(sets, deps);
+  }
+  const result: PluginMigrationRunResult = {
+    applied: 0,
+    adopted: 0,
+    skipped: 0,
+  };
+  const budget = { remaining: moduleBudget(deps.limit) };
+  for (const set of sets) {
+    // A plugin after the budget ran out is left for the next run whole,
+    // rather than having its recorded modules re-judged now.
+    if (budget.remaining <= 0) break;
+    await runSet(set, deps, result, budget);
+  }
+  return result;
+}
+
+/**
+ * The modules a run over `appliedShas` applies, in the order it applies them
+ * and within `limit`: each one the history records no checksum for
+ * (`isPending`), walked as `runPluginMigrations` walks the sets
+ * (`orderedMigrations`, `moduleBudget`). What `nextly migrate` judges for
+ * the data its modules delete, before it runs them.
+ */
+export function pendingPluginModules(
+  sets: readonly PluginMigrationSet[],
+  appliedShas: ReadonlyMap<string, string | null>,
+  limit: number | undefined
+): { filename: string; migration: PluginMigration }[] {
+  const pending: { filename: string; migration: PluginMigration }[] = [];
+  let remaining = moduleBudget(limit);
+  for (const set of sets) {
+    for (const migration of orderedMigrations(set.migrations)) {
+      if (!isPending(set, migration, { appliedShas })) continue;
+      if (remaining <= 0) return pending;
+      pending.push({
+        filename: qualifiedFilename(set.pluginName, migration.name),
+        migration,
+      });
+      remaining -= 1;
+    }
+  }
+  return pending;
+}
+
+/**
+ * Refuse, before any module runs, a module whose key reaches a table that
+ * neither exists before the run nor is created earlier in it: by core, by a
+ * plugin ordered before this one, or by this plugin's own earlier modules
+ * (`assertModuleForeignKeysResolve`). Only modules the ledger does not record
+ * as applied are judged for that; the chain's own order is judged over all of
+ * them. A run and its preview ask this one question, so a dry run refuses what
+ * the run would.
+ */
+async function assertStreamKeysResolve(
+  sets: readonly PluginMigrationSet[],
+  dialect: SupportedDialect,
+  existingTables: (() => Promise<ReadonlySet<string>>) | undefined,
+  appliedShas: { has(key: string): boolean }
+): Promise<void> {
+  const available = new Set<string>(CORE_TABLE_NAMES);
+  for (const name of (await existingTables?.()) ?? []) available.add(name);
+  for (const set of sets) {
+    const ordered = orderedMigrations(set.migrations);
+    assertModuleForeignKeysResolve(set.pluginName, ordered, {
+      availableTables: available,
+      dialect,
+      // Only a module still to run reaches a table now; an applied one's key
+      // may name a table its owner has since dropped, after a later module
+      // took the key away.
+      pending: migration => isPending(set, migration, { appliedShas }),
+    });
+    for (const table of ordered.at(-1)?.snapshot[dialect]?.tables ?? []) {
+      available.add(table.name);
+    }
+  }
+}
+
+/**
+ * Refuse pending modules that would add a check the connected server will not
+ * enforce, or an expression index it cannot build, within `limit`: judged on
+ * what each module adds over the snapshot before it, and on the statements it
+ * would run (`server-constructs.ts`). Already-applied modules are left alone,
+ * so a pending module removing a construct an applied one added runs.
+ */
+function refusePendingConstructsTheServerCannotHold(
+  sets: readonly PluginMigrationSet[],
+  deps: {
+    dialect: SupportedDialect;
+    appliedShas: { has(key: string): boolean };
+    limit?: number;
+    serverConstructs?: ServerConstructCapabilities;
+  }
+): void {
+  const server = deps.serverConstructs;
+  if (server === undefined) return;
+  let remaining = moduleBudget(deps.limit);
+  for (const set of sets) {
+    const ordered = orderedMigrations(set.migrations);
+    for (const [at, migration] of ordered.entries()) {
+      if (!isPending(set, migration, deps)) continue;
+      if (remaining <= 0) return;
+      remaining -= 1;
+      refuseUnitTheServerCannotHold({
+        source: qualifiedFilename(set.pluginName, migration.name),
+        dialect: deps.dialect,
+        server,
+        statements: pluginModuleStatements(migration, deps.dialect, "up"),
+        added: constructsAddedByModule(ordered, at, deps.dialect),
+      });
+    }
+  }
+}
+
+/**
+ * The checks and indexes a module adds: on its own tables, every one its
+ * snapshot holds that the snapshot before it did not; on another owner's
+ * table, of those, only the ones this plugin's modules record as its own —
+ * the module carries a frozen copy of the whole table, whose other elements
+ * are the owner's to add and answer for.
+ */
+function constructsAddedByModule(
+  ordered: readonly PluginMigration[],
+  at: number,
+  dialect: SupportedDialect
+): AddedConstructs[] {
+  const migration = ordered[at];
+  const tables = (side?: Record<SupportedDialect, PluginMigrationSnapshot>) =>
+    side?.[dialect]?.tables ?? [];
+  const own = constructsAdded(
+    tables(migration.before),
+    tables(migration.snapshot)
+  );
+  const contributed = tables(migration.contributed);
+  if (contributed.length === 0) return own;
+  const recorded = recordedContributions(ordered.slice(0, at + 1), dialect);
+  const foreign = Object.fromEntries(
+    contributed.map(table => [table.name, recorded[table.name] ?? NO_ELEMENTS])
+  );
+  return [
+    ...own,
+    ...constructsAdded(
+      tables(migration.contributedBefore),
+      contributed,
+      foreign
+    ),
+  ];
+}
+
+/**
+ * How many modules a run may apply or adopt under `limit`
+ * (`RunPluginMigrationsDeps.limit`): all of them unless it is positive.
+ */
+function moduleBudget(limit: number | undefined): number {
+  return limit !== undefined && limit > 0 ? limit : Number.POSITIVE_INFINITY;
+}
+
+/**
+ * The applied plugin modules among the ledger's `file_apply` rows, keyed by
+ * qualified filename, with the sha256 that ran: the `appliedShas` a run is
+ * handed.
+ *
+ * The NEWEST event per filename decides it. A rolled_back event INSERTED
+ * after an applied one (the shape `migrate:down` records) means the module is
+ * not applied, however many older applied rows exist. It is read through
+ * `newestEventsByFilename`, the one helper every ledger reader shares, so a
+ * run, its preview, `migrate:down` and `plugins uninstall` cannot disagree
+ * about the same rows.
+ */
+export function appliedPluginShas(
+  rows: readonly SchemaEventRow[]
+): Map<string, string | null> {
+  const applied = new Map<string, string | null>();
+  for (const [filename, newest] of newestEventsByFilename([...rows])) {
+    if (filename.startsWith("plugin:") && newest.status === "applied") {
+      applied.set(filename, newest.sha256);
+    }
+  }
+  return applied;
+}
+
+/** One plugin module as `nextly migrate --dry-run` lists it. */
+export interface PluginModulePreview {
+  /** The module's ledger key (`qualifiedFilename`). */
+  filename: string;
+  /** False when the module runs outside a transaction. */
+  transaction: boolean;
+  /**
+   * Already recorded as applied. Such a module is listed only when a run
+   * would refuse it, since the run checks it again before going past it.
+   */
+  recorded: boolean;
+  /** What a real run would refuse the module for; empty when nothing. */
+  refusals: string[];
+}
+
+/**
+ * The modules a run over this ledger would reach, in the order it reaches
+ * them: each one it would apply or adopt within `limit`, and each recorded
+ * one it would refuse on the way. Reads nothing beyond `rows` and writes
+ * nothing.
+ *
+ * Walks the sets as `runPluginMigrations` and `runSet` do: the same history
+ * check over every plugin first (`assertPluginHistories`), thrown as a run
+ * throws it, the same order (`orderedMigrations`), the same pending test
+ * (`isPending` over `appliedPluginShas`) and the same budget
+ * (`moduleBudget`). A pending module is judged by the checks a run makes
+ * before it reads the live schema: its checksum (`assertModuleIntact`), its
+ * statements (`statementRefusals`, which `assertRunnableStatements` throws
+ * from) and an unfinished attempt that may have stopped part-way
+ * (`assertNotPartiallyApplied`) — except for a module the snapshot proves
+ * (`provenBySnapshot`), which a run records or refuses by where the live
+ * schema stands.
+ * What a run decides from the live schema (adoption, drift, the drop guard,
+ * that module's attempt) is not previewed.
+ */
+export async function previewPluginMigrations(
+  sets: readonly PluginMigrationSet[],
+  args: {
+    dialect: SupportedDialect;
+    /** The ledger's `file_apply` rows; none when the ledger is not there. */
+    rows: readonly SchemaEventRow[];
+    limit?: number;
+    /** As a run is handed it (`RunPluginMigrationsDeps.declaredPlugins`). */
+    declaredPlugins?: ReadonlySet<string>;
+    /** Server construct capabilities, judged identically to execution. */
+    serverConstructs?: ServerConstructCapabilities;
+    /** As a run is handed it (`RunPluginMigrationsDeps.existingTables`). */
+    existingTables?: () => Promise<ReadonlySet<string>>;
+  }
+): Promise<PluginModulePreview[]> {
+  const appliedShas = appliedPluginShas(args.rows);
+  // Refused as the run refuses it, before any module is reached.
+  assertPluginHistories({
+    lists: sets,
+    appliedShas,
+    declaredPlugins: args.declaredPlugins,
+  });
+  await assertStreamKeysResolve(
+    sets,
+    args.dialect,
+    args.existingTables,
+    appliedShas
+  );
+  if (args.serverConstructs !== undefined) {
+    refusePendingConstructsTheServerCannotHold(sets, {
+      dialect: args.dialect,
+      appliedShas,
+      limit: args.limit,
+      serverConstructs: args.serverConstructs,
+    });
+  }
+  const context: PreviewContext = {
+    dialect: args.dialect,
+    appliedShas,
+    history: {
+      findFileApplies: (filename: string) =>
+        Promise.resolve(args.rows.filter(row => row.filename === filename)),
+    },
+  };
+  const preview: PluginModulePreview[] = [];
+  let remaining = moduleBudget(args.limit);
+  for (const set of sets) {
+    if (remaining <= 0) break;
+    remaining = await previewSet(set, context, remaining, preview);
+  }
+  return preview;
+}
+
+/** What previewing a module reads: the dialect and the ledger's rows. */
+interface PreviewContext {
+  dialect: SupportedDialect;
+  /** The applied checksums `appliedPluginShas` reads from the rows. */
+  appliedShas: ReadonlyMap<string, string | null>;
+  /** The rows of one filename, as `assertNotPartiallyApplied` asks for them. */
+  history: Pick<ReconcileRepo, "findFileApplies">;
+}
+
+/**
+ * Preview one plugin's modules into `preview`, in run order, and return the
+ * budget left: a pending module spends one, and once none is left the walk
+ * stops at the next pending module.
+ */
+async function previewSet(
+  set: PluginMigrationSet,
+  context: PreviewContext,
+  budget: number,
+  preview: PluginModulePreview[]
+): Promise<number> {
+  let remaining = budget;
+  for (const migration of orderedMigrations(set.migrations)) {
+    const pending = isPending(set, migration, context);
+    if (remaining <= 0 && pending) break;
+    const entry = await previewModule(set, migration, pending, context);
+    if (entry !== undefined) preview.push(entry);
+    if (pending) remaining -= 1;
+  }
+  return remaining;
+}
+
+/**
+ * One module as a run would meet it, or undefined for a recorded module the
+ * run would go past without refusing.
+ */
+async function previewModule(
+  set: PluginMigrationSet,
+  migration: PluginMigration,
+  pending: boolean,
+  context: PreviewContext
+): Promise<PluginModulePreview | undefined> {
+  const filename = qualifiedFilename(set.pluginName, migration.name);
+  const transaction = migration.transaction !== false;
+  const refusals: string[] = [];
+  await collectRefusal(refusals, () =>
+    assertModuleIntact(set.pluginName, migration)
+  );
+  if (!pending) {
+    await collectRefusal(refusals, () =>
+      assertAppliedUnchanged(
+        set.pluginName,
+        migration,
+        context.appliedShas.get(filename) ?? null
+      )
+    );
+    return refusals.length > 0
+      ? { filename, transaction, recorded: true, refusals }
+      : undefined;
+  }
+  for (const refusal of statementRefusals(
+    pluginModuleStatements(migration, context.dialect, "up"),
+    context.dialect,
+    { transaction, unit: "module" }
+  )) {
+    refusals.push(refusal.message);
+  }
+  // Worded as the refusal to run it again: a pending module the run
+  // reaches is run where the database stands at its start, and whichever
+  // side the live schema shows, an unfinished attempt is refused. Not for a
+  // module the snapshot proves (`provenBySnapshot`): a run records it when
+  // the database stands at its result, which only the live schema can tell.
+  if (provenBySnapshot(migration, context.dialect)) {
+    return { filename, transaction, recorded: false, refusals };
+  }
+  await collectRefusal(refusals, () =>
+    assertNotPartiallyApplied(
+      { filename, transaction },
+      context.dialect,
+      context.history,
+      "rerun"
+    )
+  );
+  return { filename, transaction, recorded: false, refusals };
+}
+
+/** Run one check, adding what it refuses to `refusals`. */
+async function collectRefusal(
+  refusals: string[],
+  check: () => unknown
+): Promise<void> {
+  try {
+    await check();
+  } catch (error) {
+    // A refusal is reported as the run would print it; anything else
+    // is a fault of the preview itself, and is raised.
+    if (!NextlyError.is(error)) throw error;
+    refusals.push(describeError(error));
+  }
+}
+
+/** Apply one plugin's pending modules, counting each outcome into `result`. */
+async function runSet(
+  set: PluginMigrationSet,
+  deps: RunPluginMigrationsDeps,
+  result: PluginMigrationRunResult,
+  /** The modules this run may still apply or adopt; spent as they are. */
+  budget: { remaining: number }
+): Promise<void> {
+  const ordered = orderedMigrations(set.migrations);
+  let lastOutcome: keyof PluginMigrationRunResult = "skipped";
+  for (let position = 0; position < ordered.length; position += 1) {
+    // Out of budget at a module still to run: stop here. Returning, not
+    // breaking, because the repair below assumes the LAST module is the one
+    // recorded applied, and a run that stopped short has not reached it.
+    if (budget.remaining <= 0 && isPending(set, ordered[position], deps)) {
+      return;
+    }
+    const forwarded = await fastForward(
+      set,
+      ordered,
+      position,
+      deps,
+      budget.remaining
+    );
+    if (forwarded !== undefined) {
+      result.adopted += forwarded.adopted;
+      result.applied += forwarded.applied;
+      budget.remaining -= forwarded.through - position + 1;
+      position = forwarded.through;
+      // The last module of the range ran or was adopted, and either way
+      // recorded its ownership itself.
+      lastOutcome = "adopted";
+      continue;
+    }
+    // Not caught: the first failure must stop later plugins and the app
+    // phase, which assume a state that was never reached.
+    lastOutcome = await applyModule(
+      set,
+      ordered[position],
+      ordered.slice(0, position),
+      deps
+    );
+    result[lastOutcome] += 1;
+    if (lastOutcome !== "skipped") budget.remaining -= 1;
+  }
+  // A module that ran or was adopted just now recorded its ownership itself.
+  // A set with no modules has no last one, and nothing of its to repair;
+  // the callers pass none such today, which keeps the guard free.
+  const last = ordered.at(-1);
+  if (lastOutcome === "skipped" && last !== undefined) {
+    await repairOwnership(set, last, deps);
+  }
+}
+
+/**
+ * Record a plugin's ownership again when its last module is recorded applied
+ * but the owner rows do not stand where that module leaves them.
+ *
+ * A module that runs in a transaction writes its ledger row and its owner
+ * rows inside it, together. One run outside a transaction, or recorded as
+ * applied without running, writes them one after the other, so a run that
+ * stops between the two leaves the module recorded applied and its tables
+ * unclaimed, or claimed at the previous module's schema version. Every later
+ * run skips the module, so nothing else writes those rows again: the drop
+ * guard would protect none of the plugin's tables, and the production boot
+ * gate would read a schema version the plugin is no longer at, for good. The
+ * last module's tables are the plugin's whole owned shape, so recording them
+ * is exactly what that module's run would have recorded.
+ *
+ * Only a row that is missing, or is this plugin's at another schema version,
+ * is repaired. A table another owner's row names is left as it is: who owns a
+ * table changes only through an explicit transfer, never as a repair.
+ */
+async function repairOwnership(
+  set: PluginMigrationSet,
+  last: PluginMigration,
+  deps: RunPluginMigrationsDeps
+): Promise<void> {
+  const owners = deps.owners ?? new Map<string, OwnerRecord>();
+  const tables = (last.snapshot[deps.dialect]?.tables ?? []).map(
+    table => table.name
+  );
+  const stale = (row: OwnerRecord): boolean =>
+    row.ownerId === set.pluginName && row.schemaVersion !== last.schemaVersion;
+  const repaired = tables.filter(name => {
+    const row = owners.get(name);
+    return row === undefined || stale(row);
+  });
+  // A plugin left owning no table records its version on the rows it still
+  // has (`recordOwner` carries them forward), so those are the ones read.
+  const needsRepair =
+    tables.length > 0 ? repaired.length > 0 : [...owners.values()].some(stale);
+  if (!needsRepair) return;
+  await deps.recordOwner({
+    pluginName: set.pluginName,
+    pluginVersion: set.pluginVersion,
+    schemaVersion: last.schemaVersion,
+    tables: repaired,
+    // The module ran, or was adopted, in an earlier run; nothing runs now.
+    adopted: false,
+  });
+}
+
+/**
+ * Adopt a run of pending modules when the database is already past them.
+ *
+ * Dev push creates a plugin's tables in their CURRENT shape. With more than
+ * one module, that shape is the LAST module's result, so the first pending
+ * module finds a database matching neither its start nor its end, and the
+ * reconcile alone refuses it — although nothing is wrong. Here, when a module
+ * would be refused that way, the later modules are asked, latest first,
+ * whether the database already stands at their result; if one does, every
+ * module up to it is recorded as applied without running.
+ *
+ * Only then: a module whose start or end the database matches goes through
+ * the reconcile as before, so a fresh install and an ordinary upgrade are
+ * untouched. "Stands at" is the reconcile's own equivalence, and the ledger
+ * rows are the reconcile's own adoption rows. Returns the index of the last
+ * module adopted, or undefined when the reconcile should decide.
+ */
+async function fastForward(
+  set: PluginMigrationSet,
+  ordered: readonly PluginMigration[],
+  position: number,
+  deps: RunPluginMigrationsDeps,
+  /**
+   * How many modules this run may still record. The database stands at
+   * `last`; recording only the first of the modules up to it leaves the
+   * ledger behind the database, which is where it started, and the next run
+   * asks the same question from the module after them and adopts the rest.
+   */
+  budget: number
+): Promise<{ through: number; adopted: number; applied: number } | undefined> {
+  if (await reconcileDecides(set, ordered, position, deps)) return undefined;
+  const last = await furthestMatched(set, ordered, position, deps);
+  if (last === undefined) return undefined;
+  const through = Math.min(last, position + budget - 1);
+  const forward: ForwardRange = {
+    set,
+    range: ordered.slice(position, through + 1),
+    earlier: at => ordered.slice(0, position + at),
+  };
+  const runs = await judgeRange(forward, deps);
+  return { through, ...(await forwardRange(forward, runs, deps)) };
+}
+
+/** The modules a fast-forward records or runs, and what precedes each. */
+interface ForwardRange {
+  set: PluginMigrationSet;
+  range: readonly PluginMigration[];
+  /** The plugin's modules ordered before the range's `at`th. */
+  earlier: (at: number) => readonly PluginMigration[];
+}
+
+/**
+ * Every module of the range judged before any row is written, as an adoption
+ * is: a module refused part-way would leave the ones before it recorded. An
+ * edited module first, whatever its statements say. Returns whether each
+ * runs where the database stands rather than being recorded unrun.
+ */
+async function judgeRange(
+  { set, range, earlier }: ForwardRange,
+  deps: RunPluginMigrationsDeps
+): Promise<boolean[]> {
+  for (const migration of range) assertModuleIntact(set.pluginName, migration);
+  const runs: boolean[] = [];
+  for (const migration of range) {
+    runs.push(await pastModuleRuns(set, migration, deps));
+  }
+  await assertAdoptable(
+    set,
+    range.filter((_, at) => !runs[at]),
+    deps
+  );
+  for (const [at, migration] of range.entries()) {
+    if (runs[at]) {
+      await assertModuleRunnable(set, migration, earlier(at), deps);
+    }
+  }
+  return runs;
+}
+
+/**
+ * Whether a module the database already stands past runs where it stands,
+ * rather than being recorded without running, by what its statements do
+ * (`moduleEffects`): a schema module is recorded, since the snapshot the
+ * database matches is its whole effect; a data module runs, since its work
+ * is in no snapshot; a module doing both is refused, since it can be
+ * neither. The one answer for a fast-forward range and for a module whose
+ * own result the database already holds.
+ *
+ * The ledger answers first where it can. A module whose newest attempt the
+ * operator cleared (`attemptCleared`) is recorded: with the database past its
+ * start, that is the recovery for an attempt finished by hand, which the
+ * partially-applied refusal names. A mixed module whose last attempt did not
+ * finish and may have stopped part-way is refused as that
+ * (`assertNotPartiallyApplied`): the attempt is what put the database past
+ * it, and that refusal says how to finish or clear it.
+ */
+async function pastModuleRuns(
+  set: PluginMigrationSet,
+  migration: PluginMigration,
+  deps: RunPluginMigrationsDeps
+): Promise<boolean> {
+  const effects = moduleEffects(migration, deps.dialect);
+  if (effects === "schema") return false;
+  const unit = ledgerUnit(set, migration);
+  const history = await deps.repo.findFileApplies(unit.filename);
+  if (attemptCleared(newestEvent(history))) return false;
+  if (effects === "data") return true;
+  await assertNotPartiallyApplied(unit, deps.dialect, deps.repo);
+  throw mixedModuleRefusal(set, migration);
+}
+
+/**
+ * Whether a database standing at a module's result proves the module ran, so
+ * an attempt of it that did not finish may be recorded without running.
+ *
+ * Both must hold: its statements change only the schema (`moduleEffects`),
+ * and they are exactly what its two sides render to (`upRendersItsSides`).
+ * The first alone is not enough: an `ALTER TABLE` reads as schema, yet one
+ * enabling row-level security or setting a table option changes nothing the
+ * snapshot records, and a run stopped before it reaches the result all the
+ * same. A module written or edited by hand fails the second and keeps the
+ * refusal, which is the safe answer.
+ */
+function provenBySnapshot(
+  migration: PluginMigration,
+  dialect: SupportedDialect
+): boolean {
+  return (
+    moduleEffects(migration, dialect) === "schema" &&
+    upRendersItsSides(migration, dialect)
+  );
+}
+
+/** A module as the ledger knows it: its file name and how it runs. */
+function ledgerUnit(
+  set: PluginMigrationSet,
+  migration: PluginMigration
+): { filename: string; transaction: boolean } {
+  return {
+    filename: qualifiedFilename(set.pluginName, migration.name),
+    transaction: migration.transaction !== false,
+  };
+}
+
+/**
+ * In order: a run of schema modules is adopted, and a data module runs where
+ * it stands — its work is in no snapshot, so the database standing past it
+ * says nothing about whether that work was done. Its statements can still
+ * fail there, against a schema later than the one it was written for; the
+ * modules recorded before it stay recorded, which is where the database
+ * stands.
+ */
+async function forwardRange(
+  { set, range, earlier }: ForwardRange,
+  runs: readonly boolean[],
+  deps: RunPluginMigrationsDeps
+): Promise<{ adopted: number; applied: number }> {
+  let adopted = 0;
+  let pending: PluginMigration[] = [];
+  for (const [at, migration] of range.entries()) {
+    if (!runs[at]) {
+      pending.push(migration);
+      continue;
+    }
+    await recordAdopted(set, pending, deps);
+    adopted += pending.length;
+    pending = [];
+    await applyModule(set, migration, earlier(at), deps, "live");
+  }
+  await recordAdopted(set, pending, deps);
+  adopted += pending.length;
+  return { adopted, applied: range.length - adopted };
+}
+
+/**
+ * The refusal for a module the database stands past whose statements do more
+ * than the schema shows (`moduleEffects`): it cannot be recorded without
+ * running, which would skip that work, nor run, which would repeat DDL the
+ * database already holds.
+ */
+function mixedModuleRefusal(
+  set: PluginMigrationSet,
+  migration: PluginMigration
+): NextlyError {
+  return new NextlyError({
+    code: "NEXTLY_MIGRATION_DRIFT",
+    publicMessage:
+      `Plugin "${set.pluginName}" migration ${migration.name} changes the schema and also does work the schema does not show (data, objects such as triggers, or a statement that cannot be read, which counts as such work), and the database already holds its schema changes — so it can be neither recorded as applied, which would skip that work, nor run, which would repeat them. Nothing was applied. ` +
+      "Bring the plugin's tables back to the state this migration starts from and run `nextly migrate`, which then runs it; on a development database, drop the plugin's tables and run `nextly migrate`. " +
+      "A plugin keeps its data statements in migrations of their own (`nextly migrate:create --plugin <entry> --blank`) so they can always run.",
+    logContext: {
+      plugin: set.pluginName,
+      migration: migration.name,
+      reason: "mixed-module-past",
+    },
+  });
+}
+
+/**
+ * A data module that failed where it ran against the plugin's tables as the
+ * database holds them — at the module's result or past it, later than the
+ * schema it was written for — with the way out. Any other refusal, from a check
+ * that runs before the module, is its own and passes through.
+ */
+function dataModuleFailure(
+  set: PluginMigrationSet,
+  migration: PluginMigration,
+  error: unknown
+): unknown {
+  if (
+    !NextlyError.is(error) ||
+    error.code !== "NEXTLY_MIGRATION_APPLY_FAILED"
+  ) {
+    return error;
+  }
+  return new NextlyError({
+    code: "NEXTLY_MIGRATION_APPLY_FAILED",
+    publicMessage:
+      `${error.publicMessage} ` +
+      `Plugin "${set.pluginName}" migration ${migration.name} changes no schema the database can show, so it runs even though the plugin's tables already stand at or past its result — and it failed against them, being written for an earlier shape of them. ` +
+      "Bring the plugin's tables back to the state this migration starts from and run `nextly migrate`, which then runs every later migration after it; on a development database, drop the plugin's tables and run `nextly migrate`. " +
+      "A plugin's data migrations must hold against every later shape of its tables.",
+    logContext: {
+      plugin: set.pluginName,
+      migration: migration.name,
+      reason: "data-module-past",
+    },
+    cause: error,
+  });
+}
+
+/** Whether a module has not been recorded as applied yet. */
+function isPending(
+  set: PluginMigrationSet,
+  migration: PluginMigration,
+  deps: { appliedShas: { has(key: string): boolean } }
+): boolean {
+  return !deps.appliedShas.has(
+    qualifiedFilename(set.pluginName, migration.name)
+  );
+}
+
+/**
+ * Whether the reconcile alone decides this module: it is recorded already, it
+ * is the plugin's last, or the database stands at its start or its end.
+ */
+async function reconcileDecides(
+  set: PluginMigrationSet,
+  ordered: readonly PluginMigration[],
+  position: number,
+  deps: RunPluginMigrationsDeps
+): Promise<boolean> {
+  if (!isPending(set, ordered[position], deps)) return true;
+  if (position === ordered.length - 1) return true;
+  const here = await moduleSides(
+    set,
+    ordered[position],
+    ordered.slice(0, position),
+    deps
+  );
+  return (
+    snapshotsEquivalent(here.live, here.before) ||
+    snapshotsEquivalent(here.live, here.target)
+  );
+}
+
+/**
+ * The latest module after `position` whose result the database already
+ * stands at, with every module up to it still pending — or undefined.
+ */
+async function furthestMatched(
+  set: PluginMigrationSet,
+  ordered: readonly PluginMigration[],
+  position: number,
+  deps: RunPluginMigrationsDeps
+): Promise<number | undefined> {
+  for (let last = ordered.length - 1; last > position; last -= 1) {
+    // A recorded module inside the run would be adopted over; the ledger and
+    // the database disagree there, which is the reconcile's to report.
+    const run = ordered.slice(position, last + 1);
+    if (!run.every(migration => isPending(set, migration, deps))) continue;
+    const there = await moduleSides(
+      set,
+      ordered[last],
+      ordered.slice(0, last),
+      deps
+    );
+    if (snapshotsEquivalent(there.live, there.target)) return last;
+  }
+  return undefined;
+}
+
+/**
+ * Refuse an adoption before any row is written: every module is checked
+ * intact, takes no table another owner holds, and is not left part-way by a
+ * failed attempt (`assertNotPartiallyApplied`) — so such a module later in
+ * the run refuses the whole adoption rather than leaving the modules before
+ * it recorded. A module that changes only the schema is not refused for its
+ * attempt when the snapshot proves its whole effect (`provenBySnapshot`).
+ */
+async function assertAdoptable(
+  set: PluginMigrationSet,
+  modules: readonly PluginMigration[],
+  deps: RunPluginMigrationsDeps
+): Promise<void> {
+  for (const migration of modules) {
+    assertModuleIntact(set.pluginName, migration);
+    assertTakesNoOwnedTable(set, migration, deps);
+    if (provenBySnapshot(migration, deps.dialect)) continue;
+    await assertNotPartiallyApplied(
+      ledgerUnit(set, migration),
+      deps.dialect,
+      deps.repo
+    );
+  }
+}
+
+/**
+ * Record each module as applied without running it, and its ownership.
+ * Judged by `assertAdoptable` first.
+ *
+ * Written in one transaction with no statements, so every module's ledger
+ * row and owner rows commit together or not at all: a run stopping part-way
+ * leaves no module recorded applied without the tables it owns.
+ */
+async function recordAdopted(
+  set: PluginMigrationSet,
+  modules: readonly PluginMigration[],
+  deps: RunPluginMigrationsDeps
+): Promise<void> {
+  if (modules.length === 0) return;
+  await deps.executeSql(
+    "",
+    {
+      source: qualifiedFilename(set.pluginName, modules[0].name),
+      transaction: true,
+    },
+    async db => {
+      for (const migration of modules) {
+        await recordAlreadyApplied(
+          {
+            filename: qualifiedFilename(set.pluginName, migration.name),
+            sha256: migration.checksum,
+          },
+          deps.repo.boundTo(db)
+        );
+        await deps.recordOwner({
+          pluginName: set.pluginName,
+          pluginVersion: set.pluginVersion,
+          schemaVersion: migration.schemaVersion,
+          tables: ownedTables(migration, deps.dialect),
+          adopted: true,
+          db,
+        });
+      }
+    }
+  );
+}
+
+/**
+ * The tables a module leaves its plugin OWNING, never the foreign ones it
+ * only contributes an element to — the rows `recordOwner` writes for it.
+ */
+function ownedTables(
+  migration: PluginMigration,
+  dialect: SupportedDialect
+): string[] {
+  return (migration.snapshot[dialect]?.tables ?? []).map(table => table.name);
+}
+
+/**
+ * Refuse, before a module runs or is adopted, one whose tables are recorded
+ * as another owner's: a removed plugin's table taken over by a newcomer of
+ * the same name. Recording the module would rewrite the owner row and let
+ * the newcomer drop the old owner's data, so the decision is made before
+ * the ledger or the database changes, not when the row is written.
+ */
+function assertTakesNoOwnedTable(
+  set: PluginMigrationSet,
+  migration: PluginMigration,
+  deps: RunPluginMigrationsDeps
+): void {
+  assertNoOwnerChange(
+    ownedTables(migration, deps.dialect).map(tableName => ({
+      tableName,
+      ownerId: set.pluginName,
+    })),
+    deps.owners?.values() ?? []
+  );
+}
+
+/**
+ * The tables a module leaves behind, as a run compares the database against
+ * its end: the plugin's own (`snapshot`) and the foreign tables it contributes
+ * elements to (`contributed`), before they are narrowed to its elements. The
+ * one answer `moduleSides` judges a module's end by, and that `nextly
+ * migrate`'s rename check reads for where a run may adopt a module.
+ */
+export function moduleTargetTables(
+  migration: PluginMigration,
+  dialect: SupportedDialect
+): NextlySchemaSnapshot["tables"] {
+  return [
+    ...(migration.snapshot[dialect]?.tables ?? []),
+    ...(migration.contributed?.[dialect]?.tables ?? []),
+  ];
+}
+
+/**
+ * A module's start, end and the live database, scoped and narrowed the way
+ * the reconcile judges them.
+ */
+async function moduleSides(
+  set: PluginMigrationSet,
+  migration: PluginMigration,
+  /** The plugin's modules ordered before this one, for its contributions. */
+  earlier: readonly PluginMigration[],
+  deps: RunPluginMigrationsDeps
+): Promise<{
+  before: NextlySchemaSnapshot;
+  target: NextlySchemaSnapshot;
+  live: NextlySchemaSnapshot;
+}> {
+  // Both sides include the FOREIGN tables this module contributes elements to,
+  // so the reconcile compares against the shape the module's SQL actually
+  // produces. Leaving them out would let it judge a module by a target that
+  // never mentions the table its ALTER touches.
+  const before: NextlySchemaSnapshot = {
+    tables: [
+      ...(migration.before[deps.dialect]?.tables ?? []),
+      ...(migration.contributedBefore?.[deps.dialect]?.tables ?? []),
+    ],
+  };
+  const target: NextlySchemaSnapshot = {
+    tables: moduleTargetTables(migration, deps.dialect),
+  };
+  // The before side names tables an older module created, so both sides scope
+  // the live read — a module dropping a table it no longer wants must still
+  // see that table to compare against.
+  const names = [
+    ...new Set([...before.tables, ...target.tables].map(table => table.name)),
+  ];
+  // A contributed table is judged on this plugin's elements alone, exactly as
+  // the app stream judges the tables it contributes to (`narrowToContributions`,
+  // the same function). Its `contributedBefore`/`contributed` copies are the
+  // whole table as it was when the module was generated; the owner may have
+  // shipped later modules since, which a fresh install applies first, so the
+  // live table then matches neither copy and a valid contribution would be
+  // refused as drift. The elements that are this plugin's are the ones its
+  // modules record either side of this one — the same replay the generator
+  // reads them from.
+  return narrowToContributions({
+    before,
+    target,
+    live: await deps.introspect(names, `plugin:${set.pluginName}`),
+    contributions: mergeContributions(
+      recordedContributions(earlier, deps.dialect),
+      recordedContributions([...earlier, migration], deps.dialect)
+    ),
+  });
+}
+
+async function applyModule(
+  set: PluginMigrationSet,
+  migration: PluginMigration,
+  /** The plugin's modules ordered before this one, for its contributions. */
+  earlier: readonly PluginMigration[],
+  deps: RunPluginMigrationsDeps,
+  /**
+   * `"live"` runs the module against the database as it stands, whatever its
+   * own sides say: a data module a fast-forward reaches, whose schema the
+   * database is already past (`fastForward`). A data module whose own result
+   * the database holds is run this way too, unasked. Every check before it
+   * runs is the same; only the reconcile is told the module starts where the
+   * database is, so it runs rather than refusing the difference as drift.
+   */
+  against?: "live"
+): Promise<"applied" | "adopted" | "skipped"> {
+  // Before anything is read from the database: a module whose SQL was edited
+  // after generation is refused whatever the live state is.
+  assertModuleIntact(set.pluginName, migration);
+
+  const filename = qualifiedFilename(set.pluginName, migration.name);
+  const recorded = deps.appliedShas.get(filename);
+  if (recorded !== undefined) {
+    assertAppliedUnchanged(set.pluginName, migration, recorded);
+    return "skipped";
+  }
+
+  await assertModuleRunnable(set, migration, earlier, deps);
+  // Counted here, right before this module runs, rather than in `assertModuleRunnable`: a
+  // fast-forward judges its whole range before any module of it runs, and a count then would
+  // refuse a module over rows an earlier module of the range fills.
+  await deps.refuseRequiredColumns?.(
+    pluginModuleStatements(migration, deps.dialect, "up"),
+    filename
+  );
+
+  const { live, sides } = await reconcileSides(
+    set,
+    migration,
+    earlier,
+    deps,
+    against
+  );
+
+  // The tables this plugin OWNS, never the foreign ones it only contributed
+  // an element to. `recordOwner` upserts ownership, so a dependency's table
+  // listed here would hand this plugin the row naming its real owner — and
+  // the drop guard would then let this plugin's DOWN drop it.
+  const recordOwned = (adopted: boolean, db?: unknown): Promise<void> =>
+    deps.recordOwner({
+      pluginName: set.pluginName,
+      pluginVersion: set.pluginVersion,
+      schemaVersion: migration.schemaVersion,
+      tables: ownedTables(migration, deps.dialect),
+      adopted,
+      db,
+    });
+
+  const reconcile = reconcileFile({
+    file: {
+      ...ledgerUnit(set, migration),
+      // Recorded at its result even after an attempt that did not finish
+      // when the snapshot is provably its whole effect (`provenBySnapshot`).
+      schemaOnly: provenBySnapshot(migration, deps.dialect),
+      // Split by the executor, like an app file; see `moduleSql`.
+      sql: moduleSql(migration, deps.dialect, "up"),
+      path: `plugin:${set.pluginName}/${migration.name}`,
+      sha256: migration.checksum,
+    },
+    before: sides.before,
+    target: sides.target,
+    live: sides.live,
+    dialect: deps.dialect,
+    repo: deps.repo,
+    executeSql: deps.executeSql,
+    ...(deps.recordStopped === undefined
+      ? {}
+      : { recordStopped: deps.recordStopped }),
+    // A module records its owner rows through the handle its applied row
+    // was written on, after that row, so in a transaction both commit with
+    // the statements, or with the adoption, or neither does.
+    recordApplied: (db, adopted) => recordOwned(adopted, db),
+    pluginName: set.pluginName,
+  });
+  // A data module run past its own schema fails against a later shape of the
+  // plugin's tables than it was written for; the refusal names the way out.
+  const { state } = live
+    ? await reconcile.catch((error: unknown) => {
+        throw dataModuleFailure(set, migration, error);
+      })
+    : await reconcile;
+
+  return state === "already_applied" ? "adopted" : "applied";
+}
+
+/**
+ * The sides the reconcile judges a module by, and whether it runs against
+ * the live database. Reads the live schema but writes nothing, so a module
+ * missing its SQL is refused here with the ledger untouched.
+ */
+async function reconcileSides(
+  set: PluginMigrationSet,
+  migration: PluginMigration,
+  /** The plugin's modules ordered before this one, for its contributions. */
+  earlier: readonly PluginMigration[],
+  deps: RunPluginMigrationsDeps,
+  against: "live" | undefined
+): Promise<{
+  live: boolean;
+  sides: Awaited<ReturnType<typeof moduleSides>>;
+}> {
+  const own = await moduleSides(set, migration, earlier, deps);
+  const live = await runsAgainstLive(set, migration, own, deps, against);
+  const sides = live
+    ? { before: own.live, target: own.live, live: own.live }
+    : own;
+  if (!live && snapshotsEquivalent(own.live, own.before)) {
+    assertSchemaChangeWritten(set, migration, own, deps.dialect);
+  }
+  return { live, sides };
+}
+
+/**
+ * Whether a module runs against the database as it stands: asked for, or a
+ * data module whose own result the database already holds.
+ *
+ * A module whose result the database already holds would be recorded
+ * without running, which proves only what a snapshot shows: it is judged
+ * as a fast-forward judges a module the database stands past, whether it
+ * is the plugin's last module or the reconcile alone decides it.
+ */
+async function runsAgainstLive(
+  set: PluginMigrationSet,
+  migration: PluginMigration,
+  own: Awaited<ReturnType<typeof moduleSides>>,
+  deps: RunPluginMigrationsDeps,
+  against: "live" | undefined
+): Promise<boolean> {
+  return (
+    against === "live" ||
+    (!snapshotsEquivalent(own.live, own.before) &&
+      snapshotsEquivalent(own.live, own.target) &&
+      (await pastModuleRuns(set, migration, deps)))
+  );
+}
+
+/**
+ * Refuse to run a module that changes the schema on this dialect with no
+ * statements for it: one written for its author's SQL (`migrate:create
+ * --plugin --blank`, or a change the dialect cannot make in place) whose SQL
+ * was never added. Run, it would execute nothing and be recorded as having
+ * reached a schema the database never reached, and the plugin's next module
+ * would then meet a database matching neither of its sides.
+ *
+ * Asked only of a module about to run from its start: one whose result the
+ * database already holds is recorded without running, which is right for it
+ * whatever its statements are.
+ */
+function assertSchemaChangeWritten(
+  set: PluginMigrationSet,
+  migration: PluginMigration,
+  sides: { before: NextlySchemaSnapshot; target: NextlySchemaSnapshot },
+  dialect: SupportedDialect
+): void {
+  if (snapshotsEquivalent(sides.before, sides.target)) return;
+  if (pluginModuleStatements(migration, dialect, "up").length > 0) return;
+  throw new NextlyError({
+    code: "PLUGIN_MIGRATION_SQL_MISSING",
+    publicMessage:
+      `Plugin "${set.pluginName}" migration ${migration.name} changes the schema on ${dialect} but has no ${dialect} statements, so running it would record a change it never made. Nothing was applied. ` +
+      `Write the module's ${dialect} \`up\` and \`down\` in the plugin, then run \`nextly migrate\` again.`,
+    logContext: {
+      plugin: set.pluginName,
+      migration: migration.name,
+      dialect,
+    },
+  });
+}
+
+/**
+ * The checks a pending module passes before it may run, none of which reads
+ * or writes the ledger: run by `applyModule`, and by `fastForward` for a data
+ * module before any row of its range is written.
+ */
+async function assertModuleRunnable(
+  set: PluginMigrationSet,
+  migration: PluginMigration,
+  /** The plugin's modules ordered before this one, for its contributions. */
+  earlier: readonly PluginMigration[],
+  deps: RunPluginMigrationsDeps
+): Promise<void> {
+  const filename = qualifiedFilename(set.pluginName, migration.name);
+  assertTakesNoOwnedTable(set, migration, deps);
+  // Judged for the module as a whole, before anything executes: a module
+  // dropping another stream's table is refused with the ledger untouched,
+  // never partly applied.
+  //
+  // Only a module about to run is judged. An applied module runs nothing
+  // here, and judging it against today's owners would refuse every later
+  // migrate once another stream came to own a name its old SQL dropped.
+  //
+  // The statements judged are the ones the executor runs: the same text
+  // (`moduleSql`, handed to `reconcileFile` below) through the same splitter.
+  // A statement the runner's transaction cannot hold is refused here too,
+  // before the ledger records an attempt.
+  const statements = pluginModuleStatements(migration, deps.dialect, "up");
+  assertNoForeignDrops({
+    statements,
+    stream: `plugin:${set.pluginName}`,
+    owners: deps.owners ?? new Map(),
+    elementOwners: deps.elementOwners ?? [],
+    // The columns this plugin's earlier modules contributed are its own
+    // before any element row records them: rows are written once the run
+    // ends, and a fresh install runs every module in one run.
+    ownedElements: recordedContributions(earlier, deps.dialect),
+    dialect: deps.dialect,
+    source: filename,
+    liveColumns: await deps.liveColumns?.(statements),
+    liveElements: await deps.liveElements?.(statements),
+    liveTables: await deps.liveTables?.(statements),
+    liveIndexTables: await deps.liveIndexTables?.(statements),
+  });
+  assertRunnableStatements(statements, deps.dialect, filename, {
+    transaction: migration.transaction !== false,
+    unit: "module",
+  });
+}

@@ -1,0 +1,142 @@
+"use client";
+/**
+ * The draft mutations a reader performs while customising their dashboard.
+ *
+ * Lifted out of `useLayoutEditor` rather than left inline. Each is a small
+ * closure, but a hook accumulating a dozen of them becomes a body nobody reads
+ * end to end — and the mutations are the part where a mistake silently edits
+ * the wrong card, so they are worth reading as a set. Every one addresses its
+ * card by placement ID, through the pure rules in `layout-editor`.
+ *
+ * Every one goes through `mutatePlacements`, which owns the single decision
+ * they all share: with no draft, do nothing.
+ *
+ * @module components/features/widgets/edit/usePlacementMutations
+ */
+import type { GridSize, WidgetSizeBounds } from "nextly/config";
+import { useCallback, type Dispatch, type SetStateAction } from "react";
+
+import type { WidgetPlacement } from "@admin/types/dashboard/widgets";
+
+import {
+  discardPlacement,
+  movePlacement,
+  movePlacementToPosition,
+  removePlacement,
+  restorePlacement,
+  setPlacementConfig,
+  setPlacementSize,
+  type IsDrawn,
+  type MoveDirection,
+} from "../layout-editor";
+
+import type { LayoutDraft } from "./useLayoutEditor";
+
+export interface PlacementMutations {
+  /**
+   * Records what a reader chose for one card.
+   *
+   * Takes the WHOLE answer rather than one field, because the form that calls
+   * it knows every setting it drew — and a per-field write could not express
+   * clearing one, since an emptied field arrives as an absent key.
+   */
+  /** Records a card's settings, and its own title where the change sets one (`setPlacementConfig`). */
+  setConfig: (
+    placementId: string,
+    config: Record<string, unknown>,
+    ownTitle?: string
+  ) => void;
+  /** Move one card to an end, or one step past its drawn neighbour. */
+  move: (placementId: string, direction: MoveDirection) => void;
+  /** Move one card to `final` among the drawn cards: where a drag released it. */
+  moveTo: (placementId: string, final: number) => void;
+  /** Set one card's size, when it lies within its widget's bounds. */
+  setSize: (placementId: string, size: GridSize) => void;
+  /** Take one card off the dashboard, keeping it in the list. */
+  remove: (placementId: string) => void;
+  /** Put a removed card back where it was. */
+  restore: (placementId: string) => void;
+  /**
+   * Drop a card added this session as if it was never added (`discardPlacement`): no removed
+   * card is left to save or to put back.
+   */
+  discard: (placementId: string) => void;
+}
+
+export function usePlacementMutations(
+  setDraft: Dispatch<SetStateAction<LayoutDraft | null>>,
+  isDrawn: IsDrawn,
+  boundsFor: (widgetId: string) => WidgetSizeBounds | undefined
+): PlacementMutations {
+  /**
+   * Apply a change to the draft's placements, or do nothing without a draft.
+   *
+   * One place for the null check every mutation needs, so none of them can be
+   * written to no-op when the draft is PRESENT instead of when it is absent.
+   */
+  const mutatePlacements = useCallback(
+    (change: (placements: WidgetPlacement[]) => WidgetPlacement[]) =>
+      setDraft(current =>
+        current
+          ? { ...current, placements: change(current.placements) }
+          : current
+      ),
+    [setDraft]
+  );
+
+  const move = useCallback(
+    (placementId: string, direction: MoveDirection) =>
+      mutatePlacements(placements =>
+        movePlacement(placements, placementId, direction, isDrawn)
+      ),
+    [mutatePlacements, isDrawn]
+  );
+
+  const moveTo = useCallback(
+    (placementId: string, final: number) =>
+      mutatePlacements(placements =>
+        movePlacementToPosition(placements, placementId, final, isDrawn)
+      ),
+    [mutatePlacements, isDrawn]
+  );
+
+  const setSize = useCallback(
+    (placementId: string, size: GridSize) =>
+      mutatePlacements(placements => {
+        // The bounds of THIS card's widget, read from the draft's own
+        // placement so a stale id cannot borrow another widget's bounds.
+        const placement = placements.find(p => p.id === placementId);
+        const bounds = placement ? boundsFor(placement.widgetId) : undefined;
+        return setPlacementSize(placements, placementId, size, bounds);
+      }),
+    [mutatePlacements, boundsFor]
+  );
+
+  const remove = useCallback(
+    (placementId: string) =>
+      mutatePlacements(placements => removePlacement(placements, placementId)),
+    [mutatePlacements]
+  );
+
+  const restore = useCallback(
+    (placementId: string) =>
+      mutatePlacements(placements => restorePlacement(placements, placementId)),
+    [mutatePlacements]
+  );
+
+  const discard = useCallback(
+    (placementId: string) =>
+      mutatePlacements(placements => discardPlacement(placements, placementId)),
+    [mutatePlacements]
+  );
+
+  const setConfig = useCallback(
+    (placementId: string, config: Record<string, unknown>, ownTitle?: string) =>
+      mutatePlacements(placements =>
+        setPlacementConfig(placements, placementId, config, ownTitle)
+      ),
+    [mutatePlacements]
+  );
+
+  return { move, moveTo, setSize, remove, restore, discard, setConfig };
+}

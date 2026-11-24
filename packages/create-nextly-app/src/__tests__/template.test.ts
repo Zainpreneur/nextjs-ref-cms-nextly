@@ -1,0 +1,535 @@
+/**
+ * Tests for template copy utility and package.json generation
+ */
+
+import { readFileSync } from "node:fs";
+import path from "path";
+
+import fs from "fs-extra";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+import type { DatabaseConfig } from "../types";
+import {
+  copyTemplate,
+  generatePackageJson,
+  generateNpmrc,
+  generatePnpmWorkspaceYaml,
+  NATIVE_BUILD_DEPENDENCIES,
+} from "../utils/template";
+
+// Mock fs-extra
+vi.mock("fs-extra", () => ({
+  default: {
+    pathExists: vi.fn(),
+    // Nothing at any path: the target these cases scaffold into is empty.
+    lstat: vi.fn(async () => {
+      throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    }),
+    existsSync: vi.fn(),
+    copy: vi.fn(),
+    writeFile: vi.fn(),
+    readFile: vi.fn(),
+    readdir: vi.fn(),
+    remove: vi.fn(),
+    move: vi.fn(),
+    ensureDir: vi.fn(),
+  },
+}));
+
+const mockPathExists = vi.mocked(fs.pathExists);
+const mockExistsSync = vi.mocked(fs.existsSync);
+const mockCopy = vi.mocked(fs.copy);
+const mockWriteFile = vi.mocked(fs.writeFile);
+const mockReaddir = vi.mocked(fs.readdir);
+
+// ============================================================
+// Test Fixtures
+// ============================================================
+
+const pgDatabase: DatabaseConfig = {
+  type: "postgresql",
+  adapter: "@nextlyhq/adapter-postgres",
+  databaseDriver: "pg",
+  connectionUrl: "postgresql://localhost/test",
+  envExample: "postgresql://localhost/test",
+};
+
+const mysqlDatabase: DatabaseConfig = {
+  type: "mysql",
+  adapter: "@nextlyhq/adapter-mysql",
+  databaseDriver: "mysql2",
+  connectionUrl: "mysql://localhost/test",
+  envExample: "mysql://localhost/test",
+};
+
+const sqliteDatabase: DatabaseConfig = {
+  type: "sqlite",
+  adapter: "@nextlyhq/adapter-sqlite",
+  databaseDriver: "better-sqlite3",
+  connectionUrl: "file:./data/nextly.db",
+  envExample: "file:./data/nextly.db",
+};
+
+// ============================================================
+// generatePackageJson Tests
+// ============================================================
+
+describe("generatePackageJson", () => {
+  // The first call loads the template module cold; the default release
+  // source and the reviewed Next.js and React make no registry request.
+  it("should include correct project name", async () => {
+    const result = JSON.parse(await generatePackageJson("my-app", pgDatabase));
+    expect(result.name).toBe("my-app");
+  }, 30_000);
+
+  it("should include only the selected adapter (PostgreSQL)", async () => {
+    const result = JSON.parse(await generatePackageJson("test", pgDatabase));
+    expect(result.dependencies["@nextlyhq/adapter-postgres"]).toBeDefined();
+    expect(result.dependencies["pg"]).toBeUndefined();
+    expect(result.dependencies["mysql2"]).toBeUndefined();
+    expect(result.dependencies["better-sqlite3"]).toBeUndefined();
+  });
+
+  it("should include only the selected adapter (MySQL)", async () => {
+    const result = JSON.parse(await generatePackageJson("test", mysqlDatabase));
+    expect(result.dependencies["@nextlyhq/adapter-mysql"]).toBeDefined();
+    expect(result.dependencies["@nextlyhq/adapter-postgres"]).toBeUndefined();
+  });
+
+  it("should include only the selected adapter (SQLite)", async () => {
+    const result = JSON.parse(
+      await generatePackageJson("test", sqliteDatabase)
+    );
+    expect(result.dependencies["@nextlyhq/adapter-sqlite"]).toBeDefined();
+    expect(result.dependencies["@nextlyhq/adapter-postgres"]).toBeUndefined();
+  });
+
+  it("should not include storage packages (local disk is default)", async () => {
+    const result = JSON.parse(await generatePackageJson("test", pgDatabase));
+    expect(result.dependencies["@nextlyhq/storage-s3"]).toBeUndefined();
+    expect(
+      result.dependencies["@nextlyhq/storage-vercel-blob"]
+    ).toBeUndefined();
+  });
+
+  it("should always include core Nextly packages", async () => {
+    const result = JSON.parse(await generatePackageJson("test", pgDatabase));
+    expect(result.dependencies["nextly"]).toBeDefined();
+    expect(result.dependencies["@nextlyhq/admin"]).toBeDefined();
+    expect(result.dependencies["@nextlyhq/adapter-drizzle"]).toBeDefined();
+  });
+
+  it("should always include Next.js and React", async () => {
+    const result = JSON.parse(await generatePackageJson("test", pgDatabase));
+    expect(result.dependencies["next"]).toBeDefined();
+    expect(result.dependencies["react"]).toBeDefined();
+    expect(result.dependencies["react-dom"]).toBeDefined();
+  });
+
+  it("should include dev dependencies", async () => {
+    const result = JSON.parse(await generatePackageJson("test", pgDatabase));
+    expect(result.devDependencies["typescript"]).toBeDefined();
+    expect(result.devDependencies["@types/node"]).toBeDefined();
+    expect(result.devDependencies["@types/react"]).toBeDefined();
+    expect(result.devDependencies["eslint"]).toBeDefined();
+  });
+
+  // A scaffolded project's Node types follow the oldest Node this CLI supports,
+  // so an API newer than that floor fails the project's type-check rather than
+  // its first run on the floor. The app and the plugin take different paths.
+  it("types scaffolded apps and plugins against the oldest supported Node", async () => {
+    const engines: string = JSON.parse(
+      readFileSync(new URL("../../package.json", import.meta.url), "utf8")
+    ).engines.node;
+    const floor = Math.min(
+      ...engines.split("||").map(clause => Number(/\d+/.exec(clause)?.[0]))
+    );
+    for (const projectType of ["blank", "plugin"] as const) {
+      const result = JSON.parse(
+        await generatePackageJson("test", pgDatabase, undefined, projectType)
+      );
+      expect(result.devDependencies["@types/node"]).toBe(`^${floor}`);
+    }
+  });
+
+  it("should output valid JSON", async () => {
+    const output = await generatePackageJson("test", pgDatabase);
+    expect(() => JSON.parse(output)).not.toThrow();
+  });
+
+  it("should omit @nextlyhq packages in yalc mode", async () => {
+    const result = JSON.parse(
+      await generatePackageJson("test", pgDatabase, {
+        kind: "yalc",
+        cliVersion: "0.0.2-alpha.40",
+      })
+    );
+    expect(result.dependencies["nextly"]).toBeUndefined();
+    expect(result.dependencies["@nextlyhq/admin"]).toBeUndefined();
+    expect(result.dependencies["@nextlyhq/adapter-drizzle"]).toBeUndefined();
+    expect(result.dependencies["@nextlyhq/adapter-postgres"]).toBeUndefined();
+  });
+
+  it("should not include DB drivers in yalc mode (they are transitive deps)", async () => {
+    const result = JSON.parse(
+      await generatePackageJson("test", pgDatabase, {
+        kind: "yalc",
+        cliVersion: "0.0.2-alpha.40",
+      })
+    );
+    expect(result.dependencies["pg"]).toBeUndefined();
+    expect(result.dependencies["mysql2"]).toBeUndefined();
+    expect(result.dependencies["better-sqlite3"]).toBeUndefined();
+  });
+
+  it("should include Next.js scripts", async () => {
+    const result = JSON.parse(await generatePackageJson("test", pgDatabase));
+    expect(result.scripts.dev).toBe("next dev --turbopack");
+    // No search-index step, and no `search:index`, because no template directory was passed —
+    // so the generator saw a scaffold that does not receive the Pagefind builder. A template
+    // that does ship it is covered in template-search-index.test.ts, against a real tree.
+    expect(result.scripts.build).toBe("nextly migrate && next build");
+    expect(result.scripts["search:index"]).toBeUndefined();
+    expect(result.scripts.start).toBe("next start");
+    // Next.js 16 removed `next lint`, so that script fails in every project the generator
+    // makes. `eslint` with the template's flat config is what create-next-app writes itself.
+    expect(result.scripts.lint).toBe("eslint");
+  });
+
+  it("should include db:* scripts that proxy to the nextly CLI", async () => {
+    const result = JSON.parse(await generatePackageJson("test", pgDatabase));
+
+    expect(result.scripts.nextly).toBe("nextly");
+    expect(result.scripts["db:setup"]).toBe("nextly db:sync");
+    expect(result.scripts["db:migrate"]).toBe("nextly migrate");
+    expect(result.scripts["db:migrate:status"]).toBe("nextly migrate:status");
+    expect(result.scripts["db:migrate:fresh"]).toBe("nextly migrate:fresh");
+    // Asserted ABSENT: `nextly migrate:reset` is not a registered command, so
+    // generating this script shipped every project a `npm run db:migrate:reset`
+    // that fails. The test previously pinned it as expected output.
+    expect(result.scripts["db:migrate:reset"]).toBeUndefined();
+    expect(result.scripts["types:generate"]).toBe("nextly generate:types");
+  });
+
+  // Regression guard: pnpm 11 no longer reads the `pnpm` field from
+  // package.json (it warns and ignores it). The build-script allowlist now
+  // lives in pnpm-workspace.yaml, so the generated package.json must NOT
+  // carry a dead `pnpm` field that only produces a warning on a fresh install.
+  it("should not emit a pnpm field in package.json", async () => {
+    const pg = JSON.parse(await generatePackageJson("test", pgDatabase));
+    const sqlite = JSON.parse(
+      await generatePackageJson("test", sqliteDatabase)
+    );
+    expect(pg.pnpm).toBeUndefined();
+    expect(sqlite.pnpm).toBeUndefined();
+  });
+});
+
+// ============================================================
+// generatePnpmWorkspaceYaml Tests
+// ============================================================
+
+describe("generatePnpmWorkspaceYaml", () => {
+  // pnpm 10+ blocks dependency build scripts by default. Without an
+  // allowlist, `pnpm install` aborts with ERR_PNPM_IGNORED_BUILDS on pnpm 11,
+  // better-sqlite3 never compiles (sqlite apps crash at boot), and
+  // sharp/esbuild/unrs-resolver silently degrade.
+  it("emits allowBuilds (pnpm 11) for every native build dependency", () => {
+    const yaml = generatePnpmWorkspaceYaml();
+    expect(yaml).toMatch(/^allowBuilds:/m);
+    for (const dep of NATIVE_BUILD_DEPENDENCIES) {
+      expect(yaml).toContain(`  ${dep}: true`);
+    }
+  });
+
+  it("emits onlyBuiltDependencies (pnpm 10.6+) for every native build dependency", () => {
+    const yaml = generatePnpmWorkspaceYaml();
+    expect(yaml).toMatch(/^onlyBuiltDependencies:/m);
+    for (const dep of NATIVE_BUILD_DEPENDENCIES) {
+      expect(yaml).toContain(`  - ${dep}`);
+    }
+  });
+
+  // better-sqlite3 must always be allow-listed: it's a direct dep only for
+  // sqlite scaffolds, but the --use-yalc dev flow installs every adapter, so
+  // a postgres/mysql yalc scaffold still pulls (and must build) better-sqlite3.
+  it("always includes better-sqlite3 in the allowlist", () => {
+    expect(NATIVE_BUILD_DEPENDENCIES).toContain("better-sqlite3");
+  });
+});
+
+describe("generateNpmrc", () => {
+  // The setting is not npm's. npm reads .npmrc too and answers every command
+  // with `npm warn Unknown project config "ignore-workspace-root-check". This
+  // will stop working in the next major version of npm.` — a permanent warning
+  // for the majority of users, buying them nothing.
+  it.each(["npm", "yarn", "bun"] as const)("writes nothing for %s", manager => {
+    expect(generateNpmrc(manager)).toBeNull();
+  });
+
+  it("opts a pnpm scaffold out of the workspace-root check", () => {
+    const npmrc = generateNpmrc("pnpm");
+    expect(npmrc).not.toBeNull();
+    expect(npmrc).toMatch(/^ignore-workspace-root-check=true$/m);
+  });
+
+  // pnpm 9 treats the presence of this file as declaring a workspace and
+  // refuses to install without a `packages` key
+  // (ERR_PNPM_INVALID_WORKSPACE_CONFIGURATION). A scaffold that ships the
+  // allowlist alone cannot be installed at all on that line, so the key is
+  // what makes the file safe to emit unconditionally.
+  it("declares packages, so pnpm 9 can install the scaffold", () => {
+    const yaml = generatePnpmWorkspaceYaml();
+    expect(yaml).toMatch(/^packages: \[\]$/m);
+  });
+
+  // Emitting this file has a cost on the same pnpm versions it is emitted for:
+  // it makes the project a workspace ROOT, so `pnpm add <pkg>` is refused with
+  // ERR_PNPM_ADDING_TO_ROOT. generateNpmrc pays that cost back, and these two
+  // are only correct together — hence the pointer.
+  it("is paired with an npmrc that keeps pnpm add working", () => {
+    expect(generatePnpmWorkspaceYaml()).toMatch(/^packages: \[\]$/m);
+    expect(generateNpmrc("pnpm")).toMatch(
+      /^ignore-workspace-root-check=true$/m
+    );
+  });
+
+  // A scaffolded app is a single package. Naming any member would claim a
+  // repository layout the scaffold does not create, and pnpm would then look
+  // for manifests that are not there.
+  it("declares no workspace members", () => {
+    const yaml = generatePnpmWorkspaceYaml();
+    const packagesLine = yaml
+      .split("\n")
+      .findIndex(line => line.startsWith("packages:"));
+    expect(packagesLine).toBeGreaterThanOrEqual(0);
+    // A YAML list continues on indented lines; the next top-level key ends it.
+    const next = yaml.split("\n")[packagesLine + 1] ?? "";
+    expect(next).not.toMatch(/^\s+-/);
+  });
+});
+
+// ============================================================
+// copyTemplate Tests
+// ============================================================
+
+describe("copyTemplate", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Default: target dir does not exist, template dirs exist
+    mockPathExists.mockResolvedValue(false as never);
+    mockExistsSync.mockReturnValue(true);
+    mockCopy.mockResolvedValue(undefined as never);
+    mockWriteFile.mockResolvedValue(undefined as never);
+    mockReaddir.mockResolvedValue([] as never);
+  });
+
+  it("should error if target directory already exists", async () => {
+    mockPathExists.mockResolvedValueOnce(true as never);
+
+    await expect(
+      copyTemplate({
+        projectName: "my-app",
+        projectType: "blank",
+        targetDir: "/test/my-app",
+        database: pgDatabase,
+      })
+    ).rejects.toThrow('Directory "my-app" already exists');
+  });
+
+  // Regression: when the installer has already negotiated a non-empty
+  // target with the user (cancel / remove / ignore prompt), it sets
+  // allowExistingTarget so the internal "already exists" guard is
+  // bypassed. Before this opt-in flag the "remove" recovery path
+  // would empty the dir, then crash on this guard because
+  // emptyDirectory leaves the directory itself in place.
+  it("should not error on existing target when allowExistingTarget is true", async () => {
+    mockPathExists.mockImplementation((async (pathArg: unknown) => {
+      const s = String(pathArg);
+      if (s === "/test/my-app") return true; // target exists
+      if (s.endsWith(path.join("templates", "base"))) return true;
+      if (s.endsWith(path.join("templates", "blank"))) return true;
+      return false;
+    }) as never);
+
+    await expect(
+      copyTemplate({
+        projectName: "my-app",
+        projectType: "blank",
+        targetDir: "/test/my-app",
+        database: pgDatabase,
+        allowExistingTarget: true,
+      })
+    ).resolves.toBeUndefined();
+  });
+
+  it("should error if base template is missing", async () => {
+    // target dir doesn't exist
+    mockPathExists.mockResolvedValueOnce(false as never);
+    // base dir doesn't exist
+    mockPathExists.mockResolvedValueOnce(false as never);
+
+    await expect(
+      copyTemplate({
+        projectName: "my-app",
+        projectType: "blank",
+        targetDir: "/test/my-app",
+        database: pgDatabase,
+      })
+    ).rejects.toThrow("Base template not found");
+  });
+
+  it("should error if project type template is missing", async () => {
+    // target dir doesn't exist
+    mockPathExists.mockResolvedValueOnce(false as never);
+    // base dir exists
+    mockPathExists.mockResolvedValueOnce(true as never);
+    // type dir doesn't exist
+    mockPathExists.mockResolvedValueOnce(false as never);
+
+    await expect(
+      copyTemplate({
+        projectName: "my-app",
+        projectType: "blank",
+        targetDir: "/test/my-app",
+        database: pgDatabase,
+      })
+    ).rejects.toThrow('Template "blank" not found');
+  });
+
+  it("should copy base template and handle template files", async () => {
+    // Smart mock: only the top-level template dirs exist (not src/, configs/, etc.)
+    mockPathExists.mockImplementation((async (p: unknown) => {
+      const s = String(p);
+      // Target dir doesn't exist
+      if (s === "/test/my-app") return false;
+      // Base and type template dirs exist at top level
+      if (s.endsWith(path.join("templates", "base"))) return true;
+      if (s.endsWith(path.join("templates", "blank"))) return true;
+      // Everything else (src/, configs/, nextly.config.ts, etc.) doesn't exist
+      return false;
+    }) as never);
+
+    await copyTemplate({
+      projectName: "my-app",
+      projectType: "blank",
+      targetDir: "/test/my-app",
+      database: pgDatabase,
+    });
+
+    // At minimum, base template should be copied
+    expect(mockCopy).toHaveBeenCalled();
+    const firstCopySrc = mockCopy.mock.calls[0][0] as string;
+    expect(firstCopySrc).toContain(path.join("templates", "base"));
+  });
+
+  it("should generate package.json in target directory", async () => {
+    // Smart mock: true for base/type dir checks, false for everything else
+    mockPathExists.mockImplementation((async (p: unknown) => {
+      const s = String(p);
+      if (s.includes("my-app") && !s.includes("templates")) return false; // target doesn't exist
+      if (s.includes(path.join("templates", "base"))) return true;
+      if (s.includes(path.join("templates", "blank"))) return true;
+      return false;
+    }) as never);
+
+    await copyTemplate({
+      projectName: "my-app",
+      projectType: "blank",
+      targetDir: "/test/my-app",
+      database: pgDatabase,
+    });
+
+    // writeFile called for package.json
+    const writeCall = mockWriteFile.mock.calls.find(
+      call => (call[0] as string) === path.join("/test/my-app", "package.json")
+    );
+    expect(writeCall).toBeDefined();
+
+    // Verify it's valid JSON with correct project name
+    const content = JSON.parse(writeCall![1] as string);
+    expect(content.name).toBe("my-app");
+  });
+
+  it("should generate a database-specific next.config.ts", async () => {
+    mockPathExists.mockImplementation((async (p: unknown) => {
+      const s = String(p);
+      if (s.includes("my-app") && !s.includes("templates")) return false;
+      if (s.includes(path.join("templates", "base"))) return true;
+      if (s.includes(path.join("templates", "blank"))) return true;
+      return false;
+    }) as never);
+
+    await copyTemplate({
+      projectName: "my-app",
+      projectType: "blank",
+      targetDir: "/test/my-app",
+      database: pgDatabase,
+    });
+
+    const writeCall = mockWriteFile.mock.calls.find(
+      call =>
+        (call[0] as string) === path.join("/test/my-app", "next.config.ts")
+    );
+
+    expect(writeCall).toBeDefined();
+    const content = writeCall![1] as string;
+    expect(content).toContain("@nextlyhq/adapter-postgres");
+    expect(content).toContain("pg");
+    expect(content).not.toContain("@nextlyhq/adapter-mysql");
+    expect(content).not.toContain("mysql2");
+    expect(content).not.toContain("@nextlyhq/adapter-sqlite");
+    expect(content).not.toContain("better-sqlite3");
+  });
+
+  it("should generate pnpm-workspace.yaml with the build-script allowlist", async () => {
+    mockPathExists.mockImplementation((async (p: unknown) => {
+      const s = String(p);
+      if (s.includes("my-app") && !s.includes("templates")) return false;
+      if (s.includes(path.join("templates", "base"))) return true;
+      if (s.includes(path.join("templates", "blank"))) return true;
+      return false;
+    }) as never);
+
+    await copyTemplate({
+      projectName: "my-app",
+      projectType: "blank",
+      targetDir: "/test/my-app",
+      database: sqliteDatabase,
+    });
+
+    const writeCall = mockWriteFile.mock.calls.find(
+      call =>
+        (call[0] as string) === path.join("/test/my-app", "pnpm-workspace.yaml")
+    );
+    expect(writeCall).toBeDefined();
+    const content = writeCall![1] as string;
+    expect(content).toContain("allowBuilds:");
+    expect(content).toContain("better-sqlite3: true");
+    expect(content).toContain("onlyBuiltDependencies:");
+  });
+
+  it("should generate package.json without @nextlyhq packages in yalc mode", async () => {
+    mockPathExists.mockImplementation((async (p: unknown) => {
+      const s = String(p);
+      if (s.includes("my-app") && !s.includes("templates")) return false;
+      if (s.includes(path.join("templates", "base"))) return true;
+      if (s.includes(path.join("templates", "blank"))) return true;
+      return false;
+    }) as never);
+
+    await copyTemplate({
+      projectName: "my-app",
+      projectType: "blank",
+      targetDir: "/test/my-app",
+      database: pgDatabase,
+      useYalc: true,
+    });
+
+    const writeCall = mockWriteFile.mock.calls.find(
+      call => (call[0] as string) === path.join("/test/my-app", "package.json")
+    );
+    const content = JSON.parse(writeCall![1] as string);
+    expect(content.dependencies["nextly"]).toBeUndefined();
+  });
+});

@@ -1,0 +1,588 @@
+import { describe, expect, it } from "vitest";
+
+import * as entry from "./index";
+
+import type { BlockDocument, BlockNode } from "./document";
+import { renderedDomId, renderedDomIdIn } from "./document";
+import {
+  COMPONENT_INSTANCE_TYPE,
+  isBlockOrigin,
+  patternRenameRecord,
+  patternRenames,
+  DOCUMENT_FORMAT_VERSION,
+  DOCUMENT_KINDS,
+  isComponentInstance,
+  isTokenRef,
+} from "./document";
+import {
+  DEFAULT_MAX_DOCUMENT_BYTES,
+  LIMIT_WARNING_RATIO,
+  MAX_DEPTH,
+  MAX_NODES,
+  documentBytes,
+} from "./limits";
+import { makeNode } from "./tree";
+
+describe("document constants", () => {
+  it("pins the format version and the closed kind enum", () => {
+    expect(DOCUMENT_FORMAT_VERSION).toBe(1);
+    expect(DOCUMENT_KINDS).toEqual([
+      "page",
+      "pattern",
+      "component",
+      "template",
+    ]);
+  });
+
+  it("pins the limits the format spec documents", () => {
+    expect(MAX_DEPTH).toBe(12);
+    expect(MAX_NODES).toBe(5000);
+    expect(DEFAULT_MAX_DOCUMENT_BYTES).toBe(2 * 1024 * 1024);
+    expect(LIMIT_WARNING_RATIO).toBe(0.8);
+  });
+});
+
+describe("guards", () => {
+  it("isTokenRef accepts only { $token: string }", () => {
+    expect(isTokenRef({ $token: "color.primary" })).toBe(true);
+    expect(isTokenRef({ token: "color.primary" })).toBe(false);
+    expect(isTokenRef("var(--x)")).toBe(false);
+    expect(isTokenRef(null)).toBe(false);
+    expect(isTokenRef({ $token: 3 })).toBe(false);
+  });
+
+  it("isComponentInstance keys on the reserved node type", () => {
+    const instance = makeNode(COMPONENT_INSTANCE_TYPE, 1, {
+      componentId: "cmp-1",
+    });
+    expect(isComponentInstance(instance)).toBe(true);
+    expect(isComponentInstance(makeNode("core/heading", 1))).toBe(false);
+  });
+});
+
+describe("JSON round-trip", () => {
+  it("a full document survives serialize → parse structurally unchanged", () => {
+    // Exercises every envelope feature at once: bindings, styles on both
+    // states, breakpoint-keyed values, token refs, visibility, slots.
+    const doc: BlockDocument = {
+      formatVersion: DOCUMENT_FORMAT_VERSION,
+      kind: "page",
+      nodes: [
+        {
+          ...makeNode(
+            "core/section",
+            2,
+            {},
+            {
+              children: [
+                {
+                  ...makeNode("core/heading", 1, { text: "Fallback title" }),
+                  bindings: {
+                    text: {
+                      $bind: "title",
+                      source: "entry",
+                      fallback: "Untitled",
+                      format: { type: "date", options: { dateStyle: "long" } },
+                    },
+                    // A single-sourced binding names which single via sourceKey.
+                    subtitle: {
+                      $bind: "tagline",
+                      source: "single",
+                      sourceKey: "site-settings",
+                    },
+                  },
+                  styles: {
+                    base: { base: { color: { $token: "color.text" } } },
+                    hover: { base: { color: "#ff0000" } },
+                  },
+                  visibility: {
+                    conditions: [[{ field: "status", op: "eq", value: "vip" }]],
+                    devices: { mobile: false },
+                  },
+                  name: "Hero heading",
+                },
+              ],
+            }
+          ),
+          classes: ["cls_hero"],
+          locked: true,
+        },
+      ],
+      settings: { customCss: ".page { scroll-behavior: smooth; }" },
+      assets: { mediaIds: ["media-1"] },
+    };
+
+    const parsed = JSON.parse(JSON.stringify(doc)) as BlockDocument;
+    expect(parsed).toEqual(doc);
+    expect(documentBytes(doc)).toBeGreaterThan(0);
+    expect(documentBytes(doc)).toBeLessThan(DEFAULT_MAX_DOCUMENT_BYTES);
+  });
+
+  it("documentBytes measures UTF-8 bytes, not string length", () => {
+    const ascii: BlockDocument = {
+      formatVersion: 1,
+      kind: "page",
+      nodes: [makeNode("core/text", 1, { text: "aaaa" })],
+    };
+    const cjk: BlockDocument = {
+      formatVersion: 1,
+      kind: "page",
+      nodes: [makeNode("core/text", 1, { text: "字字字字" })],
+    };
+    // Same JSON string length per character, but CJK is 3 UTF-8 bytes each.
+    expect(documentBytes(cjk)).toBeGreaterThan(documentBytes(ascii));
+  });
+});
+
+describe("the bounds a writer must honour are reachable from the entry", () => {
+  // Every one of these SILENTLY discards stored input past its limit: a class
+  // over `MAX_NAMED_CLASS_NAME_LENGTH` is rejected whole, a breakpoint over
+  // `MAX_BREAKPOINT_ID_LENGTH` is dropped, definitions past
+  // `MAX_BREAKPOINTS_PER_AXIS` and entries past `MAX_NAMED_CLASSES` are never
+  // read, and one record wider than `MAX_SCANNED_KEYS` stops being enumerated.
+  //
+  // A store validating on write can only refuse what the compiler will not read
+  // if it can SEE the rule. The package's export map exposes `.` and `./format`
+  // and nothing else, so a constant that lives in a module without being
+  // re-exported is unreachable — and a consumer then accepts a value that
+  // satisfies the published type and loses every style keyed to it.
+  //
+  // Asserted as a set rather than one at a time because the defect is an
+  // omission: `MAX_BREAKPOINT_ID_LENGTH` was added beside its sibling and not
+  // re-exported, which no test in this package could see.
+  it("exposes every limit that discards input rather than reporting it", () => {
+    const bounds: Record<string, unknown> = {
+      MAX_BREAKPOINTS_PER_AXIS: entry.MAX_BREAKPOINTS_PER_AXIS,
+      MAX_BLOCK_TYPE_LENGTH: entry.MAX_BLOCK_TYPE_LENGTH,
+      MAX_BREAKPOINT_ID_LENGTH: entry.MAX_BREAKPOINT_ID_LENGTH,
+      MAX_NAMED_CLASSES: entry.MAX_NAMED_CLASSES,
+      MAX_NAMED_CLASS_NAME_LENGTH: entry.MAX_NAMED_CLASS_NAME_LENGTH,
+      MAX_SCANNED_KEYS: entry.MAX_SCANNED_KEYS,
+      MAX_VALUE_LENGTH: entry.MAX_VALUE_LENGTH,
+    };
+
+    for (const [name, value] of Object.entries(bounds)) {
+      expect(typeof value, `${name} is not exported from the entry`).toBe(
+        "number"
+      );
+    }
+  });
+});
+
+describe("the block-type predicate", () => {
+  // Three gates decide whether a string is a block type: registration
+  // (`isBlockName`), document validation (`isNodeType`) and compilation. One
+  // accepting what another rejects is not a cosmetic inconsistency — a block
+  // that registers and validates while the compiler omits its defaults renders
+  // without the look it declared, and nothing reports why.
+  //
+  // They agree by construction, because each calls this one function, and the
+  // requirement is that they keep doing so. A second implementation of the
+  // grammar agrees with this one wherever it is exercised and diverges only at
+  // the edges, so the boundary cases below are what a divergence shows up in.
+  const cases: [string, string, boolean][] = [
+    ["a namespaced slug", "core/heading", true],
+    [
+      "a slug at the cap",
+      `core/${"a".repeat(entry.MAX_BLOCK_TYPE_LENGTH - 5)}`,
+      true,
+    ],
+    [
+      "a slug one past the cap",
+      `core/${"a".repeat(entry.MAX_BLOCK_TYPE_LENGTH - 4)}`,
+      false,
+    ],
+    ["no namespace", "heading", false],
+    ["a trailing slash", "core/columns/", false],
+    ["uppercase", "Core/Heading", false],
+  ];
+
+  it.each(cases)(
+    "agrees across all three gates on %s",
+    (_what, value, want) => {
+      expect(entry.isBlockType(value), "isBlockType").toBe(want);
+      expect(entry.isNodeType(value), "isNodeType").toBe(want);
+      expect(entry.isBlockName(value), "isBlockName").toBe(want);
+    }
+  );
+
+  it("puts the cap where the boundary cases say it is", () => {
+    // The pair above only means something if the two lengths really straddle
+    // the cap, which is a property of the fixtures rather than of the code.
+    expect(`core/${"a".repeat(entry.MAX_BLOCK_TYPE_LENGTH - 5)}`).toHaveLength(
+      entry.MAX_BLOCK_TYPE_LENGTH
+    );
+    expect(`core/${"a".repeat(entry.MAX_BLOCK_TYPE_LENGTH - 4)}`).toHaveLength(
+      entry.MAX_BLOCK_TYPE_LENGTH + 1
+    );
+  });
+});
+
+describe("renderedDomId: which of a node's two spellings reaches the page", () => {
+  const bare = (extra: Record<string, unknown>) =>
+    ({
+      id: "n",
+      type: "core/box",
+      version: 1,
+      props: {},
+      ...extra,
+    }) as BlockNode;
+
+  it("prefers a non-empty cssId, which overwrites the bag", () => {
+    expect(
+      renderedDomId(bare({ cssId: "actual", attributes: { id: "hero" } }))
+    ).toBe("actual");
+  });
+
+  it("treats an EMPTY string cssId as shadowing, emitting nothing reachable", () => {
+    // Nothing reachable is emitted: an empty id addresses nothing, and the
+    // bag is shadowed, so its value does not render either.
+    expect(
+      renderedDomId(bare({ cssId: "", attributes: { id: "hero" } }))
+    ).toBeUndefined();
+  });
+
+  it("lets the bag through when cssId is NOT a string", () => {
+    // The renderer normalises a non-string cssId to undefined
+    // (`typeof node.cssId === "string" ? node.cssId : undefined`) and only then
+    // decides whether to overwrite — so the bag is what renders. Reading this
+    // as "any cssId shadows" costs a real duplicate id on the page.
+    expect(
+      renderedDomId(bare({ cssId: null, attributes: { id: "hero" } }))
+    ).toBe("hero");
+    expect(renderedDomId(bare({ cssId: 7, attributes: { id: "hero" } }))).toBe(
+      "hero"
+    );
+  });
+
+  it("folds the attribute name, because HTML does", () => {
+    expect(renderedDomId(bare({ attributes: { ID: "hero" } }))).toBe("hero");
+  });
+
+  it("lets a trailing EMPTY case variant overwrite an earlier one", () => {
+    // Attribute names are case-insensitive and the last variant decides, so
+    // `{ id: "hero", ID: "" }` leaves an empty id, which is no id. Skipping the
+    // empty one keeps `hero` and reports an id that does not render — which
+    // then makes a copy rename itself away from an id nothing owns.
+    expect(
+      renderedDomId(bare({ attributes: { id: "hero", ID: "" } }))
+    ).toBeUndefined();
+  });
+
+  it("lets a trailing NON-empty variant win too", () => {
+    // The control. "Ignore empty values entirely" passes the case above only by
+    // accident; "last one wins, whatever it holds" is the rule.
+    expect(renderedDomId(bare({ attributes: { id: "", ID: "hero" } }))).toBe(
+      "hero"
+    );
+  });
+
+  it("reads a bag the RENDERER would read, not only a plain record", () => {
+    // The renderer does `Object.entries(attributes)` on any non-array object,
+    // so a class instance with an own `id` puts that id on the page. Narrowing
+    // to a plain record reported no id, and an insert then kept an incoming id
+    // the destination was already rendering.
+    class Bag {
+      id = "hero";
+    }
+    expect(renderedDomId(bare({ attributes: new Bag() }))).toBe("hero");
+    // Still absent for the shapes the renderer treats as absent.
+    expect(renderedDomIdIn(null)).toBeUndefined();
+    expect(renderedDomIdIn(["id"])).toBeUndefined();
+  });
+
+  it("asks the bag alone the same way", () => {
+    // The narrower question a surface asks when it needs to know whether an
+    // empty bag id would SHADOW something.
+    expect(renderedDomIdIn({ id: "hero", ID: "" })).toBe("");
+    expect(renderedDomIdIn({ id: "", ID: "hero" })).toBe("hero");
+    expect(renderedDomIdIn(null)).toBeUndefined();
+    expect(renderedDomIdIn(["id"])).toBeUndefined();
+  });
+
+  it("reports none when the node spells none", () => {
+    expect(renderedDomId(bare({}))).toBeUndefined();
+    expect(renderedDomId(bare({ attributes: { id: "" } }))).toBeUndefined();
+  });
+});
+
+/** A rename map whose only entry is an accessor. */
+function computedRenameEntry(): Record<string, unknown> {
+  const renamed: Record<string, unknown> = {};
+  Object.defineProperty(renamed, "authored", {
+    enumerable: true,
+    get() {
+      throw new Error("boom");
+    },
+  });
+  return renamed;
+}
+
+describe("a provenance record's rename map", () => {
+  const base = { from: "pattern" as const, id: "p1", digest: "d1" };
+
+  it("accepts a record with no rename map", () => {
+    // The migration path, and the control for every refusal below: a record
+    // written before this field existed is still whole.
+    expect(isBlockOrigin(base)).toBe(true);
+  });
+
+  it("accepts a well-formed map", () => {
+    expect(
+      isBlockOrigin({ ...base, renamed: { pricing: "pricing-a1b2" } })
+    ).toBe(true);
+  });
+
+  it.each([
+    ["not a record", "pricing"],
+    ["an array", ["pricing"]],
+    ["null", null],
+    ["a non-string current id", { pricing: 3 }],
+    ["an empty current id", { pricing: "" }],
+    ["an empty original", { "": "pricing" }],
+    ["two sources claiming one current id", { a: "same", b: "same" }],
+    ["an entry that computes itself", computedRenameEntry()],
+  ])("refuses %s", (_name, renamed) => {
+    // A half-record is read as "these are the originals" and puts back an id
+    // that was never there, which is worse than having no record at all — the
+    // same reason a pattern origin without a digest is refused.
+    expect(isBlockOrigin({ ...base, renamed })).toBe(false);
+  });
+
+  it.each(["id", "from", "digest", "renamed"])(
+    "refuses a record whose %s computes itself, without running it",
+    field => {
+      // Every field of a provenance record is data a caller supplied — an
+      // import, a script, an in-process edit — and this is the published guard
+      // that decides whether to trust it. Reading a field with an ordinary
+      // property access runs the caller's code INSIDE that decision: a throwing
+      // getter escaped as a native error rather than the `false` this promises,
+      // and a side-effecting one executed on the way past. Measured, all four
+      // fields did that; only the entries INSIDE the map were descriptor-read.
+      let reads = 0;
+      const origin: Record<string, unknown> = { ...base };
+      Object.defineProperty(origin, field, {
+        enumerable: true,
+        configurable: true,
+        get() {
+          reads += 1;
+          throw new Error("a provenance field must never be invoked");
+        },
+      });
+
+      expect(isBlockOrigin(origin)).toBe(false);
+      expect(reads).toBe(0);
+    }
+  );
+
+  it("refuses a record whose renamed is a set-only accessor", () => {
+    // Absent and COMPUTED are different answers and both read back as
+    // `undefined`, so collapsing the descriptor to its value would call this
+    // record whole. A set-only accessor has no getter either, which is why the
+    // rule is "does the descriptor hold a value", not "is there a getter".
+    const origin: Record<string, unknown> = { ...base };
+    Object.defineProperty(origin, "renamed", {
+      enumerable: true,
+      configurable: true,
+      set() {
+        /* nothing */
+      },
+    });
+    expect(isBlockOrigin(origin)).toBe(false);
+  });
+
+  it.each(["id", "from", "digest", "renamed"])(
+    "refuses a record whose %s storage would not keep",
+    field => {
+      // A non-enumerable field is dropped by every road this record travels to
+      // storage — `JSON.stringify`, an object spread, `structuredClone` — so a
+      // guard that admits one has trusted a record whose persisted form is a
+      // different record. Absent is the honest reading of it, which for `id`,
+      // `from` and `digest` is a refusal on its own; the map's own arm is
+      // asserted separately, because absent is VALID there and the consequence
+      // is a restore rather than a verdict.
+      const origin: Record<string, unknown> = { ...base };
+      Object.defineProperty(origin, field, {
+        value: field === "renamed" ? { pricing: "pricing-1" } : "x",
+        enumerable: false,
+        configurable: true,
+      });
+
+      expect(JSON.parse(JSON.stringify(origin))[field]).toBeUndefined();
+      expect(isBlockOrigin(origin)).toBe(field === "renamed");
+    }
+  );
+
+  it("reads no renames from a map storage would not keep", () => {
+    // The record stays whole — `renamed` may be absent — and what it SAYS is
+    // that nothing was renamed, so a planner restoring from it puts nothing
+    // back rather than acting on metadata the saved document will not carry.
+    const origin: Record<string, unknown> = { ...base };
+    Object.defineProperty(origin, "renamed", {
+      value: { pricing: "pricing-1" },
+      enumerable: false,
+      configurable: true,
+    });
+
+    expect(patternRenames(origin)?.size).toBe(0);
+  });
+
+  it("says what a whole pattern record renamed", () => {
+    // The control for the two refusals above: the same question, asked of a
+    // record with nothing wrong with it, answers with the map.
+    expect([
+      ...(patternRenames({ ...base, renamed: { pricing: "pricing-1" } }) ?? []),
+    ]).toEqual([["pricing", "pricing-1"]]);
+  });
+
+  it("hands out a map of its own for a record that renamed nothing", () => {
+    // `ReadonlyMap` is readonly to TypeScript and nothing else: `.set` is still
+    // there at runtime, and this is a published function. A consumer writing to
+    // a module-wide empty singleton would make every later origin that renamed
+    // NOTHING claim that rename, and silently rewrite ids on a save with
+    // nothing to restore.
+    const whole = { ...base };
+    const first = patternRenames(whole);
+    (first as Map<string, string>).set("pricing", "pricing-1");
+
+    expect(patternRenames({ ...base })?.size).toBe(0);
+  });
+
+  it("says nothing about a record it would not trust, or one that renames none", () => {
+    // Undefined covers both, because a caller that must tell them apart is
+    // asking `readBlockOrigin`, which answers in four.
+    expect(patternRenames({ ...base, renamed: null })).toBeUndefined();
+    expect(patternRenames({ from: "component", id: "c1" })).toBeUndefined();
+  });
+
+  it("ignores a rename map on a component record", () => {
+    // That arm severs a link deliberately and restores nothing, so it has no
+    // such field; an extra member is not what makes a record whole. The map is
+    // PRESENT in the input, and malformed — without that this would prove only
+    // that the component arm accepts a record with no map at all.
+    expect(
+      isBlockOrigin({ from: "component", id: "c1", renamed: "nonsense" })
+    ).toBe(true);
+  });
+});
+
+describe("a provenance record's node lists", () => {
+  const base = {
+    from: "pattern" as const,
+    id: "p1",
+    digest: "d1",
+    renamed: { pricing: "pricing-1", hero: "hero-1" },
+  };
+  const lists = { pricing: ["n1"], hero: ["n2", "n3"] };
+
+  /** A list whose first member is missing, as an array literal cannot say. */
+  function holed(): unknown[] {
+    const list: unknown[] = [];
+    list[1] = "n2";
+    return list;
+  }
+
+  it("accepts lists naming exactly the renamed ids", () => {
+    expect(isBlockOrigin({ ...base, renamedNodes: lists })).toBe(true);
+  });
+
+  it("accepts a record with no lists, which is every older record", () => {
+    // The fallback's own control: the renames are still read, and what the
+    // record says about nodes is nothing rather than an empty answer.
+    expect(isBlockOrigin(base)).toBe(true);
+    expect(patternRenames(base)?.size).toBe(2);
+    expect(patternRenameRecord(base)?.renamed.size).toBe(2);
+    expect(patternRenameRecord(base)?.renamedNodes).toBeUndefined();
+  });
+
+  it("accepts an empty list, which names no node", () => {
+    expect(
+      isBlockOrigin({ ...base, renamedNodes: { ...lists, hero: [] } })
+    ).toBe(true);
+  });
+
+  it.each([
+    ["not a record", "n1"],
+    ["an array", [["n1"]]],
+    ["null", null],
+    ["a list for an id nothing renamed", { ...lists, other: ["n4"] }],
+    ["a rename with no list", { pricing: ["n1"] }],
+    ["a list that is not an array", { ...lists, hero: "n2" }],
+    ["a non-string member", { ...lists, hero: [2] }],
+    ["an empty member", { ...lists, hero: [""] }],
+    ["a list with a hole in it", { ...lists, hero: holed() }],
+  ])("refuses %s", (_name, renamedNodes) => {
+    // A half-record decides by node for some ids and by value for the rest, on
+    // the strength of a record that is wrong about at least one of them.
+    expect(isBlockOrigin({ ...base, renamedNodes })).toBe(false);
+  });
+
+  it("refuses lists on a record that renamed nothing", () => {
+    const { renamed: _renamed, ...none } = base;
+    expect(isBlockOrigin({ ...none, renamedNodes: { pricing: ["n1"] } })).toBe(
+      false
+    );
+    expect(isBlockOrigin({ ...none, renamedNodes: {} })).toBe(true);
+  });
+
+  it.each(["list", "member"])(
+    "refuses a %s that computes itself, without running it",
+    where => {
+      let reads = 0;
+      const boom = {
+        enumerable: true,
+        configurable: true,
+        get() {
+          reads += 1;
+          throw new Error("a stored list must never be invoked");
+        },
+      };
+      const renamedNodes: Record<string, unknown> = { ...lists };
+      if (where === "list") {
+        Object.defineProperty(renamedNodes, "hero", boom);
+      } else {
+        const member: unknown[] = ["n2"];
+        Object.defineProperty(member, 0, boom);
+        renamedNodes.hero = member;
+      }
+
+      expect(isBlockOrigin({ ...base, renamedNodes })).toBe(false);
+      expect(reads).toBe(0);
+    }
+  );
+
+  it("refuses a list storage would not keep", () => {
+    const renamedNodes: Record<string, unknown> = { pricing: ["n1"] };
+    Object.defineProperty(renamedNodes, "hero", {
+      value: ["n2"],
+      enumerable: false,
+      configurable: true,
+    });
+
+    expect(JSON.parse(JSON.stringify(renamedNodes)).hero).toBeUndefined();
+    expect(isBlockOrigin({ ...base, renamedNodes })).toBe(false);
+  });
+
+  it("says which nodes each rename was applied to", () => {
+    const read = patternRenameRecord({
+      ...base,
+      renamedNodes: lists,
+    })?.renamedNodes;
+
+    expect([...(read ?? [])].map(([was, ids]) => [was, [...ids]])).toEqual([
+      ["pricing", ["n1"]],
+      ["hero", ["n2", "n3"]],
+    ]);
+  });
+
+  it("says nothing about a record it would not trust", () => {
+    // The RECORD is absent, not merely its lists: a half-record is not one a
+    // caller may act on for its renames either.
+    expect(
+      patternRenameRecord({ ...base, renamedNodes: { pricing: ["n1"] } })
+    ).toBeUndefined();
+    expect(
+      patternRenameRecord({ from: "component", id: "c1", renamedNodes: lists })
+    ).toBeUndefined();
+  });
+});

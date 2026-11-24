@@ -1,0 +1,1934 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import type { PluginDefinition } from "./plugin-context";
+import { definePlugin } from "./plugin-context";
+
+import { NEXTLY_ERROR_STATUS } from "../errors/error-codes";
+import { NextlyError } from "../errors/nextly-error";
+
+import { setNextlyLogger } from "../observability/logger";
+
+import { buildPluginAdminMeta } from "./admin-meta";
+import { reportUserMenuItemProblems } from "./header-item";
+
+const base = {
+  name: "@acme/p",
+  version: "1.0.0",
+  nextly: "*",
+} as const;
+
+function asPlugins(defs: unknown[]): PluginDefinition[] {
+  return defs as PluginDefinition[];
+}
+
+describe("buildPluginAdminMeta", () => {
+  it("serializes a field type's layout hint", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          contributes: {
+            fieldTypes: [
+              {
+                type: "page-builder",
+                storage: "json",
+                component: "@acme/p/admin#Canvas",
+                layout: "takeover",
+              },
+            ],
+          },
+        },
+      ]),
+      undefined
+    );
+    expect(meta[0].fieldTypes?.[0]).toMatchObject({
+      type: "page-builder",
+      component: "@acme/p/admin#Canvas",
+      layout: "takeover",
+    });
+  });
+
+  it("serializes a field type's picker presentation and surfaces", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          contributes: {
+            fieldTypes: [
+              {
+                type: "rating",
+                storage: "number",
+                component: "@acme/p/admin#Rating",
+                label: "Star Rating",
+                description: "A 1-5 star rating",
+                icon: "Star",
+                category: "Advanced",
+                surfaces: ["entries", "users"],
+              },
+            ],
+          },
+        },
+      ]),
+      undefined
+    );
+    expect(meta[0].fieldTypes?.[0]).toEqual({
+      type: "rating",
+      component: "@acme/p/admin#Rating",
+      storage: "number",
+      label: "Star Rating",
+      description: "A 1-5 star rating",
+      icon: "Star",
+      category: "Advanced",
+      surfaces: ["entries", "users"],
+    });
+  });
+
+  it("serves a field type's declared settings as declared, for the settings panel", () => {
+    const settings = [
+      { key: "max", label: "Most stars", control: "number" },
+      {
+        key: "shape",
+        label: "Shape",
+        control: "select",
+        tab: "display",
+        options: [{ label: "Star", value: "star" }],
+      },
+    ];
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          contributes: {
+            fieldTypes: [
+              {
+                type: "rating",
+                storage: "number",
+                component: "@acme/p/admin#Rating",
+                settings,
+              },
+            ],
+          },
+        },
+      ]),
+      undefined
+    );
+    expect(meta[0].fieldTypes?.[0].settings).toEqual(settings);
+  });
+
+  it("omits presentation and surfaces keys a field type does not declare", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          contributes: {
+            fieldTypes: [
+              { type: "rating", storage: "number", component: "@p#R" },
+            ],
+          },
+        },
+      ]),
+      undefined
+    );
+    expect(meta[0].fieldTypes?.[0]).toEqual({
+      type: "rating",
+      component: "@p#R",
+      // Storage is not presentation: it decides how the type's values behave,
+      // so it always travels even when every optional key is omitted.
+      storage: "number",
+    });
+  });
+
+  it("serializes schemaBuilderSlot for an enabled plugin only", () => {
+    const enabled = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          contributes: { admin: { schemaBuilderSlot: "@acme/p/admin#Toggle" } },
+        },
+      ]),
+      undefined
+    );
+    expect(enabled[0].schemaBuilderSlot).toBe("@acme/p/admin#Toggle");
+
+    const disabled = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          enabled: false,
+          contributes: { admin: { schemaBuilderSlot: "@acme/p/admin#Toggle" } },
+        },
+      ]),
+      undefined
+    );
+    expect(disabled[0].schemaBuilderSlot).toBeUndefined();
+  });
+
+  it("serializes entryFormToolbarSlot for an enabled plugin only", () => {
+    const enabled = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          contributes: { admin: { entryFormToolbarSlot: "@acme/p/admin#Bar" } },
+        },
+      ]),
+      undefined
+    );
+    expect(enabled[0].entryFormToolbarSlot).toBe("@acme/p/admin#Bar");
+
+    const disabled = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          enabled: false,
+          contributes: { admin: { entryFormToolbarSlot: "@acme/p/admin#Bar" } },
+        },
+      ]),
+      undefined
+    );
+    expect(disabled[0].entryFormToolbarSlot).toBeUndefined();
+  });
+
+  it("publishes document views on their routed slug, for an enabled plugin only", () => {
+    const declaration = {
+      ...base,
+      renameMap: { pages: "site-pages" },
+      contributes: {
+        admin: {
+          views: {
+            pages: {
+              documentViews: [
+                {
+                  path: "builder",
+                  component: "@acme/p/admin#Builder",
+                  label: "Page Builder",
+                },
+              ],
+            },
+          },
+        },
+      },
+    };
+    const [enabled] = buildPluginAdminMeta(asPlugins([declaration]), undefined);
+    // On the slug the admin routes, not the one the plugin wrote: the admin
+    // matches the address it is on against this.
+    expect(enabled.documentViews).toEqual([
+      {
+        slug: "site-pages",
+        path: "builder",
+        component: "@acme/p/admin#Builder",
+        label: "Page Builder",
+      },
+    ]);
+
+    const [disabled] = buildPluginAdminMeta(
+      asPlugins([{ ...declaration, enabled: false }]),
+      undefined
+    );
+    expect(disabled.documentViews).toBeUndefined();
+  });
+
+  it("publishes document action overrides and panel sections on their routed slug, for an enabled plugin only", () => {
+    const declaration = {
+      ...base,
+      renameMap: { layouts: "site-layouts" },
+      contributes: {
+        admin: {
+          views: {
+            layouts: {
+              documentActions: {
+                unpublish: "hidden",
+                delete: { component: "@acme/p/admin#Remove" },
+              },
+              panelSections: [
+                { title: "Used by", component: "@acme/p/admin#Usage" },
+              ],
+            },
+          },
+        },
+      },
+    };
+    const [enabled] = buildPluginAdminMeta(asPlugins([declaration]), undefined);
+    expect(enabled.documentActions).toEqual([
+      { slug: "site-layouts", action: "unpublish", override: "hidden" },
+      {
+        slug: "site-layouts",
+        action: "delete",
+        override: { component: "@acme/p/admin#Remove" },
+      },
+    ]);
+    expect(enabled.panelSections).toEqual([
+      {
+        slug: "site-layouts",
+        title: "Used by",
+        component: "@acme/p/admin#Usage",
+      },
+    ]);
+
+    const [disabled] = buildPluginAdminMeta(
+      asPlugins([{ ...declaration, enabled: false }]),
+      undefined
+    );
+    expect(disabled.documentActions).toBeUndefined();
+    expect(disabled.panelSections).toBeUndefined();
+  });
+
+  it("publishes the collections whose screens start folded on their routed slug, for an enabled plugin only", () => {
+    const declaration = {
+      ...base,
+      renameMap: { forms: "site-forms" },
+      contributes: {
+        admin: {
+          views: {
+            forms: { foldedPanel: true },
+            submissions: { foldedPanel: false },
+          },
+        },
+      },
+    };
+    const [enabled] = buildPluginAdminMeta(asPlugins([declaration]), undefined);
+    expect(enabled.foldedPanels).toEqual(["site-forms"]);
+
+    const [disabled] = buildPluginAdminMeta(
+      asPlugins([{ ...declaration, enabled: false }]),
+      undefined
+    );
+    expect(disabled.foldedPanels).toBeUndefined();
+  });
+
+  it("folds contributes.admin menu/pages/settings for enabled plugins", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          contributes: {
+            admin: {
+              menu: [
+                {
+                  label: "Forms",
+                  to: "/admin/collections/forms",
+                  icon: "file-text",
+                  order: 10,
+                },
+              ],
+              pages: [
+                {
+                  path: "reports",
+                  component: "@acme/p/admin#Reports",
+                  requiredPermission: "read-reports",
+                },
+              ],
+              settings: { component: "@acme/p/admin#Settings" },
+            },
+          },
+        },
+      ]),
+      undefined
+    );
+
+    expect(meta[0].menu).toEqual([
+      {
+        label: "Forms",
+        to: "/admin/collections/forms",
+        icon: "file-text",
+        order: 10,
+      },
+    ]);
+    expect(meta[0].pages?.[0]).toMatchObject({
+      path: "reports",
+      component: "@acme/p/admin#Reports",
+      requiredPermission: "read-reports",
+    });
+    expect(meta[0].settings?.component).toBe("@acme/p/admin#Settings");
+  });
+
+  describe("the permission the settings page asks for", () => {
+    const settingsPage = { component: "@acme/p/admin#Settings" };
+
+    it("is the plugin's own settings permission when it names one", () => {
+      // The request gate takes this one alone for a write, so a page gated on
+      // anything else either shuts out the role it was granted to or shows
+      // an editor whose saves are refused.
+      const meta = buildPluginAdminMeta(
+        asPlugins([
+          {
+            ...base,
+            contributes: {
+              permissions: [{ action: "update", resource: "pay-settings" }],
+              settingsPermission: "update-pay-settings",
+              admin: { settings: settingsPage },
+            },
+          },
+        ]),
+        undefined
+      );
+      expect(meta[0].settings).toEqual({
+        ...settingsPage,
+        permission: "update-pay-settings",
+      });
+    });
+
+    it("is update-settings when it names none", () => {
+      const meta = buildPluginAdminMeta(
+        asPlugins([
+          { ...base, contributes: { admin: { settings: settingsPage } } },
+        ]),
+        undefined
+      );
+      expect(meta[0].settings?.permission).toBe("update-settings");
+    });
+  });
+
+  it("folds headerSlot for enabled plugins, and publishes nothing a plugin carries under admin.widgets", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          contributes: {
+            admin: {
+              headerSlot: "@acme/p/admin#HeaderBadge",
+              widgets: [
+                {
+                  id: "stats",
+                  component: "@acme/p/admin#Stats",
+                  size: { default: { w: 6, h: 4 } },
+                  requiredPermission: "read-stats",
+                },
+              ],
+            },
+          },
+        },
+      ]),
+      undefined
+    );
+    expect(meta[0].headerSlot).toBe("@acme/p/admin#HeaderBadge");
+    // The key is no field, and startup refuses a plugin carrying it: a widget
+    // reaches the admin only through the registry.
+    expect(meta[0]).not.toHaveProperty("widgets");
+  });
+
+  it("folds contributes.admin.header (slot + hideDefaults + hide) for enabled plugins", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          contributes: {
+            admin: {
+              header: {
+                slot: "@acme/p/admin#Publish",
+                hideDefaults: true,
+                hide: ["github", "notifications"],
+              },
+            },
+          },
+        },
+      ]),
+      undefined
+    );
+    expect(meta[0].header).toEqual({
+      slot: "@acme/p/admin#Publish",
+      hideDefaults: true,
+      hide: ["github", "notifications"],
+    });
+    // Back-compat: legacy headerSlot mirrors header.slot.
+    expect(meta[0].headerSlot).toBe("@acme/p/admin#Publish");
+  });
+
+  it("maps a deprecated top-level headerSlot into header.slot", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          contributes: { admin: { headerSlot: "@acme/p/admin#Badge" } },
+        },
+      ]),
+      undefined
+    );
+    expect(meta[0].header?.slot).toBe("@acme/p/admin#Badge");
+    expect(meta[0].headerSlot).toBe("@acme/p/admin#Badge");
+  });
+
+  it("omits header for enabled:false plugins", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          enabled: false,
+          contributes: {
+            admin: {
+              header: { slot: "@acme/p/admin#Publish", hideDefaults: true },
+            },
+          },
+        },
+      ]),
+      undefined
+    );
+    expect(meta[0].header).toBeUndefined();
+    expect(meta[0].headerSlot).toBeUndefined();
+  });
+
+  it("omits headerSlot for enabled:false plugins", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          enabled: false,
+          contributes: {
+            admin: {
+              headerSlot: "@acme/p/admin#HeaderBadge",
+              widgets: [{ id: "stats", component: "@acme/p/admin#Stats" }],
+            },
+          },
+        },
+      ]),
+      undefined
+    );
+    expect(meta[0].headerSlot).toBeUndefined();
+    expect(meta[0]).not.toHaveProperty("widgets");
+  });
+
+  it("serializes contributes.fieldTypes type→component, even when disabled", () => {
+    const fieldTypes = [
+      { type: "rating", storage: "number", component: "@acme/p/admin#Rating" },
+    ];
+    const enabled = buildPluginAdminMeta(
+      asPlugins([{ ...base, contributes: { fieldTypes } }]),
+      undefined
+    );
+    expect(enabled[0].fieldTypes).toEqual([
+      { type: "rating", component: "@acme/p/admin#Rating", storage: "number" },
+    ]);
+
+    // Disabled plugins keep their collections + custom field types so the admin
+    // can still render fields of retained collections.
+    const disabled = buildPluginAdminMeta(
+      asPlugins([{ ...base, enabled: false, contributes: { fieldTypes } }]),
+      undefined
+    );
+    expect(disabled[0].fieldTypes).toEqual([
+      { type: "rating", component: "@acme/p/admin#Rating", storage: "number" },
+    ]);
+  });
+
+  it("omits admin contributions for enabled:false plugins", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          enabled: false,
+          contributes: {
+            admin: { menu: [{ label: "x", to: "/x" }] },
+          },
+        },
+      ]),
+      undefined
+    );
+    // The plugin entry still exists (its schema still applies), but its
+    // behavioral admin UI (menu/pages/settings) is skipped per D49.
+    expect(meta).toHaveLength(1);
+    expect(meta[0].menu).toBeUndefined();
+    expect(meta[0].pages).toBeUndefined();
+    expect(meta[0].settings).toBeUndefined();
+  });
+
+  it("preserves placement/appearance/collections and applies host overrides", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          admin: {
+            placement: "users",
+            order: 60,
+            appearance: { icon: "BarChart", label: "Analytics" },
+          },
+          contributes: { collections: [{ slug: "forms" }] },
+        },
+      ]),
+      { "acme-p": { order: 5, appearance: { badge: "Beta" } } }
+    );
+
+    expect(meta[0].placement).toBe("users");
+    expect(meta[0].order).toBe(5); // host override wins
+    expect(meta[0].appearance).toEqual({
+      icon: "BarChart",
+      label: "Analytics",
+      badge: "Beta", // shallow-merged
+    });
+    expect(meta[0].collections).toEqual(["forms"]);
+  });
+
+  it("defaults placement to 'plugins' and has no admin keys when none declared", () => {
+    const meta = buildPluginAdminMeta(asPlugins([{ ...base }]), undefined);
+    expect(meta[0].placement).toBe("plugins");
+    expect(meta[0].menu).toBeUndefined();
+    expect(meta[0].pages).toBeUndefined();
+    expect(meta[0].settings).toBeUndefined();
+  });
+
+  it("passes identity metadata through (author/links/license/category/tags)", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          author: "Acme Inc.",
+          homepage: "https://acme.dev",
+          repository: "https://github.com/acme/p",
+          docsUrl: "https://acme.dev/docs",
+          license: "MIT",
+          category: "forms",
+          tags: ["forms", "email"],
+        },
+      ]),
+      undefined
+    );
+    expect(meta[0]).toMatchObject({
+      author: "Acme Inc.",
+      homepage: "https://acme.dev",
+      repository: "https://github.com/acme/p",
+      docsUrl: "https://acme.dev/docs",
+      license: "MIT",
+      category: "forms",
+      tags: ["forms", "email"],
+    });
+  });
+
+  it("keeps identity metadata for disabled plugins", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        { ...base, enabled: false, author: "Acme Inc.", license: "MIT" },
+      ]),
+      undefined
+    );
+    expect(meta[0].author).toBe("Acme Inc.");
+    expect(meta[0].license).toBe("MIT");
+  });
+
+  it("serializes the enabled state explicitly", () => {
+    const on = buildPluginAdminMeta(asPlugins([{ ...base }]), undefined);
+    expect(on[0].enabled).toBe(true);
+
+    const off = buildPluginAdminMeta(
+      asPlugins([{ ...base, enabled: false }]),
+      undefined
+    );
+    expect(off[0].enabled).toBe(false);
+  });
+
+  it("serializes dependsOn ranges for the detail page", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([{ ...base, dependsOn: { "@acme/core": "^1.2.0" } }]),
+      undefined
+    );
+    expect(meta[0].dependsOn).toEqual({ "@acme/core": "^1.2.0" });
+  });
+
+  /**
+   * The admin-meta endpoint answers WITHOUT authentication, so anything on this
+   * payload is readable by anyone who can reach the app. A permission
+   * vocabulary is a map of what the installation can do and how each capability
+   * is spelled, which is reconnaissance rather than content, so it is not
+   * served here at all.
+   *
+   * Asserted against a plugin that DECLARES one, so the absence is the
+   * serializer declining to carry it rather than a fixture with nothing to
+   * carry. The admin reads the seeded rows from the authenticated permissions
+   * endpoint instead, which is also the set that actually exists.
+   */
+  it("never serializes declared permissions onto the public payload", () => {
+    const contributes = {
+      permissions: [
+        {
+          action: "export",
+          resource: "submissions",
+          label: "Export submissions",
+          danger: true,
+        },
+      ],
+    };
+    const enabled = buildPluginAdminMeta(
+      asPlugins([{ ...base, contributes }]),
+      undefined
+    );
+    expect(enabled[0]).not.toHaveProperty("permissions");
+    // The plugin itself was serialized: without this the assertion above would
+    // pass just as well for a fixture the builder dropped entirely.
+    expect(enabled[0].name).toBe(base.name);
+
+    const disabled = buildPluginAdminMeta(
+      asPlugins([{ ...base, enabled: false, contributes }]),
+      undefined
+    );
+    expect(disabled[0]).not.toHaveProperty("permissions");
+  });
+
+  it("summarizes declared routes (method + path only) for enabled plugins only", () => {
+    const contributes = {
+      routes: [
+        {
+          method: "GET",
+          path: "/submissions/export",
+          handler: () => new Response(),
+          requiredPermission: "export-submissions",
+        },
+      ],
+    };
+    const enabled = buildPluginAdminMeta(
+      asPlugins([{ ...base, contributes }]),
+      undefined
+    );
+    // `fullPath` travels too: it is the namespace the dispatcher mounts the
+    // route at, derived from the raw package name, and the admin renders it
+    // rather than rebuilding it from the slug.
+    expect(enabled[0].routes).toEqual([
+      {
+        method: "GET",
+        path: "/submissions/export",
+        fullPath: "/plugins/@acme/p/submissions/export",
+      },
+    ]);
+
+    const disabled = buildPluginAdminMeta(
+      asPlugins([{ ...base, enabled: false, contributes }]),
+      undefined
+    );
+    expect(disabled[0].routes).toBeUndefined();
+  });
+
+  it("lists contributed singles and field group slugs alongside collections", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          contributes: {
+            collections: [{ slug: "forms" }],
+            singles: [{ slug: "form-settings" }],
+            fieldGroups: [{ slug: "form-block" }],
+          },
+        },
+      ]),
+      undefined
+    );
+    expect(meta[0].collections).toEqual(["forms"]);
+    expect(meta[0].singles).toEqual(["form-settings"]);
+    expect(meta[0].fieldGroups).toEqual(["form-block"]);
+  });
+});
+
+describe("buildPluginAdminMeta — the slugs a plugin's entities are registered under", () => {
+  it("names each collection, Single and field group by the slug the host's rename gave it", () => {
+    const [meta] = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          contributes: {
+            collections: [{ slug: "forms" }, { slug: "submissions" }],
+            singles: [{ slug: "settings" }],
+            fieldGroups: [{ slug: "address" }],
+          },
+          // As `plugin.rename({ … })` leaves it: declared slug to registered slug.
+          renameMap: {
+            forms: "contact-forms",
+            settings: "form-settings",
+            address: "postal-address",
+          },
+        },
+      ]),
+      undefined
+    );
+    // What the admin lists, so a renamed entity is found under its plugin
+    // rather than shown among the site's own content.
+    expect(meta.collections).toEqual(["contact-forms", "submissions"]);
+    expect(meta.singles).toEqual(["form-settings"]);
+    expect(meta.fieldGroups).toEqual(["postal-address"]);
+  });
+});
+
+describe("buildPluginAdminMeta — clientConfig", () => {
+  const withConfig = (clientConfig: Record<string, unknown>) =>
+    asPlugins([{ ...base, contributes: { admin: { clientConfig } } }]);
+
+  it("delivers a plugin's own config to the client", () => {
+    // A plugin's factory runs on the server when the host builds its config;
+    // its admin components run in the browser. This is the only thing that
+    // crosses between them.
+    const meta = buildPluginAdminMeta(
+      withConfig({
+        remotePatterns: [{ protocol: "https", hostname: "a.example" }],
+      }),
+      undefined
+    );
+    expect(meta[0]?.clientConfig).toEqual({
+      remotePatterns: [{ protocol: "https", hostname: "a.example" }],
+    });
+  });
+
+  it("keeps it for a disabled plugin, whose field editors still mount", () => {
+    // Unlike menus and pages, which a disabled plugin does not render at all.
+    // Its collections and their fields are retained, so its field editors DO
+    // render, and one configured by this would read `undefined`. For the page
+    // builder that is a configured allowlist becoming an empty one, which
+    // makes remote media vanish from entries that are otherwise fine.
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          enabled: false,
+          contributes: {
+            admin: { clientConfig: { a: 1 }, menu: [{ label: "X", to: "/x" }] },
+          },
+        },
+      ]),
+      undefined
+    );
+    expect(meta[0]?.enabled).toBe(false);
+    expect(meta[0]?.clientConfig).toEqual({ a: 1 });
+    // The behavioral surface is still withheld, so this is a deliberate
+    // distinction rather than the enabled gate having been dropped.
+    expect(meta[0]?.menu).toBeUndefined();
+  });
+
+  it("refuses config that will not survive the trip, naming the plugin", () => {
+    // Rejected rather than repaired. A config whose Dates arrive as strings and
+    // whose functions arrive as nothing still looks plausible to the component
+    // reading it, which is harder to diagnose than a config that never arrives.
+    for (const bad of [
+      { when: new Date() },
+      { fn: () => 1 },
+      { m: new Map() },
+      { s: new Set([1]) },
+      { big: 1n },
+      { nested: { deep: [{ when: new Date() }] } },
+    ]) {
+      // The public message stays generic; the plugin and the offending keys
+      // live in the log context, which is where a boot failure is read.
+      let thrown: unknown;
+      try {
+        buildPluginAdminMeta(withConfig(bad), undefined);
+      } catch (error) {
+        thrown = error;
+      }
+      const label = JSON.stringify(Object.keys(bad));
+      expect(NextlyError.is(thrown), label).toBe(true);
+      const err = thrown as NextlyError;
+      expect(String(err.code), label).toBe(
+        "NEXTLY_PLUGIN_CLIENT_CONFIG_INVALID"
+      );
+      expect(err.logContext?.plugin, label).toBe("@acme/p");
+      // Named so an author does not have to bisect the object to find it.
+      expect(err.logContext?.keys, label).toEqual(Object.keys(bad));
+    }
+  });
+
+  it("refuses a key whose value simply disappears", () => {
+    // `undefined` and a function are both dropped by JSON, so the object the
+    // client receives is missing a key the plugin wrote. That is a silent
+    // shape change, not a harmless omission.
+    expect(() =>
+      buildPluginAdminMeta(withConfig({ a: 1, gone: undefined }), undefined)
+    ).toThrow(NextlyError);
+  });
+
+  it("accepts the JSON shapes a real config uses", () => {
+    const config = {
+      s: "x",
+      n: 1,
+      b: true,
+      nul: null,
+      arr: [1, "two", { three: 3 }],
+      nested: { deep: { deeper: [true] } },
+    };
+    const meta = buildPluginAdminMeta(withConfig(config), undefined);
+    expect(meta[0]?.clientConfig).toEqual(config);
+  });
+
+  it("survives a cycle by refusing rather than by hanging", () => {
+    const cyclic: Record<string, unknown> = { a: 1 };
+    cyclic.self = cyclic;
+    expect(() => buildPluginAdminMeta(withConfig(cyclic), undefined)).toThrow(
+      NextlyError
+    );
+  });
+});
+
+describe("buildPluginAdminMeta — clientConfig runtime shapes", () => {
+  const withConfig = (clientConfig: unknown) =>
+    asPlugins([
+      { ...base, contributes: { admin: { clientConfig } } },
+    ]) as PluginDefinition[];
+
+  it("refuses a top level that is not a plain object", () => {
+    // The declared type promises a record; a JavaScript host need not deliver
+    // one. Each of these round-trips perfectly, so only a shape check catches
+    // it — and every reader downstream assumes an object it can destructure.
+    for (const bad of [null, [1, 2], "a string", 42, true]) {
+      expect(
+        () => buildPluginAdminMeta(withConfig(bad), undefined),
+        JSON.stringify(bad)
+      ).toThrow(NextlyError);
+    }
+  });
+
+  it("refuses negative zero, which JSON turns into zero", () => {
+    // Observable in the browser as `1 / value`, so it is a mangled copy like
+    // any other rather than a rounding detail.
+    expect(() =>
+      buildPluginAdminMeta(withConfig({ n: -0 }), undefined)
+    ).toThrow(NextlyError);
+  });
+
+  it("reports a throwing getter instead of letting it escape", () => {
+    // The diagnostic path reads each value to name the offending key, so a
+    // getter that throws would replace the reportable error with a raw one
+    // from the very function whose job is to describe the problem.
+    const config = {
+      ok: 1,
+      get boom(): never {
+        throw new Error("getter");
+      },
+    };
+    let thrown: unknown;
+    try {
+      buildPluginAdminMeta(withConfig(config), undefined);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(NextlyError.is(thrown)).toBe(true);
+    expect(String((thrown as NextlyError).code)).toBe(
+      "NEXTLY_PLUGIN_CLIENT_CONFIG_INVALID"
+    );
+  });
+
+  it("resolves its status from the canonical table, not an inline literal", () => {
+    let thrown: unknown;
+    try {
+      buildPluginAdminMeta(withConfig({ when: new Date() }), undefined);
+    } catch (error) {
+      thrown = error;
+    }
+    expect((thrown as NextlyError).statusCode).toBe(
+      NEXTLY_ERROR_STATUS.NEXTLY_PLUGIN_CLIENT_CONFIG_INVALID
+    );
+  });
+});
+
+/**
+ * Routes and permissions are asymmetric, and the tests exist to hold that
+ * apart. `collectPluginRoutes` covers enabled plugins only, so a disabled
+ * plugin serves nothing — that is what enabling would add. `collectCustomPermissions`
+ * folds over every plugin including disabled ones, so its permissions are
+ * already seeded and are not pending on anything.
+ */
+describe("dormant routes", () => {
+  const declaring = {
+    name: "@acme/p",
+    version: "1.0.0",
+    contributes: {
+      permissions: [
+        { action: "export", resource: "submissions", danger: true },
+      ],
+      routes: [{ method: "GET", path: "/export", handler: () => undefined }],
+    },
+  } as unknown as PluginDefinition;
+
+  it("reports a disabled plugin's routes as dormant, not active", () => {
+    const [meta] = buildPluginAdminMeta(
+      [{ ...declaring, enabled: false } as PluginDefinition],
+      undefined
+    );
+
+    expect(meta.whenEnabled?.routes).toEqual([
+      { method: "GET", path: "/export", fullPath: "/plugins/@acme/p/export" },
+    ]);
+    expect(meta.routes).toBeUndefined();
+  });
+
+  /**
+   * The separating case for the routes/permissions split. A disabled plugin's
+   * permissions are seeded whatever this page shows, so presenting them as
+   * something enabling would ADD would be false — the dormant branch must
+   * carry routes and nothing else.
+   */
+  it("never presents permissions as pending on being enabled", () => {
+    const [meta] = buildPluginAdminMeta(
+      [{ ...declaring, enabled: false } as PluginDefinition],
+      undefined
+    );
+
+    expect(Object.keys(meta.whenEnabled ?? {})).toEqual(["routes"]);
+  });
+
+  it("reports an enabled plugin's routes as active, not dormant", () => {
+    const [meta] = buildPluginAdminMeta(
+      [{ ...declaring, enabled: true } as PluginDefinition],
+      undefined
+    );
+
+    expect(meta.routes).toEqual([
+      { method: "GET", path: "/export", fullPath: "/plugins/@acme/p/export" },
+    ]);
+    expect(meta.whenEnabled).toBeUndefined();
+  });
+
+  it.each([true, false])(
+    "never carries the active and dormant routes together (enabled=%s)",
+    enabled => {
+      const [meta] = buildPluginAdminMeta(
+        [{ ...declaring, enabled } as PluginDefinition],
+        undefined
+      );
+
+      const active = Boolean(meta.routes);
+      const dormant = Boolean(meta.whenEnabled);
+      expect(active && dormant).toBe(false);
+      // Exactly one, so this cannot pass on a plugin that serialized neither.
+      expect(active || dormant).toBe(true);
+    }
+  );
+
+  /**
+   * `collectPluginRoutes` throws on a path without a leading slash, so a
+   * declaration like this cannot mount. Presenting it as something enabling
+   * would add is a promise that boot then refuses.
+   */
+  it("omits a declared route that could not mount", () => {
+    const [meta] = buildPluginAdminMeta(
+      [
+        {
+          name: "@acme/bad",
+          version: "1.0.0",
+          enabled: false,
+          contributes: { routes: [{ method: "GET", path: "export" }] },
+        } as unknown as PluginDefinition,
+      ],
+      undefined
+    );
+
+    expect(meta.whenEnabled).toBeUndefined();
+  });
+
+  /**
+   * The second of `collectPluginRoutes`'s two rules, and the one a
+   * leading-slash filter alone would miss. Two declarations sharing a
+   * `(method, full path)` make boot throw NEXTLY_ROUTE_COLLISION, so
+   * advertising both as things enabling would serve is a promise boot refuses.
+   */
+  it("omits declarations that collide with each other", () => {
+    const [meta] = buildPluginAdminMeta(
+      [
+        {
+          name: "@acme/dup",
+          version: "1.0.0",
+          enabled: false,
+          contributes: {
+            routes: [
+              { method: "GET", path: "/export" },
+              { method: "GET", path: "/export" },
+            ],
+          },
+        } as unknown as PluginDefinition,
+      ],
+      undefined
+    );
+
+    expect(meta.whenEnabled).toBeUndefined();
+  });
+
+  /**
+   * The third refusal, and the one that showed the classifier had to be a list
+   * rather than a habit. A root route under `/auth` is unreachable, so boot
+   * refuses it -- and a DISABLED plugin declaring one must still only lose its
+   * dormant branch. Unclassified, the throw escapes `mountableRoutes` and
+   * `/api/admin-meta` fails for every reader over a plugin nobody enabled.
+   */
+  it("omits a dormant root route the request pipeline never reaches", () => {
+    const [meta] = buildPluginAdminMeta(
+      [
+        {
+          name: "@acme/shadowed",
+          version: "1.0.0",
+          enabled: false,
+          contributes: {
+            routes: [{ method: "GET", path: "/auth/whoami", mount: "root" }],
+          },
+        } as unknown as PluginDefinition,
+      ],
+      undefined
+    );
+
+    expect(meta.whenEnabled).toBeUndefined();
+  });
+
+  /**
+   * The route-option refusal is raised under the plugin resolution code, not
+   * a route code. Unclassified, a disabled plugin declaring a lowercase
+   * method would fail `/api/admin-meta` for every reader.
+   */
+  it("omits a dormant route whose options boot would refuse", () => {
+    const [meta] = buildPluginAdminMeta(
+      [
+        {
+          name: "@acme/lowercase",
+          version: "1.0.0",
+          enabled: false,
+          contributes: {
+            routes: [{ method: "post", path: "/items" }],
+          },
+        } as unknown as PluginDefinition,
+      ],
+      undefined
+    );
+
+    expect(meta.whenEnabled).toBeUndefined();
+  });
+
+  it("omits the dormant branch for a plugin that declares no routes", () => {
+    const [meta] = buildPluginAdminMeta(
+      [
+        {
+          name: "@acme/bare",
+          version: "1.0.0",
+          enabled: false,
+        } as PluginDefinition,
+      ],
+      undefined
+    );
+
+    expect(meta.whenEnabled).toBeUndefined();
+  });
+});
+
+/**
+ * Namespaces are built from package names, so a collision need not be
+ * self-inflicted: an enabled plugin can already own the path a disabled one
+ * would claim. Advertising it as something enabling would serve is a promise
+ * boot refuses.
+ */
+describe("dormant routes against the enabled set", () => {
+  const enabledOwner = {
+    name: "foo",
+    version: "1.0.0",
+    contributes: { routes: [{ method: "GET", path: "/bar/x" }] },
+  } as unknown as PluginDefinition;
+
+  const disabledClaimant = {
+    name: "foo/bar",
+    version: "1.0.0",
+    enabled: false,
+    contributes: { routes: [{ method: "GET", path: "/x" }] },
+  } as unknown as PluginDefinition;
+
+  it("omits a dormant route an enabled plugin already serves", () => {
+    // Both resolve to /plugins/foo/bar/x.
+    const metas = buildPluginAdminMeta(
+      [enabledOwner, disabledClaimant],
+      undefined
+    );
+    const claimant = metas.find(m => m.name === "foo/bar");
+
+    expect(claimant?.whenEnabled).toBeUndefined();
+  });
+
+  /**
+   * The control. Without the enabled owner present the same declaration is
+   * perfectly mountable, so the omission above is about the collision rather
+   * than about a route that was never valid.
+   */
+  it("keeps it when no enabled plugin holds that path", () => {
+    const metas = buildPluginAdminMeta([disabledClaimant], undefined);
+    const claimant = metas.find(m => m.name === "foo/bar");
+
+    expect(claimant?.whenEnabled?.routes).toEqual([
+      { method: "GET", path: "/x", fullPath: "/plugins/foo/bar/x" },
+    ]);
+  });
+
+  it("leaves the enabled owner's own route reported", () => {
+    const metas = buildPluginAdminMeta(
+      [enabledOwner, disabledClaimant],
+      undefined
+    );
+
+    expect(metas.find(m => m.name === "foo")?.routes).toEqual([
+      { method: "GET", path: "/bar/x", fullPath: "/plugins/foo/bar/x" },
+    ]);
+  });
+});
+
+/**
+ * A menu item that spells a slug survives boot and breaks at navigation.
+ *
+ * `.rename()` moves a contributed collection and the permission its slug
+ * seeds, and nothing type-checks a path or a permission string, so the
+ * broken versions of these items all serialize. Each assertion below is
+ * written against one of them: a `to` still naming the declared slug, a
+ * `requiredPermission` still naming it, a literal path rewritten by a rule
+ * that should not have touched it, and the declared slug leaking through to
+ * the client beside the resolved one.
+ */
+describe("buildPluginAdminMeta menu slugs", () => {
+  /** A plugin owning `patterns`, offering it a menu item, optionally renamed. */
+  function withPatternsMenu(map?: Record<string, string>): PluginDefinition {
+    const plugin = definePlugin({
+      ...base,
+      contributes: {
+        collections: [{ slug: "patterns" } as never],
+        admin: {
+          menu: [
+            {
+              label: "Patterns",
+              collection: "patterns",
+              to: "/admin/collections/patterns",
+              icon: "LayoutTemplate",
+            },
+          ],
+        },
+      },
+    } as unknown as PluginDefinition);
+    return map ? (plugin.rename?.(map) ?? plugin) : plugin;
+  }
+
+  const menuOf = (plugin: PluginDefinition) =>
+    buildPluginAdminMeta([plugin], undefined)[0].menu;
+
+  it("points the item at the slug the host registered", () => {
+    // The control: the same declaration with nothing renamed has to resolve to
+    // the declared slug. Without it, a resolver that returned a constant, or
+    // one that dropped the item, would satisfy the renamed assertion below.
+    expect(menuOf(withPatternsMenu())?.[0]).toMatchObject({
+      to: "/admin/collections/patterns",
+      requiredPermission: "read-patterns",
+    });
+
+    expect(
+      menuOf(withPatternsMenu({ patterns: "saved-patterns" }))?.[0]
+    ).toMatchObject({
+      to: "/admin/collections/saved-patterns",
+      // The gate moves with the link. A rename seeds `read-saved-patterns`,
+      // so an item still asking for `read-patterns` is withheld from every
+      // non-super-admin who can open the list.
+      requiredPermission: "read-saved-patterns",
+    });
+  });
+
+  it("does not ship the declared slug beside the resolved one", () => {
+    const item = menuOf(withPatternsMenu({ patterns: "saved-patterns" }))?.[0];
+
+    // Two answers to one question, of which the stale one reads as
+    // authoritative because it is the name the plugin's own code uses.
+    expect(item).not.toHaveProperty("collection");
+  });
+
+  it("leaves an item that names no collection exactly as written", () => {
+    const plugin = definePlugin({
+      ...base,
+      contributes: {
+        collections: [{ slug: "patterns" } as never],
+        admin: {
+          menu: [
+            {
+              label: "Pages",
+              to: "/admin/collections/patterns",
+              icon: "Layout",
+            },
+          ],
+        },
+      },
+    } as unknown as PluginDefinition);
+    // The rename map COVERS the slug spelled in the path, so a resolver that
+    // rewrote paths by matching text rather than by reading `collection`
+    // would move this one. It must not: the item named no collection, and an
+    // author's literal path is not the framework's to reinterpret.
+    const renamed = plugin.rename?.({ patterns: "saved-patterns" }) ?? plugin;
+
+    expect(menuOf(renamed)?.[0]).toEqual({
+      label: "Pages",
+      to: "/admin/collections/patterns",
+      icon: "Layout",
+    });
+  });
+
+  it("refuses an item naming a collection the plugin does not contribute", () => {
+    const plugin = definePlugin({
+      ...base,
+      contributes: {
+        collections: [{ slug: "patterns" } as never],
+        admin: {
+          menu: [
+            {
+              label: "Patterns",
+              collection: "pattrens",
+              to: "/admin/collections/patterns",
+            },
+          ],
+        },
+      },
+    } as unknown as PluginDefinition);
+
+    // A typo resolves to a well-formed path and a well-formed permission, and
+    // both are wrong in the quietest way available: the permission is never
+    // seeded, so a non-super-admin cannot tell the item from one they are not
+    // allowed to see. Registration is the last moment it is visible as a
+    // mistake, so it is refused there rather than serialized.
+    let caught: unknown;
+    try {
+      menuOf(plugin);
+    } catch (error) {
+      caught = error;
+    }
+
+    // Asserted on the reason and the log message rather than on `message`,
+    // which every plugin resolution error answers with the same sentence — a
+    // match on it would pass for a duplicate admin slug just as readily.
+    expect(
+      (caught as { logContext?: { reason?: string } })?.logContext?.reason
+    ).toBe("menu-item-unowned-collection");
+    // Names the offending slug AND what it could have been. Neither is
+    // recoverable from the other, and a reader looking at a typo is exactly
+    // the reader who cannot see it.
+    const logMessage = (caught as { logMessage?: string })?.logMessage ?? "";
+    expect(logMessage).toContain("pattrens");
+    expect(logMessage).toContain("patterns");
+  });
+
+  it("keeps a destination that carries list state when nothing is renamed", () => {
+    const plugin = definePlugin({
+      ...base,
+      contributes: {
+        collections: [{ slug: "patterns" } as never],
+        admin: {
+          menu: [
+            {
+              label: "Drafts",
+              collection: "patterns",
+              to: "/admin/collections/patterns?status=draft",
+            },
+          ],
+        },
+      },
+    } as unknown as PluginDefinition);
+
+    // Naming a collection is how an item opts into rename-safety and RBAC, not
+    // a request to be sent somewhere canonical. Overwriting `to` made adding
+    // `collection` to a working link silently change where that link went —
+    // and the contract on the field says the opposite.
+    expect(menuOf(plugin)?.[0]).toMatchObject({
+      to: "/admin/collections/patterns?status=draft",
+      requiredPermission: "read-patterns",
+    });
+
+    // And when the slug DOES move, only the collection segment is rewritten.
+    const renamed = plugin.rename?.({ patterns: "saved" }) ?? plugin;
+    expect(menuOf(renamed)?.[0]).toMatchObject({
+      to: "/admin/collections/saved?status=draft",
+      requiredPermission: "read-saved",
+    });
+  });
+
+  it("does not resolve a slug through an inherited object property", () => {
+    const plugin = definePlugin({
+      ...base,
+      contributes: {
+        // A legal slug that is also a key every object inherits.
+        collections: [{ slug: "constructor" } as never],
+        admin: {
+          menu: [
+            {
+              label: "Constructor",
+              collection: "constructor",
+              to: "/admin/collections/constructor",
+            },
+          ],
+        },
+      },
+    } as unknown as PluginDefinition);
+
+    // With no rename the map is `{}`, and `{}["constructor"]` is the Object
+    // constructor — a function, so `??` never fires and the destination
+    // becomes the source text of a native function.
+    expect(menuOf(plugin)?.[0]).toMatchObject({
+      to: "/admin/collections/constructor",
+      requiredPermission: "read-constructor",
+    });
+  });
+
+  it("resolves a nested item too", () => {
+    const plugin = definePlugin({
+      ...base,
+      contributes: {
+        collections: [{ slug: "patterns" } as never],
+        admin: {
+          menu: [
+            {
+              label: "Design",
+              to: "/admin/collections/patterns",
+              children: [
+                {
+                  label: "Patterns",
+                  collection: "patterns",
+                  to: "/admin/collections/patterns",
+                },
+              ],
+            },
+          ],
+        },
+      },
+    } as unknown as PluginDefinition);
+    const renamed = plugin.rename?.({ patterns: "saved-patterns" }) ?? plugin;
+
+    // A child is exactly as stranded as a parent, and is the one a resolver
+    // that only walked the top level would leave behind.
+    expect(menuOf(renamed)?.[0].children?.[0]).toMatchObject({
+      to: "/admin/collections/saved-patterns",
+      requiredPermission: "read-saved-patterns",
+    });
+  });
+});
+
+describe("buildPluginAdminMeta, a plugin's translations", () => {
+  const catalog = { en: { "acme-p.cart.title": "Cart" } };
+
+  it("serves a plugin's translations whether or not it is enabled, as its field editors still mount", () => {
+    const [enabled] = buildPluginAdminMeta(
+      asPlugins([{ ...base, contributes: { translations: catalog } }]),
+      undefined
+    );
+    const [disabled] = buildPluginAdminMeta(
+      asPlugins([
+        { ...base, enabled: false, contributes: { translations: catalog } },
+      ]),
+      undefined
+    );
+
+    expect(enabled?.translations).toEqual(catalog);
+    expect(disabled?.translations).toEqual(catalog);
+  });
+
+  it("refuses to serve a catalog startup would refuse", () => {
+    expect(() =>
+      buildPluginAdminMeta(
+        asPlugins([
+          {
+            ...base,
+            contributes: {
+              translations: { en: { "other.cart.title": "Cart" } },
+            },
+          },
+        ]),
+        undefined
+      )
+    ).toThrow(NextlyError);
+  });
+});
+
+describe("a plugin's own item, in the place it chose", () => {
+  /** The plugin's own staff route a menu item's `run` may name. */
+  const SYNC_ROUTE = {
+    method: "POST",
+    path: "/sync",
+    handler: () => new Response(),
+  };
+  const withHeader = (header: unknown, rest: object = {}) =>
+    asPlugins([
+      {
+        ...base,
+        ...rest,
+        contributes: { routes: [SYNC_ROUTE], admin: { header } },
+      },
+    ]);
+  const headerOf = (header: unknown, rest?: object) =>
+    buildPluginAdminMeta(withHeader(header, rest), undefined)[0];
+
+  it("keeps a slot that names no place at the bar, exactly as before", () => {
+    const meta = headerOf({ slot: "@acme/p/admin#Publish" });
+    expect(meta.header).toEqual({ slot: "@acme/p/admin#Publish" });
+    expect(meta.headerSlot).toBe("@acme/p/admin#Publish");
+  });
+
+  it("serializes the bar named outright as the default, with no place", () => {
+    const meta = headerOf({ slot: "@acme/p/admin#Publish", place: "bar" });
+    expect(meta.header).toEqual({ slot: "@acme/p/admin#Publish" });
+    expect(meta.headerSlot).toBe("@acme/p/admin#Publish");
+  });
+
+  it("serializes a slot at the rail's foot, and mirrors no bar slot for it", () => {
+    const meta = headerOf({
+      slot: "@acme/p/admin#Helper",
+      place: "rail-foot",
+      hide: ["docs"],
+    });
+    expect(meta.header).toEqual({
+      slot: "@acme/p/admin#Helper",
+      place: "rail-foot",
+      hide: ["docs"],
+    });
+    expect(meta.headerSlot).toBeUndefined();
+  });
+
+  it("folds the deprecated headerSlot into the rail's foot when that is the place", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          contributes: {
+            admin: {
+              headerSlot: "@acme/p/admin#Old",
+              header: { place: "rail-foot" },
+            },
+          },
+        },
+      ]),
+      undefined
+    )[0];
+    expect(meta.header).toEqual({
+      slot: "@acme/p/admin#Old",
+      place: "rail-foot",
+    });
+    expect(meta.headerSlot).toBeUndefined();
+  });
+
+  it("serializes a menu link with its id, and no slot", () => {
+    const meta = headerOf({
+      place: "menu",
+      item: { label: "Support", icon: "LifeBuoy", to: "/admin/plugins/p" },
+      hideDefaults: true,
+    });
+    expect(meta.header).toEqual({
+      place: "menu",
+      item: {
+        id: "acme-p.user-menu",
+        label: "Support",
+        icon: "LifeBuoy",
+        to: "/admin/plugins/p",
+      },
+      hideDefaults: true,
+    });
+    expect(meta.headerSlot).toBeUndefined();
+  });
+
+  it("serializes a menu action, and only the declared fields", () => {
+    const action = { run: { method: "POST", path: "/sync" } };
+    const meta = headerOf({
+      place: "menu",
+      item: { label: "Sync", icon: "RefreshCw", action, extra: "dropped" },
+    });
+    expect(meta.header?.item).toEqual({
+      id: "acme-p.user-menu",
+      label: "Sync",
+      icon: "RefreshCw",
+      action,
+    });
+  });
+
+  it("publishes a menu action that opens a component", () => {
+    const action = { open: "@acme/p/admin#Report" };
+    const meta = headerOf({
+      place: "menu",
+      item: { label: "Report", icon: "BookOpen", action },
+    });
+    expect(meta.header?.item?.action).toEqual(action);
+  });
+
+  it.each([
+    ["null", null],
+    ["an empty object", {}],
+    ["a run that is not a route", { run: "x" }],
+    ["an open that names no component", { open: 5 }],
+    [
+      "both open and run",
+      { open: "@a#B", run: { method: "POST", path: "/sync" } },
+    ],
+    [
+      "a run naming no route of the plugin's",
+      { run: { method: "POST", path: "/gone" } },
+    ],
+  ])("leaves out a menu item whose action is %s", (_case, action) => {
+    const meta = headerOf({
+      place: "menu",
+      item: { label: "X", icon: "BookOpen", action },
+    });
+    expect(meta.header).toBeUndefined();
+  });
+
+  it("never publishes a component for the menu, even a deprecated headerSlot", () => {
+    const meta = buildPluginAdminMeta(
+      asPlugins([
+        {
+          ...base,
+          contributes: {
+            admin: {
+              headerSlot: "@acme/p/admin#Old",
+              header: {
+                place: "menu",
+                item: { label: "Help", icon: "BookOpen", to: "/x" },
+              },
+            },
+          },
+        },
+      ]),
+      undefined
+    )[0];
+    expect(meta.header?.slot).toBeUndefined();
+    expect(meta.headerSlot).toBeUndefined();
+  });
+
+  it.each([
+    ["neither a link nor an action", { label: "X", icon: "BookOpen" }],
+    [
+      "both a link and an action",
+      { label: "X", icon: "BookOpen", to: "/x", action: { open: "@a#B" } },
+    ],
+  ])("leaves out a menu item with %s", (_case, item) => {
+    const meta = headerOf({ place: "menu", item, hide: ["github"] });
+    expect(meta.header).toEqual({ hide: ["github"] });
+  });
+
+  it("publishes nothing for a disabled plugin, in any place", () => {
+    for (const header of [
+      { slot: "@acme/p/admin#Helper", place: "rail-foot" },
+      { place: "menu", item: { label: "X", icon: "BookOpen", to: "/x" } },
+    ]) {
+      const meta = headerOf(header, { enabled: false });
+      expect(meta.header).toBeUndefined();
+      expect(meta.headerSlot).toBeUndefined();
+    }
+  });
+});
+
+describe("the start-up report of a menu item left out", () => {
+  const warn = vi.fn();
+  /** The host's logger, as start-up resolves it. */
+  const logger = { error: vi.fn(), warn, info: vi.fn(), debug: vi.fn() };
+  /** Where a report would land if it went to the global logger instead. */
+  const globalWarn = vi.fn();
+  const plugins = asPlugins([
+    {
+      ...base,
+      contributes: {
+        admin: {
+          header: { place: "menu", item: { label: "X", icon: "BookOpen" } },
+        },
+      },
+    },
+    {
+      ...base,
+      name: "@acme/fine",
+      contributes: {
+        admin: {
+          header: {
+            place: "menu",
+            item: { label: "Y", icon: "BookOpen", to: "/y" },
+          },
+        },
+      },
+    },
+  ]);
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    setNextlyLogger(undefined);
+    warn.mockReset();
+    globalWarn.mockReset();
+  });
+
+  it("names the plugin and why, in development, to the logger it is handed", () => {
+    vi.stubEnv("NODE_ENV", "development");
+    setNextlyLogger({ ...logger, warn: globalWarn });
+    reportUserMenuItemProblems(plugins, logger);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain(
+      "@acme/p: its item has neither a link nor an action"
+    );
+    expect(warn.mock.calls[0][1]).toEqual({
+      kind: "plugin-user-menu-item-left-out",
+    });
+    expect(globalWarn).not.toHaveBeenCalled();
+  });
+
+  it("reports each malformed action, by what is wrong with it", () => {
+    vi.stubEnv("NODE_ENV", "development");
+    const withAction = (name: string, action: unknown) => ({
+      ...base,
+      name,
+      contributes: {
+        admin: {
+          header: { place: "menu", item: { label: "X", icon: "I", action } },
+        },
+      },
+    });
+    reportUserMenuItemProblems(
+      asPlugins([
+        withAction("@acme/null", null),
+        withAction("@acme/empty", {}),
+        withAction("@acme/run", { run: "x" }),
+        withAction("@acme/open", { open: 5 }),
+      ]),
+      logger
+    );
+    expect(warn.mock.calls.map(call => String(call[0]))).toEqual([
+      expect.stringContaining("@acme/null: its `action` is not an action"),
+      expect.stringContaining(
+        "@acme/empty: its `action` must be exactly one of"
+      ),
+      expect.stringContaining("@acme/run: its `action.run` is not a route's"),
+      expect.stringContaining(
+        "@acme/open: its `action.open` names no component"
+      ),
+    ]);
+  });
+
+  it.each(["production", "test"])("is silent in %s", env => {
+    vi.stubEnv("NODE_ENV", env);
+    reportUserMenuItemProblems(plugins, logger);
+    expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe("buildPluginAdminMeta, a standalone plugin's landing", () => {
+  /** A plugin owning `reports` and an `overview` page, naming `landing`. */
+  function reports(landing?: string, extra: object = {}): PluginDefinition {
+    return definePlugin({
+      ...base,
+      ...extra,
+      admin: {
+        placement: "standalone",
+        ...(landing === undefined ? {} : { landing }),
+      },
+      contributes: {
+        collections: [{ slug: "reports" } as never],
+        admin: {
+          pages: [{ path: "overview", component: "@acme/p/admin#Overview" }],
+        },
+      },
+    } as unknown as PluginDefinition);
+  }
+
+  const landingOf = (
+    plugin: PluginDefinition,
+    overrides?: Parameters<typeof buildPluginAdminMeta>[1]
+  ) => buildPluginAdminMeta([plugin], overrides)[0].landing;
+
+  it("serializes a page landing as the address the admin mounts it at", () => {
+    expect(landingOf(reports("/admin/plugins/acme-p/overview"))).toBe(
+      "/admin/plugins/acme-p/overview"
+    );
+  });
+
+  it("serializes a collection landing through the host's rename", () => {
+    const plugin = reports("/admin/collections/reports");
+    // The control: unrenamed, the declared slug is the address.
+    expect(landingOf(plugin)).toBe("/admin/collections/reports");
+    const renamed = plugin.rename?.({ reports: "acme-reports" }) ?? plugin;
+    expect(landingOf(renamed)).toBe("/admin/collections/acme-reports");
+  });
+
+  it("lets the site's override win", () => {
+    expect(
+      landingOf(reports("/admin/collections/reports"), {
+        "acme-p": { landing: "/admin/plugins/acme-p/overview" },
+      })
+    ).toBe("/admin/plugins/acme-p/overview");
+  });
+
+  it("drops a landing naming nothing the plugin owns, and any when disabled", () => {
+    // The control for both: the same plugin with a landing it owns has one.
+    expect(landingOf(reports("/admin/collections/reports"))).toBeDefined();
+    expect(landingOf(reports("/admin/collections/posts"))).toBeUndefined();
+    expect(
+      landingOf(reports("/admin/collections/reports", { enabled: false }))
+    ).toBeUndefined();
+    expect(landingOf(reports())).toBeUndefined();
+  });
+});
+
+describe("buildPluginAdminMeta, a standalone plugin's panel", () => {
+  /**
+   * A standalone plugin owning `patterns` (renamed by the host to
+   * `site-patterns`) and `layouts`, with a `checks` page and a
+   * `bindings-to-fix` attention item, and the menu and panel a test gives it.
+   */
+  function library(admin: object): PluginDefinition {
+    return {
+      ...base,
+      admin: { placement: "standalone" },
+      renameMap: { patterns: "site-patterns" },
+      contributes: {
+        collections: [{ slug: "patterns" }, { slug: "layouts" }],
+        dashboard: { attention: [{ id: "acme/bindings-to-fix" }] },
+        admin: {
+          pages: [{ path: "/checks", component: "@acme/p/admin#Checks" }],
+          ...admin,
+        },
+      },
+    } as unknown as PluginDefinition;
+  }
+
+  const metaOf = (plugin: PluginDefinition) =>
+    buildPluginAdminMeta([plugin], undefined)[0];
+
+  it("serializes the groups in the order declared", () => {
+    const meta = metaOf(
+      library({
+        panel: {
+          groups: [
+            { id: "library", label: "Library" },
+            { id: "checks", label: "Checks" },
+          ],
+        },
+        menu: [
+          {
+            label: "Layouts",
+            to: "/admin/collections/layouts",
+            group: "checks",
+          },
+        ],
+      })
+    );
+    expect(meta.panel).toEqual({
+      groups: [
+        { id: "library", label: "Library" },
+        { id: "checks", label: "Checks" },
+      ],
+    });
+    expect(meta.menu?.[0].group).toBe("checks");
+  });
+
+  it("sends no panel for a plugin that declares none, and its items as before", () => {
+    const item = { label: "Layouts", to: "/admin/collections/layouts" };
+    const meta = metaOf(library({ menu: [item] }));
+    expect(meta.panel).toBeUndefined();
+    expect(meta.menu).toEqual([item]);
+  });
+
+  it("resolves a collection count through the host's rename, with its where", () => {
+    const where = { status: { equals: "draft" } };
+    const meta = metaOf(
+      library({
+        menu: [
+          {
+            label: "Patterns",
+            to: "/admin/collections/patterns",
+            collection: "patterns",
+            count: { collection: "patterns", where },
+          },
+        ],
+      })
+    );
+    expect(meta.menu?.[0]).toMatchObject({
+      to: "/admin/collections/site-patterns",
+      count: { collection: "site-patterns", where },
+    });
+  });
+
+  it("keeps a badge naming one of the plugin's own attention items", () => {
+    const meta = metaOf(
+      library({
+        menu: [
+          {
+            label: "Checks",
+            to: "/admin/plugins/acme-p/checks",
+            badge: { attention: "acme/bindings-to-fix" },
+          },
+        ],
+      })
+    );
+    expect(meta.menu?.[0].badge).toEqual({ attention: "acme/bindings-to-fix" });
+  });
+
+  it("lists an item naming an unknown group with the ungrouped items", () => {
+    const meta = metaOf(
+      library({
+        panel: { groups: [{ id: "library", label: "Library" }] },
+        menu: [
+          { label: "Layouts", to: "/admin/collections/layouts", group: "nope" },
+        ],
+      })
+    );
+    expect(meta.menu?.[0]).toEqual({
+      label: "Layouts",
+      to: "/admin/collections/layouts",
+    });
+  });
+
+  it("draws a count naming a collection the plugin does not own without a number", () => {
+    const meta = metaOf(
+      library({
+        menu: [
+          {
+            label: "Posts",
+            to: "/admin/collections/posts",
+            count: { collection: "posts" },
+          },
+        ],
+      })
+    );
+    expect(meta.menu?.[0]).toEqual({
+      label: "Posts",
+      to: "/admin/collections/posts",
+    });
+  });
+
+  it("draws a badge naming an attention item the plugin does not declare without a number", () => {
+    const meta = metaOf(
+      library({
+        menu: [
+          {
+            label: "Checks",
+            to: "/admin/plugins/acme-p/checks",
+            badge: { attention: "core/overdue-releases" },
+          },
+        ],
+      })
+    );
+    expect(meta.menu?.[0]).toEqual({
+      label: "Checks",
+      to: "/admin/plugins/acme-p/checks",
+    });
+  });
+
+  it("leaves out an item, or a child, for a page of its own it does not register", () => {
+    const meta = metaOf(
+      library({
+        menu: [
+          { label: "Missing", to: "/admin/plugins/acme-p/missing?tab=1" },
+          {
+            label: "Checks",
+            to: "/admin/plugins/acme-p/checks#top",
+            children: [
+              { label: "Gone", to: "/admin/plugins/acme-p/gone" },
+              { label: "Kept", to: "/admin/plugins/acme-p/checks?all=1" },
+            ],
+          },
+        ],
+      })
+    );
+    expect(meta.menu).toEqual([
+      {
+        label: "Checks",
+        to: "/admin/plugins/acme-p/checks#top",
+        children: [{ label: "Kept", to: "/admin/plugins/acme-p/checks?all=1" }],
+      },
+    ]);
+  });
+
+  it("keeps items linking anywhere but the plugin's own pages untouched", () => {
+    const menu = [
+      { label: "Settings", to: "/admin/plugins/acme-p" },
+      { label: "Other plugin", to: "/admin/plugins/acme-q/reports" },
+      { label: "Posts", to: "/admin/collections/posts" },
+      { label: "General", to: "/admin/settings" },
+      { label: "Docs", to: "https://example.com/docs" },
+    ];
+    expect(metaOf(library({ menu })).menu).toEqual(menu);
+  });
+
+  it("sends no panel and no menu for a disabled plugin", () => {
+    const meta = metaOf({
+      ...library({
+        panel: { groups: [{ id: "library", label: "Library" }] },
+        menu: [{ label: "Layouts", to: "/admin/collections/layouts" }],
+      }),
+      enabled: false,
+    } as PluginDefinition);
+    expect(meta.panel).toBeUndefined();
+    expect(meta.menu).toBeUndefined();
+  });
+});

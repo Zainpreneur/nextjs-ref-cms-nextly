@@ -1,0 +1,463 @@
+---
+title: Localization
+description: Run the same site in several languages, with a fallback when a translation is missing, and publish each language separately.
+---
+
+Localization lets one document exist in several languages. An editor switches language at
+the top of the edit screen and writes the Spanish version of the same post, without
+creating a second post.
+
+## Availability
+
+|            |                                                                 |
+| ---------- | --------------------------------------------------------------- |
+| Built in   | No plugin required                                              |
+| Admin      | Language switcher on edit screens, plus a translations overview |
+| Permission | The same access as editing the document                         |
+
+## Turn it on
+
+Declare your languages once, in `nextly.config.ts`:
+
+```ts
+import { defineConfig } from "nextly";
+
+export default defineConfig({
+  localization: {
+    locales: [
+      "en",
+      { code: "es", label: "Español" },
+      { code: "ar", label: "العربية", rtl: true },
+      { code: "fr", label: "Français", fallbackLocale: "en" },
+    ],
+    defaultLocale: "en",
+    fallback: true,
+  },
+});
+```
+
+A locale is either a bare code or an object. The object form carries:
+
+| Key              | Meaning                                          |
+| ---------------- | ------------------------------------------------ |
+| `code`           | The locale code, e.g. `es`                       |
+| `label`          | What the admin shows in the language switcher    |
+| `rtl`            | Renders that language right-to-left              |
+| `fallbackLocale` | Which language (or ordered list) to fall back to |
+
+### Or keep the list out of your code
+
+Leave the `localization` block out, and the site's languages are stored in its database instead.
+An admin manages them under **Settings → Languages** (`/admin/settings/languages`): adds, renames,
+reorders and removes languages, and makes one the default after reading what that changes. The
+languages API below does the same. A site starts with one language, English, and nothing is
+stored until a change is made. Where the `localization` block sets the languages, the same screen
+shows them read-only and says where they are set.
+
+| Request                                | What it does                                                                              |
+| -------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `GET /api/languages`                   | Lists the languages, removed ones included: `{ items, meta }`, with `meta.lockedByConfig` |
+| `GET /api/languages?defaultPreview=fr` | Says how many translations each language holds, before French becomes the default         |
+| `POST /api/languages`                  | Makes one change, named by `kind`: `add`, `update`, `reorder`, `remove` or `setDefault`   |
+
+```json
+{ "kind": "add", "code": "fr", "label": "Français", "fallback": ["en"] }
+```
+
+- Codes are BCP 47 (`fr`, `pt-BR`) and unique whatever their letter case.
+- Removing a language keeps its content: it stops being served, other languages' fallback lists
+  skip it, and adding it back restores it. The default language cannot be removed.
+- Making another language the default must be confirmed (`"confirmed": true`), moves no content,
+  and is refused while the current default has unpublished changes.
+- Reading needs the settings read or manage permission; changing needs update or manage.
+
+A `localization` block in `nextly.config.ts` always wins: the list is then read-only through the
+API. A language added on one server is served by every other server within a second.
+
+## Choose what gets translated
+
+Every site keeps its translatable fields per language, a site with one language included. An existing site moves its values when it upgrades: see [Upgrading an existing site](/docs/guides/upgrading).
+
+Mark a whole collection localized, then opt individual fields out:
+
+```ts
+import { defineCollection, text } from "nextly/config";
+
+export const Posts = defineCollection({
+  slug: "posts",
+  localized: true,
+  fields: [
+    text({ name: "title" }),
+    // Not worth translating: the same value in every language.
+    text({ name: "externalId", localized: false }),
+  ],
+});
+```
+
+A field's type decides whether it is translated when it sets no `localized` of its own:
+
+| Field types                                     | Unset `localized`                                                                     |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `text`, `textarea`, `richText`, `email`, `code` | Translated                                                                            |
+| Every other type                                | Shared by every language                                                              |
+| `password`, and any virtual field               | Shared, whatever `localized` says                                                     |
+| A many-to-many `relationship`                   | Shared, whatever `localized` says: its links are kept in one table for every language |
+| A `component` reference                         | Decided by the component's own fields, whatever `localized` says on the reference     |
+
+Set `localized: true` to translate a field of another type, or `localized: false` to share a text field, as `externalId` does above. On a collection or Single that is not localized, the flag does nothing.
+
+### When a field stops being translated
+
+Changing a translated field to shared keeps its content, for a collection, a Single or a field group, whether you change it in the Schema Builder or in code:
+
+- The default language's value becomes the field's shared value.
+- Every other language's value is copied to the localization archive (the `nextly_i18n_archive` table) before the translated column is removed.
+
+In code, set `localized: false` on the field and run `nextly migrate:create`. It writes three files that `nextly migrate` runs in order: one that writes the other languages to the archive, the migration that gives the main table the field's column, and one that copies the default language's value into it and removes the translated column. Rolling them back with `nextly migrate:down` puts the translated field back, every language included. `nextly migrate --dry-run` shows all three before anything runs.
+
+If the archive cannot be written, the change is refused and nothing is changed.
+
+In development, `next dev` makes the same move when you save the config, and so does `nextly db:sync` (and each re-sync of `nextly db:sync --watch`): the other languages go to the archive, the default language's value is copied into the shared column, and then the translated column is removed. A Required or Unique field gets its setting once its values are copied. When the values can't take it, the change is refused before anything changes, and the message names the field and how many entries are in the way.
+
+A field marked Required or Unique can stop being translated in the same change, as long as the default language's values can take the setting. The shared column is created without the setting, filled with the default language's values, and only then made required or unique. In the Schema Builder, the change is refused before anything runs when they can't, and the dialog says so before Apply: Required needs every entry to have a default-language value, and Unique needs no two entries to end up with the same value (an entry with no default-language value takes another language's, which counts). The refusal names the field and how many entries are in the way, never a value. In code, `migrate:create` writes the setting into the third file, after the copy and before the translated column is removed. `nextly migrate` checks the values before the first of the three files runs, and again before the third: when they can't take the setting, it refuses with the field and how many entries are in the way, and changes nothing. Give those entries their values, then run `nextly migrate` again. The values are checked once, before the move starts, so stop the app's writes while `nextly migrate` runs. Files that record the setting need this version of Nextly or a newer one to run.
+
+To bring those values back, make the field translated again, then restore that field:
+
+```bash
+npx nextly i18n:restore --collection posts --field title
+```
+
+`--collection` takes the slug of a collection, Single or field group, and `--field` takes the field's name or its column name. `--locale es` restores one language only. A field group can share its slug with a collection or a Single, and each one's archived values stay its own: when the slug names more than one, say which with `--kind collection`, `--kind single` or `--kind field-group`. The archive keeps the values until you remove them: add `--purge` to a restore to delete the rows it replayed. Deleting them takes the data-loss consent: `--accept-data-loss` (or `NEXTLY_ACCEPT_DATA_LOSS=1`). At a terminal it asks; with nobody to ask and no consent, it changes nothing. Deleting the collection, Single or field group also removes its archived values.
+
+Values archived by a version of Nextly from before the archive recorded which kind of entity they belong to are matched to their entity when the slug names only one, and only from the time that entity was created. Any the archive can't match are kept, never deleted, and a restore of that slug says how many there are. Restoring with `--kind` also brings those values back as that entity's.
+
+### When a shared field becomes translated
+
+Changing a shared field to translated keeps its value too, for a collection, a Single or a field group, in the Schema Builder or in code. The value becomes the default language's translation, and the other languages start empty, to be translated.
+
+In code, set `localized: true` on the field (or remove `localized: false` from a text field) and run `nextly migrate:create`. It writes one file, which adds the translated column, copies each entry's value into the default language, and removes the shared column. Rolling it back with `nextly migrate:down` makes the field shared again with the default language's value, and writes the other languages to the archive, as when a field stops being translated.
+
+A field whose type, length or precision changes in the same change is refused, because its value would be copied into a column of the new shape: save the new type with the field still shared, then make it translated.
+
+### When a translated field is added
+
+Adding a translated field to a collection, Single or field group that is already translated is recorded in its migration. `nextly migrate:create` writes a file that adds the field's column to the translations table, and `nextly migrate:down` removes it again. The file needs this version of Nextly or a newer one to run.
+
+### When your migrations predate the record of translated fields
+
+Snapshots written by early versions of Nextly don't record which fields are translated. Every snapshot written now does, and a new project always has the record. When the latest snapshot predates it and your project has translations (a localization migration file, or a collection, Single or field group the latest snapshot's settings say was translated, as when your change turns its translation off), `nextly migrate:create` can't tell which fields are translated. Planning a change on a guess could lose a field's values as it moves between translated and shared, so it refuses every change and writes nothing ([`TRANSLATIONS_UNRECORDED`](/docs/cli/errors/translations-unrecorded)) until you record the translated fields once. A project with no translations is unaffected, and its first translated entity is planned as usual. A database where `db:sync` or a development sync made a translations table that no migration file records is read the same way, so don't mix `db:sync` and `nextly migrate` on one database.
+
+To record the translated fields, take two steps:
+
+1. Put your config back as it was at the last migration, and run:
+
+   ```bash
+   npx nextly migrate:create --record-snapshot
+   ```
+
+   It writes a migration that changes nothing when it runs or rolls back, and a snapshot that records which fields are translated. It records them as the database holds them: it connects to the database `DATABASE_URL` names, the only `migrate:create` run that does, and refuses a translated field whose translations table or column isn't there, writing nothing. Run it against a database that has applied every migration. Commit both. Run again, it writes nothing. While the config has changes to migrate, it's refused and names their tables: put them aside, record, then make them again.
+
+2. Make the change again and run `npx nextly migrate:create --name <name>`.
+
+The record names the translated fields but not how each is stored. After recording, change a field's type and make it shared in separate migrations: `migrate:create` warns that it can't check the type, and copying values into a column of another type can fail when the migration runs.
+
+### When a translated field is renamed
+
+Renaming a translated field in the Schema Builder keeps every language's value under the new name, for a collection, a Single or a field group. The schema dialog lists it as a rename; keep that choice to keep the values. Renamed and made shared in the same change, the field keeps the default language's value as its shared value, and the other languages go to the archive under the new name, so `nextly i18n:restore --field <new name>` brings them back once the field is translated again.
+
+Two changes are refused alongside a rename, before anything is saved, and each works as two saves instead: changing how the field is stored (its length, its precision, or its type to a compatible one), and turning translation off for the whole collection, Single or field group. Rename the field and save, then make the other change. A change to an incompatible type is not a rename: the dialog lists it as removing one field and adding another.
+
+A translated field renamed in code is not yet carried over: the old column keeps every language's value, and the new field starts empty. To rename one in code today, keep the old name until its values are moved.
+
+### Translated date fields on PostgreSQL
+
+The translations table keeps a translated date field as the main table does: a `timestamp` holding the UTC time. A PostgreSQL database from an earlier release keeps these columns with a time zone until `nextly i18n:convert-zoned-dates` converts them, keeping each date as Nextly showed it; on a server not in UTC, run it as soon as the release serves every instance, and check recent translated dates after it. See [Translated date fields on PostgreSQL](/docs/guides/production-migrations#translated-date-fields-on-postgresql).
+
+## Fallback chains
+
+`fallback: true` means a missing translation falls back rather than rendering empty. A
+locale can name its own chain — `fallbackLocale: ["es", "en"]` tries Spanish, then
+English. Without a chain, the default locale is used. A chain may pass through other languages but never back to the one it
+starts from: a loop is refused when the configuration loads, and when the list is changed through
+the API.
+
+## Reading in a language
+
+A public read in a language answers for that language only:
+
+- **A document not published in the language is not there.** Reading an entry or a Single in a
+  language it isn't published in answers `404`, and a list or count leaves it out. A due release
+  counts as published.
+- **Whole-document fallback, when asked.** With `?fallback=document` (Direct API
+  `wholeDocumentFallback: true`), a read of one document answers in the first language of its
+  fallback chain that it is published in, and says which in `_locale`. That language is then read
+  throughout, related documents included. A list asked for it is refused with `400`.
+- **Unique fields never fall back.** A translated unique field, such as a slug, reads in the
+  requested language only.
+- **Filters and search judge the value shown.** In a read that falls back, a filter or search on a
+  translated field matches the value the reader sees: the requested language's, or the fallback
+  language's where the requested one has none. A sort orders by the same value.
+
+A read can also say more about its values:
+
+- **`?source-locales=1`** (Direct API `sourceLocales: true`) adds `_sources`: for each translated
+  field, the language its value came from, or `null` where no language holds one.
+- **`?translations=all`** (Direct API `translations: "all"`) adds `_allLocales`: each translated
+  field's value in every language, while the document's own fields stay in the language read.
+  `locale=all` is this on the default language. Each language's values are judged as the document
+  is: field read rules and field `afterRead` hooks run per language, and the read rule is asked
+  for every language. A field withheld from the document is withheld from both keys.
+
+### Saying where a translated value came from
+
+This is experimental. A save in a language other than the default can say, per field, where each
+translated value came from, under `_provenance`:
+
+```ts
+await nextly.update({
+  collection: "posts",
+  id,
+  locale: "es",
+  data: {
+    title: "Hola",
+    _provenance: {
+      title: {
+        origin: "copy",
+        sourceLocale: "en",
+        sourceRevision: englishRead._rev,
+      },
+    },
+  },
+});
+```
+
+- **`{ origin: "machine", engine }`** is a machine translation, **`{ origin: "agent" }`** an
+  agent's (an API key or a plugin-defined person only), and **`{ origin: "original" }`** a value
+  written in its own language, which never falls out of date.
+- **`{ origin: "copy", sourceLocale, sourceRevision }`** is a copy from another of the site's
+  languages. `sourceRevision` is the document's `_rev` as the copy read the source language. A
+  copy whose source has changed since that version, or one that names no `sourceRevision`, reads
+  as out of date until it is copied or translated again from the source as it stands.
+- A claim the site can't accept is refused with `400` before anything is written: a copy from a
+  language the site doesn't have, or into the language being written, or a `sourceRevision` that
+  isn't a version.
+
+A translation read with `?translation-status=1` says, per field, where the value came from and
+whether its source has changed since (`outOfDate`). A field cleared in a language keeps no such
+record: that language reads the field from another, so it never puts the language out of date.
+
+## Publishing one language at a time
+
+Per-locale publishing needs **two** flags, not one. `localized` gives you translations;
+`status` gives you the draft/published lifecycle. Only with both does each language get its
+own state:
+
+```ts
+import { defineCollection, text } from "nextly/config";
+
+export const Posts = defineCollection({
+  slug: "posts",
+  localized: true,
+  status: true,
+  fields: [text({ name: "title" })],
+});
+```
+
+With both set, publishing the Spanish version does not publish the French one, and a language
+still being translated stays invisible while the others are live.
+
+<Callout type="warn">
+  With `localized: true` alone you get translations and no lifecycle — there is
+  nothing to publish per language, because the entity has no draft/published
+  state at all.
+</Callout>
+
+<Callout type="warn">
+  This is per-locale **publishing**, not per-locale scheduling. A [content
+  release](/docs/releases) schedules the whole document across every language;
+  it cannot schedule one language on its own.
+</Callout>
+
+### Publish chosen languages in one request
+
+<Callout type="warn">
+  Experimental: the request and its answer may change until publishing per
+  language is complete.
+</Callout>
+
+An entry has a **shared part**, the values every language shows (fields with `localized: false`),
+and one part per language. Publish or unpublish the parts you choose in one request:
+
+```ts
+// Spanish and French together, and the shared part with them.
+await nextly.publish({
+  collection: "posts",
+  id,
+  locales: ["es", "fr"],
+  shared: true,
+  data: { _overwrite: true },
+});
+
+// Only Spanish: its own values go live, the shared part stays as it is.
+await nextly.publish({
+  collection: "posts",
+  id,
+  locales: ["es"],
+  data: { _rev },
+});
+
+// Take French down, leaving every other language live.
+await nextly.unpublish({
+  collection: "posts",
+  id,
+  locales: ["fr"],
+  data: { _rev },
+});
+```
+
+Over REST, send the same choice to `POST /api/collections/{slug}/entries/{id}/publish` or
+`.../unpublish`, with a body of `{ "locales": ["es", "fr"], "shared": true, "_rev": "<_rev from your read>" }`.
+`_rev` is the string token a read returns; send it back unchanged.
+`locales: "all"` chooses every language the site has, and the shared part with them.
+
+Everything chosen moves together, or nothing moves:
+
+- **Every refusal is reported at once.** A request is refused whole when any chosen part is
+  refused, and the error lists each one, each issue naming its language in `locale`: the publish
+  or unpublish rule in that language, validation of that language's values, and anything else
+  that holds a part back.
+- **A language can go live first.** An entry's first publish takes the shared part with it,
+  whichever language goes first, since no language is shown without its shared part. The answer
+  says so: `shared: { changes: true, added: true }`. The shared part's publish rule is asked in
+  every language, because every language shows it, so a rule that admits only Spanish refuses
+  that first publish.
+- **The shared part stays live while a language does.** Unpublishing the shared part while a
+  language you did not choose stays live is refused, naming that language.
+- **A languages-only publish changes no shared value.** Pending edits to the shared part stay
+  pending until the shared part is published. To throw them away instead, send
+  `DELETE /api/collections/{slug}/entries/{id}/versions/working-draft?part=shared`: each
+  language's pending change stays. Where the shared part keeps no draft of its own, as on a
+  Single, the request is refused with `NO_SHARED_DRAFT` and nothing is discarded.
+- **A unique translated field needs a value in each language.** A unique field is never filled
+  from another language, so a language whose required unique field is empty is refused with
+  `UNIQUE_VALUE_REQUIRED_IN_LANGUAGE`.
+
+Add `describe: true` to get the answer without changing anything: each chosen language's outcome
+(`goes-live`, `goes-live-with-pending-change`, `stays-published`, `shows-fallback`, or for an
+unpublish `taken-down` and `stays-unpublished`) and what happens to the shared part. A refusal is
+answered the same way it would be for the real request.
+
+By default a language whose required translated field is empty publishes and shows the value it
+falls back to. To require each language to hold its own value, set `requireEveryLanguage: true`
+on the collection (experimental); a language missing one is refused with
+`REQUIRED_IN_LANGUAGE`.
+
+## Access rules and languages
+
+Every access rule — a collection's, a Single's and a field's — is told which languages it is
+judging, so a rule can answer by language:
+
+```ts
+import { defineCollection, text } from "nextly/config";
+
+export const Posts = defineCollection({
+  slug: "posts",
+  localized: true,
+  access: {
+    // The French translation is not open to editing yet.
+    update: ({ permissions, locales }) =>
+      permissions.includes("update-posts") && !locales.includes("fr"),
+  },
+  fields: [text({ name: "title" })],
+});
+```
+
+- `locale` is the one language the operation is in: the language a read reads or a write
+  writes. An unknown or missing `?locale=` is judged as the default it resolves to, and so is
+  `*` on a read and `all` on a write, which each resolves the same way. A bulk create or update,
+  and a duplicate, write the default language, and are judged in it.
+- `locales` is every language the operation involves: `[locale]` for one language, followed,
+  on a read, by each language a missing value falls back to (the site's fallback chain, or
+  `?fallback-locale=`), since a value shown from a fallback is that language's content; and every
+  configured language for a read of every translation (`locale=all`), a write to every language
+  (`locale=*`), and an operation on the whole entry, such as a delete. There `locale` is absent.
+  A duplicate copies what a read of the source shows in the default language, so its `locales`
+  also lists each language that falls back to. A read that also reads each language's
+  translation state (`?translation-status=1`, or a `_translated` filter) keeps its `locale` and
+  lists every configured language, and so does an autosave that names a language the site
+  doesn't configure. A collection or Single that isn't localized, and has no localized field
+  group, stores the same content in every language, so an operation on it is told every
+  language with no `locale`, whatever `?locale=` names.
+
+A rule that limits someone to some languages should check `locales`, not only `locale`, so it
+refuses an operation that reaches beyond them: a delete removes every language.
+
+Write a language rule as a restriction, refusing when `locales` includes a language
+(`!locales.includes("fr")`), not as an admission that allows when it does
+(`locales.includes("fr")`). Where the languages an operation involves can't be known exactly,
+such as an operation that names none or a collection built in the admin, the rule is told every
+configured language. A restriction then refuses, which is safe; an admission by inclusion would
+allow.
+
+Publishing several languages at once — publishing every language of an entry or a Single, or
+writing `status: "published"` with `locale: "*"` — asks the publish rule once for each language
+it puts live, each time with `locale` set to that language and `locales` to all of them. A rule
+such as `publish: ({ locale }) => locale !== "fr"` therefore refuses a publish that would put
+French live, and since the publish is one transaction, no language goes live. A publish that
+puts no French live is allowed.
+
+## Each language's address
+
+A page keeps its address per language: `/about` in English, `/ueber` in German. Declare how a
+language's address is formed, so its links to its other languages, its canonical and its sitemap
+entries name the address a visitor opens:
+
+```ts
+export default defineConfig({
+  localization: { locales: ["en", "de"], defaultLocale: "en" },
+  // Under the language's code: /de/ueber. The default language at the root: /about.
+  languageAddresses: { by: "prefix", defaultLanguage: "unprefixed" },
+});
+```
+
+```ts
+// Or each language on a domain of its own, at the same path.
+languageAddresses: {
+  by: "domain",
+  domains: { en: "https://example.com", de: "https://example.de" },
+},
+```
+
+| Rule                                              | German `/ueber` is opened at         |
+| ------------------------------------------------- | ------------------------------------ |
+| None declared, several languages                  | `/de/ueber`, and English `/en/about` |
+| `{ by: "prefix" }`                                | `/de/ueber`, and English `/en/about` |
+| `{ by: "prefix", defaultLanguage: "unprefixed" }` | `/de/ueber`, and English `/about`    |
+| `{ by: "domain", domains: { … } }`                | `https://example.de/ueber`           |
+
+- A site with one language, and no rule, keeps every address as it is.
+- Each domain is a bare origin, `https://example.de`, with no path or trailing slash, and no two
+  languages share one. Where the languages are in `nextly.config.ts`, each needs a domain; a
+  language added in Settings has no address until it is given one.
+- The rule describes your addresses; it does not route them. A
+  [route under a `[locale]` segment](/docs/guides/routing-and-seo#one-route-for-every-language)
+  serves the prefixes. Sending each domain to its language, and the default language's
+  unprefixed addresses to the route, stays with your site, for example a rewrite in
+  `next.config.ts` or a Proxy.
+- On a Page Builder route under a `[locale]` segment, a block's link to another entry is read in
+  the request's language and points at that entry's address in it: a German page's button links
+  to `/de/kontakt`, not the English `/contact`. A route mounted for one language with its own
+  `locale` keeps its links as it serves its pages. A route given its own `resolveEntryPath` is
+  handed the language as a third argument and answers the whole address itself.
+- `languageAddressOf(path, locale)`, from `nextly` or `@nextlyhq/plugin-sdk`, answers the address
+  a path kept in a language is opened at: `{ status: "resolved", path, origin? }`, or
+  `{ status: "unavailable" }` for a language the site does not have.
+- `addressOfRequest(url)`, from the same two places, answers the other way round: the language
+  and the kept path a request asks for, `{ locale, path }`, or `undefined` where no language
+  serves that address. A request on a host no domain rule names is read in the default language.
+
+## Related
+
+- [Draft and published status](/docs/guides/draft-published-status)
+- [Content releases](/docs/releases) — publishing a set of documents together
+- [Versions](/docs/versions) — history per document

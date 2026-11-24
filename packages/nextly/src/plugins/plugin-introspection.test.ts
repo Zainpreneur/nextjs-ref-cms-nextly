@@ -1,0 +1,212 @@
+import { describe, expect, it } from "vitest";
+
+import type { NextlyServiceConfig } from "../di/register";
+import {
+  migrationChecksum,
+  type PluginMigration,
+} from "../domains/schema/migrate/plugin/plugin-migration";
+
+import { NO_PLUGIN_CONSENT } from "./plugin-consent";
+import type { PluginDefinition } from "./plugin-context";
+import { collectPluginInfo, findPluginInfo } from "./plugin-introspection";
+
+function cfg(partial: Record<string, unknown> = {}): NextlyServiceConfig {
+  return partial as unknown as NextlyServiceConfig;
+}
+
+// A bare dependency so form-builder's `dependsOn` resolves (D5 — missing deps fail).
+function basePlugin(): PluginDefinition {
+  return {
+    name: "@acme/base",
+    version: "1.0.0",
+    nextly: "*",
+  } as unknown as PluginDefinition;
+}
+
+/**
+ * A module of the shape resolution reads: named, versioned and sealed with
+ * its checksum, here with no statements and no tables of its own.
+ */
+function dataOnlyModule(name: string, schemaVersion: number): PluginMigration {
+  const empty = { tables: [] };
+  const content = {
+    name,
+    schemaVersion,
+    dialects: {
+      postgresql: { up: [], down: [] },
+      mysql: { up: [], down: [] },
+      sqlite: { up: [], down: [] },
+    },
+    snapshot: { postgresql: empty, mysql: empty, sqlite: empty },
+    before: { postgresql: empty, mysql: empty, sqlite: empty },
+  };
+  return { ...content, checksum: migrationChecksum(content) };
+}
+
+function fbPlugin(overrides: Record<string, unknown> = {}): PluginDefinition {
+  return {
+    name: "@nextlyhq/plugin-form-builder",
+    version: "2.0.0",
+    nextly: "*",
+    dependsOn: { "@acme/base": "^1.0.0" },
+    contributes: {
+      collections: [{ slug: "forms" }, { slug: "form-submissions" }],
+      singles: [{ slug: "form-settings" }],
+      fieldGroups: [{ slug: "field-group" }],
+      permissions: [
+        {
+          action: "export",
+          resource: "submissions",
+          label: "Export Submissions",
+        },
+      ],
+      events: [{ name: "nextlyhq-plugin-form-builder.submitted" }],
+      routes: [
+        {
+          method: "GET",
+          path: "/export",
+          handler: () => new Response(null, { status: 204 }),
+        },
+      ],
+      admin: {
+        menu: [{ label: "Forms", to: "/forms" }],
+        pages: [
+          {
+            path: "submissions",
+            component: "@nextlyhq/plugin-form-builder/admin#Submissions",
+          },
+        ],
+        settings: { component: "@nextlyhq/plugin-form-builder/admin#Settings" },
+      },
+    },
+    ...overrides,
+  } as unknown as PluginDefinition;
+}
+
+describe("collectPluginInfo", () => {
+  it("summarizes a plugin's contributions without running it", () => {
+    const infos = collectPluginInfo(cfg(), [basePlugin(), fbPlugin()], {
+      coreVersion: "1.0.0",
+      consent: NO_PLUGIN_CONSENT,
+    });
+    expect(infos).toHaveLength(2);
+
+    const fb = findPluginInfo(infos, "@nextlyhq/plugin-form-builder")!;
+    expect(fb.name).toBe("@nextlyhq/plugin-form-builder");
+    expect(fb.version).toBe("2.0.0");
+    expect(fb.enabled).toBe(true);
+    expect(fb.dependsOn).toEqual(["@acme/base"]);
+    expect(fb.collections).toEqual(["forms", "form-submissions"]);
+    expect(fb.singles).toEqual(["form-settings"]);
+    expect(fb.fieldGroups).toEqual(["field-group"]);
+    expect(fb.permissions).toEqual(["export-submissions"]);
+    expect(fb.events).toEqual(["nextlyhq-plugin-form-builder.submitted"]);
+    expect(fb.routeCount).toBe(1);
+    expect(fb.adminMenuCount).toBe(1);
+    expect(fb.adminPageCount).toBe(1);
+    expect(fb.hasSettings).toBe(true);
+  });
+
+  it("carries the declared schemaVersion, and none when undeclared", () => {
+    // Shipped with a migration reaching it: resolution refuses a declared
+    // schemaVersion that no migration of the plugin's own can apply.
+    const versioned = fbPlugin({ schemaVersion: 4 });
+    versioned.contributes = {
+      ...versioned.contributes,
+      schema: { migrations: [dataOnlyModule("20261001_100000_forms", 4)] },
+    };
+    const infos = collectPluginInfo(cfg(), [basePlugin(), versioned], {
+      coreVersion: "1.0.0",
+      consent: NO_PLUGIN_CONSENT,
+    });
+    expect(
+      findPluginInfo(infos, "@nextlyhq/plugin-form-builder")!.manifest
+        .schemaVersion
+    ).toBe(4);
+    expect(
+      findPluginInfo(infos, "@acme/base")!.manifest.schemaVersion
+    ).toBeUndefined();
+  });
+
+  it("reports a determineUser plugin as a login finisher", () => {
+    // The consent makes a determineUser hook login-capable: once the app
+    // lists the plugin it can finish logins, so the operator's summary must
+    // say so whatever spelling the manifest used.
+    const hookOnly = {
+      name: "@acme/members",
+      version: "1.0.0",
+      nextly: "*",
+      contributes: { auth: { hooks: { determineUser: () => null } } },
+    } as unknown as PluginDefinition;
+    const declared = fbPlugin({ capabilities: { auth: { login: true } } });
+    const infos = collectPluginInfo(cfg(), [basePlugin(), hookOnly, declared], {
+      coreVersion: "1.0.0",
+      consent: {
+        rawSql: [],
+        login: ["@acme/members", "@nextlyhq/plugin-form-builder"],
+      },
+    });
+    expect(
+      findPluginInfo(infos, "@acme/members")!.manifest.completesLogins
+    ).toBe(true);
+    expect(
+      findPluginInfo(infos, "@nextlyhq/plugin-form-builder")!.manifest
+        .completesLogins
+    ).toBe(true);
+    // The control: a plugin declaring neither spelling reports no.
+    expect(findPluginInfo(infos, "@acme/base")!.manifest.completesLogins).toBe(
+      false
+    );
+  });
+
+  it("lists the kinds of signed-in person each plugin registers", () => {
+    const accounts = {
+      name: "@acme/accounts",
+      version: "1.0.0",
+      nextly: "*",
+      contributes: {
+        principals: [
+          { name: "account", attributes: {}, resolve: async () => null },
+          { name: "guest", attributes: {}, resolve: async () => null },
+        ],
+      },
+    } as unknown as PluginDefinition;
+    const infos = collectPluginInfo(cfg(), [basePlugin(), accounts], {
+      coreVersion: "1.0.0",
+      consent: NO_PLUGIN_CONSENT,
+    });
+    expect(findPluginInfo(infos, "@acme/accounts")!.principalKinds).toEqual([
+      "acme-accounts:account",
+      "acme-accounts:guest",
+    ]);
+    expect(findPluginInfo(infos, "@acme/base")!.principalKinds).toEqual([]);
+  });
+
+  it("reports a disabled plugin: schema listed, behavior counts zeroed", () => {
+    const infos = collectPluginInfo(
+      cfg(),
+      [basePlugin(), fbPlugin({ enabled: false })],
+      { coreVersion: "1.0.0", consent: NO_PLUGIN_CONSENT }
+    );
+    const fb = findPluginInfo(infos, "@nextlyhq/plugin-form-builder")!;
+    expect(fb.enabled).toBe(false);
+    // Schema contributions still apply when disabled.
+    expect(fb.collections).toEqual(["forms", "form-submissions"]);
+    // Behavior (routes + admin UI) is skipped.
+    expect(fb.routeCount).toBe(0);
+    expect(fb.adminMenuCount).toBe(0);
+    expect(fb.adminPageCount).toBe(0);
+    expect(fb.hasSettings).toBe(false);
+  });
+
+  it("findPluginInfo matches by exact name", () => {
+    const infos = collectPluginInfo(cfg(), [basePlugin(), fbPlugin()], {
+      coreVersion: "1.0.0",
+      consent: NO_PLUGIN_CONSENT,
+    });
+    expect(
+      findPluginInfo(infos, "@nextlyhq/plugin-form-builder")?.version
+    ).toBe("2.0.0");
+    expect(findPluginInfo(infos, "nope")).toBeUndefined();
+  });
+});

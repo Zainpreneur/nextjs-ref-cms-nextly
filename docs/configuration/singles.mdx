@@ -1,0 +1,357 @@
+---
+title: Singles
+description: Define single-document content like site settings, headers, and footers.
+---
+
+import { Tab, Tabs } from "fumadocs-ui/components/tabs";
+
+A single is a one-off document — content that exists as exactly one instance. Site settings, navigation headers, footers, and homepage configurations are typical singles. Unlike [collections](/docs/configuration/collections), singles have no list view, no create/delete operations, and are auto-created on first access. When several requests reach a single that has no document yet at the same moment, such as the first page views of a new site, one document is created from its defaults and every request gets it.
+
+> **Source of truth:** the `SingleConfig` interface lives in `packages/nextly/src/singles/config/types.ts`. The `defineSingle()` helper is in `packages/nextly/src/singles/config/define-single.ts`.
+
+<Tabs items={["Code-first", "Visual Schema Builder"]}>
+<Tab value="Code-first">
+
+## Defining a single
+
+Use `defineSingle()` from `nextly`:
+
+```typescript title="src/singles/site-settings.ts"
+import { defineSingle, text, upload, group, repeater } from "nextly";
+
+export default defineSingle({
+  slug: "site-settings",
+  label: { singular: "Site Settings" },
+  admin: {
+    group: "Settings",
+    icon: "Settings",
+    description: "Global site configuration",
+  },
+  fields: [
+    text({ name: "siteName", required: true, label: "Site Name" }),
+    text({ name: "tagline", label: "Tagline" }),
+    upload({ name: "logo", relationTo: "media", label: "Logo" }),
+    upload({ name: "favicon", relationTo: "media", label: "Favicon" }),
+    group({
+      name: "seo",
+      label: "SEO Defaults",
+      fields: [
+        text({ name: "metaTitle", label: "Default Meta Title" }),
+        text({ name: "metaDescription", label: "Default Meta Description" }),
+      ],
+    }),
+    repeater({
+      name: "socialLinks",
+      label: "Social Links",
+      fields: [
+        text({ name: "platform", required: true }),
+        text({ name: "url", required: true }),
+      ],
+    }),
+  ],
+  access: {
+    // Visitors can read, and signed-in callers holding read-site-settings;
+    // the role's update-site-settings decides an update.
+    read: true,
+  },
+  hooks: {
+    afterChange: [
+      async ({ data }) => {
+        // Nextly invalidates its own cache tags on every write once the cache
+        // revalidator is registered (see ISR caching). Use hooks for side
+        // effects of your own.
+        console.info("site settings updated", data);
+      },
+    ],
+  },
+});
+```
+
+Then register it in your config:
+
+```typescript title="nextly.config.ts"
+import { defineConfig } from "nextly";
+import SiteSettings from "./src/singles/site-settings";
+import Header from "./src/singles/header";
+import Footer from "./src/singles/footer";
+
+export default defineConfig({
+  singles: [SiteSettings, Header, Footer],
+});
+```
+
+</Tab>
+<Tab value="Visual Schema Builder">
+
+## Creating a single in the Visual Schema Builder
+
+The Nextly admin panel ships with a Visual Schema Builder for creating singles without writing code. (We'll just call it the Schema Builder below.)
+
+1. Open the admin panel and navigate to **Builder > Singles**.
+2. Click **Create Single**.
+3. Enter a slug (e.g. `site-settings`) and a display label.
+4. Add fields using the drag-and-drop field editor.
+5. Configure access control and hooks through the UI.
+6. Click **Save**.
+
+The Schema Builder produces the same `SingleConfig` that code-first singles use. Unlike a collection, a builder-created single has no command that moves it into code.
+
+</Tab>
+</Tabs>
+
+## How singles differ from collections
+
+|                               | Collections                                                  | Singles                                                            |
+| ----------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------ |
+| **Entries**                   | Many                                                         | Exactly one                                                        |
+| **List view**                 | Yes                                                          | No                                                                 |
+| **Create/Delete**             | Yes                                                          | No (auto-created on first access; cannot be deleted)               |
+| **Access control operations** | `create`, `read`, `update`, `delete`, `publish`, `unpublish` | `read`, `update`, `publish`, `unpublish`                           |
+| **Hooks**                     | 8 hooks                                                      | 4 hooks (`beforeRead`, `afterRead`, `beforeChange`, `afterChange`) |
+| **Default table prefix**      | None — uses slug as table name                               | `single_` (e.g. `single_site_settings`)                            |
+| **API endpoint**              | `/admin/api/collections/[slug]/entries`                      | `/admin/api/singles/[slug]`                                        |
+
+## Single options
+
+Only `slug` and `fields` are required.
+
+A Single's slug follows the [address rule](/docs/configuration/collections#the-address-rule) shared by collections and field groups.
+
+### `slug`
+
+|              |          |
+| ------------ | -------- |
+| **Type**     | `string` |
+| **Required** | Yes      |
+
+Unique identifier across all singles **and** collections **and** field groups. Used as the API endpoint path and database table name (with the `single_` prefix unless `dbName` is set). Must be lowercase and URL-friendly.
+
+### `fields`
+
+|              |                 |
+| ------------ | --------------- |
+| **Type**     | `FieldConfig[]` |
+| **Required** | Yes             |
+
+Array of field definitions. Singles support the same field types as collections. See [Fields](/docs/configuration/fields).
+
+### `label`
+
+|             |                          |
+| ----------- | ------------------------ |
+| **Type**    | `{ singular: string }`   |
+| **Default** | Auto-generated from slug |
+
+Display label in the admin sidebar, breadcrumbs, and page titles. Singles only need a singular label since there is exactly one document.
+
+### `dbName`
+
+|             |                                               |
+| ----------- | --------------------------------------------- |
+| **Type**    | `string`                                      |
+| **Default** | `single_[slug]` (e.g. `single_site_settings`) |
+
+Custom database table name.
+
+### `description`
+
+|             |             |
+| ----------- | ----------- |
+| **Type**    | `string`    |
+| **Default** | `undefined` |
+
+Description displayed in the admin UI, including as the first line of the Single's side panel ("What this is"). Falls back to `admin.description`.
+
+### `sanitize`
+
+|             |           |
+| ----------- | --------- |
+| **Type**    | `boolean` |
+| **Default** | `true`    |
+
+When enabled, the global sanitization hook strips HTML tags from plain-text fields (`text`, `textarea`, `email`) before storage. Set to `false` only if the single intentionally stores HTML in those fields.
+
+### `custom`
+
+|             |                           |
+| ----------- | ------------------------- |
+| **Type**    | `Record<string, unknown>` |
+| **Default** | `undefined`               |
+
+Arbitrary metadata for hooks, plugins, or custom code. Not persisted to the database.
+
+### `publicAddress`
+
+|             |             |
+| ----------- | ----------- |
+| **Type**    | `string`    |
+| **Default** | `undefined` |
+
+Where the Single is served on your site, as a fixed path: `"/"` for a homepage, `"/about"`. A Single is one page, so its address has no placeholder. `publicAddressOf` answers that a Single without one has no address. Two Singles can't share an address: the configuration stops loading, naming both. See [Public addresses](/docs/configuration/public-addresses).
+
+## Admin options
+
+Configure how the single appears in the admin panel via the `admin` property.
+
+| Property       | Type      | Default    | Description                                                                            |
+| -------------- | --------- | ---------- | -------------------------------------------------------------------------------------- |
+| `group`        | `string`  | None       | Sidebar group name.                                                                    |
+| `icon`         | `string`  | None       | Lucide icon name (e.g. `"Settings"`, `"Menu"`, `"Home"`).                              |
+| `hidden`       | `boolean` | `false`    | Hide from sidebar navigation (still reachable via direct URL and API).                 |
+| `order`        | `number`  | `100`      | Sort order within sidebar group (lower = higher).                                      |
+| `sidebarGroup` | `string`  | None       | Custom sidebar group slug; moves the entry from its default section to a custom group. |
+| `description`  | `string`  | None       | Help text below the single title.                                                      |
+| `opensIn`      | `string`  | Main field | Experimental. See [Where a Single opens](#where-a-single-opens).                       |
+
+> **Singles do not support `useAsTitle`, `pagination`, `preview`, or admin-component overrides** — those concepts are collection-specific.
+
+### Where a Single opens
+
+A Single opens where a collection's entry of the same shape would, by the one
+rule in [Where an entry opens](/docs/plugins/admin-ui#where-an-entry-opens).
+With the Page Builder installed, a Single whose main field is a page layout,
+such as a Homepage with a title and a `blocks` field, opens straight in the
+builder from the sidebar, the Content screen, the dashboard and every other
+link that opens it. The builder's **⋯** menu offers **Open as form**, and its
+back arrow reads **Back to content** and returns to the Content screen. A
+Single whose main field is anything else opens as its form, and so does one
+opened by a reader who may only read it, or in a language other than the
+default.
+
+To keep a Single opening as its form, set `admin: { opensIn: "form" }` on it.
+Startup is refused when a Single's `opensIn` names a view it can't open in: one
+no plugin offers on a field type, or one whose field type isn't among its
+top-level fields. A view a plugin declares on a collection's slug is never a
+Single's.
+
+### The side panel
+
+A Single's editor has a side panel that reads, top to bottom:
+
+1. **What this is**: the Single's `description` (or `admin.description`). Without one, it says "One entry the site uses in one place. There's only ever one" and then the Single's label.
+2. **Status**, **Publishing** and **Language**, where the Single has drafts or languages.
+3. **Last changed**: how long ago, and who made the change, named as their account names them now and never by email. **History** opens the Single's history, where it keeps versions and you may read them.
+4. Any sections plugins add to the Single's page.
+5. **For developers**: the API address (`/admin/api/singles/<slug>`, the one "View API response" reads) and the document's ID, each with a copy button.
+
+"For developers" takes the place of a collection entry's Details, under the same name, `details`. A plugin section placed `before: "details"` sits above it, and one placed `after: "details"` (the SEO plugin's search lines) sits straight under it, as it does under an entry's Details.
+
+## Access control
+
+A single's access rules are `read`, `update`, `publish` and `unpublish` — there is no `create` or `delete`, since the document is auto-created on first access and cannot be removed. For a single with `status: true`, a write that changes only its status is judged by `publish` or `unpublish` alone, so a publisher sends `{ "status": "published" }`; a write that also edits fields needs `update` too. Any other key stops startup with `ACCESS_KEY_UNKNOWN`, naming the key; remove it to fix the config.
+
+```typescript
+access: {
+  read: true,
+  // On top of the role's update permission: not while a content freeze is on.
+  update: () => process.env.CONTENT_FREEZE !== "on",
+}
+```
+
+Each operation accepts a function (returning `boolean | Promise<boolean>`), a literal `boolean`, or can be omitted to fall back to database role/permission checks. A declared rule only narrows the permission: a signed-in user or an API key needs it first, and the rule lets them through only by returning `true`; don't decide by a role's name. Super-admin always bypasses checks. A Single's rule is handed the same context as a collection's, with `target.kind` set to `"single"`: see [collections](/docs/configuration/collections#access-control).
+
+## Hooks
+
+Singles support four lifecycle hooks — a subset of the eight available on collections.
+
+### Five available hooks
+
+| Hook             | Triggers on                                          | Can modify             |
+| ---------------- | ---------------------------------------------------- | ---------------------- |
+| `beforeRead`     | Before reading from the database.                    | Yes (query parameters) |
+| `afterRead`      | After reading from the database.                     | Yes (transform output) |
+| `beforeValidate` | Before the schema's rules are enforced on an update. | Yes (data)             |
+| `beforeChange`   | After validation passes, before the database write.  | Yes (data)             |
+| `afterChange`    | After the database write.                            | No (side effects)      |
+
+### Execution order — read
+
+1. `beforeRead`
+2. **Database read**
+3. `afterRead`
+
+### Execution order — update
+
+1. `beforeValidate`
+2. **Validation** - the schema's declared rules are enforced
+3. `beforeChange`
+4. **Database update**
+5. `afterChange`
+
+The validation gate is what separates the two write hooks. Use `beforeValidate`
+to supply or repair a value you want the rules applied to; use `beforeChange` to
+derive the value that gets stored, knowing the document has already passed them.
+What a `beforeChange` handler returns is written without being re-validated.
+
+### Example: cache invalidation
+
+```typescript title="src/singles/site-settings.ts"
+hooks: {
+  afterChange: [
+    async ({ data }) => {
+      // Nextly's own cache tags are already invalidated on every write once
+      // the cache revalidator is registered (see ISR caching). Notify a
+      // system of your own here, with an absolute URL: a relative fetch
+      // throws on the server.
+      await fetch(`${process.env.NEXT_PUBLIC_APP_URL}/api/my-webhook`, {
+        method: "POST",
+        body: JSON.stringify(data),
+      });
+    },
+  ],
+  afterRead: [
+    async ({ data }) => {
+      // Add a computed field
+      return { ...data, fullTitle: `${data.siteName} - ${data.tagline}` };
+    },
+  ],
+}
+```
+
+### When to use which hook
+
+- `beforeRead` — modify query filters (e.g., scope to the current tenant), audit logging.
+- `afterRead` — compute virtual properties, redact sensitive fields.
+- `beforeValidate` — coerce inputs (trim strings, normalize casing), or supply a value the rules require.
+- `beforeChange` — final mutations before the row is persisted, on data already known to be valid.
+- `afterChange` — cache busting, webhooks, queue jobs.
+
+Throwing inside any hook aborts the operation and rolls back the transaction.
+
+## Example: header navigation
+
+```typescript title="src/singles/header.ts"
+import { defineSingle, repeater, text, relationship } from "nextly";
+
+export default defineSingle({
+  slug: "header",
+  label: { singular: "Header Navigation" },
+  admin: {
+    group: "Navigation",
+    icon: "Menu",
+  },
+  fields: [
+    repeater({
+      name: "navItems",
+      label: "Navigation Items",
+      fields: [
+        text({ name: "label", required: true }),
+        text({ name: "url" }),
+        relationship({ name: "page", relationTo: "pages" }),
+      ],
+    }),
+  ],
+  access: {
+    // Visitors can read, and signed-in callers holding read-header; the
+    // role's update-header decides an update.
+    read: true,
+  },
+});
+```
+
+## Next steps
+
+- [Collections](/docs/configuration/collections) — content types with multiple entries
+- [Fields](/docs/configuration/fields) — every field type and validation option
+- [Field Groups](/docs/configuration/field-groups) — reusable field groups for collections and singles
+- [Visual Schema Builder](/docs/schema-builder) — create singles visually with drag-and-drop

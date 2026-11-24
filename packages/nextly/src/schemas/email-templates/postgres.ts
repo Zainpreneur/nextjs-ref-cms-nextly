@@ -1,0 +1,303 @@
+/**
+ * PostgreSQL Schema for Email Templates
+ *
+ * Defines the `email_templates` table schema for PostgreSQL databases
+ * using Drizzle ORM. This schema stores email templates with variable
+ * interpolation support, managed via the Admin Settings UI.
+ *
+ * @module schemas/email-templates/postgres
+ * @since 1.0.0
+ *
+ * @example
+ * ```typescript
+ * import {
+ *   emailTemplatesPg,
+ *   type EmailTemplatePg,
+ *   type EmailTemplateInsertPg,
+ * } from '../schemas/email-templates/postgres';
+ *
+ * // Insert a new template
+ * await db.insert(emailTemplatesPg).values({
+ *   name: 'Welcome Email',
+ *   slug: 'welcome',
+ *   subject: 'Welcome to {{appName}}, {{userName}}!',
+ *   htmlContent: '<h1>Welcome, {{userName}}!</h1>',
+ * });
+ * ```
+ */
+
+import {
+  pgTable,
+  uuid,
+  varchar,
+  text,
+  boolean,
+  timestamp,
+  jsonb,
+  index,
+} from "drizzle-orm/pg-core";
+
+import type { EmailAttachmentInput } from "../../domains/email/types";
+import type { WrittenDocument } from "../../domains/email/written/document";
+
+import type { EmailTemplateVariable, EmailTemplateVersion } from "./types";
+
+// ============================================================
+// Email Templates Table (PostgreSQL)
+// ============================================================
+
+/**
+ * PostgreSQL schema for the `email_templates` table.
+ *
+ * Stores email templates with `{{variable}}` interpolation support.
+ * Templates can be managed via the admin Settings UI. Built-in
+ * templates (welcome, password-reset, email-verification) and
+ * layout templates (_email-header, _email-footer) are auto-created
+ * by the service layer.
+ *
+ * @example
+ * ```typescript
+ * // Query template by slug
+ * const template = await db
+ *   .select()
+ *   .from(emailTemplatesPg)
+ *   .where(eq(emailTemplatesPg.slug, 'password-reset'))
+ *   .limit(1);
+ *
+ * // Query all active templates
+ * const activeTemplates = await db
+ *   .select()
+ *   .from(emailTemplatesPg)
+ *   .where(eq(emailTemplatesPg.isActive, true));
+ * ```
+ */
+export const emailTemplatesPg = pgTable(
+  "email_templates",
+  {
+    // --------------------------------------------------------
+    // Primary Key
+    // --------------------------------------------------------
+
+    /** Unique identifier (UUID v4, auto-generated) */
+    id: uuid("id").primaryKey().defaultRandom(),
+
+    // --------------------------------------------------------
+    // Template Identity
+    // --------------------------------------------------------
+
+    /**
+     * Display name for this template.
+     * @example 'Welcome Email', 'Password Reset'
+     */
+    name: varchar("name", { length: 255 }).notNull(),
+
+    /**
+     * Unique identifier slug for programmatic access.
+     * @example 'welcome', 'password-reset', '_email-header'
+     */
+    slug: varchar("slug", { length: 255 }).unique().notNull(),
+
+    // --------------------------------------------------------
+    // Content
+    // --------------------------------------------------------
+
+    /**
+     * Email subject line. Supports `{{variable}}` interpolation.
+     * @example 'Reset your {{appName}} password'
+     */
+    subject: text("subject").notNull(),
+
+    /**
+     * HTML body content. Supports `{{variable}}` interpolation.
+     * When `useLayout` is true, this content is wrapped with the
+     * shared header/footer layout at send time.
+     */
+    htmlContent: text("html_content").notNull(),
+
+    /**
+     * Optional plain text fallback content.
+     * Supports `{{variable}}` interpolation.
+     */
+    plainTextContent: text("plain_text_content"),
+
+    /**
+     * Inbox preview line shown after the subject in most clients.
+     * Supports `{{variable}}` interpolation. Null renders no preheader.
+     */
+    preheader: text("preheader"),
+
+    /**
+     * Whether the template is written (blocks) or coded (HTML). Null, as on
+     * every row stored before written templates, is coded.
+     */
+    format: varchar("format", { length: 10 }),
+
+    /** A written template's blocks (`domains/email/written`); null for a coded one. */
+    blocks: jsonb("blocks").$type<WrittenDocument>(),
+
+    // --------------------------------------------------------
+    // Template Metadata
+    // --------------------------------------------------------
+
+    /**
+     * Row kind. `layout` rows are wrappers whose `htmlContent` holds a
+     * `{{content}}` placeholder; `template` rows are message bodies;
+     * `partial` rows are reusable fragments. Nullable so it adds cleanly
+     * to existing tables; boot backfills nulls to `template` and a null
+     * kind is treated as `template` on read.
+     */
+    kind: varchar("kind", { length: 20 }).default("template"),
+
+    /**
+     * Layout that wraps this template at send time (`kind = 'layout'` row).
+     * Null uses the default layout. Soft reference to another row's id
+     * (no DB FK — integrity is enforced in the service so the column can
+     * be added to existing tables without a table rebuild).
+     */
+    layoutId: uuid("layout_id"),
+
+    /**
+     * Available template variables with descriptions.
+     * Displayed in the admin UI template editor for reference.
+     */
+    variables: jsonb("variables").$type<EmailTemplateVariable[]>(),
+
+    /**
+     * Whether to wrap `htmlContent` with the shared email
+     * header/footer layout at send time.
+     */
+    useLayout: boolean("use_layout").default(true).notNull(),
+
+    /**
+     * Whether this template is currently active.
+     * Inactive templates are stored but cannot be used for sending.
+     */
+    isActive: boolean("is_active").default(true).notNull(),
+
+    /**
+     * Optional provider ID to override the default email provider
+     * for this specific template. When null, the system default is used.
+     * Soft reference (no DB FK); the send path falls back to the default
+     * provider when this points at a removed provider.
+     */
+    providerId: uuid("provider_id"),
+
+    /**
+     * Per-template From override (e.g. `Support <help@example.com>`).
+     * Null falls back to the provider / config From.
+     */
+    fromOverride: text("from_override"),
+
+    /** Per-template Reply-To address. Null sets no Reply-To header. */
+    replyTo: text("reply_to"),
+
+    /**
+     * Fixed addresses copied on every send of the template, after the send's
+     * own copies. Never variables, and never on a template carrying a secret.
+     * Nullable, so it reaches an existing table as a plain ADD COLUMN.
+     */
+    cc: jsonb("cc").$type<string[]>(),
+
+    /** Fixed addresses blind-copied on every send, on the same rules as `cc`. */
+    bcc: jsonb("bcc").$type<string[]>(),
+
+    /**
+     * Default attachments for this template. Merged with per-send
+     * attachments at send time (dedupe by mediaId, per-send wins).
+     * When null, no default attachments are applied.
+     */
+    attachments: jsonb("attachments").$type<EmailAttachmentInput[]>(),
+
+    // --------------------------------------------------------
+    // Ownership
+    //
+    // Every column here is nullable with no foreign key, so it reaches an
+    // existing table as a plain ADD COLUMN on every dialect. A row whose
+    // owner is still null has not been reconciled yet: the boot
+    // reconciliation assigns it.
+    // --------------------------------------------------------
+
+    /** Who owns the template: `core`, `plugin` or `site`. */
+    ownerKind: varchar("owner_kind", { length: 20 }),
+
+    /** The owning plugin's name, for `ownerKind = 'plugin'`; unbounded, as a plugin's name is. */
+    ownerName: text("owner_name"),
+
+    /**
+     * Whether the site has overridden an owned template. While true the row
+     * holds the site's version and owner updates wait for review; null reads
+     * as false.
+     */
+    overridden: boolean("overridden"),
+
+    /** Digest of the owner's version an override started from. */
+    baseDigest: varchar("base_digest", { length: 64 }),
+
+    /**
+     * The owner's version an override started from, kept so a later owner
+     * update can be reviewed change by change against it.
+     */
+    baseVersion: jsonb("base_version").$type<EmailTemplateVersion>(),
+
+    /**
+     * Whether the template's owner marks it as carrying a secret (a reset or
+     * verification link). Written from the owner's declaration, never by an
+     * edit; kept so a plugin that is not running keeps its mark. Null reads as
+     * false.
+     */
+    carriesSecret: boolean("carries_secret"),
+
+    /** When the template is sent, written by its owner (or the site). */
+    description: text("description"),
+
+    // --------------------------------------------------------
+    // Metadata
+    // --------------------------------------------------------
+
+    /** When the template was created */
+    createdAt: timestamp("created_at", { withTimezone: false })
+      .defaultNow()
+      .notNull(),
+
+    /** When the template was last updated */
+    updatedAt: timestamp("updated_at", { withTimezone: false })
+      .defaultNow()
+      .notNull(),
+  },
+  table => [
+    // --------------------------------------------------------
+    // Indexes for Query Performance
+    // --------------------------------------------------------
+
+    /** Index for filtering active/inactive templates */
+    index("email_templates_is_active_idx").on(table.isActive),
+
+    /** Index for filtering templates by provider */
+    index("email_templates_provider_id_idx").on(table.providerId),
+
+    /** Index for filtering by row kind (template / layout / partial) */
+    index("email_templates_kind_idx").on(table.kind),
+
+    /** Index for resolving templates that reference a layout */
+    index("email_templates_layout_id_idx").on(table.layoutId),
+
+    /** Index for sorting by creation date */
+    index("email_templates_created_at_idx").on(table.createdAt),
+  ]
+);
+
+// ============================================================
+// Type Exports (Drizzle Inference)
+// ============================================================
+
+/**
+ * PostgreSQL-specific select type for email templates.
+ * Represents a full row from the `email_templates` table.
+ */
+export type EmailTemplatePg = typeof emailTemplatesPg.$inferSelect;
+
+/**
+ * PostgreSQL-specific insert type for email templates.
+ * Fields with defaults (id, useLayout, isActive, timestamps) are optional.
+ */
+export type EmailTemplateInsertPg = typeof emailTemplatesPg.$inferInsert;

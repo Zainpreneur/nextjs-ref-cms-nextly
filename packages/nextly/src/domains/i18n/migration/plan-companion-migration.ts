@@ -1,0 +1,136 @@
+import { buildLocalizationDownSql } from "./generate-down";
+import {
+  buildCompanionCreateOnlySql,
+  buildLocalizationUpSql,
+} from "./generate-up";
+import type { CompanionMigrationSpec } from "./types";
+
+/** The shape of a planned companion migration. */
+export interface CompanionMigrationPlan {
+  /**
+   * - `enable`: the previous main table held the localized columns → seed the companion from
+   *   them and drop them from main (M1's create+seed+drop). Reversible.
+   * - `create-only`: a fresh localized collection whose main table never held the columns →
+   *   just CREATE the companion (no seed, no drop). Reversible.
+   * - `disable`: the entity was localized in the previous snapshot and is not anymore →
+   *   restore the default locale onto main, archive the other languages, drop the companion
+   *   Reversible (its DOWN re-enables).
+   * - `none`: the companion already exists / nothing to relocate → emit nothing.
+   * - `adds`: the companion exists and gains the columns of translated fields added to the entity
+   *   (`field-added-to-translation.ts`). Not planned here, but carried in the same list.
+   */
+  kind: "enable" | "create-only" | "disable" | "none" | "adds";
+  upSql: string;
+  downSql: string;
+  /**
+   * The spec the SQL above was actually built from, which is not always the one passed in.
+   *
+   * An ENABLE narrows `columnsOnMain` to the subset the previous main table really carried, and the
+   * statements follow that subset. Anything recording what this migration is for has to record the
+   * narrowed spec: the wider one says every localized column was on main, so a reader acting on it
+   * would seed from, or drop, a column that never existed there.
+   */
+  spec: CompanionMigrationSpec;
+}
+
+export interface PlanCompanionArgs {
+  spec: CompanionMigrationSpec;
+  /** Column names present on the main table in the PREVIOUS committed snapshot. */
+  prevMainColumnNames: string[];
+  /** Whether the companion table already existed in the previous snapshot. */
+  companionExisted: boolean;
+  /**
+   * Whether the entity is localized in the NEW config. Defaults to `true` (the
+   * historical behavior: this planner was only ever called for localized entities).
+   */
+  localized?: boolean;
+  /**
+   * Whether the PREVIOUS committed snapshot explicitly recorded this entity as
+   * localized (`TableSpec.localized === true`). Only an explicit `true` here can produce a
+   * DISABLE plan, so a pre-marker snapshot (undefined) never triggers a destructive
+   * transition.
+   */
+  previouslyLocalized?: boolean;
+  /**
+   * A DISABLE's statements to run once the values are back on the main table
+   * (`LocalizationDownOptions.afterRestore`): the Required and unique settings the main table's
+   * snapshot records of the restored columns (`up`); and what its DOWN undoes first (`down`), the
+   * unique indexes, since SQLite drops no column an index covers.
+   */
+  afterRestore?: { up: readonly string[]; down: readonly string[] };
+}
+
+/**
+ * Decide the companion migration shape for a collection, comparing the previous snapshot
+ * against the new localized spec. Pure — no DB access. The `downSql` reverses the `upSql`,
+ * so every plan is rollback-able.
+ */
+export function planCompanionMigration(
+  args: PlanCompanionArgs
+): CompanionMigrationPlan {
+  const { spec, prevMainColumnNames, companionExisted } = args;
+  const localized = args.localized ?? true;
+
+  // DISABLE: localization was on and is now off. The transition is
+  // gated on the previous snapshot's explicit marker, never inferred from column shape,
+  // because "the main table gained columns" is also what a plain field-add looks like.
+  if (!localized) {
+    if (args.previouslyLocalized !== true) {
+      return { kind: "none", upSql: "", downSql: "", spec };
+    }
+    return {
+      // UP restores the default locale onto main, archives non-default translations into
+      // `nextly_i18n_archive`, then drops the companion. DOWN is the inverse (re-enable).
+      kind: "disable",
+      upSql: buildLocalizationDownSql(spec, {
+        ...(args.afterRestore === undefined
+          ? {}
+          : { afterRestore: args.afterRestore.up }),
+      }),
+      downSql: [
+        ...(args.afterRestore?.down ?? []).map(s => `${s};`),
+        buildLocalizationUpSql(spec),
+      ].join("\n\n"),
+      spec,
+    };
+  }
+
+  if (companionExisted) {
+    return { kind: "none", upSql: "", downSql: "", spec };
+  }
+
+  const prev = new Set(prevMainColumnNames);
+  // Enable transition: the previous main table carried the localized columns and they need
+  // relocating (seed + drop). If none of the localized columns were on the previous main
+  // table, this is a fresh localized collection → create-only.
+  const hadLocalizedColumns = spec.columns.some(c => prev.has(c.name));
+
+  if (hadLocalizedColumns) {
+    // Seed from (and drop) only the localized columns the previous main actually carried. A
+    // field added and localized in the same config change is in `spec.columns` (the companion
+    // CREATE needs it) but was never on main, so including it in the seed SELECT or the DROP
+    // list makes the migration fail on apply with "no such column". The DOWN uses the same
+    // subset so it re-adds exactly what the UP dropped.
+    const enableSpec: CompanionMigrationSpec = {
+      ...spec,
+      columnsOnMain: spec.columns.map(c => c.name).filter(n => prev.has(n)),
+    };
+    return {
+      kind: "enable",
+      upSql: buildLocalizationUpSql(enableSpec),
+      downSql: buildLocalizationDownSql(enableSpec),
+      // The narrowed one, matching the statements above rather than the caller's wider input.
+      spec: enableSpec,
+    };
+  }
+
+  return {
+    kind: "create-only",
+    // Written to a migration file, so the create may guard against a companion the dev server
+    // or a `db:sync` has already provisioned.
+    upSql: buildCompanionCreateOnlySql(spec, { emittedToFile: true }),
+    // Reverse of a bare CREATE is a DROP TABLE (no data to restore — main never had it).
+    downSql: `DROP TABLE ${spec.dialect === "mysql" ? `\`${spec.companionTable}\`` : `"${spec.companionTable}"`};`,
+    spec,
+  };
+}

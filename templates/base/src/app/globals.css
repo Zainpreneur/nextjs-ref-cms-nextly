@@ -1,0 +1,79 @@
+@import "tailwindcss";
+
+/* The families the imported font stylesheets declare, bound to the variables the rules
+   below read. Named here rather than by `next/font`, which used to inject them: the faces
+   now arrive as ordinary stylesheets, so the binding has to be written down somewhere, and
+   the name is load-bearing — the admin theme reads `--font-geist`. Quoted family names, so
+   the two-word values stay one identifier. */
+:root {
+  --font-geist: "Geist Variable";
+  --font-geist-mono: "Geist Mono Variable";
+}
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  /* Fallback arguments, not a trailing family list: an unresolved var() with no
+     fallback invalidates the whole declaration rather than falling through to
+     what comes after the closing paren. */
+  --font-sans: var(--font-geist, ui-sans-serif), system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono, ui-monospace), monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+/* ===============================================================
+   Accessibility baseline
+   ---------------------------------------------------------------
+   Applied globally so the template passes a WCAG AA keyboard audit
+   out of the box. Adjust to match your brand.
+   =============================================================== */
+
+/* Visible focus ring for keyboard users. `:focus-visible` only fires
+   on keyboard / programmatic focus, so clicking a button doesn't
+   show the ring but tabbing to it does.
+
+   Weighed as two element names, the pseudo-class inside `:where()` counting
+   for nothing. That is enough to keep the ring over a reset added later, such
+   as `button { outline: none }`, and on this site's pages it draws as
+   `*:focus-visible` did, since no other rule here sets these properties on a
+   focused element. The admin at /admin renders in this same document and
+   reverts a site's rules made of element names only; with the pseudo-class
+   counted, this rule would outweigh that and redraw every focused control in
+   the admin with this ring and corner. The trade: a class-based reset, such as
+   `.btn { outline: none }`, outweighs this ring wherever it is written; give
+   such a rule a `:focus-visible` style of its own. */
+html body :where(:focus-visible) {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Honor OS-level reduced-motion preference — disables hover scale,
+   transitions, and animations for users who've opted out. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

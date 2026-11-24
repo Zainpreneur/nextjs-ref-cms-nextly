@@ -1,0 +1,781 @@
+/**
+ * Needs attention's source, `system:attention`: what is waiting for this reader,
+ * as one count per kind and, where a kind spans collections, one per part.
+ *
+ * ## It combines domain reads and owns no rule
+ *
+ * Each kind is asked of the domain that defines it, as the requesting person:
+ *
+ * - **Unpublished changes.** A collection's are counted through the entry list's
+ *   own `_pendingChange` condition, so the number and the list it links to are
+ *   one read. A Single has no list, so Singles come from the versions domain's
+ *   pending-edit walk. Both read the working-draft shape the versions repository
+ *   defines.
+ * - **Due within a week.** Entries a scheduled release will publish, counted
+ *   through the entry list's `_inRelease` condition with the week's bound.
+ * - **Overdue releases.** The releases domain's own count of its Needs attention
+ *   tab narrowed to overdue. "Overdue" is never decided here.
+ *
+ * ## A part the reader may not read is absent, not zero
+ *
+ * A collection the reader may not read is never counted; the release kinds are
+ * not asked at all of a reader who may not read releases. Kinds and parts with
+ * nothing in them are left out too, so a reader barred from releases receives
+ * exactly what a reader on a site with no releases due receives, and the card
+ * cannot tell either of them what it withheld.
+ *
+ * ## Bounded work
+ *
+ * Each collection is counted only up to {@link ATTENTION_COUNT_CAP}, by a read
+ * that stops one row past it, and at most {@link ATTENTION_MAX_COLLECTIONS}
+ * collections are counted, a few at a time. Past either bound the count is a
+ * floor and says so (`atLeast`), and the card shows "N+".
+ *
+ * ## One collection that cannot be counted fails only its part
+ *
+ * Its part is left out and the kind's total is a floor, as past the bound;
+ * every other part and kind is still answered. The collections counted are the
+ * dashboard's own (`queryableSlugs`), which already leave out one kept off the
+ * dashboard, a collection removed from code included, whose table may be gone.
+ *
+ * ## Language
+ *
+ * The counts are read with no language named, as the entry list reads, so each
+ * number is read in the language the list it links to opens in.
+ *
+ * ## The digest
+ *
+ * Asked with `op: "list"`, the source answers the attention digest instead: one
+ * item per thing waiting, each with its severity and link, read by the digest's
+ * own runner (`domains/widgets/attention/digest`). Its core kinds are releases
+ * that stopped and overdue releases, both critical and both the releases
+ * domain's own counts; plugins' items follow as warnings. Unpublished changes
+ * and entries publishing this week are not in it: they belong to the Content
+ * table and Upcoming releases. The grouped answer above stays as it is, for a
+ * widget that asks the source with `groupBy`.
+ *
+ * @module services/dashboard/attention-source
+ * @experimental The card's kinds and bucket keys may change until plugin
+ *   attention items join them.
+ */
+
+import { authorizationGroups } from "../../auth/entity-read-access";
+import { container } from "../../di/container";
+import type { WorkflowFilter } from "../../domains/collections/query/workflow-filter";
+import {
+  callerMayReadReleases,
+  overdueReleaseCount,
+  stoppedReleaseCount,
+} from "../../domains/releases/releases-widget-source";
+import { singlesWithPendingChanges } from "../../domains/versions/versions-widget-source";
+import {
+  type DigestReader,
+  runDigest,
+} from "../../domains/widgets/attention/digest";
+import type { AttentionDigestItem } from "../../domains/widgets/attention/digest-item";
+import { pluginItemReaders } from "../../domains/widgets/attention/items";
+import {
+  ATTENTION_DUE_WINDOW_MS,
+  attentionPartKey,
+  type AttentionContentKind,
+  type AttentionKind,
+} from "../../domains/widgets/attention-keys";
+import { provideAttentionDigest } from "../../domains/widgets/core-widgets/needs-attention";
+import {
+  boundCaller,
+  boundReadAhead,
+  type ReadAheadSide,
+} from "../../domains/widgets/declaration/read-services";
+import { processHeld } from "../../domains/widgets/process-held";
+import {
+  MAX_WIDGET_LIMIT,
+  type WidgetQuery,
+} from "../../domains/widgets/query";
+import { readAheadState } from "../../domains/widgets/read-ahead-handover";
+import {
+  queryableSlugs,
+  readableCollectionSlugs,
+} from "../../domains/widgets/reader-content";
+import type { ResolverOptions } from "../../domains/widgets/resolved-sources";
+import type {
+  WidgetResult,
+  WidgetResultField,
+} from "../../domains/widgets/result";
+import {
+  failUnavailableSourceOrOp,
+  getSource,
+  refuseUnconsumedQueryFields,
+} from "../../domains/widgets/sources";
+import { ATTENTION_SOURCE_ID } from "../../domains/widgets/system-source-ids";
+import { registerSystemSource } from "../../domains/widgets/system-sources";
+import { errorFromServiceEnvelope } from "../../errors/from-service-envelope";
+import { NextlyError } from "../../errors/nextly-error";
+import { getNextlyLogger } from "../../observability/logger";
+import type { CollectionsHandler } from "../collections-handler";
+
+import { readAheadAccess } from "./read-ahead-access";
+import type { ReadCaller } from "./readable-resources";
+import { systemProblemReaders } from "./system-health-source";
+
+/**
+ * How far one collection's count reads: past it, the card shows "99+".
+ *
+ * A card that asks for action gains nothing from "1,234" over "99+", because
+ * its link opens the whole list; reading 100 ids is what stops a large table
+ * from costing a full count on every dashboard load. "99+" is the common
+ * convention for count badges.
+ */
+export const ATTENTION_COUNT_CAP = 99;
+
+/**
+ * How many collections one kind counts. Past it, the kind's total is a floor.
+ *
+ * Its own number, not shared with any other bound, because it limits a
+ * different thing and the two must be free to move apart. Twenty follows the
+ * translation worklist's per-collection count fan-out.
+ */
+export const ATTENTION_MAX_COLLECTIONS = 20;
+
+/** One collection's or Single's share of a kind. */
+interface AttentionPart {
+  contentKind: AttentionContentKind;
+  slug: string;
+  /** For a Single, the language its pending change was counted in. */
+  locale?: string;
+  count: number;
+  atLeast: boolean;
+}
+
+/** One kind's answer: its parts, or its count alone when it has none. */
+interface AttentionAnswer {
+  kind: AttentionKind;
+  parts: AttentionPart[];
+  /** For a kind with no parts. */
+  count?: number;
+  /** The kind's total is a floor even when every part is whole. */
+  atLeast: boolean;
+}
+
+/**
+ * Reads one kind for one caller, or `null` when the kind is absent for them.
+ *
+ * The seam further kinds join through: each is a function of the caller, run
+ * under the same budget and signal, so a kind added later (plugin attention
+ * items) reaches the card through this source rather than a second card path.
+ */
+type AttentionKindReader = (
+  caller: ReadCaller,
+  context: AttentionContext
+) => Promise<AttentionAnswer | null>;
+
+/** What every kind reader of one query shares. */
+interface AttentionContext {
+  /** One instant for the whole answer, so no two kinds disagree about "now". */
+  now: Date;
+  opts?: ResolverOptions;
+  /** Whether this caller may read releases, asked once. */
+  mayReadReleases: () => Promise<boolean>;
+}
+
+function collections(): CollectionsHandler {
+  if (!container.has("collectionsHandler")) {
+    throw NextlyError.internal({
+      logContext: { reason: "collections-handler-unregistered" },
+    });
+  }
+  return container.get<CollectionsHandler>("collectionsHandler");
+}
+
+/**
+ * The collections a kind counts: the reader's queryable ones, in slug order so
+ * the same twenty are counted on every read, and whether more were left out.
+ */
+async function countedCollections(
+  caller: ReadCaller
+): Promise<{ slugs: string[]; more: boolean }> {
+  const queryable = queryableSlugs(
+    "collection",
+    await readableCollectionSlugs(caller)
+  ).sort();
+  return {
+    slugs: queryable.slice(0, ATTENTION_MAX_COLLECTIONS),
+    more: queryable.length > ATTENTION_MAX_COLLECTIONS,
+  };
+}
+
+/**
+ * Each counted collection's entries under `filter`, up to the cap, as the
+ * caller reads them: through the entry list's own door, a few at a time, and
+ * stopping when the slot's signal says nobody is waiting any more.
+ *
+ * A collection that could not be counted costs only its own part: it is left
+ * out and logged, and the kind's total becomes a floor (`more`), as it does
+ * for collections past the bound, so the card never reads "All clear" over a
+ * list it could not read and every other part is still answered.
+ */
+async function collectionParts(
+  caller: ReadCaller,
+  filter: WorkflowFilter,
+  context: AttentionContext
+): Promise<{ parts: AttentionPart[]; more: boolean; any: boolean }> {
+  const { slugs, more } = await countedCollections(caller);
+  const parts: AttentionPart[] = [];
+  let unread = false;
+  for (const group of authorizationGroups(slugs)) {
+    context.opts?.signal?.throwIfAborted();
+    const settled = await Promise.allSettled(
+      group.map(slug => collectionPart(caller, slug, filter, context))
+    );
+    settled.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        parts.push(result.value);
+        return;
+      }
+      unread = true;
+      getNextlyLogger().warn({
+        kind: "attention-part-failed",
+        source: ATTENTION_SOURCE_ID,
+        collection: group[index],
+        ...(result.reason instanceof Error
+          ? { error: result.reason.message }
+          : {}),
+      });
+    });
+  }
+  return { parts, more: more || unread, any: slugs.length > 0 };
+}
+
+/**
+ * One collection's entries under `filter`, up to the cap, as the caller reads
+ * them. Rejects when the collection could not be counted, for
+ * {@link collectionParts} to leave its part out.
+ */
+async function collectionPart(
+  caller: ReadCaller,
+  slug: string,
+  filter: WorkflowFilter,
+  context: AttentionContext
+): Promise<AttentionPart> {
+  const result = await collections().countEntriesUpTo({
+    collectionName: slug,
+    overrideAccess: false,
+    user: caller.user,
+    ...(caller.authenticatedScope
+      ? { authenticatedScope: caller.authenticatedScope }
+      : {}),
+    // Every lifecycle state, as the entry list asks by default: the entries a
+    // workflow condition keeps may be drafts.
+    status: "all",
+    workflowFilter: filter,
+    releaseNow: context.now,
+    cap: ATTENTION_COUNT_CAP,
+  });
+  if (!result.success || !result.data) {
+    throw errorFromServiceEnvelope(result, {
+      source: ATTENTION_SOURCE_ID,
+      collectionName: slug,
+    });
+  }
+  return {
+    contentKind: "collection",
+    slug,
+    count: result.data.count,
+    atLeast: result.data.atLeast,
+  };
+}
+
+const readUnpublished: AttentionKindReader = async (caller, context) => {
+  const [inCollections, singles] = await Promise.all([
+    collectionParts(caller, { pendingChange: true, inRelease: null }, context),
+    singlesWithPendingChanges(caller, context.opts),
+  ]);
+  // Absent, not empty, for a reader who may read no collection and no Single:
+  // there is nothing this kind could ever show them.
+  if (!inCollections.any && !singles.anyReadable) return null;
+  return {
+    kind: "unpublished",
+    parts: [
+      ...inCollections.parts,
+      ...singles.singles.map(({ slug, locale }) => ({
+        contentKind: "single" as const,
+        slug,
+        ...(locale !== null ? { locale } : {}),
+        count: 1,
+        // The walk's floor belongs to the kind, not to any one Single.
+        atLeast: false,
+      })),
+    ],
+    atLeast: inCollections.more || singles.atLeast,
+  };
+};
+
+const readScheduled: AttentionKindReader = async (caller, context) => {
+  if (!(await context.mayReadReleases())) return null;
+  const { parts, more } = await collectionParts(
+    caller,
+    {
+      pendingChange: false,
+      inRelease: {
+        scheduledBefore: new Date(
+          context.now.getTime() + ATTENTION_DUE_WINDOW_MS
+        ),
+      },
+    },
+    context
+  );
+  return { kind: "scheduled", parts, atLeast: more };
+};
+
+const readOverdue: AttentionKindReader = async (caller, context) => {
+  if (!(await context.mayReadReleases())) return null;
+  return {
+    kind: "overdue",
+    parts: [],
+    count: await overdueReleaseCount(caller),
+    atLeast: false,
+  };
+};
+
+/** The kinds core reads, in the order `ATTENTION_KINDS` lists them. */
+const CORE_KIND_READERS: readonly AttentionKindReader[] = [
+  readUnpublished,
+  readScheduled,
+  readOverdue,
+];
+
+/** What the card shows for a part: its collection's or Single's own label. */
+function partLabel(part: AttentionPart): string {
+  return getSource(`${part.contentKind}:${part.slug}`)?.label ?? part.slug;
+}
+
+/** One bucket of the answer: a kind's total or one part's count. */
+interface AttentionBucket {
+  value: string;
+  count: number;
+  atLeast?: boolean;
+}
+
+/**
+ * One kind's buckets: its total, then a bucket per part with something in it,
+ * each part with the label its link is shown under. None for an empty kind.
+ */
+function answerBuckets(answer: AttentionAnswer): {
+  buckets: AttentionBucket[];
+  choices: { value: string; label: string }[];
+} {
+  const parts = answer.parts.filter(part => part.count > 0);
+  const total =
+    answer.count ?? parts.reduce((sum, part) => sum + part.count, 0);
+  const atLeast = answer.atLeast || parts.some(part => part.atLeast);
+  // Nothing found, and nothing left unread: the kind is absent, as if empty.
+  // Nothing found while some lists went unread is NOT empty: the kind stays,
+  // a zero floor, so the card never says "All clear" over lists it skipped.
+  if (total === 0 && !atLeast) return { buckets: [], choices: [] };
+  const buckets: AttentionBucket[] = [
+    { value: answer.kind, count: total, ...(atLeast ? { atLeast: true } : {}) },
+  ];
+  const choices: { value: string; label: string }[] = [];
+  for (const part of parts) {
+    const value = attentionPartKey(
+      answer.kind,
+      part.contentKind,
+      part.slug,
+      part.locale
+    );
+    buckets.push({
+      value,
+      count: part.count,
+      ...(part.atLeast ? { atLeast: true } : {}),
+    });
+    choices.push({ value, label: partLabel(part) });
+  }
+  return { buckets, choices };
+}
+
+/**
+ * The answers as a grouped result: a bucket per kind with something waiting,
+ * then a bucket per part with something waiting, largest first as every
+ * grouped result is. Empty kinds and parts are left out, so absence and zero
+ * read the same.
+ */
+function asGroupedResult(
+  answers: readonly AttentionAnswer[],
+  limit: number,
+  asOf: Date
+): WidgetResult {
+  const kinds: AttentionBucket[] = [];
+  const parts: AttentionBucket[] = [];
+  const labels = new Map<string, string>();
+  for (const answer of answers) {
+    const [kind, ...own] = answerBuckets(answer).buckets;
+    if (kind !== undefined) kinds.push(kind);
+    parts.push(...own);
+  }
+  for (const answer of answers) {
+    for (const choice of answerBuckets(answer).choices) {
+      labels.set(choice.value, choice.label);
+    }
+  }
+  // The query's bucket limit bounds the answer as it bounds every grouped one.
+  // Kinds first, since each is the total its parts break down, then the parts
+  // with most waiting; what the limit leaves out is said with `truncated`.
+  // Stable, so equal counts keep the order they were built in.
+  const ranked = [...kinds, ...parts.sort((a, b) => b.count - a.count)];
+  const kept = ranked.slice(0, Math.max(0, limit));
+  const buckets = [...kept].sort((a, b) => b.count - a.count);
+  const choices = kept.flatMap(bucket => {
+    const label = labels.get(bucket.value);
+    return label === undefined ? [] : [{ value: bucket.value, label }];
+  });
+  const field: WidgetResultField = {
+    name: "item",
+    label: "Item",
+    type: "string",
+    ...(choices.length > 0 ? { choices } : {}),
+  };
+  // No result-level `atLeast`: it says EVERY bucket is a floor, and here a
+  // floor belongs to the kinds and parts that reached a bound, each saying so
+  // on its own bucket.
+  return {
+    op: "groupBy",
+    buckets,
+    ...(kept.length < ranked.length ? { truncated: true } : {}),
+    // The one instant every kind was read at, so a card links the week the
+    // scheduled count was measured over rather than one from its own clock.
+    asOf: asOf.toISOString(),
+    field,
+  };
+}
+
+/**
+ * What this source does with each field of a widget query: it answers one
+ * fixed question, grouped by item or as the digest, so nothing else a query
+ * may carry applies.
+ */
+const QUERY_FIELD_USE: Record<keyof WidgetQuery, "consumed" | "refused"> = {
+  source: "consumed",
+  op: "consumed",
+  groupBy: "consumed",
+  // Defaulted and bounded by validation; it bounds how many kinds and parts
+  // the grouped answer carries, and how many items the digest does.
+  limit: "consumed",
+  select: "refused",
+  where: "refused",
+  sort: "refused",
+  status: "refused",
+  dateField: "refused",
+  interval: "refused",
+  since: "refused",
+  until: "refused",
+  range: "refused",
+};
+
+/**
+ * Core's release kinds of the digest: what the releases domain counts on its
+ * Needs attention tab, each critical and linked to that tab filtered to it.
+ */
+const RELEASE_KINDS = [
+  {
+    id: "core/stopped-releases",
+    kind: "stopped",
+    label: "Releases that stopped",
+    reason: "A scheduled publish failed.",
+    count: stoppedReleaseCount,
+  },
+  {
+    id: "core/overdue-releases",
+    kind: "overdue",
+    label: "Overdue releases",
+    reason: "Still scheduled after its time.",
+    count: overdueReleaseCount,
+  },
+] as const;
+
+/**
+ * Where the releases of one attention reason are listed, relative to the
+ * admin: the Releases list's Needs attention tab, filtered to that reason.
+ * The digest's release items link here, and the dashboard header's attention
+ * part follows the overdue item's own link.
+ */
+function releasesAttentionLink(
+  reason: (typeof RELEASE_KINDS)[number]["kind"]
+): string {
+  return `releases?tab=attention&reason=${reason}`;
+}
+
+/**
+ * A reader for each release kind. A reader who may not read releases is shown
+ * neither, exactly as on a site with none; and so is one whose access could
+ * not be read, since the digest hides an item whose `visible` check throws
+ * (and logs it) rather than showing release labels to a reader never proven
+ * to read releases.
+ */
+function releaseReaders(caller: ReadCaller): DigestReader[] {
+  let mayRead: Promise<boolean> | undefined;
+  const mayReadReleases = () => (mayRead ??= callerMayReadReleases(caller));
+  return RELEASE_KINDS.map(({ id, kind, label, reason, count }) => ({
+    id,
+    kind,
+    label,
+    reason,
+    severity: "critical" as const,
+    link: releasesAttentionLink(kind),
+    owner: "core",
+    visible: mayReadReleases,
+    read: () => count(caller),
+  }));
+}
+
+/**
+ * Core's workflow kind: the parts waiting for the reader's review, counted by the waiting list's own
+ * read (one page of one), so the card and the list it links to never disagree; its count is a floor
+ * where the list's is. A person's alone: an API key reads no dashboard, so it is shown nothing.
+ */
+function workflowReaders(caller: ReadCaller): DigestReader[] {
+  return [
+    {
+      id: "core/waiting-for-review",
+      kind: "review",
+      label: "Waiting for your review",
+      reason: "You may take the next step.",
+      severity: "warning" as const,
+      link: "content/waiting",
+      owner: "core",
+      visible: () => Promise.resolve(caller.authenticatedScope === undefined),
+      read: async () => {
+        // Loaded when asked: the workflows API reaches the services this module is read by.
+        const { waitingPage } = await import("../../api/workflows");
+        const { meta } = await waitingPage(
+          {
+            user: caller.user,
+            scope: undefined,
+            caller: { kind: "user", userId: caller.user.id },
+          },
+          { page: 1, limit: 1 }
+        );
+        return meta.totalCapped
+          ? { count: meta.total, atLeast: true }
+          : meta.total;
+      },
+    },
+  ];
+}
+
+/**
+ * Every item waiting for `caller`, most urgent first: the one read of the
+ * digest, which the source's list answer, the Needs attention card and the
+ * dashboard header's attention part all make, so they cannot disagree about
+ * what is waiting.
+ *
+ * Internal to core, never on an entry point: a plugin holding it could ask the
+ * digest as anyone.
+ */
+export async function readAttentionDigest(
+  caller: ReadCaller,
+  opts?: { signal?: AbortSignal; now?: Date }
+): Promise<AttentionDigestItem[]> {
+  // One instant for every item, so each plugin item counts against the same "now".
+  const now = opts?.now ?? new Date();
+  const readers = [
+    ...releaseReaders(caller),
+    ...workflowReaders(caller),
+    // System problems, shown to super-admins alone (`systemProblemReaders`).
+    ...systemProblemReaders(caller),
+    ...pluginItemReaders(caller, now),
+  ];
+  return runDigest(readers, opts?.signal);
+}
+
+/** At most this many loads' digests wait at once; the oldest goes first. */
+const READ_AHEAD_LOADS = 500;
+
+/** A digest read ahead, and the dashboard load it waits for. */
+interface WaitingDigest {
+  token: string;
+  items: AttentionDigestItem[];
+}
+
+/**
+ * Digests read ahead by the layout read, by access and load
+ * ({@link waitingKey}), each waiting for the batch of that load: one load,
+ * never a standing cache. How long one waits is its load's (`readAheadState`):
+ * from when its layout read handed the load over, having judged every card,
+ * not from when the digest was read. Held for the process (`processHeld`), as
+ * the card's own digest read is: the layout read and the batch can reach
+ * different copies of this module.
+ *
+ * Per process, never shared between processes: where several instances serve
+ * the admin (several workers, or serverless), a load's batch may reach an
+ * instance its layout read did not. That batch finds no digest waiting and
+ * reads its own, as any batch without a read-ahead does. If the work was done
+ * in between, the card the layout read placed answers empty, and it stays on
+ * the page saying nothing is waiting until the next load, since a later
+ * answer only ever shows a card. The read-ahead saves a read; it is not what
+ * keeps the card's answer right.
+ */
+const readAhead = processHeld(
+  "nextly.dashboard.attentionReadAhead",
+  () => new Map<string, WaitingDigest>(),
+  (held): held is Map<string, WaitingDigest> => held instanceof Map
+);
+
+/**
+ * Where one load's digest waits: under the whole access it was read with
+ * (`readAheadAccess`: the caller, every claim and grant it carries, the
+ * authority the access gate reads for it, and the credential it came on) AND
+ * its load's token. The access keeps a token sent under any other access, a
+ * narrower key, a changed claim or an authority that lapsed since, from
+ * reaching a digest read under this one; the token keeps two loads of one
+ * reader, two tabs or a remount racing a refetch, from taking each other's
+ * digest, read at different moments and so perhaps different.
+ */
+function waitingKey(access: string, token: string): string {
+  return JSON.stringify([access, token]);
+}
+
+/**
+ * The digest waiting under `key`, taken: gone from the map whether or not it
+ * may be taken, and `undefined` when there was none or its load is not open
+ * (`readAheadState`): not yet handed over by its layout read, or handed over
+ * longer ago than its batch is given.
+ */
+function takeWaiting(key: string): AttentionDigestItem[] | undefined {
+  const waiting = readAhead.get(key);
+  readAhead.delete(key);
+  return waiting !== undefined && readAheadState(waiting.token) === "open"
+    ? waiting.items
+    : undefined;
+}
+
+/**
+ * The Needs attention card's digest: read once per dashboard load. The layout
+ * read answers the card ahead (`side: "ahead"`), to learn whether it is empty
+ * before the dashboard is drawn, and leaves its digest under its access and
+ * its load's token; the batch of that load (`side: "batch"`, the same token)
+ * takes it, once, while its load is open (from when the layout read handed it
+ * over, having judged every card, for the window `readAheadState` gives) and
+ * if the batch asks under exactly the same access, read at the batch's own
+ * request. Any other ask, a batch of no load, one under any other access, one
+ * whose digest was taken, expired or never read, a refetch or a later visit,
+ * reads anew, and no ask takes or removes another load's digest. So what a
+ * reader resolved is gone from the next answer they are given, two loads of
+ * one reader each draw from their own read, and a digest is never handed to
+ * access it was not read for. A side whose access cannot be stated neither
+ * keeps nor takes one.
+ */
+async function cardDigest(
+  caller: ReadCaller,
+  load: ReadAheadSide | undefined,
+  opts: { signal: AbortSignal; now: Date }
+): Promise<AttentionDigestItem[]> {
+  const access =
+    load === undefined ? undefined : readAheadAccess(caller, load.credential);
+  if (load?.side === "batch" && access !== undefined) {
+    const taken = takeWaiting(waitingKey(access, load.token));
+    if (taken !== undefined) return taken;
+  }
+  const items = await readAttentionDigest(caller, opts);
+  if (load?.side === "ahead" && access !== undefined) {
+    keepForBatch(waitingKey(access, load.token), load.token, items);
+  }
+  return items;
+}
+
+/**
+ * Leaves `items` under `key` for the batch of the load `token` names. Every
+ * digest whose load has closed goes first, since no batch will take it; one
+ * whose load is still being judged stays, however long ago it was read, as
+ * its window has not begun. Then the oldest beyond {@link READ_AHEAD_LOADS}.
+ */
+function keepForBatch(
+  key: string,
+  token: string,
+  items: AttentionDigestItem[]
+): void {
+  // Deleted first, so a load read ahead again is kept at the back, as the
+  // newest, rather than in its first place.
+  readAhead.delete(key);
+  // Every entry is looked at, not only those at the front: digests are kept in
+  // the order they were read, and loads close in the order they are handed
+  // over, which is not the same order.
+  for (const [held, waiting] of readAhead) {
+    if (readAheadState(waiting.token) === "closed") readAhead.delete(held);
+  }
+  readAhead.set(key, { token, items });
+  for (const oldest of readAhead.keys()) {
+    if (readAhead.size <= READ_AHEAD_LOADS) break;
+    readAhead.delete(oldest);
+  }
+}
+
+/**
+ * The digest as a list result: the items the query's `limit` holds, most
+ * urgent first, and how many there are in all.
+ */
+async function resolveDigest(
+  query: WidgetQuery,
+  caller: ReadCaller,
+  opts?: ResolverOptions
+): Promise<WidgetResult> {
+  const items = await readAttentionDigest(caller, opts);
+  return {
+    op: "list",
+    items: items
+      .slice(0, query.limit ?? MAX_WIDGET_LIMIT)
+      .map(item => ({ ...item })),
+    total: items.length,
+  };
+}
+
+async function resolveAttention(
+  query: WidgetQuery,
+  caller: ReadCaller,
+  opts?: ResolverOptions
+): Promise<WidgetResult> {
+  refuseUnconsumedQueryFields(query, QUERY_FIELD_USE, ATTENTION_SOURCE_ID);
+  if (query.op === "list") return resolveDigest(query, caller, opts);
+  let mayRead: Promise<boolean> | undefined;
+  const context: AttentionContext = {
+    now: new Date(),
+    ...(opts ? { opts } : {}),
+    mayReadReleases: () => (mayRead ??= callerMayReadReleases(caller)),
+  };
+  const answers = (
+    await Promise.all(CORE_KIND_READERS.map(read => read(caller, context)))
+  ).filter((answer): answer is AttentionAnswer => answer !== null);
+  if (answers.length === 0) {
+    // A reader who may read none of what this card counts is told the card is
+    // not available to them, as for any source they may not read. An empty
+    // answer would draw "All clear", which is a claim about content they were
+    // never shown.
+    failUnavailableSourceOrOp(
+      `source "${ATTENTION_SOURCE_ID}" has no kind this caller may read`
+    );
+  }
+  return asGroupedResult(answers, query.limit ?? MAX_WIDGET_LIMIT, context.now);
+}
+
+/**
+ * Publish the source and the function that answers it.
+ *
+ * `supports` names `groupBy`, a count per kind and per part for the card that
+ * reads it today, and `list`, the digest: one item per thing waiting. No other
+ * op has a meaning here.
+ */
+export function registerAttentionWidgetSource(): void {
+  // The Needs your attention card's own read: the digest as the caller its
+  // read services were bound for, so an API key is judged by its own grant.
+  provideAttentionDigest((services, opts) =>
+    cardDigest(boundCaller(services), boundReadAhead(services), opts)
+  );
+  registerSystemSource(
+    {
+      id: ATTENTION_SOURCE_ID,
+      label: "Needs attention",
+      kind: "system",
+      supports: ["groupBy", "list"],
+      fields: [{ name: "item", type: "string", label: "Item" }],
+    },
+    resolveAttention
+  );
+}

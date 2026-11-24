@@ -1,0 +1,1684 @@
+import type { CollectionConfig } from "../../collections/config/define-collection";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { describe, expect, it } from "vitest";
+
+import { listedFiles } from "../../../../../scripts/tsc-cli.mjs";
+
+import { contributionsForReader } from "../admin-contributions-offer";
+import { buildPluginAdminMeta, type PluginAdminMeta } from "../admin-meta";
+import type { PluginDefinition } from "../plugin-context";
+import {
+  buildComponentImportMap,
+  buildImportMapArtifacts,
+  collectAdminComponentPaths,
+  collectBlockEditorComponentPaths,
+  buildComponentPathsModule,
+  componentImportMapEntries,
+  describeComponentUse,
+  componentImportMapPaths,
+  configImportSpecifier,
+} from "./component-import-map";
+
+function plugin(admin: unknown, enabled?: boolean): PluginDefinition {
+  return {
+    name: "@acme/x",
+    version: "1.0.0",
+    nextly: "*",
+    enabled,
+    contributes: { admin },
+  } as unknown as PluginDefinition;
+}
+
+describe("buildComponentImportMap", () => {
+  it("imports each module once and registers every page/settings/view component", () => {
+    const p = plugin({
+      menu: [{ label: "X", to: "/x" }], // no component — must not appear
+      pages: [{ path: "reports", component: "@acme/x/admin#Reports" }],
+      settings: { component: "@acme/x/admin#Settings" },
+      views: {
+        forms: {
+          beforeList: "@acme/x/admin#FormsFilter",
+          edit: "@acme/y/views#FormEdit",
+        },
+      },
+    });
+
+    const code = buildComponentImportMap([p]);
+
+    // One namespace import per unique module.
+    expect(code).toContain('import * as _p0 from "@acme/x/admin";');
+    expect(code).toContain('import * as _p1 from "@acme/y/views";');
+    expect(code).toContain(
+      'import { registerComponentMap } from "@nextlyhq/admin";'
+    );
+    // Registered as the app's whole map, which tells the admin nothing more is
+    // on its way, not as one plugin's components.
+    expect(code).toContain("registerComponentMap(registered);");
+    expect(code).not.toContain("registerComponents(");
+    // Each component registered by its full path → namespace member.
+    expect(code).toContain('"@acme/x/admin#Reports": _p0.Reports,');
+    expect(code).toContain('"@acme/x/admin#Settings": _p0.Settings,');
+    expect(code).toContain('"@acme/x/admin#FormsFilter": _p0.FormsFilter,');
+    expect(code).toContain('"@acme/y/views#FormEdit": _p1.FormEdit,');
+    // Menu route ("/x") is not registered as a component (would be a quoted key).
+    expect(code).not.toContain('"/x"');
+  });
+
+  it("registers each document view's component, so the admin can load it", () => {
+    const p = plugin({
+      views: {
+        pages: {
+          documentViews: [
+            { path: "builder", component: "@acme/x/admin#Builder" },
+            { path: "preview", component: "@acme/x/admin#Preview" },
+          ],
+        },
+      },
+    });
+
+    const code = buildComponentImportMap([p]);
+    // The admin resolves a view by this string; one missing from the map is a
+    // route that draws nothing.
+    expect(code).toContain('"@acme/x/admin#Builder": _p0.Builder,');
+    expect(code).toContain('"@acme/x/admin#Preview": _p0.Preview,');
+  });
+
+  it("registers a field-type document view's component too", () => {
+    const p = plugin({
+      documentViews: [
+        {
+          path: "builder",
+          fieldType: "blocks",
+          component: "@acme/x/admin#Builder",
+        },
+      ],
+    });
+    expect(buildComponentImportMap([p])).toContain(
+      '"@acme/x/admin#Builder": _p0.Builder,'
+    );
+  });
+
+  it("registers each document view's create dialog, so the list can open it", () => {
+    const p = plugin({
+      views: {
+        pages: {
+          documentViews: [
+            {
+              path: "builder",
+              component: "@acme/x/admin#Builder",
+              createDialog: "@acme/x/admin#NewPage",
+            },
+          ],
+        },
+      },
+      documentViews: [
+        {
+          path: "canvas",
+          fieldType: "blocks",
+          component: "@acme/x/admin#Canvas",
+          createDialog: "@acme/x/admin#NewCanvasPage",
+        },
+      ],
+    });
+    const code = buildComponentImportMap([p]);
+    // The list resolves the dialog by this string; one missing from the map
+    // would leave "+ New" opening nothing.
+    expect(code).toContain('"@acme/x/admin#NewPage": _p0.NewPage,');
+    expect(code).toContain('"@acme/x/admin#NewCanvasPage": _p0.NewCanvasPage,');
+  });
+
+  it("dedupes repeated paths and maps a default export (no #) to .default", () => {
+    const p = plugin({
+      pages: [
+        { path: "a", component: "@acme/x/admin#Dup" },
+        { path: "b", component: "@acme/x/admin#Dup" },
+      ],
+      settings: { component: "@acme/x/admin/Default" },
+    });
+
+    const code = buildComponentImportMap([p]);
+    expect(code.split('"@acme/x/admin#Dup":').length - 1).toBe(1); // deduped
+    // "@acme/x/admin/Default" (no #) is its own module → default export, distinct alias.
+    expect(code).toMatch(/"@acme\/x\/admin\/Default": _p\d+\.default,/);
+  });
+
+  it("skips disabled plugins, and registers an empty map as the whole map", () => {
+    expect(
+      collectAdminComponentPaths(
+        plugin({ pages: [{ path: "a", component: "@x#Y" }] }, false)
+      )
+    ).toEqual([]);
+
+    const code = buildComponentImportMap([]);
+    expect(code).toContain("const registered = {\n};");
+    // Still called: an empty map tells the admin nothing more is on its way,
+    // as a full one does.
+    expect(code).toContain("registerComponentMap(registered);");
+  });
+
+  // An app without the admin has nothing to register into, and a static import of a package it
+  // never installed stops its type check (TS2307). The map still lists and checks every path, so
+  // the same file, regenerated once the admin is installed, registers them.
+  it("leaves the admin out of a map for an app that has not installed it", () => {
+    for (const plugins of [
+      [],
+      [plugin({ pages: [{ path: "a", component: "@acme/x/admin#A" }] })],
+    ]) {
+      const code = buildComponentImportMap(
+        plugins,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        false
+      );
+      expect(code).not.toContain('"@nextlyhq/admin"');
+      expect(code).not.toContain("registerComponentMap");
+      // And says why, and what registers it, where a developer reads the file.
+      expect(code).toContain("run `nextly generate:types` again");
+      expect(code).toContain("export const componentMapAgreesWithList");
+      expect(code).toContain("export const registeredComponentPaths = listed;");
+    }
+    const listed = buildComponentImportMap(
+      [plugin({ pages: [{ path: "a", component: "@acme/x/admin#A" }] })],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      false
+    );
+    expect(listed).toContain('"@acme/x/admin#A": _p0.A,');
+    // Installed, the same map imports and registers, empty or not.
+    for (const plugins of [
+      [],
+      [plugin({ pages: [{ path: "a", component: "@acme/x/admin#A" }] })],
+    ]) {
+      const code = buildComponentImportMap(
+        plugins,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        true
+      );
+      expect(code).toContain(
+        'import { registerComponentMap } from "@nextlyhq/admin";'
+      );
+      expect(code).toContain("registerComponentMap(registered);");
+    }
+  });
+});
+
+describe("the map's check against the site's config", () => {
+  const shop = plugin({
+    pages: [{ path: "reports", component: "@acme/x/admin#Reports" }],
+  });
+
+  it("imports the config's type, and checks the registered components against it", () => {
+    const code = buildComponentImportMap([shop], "../../nextly.config");
+    expect(code).toContain(
+      'import type { DeclaredComponentMap } from "nextly";'
+    );
+    expect(code).toContain(
+      'import type * as siteConfig from "../../nextly.config";'
+    );
+    expect(code).toContain(
+      "} satisfies DeclaredComponentMap<typeof siteConfig>;"
+    );
+    // Type-only, so the config's server code never reaches the browser bundle.
+    expect(code).not.toMatch(/^import (?!type)[^\n]*nextly\.config/m);
+  });
+
+  it("names a widget entry's widget and owner on its own line, where a props error is reported", () => {
+    const withWidget = {
+      name: "@acme/shop",
+      version: "1.0.0",
+      nextly: "*",
+      contributes: {
+        admin: {
+          pages: [{ path: "reports", component: "@acme/shop/admin#Reports" }],
+        },
+        dashboard: {
+          widgets: [
+            {
+              id: "acme/revenue",
+              view: { component: "@acme/shop/admin#Revenue" },
+            },
+          ],
+        },
+      },
+    } as unknown as PluginDefinition;
+    const code = buildComponentImportMap([withWidget], "../../nextly.config");
+    expect(code).toContain(
+      '"@acme/shop/admin#Revenue": _p0.Revenue, // widget "acme/revenue" of plugin "@acme/shop"\n'
+    );
+    // A page's entry names nothing beside it.
+    expect(code).toContain('"@acme/shop/admin#Reports": _p0.Reports,\n');
+  });
+
+  it("keeps a widget note on its line whatever the plugin is called", () => {
+    const named = {
+      name: "@acme/shop\nconst injected = 1;",
+      version: "1.0.0",
+      nextly: "*",
+      contributes: {
+        dashboard: {
+          widgets: [
+            {
+              id: "acme/revenue",
+              view: { component: "@acme/shop/admin#Revenue" },
+            },
+          ],
+        },
+      },
+    } as unknown as PluginDefinition;
+    const code = buildComponentImportMap([named], "../../nextly.config");
+    expect(code).not.toMatch(/^const injected = 1;/m);
+    expect(code).toContain('of plugin "@acme/shop const injected = 1;"');
+  });
+
+  it("writes the map unchecked, as before, where there is no config file", () => {
+    const code = buildComponentImportMap([shop]);
+    expect(code).not.toContain("siteConfig");
+    expect(code).not.toContain("satisfies");
+    expect(code).toContain('"@acme/x/admin#Reports": _p0.Reports,\n};');
+  });
+
+  it("passes the config's import through to the map and not to its path list", () => {
+    const [map, list] = buildImportMapArtifacts(
+      [shop],
+      "src/types/generated/nextly-types.ts",
+      "../../../nextly.config"
+    );
+    expect(map?.code).toContain('from "../../../nextly.config";');
+    expect(list?.code).not.toContain("nextly.config");
+  });
+
+  it.each([
+    [
+      "/app/src/types/generated",
+      "/app/nextly.config.ts",
+      "../../../nextly.config",
+    ],
+    // An ESM config keeps its module extension, written as the output's (`.mjs` for an `.mts`
+    // source, which TypeScript maps back): an extensionless specifier resolves to neither under
+    // the site's Bundler resolution.
+    [
+      "/app/src/types/generated",
+      "/app/src/nextly.config.mts",
+      "../../nextly.config.mjs",
+    ],
+    ["/app", "/app/nextly.config.mjs", "./nextly.config.mjs"],
+    ["/app/types", "/app/config/nextly.config.js", "../config/nextly.config"],
+  ])("imports the config from %s as it sits at %s", (dir, file, expected) => {
+    expect(configImportSpecifier(dir, file)).toBe(expected);
+  });
+});
+
+// What the string is for: the site's compiler resolving it to the config. Checked with the
+// TypeScript command line under the Bundler resolution a Next.js site uses, against real files,
+// since a specifier only reads right if it also resolves: the config is in the program a file
+// importing it loads only if the specifier reached it.
+describe("the config specifier, as the site's compiler resolves it", () => {
+  it.each(["nextly.config.mts", "nextly.config.mjs", "nextly.config.ts"])(
+    "resolves %s from the generated map's directory",
+    file => {
+      const root = mkdtempSync(join(tmpdir(), "config-specifier-"));
+      try {
+        const mapDir = join(root, "src", "types", "generated");
+        mkdirSync(mapDir, { recursive: true });
+        writeFileSync(join(root, file), "export default {};\n");
+        const specifier = configImportSpecifier(mapDir, join(root, file));
+        writeFileSync(
+          join(mapDir, "nextly-component-map.ts"),
+          `import config from ${JSON.stringify(specifier)};\nexport const read = config;\n`
+        );
+        const config = join(root, "tsconfig.json");
+        writeFileSync(
+          config,
+          JSON.stringify({
+            compilerOptions: {
+              module: "esnext",
+              moduleResolution: "bundler",
+              allowJs: true,
+              noEmit: true,
+              types: [],
+            },
+            files: ["src/types/generated/nextly-component-map.ts"],
+          })
+        );
+        // The listed paths have forward slashes on every platform, while `join` uses the
+        // platform separator, so both sides compare in the forward-slash form.
+        expect(listedFiles(config)).toContain(
+          join(root, file).replaceAll("\\", "/")
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  );
+});
+
+describe("buildImportMapArtifacts", () => {
+  it("returns the map and its path list, placed alongside the generated types file", () => {
+    const p = plugin({ settings: { component: "@acme/x/admin#Settings" } });
+    const [map, list] = buildImportMapArtifacts(
+      [p],
+      "./src/types/nextly-types.ts"
+    );
+
+    expect(map.path.replace(/\\/g, "/")).toMatch(
+      /src\/types\/plugin-admin-imports\.generated\.ts$/
+    );
+    expect(map.code).toContain("registerComponentMap");
+    expect(list.path.replace(/\\/g, "/")).toMatch(
+      /src\/types\/plugin-admin-components\.generated\.ts$/
+    );
+    // The list has no import statement, so server code can read it without
+    // loading a component. (Its comment may say "import"; a statement may not.)
+    expect(list.code).not.toMatch(/^\s*import\b/m);
+    expect(list.code).toContain('["@acme/x/admin#Settings"]');
+  });
+
+  it("returns both, empty, when no plugin contributes admin components", () => {
+    // The admin page and layout import them, so an empty app still has both.
+    const p = plugin({ menu: [{ label: "X", to: "/x" }] }); // menu has no component
+    for (const plugins of [[p], []]) {
+      const [map, list] = buildImportMapArtifacts(plugins, "./types.ts");
+      expect(map.code).toContain("const registered = {\n};");
+      expect(map.code).toContain("registerComponentMap(registered);");
+      expect(list.code).toContain(
+        "export const registeredComponentPaths = [] as const;"
+      );
+    }
+  });
+});
+
+/** The page builder itself, without which no block can register. */
+function pageBuilder(enabled?: boolean): PluginDefinition {
+  return {
+    name: "@nextlyhq/plugin-page-builder",
+    version: "1.0.0",
+    nextly: "*",
+    enabled,
+  } as unknown as PluginDefinition;
+}
+
+/** A plugin declaring blocks for the page builder. */
+function declaringBlocks(
+  blocks: unknown[],
+  enabled?: boolean
+): PluginDefinition {
+  return {
+    name: "@acme/blocks",
+    version: "1.0.0",
+    nextly: "*",
+    enabled,
+    contributes: {
+      declarations: { "@nextlyhq/plugin-page-builder": { blocks } },
+    },
+  } as unknown as PluginDefinition;
+}
+
+describe("block editor components", () => {
+  it("collects the editor component a declared block names", () => {
+    const paths = collectBlockEditorComponentPaths([
+      pageBuilder(),
+      declaringBlocks([
+        { name: "acme/hero", editor: { component: "@acme/blocks/admin#Hero" } },
+      ]),
+    ]);
+
+    expect(paths).toEqual(["@acme/blocks/admin#Hero"]);
+  });
+
+  it("registers them in the import map alongside admin components", () => {
+    // The point of the seam: the editor bundle loads a contributed block's
+    // inspector with no hand-written import, exactly as admin pages already do.
+    const code = buildComponentImportMap([
+      pageBuilder(),
+      declaringBlocks([
+        { name: "acme/hero", editor: { component: "@acme/blocks/admin#Hero" } },
+      ]),
+    ]);
+
+    expect(code).toContain('"@acme/blocks/admin#Hero"');
+    expect(code).toContain('import * as _p0 from "@acme/blocks/admin";');
+  });
+
+  it("emits a map for block components even with no admin contributions", () => {
+    // Blocks alone fill the map; a map without them would leave a contributed
+    // inspector unloadable.
+    const [artifact] = buildImportMapArtifacts(
+      [
+        pageBuilder(),
+        declaringBlocks([
+          {
+            name: "acme/hero",
+            editor: { component: "@acme/blocks/admin#Hero" },
+          },
+        ]),
+      ],
+      "/app/src/nextly-types.ts"
+    );
+
+    expect(artifact.code).toContain('"@acme/blocks/admin#Hero"');
+  });
+
+  it("skips a disabled plugin's blocks", () => {
+    expect(
+      collectBlockEditorComponentPaths([
+        declaringBlocks(
+          [
+            {
+              name: "acme/hero",
+              editor: { component: "@acme/blocks/admin#Hero" },
+            },
+          ],
+          false
+        ),
+      ])
+    ).toEqual([]);
+  });
+
+  it("ignores a block that names no editor component", () => {
+    // Most blocks render from their prop schema and need no custom component.
+    expect(
+      collectBlockEditorComponentPaths([
+        pageBuilder(),
+        declaringBlocks([{ name: "acme/plain", version: 1 }]),
+      ])
+    ).toEqual([]);
+  });
+
+  it("skips a malformed declaration rather than failing generation", () => {
+    // The manifest emitter already refuses these loudly; an import map is not
+    // where a schema error should surface, and reporting it twice helps nobody.
+    expect(
+      collectBlockEditorComponentPaths([
+        declaringBlocks("nope" as unknown as unknown[]),
+      ])
+    ).toEqual([]);
+  });
+});
+
+describe("block editor entries", () => {
+  /** A plugin declaring blocks and naming the module that exports them. */
+  function declaringEntry(
+    editorEntry: unknown,
+    enabled?: boolean
+  ): PluginDefinition {
+    return {
+      name: "@acme/blocks",
+      version: "1.0.0",
+      nextly: "*",
+      enabled,
+      contributes: {
+        declarations: {
+          "@nextlyhq/plugin-page-builder": {
+            blocks: [{ name: "acme/hero", version: 1 }],
+            editorEntry,
+          },
+        },
+      },
+    } as unknown as PluginDefinition;
+  }
+
+  const ENTRY = "@acme/blocks/editor#editorBlocks";
+
+  it("lists the entry while the page builder is active, and hands it to the page builder", () => {
+    const plugins = [pageBuilder(), declaringEntry(ENTRY)];
+
+    expect(componentImportMapPaths(plugins)).toContain(ENTRY);
+    const code = buildComponentImportMap(plugins);
+    expect(code).toContain(
+      'import { registerBlockEditorModules } from "@nextlyhq/plugin-page-builder/admin";'
+    );
+    expect(code).toContain(`"${ENTRY}": _p0.editorBlocks`);
+    // Definitions are not a component: the component registry never sees it.
+    const registered = code.slice(
+      code.indexOf("const registered = {"),
+      code.indexOf("};", code.indexOf("const registered = {"))
+    );
+    expect(registered).toContain("const registered = {");
+    expect(registered).not.toContain(ENTRY);
+  });
+
+  it("lists no entry while the page builder is absent or disabled", () => {
+    for (const plugins of [
+      [declaringEntry(ENTRY)],
+      [pageBuilder(false), declaringEntry(ENTRY)],
+    ]) {
+      expect(componentImportMapPaths(plugins)).not.toContain(ENTRY);
+      expect(buildComponentImportMap(plugins)).not.toContain(
+        "registerBlockEditorModules"
+      );
+    }
+  });
+
+  it("skips a malformed entry rather than failing generation", () => {
+    // The page builder refuses it at boot, naming the plugin.
+    for (const malformed of [42, "", "   "]) {
+      expect(
+        componentImportMapPaths([pageBuilder(), declaringEntry(malformed)])
+      ).toEqual([]);
+    }
+  });
+
+  it("leaves a map with no block modules exactly as before", () => {
+    // Every committed map of a site with no contributed blocks is unchanged.
+    expect(buildComponentImportMap([pageBuilder()])).not.toContain(
+      "blockEditorEntries"
+    );
+  });
+});
+
+describe("field-type and slot components", () => {
+  it("collects a field type's editor component from a plugin with no admin contributions", () => {
+    // The page builder is exactly this shape: one field type and no pages,
+    // settings or views, so before field types were collected the generated
+    // map imported nothing of it and its control could only arrive through
+    // the registry's runtime import fallback — which cannot resolve a bare
+    // package specifier in a bundled browser.
+    const p = {
+      name: "@nextlyhq/plugin-page-builder",
+      version: "1.0.0",
+      nextly: "*",
+      contributes: {
+        fieldTypes: [
+          {
+            type: "blocks",
+            storage: "json",
+            component: "@nextlyhq/plugin-page-builder/admin#BlocksField",
+          },
+        ],
+      },
+    } as unknown as PluginDefinition;
+
+    expect(collectAdminComponentPaths(p)).toEqual([
+      "@nextlyhq/plugin-page-builder/admin#BlocksField",
+    ]);
+
+    const code = buildComponentImportMap([p]);
+    expect(code).toContain(
+      'import * as _p0 from "@nextlyhq/plugin-page-builder/admin";'
+    );
+    expect(code).toContain(
+      '"@nextlyhq/plugin-page-builder/admin#BlocksField": _p0.BlocksField,'
+    );
+
+    // Field types alone are enough to need the file; returning null would
+    // leave the control unloadable by an app that registers only the plugin.
+    expect(
+      buildImportMapArtifacts([p], "./src/types/nextly-types.ts")[0].code
+    ).toContain("registerComponentMap");
+  });
+
+  it("loads the page builder's admin entry, and with it the editor's stylesheet, only where the plugin is configured", () => {
+    // The entry imports the editor's stylesheet itself, so this import is what
+    // styles the builder: an app adds nothing by hand. The map writes no
+    // stylesheet import of its own, so an app that still imports the sheet by
+    // hand loads the same file once, rather than a second copy.
+    const pageBuilder = {
+      name: "@nextlyhq/plugin-page-builder",
+      version: "1.0.0",
+      nextly: "*",
+      contributes: {
+        fieldTypes: [
+          {
+            type: "blocks",
+            storage: "json",
+            component: "@nextlyhq/plugin-page-builder/admin#BlocksField",
+          },
+        ],
+      },
+    } as unknown as PluginDefinition;
+    const other = plugin({
+      pages: [{ path: "/r", component: "@acme/x/admin#R" }],
+    });
+
+    const configured = buildComponentImportMap([other, pageBuilder]);
+    expect(configured).toContain('from "@nextlyhq/plugin-page-builder/admin";');
+    expect(configured).not.toMatch(/import\s+"[^"]*\.css";/);
+
+    const without = buildComponentImportMap([other]);
+    // The control: the other plugin's module IS imported, so the absence
+    // below is the page builder's and not an empty map's.
+    expect(without).toContain('from "@acme/x/admin";');
+    expect(without).not.toContain("@nextlyhq/plugin-page-builder");
+    expect(without).not.toMatch(/import\s+"[^"]*\.css";/);
+  });
+
+  it("collects the header slot under both spellings, the schema-builder slot and the form toolbar slot", () => {
+    const p = plugin({
+      header: { slot: "@acme/x/admin#HeaderSlot" },
+      schemaBuilderSlot: "@acme/x/admin#SchemaSlot",
+      entryFormToolbarSlot: "@acme/x/admin#ToolbarSlot",
+    });
+
+    expect(collectAdminComponentPaths(p)).toEqual([
+      "@acme/x/admin#HeaderSlot",
+      "@acme/x/admin#SchemaSlot",
+      "@acme/x/admin#ToolbarSlot",
+    ]);
+  });
+
+  it("honors the deprecated top-level headerSlot spelling", () => {
+    // Still folded into `header.slot` by admin-meta, so the map must read it
+    // the same way rather than dropping a back-compat plugin's component.
+    const p = plugin({ headerSlot: "@acme/x/admin#LegacySlot" });
+    expect(collectAdminComponentPaths(p)).toEqual(["@acme/x/admin#LegacySlot"]);
+  });
+
+  it("collects the header slot by the place the plugin chose, as admin-meta reads it", () => {
+    const LEGACY = "@acme/x/admin#LegacySlot";
+    const CURRENT = "@acme/x/admin#Slot";
+    const item = { label: "Help", icon: "BookOpen", to: "/x" };
+    // The bar and the rail's foot mount the slot, in either spelling.
+    for (const place of [undefined, "bar", "rail-foot"]) {
+      expect(
+        collectAdminComponentPaths(plugin({ header: { slot: CURRENT, place } }))
+      ).toEqual([CURRENT]);
+      expect(
+        collectAdminComponentPaths(
+          plugin({ headerSlot: LEGACY, header: { place } })
+        )
+      ).toEqual([LEGACY]);
+    }
+    // The menu mounts none, so a deprecated slot it still carries is not
+    // imported: admin-meta never publishes it.
+    const menu = plugin({
+      headerSlot: LEGACY,
+      header: { place: "menu", item },
+    });
+    expect(collectAdminComponentPaths(menu)).toEqual([]);
+    expect(
+      buildPluginAdminMeta([menu], undefined)[0].headerSlot
+    ).toBeUndefined();
+  });
+
+  it("imports nothing for a menu item whose action is malformed", () => {
+    for (const action of [null, {}, { run: "x" }, { open: 5 }]) {
+      const p = plugin({
+        header: { place: "menu", item: { label: "X", icon: "I", action } },
+      });
+      expect(collectAdminComponentPaths(p)).toEqual([]);
+    }
+  });
+
+  it("keeps a disabled plugin's field-type editors but drops its slots", () => {
+    // admin-meta serializes fieldTypes regardless of enabled state — a
+    // disabled plugin keeps its collections and their fields, so their
+    // editors still mount and still need their modules imported. Behavioral
+    // UI (pages, settings, slots) is withheld for a disabled plugin.
+    const p = {
+      name: "@acme/x",
+      version: "1.0.0",
+      nextly: "*",
+      enabled: false,
+      contributes: {
+        fieldTypes: [
+          { type: "rating", storage: "json", component: "@x/admin#Rating" },
+        ],
+        admin: { schemaBuilderSlot: "@x/admin#SchemaSlot" },
+      },
+    } as unknown as PluginDefinition;
+
+    expect(collectAdminComponentPaths(p)).toEqual(["@x/admin#Rating"]);
+  });
+});
+
+describe("declared contributions to admin places", () => {
+  it("imports a plugin whose only admin UI is a side panel section", () => {
+    // The section's component is resolved by its string when the edit page
+    // draws the panel; with no page, settings or view beside it, the map is
+    // the only importer of its module, so leaving it out leaves the section
+    // empty in a consuming app.
+    const p = plugin({
+      contributions: [
+        {
+          id: "acme-x.design",
+          kind: "sidebarSection",
+          place: "collection.edit",
+          label: "Design",
+          component: "@acme/x/admin#DesignSection",
+        },
+      ],
+    });
+
+    expect(collectAdminComponentPaths(p)).toEqual([
+      "@acme/x/admin#DesignSection",
+    ]);
+    expect(componentImportMapEntries([p])).toEqual([
+      {
+        path: "@acme/x/admin#DesignSection",
+        owner: 'plugin "@acme/x"',
+        use: "contribution",
+      },
+    ]);
+    const code = buildComponentImportMap([p]);
+    expect(code).toContain('import * as _p0 from "@acme/x/admin";');
+    expect(code).toContain('"@acme/x/admin#DesignSection": _p0.DesignSection,');
+  });
+
+  it("collects every kind that names a component, and nothing from those that do not", () => {
+    const p = plugin({
+      contributions: [
+        {
+          id: "acme-x.block",
+          kind: "block",
+          place: "dashboard",
+          component: "@acme/x/admin#Block",
+        },
+        {
+          id: "acme-x.tab",
+          kind: "tab",
+          place: "collection.edit",
+          label: "Tab",
+          component: "@acme/x/admin#Tab",
+        },
+        {
+          id: "acme-x.cell",
+          kind: "column",
+          place: "collection.list",
+          label: "Cell",
+          component: "@acme/x/admin#Cell",
+        },
+        // A column showing a field draws nothing of the plugin's.
+        {
+          id: "acme-x.field",
+          kind: "column",
+          place: "collection.list",
+          label: "Field",
+          field: "title",
+        },
+        {
+          id: "acme-x.open",
+          kind: "rowAction",
+          place: "collection.list",
+          label: "Open",
+          action: { open: "@acme/x/admin#RowDialog" },
+        },
+        {
+          id: "acme-x.bulk",
+          kind: "bulkAction",
+          place: "collection.list",
+          label: "Bulk",
+          action: { open: "@acme/x/admin#BulkDialog" },
+        },
+        // An action that calls a route opens no component.
+        {
+          id: "acme-x.run",
+          kind: "rowAction",
+          place: "collection.list",
+          label: "Run",
+          action: { run: { method: "POST", path: "/run" } },
+        },
+      ],
+    });
+
+    expect(collectAdminComponentPaths(p)).toEqual([
+      "@acme/x/admin#Block",
+      "@acme/x/admin#Tab",
+      "@acme/x/admin#Cell",
+      "@acme/x/admin#RowDialog",
+      "@acme/x/admin#BulkDialog",
+    ]);
+  });
+
+  it("registers a component two contributions share once, and none of a disabled plugin's", () => {
+    const shared = {
+      kind: "sidebarSection",
+      place: "collection.edit",
+      label: "Design",
+      component: "@acme/x/admin#DesignSection",
+    };
+    const contributions = [
+      { ...shared, id: "acme-x.one", collections: ["pages"] },
+      { ...shared, id: "acme-x.two", collections: ["posts"] },
+      // Malformed entries are refused at startup, by name; generation skips
+      // them rather than failing on them.
+      null,
+      { id: "acme-x.empty", kind: "block", place: "dashboard", component: "" },
+    ];
+
+    expect(componentImportMapPaths([plugin({ contributions })])).toEqual([
+      "@acme/x/admin#DesignSection",
+    ]);
+    expect(
+      collectAdminComponentPaths(plugin({ contributions }, false))
+    ).toEqual([]);
+  });
+});
+
+/**
+ * Meta keys that carry no `ComponentPath`, whatever else they carry.
+ *
+ * Listed rather than inferred so that a key added to `PluginAdminMeta` lands
+ * in neither this set nor the readers below and is reported as
+ * `unclassified` — which is where this guard's teeth are. Someone then has
+ * to answer whether the new key names a component, instead of the map
+ * quietly not importing it.
+ */
+const KEYS_WITHOUT_COMPONENTS = new Set([
+  "name",
+  "version",
+  "description",
+  "author",
+  "homepage",
+  "repository",
+  "docsUrl",
+  "license",
+  "category",
+  "tags",
+  "enabled",
+  "dependsOn",
+  "placement",
+  "order",
+  "after",
+  "appearance",
+  "collections",
+  "singles",
+  "fieldGroups",
+  "clientConfig",
+  "routes",
+  "whenEnabled",
+  // Menu items carry a route (`to`), never a component.
+  "menu",
+]);
+
+interface ExposedPaths {
+  /** Paths the admin resolves through the registry — each needs an import. */
+  registered: string[];
+  /** Emitted keys this helper classifies neither way. Must stay empty. */
+  unclassified: string[];
+}
+
+/**
+ * Every component path a serialized admin-meta entry carries, read BY KEY.
+ *
+ * Scanning the serialized JSON for `"…#…"` instead would be both too eager
+ * and too slack: `clientConfig` is arbitrary plugin data, so a branding hex
+ * like `#0ea5e9` reads as a component path, and a path naming a default
+ * export carries no `#` at all and is missed entirely. Reading the keys the
+ * serializer writes makes the set exact, and makes the widget exclusion
+ * something these tests STATE rather than something they happen not to
+ * notice.
+ *
+ * Written from the meta's shape rather than by calling the collector, so
+ * the two remain independent statements of the same set — a collector bug
+ * copied into the guard would assert nothing.
+ *
+ * Bounded by what the FIXTURE exercises: a key no fixture declares is never
+ * serialized and cannot be seen from here, so the fixtures below carry one
+ * of everything on purpose.
+ */
+function exposedComponentPaths(meta: PluginAdminMeta): ExposedPaths {
+  const registered = [
+    ...(meta.pages ?? []).map(page => page.component),
+    meta.settings?.component,
+    // Mirrored spellings, both serialized; the map must read whichever the
+    // browser is handed.
+    meta.headerSlot,
+    meta.header?.slot,
+    // The component a person's-menu item opens.
+    meta.header?.item?.action && "open" in meta.header.item.action
+      ? meta.header.item.action.open
+      : undefined,
+    meta.schemaBuilderSlot,
+    meta.entryFormToolbarSlot,
+    ...(meta.fieldTypes ?? []).map(fieldType => fieldType.component),
+    ...(meta.documentActions ?? []).map(each =>
+      typeof each.override === "object" ? each.override.component : undefined
+    ),
+    ...(meta.panelSections ?? []).map(section => section.component),
+  ].filter((path): path is string => Boolean(path));
+
+  const readsComponents = new Set([
+    "documentActions",
+    "panelSections",
+    "pages",
+    "settings",
+    "headerSlot",
+    "header",
+    "schemaBuilderSlot",
+    "entryFormToolbarSlot",
+    "fieldTypes",
+  ]);
+
+  return {
+    registered,
+    unclassified: Object.keys(meta).filter(
+      key => !readsComponents.has(key) && !KEYS_WITHOUT_COMPONENTS.has(key)
+    ),
+  };
+}
+
+describe("parity with the admin-meta surface", () => {
+  it("collects every component path admin-meta exposes for a plugin", () => {
+    // One of every kind, so the key sweep above sees the whole surface: the
+    // widget it must NOT import, and a `clientConfig` hex that a `#` scan
+    // would have demanded an import for.
+    const p = {
+      name: "@acme/x",
+      version: "1.0.0",
+      nextly: "*",
+      contributes: {
+        fieldTypes: [
+          {
+            type: "rating",
+            storage: "json",
+            component: "@acme/x/admin#Rating",
+          },
+        ],
+        admin: {
+          menu: [{ label: "X", to: "/x" }],
+          pages: [{ path: "reports", component: "@acme/x/admin#Reports" }],
+          settings: { component: "@acme/x/admin#Settings" },
+          header: { slot: "@acme/x/admin#HeaderSlot" },
+          schemaBuilderSlot: "@acme/x/admin#SchemaSlot",
+          entryFormToolbarSlot: "@acme/x/admin#ToolbarSlot",
+          views: {
+            posts: {
+              documentActions: {
+                delete: { component: "@acme/x/admin#RemoveDialog" },
+                unpublish: "hidden",
+              },
+              panelSections: [
+                { title: "Usage", component: "@acme/x/admin#UsageSection" },
+              ],
+            },
+          },
+          // A key startup refuses, carried as plain JavaScript can: it must
+          // contribute no path at all.
+          widgets: [{ id: "stats", component: "@acme/x/admin#StatsWidget" }],
+          clientConfig: { accent: "#0ea5e9" },
+        },
+      },
+    } as unknown as PluginDefinition;
+
+    const meta = buildPluginAdminMeta([p], undefined)[0];
+    const exposed = exposedComponentPaths(meta);
+
+    // The guard itself: every key the meta emits is accounted for. A new one
+    // fails here, before the assertions that depend on knowing what it is.
+    expect(exposed.unclassified).toEqual([]);
+
+    // Positive control — without it the loop below is satisfied by an empty
+    // probe.
+    expect(exposed.registered).toEqual(
+      expect.arrayContaining([
+        "@acme/x/admin#Rating",
+        "@acme/x/admin#Reports",
+        "@acme/x/admin#Settings",
+        "@acme/x/admin#HeaderSlot",
+        "@acme/x/admin#SchemaSlot",
+        "@acme/x/admin#ToolbarSlot",
+        "@acme/x/admin#RemoveDialog",
+        "@acme/x/admin#UsageSection",
+      ])
+    );
+
+    const collected = new Set([
+      ...collectAdminComponentPaths(p),
+      ...collectBlockEditorComponentPaths([p]),
+    ]);
+    for (const path of exposed.registered) {
+      expect(collected.has(path)).toBe(true);
+    }
+
+    // Nothing the plugin carries under `admin.widgets` is imported: startup
+    // refuses the key, and admin-meta publishes nothing under it.
+    expect(meta).not.toHaveProperty("widgets");
+    expect(collected.has("@acme/x/admin#StatsWidget")).toBe(false);
+
+    // `clientConfig` is plugin data. A colour is not a component path, and
+    // reading it as one would demand an import for a module named `#0ea5e9`.
+    expect(meta.clientConfig).toEqual({ accent: "#0ea5e9" });
+    expect(collected.has("#0ea5e9")).toBe(false);
+  });
+
+  it("collects a rail-foot slot and the component a menu item opens", () => {
+    const at = (header: unknown) =>
+      ({
+        name: "@acme/x",
+        version: "1.0.0",
+        nextly: "*",
+        contributes: { admin: { header } },
+      }) as unknown as PluginDefinition;
+    for (const p of [
+      at({ slot: "@acme/x/admin#RailHelper", place: "rail-foot" }),
+      at({
+        place: "menu",
+        item: {
+          label: "Report",
+          icon: "BookOpen",
+          action: { open: "@acme/x/admin#ReportDialog" },
+        },
+      }),
+    ]) {
+      const meta = buildPluginAdminMeta([p], undefined)[0];
+      const exposed = exposedComponentPaths(meta);
+      expect(exposed.unclassified).toEqual([]);
+      expect(exposed.registered).toHaveLength(1);
+      expect(collectAdminComponentPaths(p)).toEqual(exposed.registered);
+    }
+  });
+
+  it("covers a disabled plugin too, whose meta keeps its field types", () => {
+    // admin-meta withholds a disabled plugin's behavioral UI but still
+    // serializes its field types (retained collections keep rendering their
+    // fields), so the collector must import those editors or the fields of a
+    // disabled plugin render empty.
+    const p = {
+      name: "@acme/off",
+      version: "1.0.0",
+      nextly: "*",
+      enabled: false,
+      contributes: {
+        fieldTypes: [
+          {
+            type: "rating",
+            storage: "json",
+            component: "@acme/off/admin#Rating",
+          },
+        ],
+        admin: {
+          pages: [{ path: "reports", component: "@acme/off/admin#Reports" }],
+          schemaBuilderSlot: "@acme/off/admin#SchemaSlot",
+        },
+      },
+    } as unknown as PluginDefinition;
+
+    const meta = buildPluginAdminMeta([p], undefined)[0];
+    const exposed = exposedComponentPaths(meta);
+
+    expect(exposed.unclassified).toEqual([]);
+    // Exact, not a superset: the page and the slot are withheld for a
+    // disabled plugin, and the field type is not.
+    expect(exposed.registered).toEqual(["@acme/off/admin#Rating"]);
+
+    const collected = new Set(collectAdminComponentPaths(p));
+    for (const path of exposed.registered) {
+      expect(collected.has(path)).toBe(true);
+    }
+  });
+});
+
+describe("block editor components without an active page builder", () => {
+  it("collects nothing when the page builder is absent", () => {
+    // No page builder, no registry for the blocks to land in, so importing
+    // their editor components eagerly would load a feature that cannot run.
+    expect(
+      collectBlockEditorComponentPaths([
+        declaringBlocks([
+          {
+            name: "acme/hero",
+            editor: { component: "@acme/blocks/admin#Hero" },
+          },
+        ]),
+      ])
+    ).toEqual([]);
+  });
+
+  it("collects nothing when the page builder is disabled", () => {
+    expect(
+      collectBlockEditorComponentPaths([
+        pageBuilder(false),
+        declaringBlocks([
+          {
+            name: "acme/hero",
+            editor: { component: "@acme/blocks/admin#Hero" },
+          },
+        ]),
+      ])
+    ).toEqual([]);
+  });
+});
+
+describe("widgets declared under contributes.dashboard", () => {
+  /** A plugin declaring widgets, as plain JavaScript would hand them over. */
+  function declaring(widgets: unknown, enabled?: boolean): PluginDefinition {
+    return {
+      name: "@acme/shop",
+      version: "1.0.0",
+      nextly: "*",
+      enabled,
+      contributes: { dashboard: { widgets } },
+    } as unknown as PluginDefinition;
+  }
+
+  it("collects the component a declared widget draws with, from a plugin with no admin contributions", () => {
+    const shop = declaring([
+      {
+        id: "acme/revenue",
+        view: { component: "@acme/shop/admin#Revenue" },
+      },
+      // A core view ships no component, so it contributes no path.
+      { id: "acme/orders", view: "list" },
+    ]);
+    expect(collectAdminComponentPaths(shop)).toEqual([
+      "@acme/shop/admin#Revenue",
+    ]);
+    expect(buildComponentImportMap([shop])).toContain(
+      '"@acme/shop/admin#Revenue": _p0.Revenue,'
+    );
+  });
+
+  it("collects nothing from a disabled plugin, and skips entries that name no component", () => {
+    expect(
+      collectAdminComponentPaths(
+        declaring(
+          [{ id: "a/b", view: { component: "@acme/shop/admin#Revenue" } }],
+          false
+        )
+      )
+    ).toEqual([]);
+    // Malformed entries are startup's to refuse, by name; the map skips them.
+    expect(
+      collectAdminComponentPaths(
+        declaring([
+          null,
+          { view: { component: "" } },
+          { view: { component: 3 } },
+          { view: null },
+          // The field a declaration named its component under before `view`:
+          // startup refuses it by name, and the map does not read it.
+          { id: "a/old", display: { component: "@acme/shop/admin#Old" } },
+        ])
+      )
+    ).toEqual([]);
+    expect(collectAdminComponentPaths(declaring("not a list"))).toEqual([]);
+  });
+});
+
+describe("the site config's own widgets", () => {
+  const site = {
+    widgets: [
+      {
+        id: "site/revenue",
+        view: { component: "./dashboard/revenue#Revenue" },
+      },
+      { id: "site/cards", view: { component: "@acme/cards/admin#Cards" } },
+      { id: "site/list", view: "list" },
+    ],
+  };
+
+  it("are listed as the site config's, beside the plugins'", () => {
+    expect(componentImportMapEntries([], site)).toEqual([
+      {
+        path: "./dashboard/revenue#Revenue",
+        owner: "the site config",
+        use: "widget",
+        widget: "site/revenue",
+        fromConfig: true,
+      },
+      {
+        path: "@acme/cards/admin#Cards",
+        owner: "the site config",
+        use: "widget",
+        widget: "site/cards",
+      },
+    ]);
+    expect(componentImportMapPaths([], site)).toEqual([
+      "./dashboard/revenue#Revenue",
+      "@acme/cards/admin#Cards",
+    ]);
+  });
+
+  it("are imported from the map's folder, a relative one through where the config file is", () => {
+    // The map sits three folders below the config file, so it imports the config as
+    // `../../../nextly.config`, and the site's `./dashboard/revenue` from beside it.
+    const map = buildComponentImportMap([], "../../../nextly.config", site);
+    expect(map).toContain('import * as _p0 from "../../../dashboard/revenue";');
+    expect(map).toContain('import * as _p1 from "@acme/cards/admin";');
+    // Registered under the path as the site declared it, which the admin looks it up by.
+    expect(map).toContain('"./dashboard/revenue#Revenue": _p0.Revenue,');
+    expect(map).toContain('"@acme/cards/admin#Cards": _p1.Cards,');
+  });
+
+  it("are imported from beside the map when the config file is there too", () => {
+    expect(buildComponentImportMap([], "./nextly.config", site)).toContain(
+      'import * as _p0 from "./dashboard/revenue";'
+    );
+  });
+});
+
+describe("the list of paths the map registers", () => {
+  it("is exported by the generated map, the same list it registers", () => {
+    const p = plugin({
+      pages: [{ path: "a", component: "@acme/x/admin#B" }],
+      settings: { component: "@acme/x/admin#A" },
+    });
+    const paths = componentImportMapPaths([p]);
+    expect(paths).toEqual(["@acme/x/admin#A", "@acme/x/admin#B"]);
+    // The map re-exports its list, the one it is held to.
+    expect(buildComponentImportMap([p])).toContain(
+      'import { registeredComponentPaths as listed } from "./plugin-admin-components.generated";'
+    );
+    expect(buildComponentImportMap([p])).toContain(
+      "export const registeredComponentPaths = listed;"
+    );
+    expect(buildComponentPathsModule([p])).toContain(
+      `export const registeredComponentPaths = ${JSON.stringify(paths)} as const;`
+    );
+  });
+
+  it("is exported empty by a map that registers nothing", () => {
+    expect(componentImportMapPaths([])).toEqual([]);
+    expect(buildComponentPathsModule([])).toContain(
+      "export const registeredComponentPaths = [] as const;"
+    );
+  });
+});
+
+describe("the map's entries: each component with who declared it and what it is for", () => {
+  it("tags every kind of component, naming a widget's id, and nothing a plugin carries under admin.widgets", () => {
+    const shop = {
+      name: "@acme/shop",
+      version: "1.0.0",
+      nextly: "*",
+      contributes: {
+        fieldTypes: [{ type: "color", component: "@acme/shop/admin#Color" }],
+        admin: {
+          pages: [{ path: "reports", component: "@acme/shop/admin#Reports" }],
+          // A key startup refuses: nothing under it is imported.
+          widgets: [
+            { id: "acme/old", title: "Old", component: "@acme/shop/admin#Old" },
+          ],
+          header: { slot: "@acme/shop/admin#Header" },
+        },
+        dashboard: {
+          widgets: [
+            {
+              id: "acme/revenue",
+              view: { component: "@acme/shop/admin#Revenue" },
+            },
+          ],
+        },
+      },
+    } as unknown as PluginDefinition;
+
+    expect(componentImportMapEntries([shop])).toEqual([
+      {
+        path: "@acme/shop/admin#Color",
+        owner: 'plugin "@acme/shop"',
+        use: "field type",
+      },
+      {
+        path: "@acme/shop/admin#Header",
+        owner: 'plugin "@acme/shop"',
+        use: "slot",
+      },
+      {
+        path: "@acme/shop/admin#Reports",
+        owner: 'plugin "@acme/shop"',
+        use: "page",
+      },
+      {
+        path: "@acme/shop/admin#Revenue",
+        owner: 'plugin "@acme/shop"',
+        use: "widget",
+        widget: "acme/revenue",
+      },
+    ]);
+    // The paths the map registers are the entries' paths, in their order.
+    expect(componentImportMapPaths([shop])).toEqual(
+      componentImportMapEntries([shop]).map(each => each.path)
+    );
+  });
+
+  it("registers each setting's own editor beside its widget's component", () => {
+    const goals = {
+      name: "@acme/goals",
+      version: "1.0.0",
+      contributes: {
+        dashboard: {
+          widgets: [
+            {
+              id: "acme/goal",
+              view: { component: "@acme/goals/admin#GoalCard" },
+              settings: {
+                goal: {
+                  type: "number",
+                  label: "Goal",
+                  editor: { component: "@acme/goals/admin#GoalEditor" },
+                },
+                // Drawn by its own field: nothing to register.
+                title: { type: "text", label: "Title" },
+              },
+            },
+          ],
+        },
+      },
+    } as unknown as PluginDefinition;
+
+    const entries = componentImportMapEntries([goals]);
+    expect(entries).toEqual([
+      {
+        path: "@acme/goals/admin#GoalCard",
+        owner: 'plugin "@acme/goals"',
+        use: "widget",
+        widget: "acme/goal",
+      },
+      {
+        path: "@acme/goals/admin#GoalEditor",
+        owner: 'plugin "@acme/goals"',
+        use: "setting editor",
+        widget: "acme/goal",
+      },
+    ]);
+    expect(describeComponentUse(entries[1])).toBe(
+      'plugin "@acme/goals", a setting editor of widget "acme/goal": @acme/goals/admin#GoalEditor'
+    );
+  });
+
+  it("keeps the first declaration of a path two plugins share", () => {
+    const declaring = (name: string) =>
+      ({
+        name,
+        version: "1.0.0",
+        nextly: "*",
+        contributes: {
+          admin: { pages: [{ path: "x", component: "@shared/admin#Page" }] },
+        },
+      }) as unknown as PluginDefinition;
+    expect(
+      componentImportMapEntries([declaring("@a/one"), declaring("@b/two")])
+    ).toEqual([
+      { path: "@shared/admin#Page", owner: 'plugin "@a/one"', use: "page" },
+    ]);
+  });
+
+  it("keeps a path as a widget's when a widget uses it after a page does", () => {
+    // Declared first as a page, then by a dashboard widget: only a widget's
+    // missing component is refused, so the widget's use is the one kept.
+    const both = {
+      name: "@acme/shop",
+      version: "1.0.0",
+      nextly: "*",
+      contributes: {
+        admin: { pages: [{ path: "x", component: "@acme/shop/admin#Shared" }] },
+        dashboard: {
+          widgets: [
+            {
+              id: "acme/shared",
+              view: { component: "@acme/shop/admin#Shared" },
+            },
+          ],
+        },
+      },
+    } as unknown as PluginDefinition;
+    expect(componentImportMapEntries([both])).toEqual([
+      {
+        path: "@acme/shop/admin#Shared",
+        owner: 'plugin "@acme/shop"',
+        use: "widget",
+        widget: "acme/shared",
+      },
+    ]);
+  });
+});
+
+describe("a plugin collection's own views", () => {
+  // A collection replaces its edit or list screen by naming a component, and
+  // the admin resolves that name through the same registry a page uses. The
+  // map is the only importer of the module behind it once nothing loads
+  // modules by name at run time.
+  const forms = {
+    name: "@acme/forms",
+    version: "1.0.0",
+    nextly: "*",
+    contributes: {
+      collections: [
+        {
+          slug: "forms",
+          fields: [],
+          admin: {
+            components: {
+              views: {
+                Edit: { Component: "@acme/forms/admin#FormEditor" },
+                List: { Component: "@acme/forms/admin#FormList" },
+              },
+            },
+          },
+        },
+      ],
+    },
+  } as unknown as PluginDefinition;
+
+  it("registers the edit and list views the collection names", () => {
+    const code = buildComponentImportMap([forms]);
+
+    expect(code).toContain('import * as _p0 from "@acme/forms/admin";');
+    expect(code).toContain('"@acme/forms/admin#FormEditor": _p0.FormEditor');
+    expect(code).toContain('"@acme/forms/admin#FormList": _p0.FormList');
+  });
+});
+
+describe("the site config's own collections' views", () => {
+  // A site collection replaces its edit screen by naming a component, as the
+  // collections guide shows, beside a plugin's; written relative to the
+  // config, or as a package's.
+  const siteCollections = [
+    {
+      slug: "orders",
+      fields: [],
+      admin: {
+        components: {
+          views: { Edit: { Component: "./views/orders#OrderEditor" } },
+          BeforeListTable: "@acme/cards/admin#OrderTotals",
+        },
+      },
+    },
+  ] as unknown as CollectionConfig[];
+
+  it("are listed as the site config's, beside the plugins'", () => {
+    expect(componentImportMapEntries([], undefined, siteCollections)).toEqual([
+      {
+        path: "./views/orders#OrderEditor",
+        owner: "the site config",
+        use: "collection view",
+        fromConfig: true,
+      },
+      {
+        path: "@acme/cards/admin#OrderTotals",
+        owner: "the site config",
+        use: "collection view",
+      },
+    ]);
+  });
+
+  it("are imported from the map's folder, a relative one through where the config file is", () => {
+    const map = buildComponentImportMap(
+      [],
+      "../../../nextly.config",
+      undefined,
+      siteCollections
+    );
+    expect(map).toContain('import * as _p0 from "../../../views/orders";');
+    expect(map).toContain('"./views/orders#OrderEditor": _p0.OrderEditor,');
+    expect(map).toContain('"@acme/cards/admin#OrderTotals": _p1.OrderTotals,');
+    // And listed, so the admin's check reads them as registered.
+    expect(buildComponentPathsModule([], undefined, siteCollections)).toContain(
+      "./views/orders#OrderEditor"
+    );
+  });
+});
+
+describe("parity with the contributions a reader is sent", () => {
+  // Each contribution to an admin place is drawn by resolving its component's
+  // path through the registry, and the map is the only importer of the module
+  // behind it. So every path the admin can be sent must be one the map
+  // collects, for one of each kind, a row and bulk action's opened dialog
+  // among them.
+  const p = {
+    name: "@acme/places",
+    version: "1.0.0",
+    nextly: "*",
+    contributes: {
+      admin: {
+        contributions: [
+          {
+            id: "acme-places.block",
+            kind: "block",
+            place: "dashboard",
+            component: "@acme/places/admin#Block",
+          },
+          {
+            // A default export: a path with no `#`, as the map reads it.
+            id: "acme-places.banner",
+            kind: "block",
+            place: "dashboard",
+            component: "@acme/places/admin/banner",
+          },
+          {
+            id: "acme-places.tab",
+            kind: "tab",
+            place: "settings",
+            label: "Places",
+            component: "@acme/places/admin#Tab",
+          },
+          {
+            id: "acme-places.section",
+            kind: "sidebarSection",
+            place: "collection.edit",
+            label: "Places",
+            component: "@acme/places/admin#Section",
+          },
+          {
+            id: "acme-places.cell",
+            kind: "column",
+            place: "collection.list",
+            label: "Places",
+            component: "@acme/places/admin#Cell",
+          },
+          {
+            id: "acme-places.row",
+            kind: "rowAction",
+            place: "collection.list",
+            label: "Places",
+            action: { open: "@acme/places/admin#RowDialog" },
+          },
+          {
+            id: "acme-places.bulk",
+            kind: "bulkAction",
+            place: "collection.list",
+            label: "Places",
+            action: { open: "@acme/places/admin#BulkDialog" },
+          },
+        ],
+      },
+    },
+  } as unknown as PluginDefinition;
+
+  /**
+   * Every string in what a reader is sent that names one of this plugin's
+   * modules, whatever key holds it: each component path here, with an export
+   * after `#` or none for a default export, is under the plugin's own module
+   * prefix, and nothing else it sends is (ids are `acme-places.*`, labels are
+   * words). Found by that rather than by the keys or the path grammar the
+   * collector reads, so a contribution kind that later names its component
+   * under a new key, or in a form the collector skips, shows up here and fails
+   * the check below.
+   */
+  const MODULE_PREFIX = "@acme/places/";
+  function sentPaths(sent: unknown): string[] {
+    if (typeof sent === "string") {
+      return sent.startsWith(MODULE_PREFIX) ? [sent] : [];
+    }
+    if (Array.isArray(sent)) return sent.flatMap(sentPaths);
+    if (sent === null || typeof sent !== "object") return [];
+    return Object.values(sent).flatMap(sentPaths);
+  }
+
+  it("collects the component of every contribution a reader is sent", async () => {
+    const sent = await contributionsForReader(
+      [p],
+      { holds: () => true, mayFilter: async () => true, collections: [] },
+      "workspace"
+    );
+    const paths = sentPaths(sent);
+
+    // Positive control: without it the loop below passes on an empty probe.
+    expect([...new Set(paths)].sort()).toEqual([
+      "@acme/places/admin#Block",
+      "@acme/places/admin#BulkDialog",
+      "@acme/places/admin#Cell",
+      "@acme/places/admin#RowDialog",
+      "@acme/places/admin#Section",
+      "@acme/places/admin#Tab",
+      "@acme/places/admin/banner",
+    ]);
+    const collected = new Set(collectAdminComponentPaths(p));
+    for (const path of paths) {
+      expect(collected.has(path)).toBe(true);
+    }
+  });
+
+  it("registers each in the generated map, as contributions", () => {
+    const code = buildComponentImportMap([p]);
+    expect(code).toContain('import * as _p0 from "@acme/places/admin";');
+    expect(code).toContain('"@acme/places/admin#RowDialog": _p0.RowDialog');
+    // The default export registers under its path as declared.
+    expect(componentImportMapPaths([p])).toContain("@acme/places/admin/banner");
+    expect(
+      componentImportMapEntries([p]).every(each => each.use === "contribution")
+    ).toBe(true);
+  });
+});
+
+describe("a component path naming the admin's root entry", () => {
+  // A site or plugin may name `@nextlyhq/admin#<Name>`. The root now exports
+  // only what an application mounts; a name it no longer exports lives in
+  // `@nextlyhq/admin/kit`, and a namespace import of the root would read it
+  // as undefined.
+  const site = {
+    widgets: [
+      {
+        id: "site/media",
+        view: { component: "@nextlyhq/admin#MediaLibrary" },
+      },
+      {
+        id: "site/stats",
+        view: { component: "@nextlyhq/admin#useDashboardStats" },
+      },
+    ],
+  };
+  const pagePlugin = plugin({
+    pages: [{ path: "frame", component: "@nextlyhq/admin#RootLayout" }],
+  });
+
+  it("imports a name the root no longer exports from the kit entry", () => {
+    const map = buildComponentImportMap([pagePlugin], undefined, site);
+    expect(map).toMatch(
+      /import \* as (_p\d+) from "@nextlyhq\/admin\/kit";[\s\S]*"@nextlyhq\/admin#MediaLibrary": \1\.MediaLibrary,/
+    );
+  });
+
+  it("keeps a name the root exports on the root, and the registry key as declared", () => {
+    const map = buildComponentImportMap([pagePlugin], undefined, site);
+    expect(map).toMatch(
+      /import \* as (_p\d+) from "@nextlyhq\/admin";[\s\S]*"@nextlyhq\/admin#RootLayout": \1\.RootLayout,/
+    );
+    expect(map).toMatch(
+      /import \* as (_p\d+) from "@nextlyhq\/admin";[\s\S]*"@nextlyhq\/admin#useDashboardStats": \1\.useDashboardStats,/
+    );
+    // The registration call itself still comes from the root.
+    expect(map).toContain(
+      'import { registerComponentMap } from "@nextlyhq/admin";'
+    );
+  });
+
+  it("CONTROL: leaves every other package's path as written", () => {
+    const map = buildComponentImportMap(
+      [plugin({ pages: [{ path: "p", component: "@acme/x/admin#Kit" }] })],
+      undefined
+    );
+    expect(map).toContain('import * as _p0 from "@acme/x/admin";');
+    expect(map).not.toContain("@nextlyhq/admin/kit");
+  });
+});

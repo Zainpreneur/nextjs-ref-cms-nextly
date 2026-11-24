@@ -1,0 +1,176 @@
+/**
+ * The Count card's scheduled figure, against a real database, as callers with
+ * different read rights: the card's `load`, set to a collection and drawing
+ * its status split, the one line that shows the figure.
+ *
+ * What only a database can settle: that the figure counts exactly the entries
+ * a scheduled release will publish, through the entry list's own condition;
+ * that it reads zero where the caller has a release to read and none holds
+ * these entries; and that a caller barred from releases is answered exactly as
+ * a site without releases is, the figure left out, never zero.
+ */
+
+// Set before the harness boots (env validation reads it once).
+process.env.NEXTLY_SECRET =
+  process.env.NEXTLY_SECRET ??
+  "test-secret-must-be-at-least-32-characters-long!!";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import { defineCollection, text } from "../../../config";
+import {
+  createTestNextly,
+  getConfiguredTestDialects,
+  type TestDialect,
+  type TestNextly,
+} from "../../../plugins/test-nextly";
+import type { ReadCaller } from "../../../services/dashboard/readable-resources";
+import { releaseMemberKey } from "../../releases/release-member-key";
+import {
+  RELEASE_MEMBERS_TABLE,
+  RELEASES_TABLE,
+} from "../../releases/release-tables";
+import { refreshContentSources } from "../content-sources";
+import { countWidget } from "../core-widgets/count";
+
+import { loadCard } from "./core-card-load";
+
+let current: TestNextly | undefined;
+
+afterEach(async () => {
+  await current?.destroy();
+  current = undefined;
+});
+
+const POSTS = "cntsch_posts";
+const PAGES = "cntsch_pages";
+const DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * A super admin's API key holding `permissions`: judged on its own scope, so
+ * the bypass cannot widen what it reads.
+ */
+function scoped(permissions: string[]): ReadCaller {
+  return {
+    user: { id: "admin", roles: ["super-admin"] },
+    authenticatedScope: { actorType: "apiKey", permissions },
+  };
+}
+
+const READS_POSTS = [`read-${POSTS}`, `read-${PAGES}`];
+const READS_RELEASES = [...READS_POSTS, "read-content-releases"];
+
+/** What a Count card set to `collection`, drawing its status split, answers `caller`. */
+function card(caller: ReadCaller, collection = POSTS) {
+  return loadCard(countWidget, { collection, show: "split" }, caller, {
+    size: { w: 4, h: 2, tier: "medium" },
+  });
+}
+
+/** The card's scheduled figure for `caller`, or `undefined` when it is left out. */
+async function scheduled(caller: ReadCaller, collection = POSTS) {
+  return (await card(caller, collection)).split?.scheduled;
+}
+
+describe.each(getConfiguredTestDialects())(
+  "the Count card's scheduled figure (%s)",
+  (dialect: TestDialect) => {
+    /** Two posts, one page; `ids` by title. */
+    async function boot() {
+      current = await createTestNextly({
+        dialect,
+        collections: [POSTS, PAGES].map(slug =>
+          defineCollection({
+            slug,
+            status: true,
+            fields: [text({ name: "title" })],
+          })
+        ),
+      });
+      const t = current;
+      const handler = t.getService("collectionsHandler") as unknown as {
+        createEntry: (
+          p: Record<string, unknown>,
+          data: Record<string, unknown>
+        ) => Promise<{ data?: { id?: string } | null }>;
+      };
+      const ids = new Map<string, string>();
+      for (const [collection, title] of [
+        [POSTS, "held"],
+        [POSTS, "free"],
+        [PAGES, "page"],
+      ] as const) {
+        const created = await handler.createEntry(
+          { collectionName: collection, overrideAccess: true },
+          { title, status: "draft" }
+        );
+        const id = created.data?.id;
+        if (typeof id !== "string") throw new Error(`no id for ${title}`);
+        ids.set(title, id);
+      }
+      await refreshContentSources();
+      return { t, ids };
+    }
+
+    /** A scheduled release a day out, publishing one entry of `collection`. */
+    async function release(t: TestNextly, collection: string, entryId: string) {
+      const id = crypto.randomUUID();
+      const now = new Date();
+      await t.adapter.insert(RELEASES_TABLE, {
+        id,
+        title: `Release ${id.slice(0, 8)}`,
+        description: null,
+        scheduledAt: new Date(now.getTime() + DAY),
+        timezone: "UTC",
+        state: "scheduled",
+        publishedAt: null,
+        createdBy: null,
+        createdAt: now,
+        updatedAt: now,
+        revision: 0,
+      });
+      const ref = {
+        scopeKind: "collection" as const,
+        scopeSlug: collection,
+        entryId,
+        locale: null,
+      };
+      await t.adapter.insert(RELEASE_MEMBERS_TABLE, {
+        id: crypto.randomUUID(),
+        releaseId: id,
+        ...ref,
+        action: "publish",
+        memberKey: releaseMemberKey(id, ref),
+        createdBy: null,
+        createdAt: now,
+      });
+    }
+
+    it("counts exactly the entries a scheduled release will publish", async () => {
+      const { t, ids } = await boot();
+      await release(t, POSTS, ids.get("held")!);
+      expect(await scheduled(scoped(READS_RELEASES))).toBe(1);
+    });
+
+    it("reads zero where the caller has a release to read and none holds these entries", async () => {
+      const { t, ids } = await boot();
+      // The one release publishes a page, not a post.
+      await release(t, PAGES, ids.get("page")!);
+      expect(await scheduled(scoped(READS_RELEASES))).toBe(0);
+    });
+
+    it("answers a caller barred from releases exactly as a site without releases, never as zero", async () => {
+      const { t, ids } = await boot();
+      // No release yet: a reader who may read releases has none to read.
+      const withoutReleases = await card(scoped(READS_RELEASES));
+      await release(t, POSTS, ids.get("held")!);
+      // A release holds a post, and this reader may not read releases.
+      const barred = await card(scoped(READS_POSTS));
+      // The figure is left out, and the card is otherwise the same: its
+      // number stands, and nothing in it tells the two apart.
+      expect(withoutReleases.split?.scheduled).toBeUndefined();
+      expect(withoutReleases.total).toBe(2);
+      expect(barred).toEqual(withoutReleases);
+    });
+  }
+);

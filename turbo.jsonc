@@ -1,0 +1,756 @@
+{
+  // Turborepo Task Configuration for Nextly
+  //
+  // Nextly is an NPM package that provides a headless CMS for Next.js applications.
+  //
+  // NPM Publishing Workflow:
+  //   - nextly → npm (core CMS functionality - database, RBAC, collections)
+  //   - @nextly/admin → npm (UI components - forms, tables, dashboard)
+  //   - apps/playground → NOT published (development/testing only)
+  //
+  // Tech Stack:
+  //   - Next.js 16 (App Router, Server Components, Server Actions)
+  //   - React 19.2 (latest features, hooks, best practices)
+  //   - Turborepo for monorepo task orchestration
+  //   - TypeScript strict mode
+  //   - Vitest for testing, Playwright for E2E
+  //
+  // Quick Start:
+  //   - Package maintainers: pnpm dev (starts all dev servers)
+  //   - Contributors: pnpm build && pnpm test (validate changes)
+  //   - CI/CD: pnpm check-types && pnpm lint && pnpm test (parallel validation)
+  //
+  // Task Execution Patterns:
+  //   - dependsOn: ["^build"] = Build workspace dependencies FIRST (^ = dependencies)
+  //   - cache: false = Never cache (for dev servers, formatters, destructive operations)
+  //   - cache: true = Reuses results if inputs unchanged (test, build)
+  //   - persistent: true = Long-running process (dev servers, watch modes)
+  //
+  // Cache Behavior:
+  //   - Cache location: .turbo/cache/ (gitignored)
+  //   - Cache invalidation: Automatic when inputs change
+  //   - Cache hits = FULL TURBO (near-instant execution)
+  //
+  // Dependency Graph:
+  //   nextly (builds first)
+  //     ↓
+  //   @nextly/admin (depends on nextly)
+  //     ↓
+  //   apps/playground (depends on both)
+  //
+  // Documentation: https://turborepo.com/docs/reference/configuration
+
+  "$schema": "https://v2-9-7.turborepo.dev/schema.json",
+  "ui": "tui", // Terminal UI for better task visualization
+
+  // The local cache's bound. Turbo keeps every task's outputs until told
+  // otherwise (both settings default to off), and with several worktrees
+  // sharing one clone's cache it grew about 20 GB a day on a busy machine
+  // until the disk filled. At the start of each run turbo evicts entries older
+  // than the age, then the oldest until the cache fits the size. An evicted
+  // entry costs a rebuild, never a wrong result. `cacheDir` stays unset on
+  // purpose: worktrees share the main clone's cache only at the default path.
+  "cacheMaxAge": "3d",
+  "cacheMaxSize": "5GB",
+
+  // Files OUTSIDE any package that a task's result depends on.
+  //
+  // A task's hash covers its own package's files plus, through `dependsOn`, its
+  // dependencies' hashes. Anything belonging to NEITHER is invisible to it, and
+  // a file the compiler reads but the hash cannot see is a replayed green
+  // waiting to happen. Two trees are in that position:
+  //
+  // - `packages/tsconfig/*.json`: 22 packages extend `@nextlyhq/tsconfig`, and
+  //   it decides `strict`, `target` and `lib`. The `^check-types` edge below
+  //   now gives most of them a graph edge to it, so this is no longer the ONLY
+  //   thing covering them — it remains because that edge is a property of the
+  //   task graph rather than of the configs, and it does not reach tasks with
+  //   no such edge or consumers that read these files by relative path.
+  // - The root scripts a package's build, type-check or tests read. Root
+  //   scripts sit in no package at all, so no edge of any kind can reach them.
+  //   `apps/playground` compiles `scripts/dev-doctor.mjs` through a test, and
+  //   before it was listed here, editing that file left `playground#check-types`
+  //   on the identical hash `62b43e8dbf627e65`.
+  //
+  // Both are deliberately coarse, invalidating every task rather than the
+  // type-aware ones, because a compiler setting or a shared script reaches
+  // builds and type-aware lint too. The cost of an unnecessary re-run is
+  // minutes; the cost of a missed one is a green nobody can see through.
+  //
+  // The scripts are listed by file, not as `scripts/**`. The whole tree made
+  // every one of the ~200 root scripts (CI checks, release tooling, gates, and
+  // their tests) a global input, so editing any of them re-ran every build,
+  // lint, type-check and test in the workspace, about seven minutes cold on a
+  // local machine, to protect eleven files. Eight are every root script
+  // read from a package, an app or `e2e/` (`tsc-cli.mjs` counted with the
+  // declarations its importers compile), plus the three root scripts they import
+  // (`agent-skills` imports `agent-instructions`, which imports
+  // `check-instruction-size`; `tsc`, which every package's `check-types` runs,
+  // imports `local-limits` and `tsc-cli`), traced through every relative
+  // import. The guard in
+  // `scripts/turbo-inputs.test.mjs` reports any tracked program input that no
+  // hash covers, so a sixth read of a root script fails CI rather than passing
+  // quietly.
+  "globalDependencies": [
+    "packages/tsconfig/*.json",
+    "scripts/agent-instructions.mjs",
+    "scripts/agent-skills.mjs",
+    "scripts/check-instruction-size.mjs",
+    "scripts/cli-entry.mjs",
+    "scripts/dev-doctor.mjs",
+    "scripts/local-limits.mjs",
+    "scripts/pnpm-invocation.mjs",
+    "scripts/tsc-cli.d.mts",
+    "scripts/tsc-cli.mjs",
+    "scripts/tsc.mjs",
+    "scripts/vitest-dom-setup.ts"
+  ],
+
+  // Runtime env vars referenced from package source (not build-time inputs).
+  // Listed here so eslint-plugin-turbo's no-undeclared-env-vars rule passes.
+  // Every artifact turbo uploads to the shared remote cache is signed with
+  // TURBO_REMOTE_CACHE_SIGNATURE_KEY (HMAC-SHA256) and verified on download;
+  // one that fails verification, truncated or altered, counts as a miss. The
+  // remote cache is used only where a token is set (CI, see ci.yml), so a
+  // machine without one builds from its local cache as before. A key's length
+  // is not made fatal (`futureFlags.longerSignatureKey`): a contributor who
+  // has run `turbo link` holds no key, and would otherwise be unable to run
+  // turbo at all; what such a machine signs, CI's key rejects as a miss.
+  "remoteCache": { "signature": true },
+
+  // The runner's operating system and architecture are part of every task's
+  // hash, so the shared cache never replays a Linux task's output on a
+  // Windows or macOS job. Those jobs exist to catch what differs between the
+  // platforms. GitHub sets both on every runner; on a machine without them
+  // they are empty, the same on every run. An environment variable rather
+  // than the generated file of Turborepo's platform guide, which every entry
+  // point would have to write before turbo starts: one that forgot would hash
+  // without it, silently.
+  "globalEnv": ["RUNNER_OS", "RUNNER_ARCH"],
+
+  "globalPassThroughEnv": [
+    "npm_config_user_agent", // create-nextly-app reads this to detect the invoking PM
+    "BLOB_READ_WRITE_TOKEN", // @nextlyhq/storage-vercel-blob runtime config
+    "S3_BUCKET",
+    "S3_ENDPOINT",
+    "S3_REGION",
+    "S3_ACCESS_KEY_ID",
+    "S3_SECRET_ACCESS_KEY",
+    "AWS_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "R2_BUCKET",
+    "R2_ACCOUNT_ID",
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+    "UPLOADTHING_TOKEN",
+    "UPLOADTHING_SECRET",
+    "RESEND_BASE_URL", // Resend email provider: capture server / egress proxy host
+    "RESEND_USER_AGENT", // Resend email provider: User-Agent some proxies filter on
+    "DATABASE_URL",
+    "DB_DIALECT",
+    // nextly/testing: createTestNextly keeps a secret already set, else sets a
+    // random one for the instance and puts the environment back after it, as
+    // it does DATABASE_URL and DB_DIALECT. Passed through, not hashed: a
+    // secret changes no output, and a cache key should never carry one.
+    "NEXTLY_SECRET",
+    // The machine's worker limit, set by scripts/bounded.mjs for a local run
+    // and read by the playground's Next.js build for its page-data workers.
+    // A memory bound has to reach the task to bound it; strict env mode drops
+    // anything not listed. Passed through, not hashed: it changes how many
+    // workers build the output, never the output.
+    "NEXTLY_LOCAL_MAX_WORKERS",
+    "NEXT_PHASE", // nextly boot: a production build seeds no permissions or roles
+    "GITHUB_ACTOR", // nextly migrate: appliedBy actor in CI
+    "USER", // nextly migrate: appliedBy actor on dev laptops
+    "DEBUG",
+    "DEBUG_RBAC",
+    "DEBUG_SCHEMA", // nextly schema apply: verbose pipeline + drizzle-kit output
+    "FORCE_PATH_STYLE",
+    "HEALTH_CHECK_CACHE_SECONDS",
+    "INIT_CWD",
+    "NEXTLY_ACCEPT_DATA_LOSS",
+    "NEXTLY_ALLOW_CODE_FIRST_DROPS", // schema pipeline: opt in to auto-confirmed destructive drops
+    "NEXTLY_APPLIED_BY", // nextly migrate: override appliedBy actor (F11)
+    "NEXTLY_DEBUG_TIMEZONE",
+    "NEXTLY_DELETE_THRESHOLD",
+    "NEXTLY_EMAIL_MAX_ATTACHMENT_COUNT",
+    "NEXTLY_EMAIL_MAX_ATTACHMENT_TOTAL_BYTES",
+    "NEXTLY_ENV_LOADED",
+    "NEXTLY_IPC_PORT",
+    "NEXTLY_IPC_TOKEN",
+    "NEXTLY_SKIP_AUTO_SYNC",
+    "NEXTLY_SKIP_SCHEMA_FILES",
+    "NEXTLY_STRICT_PLUGIN_TARGETS", // P8: fail-fast on unresolvable plugin extend/relation targets
+    "NEXTLY_ALLOW_PLUGIN_PERMISSION_OVERRIDE", // let a plugin keep a permission an entity already owns
+    "PERMISSION_CACHE_ENABLED",
+    "PERMISSION_CACHE_MEMORY_SIZE",
+    "PERMISSION_CACHE_TTL_SECONDS",
+    "PUBLIC_URL",
+    "NEXT_PUBLIC_APP_URL", // @nextlyhq/plugin-mcp: default hostname the MCP endpoint answers on
+    "TEST_DATABASE_URL",
+    "TEST_MYSQL_URL",
+    "TEST_POSTGRES_URL",
+    "TEST_SQLITE_URL",
+    "UPLOADTHING_TOKEN", // @nextlyhq/storage-uploadthing runtime config
+    "TEST_DATABASE_URL_POSTGRES", // @nextlyhq/adapter-postgres integration tests
+    "TEST_DATABASE_URL_MYSQL", // @nextlyhq/adapter-mysql integration tests
+    "TRUSTED_PROXY_IPS", // nextly trust-proxy CIDR list
+    "ALLOWED_REDIRECT_HOSTS", // nextly forgot-password redirect allowlist
+    "DB_PROVIDER", // @nextlyhq/adapter-postgres runtime driver selection
+    "NEXTLY_ALLOW_CORE_DESTRUCTIVE", // migrate: allow destructive core schema ops (F11)
+    "NEXTLY_DROP_RETIRED_AUTH_TABLES", // migrate: drop the retired accounts/sessions tables
+    "NEXTLY_DROP_NONEMPTY_RETIRED", // migrate: also drop a retired table that still holds rows
+    "NEXTLY_BOOT_APPLY_FAIL_LOUDLY", // boot-apply: throw instead of warn for debugging (P2 review fix)
+    "NEXTLY_DISABLE_BOOT_APPLY", // boot-apply: opt-out escape hatch for dev workflows
+    "TMPDIR", // create-nextly-app temp dir override
+    "PORT", // nextly HMR listener: Next.js dev port
+    "USE_HTTPS", // nextly HMR listener: dev server protocol
+    "__NEXT_ASSET_PREFIX", // nextly HMR listener: Next.js asset prefix
+    "__NEXT_CACHE_COMPONENTS", // nextly release window: Cache Components on, as Next.js inlines it
+    "__NEXT_ROUTER_BASEPATH", // page builder <SiteCode>: the app's base path, as Next.js inlines it
+    "NEXTLY_DISABLE_HMR", // nextly HMR listener: opt-out escape hatch
+    "NEXTLY_HMR_URL_OVERRIDE", // nextly HMR listener: custom URL for proxy setups
+    "NEXTLY_GENERATED_FILES_WRITE", // checkAdminComponents: 0 or false stops the running app rewriting generated files
+    "NEXTLY_BUILD_SCHEMA_VERSION" // nextly production start: the build's newest migration, which withNextly sets
+  ],
+
+  "tasks": {
+    // ==================== BUILD TASKS ====================
+    // Prepare packages for npm publishing and app deployment
+
+    // build - Compile TypeScript and bundle packages for npm distribution
+    //
+    // This is the MOST IMPORTANT task for Nextly as an npm package.
+    // It prepares nextly and @nextly/admin for publishing.
+    //
+    // Execution Order:
+    //   1. Build workspace dependencies first (^build = dependencies)
+    //   2. Build current package
+    //   Example: nextly must build before apps/playground (which depends on it)
+    //
+    // Outputs:
+    //   - dist/ = Compiled package code for npm
+    //   - .next/ = Next.js build output (for apps/playground)
+    //   - .tsbuildinfo = TypeScript incremental build cache
+    //
+    // Environment Variables:
+    //   - NODE_ENV affects build output (production vs development)
+    //   - NEXTLY_DEV_DIAGNOSTICS is read at runtime, alongside NODE_ENV, before
+    //     an error response may carry the detail the public shape withholds.
+    //     Declared so the lint rule can see it and so a change is not silently
+    //     served from a cached build.
+    "build": {
+      "dependsOn": ["^build"], // Build dependencies first (critical for npm packages)
+      // Source files and env files, less tests and prose: every build reads
+      // only what it ships (tsdown follows imports from the entries, and its
+      // declarations from those), so a test-only or README edit no longer
+      // rebuilds a package and everything that depends on it.
+      // scripts/turbo-inputs.test.mjs refuses this for a build that reads them.
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        ".env*",
+        "!**/*.test.{ts,tsx,mts,cts}",
+        "!**/*.spec.{ts,tsx,mts,cts}",
+        "!**/*.test-d.ts",
+        "!**/__tests__/**",
+        "!**/*.md"
+      ],
+      "outputs": ["dist/**", ".next/**", "!.next/cache/**", "**/*.tsbuildinfo"],
+      "env": ["NODE_ENV", "NEXTLY_DEV_DIAGNOSTICS"]
+    },
+
+    // create-nextly-app#build - the one build that copies files from OUTSIDE
+    // its package into it.
+    //
+    // 🔴 Its build copies the repo-root `templates/` and the user skills in
+    // `skills/` into `packages/create-nextly-app/{templates,skills}/`, which
+    // the package publishes. Both copies are gitignored, so `$TURBO_DEFAULT$`
+    // sees neither, and the shared definition declares only `dist/**` as
+    // output. A build replayed from cache on a clean worker then restored no
+    // bundle, and the package packed without the files every scaffold needs;
+    // an edit to `skills/` or `templates/` alone left the hash unchanged and
+    // reused a stale bundle. Their sources are inputs here and the copies
+    // outputs. The skill check the build asks, `scripts/agent-skills.mjs`, is
+    // already covered by `globalDependencies`.
+    //
+    // A package task REPLACES the shared definition, so every field of it is
+    // restated, as `create-nextly-app#test` below does.
+    "create-nextly-app#build": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        ".env*",
+        "$TURBO_ROOT$/templates/**",
+        "$TURBO_ROOT$/skills/**"
+      ],
+      "outputs": ["dist/**", "templates/**", "skills/**", "**/*.tsbuildinfo"],
+      "env": ["NODE_ENV", "NEXTLY_DEV_DIAGNOSTICS"]
+    },
+
+    // ==================== TYPE CHECKING ====================
+    // Validate TypeScript types across all packages
+
+    // check-types - Run TypeScript compiler for type validation
+    //
+    // What it depends on, and why each edge is there:
+    //   - "^check-types" = a dependency's HASH, so editing a file that this
+    //     package's program reaches through a tsconfig path mapping moves this
+    //     task's hash
+    //   - "^build" = a dependency's ARTIFACT, because only five packages map a
+    //     neighbour at its source and the rest resolve through package exports,
+    //     which point at `dist`
+    //   - "build" = this package's OWN artifact, for ordering rather than
+    //     coverage: both tasks write one `.tsbuildinfo` per package
+    //
+    // This section previously said the opposite — no `^build`, runs in parallel
+    // with builds, validates source without artifacts. That was true of the
+    // packages that motivated it and of almost none of the others, and a
+    // typecheck reading a stale `dist` answers about code that is gone. It is
+    // recorded rather than deleted because the claim is an attractive one to
+    // re-derive from the task name.
+    //
+    // Note: Uses incremental compilation (.tsbuildinfo) for speed. That file is
+    // shared with `build`, which is what the third edge orders.
+    "check-types": {
+      // A package's TypeScript PROGRAM crosses workspace boundaries, so its
+      // hash has to as well. `packages/admin` maps the bare `nextly` specifier
+      // at its own source, and its program therefore compiles
+      // `packages/nextly/src/schemas/_zod/rbac.ts`. Inputs are package-scoped
+      // however they are written — `$TURBO_DEFAULT$` included — so with no edge
+      // here, editing that file left `@nextlyhq/admin#check-types` on the
+      // identical hash `4ce01f04aee7b9ee` and a cross-package type
+      // incompatibility replayed a stale green. This edge folds each
+      // dependency's hash into the dependent's, which moves it.
+      //
+      // It costs the full parallelism the note above describes: `check-types`
+      // now follows the dependency graph rather than starting everywhere at
+      // once. That is the trade a gate should take — a missed break reaches
+      // `main`, a redundant run costs minutes — and turbo still runs
+      // independent packages concurrently.
+      //
+      // `^build` as well, because the sentence above was true of the packages
+      // that motivated it and of almost none of the others. `packages/admin`
+      // maps the bare `nextly` specifier at its own source, so its program does
+      // need the dependency's hash rather than its `dist` — but only five
+      // packages declare such a mapping (`admin`, the three `storage-*`
+      // adapters, and `playground`). Every other one resolves `@nextlyhq/*`
+      // through package exports, and those point at the artifact:
+      // `blocks-react` publishes `"types": "./dist/index.d.ts"`. For those, a
+      // typecheck reads a BUILD, and a stale one answers about code that is no
+      // longer there.
+      //
+      // Measured rather than argued, by renaming an exported symbol in
+      // `blocks-engine` that `builder` imports: with `dist` untouched
+      // `builder#check-types` exits 0, and after a rebuild the same tree
+      // reports `TS2724`. It fails in the PASSING direction, which is the one
+      // nobody re-checks.
+      //
+      // The cost this note previously weighed against is a build that turbo has
+      // usually already done: warm, `turbo run build` across every package
+      // completes in ~0.2s on a full cache hit, and does real work only when a
+      // dependency actually changed — which is exactly when the answer would
+      // otherwise be stale.
+      //
+      // `^check-types` STAYS beside it rather than being replaced. The two
+      // cover different programs: a package's build compiles the sources it
+      // ships, while its `check-types` also covers the test files its shipping
+      // tsconfig excludes, so a type error confined to a dependency's tests is
+      // invisible to `^build` alone.
+      //
+      // `build` WITHOUT the caret is this package's own, and it is here for a
+      // different reason than the two beside it: ordering, not coverage.
+      // `${configDir}/.tsbuildinfo` is one file per package, `incremental` is on
+      // in the shared config, and this `tsc --noEmit` writes it. tsup's
+      // declaration pass wrote it too, which is why both tasks declare it under
+      // `outputs`; tsdown's writes none, and the order below costs nothing. Before `^build` existed the two never shared a run, so
+      // nothing ordered them and nothing had to. Pulling every dependency's
+      // build into this graph put 19 packages' `build` and `check-types` in one
+      // run as unordered siblings, free to write and restore that file at the
+      // same moment — and the note in `packages/tsconfig/base.json` records what
+      // a shared build-info file does when two writers reach it.
+      //
+      // Ordering is what removes that, rather than a second output path: the
+      // file is named by the shared tsconfig, so splitting it means every
+      // package's script carrying its own `--tsBuildInfoFile`, which is a
+      // second place for the two halves to disagree. The build this waits on is
+      // one turbo has almost always already done.
+      "dependsOn": ["^check-types", "^build", "build"],
+      // Every extension TypeScript follows, not only `.ts`/`.tsx`. A task input
+      // glob decides what turbo HASHES: a change confined to an extension
+      // missing here leaves the hash unmoved, so CI replays a cached green
+      // without ever checking the changed module. Kept in step with
+      // `MODULE_EXTENSIONS` in `packages/builder/src/source-modules.ts`.
+      //
+      // `tsconfig.tests.json` is listed for the same reason as the extensions
+      // above. Several packages run a SECOND `tsc` over that config to cover the
+      // test files their shipping config excludes, and a config outside this
+      // list does not move the hash — so narrowing what that pass checks would
+      // replay a cached green rather than re-running it.
+      //
+      // `scripts/**` is listed because a package's tests config may pull that
+      // tree into the program — `packages/ui/tsconfig.tests.json` includes it,
+      // so its build scripts are compiled by this task. A tree inside the
+      // program but outside this list is the worst combination available: the
+      // task reports on the file while a change to it leaves the hash unmoved,
+      // so an edit that breaks a script replays the previous green. Listed for
+      // every package rather than the one that needs it today, because the cost
+      // of a package having no such tree is a glob that matches nothing, while
+      // the cost of omitting it is silent.
+      // Start from turbo's DEFAULT (every non-ignored file in the package) and
+      // subtract, rather than enumerating what to include.
+      //
+      // The direction is the whole point. An include list is unbounded — every
+      // directory, extension and config a package might adopt has to be
+      // predicted — and each gap is SILENT and reports green, because a file
+      // outside the list cannot move the hash however badly it breaks. An
+      // exclude list is bounded, and its gaps cost only an unnecessary re-run.
+      //
+      // The list this replaces had been patched once along the EXTENSION axis
+      // and still failed along the DIRECTORY axis: `e2e` keeps its modules in
+      // `tests/` rather than `src/`, so turbo hashed 5 files for a package
+      // holding 35, and a type error introduced in `tests/` sat on `main`
+      // behind a replayed green until an unrelated change to a top-level file
+      // happened to move the hash. Adding `tests/**` would have fixed that case
+      // and left the next axis to be discovered the same way.
+      //
+      // `!**/*.md` is the one subtraction, and it is safe to state rather than
+      // hope: no tsconfig in this repository includes Markdown, and nothing
+      // imports it, so it cannot enter a TypeScript program.
+      "inputs": ["$TURBO_DEFAULT$", "!**/*.md"],
+      "outputs": ["**/*.tsbuildinfo"] // TypeScript incremental cache
+    },
+
+    // ==================== DEVELOPMENT TASKS ====================
+    // Local development servers for package testing
+
+    // dev - Start development servers for packages and apps
+    //
+    // Usage:
+    //   - pnpm dev             = Start all dev servers
+    //   - pnpm dev:core        = Start nextly in watch mode
+    //   - pnpm dev:app         = Start apps/playground Next.js server
+    //
+    // Configuration:
+    //   - cache: false = Dev servers always start fresh (no stale state)
+    //   - persistent: true = Long-running process (doesn't exit)
+    //   - dependsOn: ["^build"] = Needs built dependencies to run
+    //
+    // Why Build Dependencies First:
+    //   - apps/playground imports from nextly and @nextly/admin
+    //   - Those packages must be built for apps/playground to resolve imports
+    //   - After first build, watch mode handles incremental updates
+    "dev": {
+      "cache": false, // Never cache dev servers (always start fresh)
+      "persistent": true, // Long-running process (dev server stays alive)
+      "dependsOn": ["^build"] // Build workspace dependencies first
+    },
+
+    // ==================== CODE QUALITY TASKS ====================
+    // Linting, formatting, and code style enforcement
+
+    // Lint is not a task here: oxlint reads the whole repository in three
+    // passes (`pnpm lint`, scripts/lint.mjs, configured by oxlint.config.mjs),
+    // faster than turbo could fan it out per package.
+
+    // format - Run Prettier to format all files
+    //
+    // Why cache: false:
+    //   - Modifies source files in place
+    //   - Should always check for formatting (not skip based on cache)
+    //
+    // Note: Pre-commit hook (lint-staged) handles formatting automatically
+    // This task is for manual formatting or CI checks
+    "format": {
+      "cache": false, // Always run (formatting is fast anyway)
+      "inputs": ["**/*.{ts,tsx,js,jsx,json,md}"]
+    },
+
+    // ==================== TESTING TASKS ====================
+    // Unit tests, component tests, and coverage reporting
+
+    // test - Run Vitest unit and component tests
+    //
+    // Coverage Status (as of January 2025):
+    //   - nextly: 368 tests (~37% coverage) - RBAC, auth, collections, migrations
+    //   - @nextly/admin: 227 tests (~37% coverage) - forms, tables, UI components
+    //   - Total: 595 tests, 37% overall coverage
+    //   - Target: 60% by Phase 2 end, 80% by Phase 3 end
+    //
+    // Why dependsOn: ["^build"]:
+    //   - Tests import from workspace dependencies
+    //   - Those dependencies must be built first
+    //   - Example: @nextly/admin tests import from nextly
+    //
+    // Usage:
+    //   - pnpm test              = Run all tests once
+    //   - pnpm test:watch        = Watch mode (auto-rerun on changes)
+    //   - pnpm test:coverage     = Generate HTML coverage report
+    //   - pnpm test:ui           = Interactive test UI (localhost:51204)
+    // Benchmarks are a report, not a gate. Never cached, because a cached
+    // timing is a timing from another machine, and run for one package at a
+    // time so nothing else in the workspace is compiling while it measures.
+    "bench": {
+      "dependsOn": ["^build"],
+      "cache": false
+    },
+    // The declaration build the ui package's published-surface guard reads.
+    //
+    // A task rather than something the suite does inside a hook. Measured at
+    // ~13s of work — the suite takes ~800ms when the declarations are already
+    // current and ~12.9s when it has to build them — and it ran under a
+    // wall-clock budget, so on a runner already executing the rest of this
+    // graph the budget was exceeded: the suite failed with a hook timeout on
+    // branches that had not touched the package, and reddened `main` itself.
+    // Here it is scheduled, cached against declared inputs, and under no
+    // deadline.
+    //
+    // Inputs are what the declaration bundler reads. `dist` is deliberately not
+    // an output: the guard builds somewhere private, because other packages
+    // import this one through `dist` while these tests run.
+    "build:surface-declarations": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "src/**/*.{ts,tsx,mts,cts}",
+        "tsdown.config.ts",
+        "tsdown.server-safe.config.ts",
+        "tsconfig.json",
+        "package.json",
+        // The scripts BUILD it, and one of them decides what gets built:
+        // `published-entries` derives the entry list from the exports map. A
+        // change there that no listed file accompanies would otherwise leave
+        // the hash unmoved, replay the cached output, and let the surface suite
+        // pass against declarations produced by the previous derivation.
+        "scripts/**/*.{ts,mts,cts,js,mjs,cjs}"
+      ],
+      "outputs": ["node_modules/.cache/surface-declarations/**"]
+    },
+
+    "test": {
+      // `^build` for built dependencies; `build:surface-declarations` for the
+      // one package that has it. Declared on the shared task rather than on a
+      // package-scoped `@nextlyhq/ui#test`, because a package task REPLACES
+      // this definition rather than merging with it — the long inputs list
+      // below would have to be copied, and a copy is what drifts.
+      //
+      // A package without that script contributes no node, so this costs the
+      // others nothing.
+      "dependsOn": ["^build", "build:surface-declarations"],
+      "inputs": [
+        // `.mts`/`.cts` included for the same reason the JavaScript line
+        // below exists: a file the glob misses is a file whose change cannot
+        // move the hash, so a cached green is replayed over code nothing ran.
+        "src/**/*.{ts,tsx,mts,cts}",
+        "src/**/*.test.{ts,tsx,mts,cts}",
+        "src/**/*.spec.{ts,tsx,mts,cts}",
+        // JavaScript is a test input too. A bundler follows a side-effect import
+        // into a `.js` sibling and ships it, and a guard that reads those files
+        // is cached against a hash that never saw them — so the check would be
+        // skipped in exactly the commit that changed what it checks.
+        "src/**/*.{js,jsx,mjs,cjs}",
+        // Some tests read CSS at runtime (e.g. the token-contrast check parses
+        // theme.css), so CSS is a real test input; without it a CSS-only change
+        // could reuse a cached pass and skip the assertion.
+        "src/**/*.css",
+        // Same reasoning for the package's markdown and manifest. Tests here
+        // assert documentation and packaging against the real code — tokens,
+        // entry points, the stability ledger, the exports map — so a change to
+        // any of them must invalidate the cached result rather than reuse a
+        // pass that never read it. Matched by category rather than by file so
+        // a newly asserted document is covered without editing this list.
+        "docs/**/*.md",
+        "*.md",
+        "package.json",
+        "vitest.config.ts",
+        // A JavaScript-only package's config, so it keeps no TypeScript that
+        // nothing type-checks.
+        "vitest.config.mjs",
+        "tsconfig.json",
+        // Scripts and build configs are read BY tests, not only by builds: the ui suite derives
+        // its entry-point guards from `scripts/published-entries.ts`, which the tsdown configs
+        // also consume, and nextly's suites read the client entries out of its tsdown config.
+        // Without these, retargeting a source barrel or changing an entry's client/server
+        // classification leaves the cache key untouched, so CI replays the previous pass
+        // precisely when the source of truth those guards read has changed.
+        "scripts/**",
+        "tsdown*.config.ts"
+      ],
+      "outputs": ["coverage/**"], // Coverage reports
+      "cache": true // Cache test results (only re-run if inputs change)
+    },
+
+    // create-nextly-app#test - the one package whose tests read files OUTSIDE it.
+    //
+    // 🔴 `scaffold-plugin.test.ts` scaffolds the real repo-root `templates/`,
+    // then imports the scaffolded `vitest.config.ts` and asserts the timeout a
+    // freshly scaffolded suite will boot under. Every input above is
+    // package-relative, and `globalDependencies` covers `packages/tsconfig` and
+    // `scripts` only, so a commit that changes ONLY `templates/plugin/
+    // vitest.config.ts` leaves this task's hash untouched: CI replays a cached
+    // pass and the budget assertion never executes, in precisely the commit
+    // that changed what it asserts.
+    //
+    // A package task REPLACES the shared definition rather than merging, which
+    // is why the comment above discourages one. `$TURBO_DEFAULT$` is what makes
+    // this safe to write anyway: it takes the package's own files without
+    // copying the curated list, so there is nothing here to drift out of step
+    // with it. `dependsOn` is restated because replacement drops that too.
+    "create-nextly-app#test": {
+      "dependsOn": ["^build", "build:surface-declarations"],
+      // The repo-root `skills/` is read by the bundle test, and the coding-agents
+      // docs page by the test that holds it to the update command the CLI
+      // prints, so each is hashed with the templates for the same reason.
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "$TURBO_ROOT$/templates/**",
+        "$TURBO_ROOT$/skills/**",
+        "$TURBO_ROOT$/docs/guides/coding-agents.mdx"
+      ],
+      "outputs": ["coverage/**"],
+      "cache": true
+    },
+
+    // test:integration - Run integration tests against real DBs (F18).
+    //
+    // - Runs only *.integration.test.ts files via vitest.integration.config.ts.
+    // - Reads TEST_<DIALECT>_URL env vars to skip-or-run per dialect.
+    // - cache: false because results depend on the DB container's state, which
+    //   turbo cannot fingerprint. Re-runs every time.
+    // - dependsOn ^build because tests import workspace packages from dist/.
+    "test:integration": {
+      "dependsOn": ["^build"],
+      "inputs": [
+        "src/**/*.{ts,tsx}",
+        "src/**/*.integration.test.{ts,tsx}",
+        "vitest.integration.config.ts",
+        "tsconfig.json"
+      ],
+      "outputs": [],
+      "cache": false,
+      "env": ["TEST_POSTGRES_URL", "TEST_MYSQL_URL", "TEST_SQLITE_URL"],
+      // How many workers run nextly's integration files. Passed through
+      // rather than hashed: the worker count changes how long a run takes,
+      // not its results, and strict environment mode would otherwise drop it.
+      "passThroughEnv": ["NEXTLY_INTEGRATION_WORKERS"]
+    },
+
+    // test:e2e - Drive the admin in a real browser (see e2e/README.md)
+    //
+    // Never cached: the suite starts a server and a fresh database, and its
+    // result depends on the whole composed product rather than on any file set
+    // turbo can fingerprint.
+    //
+    // dependsOn ^build because the playground loads the admin and the plugins
+    // from their built output — a stale dist is a stale test. This only reaches
+    // them because the e2e package declares them as devDependencies; without
+    // that, ^build would build only e2e's own config deps and the suite would
+    // run against whatever dist happened to be lying around.
+    "test:e2e": {
+      "dependsOn": ["^build"],
+      "outputs": [],
+      "cache": false,
+      // GITHUB_STEP_SUMMARY: the flaky reporter appends a table of tests that
+      // passed only on retry. Read rather than written by the suite's logic, so
+      // it changes no result — but it is still an input turbo must know about.
+      // E2E_SETUP_PORT: where the empty install the first-run setup specs use
+      // is served, beside the servers E2E_PORT and E2E_PROD_PORT place.
+      // E2E_SERVER and E2E_PRODUCTION_PREBUILT choose the server the suite
+      // runs against (dev or production) and whether that build is reused;
+      // E2E_DEV_SPECS_ONLY runs only the specs that need the dev server.
+      // E2E_FONT_CATALOGUE_PORT: where the stand-in font catalogue the fonts
+      // spec reads is served, beside E2E_PORT by default.
+      // E2E_HEADER_FOOTER_IN_CODE_ONLY runs only the specs of a site that
+      // draws its header and footer in code, on a playground started so.
+      "env": [
+        "CI",
+        "E2E_DEV_SPECS_ONLY",
+        "E2E_FONT_CATALOGUE_PORT",
+        "E2E_HEADER_FOOTER_IN_CODE_ONLY",
+        "E2E_LANGUAGES_UNLOCKED_ONLY",
+        "E2E_PORT",
+        "E2E_PROD_PORT",
+        "E2E_PRODUCTION_PREBUILT",
+        "E2E_SERVER",
+        "E2E_SETUP_PORT",
+        "GITHUB_STEP_SUMMARY"
+      ]
+    },
+
+    // test:coverage - Generate and display code coverage report
+    //
+    // Same as 'test' but with coverage reporting enabled.
+    // Outputs HTML and terminal coverage reports.
+    "test:coverage": {
+      // `build:surface-declarations` for the same reason `test` has it: the ui
+      // package's surface suite runs here too, and it READS declarations rather
+      // than building them. Without this edge, coverage from a clean tree
+      // reaches that suite with nothing to read.
+      "dependsOn": ["^build", "build:surface-declarations"],
+      "outputs": ["coverage/**"],
+      "cache": true
+    },
+
+    // test:ui - Open Vitest UI for interactive test development
+    //
+    // Interactive test runner with:
+    //   - Visual test execution
+    //   - Component preview
+    //   - Coverage visualization
+    //   - File explorer
+    //
+    // Configuration:
+    //   - cache: false = UI always opens fresh
+    //   - persistent: true = Stays running (dev tool)
+    //
+    // Access: http://localhost:51204 (default Vitest UI port)
+    "test:ui": {
+      "cache": false, // Never cache UI (always open fresh)
+      "persistent": true // Long-running dev tool
+    },
+
+    // test:watch - Run tests in watch mode (auto-rerun on changes)
+    //
+    // Developer workflow:
+    //   1. Start watch mode: pnpm test:watch
+    //   2. Edit source or test files
+    //   3. Tests automatically re-run
+    //   4. See instant feedback in terminal
+    //
+    // Configuration:
+    //   - cache: false = Watch mode manages its own state
+    //   - persistent: true = Stays running until Ctrl+C
+    "test:watch": {
+      "cache": false, // Watch mode doesn't use Turbo cache
+      "persistent": true // Long-running dev tool
+    },
+
+    // ==================== UTILITY TASKS ====================
+    // Cleanup and maintenance tasks
+
+    // clean - Remove build artifacts and caches
+    //
+    // Execution Order:
+    //   - Clean dependencies first (^clean)
+    //   - Then clean current package
+    //
+    // Why cache: false:
+    //   - Destructive operation (deletes files)
+    //   - Should always run (not skip based on cache)
+    //
+    // Usage:
+    //   - pnpm clean           = Clean all packages
+    //   - pnpm clean:cache     = Clean Turbo daemon cache
+    //   - pnpm clean:all       = Full cleanup (node_modules too)
+    //   - pnpm fresh           = clean:all + install + build
+    //
+    // What Gets Cleaned:
+    //   - dist/ folders (built package code)
+    //   - .next/ folders (Next.js build cache)
+    //   - .turbo/ folders (Turbo cache)
+    //   - .tsbuildinfo files (TypeScript incremental cache)
+    "clean": {
+      "dependsOn": ["^clean"], // Clean dependencies first
+      "cache": false // Never cache (destructive operation)
+    }
+  }
+}

@@ -1,0 +1,457 @@
+/**
+ * useUpdateEntry Hook
+ *
+ * TanStack Query mutation hook for updating entries in a collection.
+ * Includes optimistic updates for instant UI feedback with automatic
+ * rollback on error.
+ *
+ * ## Cache Invalidation
+ * Automatically invalidates:
+ * - `["entries", "list", collectionSlug]` - Entry list queries
+ * - `["entries", "detail", collectionSlug, entryId]` - Specific entry detail
+ *
+ * ## Optimistic Updates
+ * The hook implements optimistic updates:
+ * 1. Immediately updates the cached entry with new data
+ * 2. If the mutation fails, rolls back to the previous data
+ * 3. On success, invalidates queries to ensure fresh data
+ *
+ * ## Server Error Mapping
+ * When `setError` is provided, server validation errors are automatically mapped
+ * to form fields, enabling inline error display. Generic toast is only shown when
+ * errors cannot be mapped to specific fields.
+ *
+ * @example
+ * ```tsx
+ * const { mutate: updateEntry, isPending } = useUpdateEntry({
+ *   collectionSlug: 'posts',
+ *   entryId: 'abc123',
+ * });
+ *
+ * updateEntry({ title: 'Updated Title' });
+ * ```
+ *
+ * @example With form error mapping
+ * ```tsx
+ * const form = useForm();
+ * const { mutate: updateEntry } = useUpdateEntry({
+ *   collectionSlug: 'posts',
+ *   entryId: 'abc123',
+ *   setError: form.setError,
+ * });
+ * ```
+ *
+ * @see hooks/queries/useCollections.ts - Reference pattern for mutation hooks
+ * @see services/entryApi.ts - Entry API client
+ * @see lib/errors/error-mapping.ts - Server error mapping utilities
+ */
+
+import {
+  useMutation,
+  useQueryClient,
+  type UseMutationResult,
+} from "@tanstack/react-query";
+import { useCallback } from "react";
+import type { UseFormSetError, FieldValues } from "react-hook-form";
+
+import { toast } from "@admin/components/ui/toaster";
+import { useLocalization } from "@admin/hooks/useLocalization";
+import {
+  type RefusedForm,
+  reloadDocument,
+  useSharedFieldsRecovery,
+} from "@admin/hooks/useSharedFieldsRecovery";
+import { staleVersionOf } from "@admin/lib/document-version";
+import {
+  parseServerErrorMessage,
+  placeServerRefusal,
+} from "@admin/lib/errors/error-mapping";
+import {
+  toastMutationResult,
+  type MutationResult,
+} from "@admin/lib/mutation-warnings";
+import {
+  entryApi,
+  entryKeys,
+  type UpdateEntryPayload,
+} from "@admin/services/entryApi";
+import type { Entry } from "@admin/types/collection";
+
+import { drawnFieldPath } from "./drawn-field-path";
+import { refreshAfterEntryChange } from "./entry-cache";
+import { refreshRemovedFromCodeSchema } from "./removed-from-code-refusal";
+
+/**
+ * Options for useUpdateEntry hook
+ */
+export interface UseUpdateEntryOptions<
+  T = Entry,
+  TFieldValues extends FieldValues = FieldValues,
+> {
+  /** The collection slug/name containing the entry */
+  collectionSlug: string;
+  /** The ID of the entry to update */
+  entryId: string;
+  /** Callback fired on successful update */
+  onSuccess?: (data: T) => void;
+  /** Callback fired on error */
+  onError?: (error: Error) => void;
+  /** Whether to show toast notifications (default: true) */
+  showToast?: boolean;
+  /** Whether to use optimistic updates (default: true) */
+  optimistic?: boolean;
+  /**
+   * React Hook Form setError function for mapping server validation errors to form fields.
+   * When provided, field-level errors from the server will be set on corresponding form fields.
+   */
+  setError?: UseFormSetError<TFieldValues>;
+  /** Content locale — the update targets this language's translatable values. */
+  locale?: string;
+  /** Fallback locale when a translation is missing. */
+  fallbackLocale?: string;
+  /**
+   * Whether the editor reads in draft (working-draft overlay) mode. Part of the
+   * cache identity: it must match the useEntry read key so the optimistic write,
+   * rollback, and query cancellation target the query the editor is showing.
+   */
+  draft?: boolean;
+  /**
+   * Whether the editor's read asks every language's translation state, as
+   * the editor decides it (`useAsksTranslationStatus`). Part of the cache
+   * identity for the same reason `draft` is. Defaults to false.
+   */
+  translationStatus?: boolean;
+  /**
+   * The entry's fields, for the labels a refusal over out-of-date shared
+   * fields names them by; their names are used without them.
+   */
+  fields?: readonly { name?: string; label?: unknown }[];
+  /**
+   * Reads the form's value at a path, for the conditions that decide whether
+   * a field is drawn when a refusal arrives.
+   */
+  valueAt?: (path: string) => unknown;
+  /**
+   * The editor's form. A publish refused over out-of-date shared fields
+   * offers to take the live values only with it: the action saves the form as
+   * it is when taken, and has it show the values taken.
+   */
+  refusedForm?: RefusedForm;
+}
+
+/**
+ * Context for optimistic update rollback
+ */
+interface UpdateContext<T> {
+  previousEntry: T | undefined;
+}
+
+/** No fields: a refusal names fields by their names alone. */
+const NO_FIELDS: readonly { name?: string }[] = [];
+
+/**
+ * useUpdateEntry - Mutation hook for updating an existing entry
+ *
+ * Updates an entry in a collection with optimistic UI updates.
+ * The UI is immediately updated with the new data, providing instant
+ * feedback. If the mutation fails, the changes are rolled back.
+ *
+ * ## Features
+ * - Optimistic updates for instant UI feedback (configurable)
+ * - Automatic rollback on error
+ * - Cache invalidation on success
+ * - Toast notifications for success/error (configurable)
+ * - Loading state management (isPending)
+ * - TypeScript type safety with generic entry type
+ *
+ * ## Optimistic Update Flow
+ * 1. Cancel any in-flight queries for the entry
+ * 2. Snapshot the current entry data
+ * 3. Immediately update the cache with new data
+ * 4. Execute the API call
+ * 5. On error: Rollback to snapshot
+ * 6. On success: Invalidate queries for fresh data
+ *
+ * ## Cache Invalidation
+ * On success, automatically invalidates:
+ * - `["entries", "list", collectionSlug]` - Entry list queries
+ * - `["entries", "detail", collectionSlug, entryId]` - Entry detail query
+ *
+ * @template T - The entry type (defaults to Entry)
+ * @param options - Hook options including collectionSlug, entryId, and callbacks
+ * @returns TanStack Mutation result with mutate function and states
+ *
+ * @example Basic usage
+ * ```tsx
+ * function EditPostForm({ postId }: { postId: string }) {
+ *   const { mutate: updatePost, isPending } = useUpdateEntry({
+ *     collectionSlug: 'posts',
+ *     entryId: postId,
+ *   });
+ *
+ *   const handleSubmit = (data: UpdatePostData) => {
+ *     updatePost(data);
+ *   };
+ *
+ *   return (
+ *     <form onSubmit={handleSubmit}>
+ *       <Button type="submit" disabled={isPending}>
+ *         {isPending ? 'Saving...' : 'Save Changes'}
+ *       </Button>
+ *     </form>
+ *   );
+ * }
+ * ```
+ *
+ * @example With callbacks
+ * ```tsx
+ * function PostEditor({ postId }: { postId: string }) {
+ *   const { mutate: updatePost } = useUpdateEntry({
+ *     collectionSlug: 'posts',
+ *     entryId: postId,
+ *     onSuccess: (post) => {
+ *       console.log('Post updated:', post);
+ *     },
+ *     onError: (error) => {
+ *       console.error('Update failed:', error);
+ *     },
+ *   });
+ *
+ *   return <PostForm onSubmit={updatePost} />;
+ * }
+ * ```
+ *
+ * @example Without optimistic updates
+ * ```tsx
+ * const { mutate: updatePost } = useUpdateEntry({
+ *   collectionSlug: 'posts',
+ *   entryId: postId,
+ *   optimistic: false, // Wait for server confirmation
+ * });
+ * ```
+ *
+ * @example Inline field update
+ * ```tsx
+ * function StatusToggle({ postId, status }: { postId: string; status: string }) {
+ *   const { mutate: updatePost, isPending } = useUpdateEntry({
+ *     collectionSlug: 'posts',
+ *     entryId: postId,
+ *   });
+ *
+ *   const toggleStatus = () => {
+ *     updatePost({
+ *       status: status === 'published' ? 'draft' : 'published',
+ *     });
+ *   };
+ *
+ *   return (
+ *     <Button onClick={toggleStatus} disabled={isPending}>
+ *       {status === 'published' ? 'Unpublish' : 'Publish'}
+ *     </Button>
+ *   );
+ * }
+ * ```
+ *
+ * @see https://tanstack.com/query/v5/docs/react/reference/useMutation
+ * @see https://tanstack.com/query/v5/docs/react/guides/optimistic-updates
+ */
+export function useUpdateEntry<
+  T = Entry,
+  TFieldValues extends FieldValues = FieldValues,
+>({
+  collectionSlug,
+  entryId,
+  onSuccess,
+  onError,
+  showToast = true,
+  optimistic = true,
+  setError,
+  locale,
+  fallbackLocale,
+  draft,
+  translationStatus = false,
+  fields,
+  valueAt,
+  refusedForm,
+}: UseUpdateEntryOptions<T, TFieldValues>): UseMutationResult<
+  MutationResult<T>,
+  Error,
+  UpdateEntryPayload,
+  UpdateContext<T>
+> {
+  const queryClient = useQueryClient();
+  // A publish refused over shared values someone else published since offers
+  // to take them; the reload that follows shows the change brought up to date.
+  const recoverSharedFields = useSharedFieldsRecovery({
+    scope: entryId
+      ? { kind: "collection", slug: collectionSlug, entryId }
+      : null,
+    locale,
+    fields: fields ?? NO_FIELDS,
+    // Answers once the reloaded document is back, which the recovery waits
+    // for before letting the editor save again.
+    onTaken: useCallback(
+      () =>
+        reloadDocument(
+          queryClient,
+          entryKeys.detail(collectionSlug, entryId),
+          locale
+        ),
+      [queryClient, collectionSlug, entryId, locale]
+    ),
+  });
+  const { enabled: localizationEnabled } = useLocalization();
+
+  // The optimistic cache is keyed by the same per-view dimensions useEntry reads
+  // with, built through the shared `detailScoped` helper so the two can never
+  // drift (React Query hashes the object; any mismatch silently no-ops the
+  // optimistic write, rollback, and cancellation). A localized editor reads with
+  // `fallbackLocale: "none"` and, where the user may read every language's
+  // state, `translationStatus` on; draft mode follows the collection's
+  // working-draft split.
+  const localeKey = entryKeys.detailScoped(collectionSlug, entryId, {
+    locale,
+    fallbackLocale: localizationEnabled ? "none" : fallbackLocale,
+    translationStatus,
+    draft,
+  });
+
+  // The mutation resolves to the whole envelope so the success path can report
+  // what failed after the row committed; consumers still receive the entry.
+  return useMutation<
+    MutationResult<T>,
+    Error,
+    UpdateEntryPayload,
+    UpdateContext<T>
+  >({
+    // Under the entry's own detail key, so a reader of this document can ask
+    // whether a save of it is in flight without counting anyone else's.
+    mutationKey: [...entryKeys.detail(collectionSlug, entryId), "update"],
+    mutationFn: async (data: UpdateEntryPayload) => {
+      const result = await entryApi.update(
+        collectionSlug,
+        entryId,
+        data,
+        locale ? { locale, fallbackLocale } : undefined
+      );
+      return result as MutationResult<T>;
+    },
+
+    // Optimistic update: immediately update cache before server responds
+    onMutate: async newData => {
+      if (!optimistic) {
+        return { previousEntry: undefined };
+      }
+
+      // Cancel outgoing queries to prevent race conditions
+      await queryClient.cancelQueries({ queryKey: localeKey });
+
+      // Snapshot previous value for rollback
+      const previousEntry = queryClient.getQueryData<T>(localeKey);
+
+      // Optimistically update cache
+      if (previousEntry) {
+        queryClient.setQueryData<T>(localeKey, old => {
+          if (!old) return old;
+          return { ...old, ...newData };
+        });
+      }
+
+      // Return context for rollback
+      return { previousEntry };
+    },
+
+    // Rollback on error
+    onError: (error: Error, _variables, context) => {
+      // A refusal because the collection was removed from code reads its
+      // schema again, so a screen opened before the removal turns read-only.
+      refreshRemovedFromCodeSchema(queryClient, error);
+
+      // Rollback to previous value
+      if (optimistic && context?.previousEntry) {
+        queryClient.setQueryData(localeKey, context.previousEntry);
+      }
+
+      // A save made from an older version: the editor's conflict tells the
+      // author who changed it and offers what to do, so no toast says it
+      // twice. The entry is read again, so the current version reaches the
+      // editor, whose form keeps the refused edits until the author chooses.
+      if (staleVersionOf(error)) {
+        void queryClient.invalidateQueries({
+          queryKey: entryKeys.detail(collectionSlug, entryId),
+        });
+        onError?.(error);
+        return;
+      }
+
+      // Each reason on the field it names, where the form draws that field;
+      // the form keeps the author's values. Reasons no field can show are
+      // said by the toast below instead.
+      const placed = placeServerRefusal(error, setError, {
+        isFormField: drawnFieldPath(fields, valueAt),
+      });
+      let handledByForm = placed.handled;
+
+      // The out-of-date refusal reports itself, with the action that
+      // resolves it, which works on the editor's form, wherever that form
+      // may write now.
+      if (!handledByForm && refusedForm) {
+        handledByForm = recoverSharedFields(error, refusedForm);
+      }
+
+      // Show generic toast only if errors weren't mapped to form
+      if (showToast && !handledByForm) {
+        const message =
+          placed.toastMessage ??
+          (parseServerErrorMessage(error) ||
+            error.message ||
+            "Failed to update entry");
+        toast.error(message);
+      }
+
+      onError?.(error);
+    },
+
+    // On success, invalidate queries to ensure fresh data
+    onSuccess: result => {
+      const data = result.item;
+      // Write the server's response into the detail cache the editor reads, so
+      // fields it derives server-side are shown at once rather than only after
+      // the invalidation below refetches (which may be slow or fail). The
+      // working-draft split is why this matters: a status-less save returns
+      // `_isWorkingDraft`, and without seeding it here the optimistic merge (of
+      // the status-less payload, which carries no such flag) leaves the editor's
+      // Changed state and Publish/Discard controls hidden until a refetch lands.
+      // Keyed by the same `localeKey` the read uses; merged over the cached entry
+      // so any view-only fields the response omits survive.
+      if (optimistic) {
+        queryClient.setQueryData<T>(localeKey, old => {
+          const merged = old ? { ...old, ...data } : data;
+          // `_isWorkingDraft` is a synthetic flag the server sets only on a
+          // working-draft overlay read; a publish/unpublish response returns the
+          // live document WITHOUT it. Derive it from this response so a stale
+          // cached `true` cannot survive the spread and keep the Changed state
+          // (and Publish/Discard controls) on screen after the sidecar is gone.
+          return {
+            ...merged,
+            _isWorkingDraft:
+              (data as { _isWorkingDraft?: boolean })._isWorkingDraft === true,
+          };
+        });
+      }
+
+      // Its lists, its own read and the dashboard refetch, as after every
+      // change to an entry.
+      void refreshAfterEntryChange(queryClient, collectionSlug, entryId);
+
+      if (showToast) {
+        // The row IS saved even when a post-commit hook failed, so this stays a
+        // success and names the follow-up failure beside it. Reporting an error
+        // would have the user repeat a write that already took effect.
+        toastMutationResult("Entry updated successfully", result.warnings);
+      }
+
+      onSuccess?.(data);
+    },
+  });
+}

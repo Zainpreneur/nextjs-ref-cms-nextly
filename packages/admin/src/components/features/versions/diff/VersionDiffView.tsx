@@ -1,0 +1,420 @@
+/**
+ * Compares two versions of a document.
+ *
+ * Fetches the server-computed diff for a version pair and renders it as the
+ * editor reads a version's changes: how many fields changed ("3 of 9 fields
+ * changed"), the changed fields first with Previous and Next change to move
+ * through them, and the unchanged ones folded behind "Show N unchanged fields".
+ * Owns its own scrolling body and fills the height its host gives it, so a host
+ * supplies a box and this decides how the comparison sits in it.
+ *
+ * Each change is drawn inline by default, as tracked changes; side by side is
+ * the reader's remembered choice (`changes-layout`). In columns, the columns
+ * are a function of THIS element's width — it declares the container the rows
+ * query — so a side by side reads as one wherever there is room for one and
+ * folds into a stack where there is not.
+ *
+ * @module components/features/versions/diff/VersionDiffView
+ */
+
+import type { JSX } from "react";
+import { useEffect, useRef, useState } from "react";
+
+import {
+  Alert,
+  AlertDescription,
+  Button,
+  Skeleton,
+} from "@admin/components/ui";
+import { useVersionDiff } from "@admin/hooks/queries/useVersions";
+import { apiErrorMessage } from "@admin/lib/api/parseApiError";
+import type {
+  FieldDiff,
+  VersionComparisonPart,
+  VersionDiff,
+  VersionScope,
+} from "@admin/services/versionApi";
+
+import { ChangeNav } from "../ChangeNav";
+import { UnchangedFieldsToggle } from "../UnchangedFieldsToggle";
+import { useChangeNavigation } from "../useChangeNavigation";
+import {
+  changesCountText,
+  isFieldChange,
+  isSystemField,
+  versionChangesOf,
+  type NoChanges,
+} from "../version-changes";
+import { baselineLabel } from "../version-pairing";
+import { changeAnchorId } from "../VersionChangesForm";
+
+import {
+  ChangesLayoutProvider,
+  ChangesLayoutToggle,
+  layoutFor,
+  useChangesLayoutPreference,
+  type ChangesLayout,
+} from "./changes-layout";
+import { fieldPathLabel } from "./field-path";
+import { childKey, FieldDiffNode, SystemFieldsProvider } from "./FieldDiffNode";
+
+export interface VersionDiffViewProps {
+  scope: VersionScope;
+  /** Older version being compared. */
+  from: number;
+  /** Newer version being compared. */
+  to: number;
+  /**
+   * The view an address names: inline, or side by side. Absent, the reader's
+   * own remembered choice decides.
+   */
+  view?: "inline" | "side";
+  /**
+   * Hears the reader switch the view, for a page whose address names it;
+   * absent, the switch is remembered as the reader's own choice.
+   */
+  onViewChange?: (layout: ChangesLayout) => void;
+  /**
+   * Hears this pair's comparison reach the screen, once its fields are drawn,
+   * and `null` once it no longer is. Told only from here, where the fields
+   * are drawn, so a host that marks what the reader has seen cannot mark a
+   * comparison it decided was showing while something else filled the space.
+   * The report carries the language the comparison's answer names, which is
+   * authoritative where the host's own address names none.
+   */
+  onShown?: (
+    pair: { from: number; to: number; locale: string | null } | null
+  ) => void;
+  /**
+   * The baseline whose answer already holds this pair's comparison, when the
+   * host drew it from one: the pair is then not asked for again (see
+   * `useVersionDiff`).
+   */
+  seededBy?: string;
+  /** `shared`: the shared fields alone, compared across languages. */
+  part?: VersionComparisonPart;
+}
+
+function DiffSkeleton() {
+  return (
+    <div className="p-4 flex flex-col gap-4" aria-busy="true">
+      <span className="sr-only" role="status" aria-live="polite">
+        Loading comparison
+      </span>
+      {[0, 1, 2].map(i => (
+        <div key={i} className="flex flex-col gap-1.5">
+          <Skeleton className="h-3 w-24" />
+          <Skeleton className="h-4 w-full" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * The fields of a comparison, as the reader meets them: those that changed
+ * (the server lists a removed field last), then those the reader may not read,
+ * which are named so their absence is not taken for no change, then the
+ * unchanged and the system ones, each kept back until asked for.
+ */
+function arrangeFields(fields: readonly FieldDiff[]) {
+  const system = fields.filter(isSystemField);
+  const authored = fields.filter(node => !isSystemField(node));
+  return {
+    changed: authored.filter(isFieldChange),
+    hidden: authored.filter(node => node.kind === "hidden"),
+    unchanged: authored.filter(
+      node => node.kind !== "hidden" && !isFieldChange(node)
+    ),
+    system,
+  };
+}
+
+const NO_CHANGES_TEXT: Record<NoChanges, string> = {
+  system: "Only system fields changed.",
+  unseen: "No changes in the fields you can read.",
+  identical: "These two versions are identical.",
+};
+
+function NoChangesNote({
+  note,
+  systemToggle,
+}: {
+  note: NoChanges;
+  systemToggle: React.ReactNode;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-2 py-3">
+      <p className="text-sm text-muted-foreground">{NO_CHANGES_TEXT[note]}</p>
+      {/* The control that shows them, beside the words that say so. */}
+      {note === "system" ? systemToggle : null}
+    </div>
+  );
+}
+
+/** Shows or hides the framework columns every document keeps. */
+function SystemFieldsToggle({
+  shown,
+  onToggle,
+}: {
+  shown: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="sm"
+      aria-expanded={shown}
+      onClick={onToggle}
+    >
+      {shown ? "Hide system fields" : "Show system fields"}
+    </Button>
+  );
+}
+
+/** A top-level field the moves can land on: in view, and focused. */
+function ChangeAnchor({
+  node,
+  children,
+}: {
+  node: FieldDiff;
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      id={changeAnchorId(node.name)}
+      tabIndex={-1}
+      className="scroll-mt-4 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      {children}
+    </div>
+  );
+}
+
+/**
+ * The baseline the server resolved `from` with, said in words read from its name ("since-approved"
+ * reads "Since approved"), so a baseline another feature registers reads here as core's do, with
+ * no list of names in the admin. Nothing for a pair chosen by number, which names no baseline.
+ */
+function BaselineNote({
+  diff,
+}: {
+  diff: VersionDiff | undefined;
+}): JSX.Element | null {
+  const baseline = diff?.baseline;
+  if (!baseline) return null;
+  const name = baselineLabel(baseline.name);
+  // A baseline whose version retention removed names the one standing in for it.
+  const which =
+    baseline.replaces === undefined
+      ? `version ${baseline.versionNo}`
+      : `version ${baseline.versionNo}, as version ${baseline.replaces} was removed`;
+  return (
+    <span className="text-muted-foreground">
+      Compared from: {name} ({which}).
+    </span>
+  );
+}
+
+export function VersionDiffView({
+  scope,
+  from,
+  to,
+  view,
+  onViewChange,
+  onShown,
+  seededBy,
+  part,
+}: VersionDiffViewProps): JSX.Element {
+  const [remembered, remember] = useChangesLayoutPreference();
+  // The address's view wins over the remembered one, so a shared link opens
+  // the comparison as its sender saw it.
+  const preference: ChangesLayout =
+    view === undefined ? remembered : view === "side" ? "split" : "inline";
+  const setLayout = onViewChange ?? remember;
+  const [showUnchanged, setShowUnchanged] = useState(false);
+  const [showSystem, setShowSystem] = useState(false);
+  // Every field, so the count and the fold are of the whole document: the
+  // unchanged ones are folded here rather than left out by the server.
+  const diff = useVersionDiff({
+    scope,
+    from,
+    to,
+    modifiedOnly: false,
+    ...(seededBy !== undefined ? { seededBy } : {}),
+    ...(part !== undefined ? { part } : {}),
+  });
+  const arranged = arrangeFields(diff.data?.fields ?? []);
+  const changes = diff.data ? versionChangesOf(diff.data) : null;
+  const order = arranged.changed.map(node => node.name);
+  // Said only when no authored field changed.
+  const note =
+    changes && arranged.changed.length === 0 ? changes.whenNone : null;
+  const { layout, splittable } = layoutFor(
+    preference,
+    changes?.byField.values() ?? []
+  );
+  const nav = useChangeNavigation(order);
+  // The change the position is on, named as its field is in the list.
+  const currentChange = arranged.changed[nav.position];
+  const currentChangeLabel = currentChange
+    ? fieldPathLabel(currentChange, 0)
+    : undefined;
+  // Which of the body's states is drawn, decided once so the body and the
+  // report below cannot disagree about it.
+  const body = diff.isLoading
+    ? "loading"
+    : diff.isError
+      ? "error"
+      : diff.data
+        ? "fields"
+        : "empty";
+  // This pair is on screen only when its own fields are: another pair's
+  // answer kept while this one loads draws fields that are not this pair's.
+  const drawn = body === "fields" && !diff.isPlaceholderData;
+  // Read through a ref, so a host that hands a new callback each render does
+  // not report the same showing again.
+  const onShownRef = useRef(onShown);
+  onShownRef.current = onShown;
+  // The drawn comparison's own language, read once it is drawn.
+  const drawnLocale = drawn ? (diff.data?.locale ?? null) : null;
+  useEffect(() => {
+    if (!drawn) return;
+    onShownRef.current?.({ from, to, locale: drawnLocale });
+    return () => onShownRef.current?.(null);
+  }, [drawn, from, to, drawnLocale]);
+
+  return (
+    // The container the field rows query. Their columns are a function of the
+    // width available HERE, not of the viewport: the same view sits in surfaces
+    // of different widths, and only its own box knows whether two columns fit.
+    <ChangesLayoutProvider value={layout}>
+      <div className="@container/diff flex min-h-0 flex-1 flex-col">
+        <div className="flex flex-wrap items-center gap-2 px-4 py-3 border-b border-border">
+          {/* What is on screen, in words: the pair while the column headings
+              are not there to say it, then how much of it changed. */}
+          <p className="text-sm text-muted-foreground" aria-live="polite">
+            <span className={layout === "split" ? "@2xl/diff:hidden" : ""}>
+              Comparing version{" "}
+              <span className="font-medium text-foreground">{from}</span> &rarr;{" "}
+              <span className="font-medium text-foreground">{to}</span>.{" "}
+            </span>
+            <BaselineNote diff={diff.data} />{" "}
+            {changes ? (
+              // Its own element, so the count reads, and is found, apart from
+              // the pair named before it.
+              <span className="font-medium text-foreground">
+                {changesCountText({
+                  changed: changes.byField.size,
+                  total: changes.total,
+                  incomplete: changes.incomplete,
+                })}
+              </span>
+            ) : null}
+          </p>
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            {arranged.changed.length > 0 ? (
+              <ChangeNav
+                changed={arranged.changed.length}
+                position={nav.position}
+                onMove={nav.move}
+                currentLabel={currentChangeLabel}
+              />
+            ) : null}
+            <ChangesLayoutToggle
+              layout={layout}
+              onChange={setLayout}
+              splittable={splittable}
+            />
+          </div>
+        </div>
+
+        {/* Column headings for the two sides, side by side only, on the same
+            grid and padding as each row's value pair so they sit over the
+            columns they name. Outside the scrolling body rather than sticky
+            within it, so a field far down a long document is still readable as
+            belonging to one version or the other. */}
+        {layout === "split" ? (
+          <div className="hidden grid-cols-2 gap-4 border-b border-border px-4 py-2 @2xl/diff:grid">
+            <p className="pr-4 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Version {from}
+            </p>
+            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Version {to}
+            </p>
+          </div>
+        ) : null}
+
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {body === "loading" ? (
+            <DiffSkeleton />
+          ) : body === "error" ? (
+            <div className="p-4 flex flex-col gap-3">
+              <Alert variant="destructive">
+                <AlertDescription>
+                  {apiErrorMessage(diff.error) ||
+                    "This comparison could not be loaded."}
+                </AlertDescription>
+              </Alert>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void diff.refetch()}
+              >
+                Try again
+              </Button>
+            </div>
+          ) : body === "fields" ? (
+            <SystemFieldsProvider value={showSystem}>
+              <div className="flex flex-col px-4 pb-4">
+                {note ? (
+                  <NoChangesNote
+                    note={note}
+                    systemToggle={
+                      <SystemFieldsToggle
+                        shown={showSystem}
+                        onToggle={() => setShowSystem(shown => !shown)}
+                      />
+                    }
+                  />
+                ) : null}
+                {arranged.changed.map(node => (
+                  <ChangeAnchor key={childKey(node)} node={node}>
+                    <FieldDiffNode node={node} />
+                  </ChangeAnchor>
+                ))}
+                {arranged.hidden.map(node => (
+                  <FieldDiffNode key={childKey(node)} node={node} />
+                ))}
+                {showUnchanged
+                  ? arranged.unchanged.map(node => (
+                      <FieldDiffNode key={childKey(node)} node={node} />
+                    ))
+                  : null}
+                {showSystem
+                  ? arranged.system.map(node => (
+                      <FieldDiffNode key={childKey(node)} node={node} />
+                    ))
+                  : null}
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <UnchangedFieldsToggle
+                    count={arranged.unchanged.length}
+                    shown={showUnchanged}
+                    onToggle={() => setShowUnchanged(shown => !shown)}
+                  />
+                  {arranged.system.length > 0 && note !== "system" ? (
+                    <SystemFieldsToggle
+                      shown={showSystem}
+                      onToggle={() => setShowSystem(shown => !shown)}
+                    />
+                  ) : null}
+                </div>
+              </div>
+            </SystemFieldsProvider>
+          ) : null}
+        </div>
+      </div>
+    </ChangesLayoutProvider>
+  );
+}

@@ -1,0 +1,128 @@
+/**
+ * Media tables — SQLite.
+ *
+ * Tables: media, mediaFolders.
+ * Moved verbatim from packages/nextly/src/database/schema/sqlite.ts as part of
+ * Plan A schemas consolidation. No behavior change.
+ *
+ * Cross-table `relations()` blocks live in `../_dialect-bundles/sqlite.relations.ts` and are
+ * re-exported at the bottom of this file. See `./postgres.ts` for the
+ * rationale.
+ *
+ * @module schemas/media/sqlite
+ * @since v0.0.3-alpha (Plan A — schemas consolidation)
+ */
+
+import type { BuildColumns } from "drizzle-orm";
+import { sqliteTable, integer, text, index } from "drizzle-orm/sqlite-core";
+
+import { MEDIA_INDEXES, sqliteIndexes } from "../_internal/core-indexes";
+import { sqliteTimestamp } from "../_internal/sqlite-timestamp";
+import { users } from "../users/sqlite";
+
+/** `media` columns, a fresh builder record per call (see `core-table-contributions`). */
+export function mediaColumns() {
+  return {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+
+    // File identification
+    filename: text("filename").notNull(),
+    originalFilename: text("original_filename").notNull(),
+    mimeType: text("mime_type").notNull(),
+    size: integer("size").notNull(),
+
+    // Image/video dimensions
+    width: integer("width"),
+    height: integer("height"),
+    duration: integer("duration"),
+
+    // Storage URLs
+    url: text("url").notNull(),
+    thumbnailUrl: text("thumbnail_url"),
+
+    // Crop point for smart image cropping (percentage from top-left, 0-100)
+    focalX: integer("focal_x"),
+    focalY: integer("focal_y"),
+
+    // Metadata
+    altText: text("alt_text"),
+    caption: text("caption"),
+    tags: text("tags"), // SQLite stores JSON as TEXT
+
+    // Folder organization (null for root/unorganized files)
+    // Note: FK reference uses arrow function for forward reference since mediaFolders is defined later
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    folderId: text("folder_id").references((): any => mediaFolders.id, {
+      onDelete: "set null",
+    }),
+
+    // Ownership and timestamps
+    // Nullable: CLI seeds, data imports, and other system-context uploads
+    // may not have a user to attribute the upload to.
+    uploadedBy: text("uploaded_by").references(() => users.id, {
+      onDelete: "cascade",
+    }),
+    uploadedAt: sqliteTimestamp("uploaded_at"),
+    updatedAt: sqliteTimestamp("updated_at"),
+  };
+}
+
+/** `media` indexes, from `MEDIA_INDEXES`. */
+export function mediaExtraConfig(
+  t: BuildColumns<"media", ReturnType<typeof mediaColumns>, "sqlite">
+) {
+  return sqliteIndexes(MEDIA_INDEXES, t);
+}
+
+/**
+ * Media table for storing uploaded files and images
+ *
+ * Supports various storage backends (Vercel Blob, S3, R2, local filesystem)
+ * Stores file metadata in database, actual files in configured storage
+ *
+ * SQLite variant - uses TEXT for timestamps and JSON as text
+ */
+export const media = sqliteTable("media", mediaColumns(), mediaExtraConfig);
+
+/**
+ * Media Folders table for organizing media files (SQLite)
+ *
+ * Supports nested folder hierarchy for better media organization.
+ * Folders can contain subfolders and media files.
+ */
+export const mediaFolders = sqliteTable(
+  "media_folders",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+
+    // Folder information
+    name: text("name").notNull(),
+    description: text("description"),
+
+    // Hierarchy
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    parentId: text("parent_id").references((): any => mediaFolders.id, {
+      onDelete: "cascade",
+    }), // Null for root folders
+
+    // Ownership and timestamps
+    createdBy: text("created_by")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    createdAt: integer("created_at", { mode: "timestamp" })
+      .notNull()
+      .$defaultFn(() => new Date()),
+    updatedAt: integer("updated_at", { mode: "timestamp" })
+      .notNull()
+      .$defaultFn(() => new Date()),
+  },
+  t => [
+    index("media_folders_parent_id_idx").on(t.parentId),
+    index("media_folders_created_by_idx").on(t.createdBy),
+    index("media_folders_created_at_idx").on(t.createdAt),
+  ]
+);

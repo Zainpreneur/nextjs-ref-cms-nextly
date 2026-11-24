@@ -1,0 +1,150 @@
+/**
+ * How the Needs your attention card reads its answer: the server's order kept, counts as the
+ * card writes them, failed items and reasons, and only links inside the admin.
+ */
+import { digestTotal } from "nextly/attention-keys";
+import { describe, expect, it } from "vitest";
+
+import { attentionRows } from "./needs-attention-model";
+
+const item = (fields: Record<string, unknown>) => ({
+  id: "core/overdue-releases",
+  kind: "overdue",
+  label: "Overdue releases",
+  count: 2,
+  severity: "critical",
+  link: "releases?tab=attention&reason=overdue",
+  ...fields,
+});
+
+describe("attentionRows", () => {
+  it("keeps the answer's order, which the server ranked, rather than sorting again", () => {
+    // Out of the server's own rank on purpose: a card that sorted would put critical first.
+    const rows = attentionRows({
+      items: [
+        item({ id: "seo/a", label: "A", severity: "warning", count: 1 }),
+        item({ id: "core/stopped-releases", label: "Stopped", count: 9 }),
+      ],
+    });
+    expect(rows.map(row => row.id)).toEqual(["seo/a", "core/stopped-releases"]);
+  });
+
+  it("writes each count as the card does: whole, a floor as N+, and 99+ past the cap", () => {
+    const rows = attentionRows({
+      items: [
+        item({ id: "a/1", count: 7 }),
+        item({ id: "a/2", count: 7, atLeast: true }),
+        item({ id: "a/3", count: 150 }),
+      ],
+    });
+    expect(rows.map(row => row.title)).toEqual([
+      "Overdue releases · 7",
+      "Overdue releases · 7+",
+      "Overdue releases · 99+",
+    ]);
+    expect(rows.map(row => row.spoken)).toEqual([
+      "Overdue releases: 7",
+      "Overdue releases: 7 or more",
+      "Overdue releases: 99 or more",
+    ]);
+  });
+
+  it("marks core's release items with the part of Needs attention they count, and no other item", () => {
+    const rows = attentionRows({
+      items: [
+        item({ id: "core/stopped-releases" }),
+        item({ id: "core/overdue-releases" }),
+        item({ id: "seo/overdue-releases" }),
+        item({ id: "toString" }),
+        item({ id: "core/overdue-releases", failed: true }),
+      ],
+    });
+    expect(rows.map(row => row.releases)).toEqual([
+      "stopped",
+      "overdue",
+      undefined,
+      undefined,
+      undefined,
+    ]);
+  });
+
+  it("draws a failed item by its label alone, with no count", () => {
+    const [row] = attentionRows({ items: [item({ count: 0, failed: true })] });
+    expect(row).toMatchObject({ failed: true, title: "Overdue releases" });
+  });
+
+  it("carries the reason when there is one, and none when there is not", () => {
+    const [given, absent] = attentionRows({
+      items: [
+        item({ reason: "Still scheduled after its time." }),
+        item({ id: "a/2" }),
+      ],
+    });
+    expect(given.reason).toBe("Still scheduled after its time.");
+    expect(absent).not.toHaveProperty("reason");
+  });
+
+  it("links only inside the admin, and leaves out what it cannot draw", () => {
+    const rows = attentionRows({
+      items: [
+        item({ link: "collections/pages" }),
+        item({ id: "a/2", link: "//elsewhere.example/x" }),
+        item({ id: "a/3", link: "javascript:alert(1)" }),
+        { id: "a/4" },
+        "not an item",
+      ],
+    });
+    expect(rows).toHaveLength(3);
+    expect(rows[0].href).toMatch(/\/collections\/pages$/);
+    expect(rows[1]).not.toHaveProperty("href");
+    expect(rows[2]).not.toHaveProperty("href");
+    expect(attentionRows(undefined)).toEqual([]);
+    expect(attentionRows({ items: "x" })).toEqual([]);
+  });
+
+  it("draws exactly the items the dashboard header counts, whatever else the answer holds", () => {
+    // The header's number is `digestTotal` over the same items; the card's
+    // title count is its row count. Undrawable entries of every shape, so a
+    // card that drew one the header skips, or skipped one it counts, differs.
+    const items: unknown[] = [
+      item({ id: "a/1" }),
+      item({ id: "a/2", count: 0, failed: true }),
+      item({ id: "" }),
+      item({ id: "a/4", label: "" }),
+      item({ id: "a/5", label: 7 }),
+      { id: "a/6" },
+      [item({ id: "a/7" })],
+      "not an item",
+      null,
+    ];
+    const rows = attentionRows({ items });
+    expect(rows.map(row => row.id)).toEqual(["a/1", "a/2"]);
+    expect(rows).toHaveLength(digestTotal(items).count);
+  });
+
+  it("draws a single item by its label alone, with how to fix it from Nextly's documentation only", () => {
+    const docs = "https://nextlyhq.com/docs/database/encrypted-connections";
+    const rows = attentionRows({
+      items: [
+        item({
+          id: "core/system-connection-unencrypted",
+          label: "Database connection is not encrypted",
+          count: 1,
+          single: true,
+          help: docs,
+        }),
+        item({ id: "a/2", help: "https://elsewhere.example/docs" }),
+        item({ id: "a/3", help: "http://nextlyhq.com/docs" }),
+        item({ id: "a/4", help: "javascript:alert(1)" }),
+      ],
+    });
+    expect(rows[0]).toMatchObject({
+      title: "Database connection is not encrypted",
+      spoken: "Database connection is not encrypted",
+      help: docs,
+    });
+    for (const row of rows.slice(1)) expect(row).not.toHaveProperty("help");
+    // Not single: the count is said.
+    expect(rows[1].title).toBe("Overdue releases · 2");
+  });
+});

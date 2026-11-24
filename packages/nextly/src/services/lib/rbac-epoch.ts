@@ -1,0 +1,639 @@
+/**
+ * The RBAC epoch: how many times authorization data has changed, install-wide.
+ *
+ * Every cache of an authorization answer is filed under the epoch it was
+ * computed at, and an answer filed under an older one is not served. The
+ * counter it replaces was a module variable, so it moved only in the process
+ * that handled the change: a second instance neither saw the move nor had one
+ * of its own, and served what it had cached until the entry aged out.
+ *
+ * ## Read from memory, refreshed on a timer
+ *
+ * `currentEpoch()` is synchronous because the checks that ask it are — they sit
+ * between a read and a cache write, on a path taken on every request. So the
+ * value is held in memory and refreshed by `refreshEpoch()`, which the async
+ * entry points call before they capture the epoch they will file under.
+ *
+ * The refresh is rate-limited to one read per {@link EPOCH_TTL_MS}. That
+ * interval is the bound on how long an instance can be unaware of another
+ * instance's change, and it buys back the per-request query the naive version
+ * would cost: one indexed read per second per instance rather than one per
+ * authorization check.
+ *
+ * An instance's OWN change is not subject to that delay. `bumpEpoch` advances
+ * the in-memory value as soon as the write lands, so the process that made the
+ * change never serves a stale answer of its own making.
+ *
+ * ## Degrading when the table is not there
+ *
+ * An installation upgraded from a version without this table has no row to read
+ * until `nextly db:sync` reconciles the core tables. Every read and write here
+ * therefore degrades to the previous behaviour — a counter local to this
+ * process — rather than failing the authorization check that asked. The
+ * degraded state is strictly what the install had before, so it cannot be worse
+ * than not having upgraded; it is reported once so an operator can see why
+ * cross-instance invalidation is not yet in effect.
+ *
+ * @module services/lib/rbac-epoch
+ */
+import { randomUUID } from "node:crypto";
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import { eq, sql } from "drizzle-orm";
+
+import { container } from "../../di/container";
+import { getAuthLogger } from "../../lib/logger";
+import { RBAC_EPOCH_ROW_ID, rbacEpochTables } from "../../schemas/rbac-epoch";
+import { coalesce } from "../../shared/lib/coalesce";
+
+/**
+ * How long a read of the shared counter is reused.
+ *
+ * This is the bound on cross-instance staleness, so it is deliberately short.
+ * A second is long enough to collapse a burst of authorization checks onto one
+ * query and short enough that a revocation is everywhere before an operator has
+ * finished watching for it.
+ */
+export const EPOCH_TTL_MS = 1000;
+
+/**
+ * What this process knows of the epoch, held in one place for every copy of
+ * this module in the process: a production build of a Next.js app loads a
+ * package's modules once per route and rendering layer, and the service
+ * container they reach is shared on `globalThis`. A role changed through one
+ * copy, while a check asked through a service another copy registered kept its
+ * own epoch, was retired there only at that copy's next read of the shared row,
+ * as on another instance. An instance's own change is seen at once by every
+ * copy only if they hold the one epoch.
+ */
+interface EpochState {
+  /**
+   * The epoch this process is currently answering with, and when it was read.
+   *
+   * `readAt` is zero until the first successful read, which is what makes the
+   * first `refreshEpoch()` of a process actually go to the database rather than
+   * trusting an initial value nothing established.
+   */
+  revision: number;
+  generation: string;
+  readAt: number;
+
+  /**
+   * A refresh already on its way, shared by every ORDINARY caller while it runs.
+   *
+   * Without this the interval bounds how often a read STARTS being allowed, not
+   * how many run: every check arriving after expiry sees the same stale `readAt`
+   * and issues its own query before any of them finishes, so a burst turns one
+   * read per second into one per request — the cost this design exists to avoid.
+   *
+   * A forced caller does not join it; see {@link refreshEpoch}. Held as the
+   * one entry of a map of shared reads (`coalesce`, the shared helper every
+   * followed value reads through), under {@link EPOCH_READ}.
+   */
+  readsUnderWay: Map<typeof EPOCH_READ, Promise<string>>;
+
+  /**
+   * The same read under way, as module builds from before {@link readsUnderWay}
+   * keep it. A dev server keeps this state across a module reload, and an
+   * older build of this module may still be running beside this one, its own
+   * read still pending. So this build both honours a read it finds here (it
+   * joins or waits it out exactly as one of its own) and mirrors its own read
+   * here (so an older build joins it in turn): only ever one read at a time,
+   * whichever build began it, which is what {@link persistPendingBumps} and
+   * the epoch's order rely on.
+   */
+  inFlight: Promise<string> | null;
+
+  /**
+   * Local invalidations the shared row has not accepted yet.
+   *
+   * Only ever above zero while the shared store is unreachable. It is a COUNT
+   * rather than a second epoch on purpose: two counters that both advance
+   * diverge, and the local one then wins every comparison, so an instance that
+   * invalidated while degraded would stay permanently ahead and stop noticing
+   * anybody else's changes. Nothing here invents an epoch; the only values
+   * `epoch` ever takes are ones the shared row gave it.
+   */
+  pendingBumps: number;
+
+  /**
+   * Whether the value this process is answering with came from the row.
+   *
+   * A write can land and the read that follows it fail, which leaves this
+   * process holding the value from BEFORE the write while owing nothing: the
+   * count is clear, so every stamp comparison starts passing again — against a
+   * stamp that predates the change. Trust needs both halves, so it is tracked
+   * as its own fact rather than inferred from the backlog being empty.
+   */
+  observed: boolean;
+
+  /**
+   * How many retirements are running right now.
+   *
+   * A retirement forgets what this process keeps and publishes the epoch, and
+   * the publish is an awaited database write, preceded, while the retired
+   * stored answers still exist, by emptying them: while those run the epoch has
+   * not moved yet, so a check that starts and finishes inside that window sees
+   * two values that never changed and keeps an answer the change is about to
+   * retire. A batch of permission writes holds this for its whole length, where
+   * the deferral is deliberate and the window is as long as the batch.
+   *
+   * It lives HERE rather than beside the caches because every tier has to ask
+   * it and only some of them remembered to. The one that did not was a derived
+   * cache in another module, which no list of maps to clear was ever going to
+   * reach.
+   */
+  retirements: number;
+
+  /**
+   * Whether the shared counter has been found not to be in play.
+   *
+   * Held so the warning is emitted once rather than on every check: an install
+   * that has not reconciled its core tables would otherwise log per request,
+   * and a log nobody can read is the same as no log.
+   */
+  degraded: boolean;
+
+  /**
+   * Retirements this process made and could not announce.
+   *
+   * A retirement whose shared half failed publishes nothing, so every other
+   * instance keeps the epoch it has. This process still knows the roles
+   * changed. Counted into its own stamps, the retirement makes everything it
+   * filed before no longer current HERE, in every cache that asks
+   * {@link stampIsCurrent}, including the ones in other modules. The count is
+   * never written to the shared row and no other instance compares against it,
+   * so it is not a second epoch: the shared value stays whatever the row last
+   * gave.
+   */
+  unannounced: number;
+}
+
+/** A process that has read nothing yet, and owes and runs nothing. */
+function freshState(): EpochState {
+  return {
+    revision: 0,
+    generation: "",
+    readAt: 0,
+    readsUnderWay: new Map(),
+    inFlight: null,
+    pendingBumps: 0,
+    observed: true,
+    retirements: 0,
+    degraded: false,
+    unannounced: 0,
+  };
+}
+
+/** On `globalThis`, as the container is, so every copy holds this one. */
+const globalForEpoch = globalThis as unknown as {
+  __nextly_rbacEpoch?: EpochState;
+};
+const state = (globalForEpoch.__nextly_rbacEpoch ??= freshState());
+// A dev server keeps `globalThis` across a module reload, so the state may
+// have been made by an older build of this module, which held its shared read
+// as `inFlight` alone. The map this build keeps its own read in is added
+// where the state lacks it; a read the older build left under way stays in
+// `inFlight`, where `readUnderWay` finds it.
+(state as Partial<EpochState>).readsUnderWay ??= new Map();
+(state as Partial<EpochState>).inFlight ??= null;
+
+/**
+ * The narrow view of the query builder this module uses.
+ *
+ * `getDrizzle()` is typed `unknown` because the concrete builder differs per
+ * driver, and the repository narrows it structurally at each call site rather
+ * than casting — the same shape `services/lib/permissions.ts` declares for its
+ * reads. Spelling out only the three statements used here keeps the module
+ * typed without an escape hatch, and makes a driver that stops offering one of
+ * them a compile error rather than a runtime one.
+ */
+interface EpochRow {
+  revision: number;
+  generation: string;
+}
+interface EpochSelect extends Promise<EpochRow[]> {
+  from(table: unknown): EpochSelect;
+  where(condition: unknown): EpochSelect;
+  limit(count: number): EpochSelect;
+}
+interface EpochInsert extends Promise<unknown> {
+  values(row: Record<string, unknown>): EpochInsert;
+  // Postgres and SQLite spell the upsert one way, MySQL the other. Both are
+  // optional so a builder offering neither is a branch rather than a crash.
+  onConflictDoUpdate?: (config: {
+    target: unknown;
+    set: Record<string, unknown>;
+  }) => Promise<unknown>;
+  onDuplicateKeyUpdate?: (config: {
+    set: Record<string, unknown>;
+  }) => Promise<unknown>;
+}
+interface EpochUpdate extends Promise<unknown> {
+  set(patch: Record<string, unknown>): EpochUpdate;
+  where(condition: unknown): EpochUpdate;
+}
+interface EpochExecutor {
+  select(projection: Record<string, unknown>): EpochSelect;
+  insert(table: unknown): EpochInsert;
+  update(table: unknown): EpochUpdate;
+}
+
+function adapter(): DrizzleAdapter {
+  return container.get<DrizzleAdapter>("adapter");
+}
+
+function executor(): EpochExecutor {
+  return adapter().getDrizzle();
+}
+
+function epochTable() {
+  const { dialect } = adapter().getCapabilities();
+  return rbacEpochTables(dialect).nextlyRbacEpoch;
+}
+
+/** The table is not there, which is a schema an upgrade has not reached. */
+const TABLE_NOT_RECONCILED =
+  "RBAC epoch table unreadable; cache invalidation is local to this " +
+  "process until `nextly db:sync` reconciles the core tables";
+
+/** The table is there and will not hold the one row, which is not a schema gap. */
+const ROW_NOT_ESTABLISHED =
+  "RBAC epoch row could not be established; this process cannot tell whether " +
+  "a cached authorization answer belongs to the store it is now reading, so " +
+  "it serves none until the row can be written and read back";
+
+/**
+ * Warn once that the shared counter is not in play, saying which way.
+ *
+ * The two ways here have different remedies: a table that is not there yet is
+ * what `nextly db:sync` reconciles, while a row that will not persist is a
+ * permission or a storage problem no schema command can fix. One message for
+ * both sends an operator to the wrong place, so the caller names its own.
+ */
+function reportDegraded(message: string, detail?: string): void {
+  if (state.degraded) return;
+  state.degraded = true;
+  getAuthLogger()?.log?.("warn", {
+    category: "auth",
+    op: "cache",
+    message,
+    ...(detail === undefined ? {} : { error: detail }),
+  });
+}
+
+/**
+ * The epoch to file a cached answer under, without going to the database.
+ *
+ * Callers that are about to READ and then cache should call
+ * {@link refreshEpoch} first, so the value they file under reflects any change
+ * another instance made.
+ */
+export function currentEpoch(): string {
+  const published = publishedEpoch();
+  return state.unannounced === 0
+    ? published
+    : `${published}+${String(state.unannounced)}`;
+}
+
+/** The epoch as the shared row last gave it, which every instance sees. */
+export function publishedEpoch(): string {
+  return `${state.generation}:${String(state.revision)}`;
+}
+
+/**
+ * Make everything this process filed before now no longer current here, and
+ * announce nothing; see {@link unannounced}.
+ */
+export function retireHereOnly(): void {
+  state.unannounced += 1;
+}
+
+/**
+ * May a cached answer be trusted at all right now?
+ *
+ * False while this process holds invalidations the shared row has not
+ * accepted. Its epoch is then a value other instances have never seen, so
+ * comparing anything against it says nothing about whether that answer is
+ * current — and the honest response to "I cannot tell" on an authorization
+ * decision is to recompute rather than to serve.
+ *
+ * The cost lands only on an installation whose core tables are not reconciled
+ * AND which has since changed a role: it stops serving from cache until
+ * `nextly db:sync` runs. That is a visible, self-correcting slowdown rather
+ * than an invisible stale grant, and it is the direction to fail in.
+ */
+export function epochIsTrustworthy(): boolean {
+  return state.pendingBumps === 0 && state.observed;
+}
+
+/**
+ * May an answer filed under `stamp` still be used?
+ *
+ * The one place that question is answered, because it has three askers and they
+ * were not asking the same thing. Comparing the stamp is only half of it: a
+ * match means nothing while this process holds invalidations the shared row has
+ * not accepted, since the value being matched against is then one no other
+ * instance has ever seen. A tier that compares stamps and omits the trust check
+ * looks correct beside one that does not, and serves a revoked answer for its
+ * whole life on an install whose epoch table is not yet reconciled.
+ *
+ * Every cache derives its own predicate from this rather than restating it:
+ * the kept actors add their expiry, and the API key's copied grants add their
+ * own freshness window.
+ */
+export function stampIsCurrent(stamp: string): boolean {
+  // Nothing is current while a retirement is running. The caches it is emptying
+  // are not all empty yet and the epoch has not moved, so the comparison below
+  // would compare two values that have not changed since the answer was
+  // computed — and pass.
+  if (state.retirements > 0) return false;
+  if (!epochIsTrustworthy()) return false;
+  return stamp === currentEpoch();
+}
+
+/**
+ * Run a retirement, with nothing servable or cacheable for its length.
+ *
+ * Scoped rather than begin-and-end, so the release cannot be missed on a path
+ * that threw — and a partial retirement is exactly when serving from cache is
+ * worst.
+ *
+ * Nested calls collapse by counting: a batch of permission writes holds one of
+ * these open across its whole body while each write inside it opens another.
+ */
+export async function duringRetirement<T>(run: () => Promise<T>): Promise<T> {
+  state.retirements += 1;
+  try {
+    return await run();
+  } finally {
+    state.retirements -= 1;
+  }
+}
+
+/**
+ * Bring this process's copy of the epoch up to date, at most once per TTL.
+ *
+ * Answers the epoch it settled on, so a caller can capture it in the same
+ * expression rather than reading it again afterwards and racing its own
+ * refresh.
+ */
+export async function refreshEpoch(options?: {
+  force?: boolean;
+}): Promise<string> {
+  const force = options?.force === true;
+  if (!force && Date.now() - state.readAt < EPOCH_TTL_MS) return currentEpoch();
+
+  // Joining a read already running is honest for an ordinary caller: it asked
+  // for a value no older than the interval, and that read will supply one.
+  //
+  // It is not honest for a FORCED caller. The only reason to force is to
+  // observe something that has just happened, and a read already in flight may
+  // have queried before it — handing that back answers with an observation
+  // older than the write it exists to confirm, which is the whole of the
+  // post-write verification. So a forced caller waits out the reads ahead of it
+  // and then makes one of its own.
+  if (!force) {
+    const running = readUnderWay();
+    if (running) return running;
+  } else {
+    // Sequential by design: each read ahead of this one has to finish before a
+    // new observation may start, or the observation is not a new one.
+    let ahead = readUnderWay();
+    while (ahead) {
+      await ahead;
+      ahead = readUnderWay();
+    }
+  }
+
+  // A new read every caller after it joins, mirrored where an older build of
+  // this module looks for one (see `inFlight`).
+  const reading = coalesce(state.readsUnderWay, EPOCH_READ, readShared);
+  state.inFlight = reading;
+  reading.then(
+    () => forgetMirror(reading),
+    () => forgetMirror(reading)
+  );
+  return reading;
+}
+
+/**
+ * The read under way, whichever build of this module began it: this build's
+ * own, or one an older build still running left in `inFlight`.
+ */
+function readUnderWay(): Promise<string> | undefined {
+  return state.readsUnderWay.get(EPOCH_READ) ?? state.inFlight ?? undefined;
+}
+
+/** Clear the mirrored read once it settles, unless another replaced it. */
+function forgetMirror(reading: Promise<string>): void {
+  if (state.inFlight === reading) state.inFlight = null;
+}
+
+/** The key the epoch's one shared read is held under. */
+const EPOCH_READ = "epoch";
+
+async function readShared(): Promise<string> {
+  // Which of the two degraded reports a failure below belongs to. Once the row
+  // has been found missing, the table has just answered a read, so nothing from
+  // that point on is a table an upgrade has not reached: a rejected create and
+  // a read-back that fails are both the row failing to be established.
+  let establishing = false;
+  try {
+    // Owed invalidations go in BEFORE the value comes out, and that order is
+    // the point: a read taken first answers with a number that does not
+    // include them, and this process would then adopt it as authoritative and
+    // trust its caches again while the change it made is still nowhere.
+    await persistPendingBumps();
+
+    let rows = await selectSharedRow();
+    if (rows.length === 0) {
+      // A missing row is not a failure: the table exists and nothing has
+      // invalidated yet, which is epoch zero. It is not an IDENTITY, though,
+      // and answering `:0` for it gives every never-yet-invalidated store the
+      // same stamp — so a failover onto a different one, or a restore from a
+      // backup taken before its first role change, leaves every cached answer
+      // looking current. That is precisely what `generation` exists to catch,
+      // and epoch zero is where a fresh install sits for longest.
+      //
+      // So the row is created rather than imagined, and read back. Adding zero
+      // is the same statement the bump path makes, which is why it IS that
+      // statement: the row is created with an identity when absent and left
+      // alone when present, decided by the database rather than by a
+      // check-then-insert two instances can both win.
+      //
+      // Trust drops HERE, ahead of the write rather than after it. A store with
+      // no row cannot confirm the identity this process is holding, and that
+      // identity came from whichever store answered last. Waiting for the write
+      // is waiting for something that may never come back: a rejected insert,
+      // which is what a read-only credential gives, goes straight to the catch
+      // below with the previous store's stamp still trusted, and every answer
+      // cached against that store then reads as current for as long as this
+      // process runs.
+      state.observed = false;
+      establishing = true;
+      await raiseSharedRevision(0);
+      rows = await selectSharedRow();
+    }
+    // Adopted whole, and never maxed against a local value. The row is the only
+    // authority: taking the larger of the two is what let a process that had
+    // invalidated while degraded stay permanently ahead of everyone else, and
+    // taking only the number is what let a REPLACED store read as the same one.
+    const adopted = rows.length > 0;
+    state.revision = adopted ? Number(rows[0].revision) : 0;
+    state.generation = adopted ? String(rows[0].generation) : "";
+    state.readAt = Date.now();
+    if (adopted) {
+      state.degraded = false;
+      // The value came from the row, which is the only thing that makes it
+      // worth comparing against.
+      state.observed = true;
+    } else {
+      // Seeded without an error and still absent. Zero is still the answer
+      // rather than a refused authorization check, but it is an answer with no
+      // identity behind it, so it is not one to measure a cached stamp against.
+      reportDegraded(ROW_NOT_ESTABLISHED);
+    }
+  } catch (error) {
+    reportDegraded(
+      establishing ? ROW_NOT_ESTABLISHED : TABLE_NOT_RECONCILED,
+      String(error)
+    );
+    // Rate-limit the FAILING path too. Left unset, a missing table means one
+    // failing query per authorization check rather than one per interval,
+    // which is the upgrade window turned into a load problem.
+    state.readAt = Date.now();
+  }
+  return currentEpoch();
+}
+
+/**
+ * Push the invalidations this process owes into the shared row.
+ *
+ * ## Exactly one drain runs at a time, and this depends on it
+ *
+ * The count is read, sent, and subtracted around an await. Two drains
+ * overlapping would each subtract a backlog the other had already sent, taking
+ * the count NEGATIVE: nothing could be served from cache again, and the next
+ * invalidation would publish an increment of zero, so the change that raised it
+ * would reach no other instance at all.
+ *
+ * What rules that out is not a lock here but the shape of the only path in.
+ * This is called from one place, the top of {@link readShared}; `readShared` is
+ * called from one place, {@link refreshEpoch}, through `coalesce`, which
+ * checks for a read under way and registers a new one with no await in
+ * between, so a second read cannot start while one is running; a read an
+ * older build of this module left under way (`inFlight`) is joined or waited
+ * out the same way. A second caller added anywhere else
+ * would need its own answer to this, and the subtraction is where it would go
+ * wrong.
+ *
+ * ## The count stays owed until the row has it
+ *
+ * Subtracted only after the statement resolves, so a write nobody accepted
+ * leaves this process distrusting its caches rather than believing it has
+ * caught up — and so does a write still in flight, which the row has not
+ * accepted yet either.
+ */
+/** The one row, read. */
+async function selectSharedRow(): Promise<EpochRow[]> {
+  const table = epochTable();
+  return executor()
+    .select({ revision: table.revision, generation: table.generation })
+    .from(table)
+    .where(eq(table.id, RBAC_EPOCH_ROW_ID))
+    .limit(1);
+}
+
+/**
+ * Add `by` to the shared revision, creating the row with an identity if absent.
+ *
+ * ONE statement, so there is no row count to read and no create-or-update
+ * branch to get wrong. The previous shape asked the driver how many rows an
+ * UPDATE touched and inserted when the answer was zero, which is three
+ * different result shapes across three drivers and a silent no-op whenever one
+ * of them is misread — the counter then sticks at its first value and every
+ * later invalidation is lost, while every individual statement succeeds. An
+ * upsert cannot have that failure: the row is created if it is absent and
+ * incremented if it is present, decided by the database.
+ *
+ * `by` is zero when the caller only needs the row to EXIST, which is the same
+ * statement rather than a second one — so seeding an empty store cannot drift
+ * from bumping a live one.
+ */
+async function raiseSharedRevision(by: number): Promise<void> {
+  const table = epochTable();
+  const insert = executor().insert(table).values({
+    id: RBAC_EPOCH_ROW_ID,
+    revision: by,
+    // Only ever written when the row is CREATED; the conflict branch below
+    // leaves it alone, so a live counter keeps its identity for life.
+    generation: randomUUID(),
+    updatedAt: new Date(),
+  });
+  const raise = {
+    target: table.id,
+    set: {
+      revision: sql`${table.revision} + ${by}`,
+      updatedAt: new Date(),
+    },
+  };
+  if (typeof insert.onConflictDoUpdate === "function") {
+    await insert.onConflictDoUpdate(raise);
+  } else if (typeof insert.onDuplicateKeyUpdate === "function") {
+    // MySQL spells the same statement differently and takes no target.
+    await insert.onDuplicateKeyUpdate({ set: raise.set });
+  } else {
+    await insert;
+  }
+}
+
+async function persistPendingBumps(): Promise<void> {
+  const owed = state.pendingBumps;
+  if (owed === 0) return;
+
+  await raiseSharedRevision(owed);
+
+  state.pendingBumps -= owed;
+  // The row has moved and this process has not seen where to. Until a read
+  // succeeds, the value here is the one from before the write, so nothing may
+  // be compared against it.
+  state.observed = false;
+}
+
+/**
+ * Record that authorization data changed, install-wide.
+ *
+ * The increment is one statement the database evaluates itself, so two
+ * instances invalidating at the same moment produce two increments rather than
+ * one lost update — which a read-modify-write from here would not.
+ *
+ * The value this process then answers with is READ BACK rather than assumed.
+ * Inventing `epoch + 1` locally is what made a degraded instance diverge, and
+ * it is also simply wrong whenever somebody else bumped in the same interval.
+ * Spelled as a FORCED refresh rather than as a second write path, because
+ * pushing the backlog and adopting what the row then says are already the two
+ * halves of one read: {@link refreshEpoch} drains before it queries, and
+ * forcing is what guarantees the query it makes is one this change is inside
+ * rather than an older one already in flight.
+ *
+ * A failed write leaves the count owed rather than applied, and
+ * {@link epochIsTrustworthy} then reports that nothing here may be served from
+ * cache until the shared row accepts it.
+ */
+export async function bumpEpoch(): Promise<string> {
+  state.pendingBumps += 1;
+  return refreshEpoch({ force: true });
+}
+
+/**
+ * Forget everything this process knows, for a test that needs a clean one.
+ *
+ * The module holds the epoch, the time it was read and whether the table has
+ * been found unreadable, and a suite asserting any of those has to be able to
+ * start from nothing. Exported rather than reached through a mock because the
+ * state is this module's own.
+ */
+export function resetEpochForTests(): void {
+  Object.assign(state, freshState());
+}

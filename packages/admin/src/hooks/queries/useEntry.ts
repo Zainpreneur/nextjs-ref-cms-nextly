@@ -1,0 +1,257 @@
+/**
+ * useEntry Hook
+ *
+ * TanStack Query hook for fetching a single entry by ID from a collection.
+ * Follows the established pattern from useCollection with proper
+ * cache management.
+ *
+ * ## Query Keys
+ *
+ * - `["entries", "detail", collectionSlug]` - Base key for collection entry details
+ * - `["entries", "detail", collectionSlug, entryId]` - Specific entry detail
+ *
+ * @example
+ * ```ts
+ * // Invalidate specific entry
+ * queryClient.invalidateQueries({ queryKey: entryKeys.detail('posts', 'abc123') });
+ *
+ * // Invalidate all entries in a collection
+ * queryClient.invalidateQueries({ queryKey: entryKeys.detailsByCollection('posts') });
+ * ```
+ *
+ * @see hooks/queries/useCollections.ts - Reference pattern for query hooks
+ * @see services/entryApi.ts - Entry API client
+ */
+
+import type {
+  UseQueryOptions,
+  NoInfer,
+  UseQueryResult,
+} from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+
+import { useIsKnownSingle } from "@admin/hooks/current-user-access";
+import { entryApi, entryKeys, type FindParams } from "@admin/services/entryApi";
+import type { Entry } from "@admin/types/collection";
+
+import { readCarryingStored, storedEntryKey } from "./stored-entry-seed";
+
+/**
+ * Options for useEntry hook
+ */
+export interface UseEntryOptions<T = Entry> {
+  /** The collection slug/name to fetch the entry from */
+  collectionSlug: string;
+  /** The entry ID to fetch (optional - query won't run without it) */
+  entryId?: string;
+  /** Whether the query should execute (default: true when entryId is provided) */
+  enabled?: boolean;
+  /** Depth for relationship population (0-10) */
+  depth?: number;
+  /** Locale for localized fields */
+  locale?: string;
+  /** Fallback locale when translation is missing */
+  fallbackLocale?: string;
+  /**
+   * Request the per-locale `_translations` overview map (which languages are translated
+   * + each one's draft/published status) for the per-language status pills.
+   */
+  translationStatus?: boolean;
+  /** Whether to include draft content */
+  draft?: boolean;
+  /**
+   * Ask for the entry as stored in the same answer, and hand it to the depth-0
+   * read `useStoredEntry` keeps in the same language and view, so the edit
+   * page's two reads are one request. The entry is cached without it.
+   */
+  carriesStored?: boolean;
+  /** Additional TanStack Query options */
+  queryOptions?: Omit<
+    UseQueryOptions<T, Error>,
+    "queryKey" | "queryFn" | "enabled"
+  >;
+}
+
+/**
+ * useEntry - Query hook for fetching a single entry by ID
+ *
+ * Fetches a single entry's details from a collection by its unique ID.
+ * Only runs when both collectionSlug and entryId are provided.
+ * Automatically caches result for fast navigation.
+ *
+ * ## Features
+ * - Conditional execution (only runs when entryId exists)
+ * - Automatic caching with 1 minute staleTime
+ * - Relationship depth control (depth parameter)
+ * - Localization support (locale, fallbackLocale)
+ * - Draft content support
+ * - TypeScript type safety with generic entry type
+ *
+ * ## Query Key Structure
+ * `["entries", "detail", collectionSlug, entryId]` - Hierarchical key for single entry
+ *
+ * @template T - The entry type (defaults to Entry)
+ * @param options - Hook options including collectionSlug and entryId
+ * @returns TanStack Query result with entry data, loading state, and error state
+ *
+ * @example Basic usage
+ * ```tsx
+ * function PostDetail({ postId }: { postId?: string }) {
+ *   const { data: post, isLoading, error } = useEntry({
+ *     collectionSlug: 'posts',
+ *     entryId: postId,
+ *   });
+ *
+ *   if (!postId) return <div>No post selected</div>;
+ *   if (isLoading) return <Skeleton />;
+ *   if (error) return <Alert>Error: {error.message}</Alert>;
+ *   if (!post) return <div>Post not found</div>;
+ *
+ *   return (
+ *     <article>
+ *       <h1>{post.title}</h1>
+ *       <div>{post.content}</div>
+ *     </article>
+ *   );
+ * }
+ * ```
+ *
+ * @example With relationship depth
+ * ```tsx
+ * function PostWithAuthor({ postId }: { postId: string }) {
+ *   const { data: post } = useEntry({
+ *     collectionSlug: 'posts',
+ *     entryId: postId,
+ *     depth: 2, // Populate author and author's role
+ *   });
+ *
+ *   return (
+ *     <article>
+ *       <h1>{post?.title}</h1>
+ *       <span>By: {post?.author?.name}</span>
+ *     </article>
+ *   );
+ * }
+ * ```
+ *
+ * @example With custom entry type
+ * ```tsx
+ * interface Post extends Entry {
+ *   title: string;
+ *   content: string;
+ *   author: { id: string; name: string };
+ * }
+ *
+ * function TypedPostDetail({ postId }: { postId: string }) {
+ *   const { data: post } = useEntry<Post>({
+ *     collectionSlug: 'posts',
+ *     entryId: postId,
+ *   });
+ *
+ *   // post is typed as Post | undefined
+ *   return <h1>{post?.title}</h1>;
+ * }
+ * ```
+ *
+ * @example Edit form with prefetching
+ * ```tsx
+ * function EditPostPage({ postId }: { postId: string }) {
+ *   const { data: post, isLoading } = useEntry({
+ *     collectionSlug: 'posts',
+ *     entryId: postId,
+ *   });
+ *
+ *   if (isLoading) return <FormSkeleton />;
+ *   if (!post) return <NotFound />;
+ *
+ *   return <PostForm defaultValues={post} />;
+ * }
+ * ```
+ *
+ * @see https://tanstack.com/query/v5/docs/react/reference/useQuery
+ */
+export function useEntry<T = Entry>({
+  collectionSlug,
+  entryId,
+  enabled = true,
+  depth,
+  locale,
+  fallbackLocale,
+  draft,
+  translationStatus,
+  carriesStored = false,
+  queryOptions,
+}: UseEntryOptions<T>): UseQueryResult<NoInfer<T>, Error> {
+  const queryClient = useQueryClient();
+  // Part of the key, so a read that answered 404 before the capabilities
+  // answer named the slug a Single is asked again once it does. Only a known
+  // Single's key carries it: a collection's key stays the one the mutation
+  // hooks write to.
+  const knownSingle = useIsKnownSingle(collectionSlug);
+  return useQuery<T, Error>({
+    // Locale is part of the cache identity — switching languages must refetch the
+    // entry (the localized field values differ per locale), not serve the previous language.
+    // The cache identity is built through the shared `detailScoped` helper so the
+    // mutation hook's optimistic-update key stays in lockstep with this read key.
+    // `draft` is part of it: the editor learns `draftsEnabled` only after the
+    // schema loads, flipping `draft` false -> true on a cold load, and without it
+    // in the key the stale-time would keep serving the live row and hide an
+    // existing working draft (and the Changed / Publish / Discard affordances).
+    queryKey: entryId
+      ? [
+          ...entryKeys.detailScoped(collectionSlug, entryId, {
+            locale,
+            fallbackLocale,
+            translationStatus,
+            draft,
+          }),
+          ...(knownSingle ? ["single"] : []),
+        ]
+      : entryKeys.detailsByCollection(collectionSlug),
+    queryFn: async () => {
+      // Safety check: This shouldn't execute due to `enabled` flag,
+      // but provides defense against logic changes or direct queryFn calls
+      if (!entryId) {
+        throw new Error("Entry ID is required");
+      }
+
+      const options: Pick<
+        FindParams,
+        "depth" | "locale" | "fallbackLocale" | "draft" | "translationStatus"
+      > = {};
+      if (depth !== undefined) options.depth = depth;
+      if (locale) options.locale = locale;
+      if (fallbackLocale) options.fallbackLocale = fallbackLocale;
+      if (draft !== undefined) options.draft = draft;
+      if (translationStatus) options.translationStatus = true;
+
+      // Type assertion needed because entryApi.findByID returns Entry
+      // but we want to support generic entry types
+      // A 404 is read again as a Single only for a slug the capabilities
+      // answer names one; for any other slug it is the server's answer.
+      const read = (stored: boolean) =>
+        entryApi.findByID(
+          collectionSlug,
+          entryId,
+          stored
+            ? { ...options, stored }
+            : Object.keys(options).length > 0
+              ? options
+              : undefined,
+          { knownSingle }
+        );
+      if (!carriesStored) return (await read(false)) as T;
+      const storedKey = storedEntryKey(collectionSlug, entryId, {
+        locale,
+        fallbackLocale,
+        draft,
+      });
+      return (await readCarryingStored(queryClient, storedKey, () =>
+        read(true)
+      )) as T;
+    },
+    enabled: enabled && !!collectionSlug && !!entryId,
+    staleTime: 60_000, // 1 minute
+    ...queryOptions,
+  });
+}

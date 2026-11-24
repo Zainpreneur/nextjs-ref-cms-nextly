@@ -1,0 +1,232 @@
+/**
+ * Codes for `nextly upgrade` and its steps, and for the move of an earlier
+ * release's migration records, which `nextly migrate` makes.
+ *
+ * @module cli/errors/areas/upgrade
+ */
+
+import type { NextlyError } from "../../../errors/nextly-error";
+import type { CliErrorParts } from "../cli-error";
+import { defineCodes } from "../define";
+
+/** The events table a refusal names, as the step recorded it. */
+function eventsTable(error: NextlyError): string {
+  const table = error.logContext?.table;
+  return typeof table === "string" ? table : "nextly_schema_events";
+}
+
+/**
+ * A refusal's first sentence as what happened and the rest as the next step, with the cause
+ * between: the upgrade's refusals say what and next, and leave the cause to the reader.
+ */
+function whatThenNext(message: string, why: string): CliErrorParts {
+  const end = message.indexOf(". ");
+  if (end === -1) {
+    return { what: message, why, next: "Run `nextly upgrade` again." };
+  }
+  return {
+    what: message.slice(0, end + 1),
+    why,
+    next: message.slice(end + 2),
+  };
+}
+
+/**
+ * What a backup refusal of the data steps left: nothing changed, or, where
+ * the command had changed the schema by then, those changes applied and
+ * the stored data as it was.
+ */
+function leftAsItWas(error: NextlyError): string {
+  return error.logContext?.afterMigrations === true
+    ? "The schema changes of this run had applied by then, and stay applied; the stored data was left as it is."
+    : "Nothing was changed.";
+}
+
+/**
+ * A localisation step's refusal, whose message states what was found, then the step that settles
+ * it, then that nothing was changed: the sentence before that closing one is the next step.
+ */
+function foundThenStep(message: string, why: string): CliErrorParts {
+  const closing = " Nothing was changed.";
+  const body = message.endsWith(closing)
+    ? message.slice(0, -closing.length)
+    : message;
+  const end = body.lastIndexOf(". ");
+  if (end === -1) {
+    return { what: body, why, next: "Run `nextly migrate` again." };
+  }
+  return { what: body.slice(0, end + 1), why, next: body.slice(end + 2) };
+}
+
+export const UPGRADE_CODES = defineCodes({
+  UPGRADE_CANCELLED: {
+    cause:
+      "The backup prompt of `nextly upgrade` was answered no, so the upgrade did not run.",
+    retired: {
+      why: "`nextly upgrade` no longer changes stored data: `nextly migrate` and `nextly i18n:convert-zoned-dates` do, and a no at their backup question ends them as `DATA_STEPS_BACKUP_DECLINED`.",
+    },
+  },
+  UPGRADE_BACKUP_NOT_CONFIRMED: {
+    cause:
+      "`nextly upgrade` would change the database, and no backup was confirmed, with no terminal attached to ask.",
+    retired: {
+      why: "`nextly upgrade` no longer changes stored data: `nextly migrate` and `nextly i18n:convert-zoned-dates` do, and without a confirmed backup or a terminal they end as `DATA_STEPS_BACKUP_NOT_CONFIRMED`.",
+    },
+  },
+  UPGRADE_CANNOT_START: {
+    cause:
+      "`nextly upgrade` could not read the project it was run in, or the registry the project uses, so it changed nothing.",
+  },
+  UPGRADE_RELEASE_UNKNOWN: {
+    cause:
+      "`nextly upgrade` could not tell which release to move to: the one given is not published, or the installed release's channel names none, so it changed nothing.",
+  },
+  UPGRADE_PACKAGE_CANNOT_MOVE: {
+    cause:
+      "A Nextly package of the project cannot move to the release `nextly upgrade` was moving to, so no package was moved.",
+  },
+  UPGRADE_INSTALL_FAILED: {
+    cause:
+      "The package manager failed while `nextly upgrade` was moving the packages, and the project was put back as it was.",
+  },
+  UPGRADE_NOT_RESTORED: {
+    cause:
+      "The package manager failed while `nextly upgrade` was moving the packages, and the installed packages could not be put back.",
+  },
+  UPGRADE_WORK_MOVED: {
+    cause:
+      "`nextly upgrade` was run for the database work it used to do, which `nextly migrate` and `nextly i18n:convert-zoned-dates` now do, so it changed nothing.",
+  },
+  DATA_STEPS_BACKUP_NOT_CONFIRMED: {
+    cause:
+      "A command would change data an earlier Nextly release stored, and no backup was confirmed, with no terminal attached to ask.",
+    from: [
+      {
+        code: "NEXTLY_UPGRADE_IN_PROGRESS",
+        reason: "data-steps-backup-not-confirmed",
+        describe: error =>
+          whatThenNext(
+            error.publicMessage,
+            `No terminal is attached to ask whether the database is backed up, and \`--backup-confirmed\` was not passed. ${leftAsItWas(error)}`
+          ),
+      },
+    ],
+  },
+  DATA_STEPS_BACKUP_DECLINED: {
+    cause:
+      "A command would change data an earlier Nextly release stored, and its backup question was answered no.",
+    from: [
+      {
+        code: "NEXTLY_UPGRADE_IN_PROGRESS",
+        reason: "data-steps-backup-declined",
+        describe: error =>
+          whatThenNext(
+            error.publicMessage,
+            `The command rewrites stored values in place, so it asks for a backup first, and the answer was no. ${leftAsItWas(error)}`
+          ),
+      },
+    ],
+  },
+  MIGRATE_BACKUP_NOT_CONFIRMED: {
+    cause:
+      "`nextly migrate` found the migration records of an earlier Nextly release, and no backup was confirmed, with no terminal attached to ask.",
+    from: [
+      {
+        code: "NEXTLY_UPGRADE_IN_PROGRESS",
+        reason: "migrate-backup-not-confirmed",
+        describe: error =>
+          whatThenNext(
+            error.publicMessage,
+            "No terminal is attached to ask whether the database is backed up, and `--backup-confirmed` was not passed. Nothing was changed."
+          ),
+      },
+    ],
+  },
+  MIGRATE_BACKUP_DECLINED: {
+    cause:
+      "`nextly migrate` found the migration records of an earlier Nextly release, and its backup question was answered no.",
+    from: [
+      {
+        code: "NEXTLY_UPGRADE_IN_PROGRESS",
+        reason: "migrate-backup-declined",
+        describe: error =>
+          whatThenNext(
+            error.publicMessage,
+            "`nextly migrate` moves those records into `nextly_schema_events` and drops the tables that held them, so it asks for a backup first, and the answer was no. Nothing was changed."
+          ),
+      },
+    ],
+  },
+  MIGRATE_LEDGER_UNREADABLE: {
+    cause:
+      "`nextly migrate` found a `nextly_migrations` table of an earlier Nextly release holding records it cannot read, so it moved none of them.",
+    from: [
+      {
+        code: "NEXTLY_UPGRADE_TABLE_NAME_COLLISION",
+        reason: "migrate-ledger-unreadable",
+        describe: error =>
+          whatThenNext(
+            error.publicMessage,
+            "`nextly migrate` moves the records an earlier release kept in `nextly_migrations` into `nextly_schema_events`, and reads every one before writing any. One of them it cannot read, so nothing was changed."
+          ),
+      },
+    ],
+  },
+  MIGRATE_EVENTS_TABLE_TAKEN: {
+    cause:
+      "A table of another shape already has the name `nextly migrate` moves the migration records of an earlier Nextly release into.",
+    from: [
+      {
+        code: "NEXTLY_UPGRADE_TABLE_NAME_COLLISION",
+        reason: "migrate-events-table-taken",
+        describe: error =>
+          whatThenNext(
+            error.publicMessage,
+            `\`nextly migrate\` moves the migration records of an earlier release into "${eventsTable(error)}", and the table there does not have the columns it writes. Nothing was changed.`
+          ),
+      },
+    ],
+  },
+  MIGRATE_LANGUAGE_CODES_COLLIDE: {
+    cause:
+      "Two language codes, configured or stored, become one code once written in standard form, so `nextly migrate` changed nothing.",
+    from: [
+      {
+        code: "NEXTLY_LANGUAGE_CODES_COLLIDE",
+        describe: error =>
+          foundThenStep(
+            error.publicMessage,
+            "`nextly migrate` keeps every language under its standard code, and these two would become one, putting two languages' values in one place. Nothing was changed."
+          ),
+      },
+    ],
+  },
+  MIGRATE_LOCALIZATION_UNRESOLVED: {
+    cause:
+      "`nextly migrate` found stored translations it cannot move into the layout this release keeps without choosing between two values, so it changed nothing.",
+    from: [
+      {
+        code: "NEXTLY_UPGRADE_LOCALISATION_UNRESOLVED",
+        describe: error =>
+          foundThenStep(
+            error.publicMessage,
+            "`nextly migrate` moves stored translations into the layout this release keeps, and moves nothing it would have to guess at. Nothing was changed."
+          ),
+      },
+    ],
+  },
+  UPGRADE_LEDGER_UNREADABLE: {
+    cause:
+      "`nextly upgrade` found a `nextly_migrations` table holding records it cannot read, so it moved none of them.",
+    retired: {
+      why: "`nextly upgrade` no longer moves the migration records of an earlier release: `nextly migrate` does, and a `nextly_migrations` table it cannot read ends it as `MIGRATE_LEDGER_UNREADABLE`.",
+    },
+  },
+  UPGRADE_EVENTS_TABLE_TAKEN: {
+    cause:
+      "A table of another shape already has the name `nextly upgrade` moves the migration records into.",
+    retired: {
+      why: "`nextly upgrade` no longer moves the migration records of an earlier release: `nextly migrate` does, and a table of another shape under the events table's name ends it as `MIGRATE_EVENTS_TABLE_TAKEN`.",
+    },
+  },
+});

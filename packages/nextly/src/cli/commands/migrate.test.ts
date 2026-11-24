@@ -1,0 +1,1230 @@
+// Plan C2: `nextly migrate` is now Phase 0/1/2 over `nextly_schema_events`.
+// The old F11 ledger internals (recordMigration, findPendingMigrations) are
+// gone; their logic is replaced by Phase 1/2 which is unit-tested in
+// domains/schema/migrate/{core-reconcile,drift-reconcile}.test.ts. This file
+// now pins the command registration surface.
+
+import Database from "better-sqlite3";
+import { Command } from "commander";
+import { describe, expect, it, vi } from "vitest";
+
+import { executeTransaction } from "../../domains/schema/migrate/migration-transaction";
+import {
+  assertRunnableStatements,
+  marksNoTransaction,
+  statementRefusals,
+  transactionControlOf,
+} from "../../domains/schema/migrate/split-sql";
+
+import { registerMigrateCommand, splitSqlStatements } from "./migrate";
+
+describe("registerMigrateCommand", () => {
+  it("registers the migrate command with --dry-run and --step", () => {
+    const program = new Command();
+    registerMigrateCommand(program);
+
+    const migrate = program.commands.find(c => c.name() === "migrate");
+    expect(migrate).toBeDefined();
+
+    const longFlags = migrate!.options.map(o => o.long);
+    expect(longFlags).toContain("--dry-run");
+    expect(longFlags).toContain("--step");
+  });
+});
+
+describe("splitSqlStatements", () => {
+  // A comment mentioning a DDL keyword survives the line filter, so its prose
+  // reaches the scanner. An apostrophe there is prose, not an opening quote:
+  // counted as one it opens a string that never closes, which stops every later
+  // semicolon from separating statements and hands the driver one merged
+  // statement it rejects.
+  it("does not let an apostrophe in a comment merge the statements after it", () => {
+    const sql = [
+      `CREATE TABLE "a" ("id" TEXT);`,
+      `-- SQLite doesn't support FK constraints inline; add via ALTER TABLE`,
+      `CREATE TABLE "b" ("id" TEXT);`,
+      `CREATE INDEX "i" ON "b" ("id");`,
+    ].join("\n");
+
+    const statements = splitSqlStatements(sql);
+
+    // Each DDL statement lands in its own chunk. Asserted by which statement is
+    // where rather than by count alone, since three chunks split at the wrong
+    // points would also be three.
+    expect(statements).toHaveLength(3);
+    expect(statements[0]).toContain('CREATE TABLE "a"');
+    expect(statements[1]).toContain('CREATE TABLE "b"');
+    expect(statements[2]).toContain('CREATE INDEX "i"');
+    // The merge this guards against puts two DDL statements in one chunk.
+    for (const statement of statements) {
+      expect(statement.match(/\bCREATE\b/g)).toHaveLength(1);
+    }
+  });
+
+  it("still treats an apostrophe in a string literal as a string", () => {
+    const sql = `INSERT INTO "t" ("v") VALUES ('a;b');\nCREATE TABLE "u" ("id" TEXT);`;
+
+    const statements = splitSqlStatements(sql);
+
+    expect(statements).toHaveLength(2);
+    expect(statements[0]).toContain("'a;b'");
+  });
+
+  it("does not split on a semicolon inside a block comment", () => {
+    const sql = `/* first; second */\nCREATE TABLE "a" ("id" TEXT);`;
+
+    expect(splitSqlStatements(sql)).toHaveLength(1);
+  });
+  // MySQL starts a `--` comment only when the next character is whitespace or a
+  // control character, so `n--1` is arithmetic. Treating it as a comment would
+  // swallow the line's semicolon and merge the next statement into this one,
+  // which the driver rejects as a multi-statement query.
+  it("does not treat `--` as a comment on mysql when no whitespace follows", () => {
+    const sql = [
+      `UPDATE "t" SET "n" = 5--1;`,
+      `CREATE TABLE "a" ("id" TEXT);`,
+    ].join("\n");
+
+    const statements = splitSqlStatements(sql, "mysql");
+
+    expect(statements).toHaveLength(2);
+    expect(statements[0]).toContain("5--1");
+    expect(statements[1]).toContain('CREATE TABLE "a"');
+  });
+
+  // The same text on postgres IS a comment, so the two dialects must disagree
+  // here. Asserted in both directions, because a predicate that always returned
+  // one answer would satisfy either test on its own.
+  it("treats the same `--` as a comment on postgres", () => {
+    const sql = [
+      `UPDATE "t" SET "n" = 5--1;`,
+      `CREATE TABLE "a" ("id" TEXT);`,
+    ].join("\n");
+
+    // The comment runs to end of line and takes the semicolon with it, so the
+    // UPDATE and the CREATE arrive as one chunk.
+    expect(splitSqlStatements(sql, "postgresql")).toHaveLength(1);
+  });
+
+  it("still comments on mysql when whitespace follows the dashes", () => {
+    const sql = [
+      `CREATE TABLE "a" ("id" TEXT);`,
+      `-- MySQL doesn't mind an apostrophe here; it is still a comment`,
+      `CREATE TABLE "b" ("id" TEXT);`,
+    ].join("\n");
+
+    const statements = splitSqlStatements(sql, "mysql");
+
+    expect(statements).toHaveLength(2);
+    expect(statements[1]).toContain('CREATE TABLE "b"');
+  });
+  // SQLite reads `[a--b]` as a quoted identifier, so the dashes inside it are
+  // not a comment opener. Missing that swallowed the statement's semicolon and
+  // merged the next statement into the same chunk.
+  it("does not read a comment inside a sqlite bracket-quoted identifier", () => {
+    const sql = [
+      `CREATE TABLE [a--b] ("id" TEXT);`,
+      `CREATE TABLE "c" ("id" TEXT);`,
+    ].join("\n");
+
+    const statements = splitSqlStatements(sql, "sqlite");
+
+    expect(statements).toHaveLength(2);
+    expect(statements[0]).toContain("[a--b]");
+    expect(statements[1]).toContain('CREATE TABLE "c"');
+  });
+
+  it("does not read a comment inside a mysql backtick-quoted identifier", () => {
+    const sql = [
+      "CREATE TABLE `a--b` (`id` TEXT);",
+      "CREATE TABLE `c` (`id` TEXT);",
+    ].join("\n");
+
+    const statements = splitSqlStatements(sql, "mysql");
+
+    expect(statements).toHaveLength(2);
+    expect(statements[1]).toContain("`c`");
+  });
+
+  // `[` is an array subscript in Postgres rather than a quote, so treating it as
+  // one there would swallow ordinary SQL. This pins the dialects apart.
+  it("treats a bracket as ordinary SQL on postgres", () => {
+    const sql = [
+      `CREATE TABLE "a" ("tags" text[]);`,
+      `CREATE TABLE "b" ("id" TEXT);`,
+    ].join("\n");
+
+    expect(splitSqlStatements(sql, "postgresql")).toHaveLength(2);
+  });
+});
+
+describe("splitting a statement whose value ends in a backslash", () => {
+  it("closes the quote when the backslash run is EVEN", () => {
+    // 🔴 A doubled backslash is ONE literal backslash — how MySQL escaping
+    // writes a value ending in one — so it sits immediately before the closing
+    // quote. Reading only that last character calls the quote escaped, leaves
+    // the splitter inside a string it has left, swallows the semicolon and
+    // concatenates the next statement. A driver with multi-statements disabled
+    // then rejects the pair, after earlier statements in the file have run.
+    const sql = [
+      `INSERT INTO t (d) VALUES ('ends with a backslash \\\\');`,
+      `INSERT INTO u (d) VALUES ('second');`,
+    ].join("\n");
+    expect(splitSqlStatements(sql, "mysql")).toHaveLength(2);
+  });
+
+  it("does NOT treat a backslash as an escape on PostgreSQL or SQLite", () => {
+    // 🔴 Only MySQL reads a backslash as an escape inside a string literal;
+    // SQLite has no C-style escapes at all. `quoteSqlLiteral` therefore leaves
+    // a trailing backslash SINGLE on those dialects, so a parity rule applied
+    // unconditionally calls the closing quote escaped and swallows the
+    // semicolon — the very defect the parity check was added to remove, moved
+    // to the other two dialects.
+    const sql = [
+      `INSERT INTO t (d) VALUES ('ends with a backslash \\');`,
+      `INSERT INTO u (d) VALUES ('second');`,
+    ].join("\n");
+    for (const dialect of ["postgresql", "sqlite"] as const) {
+      expect(splitSqlStatements(sql, dialect)).toHaveLength(2);
+    }
+  });
+
+  it("still treats an ODD run as escaping the quote", () => {
+    // The control: a rule that stopped honouring backslash escapes entirely
+    // would satisfy the case above and split this one in the wrong place.
+    const sql = `INSERT INTO t (d) VALUES ('not \\' the end; still inside');`;
+    expect(splitSqlStatements(sql, "mysql")).toHaveLength(1);
+  });
+});
+
+describe("PostgreSQL escape strings honour backslashes; ordinary literals do not", () => {
+  it("keeps an E'...' literal WHOLE when a backslash escapes its quote", () => {
+    // 🔴 PostgreSQL DOES read a backslash as an escape inside an `E'…'` string.
+    // Disabling backslash handling for the whole dialect split this valid
+    // statement at the semicolon INSIDE the literal.
+    //
+    // Asserted on CONTENT, not on the count: `splitSqlStatements` discards a
+    // fragment carrying no SQL keyword, so the tail `right';` vanishes either
+    // way and a length check passes on the broken implementation too.
+    const sql = `SELECT E'left \\'; right' AS v;`;
+    const out = splitSqlStatements(sql, "postgresql");
+    expect(out).toHaveLength(1);
+    expect(out[0]).toContain("right");
+  });
+
+  it("still splits an ORDINARY PostgreSQL literal ending in a backslash", () => {
+    // The control, and why this is a property of the LITERAL rather than the
+    // dialect: outside `E'…'` PostgreSQL stores a backslash verbatim, so the
+    // quote after it closes the string and the semicolon separates.
+    const sql = [
+      `INSERT INTO t (d) VALUES ('ends with a backslash \\\\');`,
+      `INSERT INTO u (d) VALUES ('second');`,
+    ].join("\n");
+    expect(splitSqlStatements(sql, "postgresql")).toHaveLength(2);
+  });
+});
+
+describe("MySQL escapes inside BOTH literal quotes", () => {
+  it("keeps a double-quoted MySQL value whole when a backslash escapes its quote", () => {
+    // 🔴 Under MySQL's default SQL mode a double quote also delimits a string,
+    // so the backslash check has to apply to whichever quote opened the region.
+    // Gating on the single quote alone splits this valid statement at the
+    // semicolon INSIDE the value.
+    //
+    // Asserted on CONTENT: a fragment carrying no SQL keyword is discarded, so
+    // a length check passes on the broken implementation too.
+    const sql = `SELECT "left \\"; right" AS v;`;
+    const out = splitSqlStatements(sql, "mysql");
+    expect(out).toHaveLength(1);
+    expect(out[0]).toContain("right");
+  });
+
+  it("does NOT treat a backtick-quoted identifier as escaping", () => {
+    // The control: a backtick delimits a NAME, not a literal, so a backslash
+    // inside one escapes nothing and the following semicolon still separates.
+    const sql =
+      "INSERT INTO `t` (d) VALUES (1); INSERT INTO `u` (d) VALUES (2);";
+    expect(splitSqlStatements(sql, "mysql")).toHaveLength(2);
+  });
+});
+
+describe("a line inside a string literal is data, not SQL", () => {
+  it("KEEPS a continuation line that begins with a comment marker", () => {
+    // 🔴 A multiline description whose second line starts with `--` puts
+    // comment-looking text at the start of a line. Read as a standalone SQL
+    // comment it is dropped, the migration still succeeds, and the replayed
+    // database stores a SILENTLY TRUNCATED description — no error anywhere.
+    const sql = `INSERT INTO "t" ("d") VALUES ('Summary\n-- internal note');`;
+    const out = splitSqlStatements(sql, "sqlite").join(";");
+    expect(out).toContain("internal note");
+  });
+
+  it("KEEPS a literal that contains the breakpoint marker text", () => {
+    // The same rule for the rewrite half of the cleanup: stripping the marker
+    // out of prose corrupts the stored value exactly as dropping the line does.
+    const sql = `INSERT INTO "t" ("d") VALUES ('note\n--> statement-breakpoint here');`;
+    const out = splitSqlStatements(sql, "sqlite").join(";");
+    expect(out).toContain("--> statement-breakpoint here");
+  });
+
+  it("still DROPS a standalone comment line outside any literal", () => {
+    // 🔴 The control. Both cases above pass on an implementation that simply
+    // stopped cleaning up, which would put marker text and comments back into
+    // the SQL the driver receives — so the cleanup must be shown to still run.
+    const sql = `-- a leading note\nCREATE TABLE "t" ("a" text);`;
+    const out = splitSqlStatements(sql, "sqlite").join(";");
+    expect(out).not.toContain("a leading note");
+    expect(out).toContain("CREATE TABLE");
+  });
+
+  it("still STRIPS an inline breakpoint marker outside any literal", () => {
+    // The rewrite half of the same control: unstripped, the marker text
+    // pollutes the next accumulated statement and MySQL rejects it.
+    const sql = `CREATE TABLE "t" ("a" text);--> statement-breakpoint\nCREATE INDEX "i" ON "t" ("a");`;
+    const out = splitSqlStatements(sql, "sqlite");
+    expect(out.join(";")).not.toContain("statement-breakpoint");
+    expect(out).toHaveLength(2);
+  });
+
+  it("KEEPS marker text in a literal that opens LATER on the line", () => {
+    // 🔴 A per-line answer is not enough. This line begins as ordinary SQL, so
+    // any rule keyed on where the LINE starts treats the whole line as SQL and
+    // rewrites the value inside it — storing a truncated description while the
+    // migration reports success.
+    const sql = `INSERT INTO "t" ("d") VALUES ('note --> statement-breakpoint here');`;
+    const out = splitSqlStatements(sql, "sqlite").join(";");
+    expect(out).toContain("--> statement-breakpoint here");
+  });
+
+  it("does not let an apostrophe inside a BLOCK comment open a literal", () => {
+    // 🔴 `it's` here is prose, not an opening quote. Counted as one, everything
+    // after it reads as being inside a literal, so the real breakpoint line
+    // below is treated as data and survives — and on MySQL, where `-->` is not
+    // a comment, that text reaches the driver as invalid SQL.
+    const sql = `/* it's a note\n   spanning lines */\nCREATE TABLE "t" ("a" text);\n--> statement-breakpoint\nCREATE INDEX "i" ON "t" ("a");`;
+    const out = splitSqlStatements(sql, "mysql");
+    expect(out.join(";")).not.toContain("statement-breakpoint");
+    expect(out).toHaveLength(2);
+  });
+});
+
+describe("a doubled delimiter escapes the delimiter, it does not end the literal", () => {
+  it("keeps a Postgres escape string whole across a doubled quote", () => {
+    // 🔴 Closing on the first quote of `''` and reopening on the second looks
+    // harmless — the state toggles twice and comes back correct — but the
+    // reopened literal is a DIFFERENT one. `escapesWithBackslash` is read from
+    // the prefix at the opening quote, and the second quote of a pair is no
+    // longer adjacent to the `E`. The mode is lost, the later `\'` reads as the
+    // closing quote, and the statement is cut at the semicolon INSIDE the
+    // value.
+    //
+    // Asserted on CONTENT, not on the number of statements: the splitter drops
+    // fragments carrying no SQL keyword, so the tail of a mis-split statement
+    // disappears and a count assertion passes on the broken implementation.
+    const sql = `SELECT E'it''s left \\'; right' AS v;`;
+    expect(splitSqlStatements(sql, "postgresql").join(" | ")).toBe(
+      `SELECT E'it''s left \\'; right' AS v`
+    );
+  });
+
+  it("keeps an ordinary literal whole across a doubled quote", () => {
+    // The control. This case is correct even when the pair is treated as a
+    // close followed by an open, because both literals carry the same escape
+    // mode — so it passes on the broken implementation and shows that the fix
+    // is about the MODE rather than about doubled quotes in general.
+    const sql = `INSERT INTO "t" ("d") VALUES ('it''s fine; really');`;
+    expect(splitSqlStatements(sql, "postgresql").join(" | ")).toBe(
+      `INSERT INTO "t" ("d") VALUES ('it''s fine; really')`
+    );
+  });
+
+  it("still CLOSES on a single delimiter, so a doubled one is not assumed", () => {
+    // 🔴 The other direction: an implementation that never closed on a quote
+    // adjacent to another would swallow the boundary between two statements.
+    const sql = `INSERT INTO "t" ("d") VALUES ('a');INSERT INTO "t" ("d") VALUES ('b');`;
+    expect(splitSqlStatements(sql, "postgresql")).toHaveLength(2);
+  });
+
+  it("keeps every statement with text outside its comments, whatever its keyword", () => {
+    const sql = [
+      `CALL cleanup_plugin_data();`,
+      `COMMENT ON TABLE "t" IS 'drop; me';`,
+      `DO 'noop';`,
+      `-- a trailing note, not a statement`,
+    ].join("\n");
+    const statements = splitSqlStatements(sql, "postgresql");
+    expect(statements).toEqual([
+      "CALL cleanup_plugin_data()",
+      `COMMENT ON TABLE "t" IS 'drop; me'`,
+      "DO 'noop'",
+    ]);
+  });
+
+  it("drops a fragment that is only comments", () => {
+    const sql = `CREATE TABLE "a" ("id" TEXT);\n/* closing note */\n-- and another`;
+    expect(splitSqlStatements(sql, "postgresql")).toEqual([
+      `CREATE TABLE "a" ("id" TEXT)`,
+    ]);
+  });
+
+  it("keeps every bracket of a file holding two transactions, for the runner to refuse", () => {
+    // The COMMIT and START TRANSACTION in the middle would commit the first
+    // half on its own. Dropped, with or without the outer pair, the file
+    // would silently run as one.
+    const sql = [
+      `BEGIN;`,
+      `ALTER TABLE "t" ADD COLUMN "a" TEXT;`,
+      `COMMIT;`,
+      `START TRANSACTION;`,
+      `ALTER TABLE "t" ADD COLUMN "b" TEXT;`,
+      `END TRANSACTION;`,
+    ].join("\n");
+    expect(splitSqlStatements(sql, "postgresql")).toEqual([
+      "BEGIN",
+      `ALTER TABLE "t" ADD COLUMN "a" TEXT`,
+      "COMMIT",
+      "START TRANSACTION",
+      `ALTER TABLE "t" ADD COLUMN "b" TEXT`,
+      "END TRANSACTION",
+    ]);
+  });
+
+  it.each([
+    [
+      "a COMMIT with no BEGIN before it",
+      `ALTER TABLE t ADD COLUMN a TEXT;\nCOMMIT;`,
+    ],
+    [
+      "a BEGIN with nothing closing it",
+      `BEGIN;\nALTER TABLE t ADD COLUMN a TEXT;`,
+    ],
+    [
+      "a COMMIT part-way",
+      `ALTER TABLE t ADD COLUMN a TEXT;\nCOMMIT;\nALTER TABLE t ADD COLUMN b TEXT;`,
+    ],
+  ])("keeps %s, which wraps nothing", (_case, sql) => {
+    const statements = splitSqlStatements(sql, "postgresql");
+    expect(statements.some(s => s === "COMMIT" || s === "BEGIN")).toBe(true);
+  });
+
+  it("keeps a wrapping pair in a file run outside a transaction, for the refusal there to name", () => {
+    expect(
+      splitSqlStatements(
+        `BEGIN;\nALTER TABLE t ADD COLUMN a TEXT;\nCOMMIT;`,
+        "postgresql",
+        {
+          transaction: false,
+        }
+      )
+    ).toEqual(["BEGIN", "ALTER TABLE t ADD COLUMN a TEXT", "COMMIT"]);
+  });
+
+  it("keeps a statement that would undo or split the runner's transaction, for the runner to refuse", () => {
+    // Splitting never refuses: a dry run splits to preview, and must not
+    // throw. The refusal is `statementRefusals`', below.
+    expect(
+      splitSqlStatements(
+        `ALTER TABLE "t" ADD COLUMN "a" TEXT;\nROLLBACK;\nSAVEPOINT s1;`
+      )
+    ).toEqual([
+      `ALTER TABLE "t" ADD COLUMN "a" TEXT`,
+      "ROLLBACK",
+      "SAVEPOINT s1",
+    ]);
+  });
+
+  it.each([
+    ["sqlite", "BEGIN IMMEDIATE TRANSACTION", "COMMIT"],
+    ["sqlite", "BEGIN EXCLUSIVE", "COMMIT"],
+    ["sqlite", "BEGIN DEFERRED", "END TRANSACTION"],
+    ["postgresql", "BEGIN ISOLATION LEVEL SERIALIZABLE", "COMMIT"],
+    ["postgresql", "BEGIN WORK READ WRITE", "END"],
+    [
+      "postgresql",
+      "START TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+      "COMMIT",
+    ],
+    ["mysql", "START TRANSACTION READ WRITE", "COMMIT"],
+    ["mysql", "START TRANSACTION WITH CONSISTENT SNAPSHOT", "COMMIT"],
+    ["mysql", "BEGIN", "COMMIT WORK AND NO CHAIN"],
+    ["postgresql", "/* opens */ BEGIN", "COMMIT"],
+  ] as const)(
+    "leaves out %s's wrapping pair `%s` ... `%s`",
+    (dialect, opener, closer) => {
+      expect(
+        splitSqlStatements(
+          `${opener};\nALTER TABLE t ADD COLUMN a TEXT;\n${closer};`,
+          dialect
+        )
+      ).toEqual(["ALTER TABLE t ADD COLUMN a TEXT"]);
+    }
+  );
+
+  it("keeps a PostgreSQL dollar-quoted body whole, whatever it holds", () => {
+    const body = `DO $$\nBEGIN\n  UPDATE "t" SET "a" = 'x;y';\n  IF true THEN RAISE NOTICE 'done'; END IF;\nEND\n$$`;
+    const fn = `CREATE FUNCTION f() RETURNS trigger AS $fn$ BEGIN NEW.a := 1; RETURN NEW; END $fn$ LANGUAGE plpgsql`;
+    expect(
+      splitSqlStatements(`${body};\n${fn};\nSELECT 1;`, "postgresql")
+    ).toEqual([body, fn, "SELECT 1"]);
+  });
+
+  it("does not read a dollar sign inside a name as a body", () => {
+    // `a$b$` continues a word, and `$1` is a parameter: neither opens a body.
+    expect(
+      splitSqlStatements(`SELECT a$b$c FROM t;SELECT $1;`, "postgresql")
+    ).toEqual(["SELECT a$b$c FROM t", "SELECT $1"]);
+  });
+  it("keeps a line beginning -- that closes a block comment", () => {
+    // The `--` is inside the block comment; the `*/` after it ends that
+    // comment, and the statement after it is SQL. (No DDL keyword on the
+    // line, which would keep it for another reason.)
+    const sql = `/* a note\n-- */ SELECT 1;\nSELECT 2;`;
+    expect(splitSqlStatements(sql, "postgresql")).toEqual([
+      `/* a note\n-- */ SELECT 1`,
+      "SELECT 2",
+    ]);
+  });
+
+  it("does not strip a breakpoint marker inside a block comment", () => {
+    const sql = `/* x;--> statement-breakpoint */ SELECT 1;`;
+    expect(splitSqlStatements(sql, "postgresql")).toEqual([
+      "/* x;--> statement-breakpoint */ SELECT 1",
+    ]);
+  });
+
+  it("reads MySQL's # comments and keeps its versioned comments", () => {
+    const sql = [
+      "/*!40000 ALTER TABLE `t` DISABLE KEYS */;",
+      "ALTER TABLE `t` ADD COLUMN `a` TEXT; # adds a; not a statement",
+      "# a closing note",
+    ].join("\n");
+    expect(splitSqlStatements(sql, "mysql")).toEqual([
+      "/*!40000 ALTER TABLE `t` DISABLE KEYS */",
+      "ALTER TABLE `t` ADD COLUMN `a` TEXT",
+    ]);
+  });
+});
+
+describe("routine and trigger bodies", () => {
+  const sqliteTrigger = [
+    "CREATE TRIGGER fx_touch AFTER UPDATE ON fx__notes FOR EACH ROW",
+    "BEGIN",
+    "  UPDATE fx__notes SET updated = CASE WHEN NEW.a > 0 THEN 1 ELSE 0 END WHERE id = NEW.id;",
+    "  INSERT INTO fx__log (id) VALUES (NEW.id);",
+    "END",
+  ].join("\n");
+  const mysqlProcedure = [
+    "CREATE DEFINER = `root`@`%` PROCEDURE fx_cleanup(IN n INT)",
+    "BEGIN",
+    "  DECLARE done INT DEFAULT 0;",
+    "  IF n > 0 THEN",
+    "    DELETE FROM fx__notes WHERE id < n;",
+    "  END IF;",
+    "  lbl: LOOP",
+    "    SET done = done + 1;",
+    "    IF done > 3 THEN LEAVE lbl; END IF;",
+    "  END LOOP lbl;",
+    "  CASE n WHEN 1 THEN SET done = 0; ELSE SET done = 1; END CASE;",
+    "  BEGIN",
+    "    SELECT 1;",
+    "  END;",
+    "END",
+  ].join("\n");
+  const postgresAtomic = [
+    "CREATE FUNCTION fx_count() RETURNS bigint LANGUAGE sql",
+    "BEGIN ATOMIC",
+    "  SELECT count(*) FROM fx__notes;",
+    "END",
+  ].join("\n");
+
+  it.each([
+    ["sqlite", sqliteTrigger],
+    ["mysql", mysqlProcedure],
+    ["postgresql", postgresAtomic],
+  ] as const)(
+    "keeps a %s body whole, END included, and splits after it",
+    (dialect, routine) => {
+      expect(
+        splitSqlStatements(`SELECT 0;\n${routine};\nSELECT 1;`, dialect)
+      ).toEqual(["SELECT 0", routine, "SELECT 1"]);
+    }
+  );
+
+  it("reads a column called begin or end as a name, not a block keyword", () => {
+    const trigger = [
+      "CREATE TRIGGER fx_span AFTER UPDATE ON fx__spans FOR EACH ROW",
+      "BEGIN",
+      "  UPDATE fx__log SET begin = NEW.begin, finish = NEW.end WHERE id = OLD.id;",
+      "  INSERT INTO fx__log (id, begin) SELECT NEW.id, NEW.begin;",
+      "END",
+    ].join("\n");
+    expect(splitSqlStatements(`${trigger};\nSELECT 1;`, "sqlite")).toEqual([
+      trigger,
+      "SELECT 1",
+    ]);
+  });
+
+  // A quoted value right before BEGIN is one token, so BEGIN does not read as
+  // a name after `=` or `.`.
+  it.each([
+    ["a string", "WHEN NEW.status = 'published'"],
+    ["a quoted name", `WHEN OLD."title" IS NOT NEW."title"`],
+    // The control: an unquoted value there.
+    ["an unquoted value", "WHEN NEW.id = 1"],
+  ])(
+    "keeps a SQLite trigger whole when %s comes right before BEGIN, and SQLite runs it",
+    (_, when) => {
+      const trigger = [
+        `CREATE TRIGGER fx_log AFTER UPDATE ON fx__posts ${when}`,
+        "BEGIN",
+        "  INSERT INTO fx__log (v) VALUES ('published');",
+        "  INSERT INTO fx__log (v) VALUES ('again');",
+        "END",
+      ].join("\n");
+      const statements = splitSqlStatements(
+        [
+          "CREATE TABLE fx__posts (id INTEGER, status TEXT, title TEXT);",
+          "CREATE TABLE fx__log (v TEXT);",
+          "INSERT INTO fx__posts VALUES (1, 'draft', 'a');",
+          `${trigger};`,
+          "SELECT 1;",
+        ].join("\n"),
+        "sqlite"
+      );
+      expect(statements.slice(3)).toEqual([trigger, "SELECT 1"]);
+
+      const db = new Database(":memory:");
+      try {
+        for (const statement of statements) db.exec(statement);
+        db.exec(
+          "UPDATE fx__posts SET status = 'published', title = 'b' WHERE id = 1"
+        );
+        expect(db.prepare("SELECT v FROM fx__log").all()).toEqual([
+          { v: "published" },
+          { v: "again" },
+        ]);
+      } finally {
+        db.close();
+      }
+    }
+  );
+
+  it("never reads a quoted begin as a block keyword", () => {
+    // Each quoted begin stands where a bare BEGIN would open a block: after
+    // LIKE, IS or WHERE, none of which makes it a name. Read as BEGIN, one
+    // would leave the body open past its END and swallow the SELECT.
+    const trigger = [
+      "CREATE TRIGGER fx_span AFTER UPDATE ON fx__spans FOR EACH ROW",
+      "BEGIN",
+      `  DELETE FROM fx__log WHERE v LIKE 'begin' OR v IS "begin";`,
+      "  DELETE FROM fx__log WHERE [begin];",
+      "END",
+    ].join("\n");
+    expect(splitSqlStatements(`${trigger};\nSELECT 1;`, "sqlite")).toEqual([
+      trigger,
+      "SELECT 1",
+    ]);
+  });
+
+  it("keeps a PostgreSQL BEGIN ATOMIC body whole after a quoted setting value", () => {
+    const routine = [
+      "CREATE FUNCTION fx_count() RETURNS bigint LANGUAGE sql",
+      "SET search_path = 'public'",
+      "BEGIN ATOMIC",
+      "  SELECT count(*) FROM fx__notes;",
+      "  SELECT 1;",
+      "END",
+    ].join("\n");
+    expect(splitSqlStatements(`${routine};\nSELECT 1;`, "postgresql")).toEqual([
+      routine,
+      "SELECT 1",
+    ]);
+  });
+
+  it("still splits a MySQL trigger whose body is one statement, with no BEGIN", () => {
+    const trigger =
+      "CREATE TRIGGER fx_bi BEFORE INSERT ON fx__notes FOR EACH ROW SET NEW.a = 1";
+    expect(splitSqlStatements(`${trigger};\nSELECT 1;`, "mysql")).toEqual([
+      trigger,
+      "SELECT 1",
+    ]);
+  });
+
+  it("reads BEGIN and END as nesting only in a routine or trigger definition", () => {
+    // Anywhere else a leading BEGIN/END is a transaction bracket and a `;`
+    // ends the statement.
+    expect(
+      splitSqlStatements(
+        "BEGIN;\nUPDATE t SET a = CASE WHEN b THEN 1 END;\nEND;",
+        "sqlite"
+      )
+    ).toEqual(["UPDATE t SET a = CASE WHEN b THEN 1 END"]);
+  });
+});
+
+describe("statementRefusals of a transaction bracket part-way through", () => {
+  it.each([
+    ["postgresql", "COMMIT", "would end the runner's transaction early"],
+    ["postgresql", "END", "would end the runner's transaction early"],
+    ["mysql", "COMMIT WORK", "would end the runner's transaction early"],
+    [
+      "sqlite",
+      "BEGIN",
+      "would open a transaction inside the one the runner holds",
+    ],
+    [
+      "mysql",
+      "START TRANSACTION",
+      "would open a transaction inside the one the runner holds",
+    ],
+  ] as const)(
+    "refuses on %s: %s, naming it and the marker",
+    (dialect, statement, effect) => {
+      const [refusal] = statementRefusals(
+        ["INSERT INTO t VALUES (1)", statement, "INSERT INTO t VALUES (2)"],
+        dialect
+      );
+      expect(refusal?.code).toBe("TRANSACTION_CONTROL_IN_MIGRATION");
+      expect(refusal?.statement).toBe(statement);
+      expect(refusal?.message).toContain(effect);
+      expect(refusal?.message).toContain("`-- nextly:no-transaction`");
+      expect(() =>
+        assertRunnableStatements(
+          splitSqlStatements(
+            `INSERT INTO t VALUES (1);\n${statement};\nINSERT INTO t VALUES (2);`,
+            dialect
+          ),
+          dialect,
+          "0001_x.sql"
+        )
+      ).toThrow(/0001_x\.sql was refused, and nothing in it ran/);
+    }
+  );
+
+  it("names transaction: false for a module", () => {
+    const [refusal] = statementRefusals(["COMMIT"], "postgresql", {
+      transaction: true,
+      unit: "module",
+    });
+    expect(refusal?.message).toContain("A module with `transaction: false`");
+  });
+
+  it("refuses nothing in a file wrapped whole in BEGIN and COMMIT", () => {
+    // The control: the split leaves the wrapper out.
+    expect(
+      statementRefusals(
+        splitSqlStatements(
+          "BEGIN;\nINSERT INTO t VALUES (1);\nCOMMIT;",
+          "postgresql"
+        ),
+        "postgresql"
+      )
+    ).toEqual([]);
+  });
+});
+
+describe("statementRefusals", () => {
+  it.each([
+    ["postgresql", "ROLLBACK", "TRANSACTION_CONTROL_IN_MIGRATION"],
+    ["postgresql", "ABORT", "TRANSACTION_CONTROL_IN_MIGRATION"],
+    ["postgresql", "COMMIT PREPARED 'x'", "TRANSACTION_CONTROL_IN_MIGRATION"],
+    [
+      "postgresql",
+      "PREPARE TRANSACTION 'x'",
+      "TRANSACTION_CONTROL_IN_MIGRATION",
+    ],
+    ["mysql", "XA START 'x'", "TRANSACTION_CONTROL_IN_MIGRATION"],
+    // The optional word alone is still a ROLLBACK of the whole transaction.
+    ["postgresql", "ROLLBACK WORK", "TRANSACTION_CONTROL_IN_MIGRATION"],
+    ["postgresql", "ROLLBACK TRANSACTION", "TRANSACTION_CONTROL_IN_MIGRATION"],
+    ["mysql", "ROLLBACK WORK", "TRANSACTION_CONTROL_IN_MIGRATION"],
+    ["sqlite", "ROLLBACK TRANSACTION", "TRANSACTION_CONTROL_IN_MIGRATION"],
+    ["mysql", "SET FOREIGN_KEY_CHECKS = 0", "SESSION_SETTING_IN_MIGRATION"],
+    [
+      "mysql",
+      "/*!40014 SET FOREIGN_KEY_CHECKS=0 */",
+      "SESSION_SETTING_IN_MIGRATION",
+    ],
+    ["mysql", "SET SESSION sql_mode = ''", "SESSION_SETTING_IN_MIGRATION"],
+    [
+      "mysql",
+      "SET @@session.time_zone = '+00:00'",
+      "SESSION_SETTING_IN_MIGRATION",
+    ],
+    ["postgresql", "SET search_path TO other", "SESSION_SETTING_IN_MIGRATION"],
+    [
+      "postgresql",
+      "SET SESSION statement_timeout = 0",
+      "SESSION_SETTING_IN_MIGRATION",
+    ],
+    ["postgresql", "RESET ALL", "SESSION_SETTING_IN_MIGRATION"],
+    ["postgresql", "VACUUM ANALYZE t", "NOT_TRANSACTIONAL_IN_MIGRATION"],
+    [
+      "postgresql",
+      "CREATE INDEX CONCURRENTLY i ON t (a)",
+      "NOT_TRANSACTIONAL_IN_MIGRATION",
+    ],
+    [
+      "postgresql",
+      "CREATE UNIQUE INDEX CONCURRENTLY i ON t (a)",
+      "NOT_TRANSACTIONAL_IN_MIGRATION",
+    ],
+    [
+      "postgresql",
+      "DROP INDEX CONCURRENTLY i",
+      "NOT_TRANSACTIONAL_IN_MIGRATION",
+    ],
+    [
+      "postgresql",
+      "REINDEX (CONCURRENTLY) TABLE t",
+      "NOT_TRANSACTIONAL_IN_MIGRATION",
+    ],
+    ["postgresql", "CREATE DATABASE other", "NOT_TRANSACTIONAL_IN_MIGRATION"],
+    // CLUSTER naming no table, which PostgreSQL refuses in a transaction.
+    ["postgresql", "CLUSTER", "NOT_TRANSACTIONAL_IN_MIGRATION"],
+    ["postgresql", "CLUSTER VERBOSE", "NOT_TRANSACTIONAL_IN_MIGRATION"],
+    [
+      "postgresql",
+      "ALTER SYSTEM SET work_mem = '64MB'",
+      "NOT_TRANSACTIONAL_IN_MIGRATION",
+    ],
+    ["sqlite", "VACUUM", "NOT_TRANSACTIONAL_IN_MIGRATION"],
+    ["sqlite", "ATTACH DATABASE 'x.db' AS x", "NOT_TRANSACTIONAL_IN_MIGRATION"],
+    ["mysql", "LOCK TABLES t WRITE", "NOT_TRANSACTIONAL_IN_MIGRATION"],
+    ["mysql", "UNLOCK TABLES", "NOT_TRANSACTIONAL_IN_MIGRATION"],
+    // Switches the pooled connection's default database, and the runner's
+    // ledger writes after the unit with it.
+    ["mysql", "USE otherdb", "NOT_TRANSACTIONAL_IN_MIGRATION"],
+  ] as const)("refuses on %s: %s", (dialect, statement, code) => {
+    expect(statementRefusals([statement], dialect).map(r => r.code)).toEqual([
+      code,
+    ]);
+    expect(() =>
+      assertRunnableStatements([statement], dialect, "0001_x.sql")
+    ).toThrow(/0001_x\.sql was refused/);
+  });
+
+  it("names the statement and what to write instead", () => {
+    const [fk] = statementRefusals(
+      ["/*!40014 SET FOREIGN_KEY_CHECKS=0 */"],
+      "mysql"
+    );
+    expect(fk?.message).toContain('"/*!40014 SET FOREIGN_KEY_CHECKS=0 */"');
+    expect(fk?.message).toContain("(FOREIGN_KEY_CHECKS)");
+    expect(fk?.message).toMatch(/drop the foreign key and add it back/);
+
+    const [path] = statementRefusals(
+      ["SET SESSION search_path TO other"],
+      "postgresql"
+    );
+    expect(path?.message).toContain('"SET SESSION search_path TO other"');
+    expect(path?.message).toContain("SET LOCAL search_path");
+
+    const [rollback] = statementRefusals(["ROLLBACK"], "postgresql");
+    expect(rollback?.message).toContain('"ROLLBACK"');
+    // Points at the form that is allowed, rather than only at removing it.
+    expect(rollback?.message).toContain("ROLLBACK TO SAVEPOINT name");
+  });
+
+  // MySQL's SET takes a list, and a system variable anywhere in it is a
+  // session setting, whatever the targets before it.
+  it.each([
+    [
+      "/*!40014 SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */",
+      "FOREIGN_KEY_CHECKS",
+    ],
+    [
+      "/*!40014 SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0 */",
+      "UNIQUE_CHECKS",
+    ],
+    [
+      "/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */",
+      "SQL_MODE",
+    ],
+    ["SET @x = 1, FOREIGN_KEY_CHECKS = 0", "FOREIGN_KEY_CHECKS"],
+    ["SET @x = IF(1, 2, 3), @y = 'a,b', sql_mode = ''", "SQL_MODE"],
+    ["SET @x = 1, @@foreign_key_checks = 0", "FOREIGN_KEY_CHECKS"],
+    ["SET @x = 1, @@session.time_zone = '+00:00'", "TIME_ZONE"],
+    ["SET @x = 1, @@global.max_connections = 10", "MAX_CONNECTIONS"],
+    ["SET @x = 1, @@local.sql_mode = ''", "SQL_MODE"],
+    ["SET @x = 1, @@persist.max_connections = 10", "MAX_CONNECTIONS"],
+    ["SET @x = 1, @@persist_only.back_log = 10", "BACK_LOG"],
+    ["SET @x = 1, SESSION sql_mode = ''", "SQL_MODE"],
+    ["SET @x = 1, GLOBAL max_connections = 10", "MAX_CONNECTIONS"],
+    ["SET @x = 1, LOCAL sql_mode = ''", "SQL_MODE"],
+    ["SET @x = 1, PERSIST max_connections = 10", "MAX_CONNECTIONS"],
+    ["SET @x = 1, PERSIST_ONLY back_log = 10", "BACK_LOG"],
+    ["SET @x = 1, `foreign_key_checks` = 0", "FOREIGN_KEY_CHECKS"],
+    ["SET NAMES utf8mb4", "NAMES"],
+    ["SET CHARACTER SET utf8mb4", "CHARACTER"],
+  ])("refuses the MySQL session setting in: %s", (statement, setting) => {
+    const refusals = statementRefusals([statement], "mysql");
+    expect(refusals.map(r => r.code)).toEqual(["SESSION_SETTING_IN_MIGRATION"]);
+    expect(refusals[0]?.message).toContain(`(${setting})`);
+  });
+
+  it.each([
+    "SET @a = 1, @b = 2",
+    "SET @a = CONCAT('x', ',', 'y'), @b = IF(1, 2, (SELECT 3))",
+    "SET @a = 'a, sql_mode = 1', @b = 2",
+    "SET @`odd name` = 1, @'q' = 2, @\"r\" := 3",
+    "/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */",
+    // An executable comment's strings are strings: this comma separates
+    // nothing.
+    "/*!40101 SET @a = 'x, sql_mode = 1' */",
+  ])("allows a MySQL SET of user variables only: %s", statement => {
+    expect(statementRefusals([statement], "mysql")).toEqual([]);
+  });
+
+  it.each([
+    ["postgresql", "SET LOCAL search_path TO other"],
+    ["postgresql", "SET CONSTRAINTS ALL DEFERRED"],
+    ["postgresql", "CREATE INDEX i ON t (a)"],
+    ["postgresql", "ALTER TYPE mood ADD VALUE 'meh'"],
+    // Both run inside a transaction: CLUSTER naming its table, quoted or
+    // not, and a concurrent refresh of a materialized view.
+    ["postgresql", "CLUSTER t"],
+    ["postgresql", "CLUSTER VERBOSE t USING t_pkey"],
+    ["postgresql", "CLUSTER (VERBOSE) t"],
+    ["postgresql", `CLUSTER "Posts"`],
+    ["postgresql", "REFRESH MATERIALIZED VIEW CONCURRENTLY mv"],
+    ["postgresql", "COMMENT ON TABLE t IS 'VACUUM me'"],
+    ["postgresql", "DO $$ BEGIN ROLLBACK; END $$"],
+    ["postgresql", `ALTER TABLE "t" ADD COLUMN "a" TEXT`],
+    ["mysql", "SET @renamed = 1"],
+    ["mysql", "/*!40000 ALTER TABLE `t` DISABLE KEYS */"],
+    ["sqlite", "PRAGMA foreign_keys = OFF"],
+    ["sqlite", "UPDATE t SET a = 1"],
+    // A savepoint runs inside the runner's transaction and undoes at most
+    // part of the file.
+    ["postgresql", "SAVEPOINT s1"],
+    ["postgresql", "ROLLBACK TO SAVEPOINT s1"],
+    ["postgresql", "RELEASE SAVEPOINT s1"],
+    ["mysql", "ROLLBACK TO s1"],
+    ["mysql", "RELEASE SAVEPOINT s1"],
+    ["sqlite", "SAVEPOINT s1"],
+    ["sqlite", "ROLLBACK TO s1"],
+    ["sqlite", "RELEASE s1"],
+    // The optional word each dialect accepts between ROLLBACK and TO.
+    ["postgresql", "ROLLBACK WORK TO s1"],
+    ["postgresql", "ROLLBACK WORK TO SAVEPOINT s1"],
+    ["postgresql", "ROLLBACK TRANSACTION TO s1"],
+    ["postgresql", "ROLLBACK TRANSACTION TO SAVEPOINT s1"],
+    ["mysql", "ROLLBACK WORK TO s1"],
+    ["mysql", "ROLLBACK WORK TO SAVEPOINT s1"],
+    ["sqlite", "ROLLBACK TRANSACTION TO s1"],
+    ["sqlite", "ROLLBACK TRANSACTION TO SAVEPOINT s1"],
+  ] as const)("allows on %s: %s", (dialect, statement) => {
+    // The control: statements a migration may hold, through the same check.
+    expect(statementRefusals([statement], dialect)).toEqual([]);
+  });
+});
+
+describe("a migration marked to run outside a transaction", () => {
+  it.each([
+    ["-- nextly:no-transaction\n-- Migration: x\n-- UP\nVACUUM;", true],
+    ["\uFEFF-- nextly:no-transaction\r\n-- UP\nVACUUM;", true],
+    ["-- nextly:no-transaction   \n-- UP\n", true],
+    // Only the first line marks the file.
+    ["-- Migration: x\n-- nextly:no-transaction\n-- UP\nVACUUM;", false],
+    ["--nextly:no-transaction\n-- UP\n", false],
+    ["-- nextly:no-transaction-please\n-- UP\n", false],
+    ["", false],
+  ])("reads the marker from %j as %s", (content, marked) => {
+    expect(marksNoTransaction(content)).toBe(marked);
+  });
+
+  const outside = { transaction: false, unit: "file" } as const;
+
+  it.each([
+    ["postgresql", "CREATE INDEX CONCURRENTLY i ON t (a)"],
+    ["postgresql", "DROP INDEX CONCURRENTLY i"],
+    ["postgresql", "REINDEX (CONCURRENTLY) TABLE t"],
+    ["postgresql", "VACUUM ANALYZE t"],
+    ["postgresql", "ALTER SYSTEM SET work_mem = '64MB'"],
+    ["postgresql", "CLUSTER"],
+    ["sqlite", "VACUUM"],
+  ] as const)("lets a marked file run on %s: %s", (dialect, statement) => {
+    expect(statementRefusals([statement], dialect, outside)).toEqual([]);
+    // The control: the same statement in an unmarked file is refused, and
+    // the refusal names the marker.
+    const [refusal] = statementRefusals([statement], dialect);
+    expect(refusal?.code).toBe("NOT_TRANSACTIONAL_IN_MIGRATION");
+    expect(refusal?.message).toContain(
+      "make `-- nextly:no-transaction` the file's first line"
+    );
+  });
+
+  it("names the module's field, not the comment, for a plugin module", () => {
+    const [refusal] = statementRefusals(
+      ["CREATE INDEX CONCURRENTLY i ON t (a)"],
+      "postgresql",
+      { transaction: true, unit: "module" }
+    );
+    expect(refusal?.message).toContain(
+      "set `transaction: false` on the module"
+    );
+    expect(
+      statementRefusals(
+        ["CREATE INDEX CONCURRENTLY i ON t (a)"],
+        "postgresql",
+        {
+          transaction: false,
+          unit: "module",
+        }
+      )
+    ).toEqual([]);
+  });
+
+  it.each([
+    // State that outlives the file on its connection, marked or not.
+    ["mysql", "LOCK TABLES t WRITE", "NOT_TRANSACTIONAL_IN_MIGRATION"],
+    ["mysql", "UNLOCK TABLES", "NOT_TRANSACTIONAL_IN_MIGRATION"],
+    ["mysql", "USE otherdb", "NOT_TRANSACTIONAL_IN_MIGRATION"],
+    ["sqlite", "ATTACH DATABASE 'x.db' AS x", "NOT_TRANSACTIONAL_IN_MIGRATION"],
+    ["sqlite", "DETACH DATABASE x", "NOT_TRANSACTIONAL_IN_MIGRATION"],
+    ["mysql", "SET FOREIGN_KEY_CHECKS = 0", "SESSION_SETTING_IN_MIGRATION"],
+    ["postgresql", "SET search_path TO other", "SESSION_SETTING_IN_MIGRATION"],
+    ["postgresql", "ROLLBACK", "TRANSACTION_CONTROL_IN_MIGRATION"],
+    ["mysql", "XA START 'x'", "TRANSACTION_CONTROL_IN_MIGRATION"],
+  ] as const)(
+    "still refuses in a marked file on %s: %s",
+    (dialect, statement, code) => {
+      expect(
+        statementRefusals([statement], dialect, outside).map(r => r.code)
+      ).toEqual([code]);
+      expect(() =>
+        assertRunnableStatements([statement], dialect, "0001_x.sql", outside)
+      ).toThrow(/0001_x\.sql was refused/);
+    }
+  );
+
+  it("does not advise SET LOCAL where there is no transaction for it", () => {
+    const [refusal] = statementRefusals(
+      ["SET search_path TO other"],
+      "postgresql",
+      outside
+    );
+    expect(refusal?.message).not.toContain("Use SET LOCAL");
+    expect(refusal?.message).toContain("runs outside a transaction");
+  });
+
+  // What only a transaction gives a statement: its own brackets, a
+  // savepoint, a setting that lasts until the transaction ends. Outside one
+  // each would do nothing, fail, or open a transaction nobody ends.
+  const needsTransaction = [
+    ...(["postgresql", "mysql", "sqlite"] as const).flatMap(dialect =>
+      [
+        "BEGIN",
+        "BEGIN IMMEDIATE",
+        "START TRANSACTION",
+        "COMMIT",
+        "END",
+        "SAVEPOINT s1",
+        "RELEASE SAVEPOINT s1",
+        "RELEASE s1",
+        "ROLLBACK TO s1",
+        "ROLLBACK WORK TO SAVEPOINT s1",
+        "ROLLBACK TRANSACTION TO s1",
+      ].map(statement => [dialect, statement] as const)
+    ),
+    ["postgresql", "SET LOCAL lock_timeout = '5s'"],
+    ["postgresql", "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"],
+    ["postgresql", "SET CONSTRAINTS ALL DEFERRED"],
+  ] as const;
+
+  it.each(needsTransaction)(
+    "refuses in a marked file on %s, as needing a transaction: %s",
+    (dialect, statement) => {
+      const [refusal, ...rest] = statementRefusals(
+        [statement],
+        dialect,
+        outside
+      );
+      expect(rest).toEqual([]);
+      expect(refusal?.code).toBe("NEEDS_TRANSACTION_IN_MIGRATION");
+      expect(refusal?.message).toContain(
+        "It needs a transaction, and this file runs outside one: move it to a file without `-- nextly:no-transaction` as its first line"
+      );
+      expect(() =>
+        assertRunnableStatements([statement], dialect, "0001_x.sql", outside)
+      ).toThrow(/0001_x\.sql was refused, and nothing in it ran/);
+    }
+  );
+
+  // A bracket alone wraps nothing, so an unmarked file refuses it too; one
+  // that wraps the whole file is left out by the split, tested beside the
+  // split. Savepoints and transaction-scoped settings run inside the
+  // runner's transaction.
+  const brackets = needsTransaction.filter(
+    ([dialect, statement]) =>
+      transactionControlOf(statement, dialect) === "bracket"
+  );
+  const inTransactionOnly = needsTransaction.filter(
+    ([dialect, statement]) =>
+      transactionControlOf(statement, dialect) !== "bracket"
+  );
+
+  it.each(inTransactionOnly)(
+    "keeps allowing it in an unmarked file on %s: %s",
+    (dialect, statement) => {
+      // The control: the same statement runs inside the runner's transaction.
+      expect(
+        statementRefusals(splitSqlStatements(statement, dialect), dialect)
+      ).toEqual([]);
+    }
+  );
+
+  it.each(brackets)(
+    "refuses a bracket that wraps nothing in an unmarked file on %s: %s",
+    (dialect, statement) => {
+      expect(
+        statementRefusals(splitSqlStatements(statement, dialect), dialect).map(
+          r => r.code
+        )
+      ).toEqual(["TRANSACTION_CONTROL_IN_MIGRATION"]);
+    }
+  );
+
+  it("names the module's field for a module marked transaction: false", () => {
+    const [refusal] = statementRefusals(["SAVEPOINT s1"], "postgresql", {
+      transaction: false,
+      unit: "module",
+    });
+    expect(refusal?.code).toBe("NEEDS_TRANSACTION_IN_MIGRATION");
+    expect(refusal?.message).toContain(
+      "this module runs outside one: move it to a module without `transaction: false`"
+    );
+  });
+
+  it.each(["postgresql", "mysql", "sqlite"] as const)(
+    "keeps a marked file's own BEGIN and COMMIT for the refusal on %s",
+    dialect => {
+      const sql =
+        "BEGIN;\nCREATE TABLE t (id int);\nCOMMIT;\nSTART TRANSACTION;\nEND;";
+      // Split as an unmarked file runs, they are kept too: four brackets
+      // wrap no file whole, and that file refuses them.
+      expect(splitSqlStatements(sql, dialect)).toHaveLength(5);
+      // Split as a marked file runs, they are kept, and each is refused.
+      const statements = splitSqlStatements(sql, dialect, {
+        transaction: false,
+      });
+      expect(statements).toEqual([
+        "BEGIN",
+        "CREATE TABLE t (id int)",
+        "COMMIT",
+        "START TRANSACTION",
+        "END",
+      ]);
+      expect(
+        statementRefusals(statements, dialect, outside).map(r => r.statement)
+      ).toEqual(["BEGIN", "COMMIT", "START TRANSACTION", "END"]);
+    }
+  );
+
+  it.each([
+    "PRAGMA foreign_keys = OFF",
+    "PRAGMA foreign_keys=ON",
+    "PRAGMA foreign_keys(0)",
+    "PRAGMA main.foreign_keys = OFF",
+    "PRAGMA defer_foreign_keys = ON",
+  ])(
+    "refuses a foreign-key pragma write in a marked SQLite file: %s",
+    statement => {
+      const [refusal] = statementRefusals([statement], "sqlite", outside);
+      expect(refusal?.code).toBe("SESSION_SETTING_IN_MIGRATION");
+      expect(refusal?.message).toContain(
+        "switches foreign-key enforcement off before the first statement"
+      );
+      // The control: inside the runner's transaction SQLite ignores it.
+      expect(statementRefusals([statement], "sqlite")).toEqual([]);
+    }
+  );
+
+  it("lets a marked SQLite file read the foreign-key setting", () => {
+    expect(
+      statementRefusals(
+        ["PRAGMA foreign_keys", "PRAGMA foreign_key_check"],
+        "sqlite",
+        outside
+      )
+    ).toEqual([]);
+  });
+});
+
+describe("executeTransaction", () => {
+  /**
+   * A pooled adapter in miniature: `executeQuery` takes whichever pooled
+   * connection is free, `transaction` reserves one for its callback.
+   */
+  function pooledAdapter() {
+    const calls: string[] = [];
+    const adapter = {
+      getCapabilities: () => ({ dialect: "postgresql" }),
+      // No transaction is open around the migration, so it may run.
+      transactionOpenInFlow: () => false,
+      executeQuery: vi.fn(async (statement: string) => {
+        calls.push(`pool: ${statement}`);
+        return [];
+      }),
+      transaction: async <T>(
+        work: (ctx: {
+          execute: (statement: string) => Promise<unknown[]>;
+          getDrizzle: () => unknown;
+        }) => Promise<T>
+      ): Promise<T> => {
+        calls.push("reserved: BEGIN");
+        try {
+          const result = await work({
+            execute: async statement => {
+              calls.push(`reserved: ${statement}`);
+              return [];
+            },
+            getDrizzle: () => "reserved-handle",
+          });
+          calls.push("reserved: COMMIT");
+          return result;
+        } catch (error) {
+          calls.push("reserved: ROLLBACK");
+          throw error;
+        }
+      },
+    };
+    return { adapter, calls };
+  }
+
+  it("runs every statement, and hands out the handle, on the reserved connection", async () => {
+    // Sent through `executeQuery`, BEGIN, the statements and COMMIT could each
+    // land on a different pooled connection, and nothing would be atomic.
+    const { adapter, calls } = pooledAdapter();
+    let handle: unknown;
+    await executeTransaction(adapter as never, async tx => {
+      await tx.execute("CREATE TABLE a (id int)");
+      await tx.execute("CREATE TABLE b (id int)");
+      handle = tx.db;
+    });
+    expect(calls).toEqual([
+      "reserved: BEGIN",
+      "reserved: CREATE TABLE a (id int)",
+      "reserved: CREATE TABLE b (id int)",
+      "reserved: COMMIT",
+    ]);
+    expect(handle).toBe("reserved-handle");
+    expect(adapter.executeQuery).not.toHaveBeenCalled();
+  });
+
+  it("rolls back on the same connection when a statement fails", async () => {
+    const { adapter, calls } = pooledAdapter();
+    await expect(
+      executeTransaction(adapter as never, async tx => {
+        await tx.execute("CREATE TABLE a (id int)");
+        throw new Error("second statement failed");
+      })
+    ).rejects.toThrow("second statement failed");
+    expect(calls).toEqual([
+      "reserved: BEGIN",
+      "reserved: CREATE TABLE a (id int)",
+      "reserved: ROLLBACK",
+    ]);
+  });
+});

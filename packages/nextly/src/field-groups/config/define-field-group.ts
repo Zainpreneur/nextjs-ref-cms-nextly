@@ -1,0 +1,230 @@
+/**
+ * Define Component Helper
+ *
+ * Provides the `defineFieldGroup()` function for creating code-first Component
+ * configurations with full TypeScript support. This is the primary API for
+ * defining Components (reusable field groups) in TypeScript files.
+ *
+ * Components are shared, reusable field structures that can be independently
+ * created and then selected from within Collections and Singles.
+ *
+ * Key characteristics:
+ * - Components are templates (schemas), not documents
+ * - Each instance is unique to its parent entry
+ * - Support all field types including nested components (max depth: 3)
+ * - Separate database table per component type (comp_{slug})
+ *
+ * @module field-groups/config/define-field-group
+ * @since 1.0.0
+ *
+ * @example
+ * ```typescript
+ * import { defineFieldGroup, text, upload } from 'nextly';
+ *
+ * export default defineFieldGroup({
+ *   slug: 'seo',
+ *   label: { singular: 'SEO Metadata' },
+ *   admin: {
+ *     category: 'Shared',
+ *     icon: 'Search',
+ *     description: 'Search engine optimization metadata',
+ *   },
+ *   fields: [
+ *     text({ name: 'metaTitle', required: true, label: 'Meta Title' }),
+ *     text({ name: 'metaDescription', label: 'Meta Description' }),
+ *     upload({ name: 'metaImage', relationTo: 'media', label: 'OG Image' }),
+ *     text({ name: 'canonicalUrl', label: 'Canonical URL' }),
+ *   ],
+ * });
+ * ```
+ */
+
+import type { FieldConfig } from "../../collections/fields/types";
+import type { AuthorableFieldConfig } from "../../collections/fields/types/plugin-field";
+import { markDeclaredByDefine } from "../../shared/lib/config-problems";
+
+import type {
+  FieldGroupConfig,
+  FieldGroupLabel,
+  FieldGroupAdminOptions,
+} from "./types";
+import { validateFieldGroupConfig } from "./validate-field-group";
+
+// ============================================================
+// Utility Functions
+// ============================================================
+
+/**
+ * Converts a slug to title case for display.
+ *
+ * @param str - The string to convert
+ * @returns Title-cased string
+ *
+ * @example
+ * ```typescript
+ * toTitleCase('social-link') // 'Social Link'
+ * toTitleCase('hero_section') // 'Hero Section'
+ * toTitleCase('seo') // 'Seo'
+ * ```
+ */
+function toTitleCase(str: string): string {
+  return str.replace(/[-_]/g, " ").replace(/\b\w/g, char => char.toUpperCase());
+}
+
+// ============================================================
+// defineFieldGroup Function
+// ============================================================
+
+/**
+ * Define a code-first Component with full type safety.
+ *
+ * This is the primary API for creating Component configurations in TypeScript.
+ * It validates the configuration, applies sensible defaults, and returns a
+ * normalized `FieldGroupConfig` object.
+ *
+ * **Defaults Applied:**
+ * - `label.singular`: Generated from slug (e.g., 'social-link' → 'Social Link')
+ * - `admin`: Empty object if not provided
+ *
+ * **Validation:**
+ * - Slug must be valid (lowercase, URL-friendly, not reserved)
+ * - Fields array must be non-empty
+ * - Component field references validated (single vs multi mode)
+ *
+ * @param config - The Component configuration
+ * @returns Normalized Component configuration with defaults applied
+ * @throws Error if configuration is invalid
+ *
+ * @example Basic Component
+ * ```typescript
+ * import { defineFieldGroup, text } from 'nextly';
+ *
+ * export default defineFieldGroup({
+ *   slug: 'seo',
+ *   fields: [
+ *     text({ name: 'metaTitle', required: true }),
+ *     text({ name: 'metaDescription' }),
+ *   ],
+ * });
+ * ```
+ *
+ * @example Component with Admin Options
+ * ```typescript
+ * import { defineFieldGroup, text, upload, select } from 'nextly';
+ *
+ * export default defineFieldGroup({
+ *   slug: 'hero',
+ *   label: { singular: 'Hero Section' },
+ *   admin: {
+ *     category: 'Blocks',
+ *     icon: 'Image',
+ *     description: 'Full-width hero banner with heading and CTA',
+ *   },
+ *   fields: [
+ *     text({ name: 'heading', required: true, label: 'Heading' }),
+ *     text({ name: 'subheading', label: 'Subheading' }),
+ *     upload({ name: 'backgroundImage', relationTo: 'media', label: 'Background Image' }),
+ *     text({ name: 'ctaText', label: 'CTA Button Text' }),
+ *     text({ name: 'ctaLink', label: 'CTA Button Link' }),
+ *     select({
+ *       name: 'alignment',
+ *       label: 'Content Alignment',
+ *       options: [
+ *         { label: 'Left', value: 'left' },
+ *         { label: 'Center', value: 'center' },
+ *         { label: 'Right', value: 'right' },
+ *       ],
+ *       defaultValue: 'center',
+ *     }),
+ *   ],
+ * });
+ * ```
+ *
+ * @example Component with Nested Component Field
+ * ```typescript
+ * import { defineFieldGroup, text, fieldGroup } from 'nextly';
+ *
+ * export default defineFieldGroup({
+ *   slug: 'faq-item',
+ *   label: { singular: 'FAQ Item' },
+ *   fields: [
+ *     text({ name: 'question', required: true }),
+ *     text({ name: 'answer', required: true }),
+ *     fieldGroup({ name: 'cta', component: 'cta' }),
+ *   ],
+ * });
+ * ```
+ */
+/**
+ * What a field group may be declared with: every built-in field shape, plus a
+ * contributed one that went through `pluginField()`. The canonical
+ * `FieldGroupConfig` keeps the closed `FieldConfig[]`, so the openness lives at
+ * the authoring boundary only, exactly as `CollectionConfigInput` does it.
+ */
+export type FieldGroupConfigInput = Omit<FieldGroupConfig, "fields"> & {
+  fields: AuthorableFieldConfig[];
+};
+
+/**
+ * Narrow the authored fields back to the canonical union.
+ *
+ * A branded contributed field is structurally a declaration like any other; it
+ * is the closed union that cannot name it, not the value that fails to be one.
+ */
+function asDeclaredFields(fields: AuthorableFieldConfig[]): FieldConfig[] {
+  return fields as FieldConfig[];
+}
+
+export function defineFieldGroup(
+  config: FieldGroupConfigInput
+): FieldGroupConfig {
+  // ============================================================
+  // Comprehensive Validation
+  // ============================================================
+
+  // Judged, not thrown: a configuration's load and the start judge every entity in it by the
+  // same rules (`configurationProblems`) and report every problem, where a throw here would stop
+  // at the first one, during the import. The entity is normalized all the same, since a plugin's
+  // setup may repair the problem and must leave what a valid declaration gives; only where the
+  // problem makes normalizing itself throw is the entry returned as declared. Either way it is
+  // marked (`markDeclaredByDefine`), which tells the start to refuse it rather than warn.
+  const accepted = validateFieldGroupConfig({
+    ...config,
+    fields: asDeclaredFields(config.fields),
+  }).valid;
+  try {
+    // ============================================================
+    // Apply Defaults
+    // ============================================================
+
+    // Generate label from slug if not provided
+    const label: FieldGroupLabel = {
+      singular: config.label?.singular ?? toTitleCase(config.slug),
+    };
+
+    // Build normalized config with defaults. The authored fields narrow back to
+    // the canonical union here, so what leaves this function is the same closed
+    // shape every internal reader already holds.
+    const normalized: FieldGroupConfig = {
+      ...config,
+      fields: asDeclaredFields(config.fields),
+      label,
+      admin: {
+        ...config.admin,
+      },
+    };
+
+    // Marked as declared through this function, so a start refuses it should the configuration's
+    // load find a problem this call could not, such as a field type nothing registers.
+    return markDeclaredByDefine(normalized);
+  } catch (error) {
+    if (accepted) throw error;
+    return markDeclaredByDefine({ ...config }) as unknown as FieldGroupConfig;
+  }
+}
+
+// ============================================================
+// Re-exports for Convenience
+// ============================================================
+
+export type { FieldGroupConfig, FieldGroupLabel, FieldGroupAdminOptions };

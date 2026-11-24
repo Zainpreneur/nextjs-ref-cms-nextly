@@ -1,0 +1,747 @@
+// F8 clack-based PromptDispatcher for the terminal channel.
+//
+// Replaces drizzle-kit's TUI prompt with our own clack-rendered prompt
+// for column-rename ambiguities. F4 RegexRenameDetector emits Cartesian
+// rename candidates (N drops x M adds = N*M candidates per table); this
+// dispatcher walks the candidates in a "shrinking pool" pattern: each
+// time the user picks 'rename', the consumed drop and add are removed
+// from the candidate pool so subsequent prompts only show options that
+// haven't been resolved yet.
+//
+// Non-TTY behavior (no terminal, `--non-interactive` or `CI`, as
+// `canPrompt` answers): throws TTYRequiredError with actionable message.
+// The intentional v1 limitation per F4 Option E plan: code-first non-TTY
+// users get a clear error directing them to a TTY terminal.
+//
+// Browser channel ('browser'): NOT implemented in this PR. F10 will add
+// SSE-based browser modal rendering. For now, channel='browser' is
+// treated like channel='terminal' (terminal prompt). UI-first prompts
+// don't go through this dispatcher in PR 5 - they're handled in admin UI
+// before save - so this is OK.
+
+import * as clack from "@clack/prompts";
+
+import { answered } from "../../../../cli/utils/prompt-cancelled";
+import { NextlyError } from "../../../../errors/nextly-error";
+import { consoleLogger } from "../../../../shared/types";
+import { cancelEndsRun, canPrompt } from "../../migrate/can-prompt";
+import {
+  deprecationNotices,
+  judgeDataLoss,
+  resolveDataLossConsent,
+  type Deletion,
+} from "../../migrate/data-loss-consent";
+import { consentForColumn } from "../../repair-columns/consent";
+import {
+  describeClassed,
+  describeRowCount,
+} from "../../value-conversion/describe";
+import { nonEmptyValuesOf } from "../classifier/classifier";
+import { lossyConsentRefusal } from "../classifier/conversion-refusal";
+import type {
+  ClassifierEvent,
+  DestructiveDropEvent,
+  PromptDispatcher,
+  PromptDispatchResult,
+  RenameCandidate,
+  Resolution,
+  ResolutionKind,
+} from "../pushschema-pipeline-interfaces";
+import type { TypeChangeEvent } from "../resolution/types";
+
+import { PromptCancelledError, TTYRequiredError } from "./errors";
+
+// Re-export so callers that want to catch these errors can import from the
+// dispatcher module they already depend on.
+export { PromptCancelledError, TTYRequiredError };
+
+/**
+ * The drops the rename candidates leave in the plan: each candidate's source
+ * column that no confirmed rename consumed, once. `answered` are those the
+ * prompt asked about and was told "drop and add"; `unasked` are those it
+ * never showed, because a rename took every column they could have become.
+ * Only an answer agrees to a drop.
+ */
+function keptDrops(
+  candidates: readonly RenameCandidate[],
+  confirmed: readonly RenameCandidate[],
+  answeredKeys: ReadonlySet<string>
+): { answered: Deletion[]; unasked: Deletion[] } {
+  const renamed = new Set(
+    confirmed.map(c => `${c.tableName}::${c.fromColumn}`)
+  );
+  const kept = new Map<string, Deletion>();
+  for (const c of candidates) {
+    const key = `${c.tableName}::${c.fromColumn}`;
+    if (renamed.has(key) || kept.has(key)) continue;
+    kept.set(key, { kind: "column", table: c.tableName, column: c.fromColumn });
+  }
+  const answered: Deletion[] = [];
+  const unasked: Deletion[] = [];
+  for (const [key, deletion] of kept) {
+    (answeredKeys.has(key) ? answered : unasked).push(deletion);
+  }
+  return { answered, unasked };
+}
+
+function isDrop(event: ClassifierEvent): event is DestructiveDropEvent {
+  return event.kind === "destructive_drop";
+}
+
+/** A type change the conversion rule judged lossy, with the rows its consent would clear. */
+type LossyTypeChange = TypeChangeEvent & {
+  lossy: NonNullable<TypeChangeEvent["lossy"]>;
+};
+
+function isLossyTypeChange(event: ClassifierEvent): event is LossyTypeChange {
+  return event.kind === "type_change" && event.lossy !== undefined;
+}
+
+/**
+ * What the database does with a type change: the line of the database being changed, or every
+ * database's where the event does not say which (an event made without the conversion rule).
+ */
+function warningOf(event: TypeChangeEvent): string {
+  const { pg, mysql, sqlite } = event.perDialectWarning;
+  if (event.dialect === undefined) return [pg, mysql, sqlite].join("\n");
+  return { postgresql: pg, mysql, sqlite }[event.dialect];
+}
+
+/**
+ * A type change's note: what the database being changed does with the pair and, for a pair the
+ * conversion rule has no conversion for, how many rows hold a value it would touch.
+ */
+function typeChangeNote(event: TypeChangeEvent): [body: string, title: string] {
+  const held =
+    event.rowsHoldingValue === undefined
+      ? []
+      : [
+          event.rowsHoldingValue === 1
+            ? "1 row holds a value."
+            : `${String(event.rowsHoldingValue)} rows hold a value.`,
+        ];
+  return [
+    [warningOf(event), ...held].join("\n"),
+    `Type change on ${event.tableName}.${event.columnName}: ${event.fromType} -> ${event.toType}`,
+  ];
+}
+
+/** `result`, with the lossy type changes whose values to clear where there are any. */
+function withClearing<T extends object>(
+  result: T,
+  clearing: readonly string[] | undefined
+): T & { clearing?: string[] } {
+  return clearing === undefined || clearing.length === 0
+    ? result
+    : { ...result, clearing: [...clearing] };
+}
+
+/**
+ * Whether the data-loss consent alone can decide an event without a terminal: a drop, a column
+ * made required (refused by the push, counting its rows), or a lossy type change.
+ */
+function consentDecides(event: ClassifierEvent): boolean {
+  return (
+    isDrop(event) || makesColumnRequired(event) || isLossyTypeChange(event)
+  );
+}
+
+/** "t.c: from -> to is <class>: <reasons with their rows>.", in the repair report's words. */
+function describeLossy(event: LossyTypeChange): string {
+  return `${event.tableName}.${event.columnName}: ${event.fromType} -> ${event.toType} is ${describeClassed(event.lossy.judgement)}.`;
+}
+
+/** Whether an event makes a column NOT NULL over rows: made required, or added required. */
+function makesColumnRequired(event: ClassifierEvent): boolean {
+  return (
+    event.kind === "add_not_null_with_nulls" ||
+    event.kind === "add_required_field_no_default"
+  );
+}
+
+/**
+ * A prompt's answer. A cancel (Ctrl+C) is not a no: under a `nextly` command
+ * it ends the run with exit 130 (`answered`); inside the app's dev server
+ * (`next dev`), where nothing turns `cancelEndsRun` on, it stops only this
+ * apply and the server keeps running.
+ */
+async function answeredHere<T>(answer: T | symbol): Promise<T> {
+  if (clack.isCancel(answer) && !cancelEndsRun()) {
+    throw new PromptCancelledError();
+  }
+  return answered(answer);
+}
+
+/** Asks at the terminal, defaulting to no; a cancel as `answeredHere`. */
+async function askInTerminal(question: string): Promise<boolean> {
+  return answeredHere(
+    await clack.confirm({
+      message: question,
+      initialValue: false,
+    })
+  );
+}
+
+/**
+ * A prompt's answer, closing the prompt block first on a cancel, which then
+ * goes as `answeredHere`. A cancel is not the "Cancel everything" answer,
+ * which stops only the apply.
+ */
+async function answeredOrClosed<T>(answer: T | symbol): Promise<T> {
+  if (clack.isCancel(answer)) clack.outro("Cancelled");
+  return answeredHere(answer);
+}
+
+export class ClackTerminalPromptDispatcher implements PromptDispatcher {
+  /**
+   * `print` writes the data-loss listing and notices; a test collects them. `asksAboutTypeChanges`
+   * false never asks about a type change, even at a terminal: a lossy one's values are cleared only
+   * under the consent naming the column and refused without it, and a batch holding any other is
+   * refused as a run without a terminal refuses it, naming where it is confirmed. A config reload
+   * runs inside the development server, where a question is not the place to give it.
+   */
+  constructor(
+    private readonly print: (line: string) => void = line =>
+      consoleLogger.warn(line),
+    private readonly options: { asksAboutTypeChanges?: boolean } = {}
+  ) {}
+
+  /**
+   * Whether `events` hold a type change this dispatcher would ask about where it may not: a pair
+   * with no conversion is always asked about, a lossy one is decided by its consent.
+   */
+  private wouldAskAboutTypeChange(events: readonly ClassifierEvent[]): boolean {
+    return (
+      this.options.asksAboutTypeChanges === false &&
+      events.some(
+        event => event.kind === "type_change" && !isLossyTypeChange(event)
+      )
+    );
+  }
+
+  /** Whether this dispatch has printed its consent notices yet. */
+  private noticed = false;
+
+  /**
+   * The column drops judged by the data-loss consent (`NEXTLY_ACCEPT_DATA_LOSS`,
+   * which `db:sync --accept-data-loss` sets for its run, or the earlier
+   * `NEXTLY_ALLOW_CODE_FIRST_DROPS`): their confirmations when covered or
+   * agreed to at the terminal, null when the terminal says no. A drop the
+   * consent does not cover is refused, naming it, before any DDL: with no
+   * terminal by a `TTYRequiredError` that names the consent covering it,
+   * and under a consent naming other targets by a refusal of its own.
+   *
+   * `kept` are the drops the rename candidates leave in the plan, which have
+   * no event of their own, so they are judged here too (`keptDrops`). One the
+   * prompt was answered "drop and add" for is agreed to by that answer, unless
+   * the consent names its targets, which then has to cover it like any other
+   * drop; one the prompt never showed is judged like any other drop. The
+   * rows a NOT NULL prompt was answered "delete" for come in as answered too.
+   */
+  private async judgeDrops(
+    drops: readonly DestructiveDropEvent[],
+    interactive: boolean,
+    kept: { answered: Deletion[]; unasked: Deletion[] } = {
+      answered: [],
+      unasked: [],
+    }
+  ): Promise<Resolution[] | null> {
+    const chosen = [...kept.answered, ...kept.unasked];
+    if (drops.length === 0 && chosen.length === 0) return [];
+    const consent = resolveDataLossConsent({
+      env: process.env,
+      honours: ["NEXTLY_ALLOW_CODE_FIRST_DROPS"],
+    });
+    // Once per dispatch, however many times its deletions are judged.
+    if (!this.noticed) {
+      for (const notice of deprecationNotices(consent)) this.print(notice);
+      this.noticed = true;
+    }
+    const named = consent.given !== null && consent.given.targets !== "all";
+    const verdict = await judgeDataLoss({
+      deletions: [
+        ...drops.map(drop => ({
+          kind: "column" as const,
+          table: drop.tableName,
+          column: drop.columnName,
+          count: nonEmptyValuesOf(drop),
+        })),
+        ...chosen,
+      ],
+      consent,
+      approved: named ? [] : kept.answered,
+      interactive,
+      ask: askInTerminal,
+      print: this.print,
+      // A push from `next dev` has no command line to pass a flag on; the
+      // variable reaches both it and `db:sync`.
+      flag: false,
+    });
+    if (verdict.kind === "declined") return null;
+    if (verdict.kind === "refused") {
+      if (verdict.reason === "needs-consent") {
+        throw new TTYRequiredError(verdict.message);
+      }
+      throw NextlyError.invalidInput({
+        message: verdict.message,
+        logContext: { reason: "data-loss-not-covered" },
+      });
+    }
+    return drops.map(drop => ({
+      kind: "confirm_drop" as const,
+      eventId: drop.id,
+    }));
+  }
+
+  /**
+   * The lossy type changes judged by the data-loss consent, by the repair command's rule: only the
+   * consent naming the column (`--accept-data-loss=table.column`, or `NEXTLY_ACCEPT_DATA_LOSS`)
+   * covers clearing its values; the form without a list and one naming only the table do not, and
+   * say so. Covered, the clearing is listed and agreed without a question. Otherwise, at a
+   * terminal, each column is asked about, defaulting to no; a no stops the apply (null). With no
+   * terminal, every column not covered is refused at once, naming its rows and the consent that
+   * would cover it, before any statement. Returns the ids of the events whose values to clear.
+   */
+  private async judgeLossyTypeChanges(
+    events: readonly ClassifierEvent[],
+    interactive: boolean
+  ): Promise<string[] | null> {
+    const lossy = events.filter(isLossyTypeChange);
+    if (lossy.length === 0) return [];
+    const consent = resolveDataLossConsent({
+      env: process.env,
+      honours: ["NEXTLY_ALLOW_CODE_FIRST_DROPS"],
+    });
+    const judged = lossy.map(event => ({
+      event,
+      consent: consentForColumn(
+        consent,
+        event.tableName,
+        event.columnName,
+        "a type change"
+      ),
+    }));
+    const uncovered = judged.filter(({ consent: c }) => !c.covered);
+    if (!interactive && uncovered.length > 0) {
+      throw lossyConsentRefusal(
+        uncovered.map(({ event, consent: c }) => ({
+          conversion: {
+            tableName: event.tableName,
+            columnName: event.columnName,
+            fromType: event.fromType,
+            toType: event.toType,
+            judgement: event.lossy.judgement,
+          },
+          consent: c,
+        }))
+      );
+    }
+    const clearing: string[] = [];
+    for (const { event, consent: c } of judged) {
+      const column = `${event.tableName}.${event.columnName}`;
+      const values = describeRowCount(event.lossy.cleared.length);
+      if (c.covered) {
+        this.print(
+          `${describeLossy(event)} Clearing the value in ${values}, under the consent naming the column.`
+        );
+      } else {
+        if (c.notice !== null) this.print(`${c.notice}.`);
+        clack.note(
+          [describeLossy(event), warningOf(event)].join("\n"),
+          `Lossy type change on ${column}`
+        );
+        const clear = await answeredOrClosed(
+          await clack.confirm({
+            message: `Clear the value in ${values} named above and convert ${column}?`,
+            initialValue: false,
+          })
+        );
+        if (!clear) {
+          clack.outro("Cancelled");
+          return null;
+        }
+      }
+      clearing.push(event.id);
+    }
+    return clearing;
+  }
+
+  async dispatch(args: {
+    candidates: RenameCandidate[];
+    events: ClassifierEvent[];
+    classification: "safe" | "destructive" | "interactive";
+    channel: "browser" | "terminal";
+  }): Promise<PromptDispatchResult> {
+    const { candidates, events } = args;
+    this.noticed = false;
+
+    // Fast path: nothing to ask, nothing to do.
+    if (candidates.length === 0 && events.length === 0) {
+      return { confirmedRenames: [], resolutions: [], proceed: true };
+    }
+
+    // The CLI's one answer to whether anyone can be asked: no terminal,
+    // `--non-interactive` or `CI` all mean the prompts below are not shown. A dispatcher that never
+    // asks about a type change answers a batch holding one it would ask about as such a run does:
+    // refused, naming where it is confirmed, never waiting on a question.
+    if (!canPrompt() || this.wouldAskAboutTypeChange(events)) {
+      // A batch of nothing but column drops is the data-loss consent's to
+      // judge: applied when covered, refused at once, naming the consent
+      // that covers it, when not. Anything needing a real decision —
+      // renames, type changes — still requires a terminal below.
+      //
+      // A column made required has no answer a run without a terminal could give, so it goes on
+      // unanswered: the push counts the rows in its way before anything runs and refuses naming
+      // the entity, the field and the count (`refuseRequiredColumnsOverNulls`), or goes ahead when
+      // no row is in the way any more. Refused here instead, it named none of them.
+      //
+      // A lossy type change is the consent's to judge too: cleared under the consent naming its
+      // column, refused, naming its rows, without one.
+      if (candidates.length === 0 && events.every(consentDecides)) {
+        const clearing =
+          (await this.judgeLossyTypeChanges(events, false)) ?? [];
+        return withClearing(
+          {
+            confirmedRenames: [],
+            resolutions:
+              (await this.judgeDrops(events.filter(isDrop), false)) ?? [],
+            proceed: true,
+          },
+          clearing
+        );
+      }
+      // Build an actionable error message covering both renames and
+      // F5/F6 events so users know what they would have been asked.
+      // Both samples name what was omitted. A list that shows three of ten with no
+      // ellipsis reads as complete, and this message exists to tell someone what they
+      // would have been asked to approve — so a silent truncation withholds exactly the
+      // inventory it was written to deliver. `browser.ts` already reports its remainder
+      // this way; this matches it.
+      const SAMPLE_SIZE = 3;
+      const remainder = (total: number) =>
+        total > SAMPLE_SIZE ? `, +${total - SAMPLE_SIZE} more` : "";
+      const renameSample = candidates
+        .slice(0, SAMPLE_SIZE)
+        .map(c => `${c.fromColumn} -> ${c.toColumn} on ${c.tableName}`)
+        .join(", ");
+      const eventSample = events
+        .slice(0, SAMPLE_SIZE)
+        .map(e => {
+          switch (e.kind) {
+            case "type_change":
+              return `type change on ${e.tableName}.${e.columnName} (${e.fromType} -> ${e.toType})`;
+            case "add_not_null_with_nulls":
+              return `NOT NULL on ${e.tableName}.${e.columnName}`;
+            case "add_required_field_no_default":
+              return `required field ${e.tableName}.${e.columnName}`;
+            case "destructive_drop":
+              return `drop column ${e.tableName}.${e.columnName} (${e.columnType}, ${e.tableRowCount} row(s))`;
+          }
+        })
+        .join(", ");
+      // The destructive subset is called out separately: a reader who sees "54 more"
+      // still cannot tell whether drops are hiding in the tail, and a drop is the only
+      // kind of hidden item that loses data.
+      const hiddenDrops = events
+        .slice(SAMPLE_SIZE)
+        .filter(e => e.kind === "destructive_drop").length;
+      const parts: string[] = [];
+      if (candidates.length > 0) {
+        parts.push(
+          `${candidates.length} rename candidate(s): ${renameSample}${remainder(candidates.length)}`
+        );
+      }
+      if (events.length > 0) {
+        const drops =
+          hiddenDrops > 0 ? ` (${hiddenDrops} of them column drops)` : "";
+        parts.push(
+          `${events.length} resolution event(s): ${eventSample}${remainder(events.length)}${drops}`
+        );
+      }
+      throw new TTYRequiredError(
+        // Multi-line so log readers can scan rename vs event sections
+        // separately without an arbitrary semicolon-join.
+        `Schema change needs confirmation.\n${parts.join("\n")}`
+      );
+    }
+
+    // Phase 1: rename candidates via shrinking-pool prompt.
+    const renameResult =
+      candidates.length > 0
+        ? await this.runShrinkingPoolPrompts(candidates)
+        : {
+            confirmedRenames: [],
+            resolutions: [] as Resolution[],
+            proceed: true,
+            answeredDrops: new Set<string>(),
+          };
+    if (!renameResult.proceed) return renameResult;
+
+    // Phase 2: F5/F6 events, with the drops the rename answers kept.
+    const eventResult = await this.runEventPrompts(
+      events,
+      keptDrops(
+        candidates,
+        renameResult.confirmedRenames,
+        renameResult.answeredDrops
+      )
+    );
+
+    return withClearing(
+      {
+        confirmedRenames: renameResult.confirmedRenames,
+        resolutions: eventResult.resolutions,
+        proceed: eventResult.proceed,
+      },
+      eventResult.clearing
+    );
+  }
+
+  // Walk classifier events in order. NOT-NULL kinds get a multi-step
+  // (select kind -> text value if provide_default -> next event); type_change
+  // gets a single warning + Y/N. An abort or a no returns proceed=false; a
+  // cancel (Ctrl+C) ends the run with exit 130.
+  private async runEventPrompts(
+    events: ClassifierEvent[],
+    kept: { answered: Deletion[]; unasked: Deletion[] } = {
+      answered: [],
+      unasked: [],
+    }
+  ): Promise<{
+    resolutions: Resolution[];
+    proceed: boolean;
+    clearing?: string[];
+  }> {
+    if (
+      events.length === 0 &&
+      kept.answered.length === 0 &&
+      kept.unasked.length === 0
+    ) {
+      return { resolutions: [], proceed: true };
+    }
+
+    // Every drop is listed, with what each column holds, and asked about
+    // once, before any other question: the operator sees all that would be
+    // lost before agreeing to any of it. Covered by consent, it is listed
+    // and confirmed without asking.
+    const drops = await this.judgeDrops(events.filter(isDrop), true, kept);
+    if (drops === null) return { resolutions: [], proceed: false };
+    const resolutions: Resolution[] = [...drops];
+    const others = events.filter(event => !isDrop(event));
+    if (others.length === 0) return { resolutions, proceed: true };
+
+    clack.intro("Schema change requires confirmation");
+
+    // Lossy type changes first, each cleared only under the consent naming it or a yes here.
+    const clearing = await this.judgeLossyTypeChanges(
+      others,
+      this.options.asksAboutTypeChanges !== false
+    );
+    if (clearing === null) return { resolutions, proceed: false };
+
+    // A lossy type change was decided above, by its consent or its own question.
+    for (const event of others.filter(e => !isLossyTypeChange(e))) {
+      if (event.kind === "type_change") {
+        // What the database does with the pair (`typeChangeNote`), then Y/N.
+        clack.note(...typeChangeNote(event));
+        const proceed = await answeredOrClosed(
+          await clack.confirm({
+            message: `Proceed with type change on ${event.tableName}.${event.columnName}?`,
+            initialValue: false,
+          })
+        );
+        if (!proceed) {
+          clack.outro("Cancelled");
+          return { resolutions, proceed: false };
+        }
+        // type_change has no resolution kinds; the user has acknowledged
+        // the warning. Nothing to push into resolutions[].
+        continue;
+      }
+
+      // F5 NOT-NULL kinds.
+      const headline =
+        event.kind === "add_not_null_with_nulls"
+          ? `Adding NOT NULL to "${event.tableName}.${event.columnName}"\n${event.nullCount} of ${event.tableRowCount} rows have NULL values.`
+          : `New required field "${event.tableName}.${event.columnName}" on table with ${event.tableRowCount} existing rows.`;
+      clack.note(headline, "Resolution needed");
+
+      const labels: Record<ResolutionKind, string> = {
+        provide_default: "Provide a default value for empty rows",
+        make_optional: "Make the field optional (cancel the NOT NULL)",
+        delete_nonconforming:
+          event.kind === "add_not_null_with_nulls"
+            ? `Delete the ${event.nullCount} rows with empty values`
+            : "Delete rows that violate the constraint",
+        // Unreachable for NOT-NULL kinds (destructive_drop never lists
+        // these resolutions in applicableResolutions), but Record<K,V>
+        // requires every key. The label only surfaces if a future event
+        // erroneously includes confirm_drop in its applicableResolutions.
+        confirm_drop: "Confirm the drop",
+        abort: "Cancel everything",
+      };
+      const options = event.applicableResolutions.map(kind => ({
+        value: kind,
+        label: labels[kind],
+      }));
+      const kind = await answeredOrClosed(
+        await clack.select({
+          message: "How do you want to handle this?",
+          options,
+        })
+      );
+      if (kind === "abort") {
+        clack.outro("Cancelled");
+        return { resolutions, proceed: false };
+      }
+      if (kind === "provide_default") {
+        const value = await answeredOrClosed(
+          await clack.text({
+            message: `Default value for "${event.columnName}":`,
+            validate: v =>
+              !v || v.trim().length === 0 ? "Cannot be empty" : undefined,
+          })
+        );
+        resolutions.push({
+          kind: "provide_default",
+          eventId: event.id,
+          value,
+        });
+      } else {
+        resolutions.push({ kind, eventId: event.id });
+      }
+    }
+
+    // Removing the rows a NOT NULL answer named is a deletion in their
+    // table, judged like a drop the prompt was answered for: the answer
+    // agrees to it, unless the consent names its targets, which then has to
+    // cover the table. Judged before the outro, so nothing has run.
+    const removedRows: Deletion[] = resolutions.flatMap(resolution => {
+      if (resolution.kind !== "delete_nonconforming") return [];
+      const event = others.find(e => e.id === resolution.eventId);
+      if (event === undefined) return [];
+      return [
+        {
+          kind: "rows" as const,
+          table: event.tableName,
+          count: "tableRowCount" in event ? event.tableRowCount : undefined,
+        },
+      ];
+    });
+    if (removedRows.length > 0) {
+      await this.judgeDrops([], true, { answered: removedRows, unasked: [] });
+    }
+
+    clack.outro("Resolutions confirmed");
+    return withClearing({ resolutions, proceed: true }, clearing);
+  }
+
+  // Walks candidates in a shrinking-pool pattern:
+  //   1. Group candidates by `fromColumn` (the dropped column).
+  //   2. For each unique drop, ask the user to pick from its valid adds
+  //      (filtered to those that haven't been consumed).
+  //   3. If user picks 'rename' with a specific add, mark both the drop
+  //      and the add as consumed; future prompts skip them.
+  //   4. If user picks 'drop_and_add', drop survives as drop+add (no rename).
+  private async runShrinkingPoolPrompts(
+    candidates: RenameCandidate[]
+  ): Promise<PromptDispatchResult & { answeredDrops: ReadonlySet<string> }> {
+    const consumedDrops = new Set<string>();
+    // The drops the operator was asked about and answered "drop and add":
+    // what agrees to them. A drop whose prompt was skipped is not among them.
+    const answeredDrops = new Set<string>();
+    const consumedAdds = new Set<string>();
+    const confirmed: RenameCandidate[] = [];
+
+    // Group candidates by drop (table::fromColumn).
+    const dropToOptions = new Map<string, RenameCandidate[]>();
+    for (const c of candidates) {
+      const key = `${c.tableName}::${c.fromColumn}`;
+      const list = dropToOptions.get(key) ?? [];
+      list.push(c);
+      dropToOptions.set(key, list);
+    }
+
+    clack.intro("Schema rename detected");
+
+    for (const [dropKey, options] of dropToOptions) {
+      if (consumedDrops.has(dropKey)) continue;
+
+      // Filter remaining options whose `toColumn` hasn't been consumed.
+      const remaining = options.filter(c => {
+        const addKey = `${c.tableName}::${c.toColumn}`;
+        return !consumedAdds.has(addKey);
+      });
+      if (remaining.length === 0) continue; // all targets already consumed
+
+      const first = remaining[0];
+
+      // Build select options: each remaining ADD becomes a 'rename to X'
+      // option, plus a 'drop and add new' option.
+      const selectOptions: Array<{
+        value: string;
+        label: string;
+        hint?: string;
+      }> = remaining.map(c => ({
+        value: `rename:${c.toColumn}`,
+        label: `Rename ${c.fromColumn} -> ${c.toColumn}`,
+        // Three answers, not two. A compatible pair can still CONVERT its
+        // values — `numeric` to `float8` is the pair that made the difference
+        // matter — and calling that "data preserved" is the claim this hint
+        // used to make.
+        hint: !c.typesCompatible
+          ? `${c.fromType} -> ${c.toType} (incompatible types; not recommended)`
+          : c.preservesValues
+            ? `${c.fromType} -> ${c.toType} (data preserved)`
+            : `${c.fromType} -> ${c.toType} (rows kept, VALUES CHANGE: ${c.valueChangeReason})`,
+      }));
+      selectOptions.push({
+        value: "drop_and_add",
+        label: `Drop ${first.fromColumn} and add new column(s) (data lost)`,
+      });
+
+      // Default to a rename that PRESERVES the values before one that merely
+      // fits: pre-selecting a conversion that rewrites every row is the
+      // decision being taken for the author, and it is the one they would
+      // most want to make themselves.
+      const preserving = remaining.find(
+        c => c.typesCompatible && c.preservesValues
+      );
+      const compatible = preserving ?? remaining.find(c => c.typesCompatible);
+      const initialValue =
+        compatible !== undefined
+          ? `rename:${compatible.toColumn}`
+          : "drop_and_add";
+
+      const choice = await answeredOrClosed(
+        await clack.select({
+          message: `Column "${first.fromColumn}" was removed in ${first.tableName}. What should happen?`,
+          options: selectOptions,
+          initialValue,
+        })
+      );
+
+      if (typeof choice === "string" && choice.startsWith("rename:")) {
+        const targetColumn = choice.slice("rename:".length);
+        const picked = remaining.find(c => c.toColumn === targetColumn);
+        if (picked) {
+          confirmed.push(picked);
+          consumedDrops.add(dropKey);
+          consumedAdds.add(`${picked.tableName}::${picked.toColumn}`);
+        }
+      }
+      // 'drop_and_add' falls through: drop and adds remain as-is in the
+      // operations list; no consumed marks added.
+      if (choice === "drop_and_add") answeredDrops.add(dropKey);
+    }
+
+    clack.outro("Schema renames confirmed");
+
+    return {
+      confirmedRenames: confirmed,
+      resolutions: [],
+      proceed: true,
+      answeredDrops,
+    };
+  }
+}

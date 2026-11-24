@@ -1,0 +1,182 @@
+/**
+ * Plugin introspection.
+ *
+ * A pure, read-only view of what each registered plugin IS and CONTRIBUTES —
+ * derived WITHOUT running the plugin (`init` is never called). Reuses the same
+ * folds the runtime/CLI boot uses, so introspection matches reality:
+ *   - {@link resolvePlugins} for canonical (topo) order + version validation;
+ *   - {@link pluginCollectionSlugs} / `contributes.singles|fieldGroups` for schema;
+ *   - {@link collectCustomPermissions} for custom permission slugs (per owner);
+ *   - {@link collectPluginRoutes} for route counts (enabled-only, D49);
+ *   - {@link buildPluginAdminMeta} for admin menu/page/settings counts.
+ *
+ * Backs `nextly plugins list` / `nextly plugins info`.
+ *
+ * @module plugins/plugin-introspection
+ */
+
+import type { NextlyServiceConfig } from "../di/register";
+
+import { buildPluginAdminMeta } from "./admin-meta";
+import { collectCustomPermissions } from "./permissions/collect-permissions";
+import { pluginCollectionSlugs } from "./plugin-admin-meta";
+import { isLoginCapable, type PluginConsent } from "./plugin-consent";
+import type { PluginDefinition } from "./plugin-context";
+import { collectPrincipalKinds } from "./principals/registry";
+import { resolvePlugins } from "./resolve";
+import { collectPluginRoutes } from "./routes/collect-routes";
+
+/** A read-only, introspectable summary of one registered plugin. */
+export interface PluginInfo {
+  name: string;
+  version: string;
+  /** Declared core-compatibility range. */
+  nextly: string;
+  /** `false` when `enabled: false` — schema still applies, behavior is skipped. */
+  enabled: boolean;
+  dependsOn: string[];
+  optionalDependsOn: string[];
+  /** Owned collection slugs (resolved, post-rename). */
+  collections: string[];
+  singles: string[];
+  fieldGroups: string[];
+  /** Custom permission slugs declared by this plugin (CRUD is auto-seeded, not listed). */
+  permissions: string[];
+  /** Custom event names this plugin declares it may emit. */
+  events: string[];
+  /**
+   * The kinds of signed-in person this plugin registers, by full name
+   * (`<plugin>:<name>`): who besides staff it lets sign in.
+   */
+  principalKinds: string[];
+  /** Number of HTTP routes contributed (0 when disabled, D49). */
+  routeCount: number;
+  adminMenuCount: number;
+  adminPageCount: number;
+  hasSettings: boolean;
+  /** Declared-slug → resolved-slug remap applied by the integrator. */
+  renamed: Record<string, string>;
+  /**
+   * What the plugin's manifest declares about its reach, for an operator to
+   * read before installing it.
+   */
+  manifest: {
+    /** Hosts `ctx.fetch` may reach; empty when it has no `ctx.fetch`. */
+    outbound: string[];
+    rawSql: boolean;
+    /** Whether it may finish logins, signing in an account it names. */
+    completesLogins: boolean;
+    secrets: string[];
+    provides: string[];
+    /** Capability → the version range its provider must satisfy. */
+    requires: Record<string, string>;
+    /** The plugin's declared schema version; absent when it declares none. */
+    schemaVersion?: number;
+  };
+}
+
+/** What a plugin's manifest declares about its reach, with absences filled. */
+function manifestSummary(plugin: PluginDefinition): PluginInfo["manifest"] {
+  const capabilities = plugin.capabilities ?? {};
+  return {
+    outbound: capabilities.net?.outbound ?? [],
+    rawSql: capabilities.db?.rawSql === true,
+    // The consent's own login-capable predicate: a determineUser hook makes
+    // the plugin a login finisher too, and `nextly plugins info` must show
+    // the operator what the boot actually grants.
+    completesLogins: isLoginCapable(plugin),
+    secrets: capabilities.secrets ?? [],
+    provides: plugin.provides ?? [],
+    requires: plugin.requires ?? {},
+    schemaVersion: plugin.schemaVersion,
+  };
+}
+
+/**
+ * Build the introspection summary for every registered plugin, in resolved
+ * (topological) order. Pure. Validates via {@link resolvePlugins} — throws
+ * `PLUGIN_RESOLUTION_ERROR` on an invalid/cyclic/incompatible config, the same
+ * fail-fast the boot uses (the caller surfaces it).
+ */
+export function collectPluginInfo(
+  config: NextlyServiceConfig,
+  plugins: PluginDefinition[],
+  opts: { coreVersion: string; consent: PluginConsent }
+): PluginInfo[] {
+  // With the app's consent, so a configuration the boot refuses is refused
+  // here too rather than listed as if it would start.
+  const resolved = resolvePlugins(plugins, {
+    coreVersion: opts.coreVersion,
+    consent: opts.consent,
+  });
+
+  // Collected ONCE. Both views below derive from this list — the slug summary
+  // here and the display metadata `buildPluginAdminMeta` serializes — so the
+  // CLI and the admin cannot disagree about which permissions a plugin owns.
+  const collectedPermissions = collectCustomPermissions(config, resolved);
+
+  // Custom permissions across all plugins, grouped by declaring owner (plugin name).
+  const permissionsByOwner = new Map<string, string[]>();
+  for (const perm of collectedPermissions) {
+    const list = permissionsByOwner.get(perm.owner) ?? [];
+    list.push(perm.slug);
+    permissionsByOwner.set(perm.owner, list);
+  }
+
+  // Route counts per plugin (collectPluginRoutes already skips disabled plugins).
+  const routeCountByPlugin = new Map<string, number>();
+  for (const route of collectPluginRoutes(resolved)) {
+    routeCountByPlugin.set(
+      route.pluginName,
+      (routeCountByPlugin.get(route.pluginName) ?? 0) + 1
+    );
+  }
+
+  // Kinds per plugin, from the fold resolution publishes, so the CLI names
+  // exactly the kinds a route or `nextly.principals` can ask for.
+  const principalKindsByPlugin = new Map<string, string[]>();
+  for (const registered of collectPrincipalKinds(resolved).values()) {
+    const list = principalKindsByPlugin.get(registered.plugin) ?? [];
+    list.push(registered.kind);
+    principalKindsByPlugin.set(registered.plugin, list);
+  }
+
+  // Admin menu/page/settings (host overrides only affect placement/appearance,
+  // not these counts, so we fold with no overrides).
+  const adminMetaByName = new Map(
+    buildPluginAdminMeta(resolved, undefined).map(meta => [meta.name, meta])
+  );
+
+  return resolved.map(plugin => {
+    const contributes = plugin.contributes;
+    const meta = adminMetaByName.get(plugin.name);
+    return {
+      name: plugin.name,
+      version: plugin.version,
+      nextly: plugin.nextly,
+      enabled: plugin.enabled !== false,
+      dependsOn: Object.keys(plugin.dependsOn ?? {}),
+      optionalDependsOn: Object.keys(plugin.optionalDependsOn ?? {}),
+      collections: pluginCollectionSlugs(plugin),
+      singles: (contributes?.singles ?? []).map(s => s.slug),
+      fieldGroups: (contributes?.fieldGroups ?? []).map(c => c.slug),
+      permissions: (permissionsByOwner.get(plugin.name) ?? []).sort(),
+      events: (contributes?.events ?? []).map(e => e.name),
+      principalKinds: principalKindsByPlugin.get(plugin.name) ?? [],
+      routeCount: routeCountByPlugin.get(plugin.name) ?? 0,
+      adminMenuCount: meta?.menu?.length ?? 0,
+      adminPageCount: meta?.pages?.length ?? 0,
+      hasSettings: Boolean(meta?.settings),
+      renamed: plugin.renameMap ?? {},
+      manifest: manifestSummary(plugin),
+    };
+  });
+}
+
+/** Find one plugin's info by exact name. Returns `undefined` if not present. */
+export function findPluginInfo(
+  infos: PluginInfo[],
+  name: string
+): PluginInfo | undefined {
+  return infos.find(i => i.name === name);
+}

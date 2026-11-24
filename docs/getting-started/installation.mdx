@@ -1,0 +1,556 @@
+---
+title: Installation
+description: Install Nextly in a new or existing Next.js project with step-by-step instructions.
+---
+
+There are two ways to install Nextly: scaffold a new project with the CLI, or add Nextly to an existing Next.js app, with the same CLI or by hand.
+
+## Option A: Create a New Project (Recommended)
+
+The `create-nextly-app` CLI scaffolds a complete Nextly project with your choice of database and template. Storage defaults to local disk, so you don't need to configure cloud storage to get started.
+
+<Tabs items={["pnpm", "npm", "yarn", "bun"]}>
+<Tab value="pnpm">
+```bash
+pnpm create nextly-app@alpha my-app
+```
+</Tab>
+<Tab value="npm">
+```bash
+npx create-nextly-app@alpha my-app
+```
+</Tab>
+<Tab value="yarn">
+```bash
+yarn create nextly-app@alpha my-app
+```
+</Tab>
+<Tab value="bun">
+```bash
+bun create nextly-app@alpha my-app
+```
+</Tab>
+</Tabs>
+
+The CLI will prompt you to:
+
+1. **Project name** -- defaults to the directory name. Use `.` to scaffold into the current folder.
+2. **Template** -- `Blank` (empty config) or `Blog` (a complete blog with posts, authors, categories, and frontend pages). See [Templates](/docs/templates) for what each one ships with.
+3. **Schema approach** (only for templates that support both) -- `code-first` (default for Blog) or `visual` (Visual Schema Builder).
+4. **Database** -- `SQLite` (default), `PostgreSQL`, or `MySQL`.
+5. **Database connection string** -- skipped for SQLite (defaults to `file:./data/nextly.db`); required for PostgreSQL/MySQL.
+
+### Which release you get
+
+A project gets the release of Nextly its CLI belongs to: `create-nextly-app@<version>` declares `nextly` and every `@nextlyhq/*` package at exactly `<version>`, so the templates, the agent guide and the skills it writes match what is installed. To start on another release, run that release's CLI; to upgrade later, move every Nextly package to the new version together.
+
+Adding Nextly to an app that already has a Nextly package at another version, or declared as a range, stops before changing anything and says what to set. With `--branch` or `--local-template`, the packages come from the `alpha` tag, the active release line, and `--use-yalc` links local builds.
+
+Once the CLI completes, change into the project and start the dev server:
+
+<Tabs items={["pnpm", "npm", "yarn", "bun"]}>
+<Tab value="pnpm">
+```bash
+cd my-app
+pnpm dev
+```
+</Tab>
+<Tab value="npm">
+```bash
+cd my-app
+npm run dev
+```
+</Tab>
+<Tab value="yarn">
+```bash
+cd my-app
+yarn dev
+```
+</Tab>
+<Tab value="bun">
+```bash
+cd my-app
+bun run dev
+```
+</Tab>
+</Tabs>
+
+### Create the super admin
+
+The first time you run the dev server, the database is empty -- there's no admin account yet. Open the setup page to create one:
+
+```
+http://localhost:3000/admin/setup
+```
+
+Enter your name, an email and a password. The first account gets the Super Admin role, with every permission. Setup then signs you in and opens the admin's dashboard at `/admin`.
+
+### Default storage is local disk
+
+Out of the box, Nextly uses your project's `./public/uploads/` directory as the media store -- no env vars, no cloud account, no credentials. Files you upload through the admin's media library land there and are served at `/uploads/...` by your app, including under `next start`, where a route in `src/app/uploads/` serves the files uploaded since the server started. When you're ready to move to S3, Vercel Blob, or Uploadthing, see [Media & Storage](/docs/guides/media-storage).
+
+## Option B: Add to an Existing Next.js Project
+
+### With the CLI
+
+Run `create-nextly-app` inside an existing Next.js app to add Nextly; it writes only the files the app does not have and extends the Next config. Run it from the app's folder, with no project name:
+
+<Tabs items={["pnpm", "npm"]}>
+<Tab value="pnpm">
+```bash
+pnpm create nextly-app@alpha
+```
+</Tab>
+<Tab value="npm">
+```bash
+npx create-nextly-app@alpha
+```
+</Tab>
+</Tabs>
+
+**What it checks first.** A folder whose `package.json` lists `next` in `dependencies` or `devDependencies` is an existing app, and the CLI asks "Install Nextly in this project?" before it changes anything. It then needs the App Router: an `app/` folder, or `src/app/` when the app has a `src/` folder. Without one it stops with "App Router not detected". It also stops, before installing or writing anything, when the app already has a Nextly package at another version or declared as a range (see [Which release you get](#which-release-you-get)). It asks which database to use and, for PostgreSQL or MySQL, the connection string. `--yes` answers yes and, unless `--database` names another, picks SQLite. An existing app always gets the blank setup: no template pages are added to it.
+
+**What it installs.** `nextly`, `@nextlyhq/admin`, `@nextlyhq/ui`, `@nextlyhq/adapter-drizzle` and the adapter for your database, at the CLI's own release, plus `@tanstack/react-query` and `lucide-react`, and `esbuild` as a dev dependency unless the app already declares it. It installs with the package manager the app's lockfile names. On pnpm 10 or later it also approves the native packages' build scripts (the settings in [Install Packages](#1-install-packages) below), and on bun it adds them to a `trustedDependencies` list the app already has, saying what it changed.
+
+**What it writes.** Each of these is created only where the app has no file yet:
+
+- `nextly.config.ts`, with no collections or singles yet
+- `app/admin/[[...params]]/page.tsx` and `layout.tsx`, the admin panel
+- `app/admin/api/[[...params]]/route.ts`, the admin's API
+- `app/admin/api/media/[[...path]]/route.ts` and `app/api/media/[[...path]]/route.ts`, the media routes
+- `app/api/health/route.ts`, a health check
+- `instrumentation.ts` beside `app/`, which starts Nextly when the server starts
+- `types/generated/nextly-types.ts`, a placeholder until types are generated, beside a `.gitkeep`
+- `.env` and `.env.example`. In one the app already has, only the keys Nextly needs and the file lacks are added at the end; a value already there is kept.
+
+With a `src/` folder, all of these except `nextly.config.ts` and the env files go under `src/`. When git would not ignore `.env`, it also adds `.env` to `.gitignore`, creating the file if there is none.
+
+**What it extends.** In the Next config it adds the packages missing from `serverExternalPackages`, and turns [Cache Components](#cache-components) and Partial Prefetching on where either is off or missing, with Nextly's cache handlers. An app an earlier Nextly release turned off is turned on again. An app with no Next config gets a `next.config.ts`. The rest of the config stays as it was.
+
+**What it leaves to you.** Its report lists every file it wrote, every file it changed, and every file it left alone and why. Nothing the app already has is replaced:
+
+- **A file that is already there** is kept, and the report prints Nextly's version of it: merge that in by hand. A route folder the app already uses, such as `app/api/health/`, is left alone the same way.
+- **An instrumentation hook the app already has** is kept, and the report prints the lines to add to its `register()`.
+- **A Next config it can't change safely**, because it can't tell where the settings are (a spread, a computed value, a wrapper call) or the app runs Next.js 14, is left as it is, and the report prints the options to add.
+- **A Next config with a cache handler of its own** keeps it: Cache Components is turned on, and the report prints Nextly's handler lines for you to weigh against yours.
+- **An app that sets `pageExtensions`** gets no routes or hook written, since Next.js would not serve them under the default names; the report names the file to create and its content.
+- **A `.env` that git already tracks** gets no generated secret, since it would be committed; the report says how to stop tracking it.
+- **`--yes` with `--database postgresql` or `--database mysql`** puts a placeholder `DATABASE_URL` in `.env`: set your own before you start the app.
+
+Then start the dev server and open `/admin/setup` to create the first administrator, as in [Verify](#7-verify) below. Running the CLI a second time writes nothing that is already there.
+
+### By hand
+
+Or add Nextly yourself, step by step.
+
+### 1. Install Packages
+
+Install the runtime, the admin panel and what it expects from your project, and `esbuild`, which the CLI and the dev server use to load `nextly.config.ts`:
+
+<Tabs items={["pnpm", "npm", "yarn", "bun"]}>
+<Tab value="pnpm">
+```bash
+pnpm add nextly @nextlyhq/admin @nextlyhq/ui @tanstack/react-query lucide-react
+pnpm add -D esbuild
+```
+</Tab>
+<Tab value="npm">
+```bash
+npm install nextly @nextlyhq/admin @nextlyhq/ui @tanstack/react-query lucide-react
+npm install -D esbuild
+```
+</Tab>
+<Tab value="yarn">
+```bash
+yarn add nextly @nextlyhq/admin @nextlyhq/ui @tanstack/react-query lucide-react
+yarn add -D esbuild
+```
+</Tab>
+<Tab value="bun">
+```bash
+bun add nextly @nextlyhq/admin @nextlyhq/ui @tanstack/react-query lucide-react
+bun add -d esbuild
+```
+</Tab>
+</Tabs>
+
+Then install your database driver:
+
+<Tabs items={["PostgreSQL", "MySQL", "SQLite"]}>
+<Tab value="PostgreSQL">
+```bash
+pnpm add @nextlyhq/adapter-postgres pg
+```
+</Tab>
+<Tab value="MySQL">
+```bash
+pnpm add @nextlyhq/adapter-mysql mysql2
+```
+</Tab>
+<Tab value="SQLite">
+```bash
+pnpm add @nextlyhq/adapter-sqlite better-sqlite3
+```
+</Tab>
+</Tabs>
+
+On pnpm 10 or later, allow the native packages to run their build scripts, or `better-sqlite3` has no compiled binding and the app fails at boot, and `sharp`, `esbuild` and `unrs-resolver` fall back to slower paths. On pnpm 10.6 or later, add to `pnpm-workspace.yaml` (create it with `packages: []` if you have none):
+
+```yaml title="pnpm-workspace.yaml"
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+  sharp: true
+  unrs-resolver: true
+onlyBuiltDependencies:
+  - better-sqlite3
+  - esbuild
+  - sharp
+  - unrs-resolver
+```
+
+pnpm 11 reads `allowBuilds`, pnpm 10.6+ reads `onlyBuiltDependencies`. On pnpm 10.0 to 10.5, put the same list in `package.json` instead, as `"pnpm": { "onlyBuiltDependencies": ["better-sqlite3", "esbuild", "sharp", "unrs-resolver"] }`, or upgrade pnpm. npm, yarn and bun need none of this.
+
+Cloud storage is optional -- Nextly's default is local disk under `./public/uploads/`. Install a storage adapter only if you need one:
+
+<Tabs items={["S3 / R2 / DigitalOcean Spaces", "Vercel Blob", "Uploadthing"]}>
+<Tab value="S3 / R2 / DigitalOcean Spaces">
+```bash
+pnpm add @nextlyhq/storage-s3
+```
+</Tab>
+<Tab value="Vercel Blob">
+```bash
+pnpm add @nextlyhq/storage-vercel-blob
+```
+</Tab>
+<Tab value="Uploadthing">
+```bash
+pnpm add @nextlyhq/storage-uploadthing
+```
+</Tab>
+</Tabs>
+
+### 2. Create `nextly.config.ts`
+
+Create a `nextly.config.ts` file in your project root:
+
+```typescript title="nextly.config.ts"
+import { defineConfig } from "nextly/config";
+
+export default defineConfig({
+  collections: [],
+  singles: [],
+
+  typescript: {
+    outputFile: "./src/types/generated/nextly-types.ts",
+  },
+});
+```
+
+### 3. Update `next.config.ts`
+
+Add `serverExternalPackages` so Next.js doesn't try to bundle server-only dependencies, and turn [Cache Components](#cache-components) and Partial Prefetching on, with Nextly's cache handlers:
+
+```typescript title="next.config.ts"
+import type { NextConfig } from "next";
+import { nextlyHtmlLimitedBots, nextlyTracingIncludes } from "nextly/next";
+
+const nextConfig: NextConfig = {
+  // Search engines and AI crawlers read each page's whole head in the first
+  // HTML; see "Metadata in the first HTML" in the routing and SEO guide.
+  htmlLimitedBots: nextlyHtmlLimitedBots,
+  // Files Nextly loads at request time that the build's trace leaves out;
+  // see "Deploying with traced functions" below.
+  outputFileTracingIncludes: { "/**": nextlyTracingIncludes() },
+  // Nextly runs with both on; see Cache Components below.
+  cacheComponents: true,
+  partialPrefetching: true,
+  cacheHandler: require.resolve("nextly/cache-handler"),
+  cacheMaxMemorySize: 0,
+  cacheHandlers: { default: require.resolve("nextly/cache-handlers") },
+  serverExternalPackages: [
+    "nextly",
+    "@nextlyhq/adapter-drizzle",
+    "@nextlyhq/adapter-postgres",
+    "@nextlyhq/adapter-mysql",
+    "@nextlyhq/adapter-sqlite",
+    "drizzle-orm",
+    "drizzle-kit",
+    "pg",
+    "mysql2",
+    "better-sqlite3",
+    "bcryptjs",
+    "sharp",
+    "esbuild",
+  ],
+};
+
+export default nextConfig;
+```
+
+Drop adapters and drivers your project doesn't actually use. A project made with `create-next-app` 16.4 already has `cacheComponents: true` and `partialPrefetching: true`. In a `next.config.mjs`, which has no `require` of its own, add `import { createRequire } from "node:module";` and `const require = createRequire(import.meta.url);` at the top.
+
+#### Deploying with traced functions
+
+A host that deploys each route with only the files the build traced, such as Vercel, needs the files Nextly loads at request time. Nextly reaches Next.js's `next/navigation`, `next/cache`, `next/headers` and `next/server` at request time, through a require the build's trace may not follow, so without them the first request that needs one can fail with `Cannot find module`. `nextlyTracingIncludes()` lists those files, with the database drivers and adapters, as globs relative to the project, and the `outputFileTracingIncludes` line above adds them to every route. A config wrapped in `withNextly()` from `nextly/next` gets them without the line. `next start` on a server with the whole `node_modules` needs neither.
+
+### 4. Set Up Admin Routes
+
+Create the admin panel page and layout:
+
+```tsx title="src/app/admin/[[...params]]/page.tsx"
+"use client";
+
+import "@nextlyhq/admin/style.css";
+import { RootLayout, QueryProvider, ErrorBoundary } from "@nextlyhq/admin";
+
+export default function AdminPage() {
+  return (
+    <ErrorBoundary
+      onError={(error, errorInfo) => {
+        console.error("Admin error:", error, errorInfo);
+      }}
+    >
+      <QueryProvider>
+        <RootLayout />
+      </QueryProvider>
+    </ErrorBoundary>
+  );
+}
+```
+
+```tsx title="src/app/admin/[[...params]]/layout.tsx"
+import {
+  ADMIN_BRANDING_ELEMENT_ID,
+  adminBrandingJson,
+  adminMetadataFor,
+  getBrandingCss,
+} from "nextly/config";
+
+import config from "../../../../nextly.config";
+
+const brandingCss = getBrandingCss(config.admin?.branding);
+const brandingJson = adminBrandingJson(config.admin?.branding);
+
+// Keeps the admin out of search results (`noindex, nofollow`), and puts the
+// configured favicon's link in the head of the first HTML the server sends.
+export const metadata = adminMetadataFor(config.admin?.branding);
+
+// `/admin` is built ahead: the same page for every visitor, served at once.
+export function generateStaticParams() {
+  return [{ params: [] }];
+}
+
+export default function AdminLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <>
+      {brandingCss && (
+        <style dangerouslySetInnerHTML={{ __html: brandingCss }} />
+      )}
+      {brandingJson && (
+        <script
+          type="application/json"
+          id={ADMIN_BRANDING_ELEMENT_ID}
+          dangerouslySetInnerHTML={{ __html: brandingJson }}
+        />
+      )}
+      {children}
+    </>
+  );
+}
+```
+
+The admin page is prebuilt. It holds nothing about whoever opens it, and fills in from the admin's own requests once it loads, so a CDN or the browser may keep it, and it's served even while the server is still starting Nextly. The logo, name and favicon set in `admin.branding` are written into it, so they show from the first paint. Branding set only in General settings arrives with the admin's first requests.
+
+Create the admin API catch-all route:
+
+```typescript title="src/app/admin/api/[[...params]]/route.ts"
+import { createDynamicHandlers } from "nextly/runtime";
+
+import nextlyConfig from "../../../../../nextly.config";
+
+const handlers = createDynamicHandlers({ config: nextlyConfig });
+
+export const GET = handlers.GET;
+export const POST = handlers.POST;
+export const PUT = handlers.PUT;
+export const PATCH = handlers.PATCH;
+export const DELETE = handlers.DELETE;
+export const OPTIONS = handlers.OPTIONS;
+```
+
+The admin's media library talks to its own route, which the catch-all above does not serve. Without it, uploads fail:
+
+```typescript title="src/app/admin/api/media/[[...path]]/route.ts"
+import { createMediaHandlers } from "nextly/api/media-handlers";
+
+import nextlyConfig from "../../../../../../nextly.config";
+
+// Checked against the caller's media permissions, except the raw bytes of a
+// publicly servable file (a web font), which a browser fetches without a session.
+const handlers = createMediaHandlers({ config: nextlyConfig, requireAuth: true });
+
+export const GET = handlers.GET;
+export const POST = handlers.POST;
+export const PATCH = handlers.PATCH;
+export const DELETE = handlers.DELETE;
+```
+
+Optionally, add a health check for your load balancer or uptime monitor:
+
+```typescript title="src/app/api/health/route.ts"
+export { GET, HEAD } from "nextly/api/health";
+```
+
+Then start Nextly when the server starts. Next.js runs `register()` once per server instance before the instance serves a request. `createRegister` begins Nextly's start there and returns without waiting for it, so pages that need no database, the admin page among them, are served while Nextly starts. The health route above, Nextly's own routes, and code that reads through `getNextly` or the `nextly` object wait for that start rather than beginning another; `requireNextly()`, which cannot wait, throws until it has finished. Without it, Nextly starts on the first request that carries its config, and the health route answers 503 until then. Put the file beside `app/`: `src/instrumentation.ts`, or `instrumentation.ts` in the project root when there is no `src/` (then import `./nextly.config`). If the app already has one, add these lines to its `register()`:
+
+```typescript title="src/instrumentation.ts"
+export async function register(): Promise<void> {
+  // Nextly needs Node.js; the Edge runtime cannot load it.
+  if (process.env.NEXT_RUNTIME !== "nodejs") return;
+
+  const { registerNextCacheRevalidator } = await import("nextly/runtime");
+  registerNextCacheRevalidator();
+
+  const { createRegister } = await import("nextly");
+  const { default: config } = await import("../nextly.config");
+  // Next.js writes its Cache Components setting into this file as it builds it.
+  // Nextly warns at start when it is off.
+  await createRegister(config, {
+    cacheComponents: process.env.__NEXT_CACHE_COMPONENTS,
+    // The build's newest migration, which `withNextly` sets: a production
+    // start warns when the database is behind it.
+    buildSchemaVersion: process.env.NEXTLY_BUILD_SCHEMA_VERSION,
+  })();
+}
+```
+
+Next.js skips `register()` during `next build`, so this opens no database connection at build time. `buildSchemaVersion` is what lets a production start compare the database's schema version with the build's (see [the schema version a production start checks](/docs/guides/production-migrations#the-schema-version-a-production-start-checks)); Next.js inlines it into this file, which is how it reaches Nextly on every host, Vercel and `output: "standalone"` included. If the config sets `pageExtensions`, name the file with one of them (`instrumentation.page.ts` for `page.ts`).
+
+### 5. Set Up Environment Variables
+
+Create a `.env` file with your database and auth configuration:
+
+```bash title=".env"
+# Database
+DB_DIALECT=postgresql
+DATABASE_URL=postgresql://user:password@localhost:5432/nextly
+
+# Authentication (REQUIRED, min 32 chars)
+# Generate with: openssl rand -base64 32
+NEXTLY_SECRET=change-me-generate-a-secure-secret
+
+# Application URL
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+```
+
+That's the minimum. For storage, email, and other optional settings see [Environment Variables](/docs/configuration/environment).
+
+### 6. Run Migrations
+
+Initialize the database schema. Nextly seeds default RBAC roles and permissions on first run:
+
+<Tabs items={["pnpm", "npm", "yarn", "bun"]}>
+<Tab value="pnpm">
+```bash
+pnpm nextly migrate
+```
+</Tab>
+<Tab value="npm">
+```bash
+npx nextly migrate
+```
+</Tab>
+<Tab value="yarn">
+```bash
+yarn nextly migrate
+```
+</Tab>
+<Tab value="bun">
+```bash
+bunx nextly migrate
+```
+</Tab>
+</Tabs>
+
+In development, Nextly auto-syncs schema changes when you save `nextly.config.ts`, so you usually only need `nextly migrate` for initial setup and production deploys. See [Production migrations](/docs/guides/production-migrations) for the production flow.
+
+### 7. Verify
+
+Start the development server:
+
+<Tabs items={["pnpm", "npm", "yarn", "bun"]}>
+<Tab value="pnpm">
+```bash
+pnpm dev
+```
+</Tab>
+<Tab value="npm">
+```bash
+npm run dev
+```
+</Tab>
+<Tab value="yarn">
+```bash
+yarn dev
+```
+</Tab>
+<Tab value="bun">
+```bash
+bun run dev
+```
+</Tab>
+</Tabs>
+
+Open [http://localhost:3000/admin/setup](http://localhost:3000/admin/setup) to create the first super admin account. Setup signs you in and opens the admin's dashboard at [http://localhost:3000/admin](http://localhost:3000/admin).
+
+## Requirements
+
+These are the versions Nextly supports.
+
+| Requirement | Version |
+| --- | --- |
+| Node.js | `^22.12.0 \|\| >=24.0.0` (not Node 20 or 23) |
+| Next.js | `^16.4.1`: 16.4.1 or any later 16.x release, with the App Router |
+| React and React DOM | `^19.3.0`: 19.3.0 or any later 19.x release |
+| TypeScript | 5+ |
+| Database | PostgreSQL (recommended for production), MySQL, or SQLite (local demo only) |
+
+Earlier Next.js and React releases are not supported. A new major version of Next.js or React is supported only once a Nextly release says so: until then, stay on the majors listed here.
+
+### Yarn Plug'n'Play
+
+Nextly installs and generates types under Yarn's Plug'n'Play, but Next.js's default bundler, Turbopack, does not support Plug'n'Play: it is listed among Turbopack's [unsupported features](https://nextjs.org/docs/app/api-reference/turbopack#unsupported-and-unplanned-features), and `next build` stops with "Could not find the Next.js package". Run Next.js with webpack instead (`next dev --webpack`, `next build --webpack`), or set `nodeLinker: node-modules` in `.yarnrc.yml` and install again.
+
+### Cache Components
+
+A Nextly app runs with Next.js [Cache Components](https://nextjs.org/docs/app/api-reference/config/next-config-js/cacheComponents) and Partial Prefetching on, and Nextly supports only that state. `create-nextly-app` writes these settings into a new project's `next.config`, and into an existing app's when it adds Nextly, saying in its report what it changed:
+
+```ts
+cacheComponents: true,
+partialPrefetching: true,
+cacheHandler: require.resolve("nextly/cache-handler"),
+cacheMaxMemorySize: 0,
+cacheHandlers: { default: require.resolve("nextly/cache-handlers") },
+```
+
+- **`cacheComponents` and `partialPrefetching`** turn the features on. `create-next-app` 16.4 sets both by default.
+- **Nextly's cache handlers** make a request sent after a write's response read the new version. Next.js's default cache judges a stored page by when it was stored, not by when its render read the content: a render that began before a write and stored its page a few milliseconds after it is served as fresh, with the previous content, until the page's lifetime runs out. It also serves a page's previous version once after a write expires it. Nextly's handlers judge each entry by when its render began, and expire it at once. Without them, see [When the new version shows](/docs/guides/isr-caching#when-the-new-version-shows).
+- **Cached reads** go through a `"use cache"` function of the app's own, which a scaffolded blog keeps in `src/nextly/cached-read.ts`. How to add one to another app: [Cache Components](/docs/guides/isr-caching#cache-components) in the caching guide.
+
+**An app with either option off** still runs, but it is not a state Nextly supports. Nextly warns once when it starts with `cacheComponents` off, from the value `instrumentation.ts` passes to `createRegister`, which is why that hook passes `process.env.__NEXT_CACHE_COMPONENTS`; a hook that passes nothing gets a warning that Nextly can't tell. `partialPrefetching` reaches no code while the app runs, so Nextly cannot see it there: only an app whose `next.config` is wrapped in `withNextly()` from `nextly/next` is warned about it, when Next.js loads the config. Apps made by an earlier Nextly release have `cacheComponents: false`: run `create-nextly-app` in the app again, or set the lines above by hand.
+
+Next.js 17 turns Cache Components on for every app and removes the option.
+
+## Next Steps
+
+- [Quick start](/docs/getting-started/quick-start) -- Create a project, start it and create the first admin
+- [Tutorial: build a blog](/docs/getting-started/build-a-blog) -- Build a blog, step by step
+- [Project Structure](/docs/getting-started/project-structure) -- Understand the file layout
+- [Configuration](/docs/configuration) -- Full configuration reference
+- [Environment Variables](/docs/configuration/environment) -- All environment variables explained

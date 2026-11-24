@@ -1,0 +1,213 @@
+/**
+ * Which version a version is compared against.
+ *
+ * One implementation, because three surfaces ask it — the history panel, the
+ * comparison page's rail, and the page itself — and they had begun to disagree.
+ * The panel answered it within one locale; the page answered it by position in
+ * the flat list, which pairs a version with whatever happens to sit below it.
+ * On a localized document that is a version in another language, and the server
+ * rejects the pair outright.
+ *
+ * Two rules the flat answer cannot express, both of them content rather than
+ * presentation:
+ *
+ * A comparison must stay within ONE LOCALE. A localized document interleaves
+ * its languages in one numbered history, so consecutive numbers routinely
+ * belong to different languages and are not a before-and-after of anything.
+ *
+ * The predecessor is the next-older row IN THAT SET, never `versionNo - 1`.
+ * Retention prunes old versions and leaves gaps in the numbering, so arithmetic
+ * on the number names a version that may no longer exist.
+ *
+ * @module components/features/versions/version-pairing
+ */
+
+/** The least a row must carry to be paired. */
+export interface PairableVersion {
+  versionNo: number | null;
+  locale?: string | null;
+}
+
+/**
+ * What sits before a version in its own locale.
+ *
+ * `unknown` is the entry that matters and the one a boolean cannot hold. A row
+ * at the bottom of a loaded page has no predecessor IN HAND, which is not the
+ * same as having none — and collapsing the two tells a reader that a version
+ * with ten older siblings is the first ever recorded, then makes selecting it
+ * do nothing. The two answers point a reader in opposite directions, so they
+ * are kept apart here rather than repaired in each consumer.
+ */
+export type Predecessor =
+  | { kind: "version"; versionNo: number }
+  | { kind: "first" }
+  | { kind: "unknown" };
+
+/** A row's locale, with an absent one and a null one meaning the same thing. */
+function localeOf(version: PairableVersion): string | null {
+  return version.locale ?? null;
+}
+
+/**
+ * The versions sharing one version's locale, newest first.
+ *
+ * Autosave rows carry a null `versionNo` and cannot be compared, so they are
+ * not in the set — a pair must name two versions the server can fetch.
+ */
+export function sameLocaleVersions<T extends PairableVersion>(
+  versions: readonly T[],
+  versionNo: number
+): T[] {
+  const anchor = versions.find(v => v.versionNo === versionNo);
+  if (anchor === undefined) return [];
+  return versionsInLocale(versions, localeOf(anchor));
+}
+
+/** The comparable versions of one locale, in list order: newest first. */
+function versionsInLocale<T extends PairableVersion>(
+  versions: readonly T[],
+  locale: string | null
+): T[] {
+  return versions.filter(v => v.versionNo !== null && localeOf(v) === locale);
+}
+
+/**
+ * The newest version in `versionNo`'s own locale, which it is compared with to
+ * see everything since it, or null when it is that version itself or none in
+ * its locale is loaded. The list loads newest first, so the first loaded row
+ * in the locale is its newest: no pager question arises, unlike a predecessor.
+ *
+ * The locale is the version's own row's; `locale`, the one the version's own
+ * read gives, answers for a version linked to beyond the loaded rows, whose
+ * newest sibling is loaded all the same.
+ */
+export function newestInLocale(
+  versions: readonly PairableVersion[],
+  versionNo: number,
+  locale?: string | null
+): number | null {
+  const anchor = versions.find(v => v.versionNo === versionNo);
+  const inLocale = anchor === undefined ? locale : localeOf(anchor);
+  if (inLocale === undefined) return null;
+  const newest = versionsInLocale(versions, inLocale)[0]?.versionNo ?? null;
+  return newest === versionNo ? null : newest;
+}
+
+/**
+ * What `versionNo` is compared against.
+ *
+ * `hasMore` is whether the history has pages still unloaded. It is what
+ * separates "there is nothing older" from "nothing older has been fetched", and
+ * a caller that cannot say should pass `true` — claiming a version is the first
+ * on record is the answer that misleads.
+ */
+export function predecessorOf(
+  versions: readonly PairableVersion[],
+  versionNo: number,
+  hasMore: boolean
+): Predecessor {
+  const sameLocale = sameLocaleVersions(versions, versionNo);
+  const index = sameLocale.findIndex(v => v.versionNo === versionNo);
+  // The row itself is not loaded, so nothing about what precedes it is known.
+  if (index === -1) return { kind: "unknown" };
+
+  const previous = sameLocale[index + 1];
+  if (previous?.versionNo != null) {
+    return { kind: "version", versionNo: previous.versionNo };
+  }
+  // Nothing older IN THIS LOCALE has loaded. Whether that is the end of the
+  // history or the end of the page is a question only the pager can answer, and
+  // interleaved locales put a predecessor beyond the page long before the
+  // selected row is the last one loaded overall.
+  return hasMore ? { kind: "unknown" } : { kind: "first" };
+}
+
+/**
+ * A pair to compare, or the reason there is none.
+ *
+ * The reasons are kept apart because a reader acts differently on each: a
+ * document with no history at all, one whose history holds a single version,
+ * one where only THIS language holds a single version and another language has
+ * its own, and one whose older versions simply have not been fetched.
+ * Collapsing them into a null pair made the pane tell someone with no versions
+ * that they had exactly one.
+ */
+export type PairResolution =
+  | { kind: "pair"; from: number; to: number }
+  | { kind: "no-history" }
+  | { kind: "only-version" }
+  /**
+   * This language holds one version; the document holds more, in others.
+   * Distinct from `only-version` because the remedy is: there is somewhere
+   * else to look, and saying "there is only one version" would contradict a
+   * rail listing several.
+   */
+  | { kind: "only-in-locale" }
+  | { kind: "not-loaded" }
+  /**
+   * A baseline only the server can resolve (what is published, the current
+   * draft, the version this person last looked at), against `to`, or against
+   * the server's default target when the address names none.
+   */
+  | { kind: "baseline"; baseline: ServerBaseline; to?: number };
+
+/**
+ * A baseline the server resolves by name, spelled as it names it.
+ *
+ * Any name rather than a list kept here: the server's registry is the one
+ * list, and other features add to it (workflows' `since-submitted` and
+ * `since-approved`). The server answers a name it does not know with a
+ * refusal naming the ones it does.
+ */
+export type ServerBaseline = string;
+
+/**
+ * A baseline's name in words: "since-approved" reads "Since approved". Read
+ * from the name itself, so a baseline another feature registers reads as
+ * core's do, with no list of names in the admin.
+ */
+export function baselineLabel(name: ServerBaseline): string {
+  const words = name.replace(/-/g, " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/**
+ * The pair to compare when the address names none: the newest version and what
+ * precedes it, within one locale.
+ */
+export function defaultPair(
+  versions: readonly PairableVersion[],
+  hasMore: boolean
+): PairResolution {
+  const newest = versions.find(v => v.versionNo !== null);
+  if (newest?.versionNo == null) return { kind: "no-history" };
+  return pairEndingAt(versions, newest.versionNo, hasMore);
+}
+
+/**
+ * `versionNo` and what precedes it, within its own locale: the change that
+ * version made.
+ */
+export function pairEndingAt(
+  versions: readonly PairableVersion[],
+  versionNo: number,
+  hasMore: boolean
+): PairResolution {
+  const previous = predecessorOf(versions, versionNo, hasMore);
+  if (previous.kind === "version") {
+    return { kind: "pair", from: previous.versionNo, to: versionNo };
+  }
+  if (previous.kind !== "first") {
+    // `unknown`: the predecessor is beyond the loaded pages, and Load more
+    // would find it.
+    return { kind: "not-loaded" };
+  }
+  // `first` is a LOCALE-SCOPED answer — `predecessorOf` looks only within one
+  // language — so it means nothing older exists in THIS one. Whether the
+  // document holds one version is a question about the whole history, and it
+  // is asked here rather than inferred from an answer that cannot carry it.
+  const comparable = versions.filter(v => v.versionNo !== null).length;
+  return comparable <= 1
+    ? { kind: "only-version" }
+    : { kind: "only-in-locale" };
+}

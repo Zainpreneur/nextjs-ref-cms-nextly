@@ -1,0 +1,85 @@
+import type { NextlyServiceConfig } from "../../di/register";
+import { PUBLIC_ROLE_SLUG } from "../../domains/auth/services/public-role";
+import { SUPER_ADMIN_SLUG } from "../../services/access/super-admin";
+import type { PluginRole } from "../contributions";
+import type { PluginDefinition } from "../plugin-context";
+
+/** A role bundle resolved to its concrete, seedable shape. */
+export interface CollectedRole {
+  slug: string;
+  name: string;
+  description?: string;
+  /** Permission slugs (`${action}-${resource}`) this role bundles. */
+  permissionSlugs: string[];
+  level: number;
+  /** Declaring owner — `"app"` or the plugin name (provenance for logs). */
+  owner: string;
+}
+
+/**
+ * Role slugs the system owns; a plugin/app may not redeclare them. Seeding
+ * skips a role whose slug exists, so one declared under a built-in role's
+ * slug would otherwise never be made, with nothing said.
+ */
+const RESERVED_ROLE_SLUGS = new Set([SUPER_ADMIN_SLUG, PUBLIC_ROLE_SLUG]);
+
+/**
+ * Fold every plugin's `contributes.roles` (and app-level `config.roles`) into a
+ * deduped, collision-validated list of seedable role bundles. Pure — no DB
+ * access. Runs over ALL plugins incl. disabled ones so declarative roles stay
+ * deterministic across environments (D49 — same policy as the permission fold).
+ *
+ * Throws on:
+ *  - the same slug declared by two sources (duplicate-role);
+ *  - a slug that collides with a reserved system role (e.g. `super-admin`).
+ *
+ * Permission-slug existence is validated later, at seed time (where the DB is) —
+ * an unresolvable permission slug is logged and skipped, not a boot error.
+ *
+ * Reads only `roles` of the config, and asks for no more, so `nextly migrate`
+ * folds the roles from the config it loads as a start does from its own.
+ */
+export function collectRoles(
+  config: Pick<NextlyServiceConfig, "roles">,
+  plugins: PluginDefinition[]
+): CollectedRole[] {
+  const seen = new Map<string, string>(); // slug -> first owner
+  const out: CollectedRole[] = [];
+
+  const consider = (role: PluginRole, owner: string): void => {
+    const { slug } = role;
+
+    const prev = seen.get(slug);
+    if (prev !== undefined) {
+      throw new Error(
+        `NEXTLY_ROLE_COLLISION: role slug "${slug}" is declared by both "${prev}" and "${owner}". Role slugs must be unique.`
+      );
+    }
+    // In any case: MySQL's collation reads `Public` as `public`, so a role
+    // declared so would meet the built-in role there and be skipped.
+    if (RESERVED_ROLE_SLUGS.has(slug.toLowerCase())) {
+      throw new Error(
+        `NEXTLY_ROLE_COLLISION: "${owner}" declares role slug "${slug}", which is reserved for a built-in system role.`
+      );
+    }
+
+    seen.set(slug, owner);
+    out.push({
+      slug,
+      name: role.name,
+      description: role.description,
+      permissionSlugs: role.permissionSlugs ?? [],
+      level: role.level ?? 0,
+      owner,
+    });
+  };
+
+  for (const role of config.roles ?? []) consider(role, "app");
+  for (const plugin of plugins) {
+    for (const role of plugin.contributes?.roles ?? []) {
+      consider(role, plugin.name);
+    }
+  }
+
+  return out;
+}

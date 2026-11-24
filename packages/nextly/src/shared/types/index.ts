@@ -1,0 +1,363 @@
+/**
+ * Shared Types
+ *
+ * Common types and interfaces used across all Nextly services.
+ * Services receive dependencies via constructor injection and use these
+ * shared types for consistent request handling and data structures.
+ *
+ * @module shared/types
+ * @since 1.0.0
+ */
+
+import type { AuthenticatedScope } from "../../auth/authenticated-scope";
+import type { RequestActor } from "../../auth/request-actor";
+import { maskingServiceLogger } from "../../observability/mask-emails";
+import type { HookExemptRead } from "../../services/collections/trust-grant";
+
+/**
+ * Type alias for Drizzle database instance.
+ * Using `any` because the concrete Drizzle type varies by dialect
+ * (NodePgDatabase, MySql2Database, BetterSQLite3Database).
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type DrizzleDB = any;
+
+/**
+ * Request context passed to service methods.
+ * Contains user information, locale, and request metadata.
+ *
+ * @example
+ * ```typescript
+ * const context: RequestContext = {
+ *   user: {
+ *     id: 'user_abc123',
+ *     email: 'user@example.com',
+ *     role: 'editor',
+ *     permissions: ['posts:read', 'posts:write'],
+ *   },
+ *   locale: 'en',
+ *   requestId: 'req_xyz789',
+ * };
+ *
+ * await collectionService.create('posts', input, context);
+ * ```
+ */
+export interface RequestContext {
+  /**
+   * Authenticated user information.
+   * Undefined for unauthenticated requests.
+   */
+  user?: {
+    /** User ID (UUID or CUID format) */
+    id: string;
+    /** User email address */
+    email: string;
+    /** User's primary role */
+    role: string;
+    /** Permission codes the user has (e.g., 'posts:read', 'posts:write') */
+    permissions: string[];
+  };
+  /** Request locale for i18n (e.g., 'en', 'es', 'fr') */
+  locale?: string;
+  /** Fallback locale (or `false` to disable fallback) for localized reads. */
+  fallbackLocale?: string | false;
+  /**
+   * Whole-document fallback for a read of one entry by id: where the entry is
+   * not published in `locale`, it answers in the first language of the
+   * fallback chain it is published in, and says which in `_locale`. Read only
+   * by `findEntryById`.
+   */
+  wholeDocumentFallback?: boolean;
+  /** Unique request identifier for tracing/logging */
+  requestId?: string;
+  /**
+   * The caller's own authorization scope when they arrived on an API key.
+   *
+   * `user` names the key's OWNER, so an access check that resolves permissions
+   * from `user.id` reads the owner's roles — which is how a viewer-scoped key
+   * minted by a super-admin came to be judged as a super-admin. This carries
+   * the grants stamped on the KEY, and the access services already prefer it
+   * over the owner when it is present. Absent for a session or system caller,
+   * who resolve the normal way.
+   */
+  authenticatedScope?: AuthenticatedScope;
+  /**
+   * @experimental Bypass the access check for this operation (D35 system
+   * elevation). Validation/hooks/events still run — only the access check is
+   * skipped. Default: undefined (enforce access).
+   */
+  overrideAccess?: boolean;
+  /**
+   * Arbitrary data handed to this operation's hooks as `ctx.context`.
+   *
+   * The way a caller tells a hook something about the CALL that the row cannot
+   * say. A hook that does expensive presentation work can be told this read is
+   * internal and skip it; a hook that writes can be told not to recurse. The
+   * entry service has accepted this on every operation for some time and seeds
+   * the shared hook context from it, but the service layer dropped it, so
+   * nothing above could reach it.
+   */
+  context?: Record<string, unknown>;
+
+  /**
+   * The HTTP request that produced this operation, when one did.
+   *
+   * The core resolves it into the facts hooks are handed as `ctx.req`: the
+   * headers, and a client address judged against this deployment's proxy-trust
+   * settings rather than read raw off `x-forwarded-for`. It is the request
+   * itself rather than an address because the caller does not get to name its
+   * own client: a forwarded address is only worth what the trust settings say
+   * it is, and those are read in one place.
+   *
+   * Leave it out for a write no request produced -- a seed, an import, a
+   * scheduled job. That absence is what tells a request-scoped rule, a rate
+   * limit or a honeypot, to stand down rather than judge a server as a visitor.
+   */
+  request?: Request;
+
+  /**
+   * @internal A grant waiving the read hooks of the collections one plugin
+   * declared, set only by that plugin's `ctx.services.ownCollections`.
+   *
+   * Recognised by identity, so a context built anywhere else, including by app
+   * code holding the raw facade, carries nothing that waives a hook, even when
+   * it copies this field's shape.
+   */
+  hookExemptRead?: HookExemptRead;
+
+  /**
+   * @internal Who a write made with this context is recorded under, in place
+   * of `user`. Set only by the plugin collection facade, from the actor of the
+   * plugin route request it serves, and only on a write made as that
+   * request's own user: an API key's write is then recorded as the key, as it
+   * is through REST. A plugin's `ServiceOpts` has no field for it, so a plugin
+   * cannot choose whom its write is attributed to. Attribution only: no
+   * access check reads it.
+   */
+  actor?: RequestActor;
+}
+
+/**
+ * System context for internal/CLI operations.
+ * Use this when performing operations that don't have a user context,
+ * such as migrations, seeders, or CLI commands.
+ *
+ * @example
+ * ```typescript
+ * // In a migration or seeder
+ * await userService.create(adminUserData, SYSTEM_CONTEXT);
+ * ```
+ */
+export const SYSTEM_CONTEXT: RequestContext = {
+  user: {
+    id: "system",
+    email: "system@nextly.local",
+    role: "admin",
+    permissions: ["*"],
+  },
+};
+
+/**
+ * Pagination options for list queries.
+ *
+ * @example
+ * ```typescript
+ * const options: PaginationOptions = {
+ *   limit: 20,
+ *   offset: 40, // Skip first 40 records (page 3)
+ * };
+ * // Or using page-based pagination
+ * const pageOptions: PaginationOptions = {
+ *   limit: 20,
+ *   page: 3, // Will be converted to offset: 40
+ * };
+ * ```
+ */
+export interface PaginationOptions {
+  /** Maximum number of records to return (default varies by service) */
+  limit?: number;
+  /** Number of records to skip */
+  offset?: number;
+  /** Page number (1-indexed, alternative to offset) */
+  page?: number;
+}
+
+/**
+ * Paginated result wrapper for list operations.
+ *
+ * @template T - The type of items in the data array
+ *
+ * @example
+ * ```typescript
+ * const result: PaginatedResult<User> = {
+ *   data: [user1, user2, user3],
+ *   pagination: {
+ *     total: 100,
+ *     limit: 10,
+ *     offset: 0,
+ *     hasMore: true,
+ *   },
+ * };
+ * ```
+ */
+export interface PaginatedResult<T> {
+  /** Array of items for the current page */
+  data: T[];
+  /** Pagination metadata */
+  pagination: {
+    /** Total number of records matching the query */
+    total: number;
+    /** Number of records per page */
+    limit: number;
+    /** Number of records skipped */
+    offset: number;
+    /** Whether there are more records after this page */
+    hasMore: boolean;
+  };
+}
+
+/**
+ * Sort options for list queries.
+ *
+ * @example
+ * ```typescript
+ * const sort: SortOptions = {
+ *   field: 'createdAt',
+ *   direction: 'desc',
+ * };
+ * ```
+ */
+export interface SortOptions {
+  /** Field name to sort by */
+  field: string;
+  /** Sort direction */
+  direction: "asc" | "desc";
+}
+
+/**
+ * Common query options combining pagination, sorting, and filtering.
+ *
+ * @example
+ * ```typescript
+ * const options: QueryOptions = {
+ *   pagination: { limit: 20, page: 1 },
+ *   sort: { field: 'createdAt', direction: 'desc' },
+ *   where: { status: 'published' },
+ * };
+ *
+ * const results = await collectionService.findMany('posts', options, context);
+ * ```
+ */
+export interface QueryOptions {
+  /** Pagination settings */
+  pagination?: PaginationOptions;
+  /** Sort settings */
+  sort?: SortOptions;
+  /** Filter conditions (key-value pairs) */
+  where?: Record<string, unknown>;
+  /**
+   * Relation population depth (0–5). Omit to keep the service default depth.
+   * @experimental Plugin data-access option (D56).
+   */
+  depth?: number;
+  /**
+   * Field projection — return only the listed fields (`{ title: true }`).
+   * @experimental Plugin data-access option (D56).
+   */
+  select?: Record<string, boolean>;
+}
+
+/**
+ * Service dependencies interface.
+ * Services receive dependencies via constructor injection.
+ *
+ * @example
+ * ```typescript
+ * class MyService {
+ *   constructor(private deps: ServiceDeps) {}
+ *
+ *   async doSomething() {
+ *     const result = await this.deps.db.select()...
+ *     this.deps.logger?.info('Operation completed');
+ *   }
+ * }
+ * ```
+ */
+export interface ServiceDeps {
+  /** Drizzle database instance */
+  db: DrizzleDB;
+  /** Optional logger instance */
+  logger?: Logger;
+}
+
+/**
+ * Logger interface for service logging.
+ * Compatible with common logging libraries (winston, pino, etc.)
+ *
+ * @example
+ * ```typescript
+ * const logger: Logger = {
+ *   debug: (msg, meta) => console.debug(`[DEBUG] ${msg}`, meta),
+ *   info: (msg, meta) => console.info(`[INFO] ${msg}`, meta),
+ *   warn: (msg, meta) => console.warn(`[WARN] ${msg}`, meta),
+ *   error: (msg, meta) => console.error(`[ERROR] ${msg}`, meta),
+ * };
+ * ```
+ */
+export interface Logger {
+  /** Log debug-level message */
+  debug(message: string, meta?: Record<string, unknown>): void;
+  /** Log info-level message */
+  info(message: string, meta?: Record<string, unknown>): void;
+  /** Log warning-level message */
+  warn(message: string, meta?: Record<string, unknown>): void;
+  /** Log error-level message */
+  error(message: string, meta?: Record<string, unknown>): void;
+}
+
+/**
+ * Default console logger implementation.
+ * Provides a simple logger that outputs to console.
+ * Use this as a fallback when no custom logger is configured.
+ *
+ * @example
+ * ```typescript
+ * import { consoleLogger } from 'nextly';
+ *
+ * const service = new MyService({
+ *   db,
+ *   logger: consoleLogger, // or your custom logger
+ * });
+ * ```
+ */
+/**
+ * One console level, labelled. A line logged without fields is written
+ * without them, rather than with an empty trailing argument. The console
+ * method is looked up as each line is written, so one replaced later (a test's
+ * spy, say) is the one that receives it.
+ */
+function consoleLevel(
+  level: "debug" | "info" | "warn" | "error",
+  label: string
+): Logger["info"] {
+  return (msg, meta) =>
+    meta === undefined
+      ? console[level](`[${label}] ${msg}`)
+      : console[level](`[${label}] ${msg}`, meta);
+}
+
+export const consoleLogger: Logger = maskingServiceLogger({
+  // Wrapped so that outside development and test every email address in a
+  // message or its fields is masked before it reaches the console: this is
+  // the logger every service falls back to.
+  debug: consoleLevel("debug", "DEBUG"),
+  info: consoleLevel("info", "INFO"),
+  warn: consoleLevel("warn", "WARN"),
+  error: consoleLevel("error", "ERROR"),
+});
+
+// Access control types (shared across collections, singles, auth)
+export * from "./access";
+
+// Database adapter type (used by BaseService generic)
+export * from "./database-adapter";

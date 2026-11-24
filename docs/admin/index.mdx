@@ -1,0 +1,103 @@
+---
+title: Admin Panel
+description: Overview of the Nextly admin panel, including navigation, default permissions, and how to access it.
+---
+
+Nextly ships with a full-featured admin panel for managing your collections, singles, media library, users, and settings without leaving the browser. It is mounted at `/admin` and is rendered by the same Next.js app that exports the Nextly route handlers, so there is no separate service to deploy.
+
+## Accessing the admin panel
+
+The first time you visit `/admin` and nobody holds the Super Admin role yet, Nextly redirects you to a setup wizard at `/admin/setup` to create that account. In production the wizard also asks for a one-time setup token, or you can create the account with `nextly users:create-admin` instead: see [The first administrator](/docs/guides/authentication#the-first-administrator). After that, sign in at `/admin/login`.
+
+```
+https://your-app.com/admin
+```
+
+Authentication is custom (email + password, JWT-backed sessions, API keys, RBAC) — see [Authentication](/docs/guides/authentication) for the full reference.
+
+## Navigation structure
+
+The admin uses a dual-sidebar layout on desktop. A narrow icon strip on the far left lists the top-level sections; clicking one reveals a wider inner sidebar with the items inside that section. On screens narrower than 1024px the layout switches to a single hamburger drawer automatically — no configuration required.
+
+The top-level sections (in order) are:
+
+| Section       | Route                        | What it contains                                                                                                                                      |
+| ------------- | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Dashboard     | `/admin`                     | Landing page after login                                                                                                                              |
+| Builder       | `/admin/builder/collections` | Schema management for Collections / Singles / Components — the [Visual Schema Builder](/docs/schema-builder)                                          |
+| Collections   | `/admin/collections/[slug]`  | Per-collection content surface; the icon appears in the sidebar once at least one collection exists and lands on the most-recently-created collection |
+| Singles       | `/admin/singles/[slug]`      | Per-single content surface; same dynamic visibility rule as Collections                                                                               |
+| Media Library | `/admin/media`               | Upload, browse, and edit files referenced by `upload` fields                                                                                          |
+| Plugins       | `/admin/plugins`             | Only visible when at least one plugin is installed and registers admin pages                                                                          |
+| Settings      | `/admin/settings`            | Site (General, Email), People (Users, Roles), Developers (API keys, Webhooks, Background jobs), then any plugin's settings                            |
+
+Collection and Single icons are added to the primary sidebar dynamically as you register collections / singles in `nextly.config.ts` (or create them via the Visual Schema Builder). The Builder icon is present outside production unless `admin.branding.showBuilder` is `false`, and never in production, where schema arrives through migrations; see [Schema Builder visibility](/docs/admin/branding#schema-builder-visibility).
+
+## What you can do in each section
+
+### Content management
+
+Every collection registered in `nextly.config.ts` gets a list view with filtering, sorting, pagination, and search. Click an entry to open the editing form; inputs are rendered field-type-aware (rich-text editor for `richText`, date picker for `date`, file picker for `upload`, related-document picker for `relationship`, and so on).
+
+Singles render a single editing form at `/admin/singles/[slug]` instead of a list view, since each Single has exactly one document.
+
+### Media Library
+
+A central media library at `/admin/media` supports drag-and-drop uploads, thumbnails, and file metadata editing. `upload` fields across all collections reference this library; uploading from inside an `upload` field writes to the same store. The default backend writes to `./public/uploads/` on local disk; configure a different storage adapter in `nextly.config.ts` to use S3, Vercel Blob, or UploadThing.
+
+### Visual Schema Builder
+
+The Visual Schema Builder lets you create and edit Collections, Singles, and Field Groups without writing TypeScript. It generates the same artifacts the code-first approach produces. See [Visual Schema Builder](/docs/schema-builder) for the full reference.
+
+### Settings
+
+The Settings inner sidebar is split into groups, each shown only when you can open something in it:
+
+- **Site.** General (site-wide settings) and Email (`/admin/settings/email`), whose tabs cover the emails your site sends, how they look and how they are sent. Email used to live at `/admin/email`; links to the old addresses redirect.
+- **People.** Users (`/admin/users`) — list, create, edit, and disable user accounts — and Roles (`/admin/security/roles`) — create roles and assign permissions to them. The setup wizard seeds a `Super Admin` role that holds every permission and assigns it to the first user. The **Fields** button on the Users page opens the user fields screen (`/admin/users/fields`), where you add extra fields to the user model. Only scalar field types are accepted on user records; see the [`users` reference](/docs/configuration/nextly-config#users) in `nextly.config.ts`.
+- **Developers.** API Keys, Webhooks and Background Jobs.
+
+Plugin settings follow these groups.
+
+The (programmatic) Permissions page also lives under settings.
+
+## Permissions
+
+Nextly's RBAC model uses permission slugs in the form `<action>-<resource>` (e.g. `read-users`, `create-roles`, `update-api-keys`, `update-settings`). Permissions and the `Super Admin` role are seeded the first time the database is set up — for the core resources (`users`, `roles`, `permissions`) the seeder creates one row per `(action, resource)` pair across `create`, `read`, `update`, `delete`. See [`packages/nextly/src/database/seeders/permissions.ts`](https://github.com/nextlyhq/nextly/blob/main/packages/nextly/src/database/seeders/permissions.ts) for the seeder source.
+
+> **Upgrading:** `manage-media`, `manage-settings`, `manage-email-providers` and `manage-email-templates` are retired. Run `nextly migrate` after updating (`nextly db:sync` in development): it gives each role holding one the plain `read-`, `create-`, `update-` and `delete-` permissions on that resource. Until it has run, a role holding only the retired permission is refused there.
+
+The admin sidebar is permission-gated. The built-in mapping is:
+
+| Sidebar item                                            | Required permission                                                           |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Dashboard                                               | Always visible                                                                |
+| Collections list / entries                              | Per-collection read permissions                                               |
+| Singles list / entries                                  | Per-Single read permissions                                                   |
+| Media Library                                           | `read-media`                                                                  |
+| Users                                                   | `read-users`                                                                  |
+| Roles                                                   | `read-roles`                                                                  |
+| User fields (the Fields button on the Users page)       | `read-settings`                                                               |
+| General settings                                        | `read-settings`                                                               |
+| API Keys                                                | `update-api-keys`                                                             |
+| Email (under Settings)                                  | `read-email-providers` (Sending) or `read-email-templates` (Messages, Design) |
+| Plugins overview                                        | `create-settings`, `update-settings` or `delete-settings`                     |
+| Builders (Collections / Singles / Field Groups Builder) | Off in production; elsewhere off when `admin.branding.showBuilder` is `false` |
+
+Permissions for collections you define in `nextly.config.ts` follow the same slug pattern (`read-posts`, `update-posts`, etc.); they are wired up automatically when the collection is registered. Assign permissions to roles from `/admin/security/roles`.
+
+## Who else is editing
+
+Opening an existing entry or a Single in the admin claims it for you while the editor is open. Anyone else who opens it is told you are editing it, and sees it read-only. They can choose **Take over** to edit it at once, or **Request edit access** to let you know they are waiting: the document stays read-only for them until you leave it. The claim is a courtesy between people in the admin: the server refuses no write because someone else holds the document. A save made from a copy someone has changed since is refused, though, and the editor asks what to do. [Editing with others](/docs/admin/editing-together) explains each message and what to do about it, and the [REST API](/docs/api-reference/rest-api#document-locks) documents the claim itself.
+
+## Plugins in the admin
+
+A plugin can register sidebar entries via its `admin.placement` setting. Until at least one plugin is installed, the Plugins section is hidden. When a plugin does add entries, they appear under the section the plugin chose (Collections, Singles, Users, Settings, Plugins, or Standalone). You can override the placement and appearance per-plugin from `admin.pluginOverrides` in `nextly.config.ts`; see [Customization](/docs/admin/customization#plugin-overrides).
+
+## Next steps
+
+- [Visual Schema Builder](/docs/schema-builder) — design content types without writing code
+- [Customization](/docs/admin/customization) — sidebar config, navigation permissions, plugin overrides
+- [Branding](/docs/admin/branding) — logo, favicon, color scheme, Builder visibility
+- [Collections](/docs/configuration/collections) — code-first collection definitions
+- [Singles](/docs/configuration/singles) — code-first Single definitions

@@ -1,0 +1,483 @@
+/**
+ * Canonical response-shape helpers. Every server handler (dispatcher
+ * methods, REST endpoints, auth handlers, routeHandler direct branches)
+ * converges on these instead of hand-rolling JSON.
+ *
+ * Contract lives in the envelope spec, section 5.1.
+ *
+ * Eight op-types:
+ *   respondList         to { items, meta }                   (paginated find)
+ *   respondDoc          to T (bare)                          (findByID)
+ *   respondMutation     to { message, item, warnings? }      (create/update/delete)
+ *   respondAction       to { message, warnings?, ...result } (non-CRUD mutation)
+ *   respondData         to T (bare object)                   (non-CRUD read)
+ *   respondCount        to { total }                         (count)
+ *   respondBulk         to { message, items, errors, warnings? } (bulk by id)
+ *   respondBulkUpload   to { message, items, errors, warnings? } (bulk upload)
+ *
+ * Errors do NOT use these helpers. Errors flow through `withErrorHandler`
+ * (REST API) or the routeHandler error path (dispatcher API), both of
+ * which emit the canonical singular `{ error: NextlyErrorJSON }` shape.
+ * See docs section 6.
+ *
+ * Note on bulk vs. error: respondBulk / respondBulkUpload are NOT errors.
+ * A bulk request always succeeds at the request layer (HTTP 200) so long
+ * as the request itself is well-formed; per-item failures are first-class
+ * data in the body's `errors` array. 4xx is reserved for malformed bulk
+ * requests (e.g. empty `ids` array) where the dispatcher's pre-check
+ * throws NextlyError.validation BEFORE entering the service.
+ */
+
+import { currentSideEffectWarnings } from "../hooks/side-effect-warnings";
+
+export type PaginationMeta = {
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+  hasNext: boolean;
+  hasPrev: boolean;
+  /**
+   * True when the list counted no further than a cap because more entries
+   * match: `total` is then the cap, a lower bound ("1000+"), and `hasNext`,
+   * `hasPrev` and `totalPages` come from the rows counted, so paging past the
+   * cap still works. Sent only by a list asked for a capped count
+   * (`count=capped`), and omitted when the total is exact.
+   */
+  totalCapped?: true;
+  /**
+   * Sources this read did not consult, named rather than dropped.
+   *
+   * Optional, and omitted by every read that consults everything — which is
+   * most of them — so it costs existing responses nothing.
+   *
+   * It exists because `hasNext` cannot carry the difference that matters. "More
+   * exists" and "these particular places were not looked at" prompt opposite
+   * reactions: the first is a paging affordance, the second is a caveat the
+   * screen has to state, because a list that quietly omits a source reads as
+   * that source having nothing in it — which is indistinguishable from the
+   * truth at a glance and is the one way such a list can lie.
+   */
+  notConsulted?: string[];
+  /**
+   * Records on this list the caller may not read, counted per scope (the
+   * collection or Single they belong to), with nothing else about them.
+   *
+   * Omitted when nothing is hidden or the list is not narrowed by reader,
+   * never sent empty. It exists for the same reason as `notConsulted`: a list
+   * that silently drops what its reader may not see reads as smaller than it
+   * is, while one that names those records shows what it must not.
+   */
+  hidden?: Array<{
+    scopeKind: string;
+    scopeSlug: string;
+    count: number;
+    /** The scope's display names, singular and plural, where it has them. */
+    labels?: { singular: string; plural: string };
+  }>;
+  /**
+   * Records on this page the caller may not read, as one number naming no
+   * scope: for a read whose records span collections and Singles the caller
+   * may not even know of, where `hidden`'s scope would name them.
+   *
+   * Optional, and sent only by those reads, every time, 0 included.
+   */
+  hiddenCount?: number;
+  /**
+   * The `before` to pass for the next page of a read walked by cursor, when
+   * there is a next page.
+   *
+   * Optional, and sent only by those reads. The last item's id is not always
+   * the cursor: a page of a release's history can end on events its reader
+   * may not see, and a read that stops scanning those must still say where
+   * it stopped, or the walk could never move past them.
+   */
+  nextBefore?: string;
+};
+
+/**
+ * Set on a response whose body is CONFIGURATION rather than records.
+ *
+ * The route handler rewrites date-looking strings in every payload by value, to
+ * present stored timestamps in the installation's timezone. A definition or a
+ * descriptor is not stored data: a field default that merely resembles a date
+ * would be rewritten, so the value delivered would stop matching the value
+ * registered and would differ between installations. Marked responses are
+ * passed through untouched, and the header is stripped before it reaches a
+ * client.
+ */
+export const SKIP_DATE_FORMATTING_HEADER = "x-nextly-skip-date-formatting";
+
+function jsonResponse(body: unknown, init?: ResponseInit): Response {
+  // Preserve caller-supplied headers, but default content-type to
+  // application/json so individual call sites don't have to repeat it.
+  const headers = new Headers(init?.headers);
+  if (!headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+  return new Response(JSON.stringify(body), {
+    status: init?.status ?? 200,
+    headers,
+  });
+}
+
+/** Paginated list response. Body is `{ items, meta }`. */
+export function respondList<T>(
+  items: T[],
+  meta: PaginationMeta,
+  init?: ResponseInit
+): Response {
+  return jsonResponse({ items, meta }, init);
+}
+
+/** Bare-doc response. Body is the doc itself. Used for findByID. */
+export function respondDoc<T>(doc: T, init?: ResponseInit): Response {
+  return jsonResponse(doc, init);
+}
+
+/**
+ * Mutation response. Body is `{ message, item }`. Default status 200;
+ * pass `status: 201` for create operations.
+ */
+export function respondMutation<T>(
+  message: string,
+  item: T,
+  init?: ResponseInit
+): Response {
+  // A post-commit hook failure reports success with a warning: the row is
+  // durable and a side-effect phase cannot change it, so failing the operation
+  // would tell the caller its write did not happen and invite a retry that
+  // writes it twice. Read here rather than passed in, because the failures are
+  // raised deep in the write path and every one of this helper's call sites
+  // would otherwise have to accept and forward them.
+  //
+  // Omitted entirely when empty, so the ordinary body is unchanged.
+  const warnings = currentSideEffectWarnings();
+  return jsonResponse(
+    warnings.length > 0 ? { message, item, warnings } : { message, item },
+    init
+  );
+}
+
+/**
+ * Action / non-CRUD-mutation response. Body is `{ message, ...result }`.
+ * Used for login, forgot-password, verify-email, seed, etc.; anywhere a
+ * server-authored toast string is needed.
+ *
+ * `result` is optional so silent actions can call `respondAction("Logged out.")`.
+ */
+export function respondAction(
+  message: string,
+  result: Record<string, unknown> = {},
+  init?: ResponseInit
+): Response {
+  // Some actions ARE writes: a version restore calls the ordinary update path,
+  // so its post-commit hooks run and can fail. Reporting a durable restore as
+  // an unqualified success would hide exactly the side effect this reports.
+  //
+  // A caller-supplied `warnings` key wins, so an action that computes its own
+  // is not overwritten by the ambient ones.
+  const warnings = currentSideEffectWarnings();
+  return jsonResponse(
+    warnings.length > 0
+      ? { message, warnings, ...result }
+      : { message, ...result },
+    init
+  );
+}
+
+/**
+ * Bare non-CRUD-read response. Body is the result object.
+ * Used by /me/permissions, /admin-meta, /dashboard/stats, /health, etc.
+ *
+ * Constraint (spec §5.1 rule 3): callers must not pass Boolean-only
+ * shapes like `{ ok: true }`. Always include at least one extra field
+ * for future growth (e.g. `{ ok, version, uptime }`).
+ */
+export function respondData<T extends Record<string, unknown>>(
+  result: T,
+  init?: ResponseInit
+): Response {
+  return jsonResponse(result, init);
+}
+
+/** Count response. Body is `{ total }`. */
+export function respondCount(total: number, init?: ResponseInit): Response {
+  return jsonResponse({ total }, init);
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Bulk shapes.
+//
+// Two distinct types because the per-item failure key differs:
+//   - id-keyed ops (bulk delete by ids, bulk update by ids, bulk update by
+//     query): the client supplied an id per item, so failures echo `id`.
+//   - upload-style ops (bulk media upload): the client supplied positional
+//     entries with no pre-assigned id. Forcing `id?: string` would be a
+//     workaround; we model the positional case honestly with `index` +
+//     `filename` (filename for UX context only, not a primary key).
+//
+// Per-item error code is the same canonical NextlyErrorCode enum the
+// single-item code path uses (NOT_FOUND, FORBIDDEN, VALIDATION_ERROR,
+// CONFLICT, INTERNAL_ERROR, ...). `message` is public-safe per spec
+// section 13.8: generic per-code, no identifier echo, no value leaking.
+// Specifics ride to the operator log via the dispatcher logger.
+// ────────────────────────────────────────────────────────────────────────
+
+export type PerItemError = {
+  /** Identifier of the item that failed (matches the request's input id). */
+  id: string;
+  /** Canonical NextlyErrorCode value. */
+  code: string;
+  /** Public-safe message. No identifier echo, no value leaking. */
+  message: string;
+};
+
+/**
+ * A per-item failure of an item the request named by a Single's slug rather than an id: a Single
+ * is one document, named by its slug, and its stored id is not the caller's to learn from a
+ * refusal.
+ */
+export type SingleItemError = {
+  /** The Single's slug, as the request named it. */
+  single: string;
+  /** Canonical NextlyErrorCode value. */
+  code: string;
+  /** Public-safe message. No identifier echo, no value leaking. */
+  message: string;
+};
+
+export type BulkUploadError = {
+  /** Positional index in the original request payload. */
+  index: number;
+  /** Filename from the input. UX context only, not an identifier. */
+  filename: string;
+  /** Canonical NextlyErrorCode value. */
+  code: string;
+  /** Public-safe message. No identifier echo, no value leaking. */
+  message: string;
+};
+
+/**
+ * Bulk-by-id response. Body is `{ message, items, errors }`. Status 200.
+ *
+ * - `items`: successes. For delete this is `{ id: string }[]` (the records
+ *   are gone, so no point shipping them back); for update/create this is
+ *   the full mutated records (the client needs the latest values without
+ *   a re-fetch).
+ * - `errors`: per-item failures. Always present, even when empty, so
+ *   consumers can iterate predictably.
+ */
+export function respondBulk<T>(
+  message: string,
+  items: T[],
+  errors: (PerItemError | SingleItemError)[],
+  init?: ResponseInit
+): Response {
+  // Same rule as `respondMutation`: a hook that failed after the write
+  // committed is reported beside the result rather than turned into an error.
+  // `errors` is per-ITEM and means that item did not happen; `warnings` is
+  // per-OPERATION and means every item happened and a side effect did not.
+  const warnings = currentSideEffectWarnings();
+  return jsonResponse(
+    warnings.length > 0
+      ? { message, items, errors, warnings }
+      : { message, items, errors },
+    init
+  );
+}
+
+/**
+ * Bulk-upload response. Body is `{ message, items, errors }`. Status 200.
+ *
+ * Same body shape as respondBulk, but `errors[]` items are positional
+ * (`{ index, filename, code, message }`) rather than id-keyed. Failed
+ * uploads have no id by construction, so id-keying would be dishonest.
+ */
+export function respondBulkUpload<T>(
+  message: string,
+  items: T[],
+  errors: BulkUploadError[],
+  init?: ResponseInit
+): Response {
+  // Same rule as `respondMutation`: a hook that failed after the write
+  // committed is reported beside the result rather than turned into an error.
+  // `errors` is per-ITEM and means that item did not happen; `warnings` is
+  // per-OPERATION and means every item happened and a side effect did not.
+  const warnings = currentSideEffectWarnings();
+  return jsonResponse(
+    warnings.length > 0
+      ? { message, items, errors, warnings }
+      : { message, items, errors },
+    init
+  );
+}
+
+/**
+ * Say that a response belongs to ONE caller's session.
+ *
+ * A session-gated response is otherwise an ordinary cacheable one, so a shared
+ * proxy may retain one caller's payload and serve it to the next request
+ * without the authentication check running again. `Vary: Cookie` states what
+ * the response depends on, for any cache that stores it regardless.
+ *
+ * Applied to the REFUSAL as well as the answer, wherever it is used. A cached
+ * 401 replayed to a request that does carry a session is the same defect
+ * pointing the other way, and it is the direction that looks like a working
+ * gate.
+ *
+ * Over HEADERS rather than over a Response, because the two callers hold
+ * different things: one owns a response it may mutate, and the plugin-route
+ * dispatch is rebuilding headers it does not own — a handler may return a
+ * response whose headers are immutable, and setting one on that throws. Both
+ * go through here so "private" has one definition rather than two that agree
+ * until someone edits one.
+ */
+export function applySessionCacheHeaders(headers: Headers): void {
+  headers.set(
+    "Cache-Control",
+    privateCacheControl(headers.get("Cache-Control"))
+  );
+  headers.set("Vary", varyingOnCredentials(headers.get("Vary")));
+}
+
+/**
+ * Directives that cannot stand beside `private, no-store`.
+ *
+ * `public` is its opposite. The freshness family describes how long a stored
+ * response stays usable, which is a statement about a response that may be
+ * stored — so leaving them beside `no-store` publishes two rules that
+ * contradict each other and lets a cache follow whichever it prefers.
+ *
+ * Everything NOT listed survives, which is the point of listing rather than
+ * replacing: `no-transform` forbids a proxy rewriting the body and remains
+ * meaningful, and so does `must-revalidate`. A handler that asked for one had a
+ * reason this boundary does not know.
+ */
+const CACHE_DIRECTIVES_REPLACED = new Set([
+  "public",
+  "max-age",
+  "s-maxage",
+  "immutable",
+  "stale-while-revalidate",
+  "stale-if-error",
+]);
+
+/** The directive's name, without whatever value it carries. */
+function directiveName(directive: string): string {
+  return (directive.split("=", 1)[0] ?? "").trim().toLowerCase();
+}
+
+/**
+ * One header's comma-separated members, respecting quoted values.
+ *
+ * A plain `split(",")` is wrong for `Cache-Control`, because a directive may
+ * carry a QUOTED field list: `private="Set-Cookie, X-User"` is one directive
+ * and splitting it produced two — the first discarded as `private`, the second
+ * surviving as the fragment `X-User"`, so this boundary emitted a malformed
+ * header and a strict intermediary could reject the privacy directives along
+ * with it. Measured on that input before the fix: `private, no-store, X-User"`.
+ *
+ * Backslash escapes are honoured inside a quoted string, so a quote written as
+ * part of a value does not end it.
+ */
+function splitOutsideQuotes(value: string): string[] {
+  const members: string[] = [];
+  let current = "";
+  let quoted = false;
+  let escaped = false;
+  for (const char of value) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+    } else if (quoted && char === "\\") {
+      current += char;
+      escaped = true;
+    } else if (char === '"') {
+      quoted = !quoted;
+      current += char;
+    } else if (char === "," && !quoted) {
+      members.push(current);
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+  members.push(current);
+  return members.map(member => member.trim()).filter(member => member !== "");
+}
+
+/**
+ * `Cache-Control` that says private, keeping what the handler already said.
+ *
+ * Merged rather than replaced. A handler that had set `no-transform` lost it,
+ * and it is orthogonal to privacy — the response is still not to be rewritten
+ * in flight whether or not a cache may keep it.
+ */
+function privateCacheControl(existing: string | null): string {
+  const kept = splitOutsideQuotes(existing ?? "").filter(directive => {
+    const name = directiveName(directive);
+    return (
+      !CACHE_DIRECTIVES_REPLACED.has(name) &&
+      name !== "private" &&
+      name !== "no-store"
+    );
+  });
+  // The privacy directives lead, so a reader sees the binding rule first.
+  return ["private", "no-store", ...kept].join(", ");
+}
+
+/**
+ * The credentials a session-gated response can depend on.
+ *
+ * BOTH, because either can identify the caller. A cookie is the browser's way
+ * in; `Authorization: Bearer` is an API key's, and `requireAuthentication`
+ * accepts one — with that key's own user, roles and permissions. Naming only
+ * the cookie gives two different API keys the same cache key, so for any
+ * intermediary that stores despite `no-store` — the fallback this header exists
+ * for — the first key's answer can be replayed to the second.
+ */
+const SESSION_CREDENTIAL_FIELDS = ["Cookie", "Authorization"] as const;
+
+/**
+ * `Vary` naming every credential the answer depends on, keeping what the
+ * response already varied on.
+ *
+ * Replacing it was the defect: a response varying on `Accept-Language` became
+ * one varying only on `Cookie`, so a cache could answer a second language from
+ * the first one's stored copy — the same session, the wrong representation.
+ *
+ * `*` is left alone. It already means "vary on everything", and narrowing it to
+ * a list would widen what may be shared.
+ */
+function varyingOnCredentials(existing: string | null): string {
+  const fields = (existing ?? "")
+    .split(",")
+    .map(field => field.trim())
+    .filter(field => field !== "");
+  if (fields.includes("*")) return "*";
+  const seen = new Set(fields.map(field => field.toLowerCase()));
+  for (const field of SESSION_CREDENTIAL_FIELDS) {
+    if (seen.has(field.toLowerCase())) continue;
+    fields.push(field);
+    seen.add(field.toLowerCase());
+  }
+  return fields.join(", ");
+}
+
+/**
+ * A route whose every answer belongs to one session, its refusals included: a
+ * shared cache must not replay one person's answer, or one person's refusal,
+ * to another.
+ */
+export function privateToSession<A extends unknown[]>(
+  handler: (...args: A) => Promise<Response>
+): (...args: A) => Promise<Response> {
+  return async (...args) => withSessionCacheHeaders(await handler(...args));
+}
+
+/** {@link applySessionCacheHeaders} for a response the caller owns. */
+export function withSessionCacheHeaders(response: Response): Response {
+  applySessionCacheHeaders(response.headers);
+  return response;
+}

@@ -1,0 +1,851 @@
+/**
+ * What an author can do to a document, as data rather than as branches.
+ *
+ * The header used to decide each control where it drew it, so what appeared was
+ * the sum of a dozen conditions spread down a 900-line component. Three
+ * consequences, and the third is the one that decided this shape:
+ *
+ * - Nothing owned the rule that there is ONE primary action. A published
+ *   document with a pending draft rendered Save, Publish and Unpublish side by
+ *   side, all the same size, and an author had to read three buttons to find
+ *   the one they wanted.
+ * - Where an action belonged — toolbar or menu — was expressed by WHERE its
+ *   JSX sat, so demoting one meant moving code rather than changing a value.
+ * - A plugin could not join in. Contributed actions get a single slot with no
+ *   priority and no placement, so "add this document to a release" could only
+ *   ever be one more button beside the others.
+ *
+ * So an action DESCRIBES itself and the surface decides how to draw it. That is
+ * the shape Sanity's document actions settled on for the same reason: one
+ * description renders as a toolbar button or a menu item depending on where it
+ * is asked for, and a plugin appends to the same list the built-ins come from.
+ *
+ * This module is deliberately free of React. What an author may do is a
+ * question about permissions and document state, and answering it in a
+ * component means it can only be tested by rendering one.
+ *
+ * @module components/features/entries/EntryForm/document-actions
+ */
+
+/**
+ * Where an action is drawn.
+ *
+ * `primary` is a promise as much as a position: exactly one action carries it,
+ * and {@link documentActions} is what keeps that true. Two primaries is the
+ * state the header was already in.
+ */
+export type ActionPlacement = "primary" | "toolbar" | "menu";
+
+/**
+ * Where the editor's own header draws an action: the public placements, and
+ * `publish-menu`.
+ *
+ * `publish-menu` is the menu on the primary action's own arrow: the other
+ * ways of putting this document live, such as at a time or with a release.
+ * They sit beside the act they vary rather than in More, where nobody
+ * deciding WHEN to publish would look. With no primary action drawn, they
+ * join More's document rows instead, so a person who may not publish still
+ * finds them and reads why they are held.
+ *
+ * Kept off the published {@link ActionPlacement}, which a plugin's document
+ * view reads through `useDocumentActions()` and may handle exhaustively. That
+ * hook hands such an action over as a `menu` one: the place the editor itself
+ * draws it whenever it has no arrow to put it on.
+ */
+export type EditorActionPlacement = ActionPlacement | "publish-menu";
+
+/**
+ * Which part of the menu an action belongs to.
+ *
+ * `danger` is separated because the menu currently mixes Duplicate with Delete
+ * in one flat list, and a destructive verb one row from a routine one is a slip
+ * waiting to happen.
+ */
+export type ActionGroup = "document" | "danger";
+
+export interface DocumentAction {
+  /** Stable identity, for tests and for a plugin replacing a built-in. */
+  id: string;
+  /**
+   * What the control says, in the imperative.
+   *
+   * Imperative and SPECIFIC: "Publish changes" rather than "Publish" on a
+   * document that is already live, where the shorter word reads as a no-op and
+   * says nothing about the pending draft it promotes.
+   */
+  label: string;
+  placement: ActionPlacement;
+  /** Which menu section, for a `menu` action. */
+  group?: ActionGroup;
+  /** Whether the action removes or replaces something an author can see. */
+  destructive?: boolean;
+  /**
+   * Why this action cannot be used right now, or absent when it can.
+   *
+   * A REASON rather than a boolean, because three separate permissions and
+   * several document states decide these, and a dead control with no
+   * explanation reads as a broken one. Whatever draws the action is expected to
+   * surface this — a tooltip on a disabled button, helper text on a menu item.
+   */
+  disabledReason?: string;
+}
+
+/**
+ * An action as the editor's own header holds it: a {@link DocumentAction}
+ * that may also sit on the primary action's arrow. Internal to the admin;
+ * `useDocumentActions()` turns it into the published shape.
+ */
+export interface EditorDocumentAction
+  extends Omit<DocumentAction, "placement"> {
+  placement: EditorActionPlacement;
+}
+
+/**
+ * Everything the answer depends on.
+ *
+ * Facts only. Whether a control is drawn is this module's decision, and a
+ * caller passing `showPublishButton` would be making it somewhere else.
+ */
+export interface DocumentActionState {
+  mode: "create" | "edit";
+  /** Whether the collection has a publish lifecycle at all. */
+  hasStatus: boolean;
+  /** Whether a published document keeps its edits as a working draft. */
+  draftsEnabled: boolean;
+  /** The document's status in the language being edited. */
+  status: "draft" | "published" | "unknown";
+  /** Whether a published document has unpublished edits pending. */
+  hasWorkingDraft: boolean;
+  /** Whether a past version is on screen, which forbids every mutation. */
+  readingHistory: boolean;
+  /**
+   * Whether the user may change the document: create it in create mode,
+   * update it in edit mode. Without it nothing that writes the document's
+   * content is offered — saving, discarding, duplicating — while publishing,
+   * unpublishing and deleting each still follow their own permission.
+   */
+  canEdit: boolean;
+  canPublish: boolean;
+  canUnpublish: boolean;
+  canDelete: boolean;
+  /** Whether the form currently holds work worth discarding. */
+  isDirty: boolean;
+  /** Whether the document can be duplicated — an edit-mode affordance. */
+  canDuplicate: boolean;
+  /**
+   * Whether the server refuses every write to this document whoever asks: its
+   * collection or Single was removed from code. Then only what reads is
+   * offered, with no permission bringing a write back. Absent means false.
+   */
+  writesRefused?: boolean;
+  /**
+   * Where the part on screen stands in the workflow that holds publishing,
+   * while it stands in a stage. Absent where no workflow is attached, or the
+   * part has nothing waiting to go live: the actions are then exactly those
+   * of a document without one.
+   */
+  review?: ReviewActionState;
+  /**
+   * Whether a workflow holds this collection's publishing, known before the
+   * document exists. Absent means false.
+   */
+  workflowAttached?: boolean;
+}
+
+/** What a workflow step does, which decides where it is drawn. */
+export type ReviewStepKind = "submit" | "approve" | "request-changes" | "move";
+
+/** A step leaving the part's stage, and whether this person may take it. */
+export interface ReviewStepState {
+  name: string;
+  label: string;
+  kind: ReviewStepKind;
+  /** Whether this person may take it, as the server judges it. */
+  held: boolean;
+  /** Whether it is the stage's primary step, which leads. */
+  primary: boolean;
+}
+
+/** The facts about the part's review the actions depend on. */
+export interface ReviewActionState {
+  /** The stage's label, as the reason a held Publish gives names it. */
+  stageLabel: string;
+  /** Whether the stage allows publishing. */
+  publishable: boolean;
+  /** The steps leaving the stage. */
+  steps: readonly ReviewStepState[];
+  /** Who the part waits for, as words; null where it waits for no one. */
+  waitingFor: string | null;
+  /** Why no step can be taken at this moment, such as unsaved edits. */
+  stepReason?: string;
+  /**
+   * Why Publish is held other than for approval: the review state is not
+   * known yet, or could not be read. Said in place of the stage it waits in.
+   */
+  publishReason?: string;
+}
+
+/**
+ * The reason every action is unavailable while a past version is on screen;
+ * the review's own actions outside the header say the same.
+ */
+export const HISTORY_REASON =
+  "You are viewing a past version. Return to the current one to make changes.";
+
+/**
+ * The one action an author is most likely reaching for, given the state.
+ *
+ * Derived rather than chosen at each call site, which is what stops two
+ * controls both claiming to be the main one. The order below is the whole rule:
+ *
+ * - CREATING, the only thing to do is make the document exist.
+ * - A DRAFT's purpose is to become published, so Publish leads and Save is the
+ *   quieter companion — the same ranking the block editor and Sanity use.
+ * - PUBLISHED WITH PENDING EDITS, publishing those edits is the act; the label
+ *   says so rather than repeating "Publish" at a document that is already live.
+ * - PUBLISHED AND CLEAN, or a collection with no lifecycle at all, saving is
+ *   all there is.
+ */
+const PRIMARY_RULES: readonly {
+  applies: (state: DocumentActionState) => boolean;
+  build: (state: DocumentActionState) => { id: string; label: string };
+}[] = [
+  /*
+   * A collection with NO lifecycle has exactly one verb, and its word depends
+   * only on whether the document exists yet.
+   */
+  {
+    applies: state => !state.hasStatus,
+    build: state => ({
+      id: "save",
+      label: state.mode === "create" ? "Create" : "Save",
+    }),
+  },
+  /*
+   * PUBLISHED WITH PENDING EDITS: publishing those edits is the act, and the
+   * label says so rather than repeating "Publish" at a document already live,
+   * where the shorter word reads as a no-op.
+   */
+  {
+    applies: state =>
+      isPublishedEdit(state) && state.hasWorkingDraft && state.canPublish,
+    build: () => ({ id: "publish", label: "Publish changes" }),
+  },
+  /*
+   * PUBLISHED AND CLEAN: saving is all there is. "Save" where drafts are
+   * enabled, because the work lands in a draft rather than in front of readers,
+   * and "Save changes" where it goes straight out — a distinction the editor
+   * already drew and worth keeping.
+   */
+  {
+    applies: isPublishedEdit,
+    build: state => ({
+      id: "save",
+      label: state.draftsEnabled ? "Save" : "Save changes",
+    }),
+  },
+  /*
+   * NO PERMISSION TO PUBLISH: saving leads instead, and publishing is not
+   * offered at all rather than offered dead.
+   *
+   * The distinction is between "not now" and "not you". A disabled control
+   * explains a temporary refusal; a permission an author will never hold is
+   * furniture they cannot use, and the header has always hidden it. Leaving it
+   * as the leading action would be worse than untidy — the one control drawn as
+   * the thing to press would be the one thing they cannot do, with their real
+   * action demoted beside it.
+   */
+  {
+    applies: state => !state.canPublish,
+    build: () => ({ id: "save", label: "Save draft" }),
+  },
+];
+
+/**
+ * A DRAFT, or a document being created in a collection that HAS a lifecycle:
+ * its purpose is to become published, so Publish leads and saving is the
+ * quieter companion beside it — the ranking the block editor and Sanity use.
+ */
+const PRIMARY_FALLBACK = { id: "publish", label: "Publish" };
+
+/**
+ * The leading action of a user who may read the document but not change it.
+ * Publishing changes only the status, which the publish permission judges
+ * alone, so where they hold it they publish a draft, or the changes held for
+ * a published document; any other state leaves them nothing to lead with.
+ */
+function readerPrimary(
+  state: DocumentActionState
+): { id: string; label: string } | undefined {
+  if (!state.canPublish || !state.hasStatus || state.mode !== "edit") {
+    return undefined;
+  }
+  if (state.status === "draft") return PRIMARY_FALLBACK;
+  return isPublishedEdit(state) && state.hasWorkingDraft
+    ? { id: "publish", label: "Publish changes" }
+    : undefined;
+}
+
+/**
+ * The one action an author is most likely reaching for, given the state.
+ *
+ * Derived rather than chosen at each call site, which is what stops two
+ * controls both claiming to be the main one. A TABLE for the same reason the
+ * built-ins are one: written as branches this reached a complexity the gate
+ * refuses, and the order of the rules — which IS the rule — was buried in the
+ * order the `if`s happened to be typed.
+ *
+ * FIRST MATCH WINS, so the rows read as "the most specific situation first".
+ */
+function primaryAction(
+  state: DocumentActionState
+): EditorDocumentAction | undefined {
+  // Nothing leads where every write is refused, not even a publish a
+  // reader's own permission would offer.
+  if (state.writesRefused === true) return undefined;
+  // Where a workflow holds publishing, its next step leads, or a Publish held
+  // with why, AHEAD of every rule below: a step stores nothing of the form,
+  // so it leads for a reviewer who may not edit the document too.
+  const blocked = state.readingHistory ? HISTORY_REASON : undefined;
+  const reviewLead = reviewPrimary(state);
+  if (reviewLead !== undefined) {
+    return withReason(
+      { id: reviewLead.id, label: reviewLead.label, placement: "primary" },
+      blocked ?? reviewLead.reason
+    );
+  }
+  // Every leading action but a publish stores the form, which a user who may
+  // not change the document cannot do: a page they may only read leads with a
+  // publish or with nothing.
+  const chosen = state.canEdit
+    ? (PRIMARY_RULES.find(rule => rule.applies(state))?.build(state) ??
+      PRIMARY_FALLBACK)
+    : readerPrimary(state);
+  if (chosen === undefined) return undefined;
+  const { id, label } = chosen;
+  return withReason(
+    { id, label, placement: "primary" },
+    /*
+     * Only the historical-view rule can refuse the leading action now.
+     * Publishing without permission is not offered at all — see the rule table
+     * — so there is no second reason left for this control to carry.
+     */
+    blocked
+  );
+}
+
+function withReason(
+  action: EditorDocumentAction,
+  reason: string | undefined
+): EditorDocumentAction {
+  return reason === undefined ? action : { ...action, disabledReason: reason };
+}
+
+/**
+ * One built-in action, and the states it applies to.
+ *
+ * A TABLE rather than a sequence of `if` blocks, and the reason is not
+ * tidiness: written as branches this reached a cyclomatic complexity of 24 in
+ * one function, which the repository's own gate refuses — correctly, because a
+ * reader then has to hold every condition at once to answer "what does an
+ * author see here".
+ *
+ * It is also the shape a plugin can join. A contributed action is another entry
+ * with its own `applies`, so "add this document to a release" arrives without
+ * the header being edited — which is the whole reason the built-ins are
+ * expressed as data rather than as JSX in the order it happened to be written.
+ */
+interface ActionRule {
+  id: string;
+  /** Whether this action exists at all for the given state. */
+  applies: (state: DocumentActionState) => boolean;
+  /** What it says, which for several actions depends on the state. */
+  label: (state: DocumentActionState) => string;
+  placement: Exclude<EditorActionPlacement, "primary">;
+  group?: ActionGroup;
+  destructive?: boolean;
+  /**
+   * Why it is unavailable, beyond the historical-view rule every mutation
+   * shares. Absent for an action nothing else can forbid.
+   */
+  reason?: (state: DocumentActionState) => string | undefined;
+  /**
+   * Whether a historical view forbids this action.
+   *
+   * Every rule sets it except the one READ in the list. Defaulting it to
+   * "mutates" would make the exception invisible at the entry that needs it.
+   */
+  mutates: boolean;
+  /**
+   * Whether the action changes the document's content, and so exists only
+   * for a user who may change it (`canEdit`). Publishing, unpublishing and
+   * deleting are not: each follows its own permission.
+   */
+  edits: boolean;
+}
+
+/**
+ * A FUNCTION declaration, not a const arrow, and that is load-bearing.
+ *
+ * Both action tables reference this at module-evaluation time, and a `const`
+ * initialised after them throws `Cannot access before initialization` the
+ * instant the module is imported. Declared this way it hoists, so the tables
+ * may sit wherever they read best rather than wherever the initialiser order
+ * permits.
+ *
+ * Worth stating because nothing static catches it: type-checking, linting and
+ * the complexity gate all passed on the broken arrangement — only running the
+ * module found it.
+ */
+function isPublishedEdit(s: DocumentActionState): boolean {
+  return s.mode === "edit" && s.hasStatus && s.status === "published";
+}
+
+function permissionReason(verb: string): string {
+  return `You do not have permission to ${verb} in this collection.`;
+}
+
+/**
+ * The built-in actions, in the order a surface presents them.
+ *
+ * Order is part of the contract: the toolbar draws its entries left to right
+ * and the menu top to bottom, so moving a row here moves it on screen.
+ */
+const BUILT_IN_ACTIONS: readonly ActionRule[] = [
+  /*
+   * Saving a published document is offered BESIDE publishing it, not folded
+   * into it. They are different acts once drafts are enabled — one keeps the
+   * work private, the other shows it to readers — and an author part-way
+   * through a rewrite needs the first without the second.
+   */
+  {
+    id: "save",
+    applies: s => isPublishedEdit(s) && s.hasWorkingDraft && s.canPublish,
+    label: s => (s.draftsEnabled ? "Save" : "Save changes"),
+    placement: "toolbar",
+    mutates: true,
+    edits: true,
+  },
+  /*
+   * A DRAFT — or a document being created where a lifecycle exists — keeps its
+   * save in the toolbar for the same reason from the other side: Publish leads,
+   * and an author not ready for readers still needs somewhere to put the work.
+   * Creating is included because a collection with a lifecycle has always
+   * offered both from the start; dropping one would take away the ability to
+   * begin a document without publishing it.
+   */
+  {
+    id: "save",
+    applies: s =>
+      s.canPublish &&
+      s.hasStatus &&
+      (s.mode === "create" || s.status === "draft"),
+    label: () => "Save draft",
+    placement: "toolbar",
+    mutates: true,
+    edits: true,
+  },
+  {
+    id: "duplicate",
+    applies: s => s.mode === "edit" && s.canDuplicate,
+    label: () => "Duplicate",
+    placement: "menu",
+    group: "document",
+    mutates: true,
+    edits: true,
+  },
+  /*
+   * The one action that survives a historical view, and deliberately so.
+   *
+   * Everything else here WRITES, and the document on screen is not the live one
+   * — so a mutation would write the wrong thing. Reading what the API returns
+   * changes nothing, and it is most useful precisely when an author is trying
+   * to understand a version they are looking at. Blocking it would be the rule
+   * applied past its reason.
+   *
+   * It still needs a document to read: while one is being CREATED there is
+   * nothing on the server to fetch, which is why the whole menu stays away in
+   * create mode.
+   */
+  {
+    id: "view-api",
+    applies: state => state.mode === "edit",
+    label: () => "View API response",
+    placement: "menu",
+    group: "document",
+    mutates: false,
+    edits: false,
+  },
+  /*
+   * The two kinds of discard are different acts on different things: a pending
+   * WORKING DRAFT is saved work readers cannot see, while unsaved FORM changes
+   * were never written down. Collapsing them into one item would let an author
+   * asking to drop a typo throw away a rewrite.
+   */
+  {
+    id: "discard-draft",
+    applies: s => s.mode === "edit" && s.hasWorkingDraft,
+    label: () => "Discard draft",
+    placement: "menu",
+    group: "danger",
+    destructive: true,
+    mutates: true,
+    edits: true,
+  },
+  {
+    id: "discard-changes",
+    applies: s => s.mode === "edit" && s.isDirty,
+    label: () => "Discard changes",
+    placement: "menu",
+    group: "danger",
+    destructive: true,
+    mutates: true,
+    edits: true,
+  },
+  {
+    id: "unpublish",
+    applies: isPublishedEdit,
+    label: () => "Unpublish",
+    placement: "menu",
+    group: "danger",
+    destructive: true,
+    reason: s => (s.canUnpublish ? undefined : permissionReason("unpublish")),
+    mutates: true,
+    edits: false,
+  },
+  {
+    id: "delete",
+    applies: s => s.mode === "edit",
+    label: () => "Delete",
+    placement: "menu",
+    group: "danger",
+    destructive: true,
+    reason: s => (s.canDelete ? undefined : permissionReason("delete")),
+    mutates: true,
+    edits: false,
+  },
+];
+
+/**
+ * Every action for a document, in the order a surface should present them.
+ *
+ * The list is the contract. A caller filters it by placement rather than asking
+ * this module for "the toolbar actions" — one question with one answer, so a
+ * button and a menu item cannot come from two derivations that disagree about
+ * whether an action exists.
+ *
+ * UNPUBLISH IS IN THE MENU, and that is a deliberate demotion. It sat beside
+ * Publish, where the two most consequential and opposite verbs in the editor
+ * were one slip apart, styled almost alike. It is rare, it changes what the
+ * public sees, and it belongs with the other destructive verbs.
+ */
+export function documentActions(
+  given: DocumentActionState
+): EditorDocumentAction[] {
+  const state = createHeldByWorkflow(given);
+  const blocked = state.readingHistory ? HISTORY_REASON : undefined;
+  const built = BUILT_IN_ACTIONS.filter(
+    rule =>
+      rule.applies(state) &&
+      (state.canEdit || !rule.edits) &&
+      // Nothing that writes, where every write is refused: not even the
+      // verbs that follow a permission of their own.
+      (state.writesRefused !== true || !rule.mutates)
+  ).map(rule =>
+    withReason(
+      {
+        id: rule.id,
+        label: rule.label(state),
+        placement: rule.placement,
+        ...(rule.group === undefined ? {} : { group: rule.group }),
+        ...(rule.destructive === undefined
+          ? {}
+          : { destructive: rule.destructive }),
+      },
+      (rule.mutates ? blocked : undefined) ?? rule.reason?.(state)
+    )
+  );
+  const reviewRows =
+    state.writesRefused === true ? [] : reviewActions(state, blocked);
+  const primary = primaryAction(state);
+  return primary === undefined
+    ? [...built, ...reviewRows]
+    : [primary, ...built, ...reviewRows];
+}
+
+/**
+ * A document being created where a workflow holds publishing cannot go live
+ * as it is created: nothing of it has been approved, and the server refuses a
+ * create that names `published`. It is offered as to a person who may not
+ * publish — Save draft leads, and Publish is not offered — so the one action
+ * drawn as the thing to press is one that can succeed.
+ */
+function createHeldByWorkflow(state: DocumentActionState): DocumentActionState {
+  return state.mode === "create" && state.workflowAttached === true
+    ? { ...state, canPublish: false }
+    : state;
+}
+
+/** The id a workflow step is offered under, apart from every built-in. */
+const REVIEW_STEP_ACTION_PREFIX = "review-step:";
+
+/** The action id of the workflow step `name`. */
+export function reviewStepActionId(name: string): string {
+  return `${REVIEW_STEP_ACTION_PREFIX}${name}`;
+}
+
+/**
+ * Which kinds of step may lead, most specific first. Asking for changes is
+ * never the main action: it sends the work back, beside the approval.
+ */
+const LEADING_STEP_KINDS: readonly ReviewStepKind[] = [
+  "approve",
+  "submit",
+  "move",
+];
+
+/**
+ * The step a stage leads with: its primary step, as the review state marks
+ * it. Where none is marked, an approval, else a submission, else a move;
+ * asking for changes never leads.
+ */
+export function leadingReviewStep<
+  T extends { kind: ReviewStepKind; primary: boolean },
+>(steps: readonly T[]): T | undefined {
+  const primary = steps.find(step => step.primary);
+  if (primary !== undefined) return primary;
+  for (const kind of LEADING_STEP_KINDS) {
+    const step = steps.find(candidate => candidate.kind === kind);
+    if (step !== undefined) return step;
+  }
+  return undefined;
+}
+
+/** Whether the workflow holds this document's publishing at its stage. */
+function heldByReview(
+  state: DocumentActionState
+): state is DocumentActionState & { review: ReviewActionState } {
+  return (
+    state.review !== undefined &&
+    !state.review.publishable &&
+    state.hasStatus &&
+    state.mode === "edit"
+  );
+}
+
+/** The step this person leads with, while the workflow holds publishing. */
+function stepThatLeads(
+  state: DocumentActionState
+): ReviewStepState | undefined {
+  if (!heldByReview(state)) return undefined;
+  const step = leadingReviewStep(state.review.steps);
+  return step?.held === true ? step : undefined;
+}
+
+/** Whether there is anything to publish: a draft, or changes held for a live page. */
+function hasSomethingToPublish(state: DocumentActionState): boolean {
+  return state.status !== "published" || state.hasWorkingDraft;
+}
+
+/** Publish's own words for the state, as its primary rows say them. */
+function publishLabel(state: DocumentActionState): string {
+  return isPublishedEdit(state) && state.hasWorkingDraft
+    ? "Publish changes"
+    : "Publish";
+}
+
+/**
+ * Why a held Publish cannot run: the stage it waits in, and who it waits for
+ * where the review state names anyone; or, before the review state is known,
+ * why it is not.
+ */
+function needsApprovalReason(review: ReviewActionState): string {
+  if (review.publishReason !== undefined) return review.publishReason;
+  return review.waitingFor === null
+    ? `Needs approval: ${review.stageLabel}`
+    : `Needs approval: ${review.stageLabel}, waiting for ${review.waitingFor}`;
+}
+
+/**
+ * What leads where a workflow holds publishing, or undefined to leave the
+ * choice to the rules every document follows:
+ *
+ * - a person holding the stage's leading step leads with it (Submit for
+ *   review, Approve);
+ * - otherwise a person who may publish sees Publish leading, drawn held with
+ *   the stage and who it waits for, so "not now" reads as a reason and not as
+ *   a missing control.
+ *
+ * In a stage that allows publishing the workflow says nothing, and Publish
+ * leads exactly as it does without one.
+ */
+function reviewPrimary(
+  state: DocumentActionState
+): { id: string; label: string; reason: string | undefined } | undefined {
+  const step = stepThatLeads(state);
+  if (step !== undefined) {
+    return {
+      id: reviewStepActionId(step.name),
+      label: step.label,
+      reason: state.review?.stepReason,
+    };
+  }
+  if (heldByReview(state) && state.canPublish && hasSomethingToPublish(state)) {
+    return {
+      id: "publish",
+      label: publishLabel(state),
+      reason: needsApprovalReason(state.review),
+    };
+  }
+  return undefined;
+}
+
+/**
+ * The workflow's rows beside the one that leads.
+ *
+ * - Where a step leads, the work still needs a Save, and a person who may
+ *   publish still sees Publish, held with why. Both sit in the toolbar.
+ * - Every other step the person holds is offered too: beside the leading one
+ *   while the stage holds publishing (Request changes beside Approve), and in
+ *   the menu once the stage allows it, where asking for changes is the rarer
+ *   act.
+ */
+function reviewActions(
+  state: DocumentActionState,
+  blocked: string | undefined
+): EditorDocumentAction[] {
+  const review = state.review;
+  if (review === undefined || !state.hasStatus || state.mode !== "edit") {
+    return [];
+  }
+  const leading = stepThatLeads(state);
+  const rows: EditorDocumentAction[] = [];
+  if (leading !== undefined && state.canEdit && !builtInToolbarSave(state)) {
+    rows.push(
+      withReason(
+        { id: "save", label: saveLabel(state), placement: "toolbar" },
+        blocked
+      )
+    );
+  }
+  if (
+    leading !== undefined &&
+    state.canPublish &&
+    hasSomethingToPublish(state)
+  ) {
+    rows.push(
+      withReason(
+        { id: "publish", label: publishLabel(state), placement: "toolbar" },
+        blocked ?? needsApprovalReason(review)
+      )
+    );
+  }
+  for (const step of review.steps) {
+    if (!step.held || step === leading) continue;
+    rows.push(
+      withReason(
+        {
+          id: reviewStepActionId(step.name),
+          label: step.label,
+          ...(review.publishable
+            ? { placement: "menu" as const, group: "document" as const }
+            : { placement: "toolbar" as const }),
+        },
+        blocked ?? review.stepReason
+      )
+    );
+  }
+  return rows;
+}
+
+/** Whether a built-in rule already offers Save in the toolbar. */
+function builtInToolbarSave(state: DocumentActionState): boolean {
+  return BUILT_IN_ACTIONS.some(
+    rule =>
+      rule.id === "save" && rule.placement === "toolbar" && rule.applies(state)
+  );
+}
+
+/** Save's words where the work lands, as the rows above say them. */
+function saveLabel(state: DocumentActionState): string {
+  if (!isPublishedEdit(state)) return "Save draft";
+  return state.draftsEnabled ? "Save" : "Save changes";
+}
+
+/**
+ * The built-in actions plus the ones a host contributed, as one list.
+ *
+ * A host owns concerns this module must not import. Adding a document to a
+ * release is a fact about the document, so its control belongs with Publish and
+ * Duplicate — but releases are a feature of the page, not of the editor, and a
+ * model that knew about them would have to know about translations and every
+ * later one too. Contributing a DESCRIPTION keeps that knowledge with the host
+ * while the placement, grouping and ordering stay this module's answer.
+ *
+ * A BUILT-IN WINS a collision, and the contributed action is dropped. The
+ * built-ins are the verbs carrying the permission checks and the destructive
+ * flags, so letting a contribution replace `delete` or `publish` by reusing its
+ * id would let a plugin silently substitute its own behaviour for the one the
+ * model reasoned about. Losing a contributed action is visible — the control is
+ * missing — where a substituted one is not.
+ *
+ * Order is built-ins first, then contributions in the order given, so a host
+ * cannot push its own action above Publish by contributing early.
+ */
+export function withContributedActions(
+  built: readonly EditorDocumentAction[],
+  contributed: readonly EditorDocumentAction[]
+): EditorDocumentAction[] {
+  /*
+   * `taken` GROWS as contributions are admitted, so the first of two
+   * contributions sharing an id wins and the second is dropped.
+   *
+   * Checking only against the built-ins would let both through, and the damage
+   * is not that a row appears twice. `acceptContributions` keys bindings by id,
+   * so the second contribution's handler overwrites the first — and BOTH rows,
+   * including the one still showing the first contribution's label and its
+   * destructive styling, would run the second one's operation. React would also
+   * be handed duplicate keys for them.
+   */
+  const taken = new Set(built.map(action => action.id));
+  const accepted: EditorDocumentAction[] = [...built];
+  for (const action of contributed) {
+    if (taken.has(action.id)) continue;
+    taken.add(action.id);
+    accepted.push(action);
+  }
+  return accepted;
+}
+
+/**
+ * The actions for one placement, in list order.
+ *
+ * Derived from {@link documentActions} rather than built beside it, so a
+ * surface cannot draw an action the model does not know about — and an action
+ * added to the model appears wherever it declared it belongs without the
+ * surfaces being edited.
+ */
+export function actionsAt(
+  actions: readonly EditorDocumentAction[],
+  placement: EditorActionPlacement
+): EditorDocumentAction[] {
+  return actions.filter(action => action.placement === placement);
+}
+
+/**
+ * Menu actions split into their groups, keeping list order inside each.
+ *
+ * Returned as a pair rather than as one list with a flag, because the caller
+ * draws a separator between them and a caller reading a flag would have to
+ * rediscover where the boundary falls.
+ */
+export function menuGroups(actions: readonly EditorDocumentAction[]): {
+  document: EditorDocumentAction[];
+  danger: EditorDocumentAction[];
+} {
+  const menu = actionsAt(actions, "menu");
+  return {
+    document: menu.filter(action => action.group !== "danger"),
+    danger: menu.filter(action => action.group === "danger"),
+  };
+}

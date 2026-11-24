@@ -1,0 +1,113 @@
+/**
+ * Hooks Module
+ *
+ * Exports all custom React hooks for Nextly admin application
+ */
+
+// Selection hooks
+export { useRowSelection } from "./useRowSelection";
+export type {
+  UseRowSelectionOptions,
+  UseRowSelectionReturn,
+} from "../types/hooks/row-selection";
+
+// Bulk mutation hooks
+export { useBulkMutation } from "./useBulkMutation";
+export type {
+  BulkMutationResult,
+  BulkMutationOptions,
+  BulkMutationItemResult,
+  UseBulkMutationReturn,
+  UseBulkMutationConfig,
+} from "../types/hooks/bulk-mutation";
+
+// Server table hook
+export { useServerTable } from "./useServerTable";
+export type {
+  UseServerTableParams,
+  UseServerTableReturn,
+} from "./useServerTable";
+
+// Utility hooks - Debouncing
+export { useDebounce } from "./useDebounce";
+export { useDebouncedValue, useDebouncedState } from "./useDebouncedValue";
+
+// Table hooks - List pagination
+//
+// The page/size state a list runs on, with the first-page resets built in, so
+// the rule lives with the state rather than in each caller's handler. Exported
+// here because the list pages that need it are spread across the admin and
+// reach their hooks through this barrel; `useServerTable` above composes it
+// rather than restating it.
+export { usePagination } from "./usePagination";
+export type { PaginationState, UsePaginationOptions } from "./usePagination";
+
+// Utility hooks - Form Protection
+export { useUnsavedChanges } from "./useUnsavedChanges";
+export type {
+  UseUnsavedChangesOptions,
+  UseUnsavedChangesReturn,
+} from "./useUnsavedChanges";
+
+// Utility hooks - Entry Preview
+export { useEntryPreview } from "./useEntryPreview";
+export type {
+  PreviewConfig,
+  PreviewCollection,
+  PreviewUnavailableReason,
+  UseEntryPreviewOptions,
+  UseEntryPreviewResult,
+} from "./useEntryPreview";
+
+// Utility hooks - Relationship Inline Create
+export { useRelationshipCreate } from "./useRelationshipCreate";
+export type {
+  CreatedEntry,
+  UseRelationshipCreateOptions,
+  UseRelationshipCreateReturn,
+} from "./useRelationshipCreate";
+
+// Utility hooks - Column Visibility
+export { useColumnVisibility } from "./useColumnVisibility";
+export type {
+  UseColumnVisibilityOptions,
+  UseColumnVisibilityReturn,
+} from "./useColumnVisibility";
+
+// Utility hooks - Keyboard Shortcuts
+export {
+  useKeyboardShortcuts,
+  useEntryListShortcuts,
+  useEntryFormShortcuts,
+} from "./useKeyboardShortcuts";
+export type {
+  Shortcut,
+  UseKeyboardShortcutsOptions,
+  EntryListShortcutsOptions,
+  EntryFormShortcutsOptions,
+} from "./useKeyboardShortcuts";
+
+// Utility hooks - Entry JSON Viewer
+export { useEntryJSON, MAX_DEPTH, MIN_DEPTH } from "./useEntryJSON";
+export type { UseEntryJSONOptions, UseEntryJSONReturn } from "./useEntryJSON";
+
+// Utility hooks - Sidebar Pins
+export { useSidebarPins } from "./useSidebarPins";
+
+// Builder state management
+export { useFieldBuilder } from "./useFieldBuilder";
+export type {
+  UseFieldBuilderOptions,
+  UseFieldBuilderReturn,
+  FieldBuilderValidationResult,
+} from "./useFieldBuilder";
+
+// Builder field operations — duplicate, drag, and which fields are the user's.
+// Companion to useFieldBuilder: that hook holds the state, this one holds the
+// decisions the builder pages make about it.
+export { useBuilderFieldActions } from "./useBuilderFieldActions";
+export type { UseBuilderFieldActionsReturn } from "./useBuilderFieldActions";
+
+// The step between previewing a schema change and applying it: which
+// confirmation the user sees, and whether an apply is in flight.
+export { useSchemaChangeConfirmation } from "./useSchemaChangeConfirmation";

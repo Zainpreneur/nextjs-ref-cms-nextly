@@ -1,0 +1,110 @@
+{
+  "name": "@nextlyhq/plugin-accounts",
+  "version": "0.0.2-alpha.80",
+  "description": "Experimental site accounts for Nextly: visitors who sign up, sign in and keep their own account, never staff",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./admin": {
+      "types": "./dist/admin/index.d.ts",
+      "import": "./dist/admin/index.js",
+      "default": "./dist/admin/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js",
+      "default": "./dist/testing/index.js"
+    },
+    "./next": {
+      "types": "./dist/next/index.d.ts",
+      "import": "./dist/next/index.js",
+      "default": "./dist/next/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "check-types": "node ../../scripts/tsc.mjs --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
+  },
+  "dependencies": {
+    "zod": "^4.6.7"
+  },
+  "peerDependencies": {
+    "@nextlyhq/admin": "0.0.2-alpha.80",
+    "@nextlyhq/plugin-sdk": "workspace:*",
+    "next": "^16.4.1",
+    "nextly": "0.0.2-alpha.80",
+    "react": "^19.3.0"
+  },
+  "peerDependenciesMeta": {
+    "@nextlyhq/admin": {
+      "optional": true
+    },
+    "next": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@nextlyhq/admin": "workspace:*",
+    "@nextlyhq/module-specifiers": "workspace:*",
+    "@nextlyhq/plugin-sdk": "workspace:*",
+    "@nextlyhq/tsconfig": "workspace:*",
+    "@testing-library/react": "^16.3.0",
+    "@types/node": "^22.20.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "jsdom": "^27.1.0",
+    "nextly": "workspace:*",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "tsdown": "^0.23.1",
+    "typescript": "7.0.2",
+    "vitest": "^5.0.5"
+  },
+  "engines": {
+    "node": "^22.12.0 || >=24.0.0"
+  },
+  "keywords": [
+    "nextly",
+    "nextly-plugin",
+    "plugin",
+    "accounts",
+    "authentication",
+    "sign-in",
+    "cms",
+    "headless-cms"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nextlyhq/nextly.git",
+    "directory": "packages/plugin-accounts"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
+  },
+  "homepage": "https://nextlyhq.com",
+  "bugs": {
+    "url": "https://github.com/nextlyhq/nextly/issues"
+  },
+  "author": "Nextly <contact@nextlyhq.com> (https://nextlyhq.com)"
+}

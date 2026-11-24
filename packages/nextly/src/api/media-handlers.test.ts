@@ -1,0 +1,361 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { container } from "../di/container";
+
+import { createMediaHandlers } from "./media-handlers";
+
+const mocks = vi.hoisted(() => {
+  return {
+    mediaService: {
+      listMedia: vi.fn(),
+      findByIds: vi.fn(),
+      countLibrary: vi.fn(),
+      getFolderContents: vi.fn(),
+      upload: vi.fn(),
+      createFolder: vi.fn(),
+      delete: vi.fn(),
+    },
+    requirePermission: vi.fn(),
+    requireListRead: vi.fn(),
+    visitorReadsSystemResource: vi.fn(),
+  };
+});
+
+vi.mock("../init", () => ({
+  getNextly: vi.fn(async () => ({})),
+  getCachedNextly: vi.fn(async () => ({})),
+}));
+
+// The list's gate and the visitor check, driven from the test only where a
+// case sets them; otherwise the real ones run.
+vi.mock("../auth/list-read-gates", async importOriginal => {
+  const actual =
+    await importOriginal<typeof import("../auth/list-read-gates")>();
+  return {
+    ...actual,
+    requireListRead: (...args: Parameters<typeof actual.requireListRead>) =>
+      mocks.requireListRead.getMockImplementation() === undefined
+        ? actual.requireListRead(...args)
+        : (mocks.requireListRead(...args) as ReturnType<
+            typeof actual.requireListRead
+          >),
+  };
+});
+vi.mock("../auth/resource-readable", async importOriginal => {
+  const actual =
+    await importOriginal<typeof import("../auth/resource-readable")>();
+  return {
+    ...actual,
+    visitorReadsSystemResource: (
+      ...args: Parameters<typeof actual.visitorReadsSystemResource>
+    ) =>
+      mocks.visitorReadsSystemResource.getMockImplementation() === undefined
+        ? actual.visitorReadsSystemResource(...args)
+        : (mocks.visitorReadsSystemResource(...args) as ReturnType<
+            typeof actual.visitorReadsSystemResource
+          >),
+  };
+});
+
+vi.mock("../di", () => ({
+  getService: vi.fn(() => mocks.mediaService),
+}));
+
+// Partial mock: keep the real ErrorResponse helpers (pure functions) and only
+// drive `requirePermission` from the test.
+vi.mock("../auth/middleware", async importOriginal => {
+  const actual = await importOriginal<typeof import("../auth/middleware")>();
+  return { ...actual, requirePermission: mocks.requirePermission };
+});
+
+describe("createMediaHandlers timezone formatting", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    container.clear();
+  });
+
+  afterEach(() => {
+    container.clear();
+  });
+
+  it("normalizes media timestamps with configured timezone for dynamic route handlers", async () => {
+    container.registerSingleton("generalSettingsService", () => ({
+      getTimezone: async () => "Asia/Tokyo",
+    }));
+
+    mocks.mediaService.listMedia.mockResolvedValue({
+      data: [
+        {
+          id: "media-1",
+          filename: "sample.png",
+          originalFilename: "sample.png",
+          mimeType: "image/png",
+          size: 1234,
+          url: "/uploads/sample.png",
+          uploadedAt: "2026-04-03T12:34:56",
+          updatedAt: "2026-04-03 13:00:00",
+        },
+      ],
+      pagination: {
+        total: 1,
+      },
+    });
+
+    const handlers = createMediaHandlers();
+    const response = await handlers.GET(
+      new Request("http://localhost/api/media"),
+      {
+        params: Promise.resolve({}),
+      }
+    );
+
+    expect(response.status).toBe(200);
+
+    // The list endpoint emits respondList `{ items, meta }`.
+    const json = (await response.json()) as {
+      items: Array<{ uploadedAt: string; updatedAt: string }>;
+    };
+
+    expect(json.items[0].uploadedAt).toContain("+09:00");
+    expect(json.items[0].updatedAt).toContain("+09:00");
+  });
+});
+
+describe("createMediaHandlers authorization", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    container.clear();
+  });
+
+  afterEach(() => {
+    container.clear();
+  });
+
+  it("does not serve writes on the public mount (upload 404s, permission never consulted)", async () => {
+    const handlers = createMediaHandlers(); // public: requireAuth defaults false
+    const response = await handlers.POST(
+      new Request("http://localhost/api/media", { method: "POST" }),
+      { params: Promise.resolve({}) } // empty path + POST → upload-media
+    );
+
+    // The public surface has no write endpoint — the write is refused exactly
+    // like an unknown route, and no permission check (or upload) happens.
+    expect(response.status).toBe(404);
+    expect(mocks.requirePermission).not.toHaveBeenCalled();
+    expect(mocks.mediaService.upload).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unauthenticated request on the gated mount with the permission's error", async () => {
+    mocks.requirePermission.mockResolvedValue({
+      success: false,
+      statusCode: 401,
+      message: "Authentication required",
+      error: "You must be logged in to access this resource",
+      data: null,
+      code: "AUTH_REQUIRED",
+    });
+
+    const handlers = createMediaHandlers({ requireAuth: true });
+    const response = await handlers.DELETE(
+      new Request("http://localhost/admin/api/media/some-id", {
+        method: "DELETE",
+      }),
+      { params: Promise.resolve({ path: ["some-id"] }) } // delete-media
+    );
+
+    expect(response.status).toBe(401);
+    expect(mocks.requirePermission).toHaveBeenCalledWith(
+      expect.anything(),
+      "delete",
+      "media"
+    );
+    expect(mocks.mediaService.delete).not.toHaveBeenCalled();
+  });
+
+  it("attributes a create to the authenticated caller, never a client-supplied identity", async () => {
+    mocks.requirePermission.mockResolvedValue({
+      userId: "real-admin",
+      permissions: [],
+      roles: [],
+      authMethod: "session",
+    });
+    mocks.mediaService.createFolder.mockResolvedValue({ id: "folder-1" });
+
+    const handlers = createMediaHandlers({ requireAuth: true });
+    const response = await handlers.POST(
+      new Request("http://localhost/admin/api/media/folders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        // A spoofed createdBy in the body must be ignored.
+        body: JSON.stringify({ name: "Photos", createdBy: "attacker" }),
+      }),
+      { params: Promise.resolve({ path: ["folders"] }) } // create-folder
+    );
+
+    expect(mocks.requirePermission).toHaveBeenCalledWith(
+      expect.anything(),
+      "create",
+      "media"
+    );
+    expect(response.status).toBe(201);
+
+    // The folder is created for the session user, not the body's `createdBy`.
+    const [, context] = mocks.mediaService.createFolder.mock.calls[0];
+    expect(context.user.id).toBe("real-admin");
+  });
+
+  it("serves the sidebar's counts on the public mount, not as a media item", async () => {
+    container.registerSingleton("generalSettingsService", () => ({
+      getTimezone: async () => "UTC",
+    }));
+    const counts = {
+      all: 3,
+      missingAltText: 1,
+      unused: 2,
+      usageRecorded: true,
+      root: 1,
+      folders: { f1: 2 },
+    };
+    mocks.mediaService.countLibrary.mockResolvedValue(counts);
+
+    const response = await createMediaHandlers().GET(
+      new Request("http://localhost/api/media/counts"),
+      { params: Promise.resolve({ path: ["counts"] }) }
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(counts);
+  });
+
+  it("says with Unused's own list whether the usage record it read was built, and with no other list", async () => {
+    container.registerSingleton("generalSettingsService", () => ({
+      getTimezone: async () => "UTC",
+    }));
+    const page = (usageRecorded?: boolean) => ({
+      data: [],
+      pagination: { total: 0, limit: 24, offset: 0, hasMore: false },
+      ...(usageRecorded === undefined ? {} : { usageRecorded }),
+    });
+    const list = async (query: string) => {
+      const response = await createMediaHandlers().GET(
+        new Request(`http://localhost/api/media${query}`),
+        { params: Promise.resolve({}) }
+      );
+      expect(response.status).toBe(200);
+      return ((await response.json()) as { meta: Record<string, unknown> })
+        .meta;
+    };
+
+    mocks.mediaService.listMedia.mockResolvedValueOnce(page(false));
+    expect(await list("?view=unused")).toMatchObject({ usageRecorded: false });
+    mocks.mediaService.listMedia.mockResolvedValueOnce(page(true));
+    expect(await list("?view=unused")).toMatchObject({ usageRecorded: true });
+    // Another list says nothing of the record.
+    mocks.mediaService.listMedia.mockResolvedValueOnce(page());
+    expect(await list("")).not.toHaveProperty("usageRecorded");
+  });
+
+  it("reads the items a list names by id in one read, and refuses more than a page of ids", async () => {
+    container.registerSingleton("generalSettingsService", () => ({
+      getTimezone: async () => "UTC",
+    }));
+    const found = [
+      { id: "b", filename: "b.png" },
+      { id: "a", filename: "a.png" },
+    ];
+    mocks.mediaService.findByIds.mockResolvedValue(found);
+    const handlers = createMediaHandlers();
+    const get = (query: string) =>
+      handlers.GET(new Request(`http://localhost/api/media${query}`), {
+        params: Promise.resolve({}),
+      });
+
+    const response = await get("?ids=b,a&ids=missing");
+    expect(response.status).toBe(200);
+    // One read of every id asked, whatever their number; not the paged list.
+    expect(mocks.mediaService.findByIds).toHaveBeenCalledTimes(1);
+    expect(mocks.mediaService.findByIds).toHaveBeenCalledWith(
+      ["b", "a", "missing"],
+      expect.anything()
+    );
+    expect(mocks.mediaService.listMedia).not.toHaveBeenCalled();
+    const body = (await response.json()) as {
+      items: { id: string }[];
+      meta: Record<string, unknown>;
+    };
+    expect(body.items.map(item => item.id)).toEqual(["b", "a"]);
+    expect(body.meta).toMatchObject({ total: 2, page: 1, totalPages: 1 });
+
+    const tooMany = Array.from({ length: 101 }, (_, i) => `m${String(i)}`);
+    expect((await get(`?ids=${tooMany.join(",")}`)).status).toBe(400);
+    expect(mocks.mediaService.findByIds).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads by id only for a caller the media list's gate lets read media", async () => {
+    container.registerSingleton("generalSettingsService", () => ({
+      getTimezone: async () => "UTC",
+    }));
+    const handlers = createMediaHandlers({ requireAuth: true });
+    const get = () =>
+      handlers.GET(new Request("http://localhost/admin/api/media?ids=a,b"), {
+        params: Promise.resolve({}),
+      });
+
+    // Refused: a visitor whom no media read is granted to.
+    mocks.requireListRead.mockImplementation(async () => ({
+      success: false,
+      statusCode: 401,
+      message: "Authentication required",
+      error: "You must be logged in to access this resource",
+      data: null,
+      code: "AUTH_REQUIRED",
+    }));
+    mocks.visitorReadsSystemResource.mockImplementation(async () => false);
+    expect((await get()).status).toBe(401);
+    expect(mocks.mediaService.findByIds).not.toHaveBeenCalled();
+
+    // Allowed: a caller the same gate lets list media reads the items.
+    mocks.requireListRead.mockImplementation(async () => ({
+      userId: "u1",
+      permissions: [],
+    }));
+    mocks.mediaService.findByIds.mockResolvedValue([{ id: "a" }]);
+    expect((await get()).status).toBe(200);
+    expect(mocks.mediaService.findByIds).toHaveBeenCalledTimes(1);
+    mocks.requireListRead.mockReset();
+    mocks.visitorReadsSystemResource.mockReset();
+  });
+
+  it("asks for the folder page the query names, and refuses one past the limit", async () => {
+    container.registerSingleton("generalSettingsService", () => ({
+      getTimezone: async () => "UTC",
+    }));
+    mocks.mediaService.getFolderContents.mockResolvedValue({
+      folder: null,
+      subfolders: [],
+      files: [],
+      breadcrumbs: [],
+      meta: { total: 0, page: 2, limit: 10, totalPages: 0 },
+    });
+    const handlers = createMediaHandlers();
+    const get = (query: string) =>
+      handlers.GET(
+        new Request(`http://localhost/api/media/folders/f1/contents${query}`),
+        { params: Promise.resolve({ path: ["folders", "f1", "contents"] }) }
+      );
+
+    expect((await get("?page=2&limit=10&sortBy=filename")).status).toBe(200);
+    expect(mocks.mediaService.getFolderContents).toHaveBeenCalledWith(
+      "f1",
+      expect.anything(),
+      {
+        page: 2,
+        limit: 10,
+        sortBy: "filename",
+        sortOrder: "desc",
+      }
+    );
+
+    expect((await get("?limit=500")).status).toBe(400);
+  });
+});

@@ -1,0 +1,904 @@
+/**
+ * One declaration that gives a widget its data and its view.
+ *
+ * `defineWidget()` takes everything a widget is: who it is, the sizes it
+ * allows, its settings, where its data comes from and how it is drawn. The
+ * compiler reads the settings once and hands their types to every reader --
+ * its `load` function and the widget's own component --
+ * with no cast and no generated file. The component gets them through a
+ * type-only import of the declaration (`WidgetProps<typeof myWidget>`), which
+ * the bundler erases, so no server code follows it into the browser.
+ *
+ * The same declaration is accepted from a plugin and from the site's config.
+ *
+ * @module domains/widgets/declaration/define-widget
+ */
+
+import type { UserContext } from "../../collections/services/collection-types";
+import type { WidgetSizeDeclaration } from "../grid-size";
+import type { RangeInterval, TimeseriesRange } from "../query";
+import type {
+  DeclaredComponentProps,
+  SettingEditorProps,
+  WidgetRenderSize,
+} from "../result";
+import type { WidgetFieldChoice, WidgetSourceFieldType } from "../sources";
+import type { WidgetScope } from "../widget-scope";
+
+import type {
+  CoreDisplay,
+  DisplayData,
+  DisplayOf,
+  WidgetView,
+} from "./displays";
+import type {
+  DateRange,
+  DependentSettings,
+  SettingEditorPathOf,
+  SettingEditorValueAt,
+  SettingValues,
+  WidgetFilter,
+  WidgetSettings,
+} from "./setting-builders";
+import type { WidgetSkeleton } from "./skeleton";
+import type { TransportableFields, TransportableValue } from "./transportable";
+
+/**
+ * How wide each point of a series is: a UTC day, an ISO week from Monday, or
+ * a calendar month. The intervals a range is drawn in (`RangeInterval`, read
+ * from the one table that pairs each range with its interval), under the name
+ * a widget author reads it by.
+ *
+ * @experimental
+ */
+export type WidgetInterval = RangeInterval;
+
+/**
+ * The ranges a series reads back over, from the instant that far before the
+ * batch's: the ones `setting.dateRange()` offers, so a card's Date range
+ * setting is handed to `timeseries` as it is. Kept to those a series query
+ * draws, so the two lists cannot part without this type saying so.
+ *
+ * @experimental
+ */
+export type WidgetRange = Extract<DateRange, TimeseriesRange>;
+
+/**
+ * Which entries a read counts: `"published"`, the published ones, what a
+ * person reads when they ask for nothing else; or `"all"`, drafts too. A
+ * collection with no draft and published lifecycle has only published
+ * entries, so both read every row.
+ */
+type WidgetReadStatus = "published" | "all";
+
+/**
+ * The window a count reads over: the entries whose `dateField` (their
+ * `createdAt` when absent) falls in the range's window, the one a series over
+ * the same range is drawn across, from the instant that range reaches back to
+ * the batch's. With `previous: true`, the window as long that ends where that
+ * one starts, so a count of the last 30 days and of the 30 before them never
+ * share an entry.
+ *
+ * `dateField` must name a date field of the collection that may be read by
+ * everyone the collection is read by: anything else is refused, as an invalid
+ * option is, whoever asks.
+ *
+ * @experimental
+ */
+export interface WidgetCountWindow {
+  range: WidgetRange;
+  dateField?: string;
+  previous?: true;
+}
+
+/**
+ * One field of a collection, as a widget's reads may use it: its name, what a
+ * person calls it, what kind of value it holds, and, for a field of choices,
+ * what each stored value is called. `groupable: false` marks a field a
+ * grouping read will not divide by, `presentable: false` one a row cannot
+ * print.
+ *
+ * `label` is the collection's own label for the field, or, where it gives
+ * none (as on its `createdAt`), the field's name made readable ("Created
+ * At"), as the admin names it on screen.
+ *
+ * @experimental
+ */
+export interface WidgetCollectionField {
+  name: string;
+  label: string;
+  type: WidgetSourceFieldType;
+  choices?: readonly WidgetFieldChoice[];
+  groupable?: false;
+  presentable?: false;
+}
+
+/**
+ * A collection as a widget's reads see it (`describe`): the field that names
+ * an entry, when it has one this person may read; whether it has a draft and
+ * published `status`, as `defineCollection({ status: true })` gives it; and
+ * the fields a read may use, every one this person may read and no other.
+ *
+ * @experimental
+ */
+export interface WidgetCollectionDescription {
+  title?: string;
+  status: boolean;
+  fields: readonly WidgetCollectionField[];
+}
+
+/**
+ * Reads a data function may make, already bound to the person asking.
+ *
+ * 🔴 They take no person, user or access option: core binds the person before
+ * handing them over, so a data function cannot leave the person out and read
+ * as the system. Rows come back as transportable values, so a function can
+ * answer them as they are.
+ */
+export interface WidgetReadServices {
+  count(
+    collection: string,
+    options?: {
+      where?: WidgetFilter;
+      /**
+       * Which entries are counted: the published ones when absent.
+       *
+       * @experimental
+       */
+      status?: WidgetReadStatus;
+      /**
+       * Counts only the entries in a window of time (`WidgetCountWindow`),
+       * beside the `where`.
+       *
+       * @experimental
+       */
+      window?: WidgetCountWindow;
+      signal?: AbortSignal;
+    }
+  ): Promise<number>;
+  find(
+    collection: string,
+    options?: {
+      where?: WidgetFilter;
+      sort?: string;
+      /**
+       * The most rows to answer. `0` answers none, as `rowsThatFit` answers
+       * for a card whose body holds no row; with `total: true` the total is
+       * still counted.
+       */
+      limit?: number;
+      select?: readonly string[];
+      /**
+       * Which entries are found: the published ones when absent.
+       *
+       * @experimental
+       */
+      status?: WidgetReadStatus;
+      /**
+       * `true` to be answered how many entries the read matched in all
+       * (`total`), from the same read as the rows, so a card's "View all (N)"
+       * names what the list it links to holds.
+       *
+       * @experimental
+       */
+      total?: true;
+      /**
+       * `0` to answer each link (a relationship or an upload) as the id it
+       * stores, unexpanded. Absent, links are expanded as they are today, as
+       * core's own read expands them by default. `0` is the only depth a read
+       * may name.
+       *
+       * @experimental
+       */
+      depth?: 0;
+      /**
+       * Handed to the collection's hooks as their `context`, as core's own
+       * read takes it: for a hook that does work only a display needs, such
+       * as a computed count, to see that this read does not need it and skip
+       * it. Plain values only; it decides nothing about who may read what.
+       *
+       * @experimental
+       */
+      context?: Readonly<Record<string, unknown>>;
+      signal?: AbortSignal;
+    }
+  ): Promise<{
+    items: { readonly [field: string]: TransportableValue }[];
+    /**
+     * How many entries the read matched in all, when the call asked for it
+     * with `total: true`.
+     *
+     * @experimental
+     */
+    total?: number;
+    /**
+     * Whether `total` is a floor: at least this many. Absent, it is whole.
+     *
+     * @experimental
+     */
+    atLeast?: boolean;
+  }>;
+  /**
+   * How many entries hold each value of one field, largest group first: the
+   * data the `bars` view draws, so a function may answer it as it is.
+   *
+   * `field` absent, the collection's own grouping: its status where it has a
+   * draft and published lifecycle, otherwise its first field with choices,
+   * the field a card's Group by setting falls back to. `limit` bounds how many
+   * groups come back.
+   *
+   * @experimental
+   */
+  groupBy(
+    collection: string,
+    options?: {
+      field?: string;
+      where?: WidgetFilter;
+      status?: WidgetReadStatus;
+      limit?: number;
+      signal?: AbortSignal;
+    }
+  ): Promise<{
+    buckets: readonly { value: string | null; count: number }[];
+    /**
+     * `true` when groups were left out because the read reached its cap:
+     * the buckets are the largest, but not every one.
+     *
+     * @experimental
+     */
+    truncated?: boolean;
+    /**
+     * `true` when each count is a floor: at least this many.
+     *
+     * @experimental
+     */
+    atLeast?: boolean;
+  }>;
+  /**
+   * How many entries fall in each interval of a range, oldest first, every
+   * interval present, a quiet one at zero: the data the `series` view draws,
+   * so a function may answer it as it is.
+   *
+   * The range decides the interval (a day for `7d` and `30d`, a week for
+   * `90d`, a month for `12m`), and `interval` is the one the points were
+   * counted in. Entries are placed by `dateField`, their `createdAt` when
+   * absent: a date field of the collection that may be read by everyone the
+   * collection is read by, or the read is refused, whoever asks.
+   *
+   * @experimental
+   */
+  timeseries(
+    collection: string,
+    options: {
+      range: WidgetRange;
+      dateField?: string;
+      where?: WidgetFilter;
+      status?: WidgetReadStatus;
+      signal?: AbortSignal;
+    }
+  ): Promise<{
+    points: readonly { start: string; count: number }[];
+    interval: WidgetInterval;
+  }>;
+  /**
+   * The collection as a widget's reads may use it (`WidgetCollectionDescription`):
+   * what titles an entry, whether it has a draft and published status, and
+   * the fields this person may read, for naming a grouping's values and
+   * choosing a list's columns. Checked as every read is, so a collection the
+   * person may not read is refused as a read of it would be.
+   *
+   * @experimental
+   */
+  describe(
+    collection: string
+  ): Promise<WidgetCollectionDescription | undefined>;
+}
+
+/**
+ * The size a card's data is loaded for: `w` and `h`, the card's size in grid
+ * units, held to its widget's declared bounds; and `tier`, how much room the
+ * card has on the screen asking, `"small"`, `"medium"` or `"large"`.
+ *
+ * 🔴 The shape a widget's own component is handed as its `size`
+ * (`WidgetRenderSize`), named again for the reader of a `load`, so the size a
+ * load reads and the size its card is drawn at cannot come to be two shapes.
+ * The tier is the one the admin predicts from the dashboard's width and the
+ * card's span before the card is drawn, by the rule the drawn card then
+ * measures itself by. A card asked with no tier (a request made with no
+ * dashboard width, or a default dashboard judged on the server) is loaded at
+ * `"medium"`, the tier a component is drawn at before its card has measured
+ * itself.
+ *
+ * @experimental
+ */
+export type WidgetLoadSize = WidgetRenderSize;
+
+/** What a data function is handed. */
+export interface WidgetDataInput<Values> {
+  /** The card's settings: the person's values, or the starting ones. */
+  settings: Values;
+  /** The person looking at the card. */
+  user: UserContext;
+  /** Aborted when the person leaves or the card's time budget runs out. */
+  signal: AbortSignal;
+  services: WidgetReadServices;
+  /**
+   * Work shared by every card of this widget's owner within one batch, asked
+   * for by one person: two cards that need the same scan ask for it under one
+   * key, and the scan runs once. Kept apart from every other owner's keys and
+   * from every content source's, so the same key in two places never meets.
+   *
+   * @experimental
+   */
+  scope: WidgetScope;
+  /**
+   * The batch's one instant: measure "since" and "until" from it rather than
+   * from `new Date()`, so every card on the dashboard, and every read this
+   * function makes, asks about the same days. This card's own copy.
+   *
+   * @experimental
+   */
+  now: Date;
+  /**
+   * The size this card is loaded for (`WidgetLoadSize`): its grid size and
+   * its tier. Part of what the load is asked, so a card that is resized or
+   * crosses a tier is loaded again, alone; read it to ask for no more than
+   * the card draws, such as `rowsThatFit(size, { density })` rows, or a
+   * trend only a large card shows.
+   *
+   * @experimental
+   */
+  size: WidgetLoadSize;
+}
+
+/** A widget's own data function, run on the server for each card. */
+export type WidgetDataFunction<Values, Data> = (
+  input: WidgetDataInput<Values>
+) => Promise<Data>;
+
+/** Carries a declaration's data type without a runtime property. */
+declare const widgetData: unique symbol;
+
+/**
+ * Marks a value made by `defineWidget`.
+ *
+ * Required, not optional, so a hand-written `{ id, view }` is not a widget:
+ * only a declaration that went through every check above can be contributed,
+ * put in the site config or given a component. Carried by the type alone.
+ */
+declare const declared: unique symbol;
+
+/**
+ * The permissions a person must hold to be offered a widget at all, each
+ * spelled as stored (`"read-orders"`):
+ *
+ * - one permission;
+ * - `{ anyOf }`, any one of several;
+ * - `{ allOf }`, every entry, each one permission or `{ anyOf }` of several.
+ *
+ * A list is never a gate on its own, so no gate reads as both "any" and
+ * "all". Judged where the dashboard decides which widgets a person is
+ * offered and which cards it sends them, by the same rule core's own widgets
+ * are gated by.
+ *
+ * @experimental
+ */
+export type WidgetAccessGate =
+  | string
+  | { anyOf: readonly string[] }
+  | { allOf: readonly (string | { anyOf: readonly string[] })[] };
+
+/**
+ * Who may see a widget's cards, in one of three forms:
+ *
+ * - a permission gate (`WidgetAccessGate`): a permission they hold, any
+ *   of several, or all of several, which also decides whether the widget is
+ *   offered to them at all;
+ * - `{ collections }`, the collections it reads, each of which they must be
+ *   able to read;
+ * - a predicate of the person, sync or async, which admits only on `true`.
+ *
+ * The last two are judged per card, with the person, before `load` runs; a
+ * person refused sees the card as not available to them. A predicate runs
+ * within the card's time budget, and one that throws refuses.
+ *
+ * @experimental
+ */
+export type WidgetAccess =
+  | WidgetAccessGate
+  | { collections: readonly string[] }
+  | ((input: { user: UserContext }) => unknown);
+
+/**
+ * A summary's count as a widget answers it: a number, or the number with
+ * `atLeast` where the widget counted only so far and there may be more, which
+ * the header then shows as a floor ("1,000+").
+ *
+ * @experimental
+ */
+export type WidgetSummaryCount =
+  | number
+  | { readonly count: number; readonly atLeast?: boolean };
+
+/**
+ * What a widget's summary counts for the dashboard's header: a label, and a
+ * count run as the person asking.
+ *
+ * @experimental
+ */
+export interface WidgetSummary {
+  label: string;
+  /**
+   * Handed `scope` as a `load` is, so a scan the card's data and the count
+   * both need can be asked for under one key and run once where both are
+   * answered together.
+   */
+  count: (
+    input: Pick<
+      WidgetDataInput<unknown>,
+      "user" | "signal" | "services" | "scope"
+    >
+  ) => Promise<WidgetSummaryCount>;
+}
+
+/**
+ * One case a test draws the card's ready state from (the scaffold's test, and
+ * core's accessibility check of its own widgets): a name, the data, and the
+ * settings it was drawn with when they matter.
+ */
+export interface WidgetPreviewCase<Data, Values> {
+  name: string;
+  data: Data;
+  settings?: Partial<Values>;
+}
+
+/**
+ * What a widget declares.
+ *
+ * - `View` is the view as written: a core view's name, or a component's path.
+ * - `Data` is `load`'s answer, inferred from what it returns.
+ * - `Preview` is the preview cases as written, checked against the data in
+ *   the return type for a component view (`CheckedDeclaration`).
+ */
+export interface WidgetDeclarationInput<
+  Id extends string,
+  S,
+  View extends WidgetView,
+  Data,
+  Preview,
+> {
+  /** `namespace/name`, unique across core, every plugin and the site. */
+  id: Id;
+  title: string;
+  /** One line, shown in the add panel. */
+  description: string;
+  /** A Lucide icon's name, shown beside the title in the add panel. */
+  icon?: string;
+  /** The add panel's group for it: "Other" when absent. */
+  category?: string;
+  /**
+   * The card's size in grid units (`{ w, h }`, twelve columns wide): the size
+   * a new card starts at, and the smallest and largest a person may resize
+   * it to.
+   *
+   * 🔴 The grid's own type, the one a stored placement, the site config and
+   * the admin say a size in, so a declared size reaches the layout as it is
+   * written, with nothing to translate.
+   */
+  size: WidgetSizeDeclaration;
+  /** Who may be offered this widget at all; everyone who can open the dashboard when absent. */
+  access?: WidgetAccess;
+  /**
+   * Whether the card shows at all for the person asking, judged on the server
+   * for each card before its `load` runs, with what `load` is handed. No
+   * leaves the card out of their dashboard, neither drawn nor counted;
+   * customise mode still shows it, marked, so it can be removed.
+   *
+   * @experimental
+   */
+  shows?: (
+    input: WidgetDataInput<SettingValues<S>>
+  ) => boolean | Promise<boolean>;
+  /**
+   * Where the add panel offers it, when not as one card for the whole
+   * dashboard: `"per-collection"`, one row per collection inside each
+   * collection's group, the card starting set to it (the widget needs a
+   * Collection setting); `"on-request"`, only as a card a person asks for.
+   * Either keeps it off the default dashboard. The registry's own `offered`.
+   *
+   * @experimental
+   */
+  offered?: "per-collection" | "on-request";
+  /**
+   * Whether a person may add it more than once. Once, unless it says so; a
+   * widget with `offered` set, any number of times, unless this says `false`.
+   */
+  several?: boolean;
+  /**
+   * Whether the card leaves the dashboard while its answer is empty, by its
+   * `isEmpty` test or its view's own rule, rather than saying so. A card that
+   * failed, or whose source the reader may not see, is never hidden, and
+   * customise mode still shows it, marked.
+   */
+  hidesWhenEmpty?: boolean;
+  settings?: S;
+  /**
+   * Where the card's data comes from: a function of the widget's own, run on
+   * the server for each card, as the person asking. Its reads go through the
+   * services it is handed, already bound to that person.
+   */
+  load: WidgetDataFunction<
+    SettingValues<S>,
+    FunctionAnswer<DisplayOf<View>, Data>
+  >;
+  /** How the card is drawn: one of core's views, or the widget's own component. */
+  view: View & OneView<View> & LiteralPath<View>;
+  /**
+   * Whether this data is empty. Run on the server with the answer, so only
+   * the verdict reaches the browser. A core view's own rule when absent (no
+   * rows, no groups, no points); required for a view of the widget's own,
+   * which is never empty unless this says so.
+   *
+   * The frame draws every state but ready (loading, empty, no permission,
+   * error), so a card looks the same as every other in each of them; "empty"
+   * is the one of those only the widget can judge from its data, so it says so
+   * here, typed by its own data.
+   */
+  isEmpty?: (data: DataFor<DisplayOf<View>, Data>) => boolean;
+  /** What the empty state says and offers, in place of the frame's own. */
+  empty?: WidgetEmpty;
+  /**
+   * The shape of the card while its data is on the way, and of its row in the
+   * add panel: one of `WidgetSkeleton`. The frame's own, generic one when
+   * absent.
+   *
+   * @experimental
+   */
+  skeleton?: WidgetSkeleton;
+  /**
+   * Cases the scaffold's test and core's checks draw the ready state from, of the
+   * widget's own data type, so a case that drifts from the data it stands in
+   * for fails to compile. How that is checked depends on the view
+   * (`PreviewFor`, `CheckedDeclaration`).
+   */
+  preview?: PreviewFor<DisplayOf<View>, Preview, SettingValues<S>>;
+  /**
+   * A label and a count for the dashboard's header, counted as the reader for
+   * each card of the widget they are shown, and left out of the line at none.
+   *
+   * @experimental
+   */
+  summary?: WidgetSummary;
+}
+
+/** What a widget's empty state says and offers. */
+export interface WidgetEmpty {
+  /** One line saying why there is nothing, in place of the frame's own. */
+  message?: string;
+  /**
+   * The empty state's single action, one of two:
+   *
+   * - a link, such as "Add a product": a path relative to the admin, offered
+   *   only to a person holding `permission` when it names one, so nobody is
+   *   shown a step they cannot take;
+   * - `opens: "settings"`, such as "Choose a collection": a button opening
+   *   this card's own settings, with focus on its first field, offered only
+   *   where the person can change them. The widget must declare settings.
+   */
+  action?:
+    | { label: string; link: string; permission?: string }
+    | { label: string; opens: "settings" };
+}
+
+/**
+ * What a declaration must hold beyond `WidgetDeclarationInput`: nothing for a
+ * core view, which has an empty rule of its own to fall back to; the
+ * `isEmpty` test, for a view of the widget's own, whose empty message and
+ * action could otherwise never be shown.
+ *
+ * 🔴 Depends on the view ONLY, and adds `isEmpty: unknown` rather than the
+ * test's own type. Intersected with the input, that makes `isEmpty` required
+ * while leaving it one signature, typed by the data. Any version of this that
+ * mentioned the data type made the compiler settle that type when it typed
+ * the test's parameter, before the data function was read, as `never`; and an
+ * intersection of two signatures leaves the parameter untyped.
+ */
+type ViewRequires<View> =
+  DisplayOf<View> extends CoreDisplay ? unknown : { isEmpty: unknown };
+
+/**
+ * The data a widget draws: its display's shape for a core display, or its own
+ * data for a component.
+ */
+type DataFor<Display, Own> = Display extends CoreDisplay
+  ? DisplayData<Display>
+  : Own;
+
+/** True when `T` is a union of more than one member. */
+type IsUnion<T, Whole = T> = T extends unknown
+  ? [Whole] extends [T]
+    ? false
+    : true
+  : never;
+
+/**
+ * Refuses a view typed as a choice of several.
+ *
+ * A `view` read from a variable typed `CoreView` is a union, and the pairing
+ * below distributes over it: data that one member draws satisfies the union,
+ * while the view the widget gets at run time may be another. The error names
+ * the fault in words.
+ */
+type OneView<View> =
+  true extends IsUnion<View>
+    ? {
+        "view must be exactly one view, not a choice of several": View;
+      }
+    : unknown;
+
+/**
+ * Refuses a component view whose path is not a literal.
+ *
+ * 🔴 The component map (`WidgetComponentMap`) is keyed by each declared path,
+ * so a component written for another widget, or a path with no component, is
+ * refused there. A path that names no one string turns that check off: a map
+ * keyed by `string`, or by a pattern such as `@acme/${string}#Card`, is an
+ * index signature that even an empty map satisfies. A view read from a
+ * variable typed `ComponentDisplay` has such a path, and so does one built
+ * from a template. So the path must be literal: one whose record an empty
+ * object does not satisfy, which `string` and every open pattern do. The
+ * error names the fault in words, as `OneView`'s does.
+ */
+type LiteralPath<View> = View extends {
+  component: infer Path extends string;
+}
+  ? Record<never, never> extends Record<Path, true>
+    ? {
+        "a component view's path must be written as a literal string": View;
+      }
+    : unknown
+  : unknown;
+
+/**
+ * What a data function must answer: its display's shape AND its own inferred
+ * type, for a core display; its own type, for a component.
+ *
+ * 🔴 `& Data` on the core branch. Without it a core display's shape was the
+ * whole contextual type of the answer, nothing was inferred into `Data`, and
+ * the transport bound on `Data` had nothing to check: a `metric` answering a
+ * `bigint` beside its total, or `list` rows holding a `Date`, compiled. With
+ * it, the answer is inferred as `Data` and checked twice: against the display
+ * and against what JSON carries.
+ */
+type FunctionAnswer<Display, Data> = Display extends CoreDisplay
+  ? AnsweredData<DisplayData<Display>> & Data
+  : Data;
+
+/**
+ * A core display's data as a data function may answer it: each list in it
+ * read-only or not.
+ *
+ * 🔴 A read service answers read-only lists (`groupBy`'s buckets,
+ * `timeseries`' points), the shapes the `bars` and `series` views draw, so a
+ * function may answer them as they come; a read-only list is not assignable
+ * to a mutable one, which would refuse exactly that. Only what a function may
+ * answer is widened: what its readers are handed (`WidgetData`) is unchanged.
+ */
+type AnsweredData<T> = { [K in keyof T]: ReadonlyList<T[K]> };
+
+/** A list, as read-only or not; anything else as it is. */
+type ReadonlyList<V> = V extends readonly (infer E)[] ? readonly E[] : V;
+
+/**
+ * What a widget's `preview` is typed as where it is written.
+ *
+ * For a core view, cases of the view's own shape, so a wrong case is refused
+ * at the property that is wrong. For a component, whatever the author wrote:
+ * see `CheckedDeclaration` for where that is checked, and why there.
+ */
+type PreviewFor<Display, Preview, Values> = Display extends CoreDisplay
+  ? readonly WidgetPreviewCase<DisplayData<Display>, Values>[]
+  : Preview;
+
+/**
+ * `T` with every array and property read-only.
+ *
+ * What the preview cases are compared against. They are inferred `const`, so
+ * `"7d"` stays the literal a date-range setting allows rather than widening to
+ * `string`; `const` also makes their arrays read-only, and a read-only array
+ * is not assignable to a mutable one, which is no fault of the case's.
+ */
+type ReadonlyDeep<T> = T extends object
+  ? { readonly [K in keyof T]: ReadonlyDeep<T[K]> }
+  : T;
+
+/**
+ * The declaration, once its preview cases have been checked against its data
+ * and settings.
+ *
+ * 🔴 Checked HERE, in the return type, for a component widget. Its data type
+ * is inferred from what its data function answers, and that function is read
+ * last, after every property that is not a function. Any type relating the
+ * cases to the data, given to the preview where it is written, made the
+ * compiler settle the data type before the function was read, as `never`.
+ * The return type is worked out once everything is inferred, so the check sees
+ * the real data type; the cost is that the error appears where the widget is
+ * used rather than at the case, so the error is made to say what is wrong.
+ */
+type CheckedDeclaration<
+  Id extends string,
+  S,
+  View extends WidgetView,
+  Data,
+  Preview,
+> =
+  DisplayOf<View> extends CoreDisplay
+    ? WidgetDeclaration<Id, S, View, Data, Preview>
+    : [Preview] extends [
+          readonly ReadonlyDeep<WidgetPreviewCase<Data, SettingValues<S>>>[],
+        ]
+      ? WidgetDeclaration<Id, S, View, Data, Preview>
+      : {
+          // Stands in for the declaration, so the widget cannot be contributed,
+          // put in the site config or given a component. Written inline, with
+          // the fault as its one key: the compiler prints an anonymous type by
+          // its shape, so the error where the widget is used opens with the
+          // fault in words and the two types to compare. A named type would
+          // print as its name and type arguments, to be looked up.
+          readonly "This widget's preview cases are not of the type its data and settings have": {
+            preview: Preview;
+            expected: readonly WidgetPreviewCase<Data, SettingValues<S>>[];
+          };
+        };
+
+/** A declared widget, carrying the types its readers need. */
+export type WidgetDeclaration<
+  Id extends string,
+  S,
+  View extends WidgetView,
+  Data,
+  Preview = never,
+> = WidgetDeclarationInput<Id, S, View, Data, Preview> & {
+  readonly [widgetData]?: DataFor<DisplayOf<View>, Data>;
+  readonly [declared]: true;
+};
+
+/**
+ * Declares a widget.
+ *
+ * The type parameters are all inferred; an author writes none of them.
+ *
+ * - `S extends DependentSettings<S>` checks that every dependent setting names
+ *   one of the widget's own Collection settings.
+ * - `Data extends TransportableFields<Data>` keeps a data function's answer to
+ *   what JSON carries unchanged, its keys included, and reports the property
+ *   that is not.
+ * - The view is inferred before the data function is read, so a core view's
+ *   shape is the type its data function must answer.
+ */
+export function defineWidget<
+  const Id extends string,
+  const View extends WidgetView,
+  S extends WidgetSettings & DependentSettings<S> = Record<never, never>,
+  Data extends TransportableFields<Data> = never,
+  const Preview = never,
+>(
+  declaration: WidgetDeclarationInput<Id, S, View, Data, Preview> &
+    ViewRequires<View>
+): CheckedDeclaration<Id, S, View, Data, Preview>;
+// The implementation hands the declaration back as it came: every type above
+// is the compiler's reading of it, and nothing at run time changes. `object`,
+// because the declaration as written does not carry the `declared` mark the
+// overload's result does; only the overload is what callers see.
+export function defineWidget(declaration: object): object {
+  return declaration;
+}
+
+/** Any widget made by `defineWidget`. */
+export interface AnyWidget {
+  readonly id: string;
+  readonly view: WidgetView;
+  readonly [declared]: true;
+}
+
+/** The settings a widget's readers are handed. */
+export type WidgetSettingValues<W> = W extends { settings?: infer S }
+  ? SettingValues<NonNullable<S>>
+  : never;
+
+/** The data a widget's component draws. */
+export type WidgetData<W> = W extends { readonly [widgetData]?: infer D }
+  ? D
+  : never;
+
+// A card's loading shape, published from here beside the declaration that states it.
+export type { WidgetSkeleton } from "./skeleton";
+
+// A card's size, declared beside the props the admin builds so both read one
+// shape, and published from here as it always was.
+export type { WidgetRenderSize } from "../result";
+
+/**
+ * What a widget's own component is handed: its settings, its size and its
+ * data, all typed from the declaration (`WidgetProps<typeof myWidget>`).
+ *
+ * 🔴 The data is a PROP, not something a hook fetches by naming the widget.
+ * A hook typed by a type argument (`useData<typeof w>()`) takes whatever
+ * widget it is told, so a component naming the wrong one compiles and is
+ * lied to; a prop is typed by the same `W` as the settings beside it, so the
+ * two cannot disagree. A component is then also a plain function of its
+ * props: a test renders it with data in hand, with no
+ * provider around it.
+ *
+ * `W extends AnyWidget`, so a declaration refused by its own checks (see
+ * `CheckedDeclaration`) cannot be given a component.
+ */
+export interface WidgetProps<W extends AnyWidget>
+  extends Omit<DeclaredComponentProps, "settings" | "data"> {
+  settings: WidgetSettingValues<W>;
+  /**
+   * The card's data, always present: the host draws loading, no permission
+   * and error itself, and calls the component only once there is data.
+   */
+  data: WidgetData<W>;
+}
+
+/**
+ * The component path a widget declares, for one drawn by its own component. Exported for the
+ * site's generated component map, which keeps only the widgets whose path is a literal.
+ */
+export type ComponentPathOf<W> = W extends {
+  readonly view: { component: infer Path extends string };
+}
+  ? Path
+  : never;
+
+/**
+ * The component map an admin entry registers, checked against the widgets it
+ * draws: one entry per declared component path, each a component taking THAT
+ * widget's props.
+ *
+ * 🔴 What closes the gap props alone leave. A component reaches the admin by
+ * the path string its declaration names, and its own signature says which
+ * widget's props it takes; nothing related the two. The path is a literal
+ * type (`view` is inferred `const`), so the map keyed by it can demand the
+ * right component for each key: a component written for another widget is
+ * refused, and so is a declared path with no component, which would otherwise
+ * be an empty card.
+ *
+ * ```ts
+ * export const components = {
+ *   "@acme/shop/admin#RevenueCard": RevenueCard,
+ * } satisfies WidgetComponentMap<(typeof widgets)[number]>;
+ * ```
+ */
+export type WidgetComponentMap<W extends AnyWidget> = {
+  // Each setting's own editor sits beside the views, by the path its setting
+  // names, taking that setting's value: an editor written for another
+  // setting's value is refused as a view written for another widget is. One
+  // mapped type, not an intersection of two, so a missing path is reported
+  // the same way either side.
+  [Path in
+    | ComponentPathOf<W>
+    | SettingEditorPathOf<W>]: Path extends ComponentPathOf<W>
+    ? (props: PropsOfEach<WidgetsAt<W, Path>>) => unknown
+    : (props: SettingEditorProps<SettingEditorValueAt<W, Path>>) => unknown;
+};
+
+/** The widgets among `W` that name this component path. */
+type WidgetsAt<W, Path> = W extends unknown
+  ? Path extends ComponentPathOf<W>
+    ? W
+    : never
+  : never;
+
+/**
+ * The props of each widget, as a union of whole prop objects.
+ *
+ * 🔴 Distributed, so two widgets sharing one component path ask for a
+ * component taking EITHER widget's props, each whole. Keyed by widget instead,
+ * the shared key merged into a union of component types, and a component
+ * written for one of the two satisfied it while the host would call it with
+ * the other's data.
+ */
+type PropsOfEach<W> = W extends AnyWidget ? WidgetProps<W> : never;

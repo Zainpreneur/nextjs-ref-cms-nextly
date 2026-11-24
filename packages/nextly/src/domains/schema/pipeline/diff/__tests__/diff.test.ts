@@ -1,0 +1,537 @@
+import { describe, expect, it } from "vitest";
+
+import { diffSnapshots } from "../diff";
+import type { NextlySchemaSnapshot } from "../types";
+
+const empty: NextlySchemaSnapshot = { tables: [] };
+
+function snap(
+  ...tables: Array<{
+    name: string;
+    columns: Array<{
+      name: string;
+      type: string;
+      nullable: boolean;
+      default?: string;
+      typeModifier?: string;
+    }>;
+  }>
+): NextlySchemaSnapshot {
+  return { tables };
+}
+
+describe("diffSnapshots - empty inputs", () => {
+  it("empty -> empty yields no operations", () => {
+    expect(diffSnapshots(empty, empty)).toEqual([]);
+  });
+
+  it("empty prev + table in cur yields add_table", () => {
+    const cur = snap({
+      name: "dc_posts",
+      columns: [{ name: "id", type: "int4", nullable: false }],
+    });
+    const ops = diffSnapshots(empty, cur);
+    expect(ops).toHaveLength(1);
+    expect(ops[0]).toEqual({
+      type: "add_table",
+      table: cur.tables[0],
+    });
+  });
+
+  it("table in prev + empty cur yields drop_table", () => {
+    const prev = snap({
+      name: "dc_posts",
+      columns: [{ name: "id", type: "int4", nullable: false }],
+    });
+    const ops = diffSnapshots(prev, empty);
+    expect(ops).toEqual([{ type: "drop_table", tableName: "dc_posts" }]);
+  });
+});
+
+describe("diffSnapshots - column-level diff within existing table", () => {
+  it("identical snapshot yields no operations", () => {
+    const s = snap({
+      name: "dc_posts",
+      columns: [
+        { name: "id", type: "int4", nullable: false },
+        { name: "title", type: "text", nullable: true },
+      ],
+    });
+    expect(diffSnapshots(s, s)).toEqual([]);
+  });
+
+  it("adding a column yields add_column", () => {
+    const prev = snap({
+      name: "dc_posts",
+      columns: [{ name: "id", type: "int4", nullable: false }],
+    });
+    const cur = snap({
+      name: "dc_posts",
+      columns: [
+        { name: "id", type: "int4", nullable: false },
+        { name: "title", type: "text", nullable: true },
+      ],
+    });
+    const ops = diffSnapshots(prev, cur);
+    expect(ops).toEqual([
+      {
+        type: "add_column",
+        tableName: "dc_posts",
+        column: { name: "title", type: "text", nullable: true },
+      },
+    ]);
+  });
+
+  it("removing a column yields drop_column with previous type captured", () => {
+    const prev = snap({
+      name: "dc_posts",
+      columns: [
+        { name: "id", type: "int4", nullable: false },
+        { name: "title", type: "text", nullable: true },
+      ],
+    });
+    const cur = snap({
+      name: "dc_posts",
+      columns: [{ name: "id", type: "int4", nullable: false }],
+    });
+    const ops = diffSnapshots(prev, cur);
+    expect(ops).toEqual([
+      {
+        type: "drop_column",
+        tableName: "dc_posts",
+        columnName: "title",
+        columnType: "text",
+      },
+    ]);
+  });
+
+  it("reports a dropped PostgreSQL column with its modifier restored", () => {
+    // PG introspection reads `udt_name`, which spells `numeric(10,2)` as a
+    // bare `numeric` with the precision recorded separately. A drop that
+    // reports `type` alone describes the column as unbounded, and the rename
+    // detector then reads a narrowing conversion as a move between two
+    // identical types.
+    const prev = snap({
+      name: "dc_orders",
+      columns: [
+        { name: "id", type: "int4", nullable: false },
+        {
+          name: "amount",
+          type: "numeric",
+          nullable: true,
+          typeModifier: "10,2",
+        },
+      ],
+    });
+    const cur = snap({
+      name: "dc_orders",
+      columns: [{ name: "id", type: "int4", nullable: false }],
+    });
+    const ops = diffSnapshots(prev, cur);
+    expect(ops).toEqual([
+      {
+        type: "drop_column",
+        tableName: "dc_orders",
+        columnName: "amount",
+        columnType: "numeric(10,2)",
+      },
+    ]);
+  });
+
+  it("does not append a modifier the type already spells out", () => {
+    // MySQL and SQLite report the declaration itself, so `type` already
+    // carries the size. Appending the modifier there yields `numeric(10,2)(10,2)`.
+    const prev = snap({
+      name: "dc_orders",
+      columns: [
+        { name: "id", type: "int4", nullable: false },
+        {
+          name: "amount",
+          type: "numeric(10,2)",
+          nullable: true,
+          typeModifier: "10,2",
+        },
+      ],
+    });
+    const cur = snap({
+      name: "dc_orders",
+      columns: [{ name: "id", type: "int4", nullable: false }],
+    });
+    const ops = diffSnapshots(prev, cur);
+    expect(ops).toEqual([
+      {
+        type: "drop_column",
+        tableName: "dc_orders",
+        columnName: "amount",
+        columnType: "numeric(10,2)",
+      },
+    ]);
+  });
+
+  it("changing column type yields change_column_type", () => {
+    const prev = snap({
+      name: "dc_posts",
+      columns: [{ name: "title", type: "varchar", nullable: false }],
+    });
+    const cur = snap({
+      name: "dc_posts",
+      columns: [{ name: "title", type: "text", nullable: false }],
+    });
+    const ops = diffSnapshots(prev, cur);
+    expect(ops).toEqual([
+      {
+        type: "change_column_type",
+        tableName: "dc_posts",
+        columnName: "title",
+        fromType: "varchar",
+        toType: "text",
+        // MySQL's MODIFY COLUMN restates the whole definition, so the
+        // nullability travels with the type or the column loses it.
+        nullable: false,
+        fromNullable: false,
+      },
+    ]);
+  });
+
+  it("does NOT emit change_column_type for PG alias pairs (int4/integer, bool/boolean, _text/text[], varchar/varchar(n))", () => {
+    // Live side = introspected udt_name (no length); desired = SQL names.
+    // These are the same types and must NOT diff (else `nextly migrate`
+    // refuses every existing Postgres DB).
+    const prev = snap({
+      name: "dc_posts",
+      columns: [
+        { name: "n", type: "int4", nullable: false },
+        { name: "flag", type: "bool", nullable: false },
+        { name: "tags", type: "_text", nullable: true },
+        { name: "name", type: "varchar", nullable: false },
+        { name: "at", type: "timestamptz", nullable: true },
+      ],
+    });
+    const cur = snap({
+      name: "dc_posts",
+      columns: [
+        { name: "n", type: "integer", nullable: false },
+        { name: "flag", type: "boolean", nullable: false },
+        { name: "tags", type: "text[]", nullable: true },
+        { name: "name", type: "varchar(255)", nullable: false },
+        { name: "at", type: "timestamp with time zone", nullable: true },
+      ],
+    });
+    expect(diffSnapshots(prev, cur)).toEqual([]);
+  });
+
+  it("changing column nullable yields change_column_nullable", () => {
+    const prev = snap({
+      name: "dc_posts",
+      columns: [{ name: "title", type: "text", nullable: true }],
+    });
+    const cur = snap({
+      name: "dc_posts",
+      columns: [{ name: "title", type: "text", nullable: false }],
+    });
+    const ops = diffSnapshots(prev, cur);
+    expect(ops).toEqual([
+      {
+        type: "change_column_nullable",
+        tableName: "dc_posts",
+        columnName: "title",
+        fromNullable: true,
+        toNullable: false,
+      },
+    ]);
+  });
+
+  it("changing column default yields change_column_default", () => {
+    const prev = snap({
+      name: "dc_posts",
+      columns: [{ name: "status", type: "text", nullable: false }],
+    });
+    const cur = snap({
+      name: "dc_posts",
+      columns: [
+        { name: "status", type: "text", nullable: false, default: "'draft'" },
+      ],
+    });
+    const ops = diffSnapshots(prev, cur);
+    expect(ops).toEqual([
+      {
+        type: "change_column_default",
+        tableName: "dc_posts",
+        columnName: "status",
+        fromDefault: undefined,
+        toDefault: "'draft'",
+      },
+    ]);
+  });
+
+  it("dropping a default yields change_column_default with toDefault undefined", () => {
+    const prev = snap({
+      name: "dc_posts",
+      columns: [
+        { name: "status", type: "text", nullable: false, default: "'draft'" },
+      ],
+    });
+    const cur = snap({
+      name: "dc_posts",
+      columns: [{ name: "status", type: "text", nullable: false }],
+    });
+    const ops = diffSnapshots(prev, cur);
+    expect(ops[0]).toEqual({
+      type: "change_column_default",
+      tableName: "dc_posts",
+      columnName: "status",
+      fromDefault: "'draft'",
+      toDefault: undefined,
+    });
+  });
+});
+
+describe("diffSnapshots - rename detection scope", () => {
+  it("does NOT detect renames at the diff layer (emits drop_column + add_column)", () => {
+    // Renames are a separate phase: F4's RegexRenameDetector reads
+    // (drop_column, add_column) pairs and asks the user. Confirmed
+    // renames get merged into rename_column ops by applyResolutions().
+    const prev = snap({
+      name: "dc_posts",
+      columns: [{ name: "title", type: "text", nullable: false }],
+    });
+    const cur = snap({
+      name: "dc_posts",
+      columns: [{ name: "name", type: "text", nullable: false }],
+    });
+    const ops = diffSnapshots(prev, cur);
+    expect(ops).toHaveLength(2);
+    expect(ops.find(op => op.type === "drop_column")).toBeDefined();
+    expect(ops.find(op => op.type === "add_column")).toBeDefined();
+  });
+});
+
+describe("diffSnapshots - multi-change ops", () => {
+  it("combines multiple ops in deterministic order", () => {
+    const prev = snap({
+      name: "dc_posts",
+      columns: [
+        { name: "id", type: "int4", nullable: false },
+        { name: "title", type: "text", nullable: false },
+        { name: "body", type: "text", nullable: true },
+      ],
+    });
+    const cur = snap({
+      name: "dc_posts",
+      columns: [
+        { name: "id", type: "int4", nullable: false },
+        { name: "name", type: "text", nullable: false }, // (rename intent)
+        { name: "summary", type: "text", nullable: true }, // new column
+        // `body` removed
+        // `title` removed
+      ],
+    });
+    const ops = diffSnapshots(prev, cur);
+
+    // Expected: 2 drops (body, title), 2 adds (name, summary)
+    expect(ops.filter(op => op.type === "drop_column")).toHaveLength(2);
+    expect(ops.filter(op => op.type === "add_column")).toHaveLength(2);
+
+    // Sort order: drops alphabetical first, then adds alphabetical
+    expect(ops.map(op => op.type)).toEqual([
+      "drop_column",
+      "drop_column",
+      "add_column",
+      "add_column",
+    ]);
+  });
+
+  it("multi-table changes don't cross-pair", () => {
+    const prev = snap(
+      {
+        name: "dc_posts",
+        columns: [{ name: "title", type: "text", nullable: false }],
+      },
+      {
+        name: "dc_users",
+        columns: [{ name: "id", type: "int4", nullable: false }],
+      }
+    );
+    const cur = snap(
+      {
+        name: "dc_posts",
+        columns: [],
+      },
+      {
+        name: "dc_users",
+        columns: [
+          { name: "id", type: "int4", nullable: false },
+          { name: "email", type: "text", nullable: true },
+        ],
+      }
+    );
+    const ops = diffSnapshots(prev, cur);
+    // dc_posts: title dropped. dc_users: email added. No cross-pairing.
+    expect(ops).toHaveLength(2);
+    expect(ops).toContainEqual({
+      type: "drop_column",
+      tableName: "dc_posts",
+      columnName: "title",
+      columnType: "text",
+    });
+    expect(ops).toContainEqual({
+      type: "add_column",
+      tableName: "dc_users",
+      column: { name: "email", type: "text", nullable: true },
+    });
+  });
+});
+
+describe("diffSnapshots - deterministic ordering", () => {
+  it("sorts tables alphabetically in op output", () => {
+    const prev = empty;
+    const cur = snap(
+      { name: "dc_zebras", columns: [] },
+      { name: "dc_alpha", columns: [] },
+      { name: "dc_mango", columns: [] }
+    );
+    const ops = diffSnapshots(prev, cur);
+    expect(
+      ops.map(op => (op.type === "add_table" ? op.table.name : "?"))
+    ).toEqual(["dc_alpha", "dc_mango", "dc_zebras"]);
+  });
+
+  it("table-level ops come before column-level ops", () => {
+    const prev = snap({
+      name: "dc_posts",
+      columns: [{ name: "title", type: "text", nullable: false }],
+    });
+    const cur = snap(
+      {
+        name: "dc_new_table",
+        columns: [{ name: "id", type: "int4", nullable: false }],
+      },
+      {
+        name: "dc_posts",
+        columns: [
+          { name: "title", type: "text", nullable: false },
+          { name: "name", type: "text", nullable: true },
+        ],
+      }
+    );
+    const ops = diffSnapshots(prev, cur);
+    // Order: add_table (dc_new_table), then add_column (dc_posts.name)
+    expect(ops[0].type).toBe("add_table");
+    expect(ops[1].type).toBe("add_column");
+  });
+});
+
+describe("diffSnapshots - a column resized but not retyped", () => {
+  it("emits the change, and states the size it is moving to", () => {
+    // Measured through the diff rather than the comparator: the defect was
+    // that NO operation reached the migration, so a test of the judgement
+    // alone would have passed while the pipeline stayed silent.
+    const prev = snap({
+      name: "dc_orders",
+      columns: [
+        {
+          name: "amount",
+          type: "numeric",
+          nullable: true,
+          typeModifier: "10,2",
+        },
+      ],
+    });
+    const cur = snap({
+      name: "dc_orders",
+      columns: [{ name: "amount", type: "numeric(5,1)", nullable: true }],
+    });
+    expect(diffSnapshots(prev, cur)).toEqual([
+      {
+        type: "change_column_type",
+        tableName: "dc_orders",
+        columnName: "amount",
+        fromType: "numeric(10,2)",
+        toType: "numeric(5,1)",
+        nullable: true,
+        fromNullable: true,
+      },
+    ]);
+  });
+
+  it("carries the nullability and default through the change", () => {
+    // MySQL spells a type change as `MODIFY COLUMN`, which restates the whole
+    // definition and drops whatever it does not restate. A generated migration
+    // has no schema push behind it to put them back, so a NOT NULL DEFAULT '0'
+    // column comes out of a resize nullable and defaultless — and its DOWN
+    // cannot recover them unless the previous pair travels too.
+    const prev = snap({
+      name: "dc_orders",
+      columns: [
+        {
+          name: "amount",
+          type: "decimal(10,2)",
+          nullable: false,
+          default: "'0'",
+        },
+      ],
+    });
+    const cur = snap({
+      name: "dc_orders",
+      columns: [
+        {
+          name: "amount",
+          type: "decimal(12,4)",
+          nullable: false,
+          default: "'0'",
+        },
+      ],
+    });
+    expect(diffSnapshots(prev, cur)[0]).toMatchObject({
+      type: "change_column_type",
+      nullable: false,
+      columnDefault: "'0'",
+      fromNullable: false,
+      fromColumnDefault: "'0'",
+    });
+  });
+
+  it("states a column that has no default as having none", () => {
+    // The control: the attributes must describe the column, not be filled in
+    // with whatever keeps the assertion above true. A default invented here
+    // would be written into every resized column that never had one.
+    const prev = snap({
+      name: "dc_orders",
+      columns: [{ name: "amount", type: "decimal(10,2)", nullable: true }],
+    });
+    const cur = snap({
+      name: "dc_orders",
+      columns: [{ name: "amount", type: "decimal(12,4)", nullable: true }],
+    });
+    const op = diffSnapshots(prev, cur)[0] as unknown as Record<
+      string,
+      unknown
+    >;
+    expect(op.nullable).toBe(true);
+    expect(op).not.toHaveProperty("columnDefault");
+    expect(op).not.toHaveProperty("fromColumnDefault");
+  });
+
+  it("emits nothing when the same size is spelled two ways", () => {
+    // The control, and the failure this must not trade itself for: the
+    // desired side writes `numeric(10, 2)` and the live side reports `10,2`,
+    // so a literal compare would report a change on every decimal column in
+    // every PostgreSQL database, on every apply.
+    const prev = snap({
+      name: "dc_orders",
+      columns: [
+        {
+          name: "amount",
+          type: "numeric",
+          nullable: true,
+          typeModifier: "10,2",
+        },
+      ],
+    });
+    const cur = snap({
+      name: "dc_orders",
+      columns: [{ name: "amount", type: "numeric(10, 2)", nullable: true }],
+    });
+    expect(diffSnapshots(prev, cur)).toEqual([]);
+  });
+});

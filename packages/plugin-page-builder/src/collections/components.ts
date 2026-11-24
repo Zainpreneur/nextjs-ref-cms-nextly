@@ -1,0 +1,136 @@
+/**
+ * Definitions an author builds once and places many times.
+ *
+ * A component is placed by REFERENCE: a page stores one node naming this
+ * document, and the tree is resolved when the page is read. So editing a
+ * component changes every page carrying it, which is the property patterns
+ * deliberately do not have.
+ *
+ * ## A header is a component
+ *
+ * There is no separate document kind for a site header or footer. A Layout
+ * names which component fills each of its areas, so the ROLE lives on the
+ * placement rather than on the document, and a header inherits everything a
+ * component has: per-instance editable fields, variants, drafts, a usage count.
+ *
+ * The alternative — a second document type for regions — was measured against
+ * the products that ship it, and the same complaint follows every one of them:
+ * a region built as a weaker thing cannot be edited by the people who need to
+ * edit it, because the machinery that makes a component editable was never
+ * built twice. Adding an announcement bar or a sidebar later is a new AREA on
+ * the Layout, not a new kind of document.
+ *
+ * `area` below is the hint that keeps the two uses apart in the UI without
+ * making them different things.
+ *
+ * @module collections/components
+ */
+import {
+  defineCollection,
+  select,
+  text,
+  textarea,
+  type CollectionConfig,
+} from "nextly/config";
+
+import { COMPONENT_LIST_TOOLS_COMPONENT } from "../builder-view";
+import { blocks } from "../fields/blocksHelper";
+import { TRANSFER_IMPORT_COMPONENT } from "../transfer/transfer-contract";
+
+import { layoutAreaOptions } from "./areas";
+
+/** The slug component definitions are stored under. */
+export const COMPONENTS_SLUG = "components";
+
+/**
+ * The plugin-owned `components` collection.
+ *
+ * Takes no preview options, for the reason patterns takes none: a component
+ * is never served at an address of its own. It reaches a visitor only inside
+ * a page or a Layout, so it has no preview path.
+ *
+ * `isStore` says whether this collection is where the site's components are
+ * kept, which it is unless the host names a store of its own
+ * (`componentReadiness.collection`). Only the store's deletes go through
+ * Delete component, so only then is the admin's own list Delete withheld and
+ * the delete tools drawn above the list.
+ */
+export function componentsCollection(
+  { isStore }: { readonly isStore: boolean } = { isStore: true }
+): CollectionConfig {
+  return defineCollection({
+    slug: COMPONENTS_SLUG,
+    labels: { singular: "Component", plural: "Components" },
+    fields: [
+      text({ name: "title", required: true }),
+      // Kept once for every language: an identifier code and other documents
+      // name, not a translated address as a page's slug is.
+      text({ name: "slug", localized: false, required: true, unique: true }),
+      textarea({ name: "description" }),
+      text({ name: "category" }),
+      // Which area of a header & footer set this component suits, if any,
+      // read as what it is used as. It orders the pickers and does not gate
+      // them: a component used as the header can still be placed inline on a
+      // page that wants its navigation baked in. Empty is "Anywhere": no hint,
+      // an ordinary in-page component offered everywhere. The stored values
+      // stay `header`, `footer` and empty.
+      select({
+        name: "area",
+        label: "Use as",
+        options: layoutAreaOptions(),
+        admin: { placeholder: "Anywhere", isClearable: true },
+      }),
+      blocks({
+        name: "content",
+        label: "Component",
+        blocks: { kinds: ["component"] },
+      }),
+    ],
+    // The published/draft split is what separates editing a component from
+    // shipping it. A page read for a visitor resolves the PUBLISHED
+    // definition, so an author can rework a header for as long as they like
+    // without every page carrying the work in progress; publishing is the
+    // single act that moves it to every one of them.
+    status: true,
+    versions: { drafts: true },
+    // Opted out of AUTOMATIC navigation, because this plugin declares its own
+    // menu entry for the store and two sources listing one screen is the
+    // problem rather than the belt-and-braces it looks like.
+    //
+    // ONE automatic source reaches this collection, and `hidden` is what
+    // excludes it: `isInCollectionsSection` (admin `lib/sidebar-landing`)
+    // admits every collection that is not hidden and claims no sidebar group.
+    //
+    // The other automatic source, `DynamicPluginNav`, lists only collections
+    // marked `admin.isPlugin`, which is a presentation flag this package never
+    // sets — so it never reaches these at all. That flag is also what an
+    // earlier note here conflated with PLACEMENT: a plugin declaring
+    // `placement` does move its collections out of the Plugins panel, through
+    // `isCollectionPlacedElsewhere`, but only for collections that opted into
+    // being listed there in the first place. Ownership and placement are
+    // separate questions, which is the distinction `collection-placement.ts`
+    // exists to draw.
+    //
+    // Hidden costs nothing else: the collection keeps its URL, its API and its
+    // permissions, and only stops being offered by navigation nobody asked
+    // for — this plugin's own menu links to it explicitly.
+    admin: {
+      useAsTitle: "title",
+      hidden: true,
+      // The store's components are deleted only through Delete component,
+      // which turns their copies into plain blocks first: the store refuses
+      // any other delete, so its list offers no Delete of its own. The plugin
+      // offers Delete component on each list row and in the document's menu,
+      // in the built-in Delete's place, instead.
+      disableDelete: isStore,
+      // "Import from file" above the list, where a file exported from
+      // another site is brought in after its preview, and, on the store, the
+      // dialog the row action "Delete component…" opens.
+      components: {
+        BeforeListTable: isStore
+          ? COMPONENT_LIST_TOOLS_COMPONENT
+          : TRANSFER_IMPORT_COMPONENT,
+      },
+    },
+  });
+}

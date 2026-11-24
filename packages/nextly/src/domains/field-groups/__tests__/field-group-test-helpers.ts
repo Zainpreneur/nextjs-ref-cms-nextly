@@ -1,0 +1,228 @@
+import { vi } from "vitest";
+
+import type { Logger } from "../../../services/shared";
+
+type MockRecord = Record<string, any>;
+
+export function createSilentLogger(): Logger {
+  return {
+    debug: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  } as unknown as Logger;
+}
+
+/**
+ * Create a mock DrizzleAdapter with stubbed CRUD methods.
+ *
+ * By default:
+ * - select() → []
+ * - selectOne() → null
+ * - insert() → { id }
+ * - update() → [{ id }]
+ * - delete() → undefined
+ * - tableExists() → true
+ * - executeQuery() → undefined
+ * - getDrizzle() → a stub whose `.delete().where()` resolves to `{ rowCount: 0 }`, and whose
+ *   `.selectDistinct().from().where()` finds no archive rows of unknown owner
+ * - listTables() → [] (no component tables for the embedded-component sweep to scan)
+ *
+ * Override any method via the `overrides` parameter.
+ */
+export function createMockAdapter(overrides: MockRecord = {}): MockRecord {
+  return {
+    dialect: "postgresql",
+    getCapabilities: vi.fn().mockReturnValue({
+      dialect: "postgresql",
+      supportsIlike: true,
+      supportsReturning: true,
+      supportsJsonb: true,
+      supportsJson: true,
+      supportsArrays: true,
+      supportsSavepoints: true,
+      supportsOnConflict: true,
+      supportsFts: true,
+    }),
+    // Answered as inside a transaction, so a registry read goes to `selectOne` as these tests
+    // drive it rather than to the registry row cache, which has tests of its own.
+    transactionOpenInFlow: vi.fn(() => true),
+    select: vi.fn().mockResolvedValue([]),
+    selectOne: vi.fn().mockResolvedValue(null),
+    insert: vi.fn().mockResolvedValue({ id: "new-id" }),
+    update: vi.fn().mockResolvedValue([{ id: "updated-id" }]),
+    delete: vi.fn().mockResolvedValue(undefined),
+    tableExists: vi.fn().mockResolvedValue(true),
+    executeQuery: vi.fn().mockResolvedValue(undefined),
+    getDialect: vi.fn().mockReturnValue("postgresql"),
+    // Empty catalog by default, so the embedded-component sweep on entity delete finds
+    // no component tables to scan. Override with table names to exercise that path.
+    listTables: vi.fn().mockResolvedValue([]),
+    // Drizzle query-builder handle, used by the ORM-path writes the adapter methods above
+    // don't cover — currently the `nextly_i18n_archive` purge on entity delete. Resolves to
+    // a driver-shaped result so the caller's row-count read finds a number.
+    getDrizzle: vi.fn().mockReturnValue({
+      selectDistinct: vi.fn().mockReturnValue({
+        from: vi.fn().mockReturnValue({
+          where: vi.fn().mockResolvedValue([]),
+        }),
+      }),
+      delete: vi.fn().mockReturnValue({
+        where: vi.fn().mockResolvedValue({ rowCount: 0 }),
+      }),
+    }),
+    ...overrides,
+  };
+}
+
+/** Sentinel handle returned by a tx double's `getDrizzle()`.
+ *
+ * Distinct from the adapter's so a test can prove WHICH connection a read was
+ * routed through, not merely that some handle was passed. */
+export const TX_DRIZZLE_HANDLE = { __handle: "tx" } as const;
+
+export function createMockTxContext(overrides: MockRecord = {}): MockRecord {
+  return {
+    select: vi.fn().mockResolvedValue([]),
+    selectOne: vi.fn().mockResolvedValue(null),
+    insert: vi.fn().mockResolvedValue({ id: "tx-new-id" }),
+    update: vi.fn().mockResolvedValue([{ id: "tx-updated-id" }]),
+    delete: vi.fn().mockResolvedValue(undefined),
+    // The component-delete path resolves each component on the TRANSACTION's
+    // own connection before deleting, because on a single-connection pool the
+    // delete transaction already holds the only connection and a pooled
+    // registry read would wait on itself. Absent from the double, that call
+    // threw -- and the production `catch` swallowed it to a debug log, so the
+    // delete simply never happened and the test read as "0 calls" rather than
+    // as an error.
+    getDrizzle: vi.fn().mockReturnValue(TX_DRIZZLE_HANDLE),
+    ...overrides,
+  };
+}
+
+/**
+ * Create a mock FieldGroupRegistryService that returns canned component metadata
+ * keyed by slug. Use `registerComponent(slug, meta)` to add new entries.
+ */
+export function createMockComponentRegistry(): MockRecord {
+  const components = new Map<string, MockRecord>();
+
+  const registerComponent = (slug: string, meta: Partial<MockRecord> = {}) => {
+    components.set(slug, {
+      id: `component-${slug}`,
+      slug,
+      label: slug,
+      tableName: `comp_${slug}`,
+      fields: [],
+      source: "code",
+      locked: true,
+      schemaHash: "hash",
+      schemaVersion: 1,
+      migrationStatus: "applied",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      ...meta,
+    });
+  };
+
+  return {
+    components,
+    registerComponent,
+    getComponent: vi.fn().mockImplementation(async (slug: string) => {
+      const meta = components.get(slug);
+      if (!meta) {
+        throw new Error(`Component "${slug}" not found`);
+      }
+      return meta;
+    }),
+    getComponentBySlug: vi.fn().mockImplementation(async (slug: string) => {
+      return components.get(slug) ?? null;
+    }),
+    // Every registered component's table, as the delete beneath a removed instance reads them.
+    getAllTableNames: vi
+      .fn()
+      .mockImplementation(async () =>
+        [...components.values()].map(meta => meta.tableName as string)
+      ),
+  };
+}
+
+export function createMockRelationshipService(): MockRecord {
+  return {
+    expandRelationships: vi
+      .fn()
+      .mockImplementation((data: Record<string, unknown>) =>
+        Promise.resolve(data)
+      ),
+  };
+}
+
+export function seoComponentField() {
+  return {
+    name: "seo",
+    type: "component",
+    component: "seo",
+  };
+}
+
+export function repeatableComponentField() {
+  return {
+    name: "features",
+    type: "component",
+    component: "feature",
+    repeatable: true,
+  };
+}
+
+export function multiComponentField() {
+  return {
+    name: "layout",
+    type: "component",
+    components: ["hero", "cta"],
+    repeatable: true,
+  };
+}
+
+export function seoComponentMeta() {
+  return {
+    slug: "seo",
+    tableName: "comp_seo",
+    fields: [
+      { name: "metaTitle", type: "text" },
+      { name: "metaDescription", type: "text" },
+    ],
+  };
+}
+
+export function featureComponentMeta() {
+  return {
+    slug: "feature",
+    tableName: "comp_feature",
+    fields: [
+      { name: "title", type: "text" },
+      { name: "description", type: "text" },
+    ],
+  };
+}
+
+export function heroComponentMeta() {
+  return {
+    slug: "hero",
+    tableName: "comp_hero",
+    fields: [
+      { name: "heading", type: "text" },
+      { name: "subheading", type: "text" },
+    ],
+  };
+}
+
+export function ctaComponentMeta() {
+  return {
+    slug: "cta",
+    tableName: "comp_cta",
+    fields: [
+      { name: "label", type: "text" },
+      { name: "href", type: "text" },
+    ],
+  };
+}

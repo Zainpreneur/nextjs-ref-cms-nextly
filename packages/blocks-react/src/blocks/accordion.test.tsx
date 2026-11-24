@@ -1,0 +1,327 @@
+/**
+ * What makes `core/accordion` and `core/accordion-item` worth being two blocks.
+ *
+ * The group delegates to `renderContainer`, so asserting that it draws a `div`
+ * would pass equally on a `core/box` and would keep passing if the pair were
+ * deleted and aliased. What SEPARATES this pair is the nesting rule's two
+ * halves, the native disclosure element the item renders, and the fact that a
+ * section's body is a SLOT rather than a string — that last one being the whole
+ * reason this is a port rather than a copy of the older repeater block.
+ */
+import {
+  blockPartClassName,
+  DISCLOSURE_ICON_CLASS,
+  DISCLOSURE_TITLE_CLASS,
+  type BlockDocument,
+} from "@nextlyhq/blocks-engine";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it } from "vitest";
+
+import { PageRenderer } from "../page-renderer";
+import { createBlockResolver } from "../resolver";
+import { resolvePageStyles } from "../styles";
+
+import { accordion, ACCORDION_BASE_STYLES } from "./accordion";
+import {
+  accordionItem,
+  ACCORDION_BLOCK,
+  ACCORDION_ITEM_BLOCK,
+  ACCORDION_ITEM_SUPPORTS,
+} from "./accordion-item";
+import { coreBlocks } from "./index";
+
+/** Render args with only what these blocks read, so a test states its inputs. */
+function args(props: Record<string, unknown>, slot = "BODY") {
+  return {
+    props,
+    node: { id: "n1", type: ACCORDION_ITEM_BLOCK, version: 1, props },
+    className: "cls",
+    // Outside any accordion's render, as a section drawn alone is.
+    ctx: {},
+    // Required by the render contract; these fixtures declare no parts.
+    partClass: () => "",
+    renderSlot: (name: string) => (name === "children" ? slot : null),
+  } as never;
+}
+
+describe("the accordion pair", () => {
+  it("states BOTH halves of the nesting rule", () => {
+    // Neither half implies the other: `block.ts` is explicit that a slot naming
+    // a type does not confine that type to it, so a group that only declared
+    // `allow` would still let a section be dropped at the document root.
+    expect(accordion.slots?.children?.allow).toEqual([ACCORDION_ITEM_BLOCK]);
+    expect(accordionItem.parent).toEqual([ACCORDION_BLOCK]);
+  });
+
+  describe("what a fresh accordion starts with", () => {
+    it("declares its three questions by type, never as stored nodes", () => {
+      // The declaration names a TYPE and carries no id, which is what lets
+      // two accordions on one page expand from it without colliding. What
+      // they expand to is `accordion-questions.test.tsx`'s.
+      const declared = accordion.slots?.children?.defaultBlock ?? [];
+      expect(declared.map(entry => entry.type)).toEqual([
+        ACCORDION_ITEM_BLOCK,
+        ACCORDION_ITEM_BLOCK,
+        ACCORDION_ITEM_BLOCK,
+      ]);
+      expect(JSON.stringify(declared)).not.toContain('"id"');
+    });
+
+    it("gives a question a Text to start, and no allow-list", () => {
+      // The child half is unrestricted (a section holds whatever a section
+      // holds); it starts with the answer to write over.
+      expect(
+        accordionItem.slots?.children?.defaultBlock?.map(entry => entry.type)
+      ).toEqual(["core/text"]);
+      expect(accordionItem.slots?.children?.allow).toBeUndefined();
+    });
+  });
+
+  it("is registered, parent before child", () => {
+    // A resolver built by iterating `coreBlocks` should meet the group first,
+    // which is the ordering the columns pair records and this one follows.
+    const names = coreBlocks.map(block => block.name);
+    expect(names).toContain(ACCORDION_BLOCK);
+    expect(names).toContain(ACCORDION_ITEM_BLOCK);
+    expect(names.indexOf(ACCORDION_BLOCK)).toBeLessThan(
+      names.indexOf(ACCORDION_ITEM_BLOCK)
+    );
+  });
+
+  it("renders a native <details> whose body comes from the SLOT", () => {
+    // The property that separates this from the block it replaces. The older
+    // page-builder stored section bodies as strings and ran them through a
+    // Markdown pass, so no block could live inside one.
+    const out = accordionItem.render?.(args({ title: "T", open: false }));
+    const el = out as { type: string; props: Record<string, unknown> };
+
+    expect(el.type).toBe("details");
+    expect(el.props.className).toBe("cls");
+    // The slot's output is placed as a child, not a prop-derived string.
+    expect(JSON.stringify(el.props.children)).toContain("BODY");
+  });
+
+  it("honours `open`, so a section can start expanded", () => {
+    const closed = accordionItem.render?.(args({ title: "T", open: false }));
+    const open = accordionItem.render?.(args({ title: "T", open: true }));
+
+    expect((closed as { props: { open: boolean } }).props.open).toBe(false);
+    expect((open as { props: { open: boolean } }).props.open).toBe(true);
+  });
+
+  it("survives a stored title that is not a string", () => {
+    // Validation asks only that props be an object, so the type states what an
+    // author may write and the document states what is stored. A stored object
+    // reaching React as a child throws and takes the page with it.
+    const out = accordionItem.render?.(args({ title: { a: 1 }, open: false }));
+
+    expect(() => JSON.stringify(out)).not.toThrow();
+    expect(JSON.stringify(out)).not.toContain('"a":1');
+  });
+
+  it("separates sections with spacing, never a hardcoded divider colour", () => {
+    // The spacing is the `space.stack` token, the space every container puts
+    // between the blocks it holds.
+    //
+    // That the reference RESOLVES is proved against a rendered page in
+    // `columns.test.tsx`. This asserts what this block declares.
+    const declared = JSON.stringify(ACCORDION_BASE_STYLES);
+
+    expect(declared).toContain('"$token":"space.stack"');
+    // Must-differ: a raw length would pass the check above if the object
+    // carried both, and would stop following the site's own spacing.
+    expect(declared).not.toContain("1rem");
+    // The older block drew its dividers with `var(--nx-color-border)` — the
+    // ADMIN namespace, which this renderer never emits, so that rule resolves
+    // to nothing on a published page while looking right in an admin preview.
+    expect(declared).not.toContain("--nx-");
+    expect(declared).not.toContain("border");
+  });
+
+  it("offers no `layout` support, since a <details> is not a flex container", () => {
+    // Withheld by this block rather than by the engine: `layout` is a real
+    // registered support, and granting it here sets the title beside the body.
+    expect(ACCORDION_ITEM_SUPPORTS).not.toHaveProperty("layout");
+    // Every key must be a STYLE CATALOG group — the registry refuses unknown
+    // ones, which is what caught `visibility` copied from the older block.
+    expect(ACCORDION_ITEM_SUPPORTS).not.toHaveProperty("visibility");
+  });
+});
+
+/** The title's part class, which carries its typography reset. */
+const TITLE_PART = blockPartClassName(ACCORDION_ITEM_BLOCK, "title");
+
+describe("an accordion's titles and icon, on a rendered page", () => {
+  /** An accordion of one section, with what the accordion is given. */
+  const page = (
+    accordionProps: Record<string, unknown>,
+    body: unknown[] = []
+  ): BlockDocument =>
+    ({
+      formatVersion: 1,
+      kind: "page",
+      nodes: [
+        {
+          id: "acc",
+          type: ACCORDION_BLOCK,
+          version: 1,
+          props: { as: "div", contained: false, ...accordionProps },
+          slots: {
+            children: [
+              {
+                id: "s1",
+                type: ACCORDION_ITEM_BLOCK,
+                version: 1,
+                props: { title: "What is included?", open: false },
+                slots: { children: body },
+              },
+            ],
+          },
+        },
+      ],
+    }) as unknown as BlockDocument;
+  const resolver = createBlockResolver([...coreBlocks]);
+  const CONTEXT = {
+    breakpoints: {
+      viewport: [{ id: "base", label: "Desktop" }],
+      container: [],
+    },
+  };
+  const markup = (document: BlockDocument): string =>
+    renderToStaticMarkup(
+      <PageRenderer
+        document={document}
+        blocks={resolver}
+        styles={resolvePageStyles(document, undefined, CONTEXT, resolver)}
+      />
+    );
+  const summaryOf = (html: string): string =>
+    /<summary[^>]*>(.*?)<\/summary>/.exec(html)?.[1] ?? "";
+
+  it("draws each title as the heading Titles as names, inside its summary", () => {
+    expect(summaryOf(markup(page({ titlesAs: "h3" })))).toBe(
+      `<span class="${DISCLOSURE_ICON_CLASS}" aria-hidden="true"></span><h3 class="${DISCLOSURE_TITLE_CLASS} ${TITLE_PART}">What is included?</h3>`
+    );
+  });
+
+  it("draws a title as text by default, and for a level it does not offer", () => {
+    for (const props of [{}, { titlesAs: "h1" }, { titlesAs: "div" }]) {
+      expect(summaryOf(markup(page(props)))).toBe(
+        `<span class="${DISCLOSURE_ICON_CLASS}" aria-hidden="true"></span><span class="${DISCLOSURE_TITLE_CLASS} ${TITLE_PART}">What is included?</span>`
+      );
+    }
+  });
+
+  it("gives a nested accordion its own titles, not its parent's", () => {
+    const nested = {
+      id: "inner",
+      type: ACCORDION_BLOCK,
+      version: 1,
+      props: { as: "div", contained: false },
+      slots: {
+        children: [
+          {
+            id: "s2",
+            type: ACCORDION_ITEM_BLOCK,
+            version: 1,
+            props: { title: "Inner", open: false },
+            slots: { children: [] },
+          },
+        ],
+      },
+    };
+    const html = markup(page({ titlesAs: "h2" }, [nested]));
+    expect(html).toContain(
+      `<h2 class="${DISCLOSURE_TITLE_CLASS} ${TITLE_PART}">What is included?</h2>`
+    );
+    expect(html).toContain(
+      `<span class="${DISCLOSURE_TITLE_CLASS} ${TITLE_PART}">Inner</span>`
+    );
+  });
+
+  it("draws a plus after the title, a minus while open", () => {
+    const html = markup(page({}));
+    expect(html).toContain(`> details > summary > .${DISCLOSURE_ICON_CLASS}`);
+    expect(html).toContain("list-style: none");
+    // The plus's upright stroke closed, the minus alone while open.
+    expect(html).toContain(encodeURIComponent("M8 3.5v9M3.5 8h9"));
+    expect(html).not.toContain("rotate(180deg)");
+    expect(html).toContain("margin-inline-start: auto");
+  });
+});
+
+describe("an accordion's title levels, as offered and as drawn", () => {
+  const resolver = createBlockResolver([...coreBlocks]);
+  const CONTEXT = {
+    breakpoints: {
+      viewport: [{ id: "base", label: "Desktop" }],
+      container: [],
+    },
+  };
+  const withTitles = (titlesAs: string, itemStyles?: unknown): BlockDocument =>
+    ({
+      formatVersion: 1,
+      kind: "page",
+      nodes: [
+        {
+          id: "acc",
+          type: ACCORDION_BLOCK,
+          version: 1,
+          props: { as: "div", contained: false, titlesAs },
+          slots: {
+            children: [
+              {
+                id: "s1",
+                type: ACCORDION_ITEM_BLOCK,
+                version: 1,
+                props: { title: "Q", open: false },
+                ...(itemStyles === undefined ? {} : { styles: itemStyles }),
+                slots: { children: [] },
+              },
+            ],
+          },
+        },
+      ],
+    }) as unknown as BlockDocument;
+  const html = (document: BlockDocument) =>
+    renderToStaticMarkup(
+      <PageRenderer
+        document={document}
+        blocks={resolver}
+        styles={resolvePageStyles(document, undefined, CONTEXT, resolver)}
+      />
+    );
+
+  it("draws every level the select offers as that element", () => {
+    const offered = accordion.props?.titlesAs?.options as string[];
+    expect(offered.length).toBeGreaterThan(1);
+    for (const level of offered) {
+      const tag = level === "text" ? "span" : level;
+      expect(html(withTitles(level))).toMatch(
+        new RegExp(
+          `<${tag} class="[^"]*${DISCLOSURE_TITLE_CLASS}[^"]*">Q</${tag}>`
+        )
+      );
+    }
+  });
+
+  it("gives a heading title the section's own typography, not the site's heading look", () => {
+    // The site's baseline styles h3 directly; the title resets it after, so
+    // the item's weight and size (on <details>) reach it by inheritance.
+    const out = html(
+      withTitles("h3", {
+        base: { base: { fontWeight: 400, fontSize: "1rem" } },
+      })
+    );
+    const baseline = out.indexOf(":where(h3)");
+    const reset = out.search(
+      /accordion-item--title\)? \{[^}]*font-weight: inherit/
+    );
+    expect(baseline).toBeGreaterThan(-1);
+    expect(reset).toBeGreaterThan(baseline);
+    expect(out).toMatch(/accordion-item--title\)? \{[^}]*font-size: inherit/);
+    expect(out).toMatch(
+      /accordion-item--title\)? \{[^}]*margin-block-start: 0/
+    );
+  });
+});

@@ -1,0 +1,457 @@
+/**
+ * Singles Domain Types
+ *
+ * Shared type definitions used by SingleEntryService, SingleQueryService,
+ * SingleMutationService, and SingleRegistryService. Extracted here so the
+ * split services can reference the same interfaces without circular imports.
+ *
+ * @module domains/singles/types
+ * @since 1.0.0
+ */
+
+import type { AuthenticatedScope } from "../../auth/authenticated-scope";
+import type { RequestActor } from "../../auth/request-actor";
+import type { StatusOption } from "../../lib/status-filter";
+import type { RevalidationIntent } from "../../revalidation/types";
+import type {
+  HookExemptRead,
+  TrustBound,
+} from "../../services/collections/trust-grant";
+import type { FieldSources } from "../versions/restored-from";
+
+/**
+ * User context for Single operations.
+ */
+export interface UserContext {
+  /** User ID */
+  id: string;
+
+  /** User email */
+  email?: string;
+
+  /** The user's display name, kept with the history events of their writes. */
+  name?: string;
+
+  /** Singular authorized role. */
+  role?: string;
+
+  /**
+   * Full authorized role set. The route path forwards the caller's decoded
+   * roles so stored Single access rules (role-based) and the super-admin
+   * bypass evaluate against the real authorized scope.
+   */
+  roles?: string[];
+
+  /** Additional user properties */
+  [key: string]: unknown;
+}
+
+/**
+ * Options for getting a Single document.
+ */
+export interface GetSingleOptions {
+  /**
+   * Which collections a trusted read may reach as relationships are expanded,
+   * asked per RELATED collection. Absent means every populated target inherits
+   * the caller's trust, which is unchanged behaviour. Evaluated as
+   * `overrideAccess && trusted(target)`, so it can only ever narrow.
+   */
+  trusted?: TrustBound;
+
+  /**
+   * Depth for relationship expansion.
+   * @default 2
+   */
+  depth?: number;
+
+  /**
+   * Locale for localized fields. Translatable fields resolve to this language
+   * (with fallback) from the companion `single_<slug>_locales` table.
+   */
+  locale?: string;
+
+  /**
+   * Fallback control (i18n). `false` / `"none"` disables fallback — an
+   * untranslated field returns empty instead of the default-locale value (so
+   * the admin editor can show blanks for a language that hasn't been
+   * translated yet). Otherwise the configured fallback chain + default locale
+   * is used. Mirrors the collection read path.
+   */
+  fallbackLocale?: string | false;
+
+  /**
+   * When true, attach a per-locale `_translations` map (translated + status)
+   * to the document for the admin's per-language status pills. No-op when the
+   * Single isn't localized. Mirrors the collection read path.
+   */
+  translationStatus?: boolean;
+
+  /**
+   * Attach `_details`: who changed the Single last and when, and where the
+   * site serves it, as an entry read's `details` does. Answered only once
+   * the read is granted; the caller decides who may ask (a signed-in admin
+   * user), so a visitor or an API key is never told.
+   */
+  details?: boolean;
+
+  /**
+   * Whole-document fallback: where the Single is not published in the
+   * requested language, answer in the first language of its fallback chain it
+   * is published in, and say which (`_locale`).
+   */
+  wholeDocumentFallback?: boolean;
+
+  /** Attach `_sources`: for each translatable field, the language its value came from. */
+  sourceLocales?: boolean;
+
+  /** `"all"`: attach every language's values beside the read's own (`_allLocales`). */
+  translations?: "all";
+
+  /**
+   * The fields to answer with, as a collection read selects them
+   * (`shared/lib/field-selection`): a field named `true` is included, a `false`
+   * entry is ignored, and a selection that includes nothing answers the whole
+   * document. The id and the system timestamps are always answered.
+   *
+   * The read takes only the selected fields' columns (with the system columns)
+   * when nothing else needs the rest: no read hook and no field read rule that
+   * runs for this read. Such a read takes the whole row and only its answer is
+   * narrowed, so a hook or a rule still sees every value.
+   */
+  select?: Record<string, boolean>;
+
+  /** User context for access control and hooks. */
+  user?: UserContext;
+
+  /**
+   * When true, bypass all RBAC access control checks.
+   * @default true (when called via Direct API)
+   */
+  overrideAccess?: boolean;
+
+  /**
+   * Enforce FIELD-level read rules even on a read that is otherwise trusted.
+   *
+   * `overrideAccess` governs two different trusts with one boolean — "you may
+   * see this document" and "skip every field rule" — and a caller can need the
+   * first without the second. A shared preview link is the case that forced
+   * them apart: it must reach an unpublished document, which only
+   * `overrideAccess` grants, and it must not show its recipient fields the
+   * person who shared it cannot see.
+   *
+   * Absent means today's behaviour exactly — field trust follows document trust
+   * — so no existing caller changes. Set it beside a `user`: the rules are
+   * evaluated as THAT user.
+   *
+   * Mirrors the collection read path, and is not optional there either: the
+   * option is declared on the configuration BOTH APIs inherit, so a Single read
+   * that ignored it would return fields the caller was promised were redacted.
+   */
+  enforceFieldAccess?: boolean;
+
+  /**
+   * Whose field-level read rules to judge by, when that is NOT the caller.
+   *
+   * See the collection read path: a preview's bearer is anonymous and must stay
+   * anonymous to every hook, while the FIELDS are judged as the person who
+   * shared the link. A redaction basis, never a principal.
+   */
+  fieldAccessUser?: UserContext;
+
+  /**
+   * Set by a route whose middleware already authenticated AND authorized the
+   * caller. Skips only the redundant RBAC re-check, which resolves permissions
+   * from the caller's stored roles and would otherwise reject an API key whose
+   * scoped permissions differ from its creator's. Stored access rules still run.
+   */
+  routeAuthorized?: boolean;
+
+  /**
+   * The caller's authenticated scope. A scoped API key is judged on its OWN
+   * read grant rather than the key owner's permissions, so a super-admin-owned
+   * key does not skip a stored read rule.
+   */
+  authenticatedScope?: AuthenticatedScope;
+
+  /**
+   * Draft/Published filter override. Only effective when single.status === true.
+   * - 'published' (default for public/untrusted callers): only return the
+   *   document when its status is 'published'; otherwise return 404 (so a
+   *   draft Single is invisible until published).
+   * - 'draft': only return when status is 'draft'.
+   * - 'all': return regardless of status.
+   * Trusted callers (overrideAccess: true) default to 'all' if unset.
+   */
+  status?: StatusOption;
+
+  /**
+   * Opt in to the working-draft overlay: a trusted editor read returns this
+   * Single's pending change in place of the live document.
+   *
+   * Opt-in on purpose, matching the collection read. Internal reads (the public
+   * route, reference labels, expansion) issue status-less reads and must keep
+   * seeing the published document, so draft visibility follows an editor's
+   * intent rather than the absence of a status filter. Gated on an actual
+   * update-capability probe, so a read-only caller passing it still sees live.
+   */
+  includeWorkingDraft?: boolean;
+
+  /**
+   * Whether a read of a Single with no stored document creates its default
+   * document, as every read always has. `false` answers with no document
+   * instead (`success` with `data` absent) and writes nothing: no row, no
+   * version, no event and no creation hook, so a caller that must not write,
+   * such as a page render, can read without materialising the Single.
+   *
+   * @default true
+   */
+  createIfMissing?: boolean;
+
+  /**
+   * With `createIfMissing: false`, what a read of a Single with no stored
+   * document answers. `"default"` answers the document the read would have
+   * created, built by the same function the creating read uses and passed
+   * through the rest of the read (access, lifecycle, field rules and read
+   * hooks) exactly as the created one would be, while still writing nothing.
+   * Ignored unless `createIfMissing` is `false`: a read that may create the
+   * document answers the created one.
+   *
+   * @experimental
+   */
+  whenAbsent?: "default";
+
+  /** Arbitrary data passed to hooks via context. */
+  context?: Record<string, unknown>;
+  /** The HTTP request behind this operation, when one produced it. */
+  request?: Request;
+  /**
+   * A grant waiving this Single's read hooks, issued to the plugin that
+   * declared it: its `beforeOperation`, `beforeRead` and `afterRead` hooks
+   * and its fields' `afterRead` hooks do not run. Effective only for a Single
+   * the grant covers; see `readHooksWaived`. Related rows keep their own.
+   */
+  hookExemptRead?: HookExemptRead;
+}
+
+/**
+ * Options for updating a Single document.
+ */
+export interface UpdateSingleOptions {
+  /**
+   * Which collections a trusted read may reach as relationships are expanded,
+   * asked per RELATED collection. Absent means every populated target inherits
+   * the caller's trust, which is unchanged behaviour. Evaluated as
+   * `overrideAccess && trusted(target)`, so it can only ever narrow.
+   */
+  trusted?: TrustBound;
+
+  /**
+   * Set when this write restores an earlier version, recording which one on the
+   * version it captures. Lineage cannot be inferred afterwards: a restore is an
+   * ordinary write that happens to reproduce an earlier state.
+   */
+  sourceVersionNo?: number;
+  /**
+   * The fields this write restored, and the version each came from, as server
+   * code states it. A client states it as `_restoredFrom` in the body, read
+   * at the write's boundary when this is absent.
+   */
+  restoredFrom?: FieldSources;
+  /**
+   * Set when this write restores a recorded save of a working draft: its
+   * content was never live, so on a published Single it must be held as the
+   * working draft. Where the Single can no longer hold one, the write is
+   * refused rather than applied to the live row.
+   */
+  requireHeldDraft?: boolean;
+  /**
+   * Locale for localized fields.
+   * Reserved for future i18n support.
+   */
+  locale?: string;
+
+  /** User context for access control and hooks. */
+  user?: UserContext;
+
+  /**
+   * Who performed the write, for webhook/audit attribution. The transport
+   * boundary resolves it (distinguishing a signed-in user from an API key
+   * acting on their behalf); when absent the recorder falls back to `user`.
+   * Parity with the collection write path's actor.
+   */
+  actor?: RequestActor;
+
+  /**
+   * When true, bypass all RBAC access control checks.
+   * @default true (when called via Direct API)
+   */
+  overrideAccess?: boolean;
+
+  /**
+   * Set by the REST dispatcher: route-level auth already ran, so `overrideAccess`
+   * is used to skip the RBAC re-check — but this is NOT a trusted-server read,
+   * so the response is still redacted to what the user may read.
+   */
+  routeAuthorized?: boolean;
+
+  /** Arbitrary data passed to hooks via context. */
+  context?: Record<string, unknown>;
+  /** The HTTP request behind this operation, when one produced it. */
+  request?: Request;
+
+  /**
+   * The caller's authenticated scope. For a scoped API-key REST write, the
+   * publish/unpublish transition gate judges the key's OWN grants rather than
+   * the key owner's RBAC.
+   */
+  authenticatedScope?: AuthenticatedScope;
+
+  /**
+   * Skip cache revalidation for this write (the outbox drain still runs). Set by
+   * callers that own their cache strategy — a CLI, seed, or bulk-import write.
+   */
+  disableRevalidate?: boolean;
+}
+
+/**
+ * Options for publishing every language of a Single at once.
+ *
+ * A deliberate subset of {@link UpdateSingleOptions}: this write persists no
+ * caller content and names no locale, so the write-locale and
+ * version-lineage options an update carries have nothing to act on here. The
+ * hook context and request do: the publish runs the update hooks a save runs.
+ */
+export interface PublishAllSingleLocalesOptions {
+  /** User context for access control. */
+  user?: UserContext;
+
+  /**
+   * Who performed the publish, recorded on the outbox events. The transport
+   * boundary resolves it, distinguishing a signed-in user from an API key
+   * acting on their behalf.
+   */
+  actor?: RequestActor;
+
+  /** When true, bypass all RBAC access control checks. */
+  overrideAccess?: boolean;
+
+  /**
+   * Set by the REST dispatcher: route middleware already ran the `update` gate,
+   * so only that redundant RBAC re-check is skipped. The `publish-{slug}` gate
+   * always runs, because the route never authorized this call as a publish.
+   */
+  routeAuthorized?: boolean;
+
+  /**
+   * The caller's authenticated scope. A scoped API key is judged on its OWN
+   * `publish-{slug}` grant rather than the key owner's RBAC.
+   */
+  authenticatedScope?: AuthenticatedScope;
+
+  /**
+   * Skip cache revalidation for this publish (the outbox drain still runs). Set
+   * by callers that own their cache strategy — a CLI, seed, or bulk import.
+   */
+  disableRevalidate?: boolean;
+
+  /** Arbitrary data passed to the update hooks the publish runs. */
+  context?: Record<string, unknown>;
+  /** The HTTP request behind this publish, which its hooks are told about. */
+  request?: Request;
+
+  /**
+   * The request's data: only the version it was made from (`_rev`) and the
+   * overwrite choice (`_overwrite`) are read, as a save's data carries them,
+   * and every language is judged against that version.
+   *
+   * @experimental
+   */
+  data?: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Single document shape. All Singles have at least an id and updatedAt.
+ */
+export interface SingleDocument {
+  /** Document ID (UUID) */
+  id: string;
+
+  /** Last update timestamp */
+  updatedAt: Date | string;
+
+  /**
+   * The document's version: changed by every save and by no read, and naming
+   * each language the read or write covered. Opaque — hand it back as it is.
+   *
+   * @experimental An update that hands it back is refused when it is no
+   *   longer the current version (`STALE_VERSION`).
+   */
+  _rev?: string;
+
+  /** Additional fields defined by the Single schema */
+  [key: string]: unknown;
+}
+
+/**
+ * Result of a Single operation.
+ */
+export interface SingleResult<T = SingleDocument> {
+  /** Whether the operation succeeded */
+  success: boolean;
+
+  /** HTTP status code */
+  statusCode: number;
+
+  /** The Single document data (on success) */
+  data?: T;
+
+  /** Error message (on failure) */
+  message?: string;
+
+  /**
+   * The failure's typed fields, so a boundary rebuilds the exact error instead
+   * of guessing it from the status. Mirrors `CollectionServiceResult`.
+   */
+  code?: string;
+  messageKey?: string;
+  /**
+   * Which check refused, for the server's log only, set by an access gate on
+   * its refusal. Logged where the refusal reaches its caller, which is never a
+   * gate asked only whether something is allowed.
+   */
+  refusalReason?: string;
+  publicData?: unknown;
+
+  /** Error details (on failure) */
+  errors?: Array<{ field?: string; code?: string; message: string }>;
+
+  /**
+   * Whether this write appended a durable outbox event, independent of
+   * `success`. The update records the event inside its transaction, then runs
+   * post-commit steps (afterChange/afterUpdate hooks, response expansion): if
+   * one of those throws, the write is already committed but `success` is
+   * reported `false`. Post-write side effects (the webhook fast-drain and
+   * retention pass) key off this flag, not `success`, so a committed-but-
+   * hook-failed write still gets its immediate delivery while a write that
+   * recorded nothing (validation/access failure) does not. Mirrors
+   * `CollectionServiceResult.eventRecorded`.
+   */
+  eventRecorded?: boolean;
+  /**
+   * The cache tags this write invalidates (`nextly:single:{slug}` plus any
+   * configured extra tags), flushed post-commit through the registered
+   * revalidator. Absent when the write recorded nothing or revalidation is
+   * disabled for the single.
+   */
+  revalidationIntent?: RevalidationIntent;
+  /**
+   * Whether this update committed a content write to the database — true once the
+   * row is written (even a write that opts out of BOTH recording and
+   * revalidation, and even one whose post-commit hook then throws), false for a
+   * rejected request or a no-op. The write-path retention pass keys off this so
+   * it runs for every durable write yet skips one that changed nothing, without
+   * conflating `success` (a no-op reports success) with a committed write.
+   * Mirrors `CollectionServiceResult.committed`.
+   */
+  committed?: boolean;
+}

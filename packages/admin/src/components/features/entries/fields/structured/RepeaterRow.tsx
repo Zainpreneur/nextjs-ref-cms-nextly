@@ -1,0 +1,409 @@
+"use client";
+
+/**
+ * Repeater Row Component
+ *
+ * A sortable, collapsible row within a repeater field.
+ * Supports drag-and-drop reordering via @dnd-kit.
+ *
+ * @module components/entries/fields/structured/RepeaterRow
+ * @since 1.0.0
+ */
+
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@nextlyhq/ui";
+import type { RepeaterFieldConfig, FieldConfig } from "nextly/config";
+import type { JSX, ReactNode } from "react";
+import type { Control, FieldValues } from "react-hook-form";
+
+import { ChevronDown, ChevronRight } from "@admin/components/icons";
+import {
+  packFieldsIntoRows,
+  fieldWeight,
+  computeGridColumns,
+} from "@admin/lib/forms/pack-fields-into-rows";
+import { cn } from "@admin/lib/utils";
+
+import {
+  useSortableRow,
+  RowDragHandle,
+  RowRemoveButton,
+  type RowDragHandleProps,
+} from "./field-array-helpers";
+import { RepeaterRowLabel } from "./RepeaterRowLabel";
+
+// ============================================================
+// Types
+// ============================================================
+
+/**
+ * Function type for rendering sub-fields within an array row.
+ * This allows injection of FieldRenderer or custom rendering logic.
+ */
+export type RenderFieldFunction<
+  TFieldValues extends FieldValues = FieldValues,
+> = (
+  field: FieldConfig,
+  basePath: string,
+  control: Control<TFieldValues>,
+  options: {
+    disabled?: boolean;
+    readOnly?: boolean;
+  }
+) => ReactNode;
+
+export interface RepeaterRowProps<
+  TFieldValues extends FieldValues = FieldValues,
+> {
+  /**
+   * Unique identifier for this row (from useFieldArray).
+   * Used as the sortable ID for drag-and-drop.
+   */
+  id: string;
+
+  /**
+   * Zero-based index of this row in the array.
+   */
+  index: number;
+
+  /**
+   * The repeater field configuration containing sub-fields.
+   */
+  field: RepeaterFieldConfig;
+
+  /**
+   * Base path for form field registration (e.g., "items.0").
+   */
+  basePath: string;
+
+  /**
+   * The current data for this row.
+   */
+  data: Record<string, unknown>;
+
+  /**
+   * React Hook Form control object.
+   */
+  control: Control<TFieldValues>;
+
+  /**
+   * Callback to remove this row from the array.
+   */
+  onRemove: () => void;
+
+  /**
+   * Whether this row can be removed (respects minRows constraint).
+   */
+  canRemove: boolean;
+
+  /**
+   * Whether the entire form/field is disabled.
+   */
+  disabled?: boolean;
+
+  /**
+   * Whether the field is read-only.
+   */
+  readOnly?: boolean;
+
+  /**
+   * Optional function to render sub-fields.
+   * When not provided, renders a placeholder for sub-field content.
+   */
+  renderField?: RenderFieldFunction<TFieldValues>;
+
+  /**
+   * Whether reordering is enabled for this row.
+   */
+  isSortable?: boolean;
+}
+
+/**
+ * Header bar for a single repeater row containing drag handle, label, collapse trigger, and remove button.
+ */
+interface RepeaterRowHeaderProps {
+  index: number;
+  field: RepeaterFieldConfig;
+  data: Record<string, unknown>;
+  isOpen: boolean;
+  isSortable: boolean;
+  isInteractive: boolean;
+  canRemove: boolean;
+  onRemove: () => void;
+  attributes: RowDragHandleProps["attributes"];
+  listeners: RowDragHandleProps["listeners"];
+}
+
+function RepeaterRowHeader({
+  index,
+  field,
+  data,
+  isOpen,
+  isSortable,
+  isInteractive,
+  canRemove,
+  onRemove,
+  attributes,
+  listeners,
+}: RepeaterRowHeaderProps) {
+  const singular = field.labels?.singular || "item";
+  return (
+    <CardHeader
+      className="p-0 pl-2 pr-1 border-b border-border dark:border-border bg-primary/5 hover:bg-primary/5 dark:hover:bg-accent/80 transition-colors"
+      noBorder
+    >
+      <div className="flex items-center gap-2">
+        <RowDragHandle
+          isSortable={isSortable}
+          isInteractive={isInteractive}
+          attributes={attributes}
+          listeners={listeners}
+          ariaLabel={`Drag to reorder ${singular} ${index + 1}`}
+        />
+
+        <CollapsibleTrigger asChild>
+          <button
+            type="button"
+            className={cn(
+              "flex items-center gap-2 flex-1 text-left min-w-0 cursor-pointer",
+              "rounded-md px-2 py-3",
+              "focus:outline-none"
+            )}
+            aria-expanded={isOpen}
+          >
+            {isOpen ? (
+              <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+            ) : (
+              <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+            )}
+            <RepeaterRowLabel index={index} field={field} data={data} />
+          </button>
+        </CollapsibleTrigger>
+
+        <RowRemoveButton
+          canRemove={canRemove}
+          isInteractive={isInteractive}
+          onRemove={onRemove}
+          ariaLabel={`Remove ${singular} ${index + 1}`}
+        />
+      </div>
+    </CardHeader>
+  );
+}
+
+function RepeaterRowFallbackList({
+  fields,
+}: {
+  fields: RepeaterFieldConfig["fields"];
+}) {
+  return (
+    <div className="text-sm text-muted-foreground bg-primary/5 rounded-lg p-4 border border-border border-dashed">
+      <p className="font-medium mb-2">Sub-fields:</p>
+      <ul className="list-disc list-inside space-y-1">
+        {fields.map((subField, idx) => {
+          const fieldWithName = subField as {
+            name?: string;
+            type: string;
+          };
+          return (
+            <li key={fieldWithName.name || idx}>
+              {fieldWithName.name ? (
+                <>
+                  <span className="font-mono text-xs">
+                    {fieldWithName.name}
+                  </span>
+                  <span className="text-muted-foreground">
+                    {" "}
+                    ({fieldWithName.type})
+                  </span>
+                </>
+              ) : (
+                <span className="text-muted-foreground">
+                  {fieldWithName.type} (layout)
+                </span>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+      <p className="text-xs text-muted-foreground mt-3 italic">
+        Full field rendering will be available when FieldRenderer is integrated.
+      </p>
+    </div>
+  );
+}
+
+interface RepeaterRowSubFieldsProps<
+  TFieldValues extends FieldValues = FieldValues,
+> {
+  field: RepeaterFieldConfig;
+  basePath: string;
+  control: Control<TFieldValues>;
+  disabled: boolean;
+  readOnly: boolean;
+  renderField?: RenderFieldFunction<TFieldValues>;
+}
+
+/**
+ * Centralized sub-field renderer for repeater rows.
+ *
+ * Encapsulates the empty state (no sub-fields configured), fallback rendering
+ * (when renderField is unavailable), width-based row packing with responsive
+ * CSS grid columns, and delegated sub-field rendering. Centralizing these decisions
+ * ensures uniform layout, gap alignment, and fallback behavior across repeater rows.
+ */
+function RepeaterRowSubFields<TFieldValues extends FieldValues = FieldValues>({
+  field,
+  basePath,
+  control,
+  disabled,
+  readOnly,
+  renderField,
+}: RepeaterRowSubFieldsProps<TFieldValues>) {
+  if (!field.fields || field.fields.length === 0) {
+    return (
+      <div className="text-sm text-muted-foreground text-center py-4">
+        No sub-fields configured for this array.
+      </div>
+    );
+  }
+
+  if (!renderField) {
+    return <RepeaterRowFallbackList fields={field.fields} />;
+  }
+
+  const rows = packFieldsIntoRows(field.fields);
+  return (
+    <>
+      {rows.map((row, rIdx) => {
+        const cols = computeGridColumns(row.map(fieldWeight));
+
+        return (
+          <div
+            key={rIdx}
+            className="grid gap-6 items-start [&>*]:!w-full"
+            style={{ gridTemplateColumns: cols }}
+          >
+            {row.map((subField, idx) => {
+              if (!("name" in subField) || !subField.name) {
+                return null;
+              }
+              return (
+                <div key={(subField as { name: string }).name || idx}>
+                  {renderField(subField as FieldConfig, basePath, control, {
+                    disabled,
+                    readOnly,
+                  })}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+/**
+ * RepeaterRow renders a single row within a repeater field.
+ *
+ * Features:
+ * - Drag handle for reordering via @dnd-kit
+ * - Collapsible content with smooth animation
+ * - Dynamic row labels based on content
+ * - Remove button with disabled state
+ * - Visual feedback during drag operations
+ *
+ * @example
+ * ```tsx
+ * <RepeaterRow
+ *   id={item.id}
+ *   index={0}
+ *   field={repeaterFieldConfig}
+ *   basePath="socialLinks.0"
+ *   data={item}
+ *   control={control}
+ *   onRemove={() => remove(0)}
+ *   canRemove={fields.length > minRows}
+ * />
+ * ```
+ */
+export function RepeaterRow<TFieldValues extends FieldValues = FieldValues>({
+  id,
+  index,
+  field,
+  basePath,
+  data,
+  control,
+  onRemove,
+  canRemove,
+  disabled = false,
+  readOnly = false,
+  renderField,
+  isSortable = field.admin?.isSortable !== false,
+}: RepeaterRowProps<TFieldValues>): JSX.Element {
+  const {
+    isOpen,
+    setIsOpen,
+    attributes,
+    listeners,
+    setNodeRef,
+    style,
+    isDragging,
+    isInteractive,
+  } = useSortableRow({
+    id,
+    initCollapsed: field.admin?.initCollapsed,
+    disabled,
+    readOnly,
+    isSortable,
+  });
+
+  return (
+    <Card
+      ref={setNodeRef}
+      style={style}
+      className={cn(
+        "transition-all shadow-none border-border dark:border-border overflow-hidden",
+        isDragging && "opacity-50 ring-1 ring-primary z-10"
+      )}
+    >
+      <Collapsible open={isOpen} onOpenChange={setIsOpen}>
+        <RepeaterRowHeader
+          index={index}
+          field={field}
+          data={data}
+          isOpen={isOpen}
+          isSortable={isSortable}
+          isInteractive={isInteractive}
+          canRemove={canRemove}
+          onRemove={onRemove}
+          attributes={attributes}
+          listeners={listeners}
+        />
+        <CollapsibleContent>
+          <CardContent className="p-5 pt-5 space-y-6">
+            <RepeaterRowSubFields
+              field={field}
+              basePath={basePath}
+              control={control}
+              disabled={disabled}
+              readOnly={readOnly}
+              renderField={renderField}
+            />
+          </CardContent>
+        </CollapsibleContent>
+      </Collapsible>
+    </Card>
+  );
+}
+
+// ============================================================
+// Exports
+// ============================================================

@@ -1,0 +1,83 @@
+/**
+ * Media domain DI registrations.
+ *
+ * Registers `UnifiedMediaService`, which composes the legacy
+ * `MediaService` + `MediaFolderService` with the image processor and a
+ * storage getter that resolves late-registered storage plugins.
+ *
+ * `MediaStorage` itself is initialized in the orchestrator (Layer 2.5)
+ * and registered there so its setup happens before plugin init runs.
+ */
+
+import { MetaRetentionGate } from "../../domains/retention/gate";
+import {
+  buildRetentionRunner,
+  retentionPoliciesFrom,
+} from "../../domains/retention/passes";
+import type { WebhookFastDrainScheduler } from "../../domains/webhooks/after-drain";
+import { MediaService as LegacyMediaService } from "../../services/media";
+import { MediaService as UnifiedMediaService } from "../../services/media/media-service";
+import { MediaFolderService } from "../../services/media-folder";
+import { resolveUploadPolicy } from "../../services/upload-validation/upload-policy";
+import type { IStorageAdapter } from "../../storage/types";
+import { container } from "../container";
+
+import type { RegistrationContext } from "./types";
+
+export function registerMediaServices(ctx: RegistrationContext): void {
+  const { adapter, logger, storage, mediaStorage, imageProcessor } = ctx;
+
+  container.registerSingleton<UnifiedMediaService>("mediaService", () => {
+    const {
+      validator: uploadValidator,
+      svgCsp,
+      maxSize,
+    } = resolveUploadPolicy();
+
+    // The wrapped writer gets the same cap the wrapper enforces; its own
+    // default would refuse, from the inside, a file the policy just allowed.
+    const legacyMediaService = new LegacyMediaService(
+      adapter,
+      logger,
+      undefined,
+      undefined,
+      maxSize
+    );
+    const folderService = new MediaFolderService(adapter, logger);
+
+    // Late-binding getter so storage plugins registered after initial
+    // service registration (e.g. Next.js config reload) are still visible.
+    const storageGetter = (): IStorageAdapter | null => {
+      if (storage) return storage;
+      try {
+        return mediaStorage.getDefaultAdapter();
+      } catch {
+        return null;
+      }
+    };
+
+    return new UnifiedMediaService(
+      legacyMediaService,
+      folderService,
+      storageGetter,
+      imageProcessor,
+      uploadValidator,
+      svgCsp,
+      logger,
+      // Media writes append outbox events through this service, so it carries
+      // its own retention runner (the webhook handler's is not on this path),
+      // mirroring collections and singles.
+      buildRetentionRunner({
+        adapter,
+        ...retentionPoliciesFrom(ctx.config),
+        gate: new MetaRetentionGate(adapter),
+        logger,
+      }),
+      // Shared post-response drain fast path (registered by the webhook
+      // services). Absent only when webhooks were never registered.
+      container.has("webhookFastDrainScheduler")
+        ? container.get<WebhookFastDrainScheduler>("webhookFastDrainScheduler")
+        : undefined
+    );
+  });
+}

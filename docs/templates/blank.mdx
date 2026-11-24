@@ -1,0 +1,98 @@
+---
+title: Blank Template
+description: Start from an empty Nextly config and define your own schemas.
+---
+
+The **Blank** template scaffolds a minimal Nextly project with no collections or singles defined. You get the full Next.js App Router setup, the admin route, the standard environment configuration, and an empty `nextly.config.ts` ready for you to fill in. It's the starting point when you want to design your schema from scratch.
+
+## Scaffold
+
+<Tabs items={["pnpm", "npm", "yarn", "bun"]}>
+<Tab value="pnpm">
+```bash
+pnpm create nextly-app@alpha my-app --template blank
+```
+</Tab>
+<Tab value="npm">
+```bash
+npx create-nextly-app@alpha my-app --template blank
+```
+</Tab>
+<Tab value="yarn">
+```bash
+yarn create nextly-app@alpha my-app --template blank
+```
+</Tab>
+<Tab value="bun">
+```bash
+bun create nextly-app@alpha my-app --template blank
+```
+</Tab>
+</Tabs>
+
+## What it ships
+
+- **Empty `nextly.config.ts`** with `collections: []` and `singles: []`. Add definitions here as you build.
+- **Standard Next.js App Router setup** -- root `layout.tsx`, `globals.css`, a `favicon.ico`, and the home page at `(frontend)/page.tsx`. The landing page is a simple "Welcome" screen with a link into the admin.
+- **Generated admin route** at `src/app/admin/[[...params]]/`. The page wires up `RootLayout`, `QueryProvider` and `ErrorBoundary`, and imports `@nextlyhq/admin/style.css`. The layout reads admin branding from `nextly.config.ts` and injects the resulting CSS variables.
+- **Health and media routes** under `src/app/api/`, and the admin media library's route at `src/app/admin/api/media/`.
+- **Default `next.config.ts`** whose `serverExternalPackages` lists Nextly's server packages and the adapter and driver for the database you chose. See [Project Structure](/docs/getting-started/project-structure) for the full list and what each entry does.
+- **Default `.env.example`** with `DB_DIALECT`, `DATABASE_URL`, `NEXTLY_SECRET` and `NEXT_PUBLIC_APP_URL`. Media is stored on local disk until you configure a storage adapter.
+- **`AGENTS.md` and `CLAUDE.md`** with instructions for coding agents working in the project.
+- **Skills for coding agents** in `.agents/skills/` and `.claude/skills/`, unless you pass `--no-skills`, answer no, or the project installs a different `nextly` release than the skills were checked against. See [Coding agents](/docs/guides/coding-agents).
+- **Generated `nextly-types.ts`** stub under `src/types/generated/` so type generation has a destination on first run.
+
+## File tree
+
+```
+my-app/
+├── src/
+│   ├── app/
+│   │   ├── (frontend)/
+│   │   │   ├── components/
+│   │   │   └── page.tsx
+│   │   ├── admin/
+│   │   │   ├── [[...params]]/
+│   │   │   │   ├── layout.tsx
+│   │   │   │   └── page.tsx
+│   │   │   └── api/
+│   │   │       ├── [[...params]]/
+│   │   │       │   └── route.ts
+│   │   │       └── media/
+│   │   │           └── [[...path]]/
+│   │   │               └── route.ts
+│   │   ├── api/
+│   │   │   ├── health/
+│   │   │   │   └── route.ts
+│   │   │   └── media/
+│   │   │       └── [[...path]]/
+│   │   │           └── route.ts
+│   │   ├── favicon.ico
+│   │   ├── globals.css
+│   │   └── layout.tsx
+│   ├── lib/
+│   │   └── site-url.ts
+│   └── types/
+│       └── generated/
+│           └── nextly-types.ts
+├── public/
+├── .agents/skills/
+├── .claude/skills/
+├── .env
+├── .env.example
+├── AGENTS.md
+├── CLAUDE.md
+├── eslint.config.mjs
+├── next.config.ts
+├── nextly.config.ts
+├── package.json
+├── pnpm-workspace.yaml
+├── postcss.config.mjs
+└── tsconfig.json
+```
+
+## Next steps
+
+- [Installation](/docs/getting-started/installation) -- Create your super-admin account on first run.
+- [Tutorial: build a blog](/docs/getting-started/build-a-blog) -- Build something concrete (a blog with posts and categories) to learn the API.
+- [Configuration](/docs/configuration) -- Define your first collections and singles in `nextly.config.ts`.

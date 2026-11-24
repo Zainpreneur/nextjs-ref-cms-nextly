@@ -1,0 +1,1460 @@
+/**
+ * Site tokens and font faces: what a site defines once and every page reads.
+ *
+ * A token is a NAME the styling layer already knows how to reference —
+ * `tokenCustomProperty` turns `color.primary` into `--site-color-primary`, and
+ * the catalog decides which properties may hold which kind. What was missing
+ * was the other half: the table those names resolve in, and the CSS that makes
+ * them resolve at all.
+ *
+ * ## Names are dot paths; the CSS prefix is applied at emission
+ *
+ * `color.primary`, `space.4`, `content.width`. The prefix is the site's choice
+ * (`--site-` by default) and is validated rather than trusted, because two of
+ * them are reserved: `--nx-` is the admin's own namespace and `--tw-` is
+ * Tailwind's internals. A site that took either would restyle surfaces it does
+ * not own.
+ *
+ * ## Modes are in the model from the start
+ *
+ * A token may carry a dark value beside its light one. The emitted sheet
+ * applies dark values when the visitor's device prefers dark, and a host can
+ * override that either way with the `data-nx-theme` marker, so a site works
+ * with no setup and a host with its own theme toggle keeps control.
+ *
+ * ## Identity is `id` when there is one, and the name otherwise
+ *
+ * A name is a label an author edits. Two things key off a token's IDENTITY and
+ * neither can move when that label does: the custom property emitted into every
+ * compiled sheet, and the `$token` string every stored document holds. So the
+ * identity is a separate field, exactly as `NamedClass` splits `id` from
+ * `slug` — and for the same reason, since an unresolved custom property
+ * invalidates the declaration rather than reporting, so a moved one loses the
+ * style with no symptom to follow.
+ *
+ * `id` is OPTIONAL, and that is the whole continuity argument rather than a
+ * convenience. Every token stored before the field existed has none, so its
+ * identity is its name, so it emits the property it already emitted and the
+ * documents referencing it already resolve. Nothing migrates. A rename then
+ * FREEZES the identity at the name it had — {@link renameSiteToken} is the one
+ * place that rule lives — and moves only the label.
+ *
+ * One consequence is worth stating because it is not obvious: ids and names
+ * share one custom-property space, so renaming `color.primary` does not fully
+ * free that name. A new token claiming it collides with the frozen id of the
+ * token that left it, and {@link emitTokenBlocks} refuses the second rather
+ * than letting one token resolve to the other's value.
+ *
+ * @module style/site-tokens
+ */
+import { isPlainRecord } from "../plain-record";
+import type { ValidationIssue } from "../validation";
+
+import type { TokenKind } from "./catalog-types";
+import {
+  asciiLower,
+  checkCssValue,
+  checkUrlValue,
+  decodeIdentifier,
+  referencesCustomProperty,
+} from "./css-value";
+import { darkModeSheet } from "./dark-mode-sheet";
+import {
+  MAX_TOKEN_NAME_LENGTH,
+  MAX_TOKEN_NAME_SEGMENTS,
+  MAX_TOKEN_PREFIX_LENGTH,
+  isAuthorableTokenName,
+  isTokenName,
+  safeTokenPrefix,
+  tokenCustomProperty,
+} from "./declarations";
+import type { SiteTextMap } from "./site-text";
+import { checkTokenKind, tokenKindExample } from "./site-token-kind";
+import { typeSizeDefaultTokens } from "./type-size-defaults";
+
+/** The marker a host sets to choose a mode, written with the dark sheet. */
+export { DARK_MODE_ATTRIBUTE } from "./dark-mode-sheet";
+
+/** The modes a token may carry a value for. */
+export type TokenMode = "light" | "dark";
+
+export const TOKEN_MODES: readonly TokenMode[] = ["light", "dark"];
+
+/**
+ * How a dark-mode token block was once chosen to apply.
+ *
+ * @deprecated Dark values are now always written twice: under
+ * `@media (prefers-color-scheme:dark)`, so a visitor's device decides with no
+ * setup, and under `[data-nx-theme="dark"]`, so a host's own switch still
+ * works. The `data-nx-theme="light"` marker pins light on a dark device. A
+ * stored strategy is still accepted, so existing records stay valid, and it no
+ * longer changes the emitted sheet.
+ */
+export type DarkModeStrategy = "attribute" | "media";
+
+/** One site token: a name, what kind of value it holds, and that value. */
+export interface SiteToken {
+  /**
+   * Stable identity, when the token has been given one.
+   *
+   * What the emitted custom property and a document's `$token` key off, and
+   * what a rename never changes. Held to the same grammar as a name, because it
+   * reaches CSS through the same `tokenCustomProperty` call.
+   *
+   * Absent means the name IS the identity, which is what every token stored
+   * before this field existed relies on — see the module note.
+   */
+  id?: string;
+  /** Dot-path name, as authors read and write it. Free to change. */
+  name: string;
+  /**
+   * The name in plain words, as the editor shows it: "Brand", "Heading 1".
+   *
+   * Optional and display-only. It never reaches a stylesheet or a stored
+   * reference, so it can hold any one line of text. Absent, a label is derived
+   * from the code name by {@link tokenDisplayLabel}, which is why sites stored
+   * before this field existed need no migration.
+   */
+  label?: string;
+  kind: TokenKind;
+  /**
+   * The value for each mode.
+   *
+   * `light` is required and is what a document with no mode resolves — a token
+   * defined only for dark would vanish for every reader who never turns it on.
+   */
+  values: { light: string; dark?: string };
+  /** Author-facing note, carried through DTCG import/export. */
+  description?: string;
+  /**
+   * Vendor data from other tools, carried untouched.
+   *
+   * The DTCG format requires it: "Tools that process design token files MUST
+   * preserve any extension data they do not themselves understand." A token
+   * that came from Figma or Style Dictionary and goes back to it has to arrive
+   * with whatever those tools wrote about it, so importing has somewhere to
+   * put data this system has no opinion on.
+   */
+  extensions?: Readonly<Record<string, unknown>>;
+  /**
+   * The two sizes a fluid size was made from, in px: on the smallest screen
+   * of the site's fluid range and on its largest. Kept beside the value it
+   * gave, so the size can be made again when the range changes; a value
+   * typed by hand has none, and a range change leaves it as it is. Never
+   * read by the emitter: the value is what reaches the page.
+   */
+  fluid?: { readonly small: number; readonly large: number };
+  /**
+   * The named group a colour is listed under in the Design panel ("Brand",
+   * "Text and surfaces"). Display-only, as `label` is: never emitted, and a
+   * group never changes the code name, so moving a colour moves no CSS.
+   */
+  group?: string;
+  /**
+   * Fields found under THIS system's own extension key that this build does not
+   * read, kept so it can write them back out.
+   *
+   * A reverse-domain key names the vendor, not the build. Under
+   * `com.nextlyhq.nextly` a field this build has no reader for is exactly as
+   * foreign as another vendor's block, and the reason the format gives for
+   * preserving one applies unchanged to the other: a tool that cannot interpret
+   * data should not be the tool that destroys it. The format's own requirement
+   * covers only other vendors, and says nothing about a producer meeting a
+   * newer version of itself — so this is the same rule, extended to the case
+   * the format leaves open.
+   *
+   * Separate from `extensions` because that field is what other tools wrote and
+   * this is what a different build of THIS one wrote. Merging them would make
+   * `com.nextlyhq.nextly` look like a foreign vendor to every later reader, and
+   * the emitter regenerates that key from the model on every export.
+   *
+   * Safe to re-emit because the format asks that extension data stay "optional
+   * meta-data that is not crucial to understanding that token's value": a
+   * conforming producer puts nothing here that a stale copy could corrupt. The
+   * cost that remains is staleness — a preserved field describing something the
+   * model later changes is written back as it arrived.
+   */
+  unreadExtension?: Readonly<Record<string, unknown>>;
+}
+
+/** Everything a site defines for its pages to read. */
+export interface SiteTokenSet {
+  tokens: readonly SiteToken[];
+  /** Custom-property prefix; `--site-` when unset. */
+  prefix?: string;
+  /**
+   * @deprecated Accepted for stored records and ignored by the emitter: see
+   * {@link DarkModeStrategy}.
+   */
+  darkMode?: DarkModeStrategy;
+  /**
+   * The page widths a size made with "Fluid…" grows across, in px: the
+   * smallest screen and the largest. 360 to 1280 where unset. Never
+   * emitted: each fluid size's value already holds it, and a change of it
+   * remakes those values.
+   */
+  fluidRange?: { readonly min: number; readonly max: number };
+  /**
+   * The site's text: Body, the six heading levels, Links, Buttons and
+   * Captions, each a font, size and line height (and for links a colour and
+   * an underline) set once for every page. A row left out keeps its built-in
+   * value (`resolveSiteText`). Never emitted here: the element tier writes
+   * it. Kept with the variables because a row points at them, so the two
+   * save, merge and undo as one.
+   *
+   * @experimental
+   */
+  siteText?: SiteTextMap;
+  /**
+   * The site's colours in the order its authors put them, by identity.
+   * Colours it does not name follow in the set's own order, so a site that
+   * never reorders stores nothing. Display-only: the Design panel and every
+   * colour picker list colours in this order, and nothing is emitted from it.
+   */
+  order?: readonly string[];
+  /**
+   * Whether the Design panel and every colour picker list the built-in
+   * colours the site does not use. Shown where unset. Display-only, like
+   * `order`: every built-in colour is still a token, and still
+   * written, whatever this says, because core blocks read them.
+   *
+   * @experimental
+   */
+  builtInColoursShown?: boolean;
+}
+
+/**
+ * What this token is, as against what it is called.
+ *
+ * The one answer to that question, because three things ask it — the custom
+ * property the emitter writes, the key a tier merge overrides on, and the
+ * string a document stores — and they have to agree by construction. Two of
+ * them agreeing today and drifting later has no symptom: a token whose
+ * identity moved emits a property nothing references, which reads exactly like
+ * a token whose value did not apply.
+ */
+export function tokenIdentity(token: SiteToken): string {
+  return token.id ?? token.name;
+}
+
+/**
+ * The token under a new name, with its identity pinned where it already was.
+ *
+ * The rename rule lives here rather than in each editor that offers one,
+ * because getting it wrong is silent in the direction that loses work: setting
+ * `id` to the NEW name moves the custom property and every stored `$token`
+ * stops resolving, which is the defect the field exists to prevent, and the
+ * page still renders — just without the style.
+ *
+ * Idempotent across repeated renames: the second one reads the id the first
+ * froze, so an identity is pinned once and never again.
+ */
+export function renameSiteToken(token: SiteToken, name: string): SiteToken {
+  const current = tokenIdentity(token);
+  // An identity this engine cannot write is not resolving for anything, so
+  // carrying it forward pins a token permanently unusable: the rename is
+  // accepted, the label changes, and the token still emits nothing with no
+  // remaining way to repair it.
+  //
+  // Re-pinning is safe in exactly that case and only there. A WORKING identity
+  // must never move, because every stored `$token` reads it — which is what
+  // this function exists to protect. One that cannot be emitted resolves for
+  // nothing, so no reference that WORKS is lost by replacing it.
+  //
+  // What that does not mean is that no references exist. A name refused today
+  // may have been valid when a document was saved, so stored `$token` values
+  // can still name it — already resolving to nothing, and still doing so after
+  // the token is repaired under a new identity. This makes the TOKEN usable
+  // again; the documents pointing at the old name are a separate repair, and
+  // one this helper cannot make: it is handed a token and never sees them.
+  if (
+    identityProblem(current, token.id === undefined ? "name" : "id") !==
+    undefined
+  ) {
+    return { ...token, id: undefined, name };
+  }
+  return { ...token, id: current, name };
+}
+
+/** The longest plain label a variable may carry. */
+export const MAX_TOKEN_LABEL_LENGTH = 80;
+
+/**
+ * Why a label cannot be stored, or nothing.
+ *
+ * A label is one line of text for people, so the rules are only what keeps it
+ * that: text, not blank, no line breaks or other control characters, and short
+ * enough to sit in a row. Absent is fine: the derived label stands in.
+ */
+export function tokenLabelIssue(label: unknown): string | undefined {
+  if (label === undefined) return undefined;
+  if (typeof label !== "string") return "A label must be text.";
+  if (label.trim() === "") return "A label cannot be empty.";
+  // A control character, a line break among them, would break the one line a
+  // label is drawn on, and a screen reader would read it out as a pause.
+  for (const char of label) {
+    const code = char.codePointAt(0) ?? 0;
+    if (code < 0x20 || (code >= 0x7f && code < 0xa0)) {
+      return "A label is one line of text.";
+    }
+  }
+  if (label.length > MAX_TOKEN_LABEL_LENGTH) {
+    return `A label is at most ${MAX_TOKEN_LABEL_LENGTH} characters.`;
+  }
+  return undefined;
+}
+
+/**
+ * The leading words of a code name that say which group a variable is in.
+ *
+ * Dropped from a derived label because the editor already groups by them:
+ * "Colours" over a row reading "Color brand" says it twice.
+ */
+const GROUP_WORDS: ReadonlySet<string> = new Set([
+  "color",
+  "colour",
+  "font",
+  "font-size",
+  "line-height",
+  "text",
+  "space",
+  "spacing",
+  "radius",
+  "shadow",
+  "size",
+  "weight",
+  "duration",
+]);
+
+/**
+ * The plain name the editor shows for a variable.
+ *
+ * Its own label when it has one; otherwise words made from the code name:
+ * `color.brand` reads "Brand", `content.width` reads "Content width", and
+ * `space.4` keeps its group word ("Space 4"), because a number alone names
+ * nothing.
+ */
+export function tokenDisplayLabel(token: {
+  name: string;
+  label?: string;
+  id?: string;
+}): string {
+  const own = token.label?.trim();
+  if (own !== undefined && own !== "") return own;
+  // A built-in's plain name, by the identity a rename leaves alone: a site
+  // overriding its value keeps the name, since the override stores no label.
+  const builtIn = BUILT_IN_LABELS.get(token.id ?? token.name);
+  if (builtIn !== undefined) return builtIn;
+  const parts = token.name.split(".");
+  const rest = parts.slice(1);
+  const dropGroup =
+    parts.length > 1 &&
+    GROUP_WORDS.has(parts[0] ?? "") &&
+    !rest.every(part => /^\d+$/.test(part));
+  const words = (dropGroup ? rest : parts).join(" ").replaceAll("-", " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/** One file a font face can be loaded from. */
+export interface FontSource {
+  /**
+   * A path on this site. Absolute-with-host is refused — see
+   * {@link validateFontFace}.
+   */
+  url: string;
+  /** `woff2`, `woff`, … Emitted as `format(…)` when present. */
+  format?: string;
+}
+
+/**
+ * Where a self-hosted face came from, for the editor to say so.
+ *
+ * Metadata only: the stylesheet never reads it, so a face loads the same with
+ * or without it. `google` is a face the server downloaded from the Google
+ * Fonts catalogue into the site's media; `upload` is a file an author uploaded.
+ */
+export interface FontFaceOrigin {
+  kind: "google" | "upload";
+  /** The catalogue's id for the family, such as `inter`. */
+  id?: string;
+  /** The licence as the catalogue names it, such as `OFL-1.1`. */
+  licence?: string;
+  /**
+   * The catalogue's category: `sans-serif`, `serif`, `display`,
+   * `handwriting` or `monospace`. The generic family a picker stores after
+   * the name comes from it.
+   */
+  category?: string;
+  /**
+   * The catalogue's script the file covers, such as `latin`, so the editor
+   * can tell a face the site has from the same cut in another script.
+   */
+  subset?: string;
+}
+
+/** A `@font-face` a site self-hosts. */
+export interface FontFaceDef {
+  family: string;
+  src: readonly FontSource[];
+  weight?: string;
+  style?: string;
+  /** Defaults to `swap`: text is readable while the file loads. */
+  display?: string;
+  unicodeRange?: string;
+  /** Where the face came from. Never emitted. */
+  source?: FontFaceOrigin;
+}
+
+/**
+ * The longest font format this engine will write.
+ *
+ * The grammar below constrains the alphabet and not the length, and a format is
+ * emitted into `format("...")` on every source of every face. Real values are
+ * `woff2`, `truetype`, `opentype` — so this sits far above anything meaningful
+ * and is only met by data already wrong.
+ */
+export const MAX_FONT_FORMAT_LENGTH = 32;
+
+/**
+ * The longest selector `emitTokenBlocks` will write a token block under.
+ *
+ * The selector is supplied by the caller and inserted into the emitted CSS
+ * verbatim — once for the light block and once more for a dark one — so an
+ * oversized one is copied into the sheet rather than merely held.
+ *
+ * Generous against what a caller passes: a page-scope class or `:root`.
+ */
+export const MAX_TOKEN_SELECTOR_LENGTH = 256;
+
+const FONT_FORMAT = /^[a-z0-9-]+$/i;
+
+/**
+ * The prefix to emit under, with a reason when the requested one is refused.
+ *
+ * The rule itself lives with the compiler, which is the other half of the same
+ * decision: this side writes the definitions and that side writes the `var()`
+ * that reads them, so a prefix either side refused alone would leave the two
+ * pointing at different custom properties. Only the shape of the report differs
+ * here, because the token table answers in issues rather than strings.
+ *
+ * A refused prefix falls back rather than throwing, in keeping with the rest of
+ * the compiler: one bad setting should cost the site its naming choice, not its
+ * stylesheet.
+ */
+export function resolveTokenPrefix(prefix: string | undefined): {
+  prefix: string;
+  issue?: ValidationIssue;
+  /**
+   * Why the requested prefix was refused, in words for the person choosing
+   * one (the site's settings), where `issue` reports to a compile. Both come
+   * from the one verdict, so a prefix a person is told is fine is the one the
+   * sheet is written under.
+   */
+  refusal?: string;
+} {
+  const safe = safeTokenPrefix(prefix);
+  return safe.warning === undefined
+    ? { prefix: safe.prefix }
+    : {
+        prefix: safe.prefix,
+        issue: tokenIssue(safe.warning),
+        refusal: PREFIX_REFUSALS[safe.reserved ?? "shape"],
+      };
+}
+
+/**
+ * The plain reason for each way a prefix is refused: each reserved prefix by
+ * whose it is, and a prefix the wrong shape by what a prefix looks like.
+ */
+const PREFIX_REFUSALS = {
+  "--nx-": "--nx- is kept for the admin's own styles. Choose another prefix.",
+  "--tw-": "--tw- is used by Tailwind. Choose another prefix.",
+  shape:
+    "A prefix starts with two dashes, uses only lowercase letters, numbers and dashes, and ends with a dash, like --brand-.",
+} as const;
+
+function tokenIssue(
+  message: string,
+  severity: ValidationIssue["severity"] = "warning",
+  suggestion?: string
+): ValidationIssue {
+  return {
+    path: "siteTokens",
+    code: "invalid-style-value",
+    severity,
+    message,
+    ...(suggestion === undefined ? {} : { suggestion }),
+  };
+}
+
+/**
+ * Whether a name may be turned into a custom property.
+ *
+ * The compiler's grammar, not a second one: it is what a `$token` reference is
+ * held to, and a table that accepted names references cannot name would hold
+ * tokens that exist and resolve to nothing. Re-exported because this is where
+ * a reader of the token table looks for it.
+ *
+ * The check matters beyond agreement, too — the name becomes the custom
+ * PROPERTY, so a name carrying `}` closes the rule the emitter opened and
+ * everything after it is CSS the site never wrote. `x:1}body{color` is the
+ * whole attack.
+ */
+export {
+  isAuthorableTokenName,
+  isTokenName,
+  MAX_TOKEN_NAME_LENGTH,
+  MAX_TOKEN_NAME_SEGMENTS,
+  MAX_TOKEN_PREFIX_LENGTH,
+};
+
+/**
+ * A font descriptor that goes inside a quoted CSS string, made safe to put
+ * there.
+ *
+ * A family name is author data and reaches the stylesheet inside quotes, so a
+ * quote in it closes the string and the rest is read as CSS —
+ * `Brand";src:url(/ok)}body{display:none}/*` ends the rule and writes another.
+ * Escaped rather than refused, because a backslash or a quote in a family name
+ * is legal CSS and the escape is what the spec provides for exactly this.
+ */
+/**
+ * A value as the CONTENT of a CSS string, escaped so it cannot end one.
+ *
+ * Published because a family name reaches CSS from more than one place: the
+ * compiler writes `font-family:"…"` into the site sheet, and a surface drawing
+ * a specimen writes the same name into an inline style. Wrapping author data in
+ * quotes without this produces `"ACME "Pro""` for the perfectly legal family
+ * `ACME "Pro"` — the browser drops the declaration, and the specimen silently
+ * demonstrates the fallback instead of the face it names.
+ */
+export function cssString(value: string): string {
+  let out = "";
+  for (const char of value) {
+    const code = char.codePointAt(0) ?? 0;
+    if (char === "\\" || char === '"') {
+      out += `\\${char}`;
+    } else if (code < 0x20 || code === 0x7f) {
+      // A raw control character cannot appear in a CSS string — a newline ends
+      // it outright, so the whole `@font-face` is discarded and the uploaded
+      // font never loads. The hex escape is what the grammar provides, and the
+      // trailing space is what ends the escape.
+      out += `\\${code.toString(16)} `;
+    } else {
+      out += char;
+    }
+  }
+  return out;
+}
+
+/**
+ * Descriptor values that are written unquoted, so they are checked instead.
+ *
+ * `font-weight`, `font-style`, `font-display` and `unicode-range` land in the
+ * rule as written. `checkCssValue` is the same guard the style compiler applies
+ * to any stored value, and it refuses the characters that end a declaration or
+ * a rule.
+ */
+function unquotedDescriptor(value: string): boolean {
+  return checkCssValue(value) === null;
+}
+
+/**
+ * Functions in a token value that can make the browser fetch something.
+ *
+ * `url()` is the obvious one; `image-set()` and `cross-fade()` hold URLs of
+ * their own, `element()` and `paint()` name a source, and `attr()` reads its
+ * destination out of the DOM at use time, where nothing here can see it.
+ */
+const FETCHING_FUNCTION =
+  /(^|[^\w-])(url|src|image|image-set|-webkit-image-set|cross-fade|-webkit-cross-fade|element|paint|attr)\s*\(/;
+
+/**
+ * Whether a token value can reach off this site, which none of them may.
+ *
+ * A token is emitted as a custom property and read back by `var()` somewhere
+ * this cannot see. That is the whole problem: sanitized custom CSS may write
+ * `background: var(--site-hero)` with no URL literal anywhere in it, so the
+ * origin policy that guards custom CSS has nothing to inspect and the
+ * selector-gated request channel it exists to close is open again through
+ * stored token data.
+ *
+ * Refused outright rather than origin-checked, because no token KIND denotes a
+ * URL — colours, lengths, durations, families, weights, numbers and shadows are
+ * the whole list. A value that fetches is not a restricted token, it is not a
+ * token. An image belongs in a block's `backgroundImage`, which carries the
+ * declared-hosts policy and is checked where it is written.
+ *
+ * Read decoded, because `\75 rl(…)` IS `url(…)` to a browser and a check
+ * against the raw text is one an author can write straight past.
+ */
+export function tokenValueFetches(value: string): boolean {
+  const read = asciiLower(decodeIdentifier(value));
+  return FETCHING_FUNCTION.test(read) || REMOTE_REFERENCE.test(read);
+}
+
+/**
+ * A remote destination written as text rather than as a call.
+ *
+ * The function check above is not enough on its own, because the FUNCTION need
+ * not be in the token. A token holding the bare string
+ * `"https://evil.example/a.png"` is inert until custom CSS writes
+ * `background-image: image-set(var(--site-x) 1x)` — and that declaration
+ * contains no URL for the origin policy to inspect, only a substitution. The
+ * two halves are written in different places by different people, which is
+ * exactly why neither half can be judged alone.
+ *
+ * Same-origin paths are left alone. `/logo.svg` resolves against the site
+ * serving the page and needs no allowlisting, which is the same line
+ * {@link isSameOriginUrl} draws for a font file. What is refused is anything
+ * naming another server: a scheme, or the `//host` form that names one while
+ * looking like a path.
+ */
+const REMOTE_REFERENCE = /\/\/|(?:^|[\s"'(,])[a-z][a-z0-9+.-]*:/;
+
+// The kind check lives in its own module; re-exported here, where a reader
+// of the token table looks for it.
+export { checkTokenKind, tokenKindExample } from "./site-token-kind";
+
+/** " Type …." for a kind with an example, else nothing. */
+function typeInstead(kind: TokenKind): string {
+  const example = tokenKindExample(kind);
+  return example === undefined ? "" : ` Type ${example}.`;
+}
+
+/**
+ * The tokens a site starts with.
+ *
+ * Deliberately small. Every entry here is one an author would otherwise have to
+ * invent before the system does anything for them, and `content.width` is the
+ * one that earns its place loudest: the Container preset reads it, so editing
+ * one token re-widths every container on the site. A default set that tried to
+ * be a design system would be a set most sites delete.
+ */
+/**
+ * A site's own token over the one it replaces, keeping the replaced token's
+ * group and label where the site's says neither: a built-in colour the site
+ * gave its own value to before colours had groups and these names is still
+ * listed where, and as, the built-in one is. Display only, as both are.
+ */
+function withDefaultWords(
+  token: SiteToken,
+  replaced: SiteToken | undefined
+): SiteToken {
+  const group = token.group ?? replaced?.group;
+  const label = token.label ?? replaced?.label;
+  return {
+    ...token,
+    ...(group === undefined ? {} : { group }),
+    ...(label === undefined ? {} : { label }),
+  };
+}
+
+/**
+ * The token set a site actually renders with: the defaults, with a site's own
+ * definitions layered over them by NAME.
+ *
+ * **Layered rather than replacing, and that is the whole point.** A site that
+ * defines a brand colour should not thereby lose `content.width` and
+ * `space.4` — every block reading those would fall back to its initial value,
+ * silently, because an unresolved custom property invalidates the declaration
+ * rather than reporting anything. Replacing is the shape that produces that,
+ * and it is the shape a caller writes by accident when the merge is left to
+ * them.
+ *
+ * The three-tier arrangement this implements is the one Gutenberg's
+ * `theme.json` reaches: core defaults, then the theme's file, then the user's
+ * saved styles, each overriding the last by identity. This function is the
+ * first two tiers; a stored per-site override is the third and layers the same
+ * way. Gutenberg keys that override on a preset's `slug` rather than on its
+ * display `name` for the reason this does: the machine key is the one that
+ * must not move when an author edits the label.
+ *
+ * **ONE implementation of "what tokens does this site have", deliberately.** The
+ * emitter and any future editor must not answer it separately — two answers
+ * that agree today drift, and the drift is invisible because a missing token
+ * looks exactly like a token whose value did not apply.
+ *
+ * `prefix`, `darkMode` and `fluidRange` come from the override when it states them, because
+ * they are site-wide decisions rather than per-token values. A site that sets a
+ * prefix must set it in ONE place: `compileSiteSheet` derives the prefix used
+ * for declaring and for referencing from a single value for exactly this
+ * reason.
+ */
+export function resolveSiteTokens(override?: SiteTokenSet): SiteTokenSet {
+  // Keyed on IDENTITY rather than on the name, because a tier overrides the
+  // token and not the label. A site that renamed a default holds it under the
+  // default's identity with a name of its own, and keying on the name would
+  // leave the default in place beside it — two entries where the author edited
+  // one, colliding on the single custom property they both key off.
+  //
+  // For a set where nothing carries an id this is the same map it always was:
+  // every identity is a name, so no existing token changes tier or slot.
+  const byIdentity = new Map<string, SiteToken>();
+  for (const token of defaultSiteTokens()) {
+    byIdentity.set(tokenIdentity(token), token);
+  }
+  // Second, so a site's own definition wins the identity. Iterated rather than
+  // spread, because a later duplicate WITHIN the override must also win — an
+  // imported DTCG file can carry one, and taking the first would apply a value
+  // the author replaced.
+  for (const token of override?.tokens ?? []) {
+    const identity = tokenIdentity(token);
+    byIdentity.set(identity, withDefaultWords(token, byIdentity.get(identity)));
+  }
+  return {
+    tokens: [...byIdentity.values()],
+    ...(override?.prefix === undefined ? {} : { prefix: override.prefix }),
+    ...(override?.darkMode === undefined
+      ? {}
+      : { darkMode: override.darkMode }),
+    // Site-wide too: the widths the sizes made with Fluid… grow between.
+    ...(override?.fluidRange === undefined
+      ? {}
+      : { fluidRange: override.fluidRange }),
+    // And the site's text, which the element tier reads beside the tokens.
+    ...(override?.siteText === undefined
+      ? {}
+      : { siteText: override.siteText }),
+    // Site-wide as well: the order the site's colours are listed in.
+    ...(override?.order === undefined ? {} : { order: override.order }),
+    // And whether the built-in colours it does not use are listed.
+    ...(override?.builtInColoursShown === undefined
+      ? {}
+      : { builtInColoursShown: override.builtInColoursShown }),
+  };
+}
+
+export function defaultSiteTokens(): SiteToken[] {
+  return [
+    {
+      name: "content.width",
+      kind: "dimension",
+      values: { light: "72rem" },
+      description: "How wide a centred container may grow.",
+    },
+    // The brand colour first: the Design panel lists the site's colours in
+    // this order, and "Brand" comes before "Text and surfaces".
+    {
+      name: "color.primary",
+      kind: "color",
+      group: "Brand",
+      values: { light: "#2563eb", dark: "#60a5fa" },
+    },
+    {
+      name: "color.text",
+      kind: "color",
+      group: "Text and surfaces",
+      values: { light: "#111827", dark: "#f9fafb" },
+    },
+    {
+      name: "color.background",
+      kind: "color",
+      group: "Text and surfaces",
+      values: { light: "#ffffff", dark: "#0b0f19" },
+    },
+    /**
+     * A raised surface: a card, a panel, a table header. DISTINCT from
+     * `color.background`, which is the page itself.
+     *
+     * Its absence is what made four blocks compromise and what created a whole
+     * defect class. `core/card` shipped with no background and no border;
+     * `badge` was unbuildable, because a tinted background IS the block; the
+     * accordion had no divider and the table no border colour. And because
+     * nothing in this set could express a surface, **six blocks across three
+     * lanes independently reached for `--nx-*`** — the ADMIN namespace, which no
+     * published page emits. That is design pressure rather than six mistakes:
+     * when the correct mechanism is missing, whatever resembles it gets used.
+     *
+     * One step off `color.background` in each mode rather than a strong tint, so
+     * a surface reads as raised without needing a border to be legible — and
+     * still contrasts with one when a border is used.
+     */
+    {
+      name: "color.surface",
+      kind: "color",
+      group: "Text and surfaces",
+      values: { light: "#f9fafb", dark: "#151b2b" },
+    },
+    /**
+     * A hairline: a card outline, a table rule, a divider between sections.
+     *
+     * DECORATIVE, and that is now a claim rather than an omission. `#e5e7eb` on
+     * `#ffffff` is 1.24:1 and `#1f2937` on `#0b0f19` is 1.30:1 — far below the
+     * 3:1 WCAG 2.2 requires of a boundary that IDENTIFIES a control (SC 1.4.11,
+     * Non-text Contrast). That is correct for what this names: a divider and a
+     * card outline are decoration the same rule exempts, and a hairline heavy
+     * enough to pass 3:1 would stop being a hairline.
+     *
+     * It is the wrong token for anything a person has to find, which is what
+     * `color.border-strong` is for. This docblock previously argued for ONE
+     * border colour "until a block asks for the distinction"; `core/form` asked,
+     * and the split is the one Material 3 draws between `outline` and
+     * `outline-variant` for the same reason.
+     */
+    {
+      name: "color.border",
+      kind: "color",
+      group: "Text and surfaces",
+      values: { light: "#e5e7eb", dark: "#1f2937" },
+    },
+    /**
+     * The boundary of a CONTROL: an input, a select, a textarea.
+     *
+     * Separate from `color.border` because the two answer to different rules. A
+     * divider is decoration; the edge of a text field is the only thing telling
+     * a person where to click, so WCAG 2.2 SC 1.4.11 requires 3:1 against what
+     * sits behind it. `core/form` gives its control the page's own background on
+     * purpose, so this border is its ONLY boundary and a decorative hairline
+     * left the field invisible — the exact defect the control styles exist to
+     * fix, reintroduced one property in.
+     *
+     * Chosen by calculation, not by eye, against both surfaces a control can sit
+     * on — and asserted that way in the tests rather than as a literal, so a
+     * later retune of the palette cannot quietly drop below the floor:
+     *
+     *     light  #6b7280 on #ffffff 4.83:1   on #f9fafb 4.63:1
+     *     dark   #9ca3af on #0b0f19 7.54:1   on #151b2b 6.76:1
+     *
+     * It carries the same values as `color.muted` today, and is a separate token
+     * anyway: they are one value serving two roles, and a site retuning its
+     * caption grey must not thereby move every control boundary it never
+     * mentioned. Material 3 keeps `outline` and `on-surface-variant` apart on
+     * exactly that argument.
+     */
+    {
+      name: "color.border-strong",
+      // Named as an author reads it; the code name stays as it was.
+      label: "Strong border",
+      kind: "color",
+      group: "Text and surfaces",
+      values: { light: "#6b7280", dark: "#9ca3af" },
+    },
+    /**
+     * Secondary text: a caption, a timestamp, a field hint.
+     *
+     * Chosen to clear WCAG AA against `color.background` in both modes rather
+     * than by eye — `#6b7280` on `#ffffff` is about 4.8:1 and `#9ca3af` on
+     * `#0b0f19` is far higher. A "muted" token that fails contrast is worse than
+     * none, because it reads as sanctioned.
+     */
+    {
+      name: "color.muted",
+      // Named as an author reads it; the code name stays as it was.
+      label: "Muted text",
+      kind: "color",
+      group: "Text and surfaces",
+      values: { light: "#6b7280", dark: "#9ca3af" },
+    },
+    { name: "font.body", kind: "fontFamily", values: { light: "system-ui" } },
+    // The font the site's headings are set in once an author picks one. No
+    // rule reads it until then: the heading rows hold no font, so headings
+    // take the body text's, the site's own or the one picked for Body.
+    {
+      name: "font.heading",
+      kind: "fontFamily",
+      values: { light: "system-ui" },
+    },
+    ...typeSizeDefaultTokens(),
+    { name: "space.4", kind: "dimension", values: { light: "1rem" } },
+    ...SPACING_DEFAULTS.map(
+      ({ name, value, description }): SiteToken => ({
+        name,
+        kind: "dimension",
+        values: { light: spacingValue(value) },
+        description,
+      })
+    ),
+  ];
+}
+
+/**
+ * A spacing default: one length, or a fluid one that grows with the viewport
+ * from `min` to `max` along `preferred`.
+ */
+type SpacingValue =
+  | string
+  | { readonly min: string; readonly preferred: string; readonly max: string };
+
+/** One row of {@link SPACING_DEFAULTS}. */
+interface SpacingDefault {
+  readonly name: string;
+  /** What it is called where an author meets it, in plain words. */
+  readonly label: string;
+  readonly value: SpacingValue;
+  readonly description: string;
+}
+
+/**
+ * The spacing every block starts from, in ONE table.
+ *
+ * Blocks carry no outer margin: the space between two blocks is their
+ * container's gap, and the space inside a band is its padding. Each row is a
+ * site token, so the blocks reference it by name and a site changing one value
+ * moves every block reading it, with no block changed.
+ *
+ * Responsive through `clamp()` rather than per breakpoint, because a token has
+ * one value per colour mode and none per width. `vw` resolves against the
+ * device being previewed in the editor too, since the canvas is its own frame.
+ * What each row resolves to at a phone, tablet and desktop width is pinned in
+ * `site-tokens.test.ts`.
+ */
+const SPACING_DEFAULTS: readonly SpacingDefault[] = [
+  {
+    name: "space.stack",
+    label: "Space between blocks",
+    value: { min: "1rem", preferred: "0.875rem + 0.5vw", max: "1.25rem" },
+    description: "The space a container puts between the blocks it holds.",
+  },
+  {
+    name: "space.section-y",
+    label: "Section padding (top and bottom)",
+    value: { min: "3rem", preferred: "2rem + 4vw", max: "5rem" },
+    description: "A section's padding above and below its content.",
+  },
+  {
+    name: "space.gutter",
+    label: "Section padding (sides)",
+    value: { min: "1rem", preferred: "4vw", max: "2rem" },
+    description: "A section's padding beside its content.",
+  },
+  // A Section's Compact and Roomy padding (`padding-preset.ts`), each a pair
+  // like the two above, which are Normal's. Tighter and airier above and
+  // below; beside the content they start as Normal's.
+  {
+    name: "space.section-y-compact",
+    label: "Section padding, compact (top and bottom)",
+    value: { min: "1.5rem", preferred: "1rem + 2vw", max: "2.5rem" },
+    description: "A Compact section's padding above and below its content.",
+  },
+  {
+    name: "space.gutter-compact",
+    label: "Section padding, compact (sides)",
+    value: { min: "1rem", preferred: "4vw", max: "2rem" },
+    description: "A Compact section's padding beside its content.",
+  },
+  {
+    name: "space.section-y-roomy",
+    label: "Section padding, roomy (top and bottom)",
+    value: { min: "4.5rem", preferred: "3rem + 6vw", max: "7.5rem" },
+    description: "A Roomy section's padding above and below its content.",
+  },
+  {
+    name: "space.gutter-roomy",
+    label: "Section padding, roomy (sides)",
+    value: { min: "1rem", preferred: "4vw", max: "2rem" },
+    description: "A Roomy section's padding beside its content.",
+  },
+  {
+    name: "space.columns",
+    label: "Space between columns",
+    value: { min: "1rem", preferred: "0.5rem + 2vw", max: "2rem" },
+    description: "The space between columns, and between gallery images.",
+  },
+  {
+    name: "space.card",
+    label: "Card padding",
+    value: { min: "1rem", preferred: "0.75rem + 1vw", max: "1.5rem" },
+    description: "A card's padding around its content.",
+  },
+  {
+    name: "space.paragraph",
+    label: "Space between paragraphs",
+    value: "1em",
+    description: "The space between the paragraphs of rich text.",
+  },
+  {
+    name: "button.padding-y",
+    label: "Button padding (top and bottom)",
+    value: "0.75rem",
+    description: "A button's padding above and below its label.",
+  },
+  {
+    name: "button.padding-x",
+    label: "Button padding (sides)",
+    value: "1.25rem",
+    description: "A button's padding beside its label.",
+  },
+];
+
+/**
+ * The plain names of the built-in variables that have one, by identity:
+ * the spacing table's, and the content width. Read by
+ * {@link tokenDisplayLabel}, so every surface that names a variable says
+ * the same words, and a stored override, which carries no label, keeps them.
+ */
+const BUILT_IN_LABELS: ReadonlyMap<string, string> = new Map([
+  ["content.width", "Content width"],
+  ...SPACING_DEFAULTS.map(row => [row.name, row.label] as const),
+]);
+
+/** A spacing default as the CSS a token stores. */
+function spacingValue(value: SpacingValue): string {
+  return typeof value === "string"
+    ? value
+    : `clamp(${value.min}, ${value.preferred}, ${value.max})`;
+}
+
+/**
+ * A font face a site may actually serve, or the reasons it may not.
+ *
+ * Self-hosted only, and this is a product rule rather than a technical one: a
+ * `@font-face` pointing at somebody else's server makes every visitor's browser
+ * announce itself to that server, with their IP address, before a word of the
+ * page is readable. A German court found exactly that arrangement unlawful for
+ * Google Fonts, so a site cannot be handed a text box that quietly recreates
+ * it. The remedy is to upload the file, which is why the message says so.
+ */
+export function validateFontFace(
+  face: FontFaceDef,
+  path: string
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const fail = (message: string): void => {
+    issues.push({
+      path,
+      code: "invalid-style-value",
+      severity: "error",
+      message,
+    });
+  };
+
+  if (face.family.trim() === "") fail("A font needs a family name.");
+  // The family is escaped at emission so a quote cannot close its string, but
+  // it is refused outright if it carries structural characters. Escaping alone
+  // would leave `{`, `}` and `<` sitting inside a stylesheet that is written
+  // into a `<style>` element — and `</style>` inside a quoted CSS string still
+  // ends the element, because the HTML parser reads the bytes before the CSS
+  // parser ever sees the quotes.
+  else if (checkCssValue(face.family) !== null) {
+    fail(`"${face.family}" is not a usable font family name.`);
+  }
+  if (face.src.length === 0) {
+    fail(`"${face.family}" has no font file to load.`);
+  }
+
+  // Every descriptor is author data that reaches the stylesheet, not only the
+  // URL. The family is quoted and therefore escaped at emission; these are
+  // written as given, so they are checked here.
+  const unquoted: Array<[string, string | undefined]> = [
+    ["font-weight", face.weight],
+    ["font-style", face.style],
+    ["font-display", face.display],
+    ["unicode-range", face.unicodeRange],
+  ];
+  for (const [descriptor, value] of unquoted) {
+    if (value !== undefined && !unquotedDescriptor(value)) {
+      fail(`"${face.family}" has a ${descriptor} value that cannot be used.`);
+    }
+  }
+  for (const source of face.src) {
+    if (
+      source.format !== undefined &&
+      (typeof source.format !== "string" ||
+        source.format.length > MAX_FONT_FORMAT_LENGTH ||
+        !FONT_FORMAT.test(source.format))
+    ) {
+      fail(`"${face.family}" has a font format that cannot be used.`);
+    }
+  }
+
+  if (face.source !== undefined && !usableOrigin(face.source)) {
+    fail(
+      `"${face.family}" says where it came from in a way that cannot be read.`
+    );
+  }
+
+  for (const source of face.src) {
+    const rejection = checkUrlValue(source.url, "raw");
+    if (rejection !== null) {
+      fail(`"${face.family}" has a font file URL that cannot be used.`);
+      continue;
+    }
+    if (!isSameOriginUrl(source.url)) {
+      fail(
+        `"${face.family}" loads a font from "${source.url}", which is on another server. Upload the font file to this site and point it at a path here — a font fetched from elsewhere tells that server every visitor's IP address before the page can be read.`
+      );
+    }
+  }
+
+  return issues;
+}
+
+/**
+ * The longest word a face's origin may carry. A catalogue id, a licence name
+ * and a category are all short; this only stops data that is already wrong.
+ */
+const MAX_FONT_ORIGIN_LENGTH = 100;
+
+/** Whether a face's origin is one of the two kinds, with short words. */
+function usableOrigin(origin: FontFaceOrigin): boolean {
+  if (origin.kind !== "google" && origin.kind !== "upload") return false;
+  return [origin.id, origin.licence, origin.category, origin.subset].every(
+    word =>
+      word === undefined ||
+      (typeof word === "string" && word.length <= MAX_FONT_ORIGIN_LENGTH)
+  );
+}
+
+/**
+ * Whether a URL stays on the site serving the page.
+ *
+ * A path, with or without a leading slash, and nothing carrying a scheme or an
+ * authority. `//host/f.woff2` is refused with the rest: it names another server
+ * while looking like a path, which is the whole reason it is worth naming here.
+ */
+function isSameOriginUrl(url: string): boolean {
+  const value = url.trim();
+  if (value === "") return false;
+  if (value.startsWith("//")) return false;
+  return !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(value);
+}
+
+/**
+ * The `@font-face` rules for the faces that passed validation.
+ *
+ * A face with any error contributes nothing: half a `@font-face` — a family
+ * declaring a file the browser will not fetch — renders as the default font
+ * rather than as the next family the author listed, so emitting it would be
+ * worse than leaving it out.
+ */
+export function emitFontFaces(faces: readonly FontFaceDef[]): {
+  css: string;
+  issues: ValidationIssue[];
+} {
+  const issues: ValidationIssue[] = [];
+  const blocks: string[] = [];
+
+  faces.forEach((face, index) => {
+    const faceIssues = validateFontFace(face, `fonts[${index}]`);
+    issues.push(...faceIssues);
+    if (faceIssues.length > 0) return;
+
+    const src = face.src
+      .map(source =>
+        source.format === undefined || source.format === ""
+          ? `url("${cssString(source.url)}")`
+          : `url("${cssString(source.url)}") format("${cssString(source.format)}")`
+      )
+      .join(",");
+
+    const parts = [
+      `font-family:"${cssString(face.family)}"`,
+      `src:${src}`,
+      `font-display:${face.display ?? "swap"}`,
+    ];
+    if (face.weight !== undefined) parts.push(`font-weight:${face.weight}`);
+    if (face.style !== undefined) parts.push(`font-style:${face.style}`);
+    if (face.unicodeRange !== undefined) {
+      parts.push(`unicode-range:${face.unicodeRange}`);
+    }
+    blocks.push(`@font-face{${parts.join(";")}}`);
+  });
+
+  return { css: blocks.join(""), issues };
+}
+
+/**
+ * What is wrong with the name a token carries, or nothing.
+ *
+ * Answered once, for every gate that decides whether a token can be written —
+ * the emitter, the DTCG exporter and the DTCG importer all ask it, and each
+ * phrases its own message from the result. Returning the PROBLEM rather than a
+ * sentence is what lets them share the rule without sharing wording that would
+ * be wrong in two of the three.
+ *
+ * The split between grammar and length is the rule itself. A token's identity is
+ * `id ?? name`, so a renamed token is written under its id and its display name
+ * reaches no stylesheet and no exported file. Both fields meet the grammar,
+ * because either can BE the identity and either would reach a selector; only the
+ * identity meets the emission cap. Capping the display name instead drops a
+ * working token the moment an author gives it a long label.
+ */
+export type TokenNamingProblem =
+  | { field: "name" | "id"; reason: "grammar" }
+  | { field: "name" | "id"; reason: "length" }
+  | { field: "name"; reason: "depth" };
+
+/**
+ * Why a LABEL cannot be used, or nothing.
+ *
+ * A label is what an author reads. It never becomes a custom property, so the
+ * emission cap does not reach it — that belongs to the identity.
+ *
+ * It does reach an exported file, though, and that is why it carries rules at
+ * all: the DTCG exporter splits it on dots and makes each part a key, so its
+ * grammar decides what those keys may contain and its DEPTH decides how far the
+ * reader has to descend to find the token underneath them.
+ */
+function labelProblem(name: unknown): TokenNamingProblem | undefined {
+  // Persisted settings reach here unvalidated, and `RegExp.test` COERCES: a
+  // stored `123` becomes "123" and satisfies the grammar, after which the value
+  // travels on as a number and throws where a string was assumed.
+  if (typeof name !== "string") return { field: "name", reason: "grammar" };
+  if (!isAuthorableTokenName(name)) return { field: "name", reason: "grammar" };
+  // Counted in place: a label carries no length cap, so splitting it
+  // materialises every part of an oversized one only to refuse it.
+  let parts = 1;
+  for (let at = 0; at < name.length && parts <= MAX_TOKEN_NAME_SEGMENTS; at++) {
+    if (name[at] === ".") parts++;
+  }
+  if (parts > MAX_TOKEN_NAME_SEGMENTS)
+    return { field: "name", reason: "depth" };
+  return undefined;
+}
+
+/**
+ * Why an IDENTITY cannot be used, or nothing.
+ *
+ * An identity is what a token is WRITTEN under — it becomes the custom property
+ * and every stored reference reads it — so the emission cap applies. Depth does
+ * not: an identity never becomes DTCG groups, and refusing one for its depth is
+ * what clears a working id and breaks every reference to it.
+ *
+ * Separate from {@link labelProblem} rather than a flag on it, because the two
+ * subjects take different rules and a caller holding a bare string cannot be
+ * relied on to say which it has.
+ */
+function identityProblem(
+  identity: unknown,
+  field: "name" | "id"
+): TokenNamingProblem | undefined {
+  if (typeof identity !== "string") return { field, reason: "grammar" };
+  if (!isAuthorableTokenName(identity)) return { field, reason: "grammar" };
+  if (identity.length > MAX_TOKEN_NAME_LENGTH)
+    return { field, reason: "length" };
+  return undefined;
+}
+
+/**
+ * Why a token cannot be written, or nothing.
+ *
+ * Composed from the two rules above so each applies to its own subject: the
+ * label is checked as a label, the identity as an identity. A token with an id
+ * is checked as both, because the id is the identity and the name is the label.
+ */
+export function tokenNamingProblem(token: {
+  name: unknown;
+  id?: unknown;
+}): TokenNamingProblem | undefined {
+  const label = labelProblem(token.name);
+  if (label !== undefined) return label;
+  if (token.id !== undefined) {
+    const stated = identityProblem(token.id, "id");
+    if (stated !== undefined) return stated;
+    return undefined;
+  }
+  // With no id the label IS the identity, so it meets the emission cap too.
+  return identityProblem(token.name, "name");
+}
+
+/** `0`, `-0`, `0.0`, `.0` and the like: a zero with no unit. */
+const UNITLESS_ZERO = /^[+-]?(?:0+(?:\.0*)?|\.0+)$/;
+
+/**
+ * A token's value as it is written into its custom property.
+ *
+ * A length token's unitless zero is written as `0px`. On its own a bare `0` is
+ * a length wherever a property takes one, but a token is also read inside
+ * `max()` (a contained block's padding is one), where it is a number, and a
+ * number beside a length makes the whole declaration invalid. Every other
+ * value, and every other kind, is written as given: a number or a duration
+ * takes a unitless zero, and a `0px` there would be the wrong quantity.
+ */
+function writtenTokenValue(kind: TokenKind, value: string): string {
+  return kind === "dimension" && UNITLESS_ZERO.test(value.trim())
+    ? "0px"
+    : value;
+}
+
+/** The emitter's wording for {@link tokenNamingProblem}. */
+function tokenNamingRefusal(token: SiteToken): string | undefined {
+  const problem = tokenNamingProblem(token);
+  if (problem === undefined) return undefined;
+  if (problem.reason === "depth") {
+    return `"${String(token.name)}" is nested too deeply, so it was not written. A token name holds at most ${MAX_TOKEN_NAME_SEGMENTS} dot-separated parts.`;
+  }
+  if (problem.reason === "length") {
+    return `"${String(token.name)}" is written under more than ${MAX_TOKEN_NAME_LENGTH} characters, so it was not written. The ${problem.field} a token is written under is at most ${MAX_TOKEN_NAME_LENGTH} characters.`;
+  }
+  return problem.field === "name"
+    ? `"${token.name}" is not a token name, so it was not written. A name is dot-separated words of letters, digits and dashes, like "color.primary".`
+    : `"${token.name}" has an id that is not a token name, so it was not written. An id is dot-separated words of letters, digits and dashes, like "color.primary".`;
+}
+
+export function emitTokenBlocks(
+  set: SiteTokenSet,
+  selector: string
+): { css: string; issues: ValidationIssue[]; emitted: readonly SiteToken[] } {
+  const { prefix, issue } = resolveTokenPrefix(set.prefix);
+  const issues: ValidationIssue[] = issue ? [issue] : [];
+
+  const light: string[] = [];
+  const dark: string[] = [];
+  // The light values of the variables that have a dark one: what a light
+  // marker has to restore, and nothing else.
+  const undoDark: string[] = [];
+  // The light declarations of the variables with no dark value of their own
+  // that read another variable, such as a shadow coloured by a colour
+  // variable. A custom property's `var()` is resolved where it is declared
+  // and inherited as the result, so one declared only on the root keeps the
+  // light colour under a dark marker on <body> or a wrapper. Declared again in
+  // every mode block, it resolves on the same element as what it reads.
+  const reread: string[] = [];
+  const seen = new Map<string, string>();
+  /*
+   * The tokens this call actually WROTE.
+   *
+   * Reported rather than left to be re-derived, because the refusals above are
+   * five separate conditions — a name that is not a token name, no light value,
+   * a value the guard rejects, a value that fetches, and two identities landing
+   * on one custom property — and a caller asking "which tokens does this site
+   * emit" would have to restate all five. A second statement of them agrees
+   * today and drifts the first time one changes.
+   */
+  const emitted: SiteToken[] = [];
+
+  for (const token of set.tokens) {
+    const naming = tokenNamingRefusal(token);
+    if (naming !== undefined) {
+      issues.push(tokenIssue(naming));
+      continue;
+    }
+    // A token with no values record at all. Site tokens are one settings row read on every page
+    // render and reach here whether or not anything validated them, so a missing field has to
+    // cost the token rather than the render: reading through it throws, and one corrupt row would
+    // take down every page on the site.
+    if (
+      !isPlainRecord(token.values) ||
+      typeof token.values.light !== "string"
+    ) {
+      issues.push(
+        tokenIssue(
+          `"${token.name}" has no light value, so it was not written. Every token needs one: it is what a reader with no mode set resolves.`
+        )
+      );
+      continue;
+    }
+    // The value is checked with the same guard the style compiler applies to
+    // any stored value. Without it a semicolon ends the custom property and
+    // whatever follows becomes a declaration on the page root.
+    const invalid = TOKEN_MODES.filter(mode => {
+      const value = token.values[mode];
+      return value !== undefined && checkCssValue(value) !== null;
+    });
+    if (invalid.length > 0) {
+      issues.push(
+        tokenIssue(
+          `"${token.name}" has a value that cannot be used, so it was not written.`
+        )
+      );
+      continue;
+    }
+    // Refused as an error rather than reported and written, unlike the kind
+    // check below: this one is not about whether the value renders. A token
+    // that fetches is read by a `var()` in a stylesheet that has no URL in it
+    // for the origin policy to see.
+    const fetching = TOKEN_MODES.filter(mode => {
+      const value = token.values[mode];
+      return value !== undefined && tokenValueFetches(value);
+    });
+    if (fetching.length > 0) {
+      issues.push(
+        tokenIssue(
+          `"${token.name}" has a value that would load a file, so it was not written. A token holds a colour, a length, a duration, a font or a number; put an image on the block that shows it, where the site's allowed hosts still apply.`,
+          "error"
+        )
+      );
+      continue;
+    }
+    // Composed from the IDENTITY, which is the name until a rename pins one.
+    // That is what keeps an already-compiled page working: its CSS references
+    // the property this token emitted when the page was built, and only a moved
+    // identity moves it.
+    const property = tokenCustomProperty(tokenIdentity(token), prefix);
+    // Two identities can land on one property — `color.primary-dark` and
+    // `color-primary.dark` both give `--site-color-primary-dark`. Emitting both
+    // would let one silently resolve to the other's value, so the second is
+    // refused and named. Ids share this space with names, so the other way to
+    // arrive here is a new token claiming a name that a renamed token still
+    // holds as its id.
+    const previous = seen.get(property);
+    if (previous !== undefined) {
+      issues.push(
+        tokenIssue(
+          `"${token.name}" and "${previous}" both become "${property}", so "${token.name}" was not written. Two tokens cannot share one custom property: rename one of them, or give one a different id.`
+        )
+      );
+      continue;
+    }
+    seen.set(property, token.name);
+    emitted.push(token);
+
+    // Reported, and then written anyway. A value that does not match its kind
+    // is dropped by the browser where it is USED, which costs the author the
+    // one declaration and no more; a refusal here would cost them the token on
+    // a verdict this is deliberately not certain enough to act on.
+    for (const mode of TOKEN_MODES) {
+      const modeValue = token.values[mode];
+      if (modeValue === undefined) continue;
+      const mismatch = checkTokenKind(token.kind, modeValue);
+      if (mismatch !== undefined) {
+        issues.push(
+          tokenIssue(
+            `"${token.name}" is a ${token.kind} token, but its ${mode} value "${modeValue}" ${mismatch}.${typeInstead(token.kind)}`,
+            "warning",
+            // What a render does with it, kept out of the message: a save
+            // that refuses on this report stores nothing, and the message
+            // must stay true there.
+            "It was written as given, and will do nothing where the token is used."
+          )
+        );
+      }
+    }
+
+    const lightValue = writtenTokenValue(token.kind, token.values.light);
+    light.push(`${property}:${lightValue}`);
+    if (token.values.dark !== undefined) {
+      dark.push(
+        `${property}:${writtenTokenValue(token.kind, token.values.dark)}`
+      );
+      undoDark.push(`${property}:${lightValue}`);
+    } else if (referencesCustomProperty(lightValue)) {
+      reread.push(`${property}:${lightValue}`);
+    }
+  }
+
+  // Refused rather than truncated: a selector cut in half is a different
+  // selector, and writing tokens under it would put the site's values on
+  // whatever it happens to match.
+  if (
+    typeof selector !== "string" ||
+    selector.length > MAX_TOKEN_SELECTOR_LENGTH
+  ) {
+    issues.push(
+      tokenIssue(
+        `The selector these tokens would be written under is longer than ${MAX_TOKEN_SELECTOR_LENGTH} characters, so none were written.`
+      )
+    );
+    // Nothing is written under an unusable selector, so nothing was emitted —
+    // whatever survived the per-token refusals above.
+    return { css: "", issues, emitted: [] };
+  }
+  if (light.length === 0) return { css: "", issues, emitted: [] };
+
+  // A site with no dark values writes its one block as it always has: there
+  // is no second scheme to state.
+  if (dark.length === 0) {
+    return { css: `${selector}{${light.join(";")}}`, issues, emitted };
+  }
+  return {
+    css: darkModeSheet(
+      selector,
+      light,
+      [...dark, ...reread],
+      [...undoDark, ...reread]
+    ),
+    issues,
+    emitted,
+  };
+}

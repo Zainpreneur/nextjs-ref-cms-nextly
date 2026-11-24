@@ -1,0 +1,171 @@
+"use client";
+
+/**
+ * useDiscardWorkingDraft Hook
+ *
+ * TanStack Query mutation for discarding a published entry's pending working
+ * draft (the draft/published split). It calls the discard endpoint, then
+ * invalidates the entry detail so the editor refetches the live published row.
+ *
+ * The list and count caches are intentionally left alone: discarding never
+ * touches the live row, so its representation in those views is unchanged.
+ *
+ * @see services/versionApi.ts - discardWorkingDraft fetcher
+ * @see hooks/queries/useDeleteEntry.ts - reference mutation pattern
+ */
+
+import {
+  useMutation,
+  useQueryClient,
+  type QueryClient,
+  type UseMutationResult,
+} from "@tanstack/react-query";
+
+import { toast } from "@admin/components/ui";
+import {
+  DISCARD_CHANGED_SINCE,
+  staleVersionOf,
+} from "@admin/lib/document-version";
+import { entryKeys } from "@admin/services/entryApi";
+import {
+  versionApi,
+  type DiscardWorkingDraftResponse,
+} from "@admin/services/versionApi";
+
+import {
+  refreshRemovedFromCodeSchema,
+  removedFromCodeRefusal,
+} from "./removed-from-code-refusal";
+
+export interface UseDiscardWorkingDraftOptions {
+  /** The collection slug/name containing the entry. */
+  collectionSlug: string;
+  /** The entry whose working draft is being discarded. */
+  entryId: string;
+  /**
+   * Which language's pending change to discard. A localized document holds one
+   * per language, so discarding without naming one would throw away a language
+   * the author never opened. Absent for an unlocalized collection, and for the
+   * default language, which the editor addresses without naming it.
+   */
+  locale?: string | null;
+  /** Callback fired on a successful discard, with the live published document. */
+  onSuccess?: (data: DiscardWorkingDraftResponse) => void;
+  /** Callback fired on error. */
+  onError?: (error: Error) => void;
+  /** Whether to show toast notifications (default: true). */
+  showToast?: boolean;
+}
+
+export function useDiscardWorkingDraft({
+  collectionSlug,
+  entryId,
+  locale,
+  onSuccess,
+  onError,
+  showToast = true,
+}: UseDiscardWorkingDraftOptions): UseMutationResult<
+  DiscardWorkingDraftResponse,
+  Error,
+  string | void,
+  unknown
+> {
+  const queryClient = useQueryClient();
+
+  return useMutation<DiscardWorkingDraftResponse, Error, string | void>({
+    // Called with the version the editor's copy started from.
+    mutationFn: version =>
+      versionApi.discardWorkingDraft(
+        {
+          kind: "collection",
+          slug: collectionSlug,
+          entryId,
+        },
+        locale,
+        version || undefined
+      ),
+
+    onSuccess: data => {
+      // Seed the authoritative live row the discard returned into every scoped
+      // variant of this entry's detail cache BEFORE invalidating. Otherwise the
+      // cache keeps the now-deleted working draft (and `_isWorkingDraft: true`)
+      // until the refetch lands: a slow or failed refetch would leave the editor
+      // showing Changed, and a remount could briefly restore the discarded
+      // values. `_isWorkingDraft` is cleared explicitly — the live item omits it,
+      // so a plain spread would let the stale `true` survive.
+      // Only the variants reading the SAME language. The response is one
+      // language's live document, and the detail key is a prefix of every scoped
+      // variant, so seeding it across all of them writes this language's values
+      // into another language's cache entry — which the editor would then show
+      // on switching, as that language's content.
+      queryClient.setQueriesData<Record<string, unknown>>(
+        {
+          queryKey: entryKeys.detail(collectionSlug, entryId),
+          predicate: query => {
+            const scope = query.queryKey[query.queryKey.length - 1];
+            // An entry cached under the bare detail key carries no read
+            // dimensions to disagree with, so it is still seeded.
+            if (typeof scope !== "object" || scope === null) return true;
+            // `detailScoped` normalises an absent locale to null, and so does
+            // this hook, so the default language compares equal on both sides.
+            return (
+              (scope as { locale?: string | null }).locale === (locale ?? null)
+            );
+          },
+        },
+        old => (old ? { ...old, ...data.item, _isWorkingDraft: false } : old)
+      );
+
+      // The editor reads with `?draft=1`; with the sidecar gone the server has
+      // no draft to overlay, so refetching the detail reconciles with the live
+      // row. List/count caches are left alone — the live row never changed.
+      void queryClient.invalidateQueries({
+        queryKey: entryKeys.detail(collectionSlug, entryId),
+      });
+
+      if (showToast) {
+        toast.success("Working draft discarded");
+      }
+
+      onSuccess?.(data);
+    },
+
+    onError: (error: Error) => {
+      tellDiscardRefused(
+        queryClient,
+        error,
+        entryKeys.detail(collectionSlug, entryId),
+        showToast
+      );
+
+      onError?.(error);
+    },
+  });
+}
+
+/**
+ * A discard's refusal, told: the schema read again where the document's
+ * collection or Single was removed from code, and the document read again
+ * where it changed since the editor's copy, so a second discard starts from
+ * the version on screen. `detail` is the document's detail key.
+ */
+export function tellDiscardRefused(
+  queryClient: QueryClient,
+  error: Error,
+  detail: readonly unknown[],
+  showToast: boolean
+): void {
+  refreshRemovedFromCodeSchema(queryClient, error);
+  const stale = staleVersionOf(error) !== undefined;
+  if (stale) void queryClient.invalidateQueries({ queryKey: detail });
+  if (showToast) {
+    // The refusal for an entity removed from code is a whole sentence of its
+    // own, so nothing goes in front of it.
+    toast.error(
+      removedFromCodeRefusal(error) ??
+        (stale
+          ? DISCARD_CHANGED_SINCE
+          : `Failed to discard working draft: ${error.message}`)
+    );
+  }
+}

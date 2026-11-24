@@ -1,0 +1,443 @@
+/**
+ * `system:releases` — what the dashboard asks the releases service, and what it
+ * refuses to answer.
+ */
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+/** The service's one-instant read of the Upcoming tab and the attention counts. */
+const upcomingWithAttention = vi.fn();
+const memberCounts = vi.fn();
+const readinessOf = vi.fn();
+const has = vi.fn();
+
+vi.mock("../../../di/container", () => ({
+  container: {
+    has: (name: string) => has(name) as boolean,
+    get: () => ({ upcomingWithAttention, memberCounts, readinessOf }),
+  },
+}));
+
+import { executeWidgetQuery } from "../../widgets/execute";
+import { clearSources } from "../../widgets/sources";
+import { clearSystemResolvers } from "../../widgets/system-sources";
+import {
+  RELEASES_SOURCE_ID,
+  registerReleasesWidgetSource,
+} from "../releases-widget-source";
+
+const caller = { user: { id: "user-1", roles: ["editor"] } };
+
+const row = {
+  id: "r1",
+  title: "Spring launch",
+  description: "notes",
+  scheduledAt: new Date("2099-01-01T00:00:00Z"),
+  timezone: "UTC",
+  state: "scheduled",
+  publishedAt: null,
+  createdBy: "someone-else",
+  createdAt: new Date("2020-01-01T00:00:00Z"),
+  updatedAt: new Date("2020-01-01T00:00:00Z"),
+  revision: 3,
+};
+
+/** What the service answers, as a case sets it. */
+let upcoming: Record<string, unknown>[] = [];
+let attentionCounts: Record<string, number> = {};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  has.mockReturnValue(true);
+  upcoming = [row];
+  // One stopped release, none overdue.
+  attentionCounts = { stopped: 1, overdue: 0 };
+  upcomingWithAttention.mockImplementation(
+    async (query: { attention: boolean }) => ({
+      upcoming,
+      attention: query.attention ? attentionCounts : {},
+    })
+  );
+  clearSources();
+  clearSystemResolvers();
+  registerReleasesWidgetSource();
+});
+
+describe("what it asks the service", () => {
+  it("asks the releases domain's one read of the Upcoming tab and the attention counts", async () => {
+    // 🔴 One read, not a window of the card's own nor a `find` and a `count` made one after the
+    // other: the service judges the tab and the overdue line against one clock reading, so a
+    // release a few minutes late is in exactly one of them.
+    await executeWidgetQuery(
+      { source: RELEASES_SOURCE_ID, op: "list", limit: 3 },
+      caller
+    );
+
+    const [query] = upcomingWithAttention.mock.calls[0] as [
+      Record<string, unknown>,
+    ];
+    expect(query).toEqual({ limit: 3, attention: false });
+  });
+
+  it("hands the service the CALLER, and never overrides access", async () => {
+    // 🔴 The resolver adds no rule of its own, so the service's `authorize` is
+    // the only thing standing between a reader and every release in the
+    // install. It can only run on a caller it was given.
+    await executeWidgetQuery(
+      { source: RELEASES_SOURCE_ID, op: "list" },
+      {
+        ...caller,
+        authenticatedScope: {
+          actorType: "apiKey" as const,
+          permissions: ["releases:read"],
+        },
+      }
+    );
+
+    const [, actor] = upcomingWithAttention.mock.calls[0] as [
+      unknown,
+      Record<string, unknown>,
+    ];
+    expect(actor.userId).toBe("user-1");
+    expect(actor.overrideAccess).toBeUndefined();
+    expect(actor.authenticatedScope).toEqual({
+      actorType: "apiKey",
+      permissions: ["releases:read"],
+    });
+  });
+
+  it("forwards the caller's ROLES", async () => {
+    // 🔴 `ReleaseActor.userRoles` is what a code-defined access rule reads. An
+    // actor built without it evaluates that rule against an empty list, so a
+    // reader authorized by their roles is refused here while the REST route and
+    // the Direct API — which both forward it — admit them.
+    await executeWidgetQuery(
+      { source: RELEASES_SOURCE_ID, op: "list" },
+      caller
+    );
+
+    const [, actor] = upcomingWithAttention.mock.calls[0] as [
+      unknown,
+      Record<string, unknown>,
+    ];
+    expect(actor.userRoles).toEqual(["editor"]);
+  });
+
+  it("does not invent an authenticatedScope for a session caller", async () => {
+    // A present-but-undefined key wins a spread, so an unconditional one would
+    // stamp a session caller with an empty scope and have it judged as a
+    // narrowly scoped key rather than by its roles.
+    await executeWidgetQuery(
+      { source: RELEASES_SOURCE_ID, op: "list" },
+      caller
+    );
+
+    const [, actor] = upcomingWithAttention.mock.calls[0] as [
+      unknown,
+      Record<string, unknown>,
+    ];
+    expect("authenticatedScope" in actor).toBe(false);
+  });
+});
+
+describe("what it answers with", () => {
+  it("publishes only its DECLARED fields", async () => {
+    // 🔴 A release row carries `createdBy`, `revision` and `publishedAt`. The
+    // source's field list is the allowlist a query is checked against, so a row
+    // returned whole would hand every reader columns the source never declared
+    // and nothing downstream would refuse them.
+    const result = await executeWidgetQuery(
+      { source: RELEASES_SOURCE_ID, op: "list" },
+      caller
+    );
+
+    const [item] = (result as { items: Record<string, unknown>[] }).items;
+    expect(Object.keys(item).sort()).toEqual(["scheduledAt", "state", "title"]);
+  });
+
+  /*
+   * 🔴 The DATE's type reaches the result, which is the half that used to stop
+   * at the server. Every source declares `scheduledAt` a date, the renderer
+   * needs that to present it, and without it the row drew the ISO string the
+   * value crossed as -- on a card whose entire subject is when. Asserted on the
+   * producer because the renderer and the wire parser each have their own test,
+   * and all three have to hold for a reader to see a date.
+   */
+  it("publishes the declared kind of each column", async () => {
+    const result = await executeWidgetQuery(
+      {
+        source: RELEASES_SOURCE_ID,
+        op: "list",
+        select: ["title", "scheduledAt"],
+      },
+      caller
+    );
+
+    expect((result as { fields?: unknown }).fields).toEqual([
+      { name: "title", label: "Release", type: "string" },
+      { name: "scheduledAt", label: "Scheduled", type: "date" },
+    ]);
+  });
+
+  it("heads only the columns the query selected", async () => {
+    const result = await executeWidgetQuery(
+      { source: RELEASES_SOURCE_ID, op: "list", select: ["title"] },
+      caller
+    );
+
+    expect((result as { fields?: unknown }).fields).toEqual([
+      { name: "title", label: "Release", type: "string" },
+    ]);
+    const [item] = (result as { items: Record<string, unknown>[] }).items;
+    expect(Object.keys(item)).toEqual(["title"]);
+  });
+
+  it("answers a release's id when the query selects it, so its row can open it", async () => {
+    const result = await executeWidgetQuery(
+      { source: RELEASES_SOURCE_ID, op: "list", select: ["id", "title"] },
+      caller
+    );
+
+    const [item] = (result as { items: Record<string, unknown>[] }).items;
+    expect(item).toEqual({ id: "r1", title: "Spring launch" });
+  });
+});
+
+describe("the attention rows, asked for by selecting `reason`", () => {
+  const ATTENTION_SELECT = ["kind", "reason", "count", "title", "scheduledAt"];
+  const items = (result: unknown) =>
+    (result as { items: Record<string, unknown>[] }).items;
+
+  it("comes before the upcoming releases, one row per reason holding any, and none for a reason at 0", async () => {
+    const result = await executeWidgetQuery(
+      { source: RELEASES_SOURCE_ID, op: "list", select: ATTENTION_SELECT },
+      caller
+    );
+    expect(items(result)).toEqual([
+      { kind: "attention", reason: "stopped", count: 1 },
+      expect.objectContaining({ kind: "release", title: "Spring launch" }),
+    ]);
+  });
+
+  it("asks the one read for the attention counts, as the caller", async () => {
+    await executeWidgetQuery(
+      { source: RELEASES_SOURCE_ID, op: "list", select: ATTENTION_SELECT },
+      caller
+    );
+    expect(upcomingWithAttention).toHaveBeenCalledTimes(1);
+    expect(upcomingWithAttention).toHaveBeenCalledWith(
+      expect.objectContaining({ attention: true }),
+      expect.objectContaining({ userId: "user-1" })
+    );
+  });
+
+  it.each([
+    ["no select at all", undefined],
+    ["a select without `reason`", ["title", "scheduledAt"]],
+  ])(
+    "is absent for %s, which gets exactly the upcoming releases",
+    async (_, select) => {
+      const result = await executeWidgetQuery(
+        {
+          source: RELEASES_SOURCE_ID,
+          op: "list",
+          ...(select ? { select } : {}),
+        },
+        caller
+      );
+      expect(items(result).every(item => item.kind !== "attention")).toBe(true);
+      expect(items(result)).toHaveLength(1);
+      expect(upcomingWithAttention).toHaveBeenCalledWith(
+        expect.objectContaining({ attention: false }),
+        expect.anything()
+      );
+    }
+  );
+
+  it("sizes the upcoming releases alone by the limit", async () => {
+    attentionCounts = { stopped: 2, overdue: 2 };
+    const result = await executeWidgetQuery(
+      {
+        source: RELEASES_SOURCE_ID,
+        op: "list",
+        select: ATTENTION_SELECT,
+        limit: 1,
+      },
+      caller
+    );
+    expect(upcomingWithAttention).toHaveBeenCalledWith(
+      expect.objectContaining({ limit: 1 }),
+      expect.anything()
+    );
+    // Both reasons and the one release: the limit did not cut the attention rows.
+    expect(items(result).map(item => item.kind)).toEqual([
+      "attention",
+      "attention",
+      "release",
+    ]);
+  });
+});
+
+describe("each release's entries and issues, asked for by selecting them", () => {
+  const items = (result: unknown) =>
+    (result as { items: Record<string, unknown>[] }).items;
+  const second = { ...row, id: "r2", title: "Summer launch" };
+
+  beforeEach(() => {
+    upcoming = [row, second];
+    memberCounts.mockResolvedValue({
+      r1: { total: 4, goLive: 4, comeDown: 0 },
+      r2: { total: 2, goLive: 1, comeDown: 1 },
+    });
+    readinessOf.mockResolvedValue([
+      {
+        releaseId: "r1",
+        checked: true,
+        // Two problems on one document, one on another, and a note: two
+        // documents to fix, since a note never stops a release.
+        hard: [{ memberId: "m1" }, { memberId: "m1" }, { memberId: "m2" }],
+        soft: [{ memberId: "m3" }],
+        // And one the reader may not read, counted by its collection.
+        hidden: [
+          {
+            scopeKind: "collection",
+            scopeSlug: "secret",
+            count: 2,
+            hard: 1,
+            soft: 0,
+          },
+        ],
+      },
+      { releaseId: "r2", checked: true, hard: [], soft: [], hidden: [] },
+    ]);
+  });
+
+  it("says how many documents each release holds and how many need a fix, by the release list's reads", async () => {
+    const result = await executeWidgetQuery(
+      {
+        source: RELEASES_SOURCE_ID,
+        op: "list",
+        select: ["id", "entries", "issues"],
+      },
+      caller
+    );
+    expect(items(result)).toEqual([
+      { id: "r1", entries: 4, issues: 3 },
+      { id: "r2", entries: 2, issues: 0 },
+    ]);
+    // Read once for the page, as the caller, the reads the release list makes.
+    expect(memberCounts).toHaveBeenCalledTimes(1);
+    expect(memberCounts).toHaveBeenCalledWith(
+      ["r1", "r2"],
+      expect.objectContaining({ userId: "user-1" })
+    );
+    expect(readinessOf).toHaveBeenCalledWith(
+      ["r1", "r2"],
+      expect.objectContaining({ userId: "user-1" })
+    );
+  });
+
+  it("leaves a release the batch did not check without a count of issues", async () => {
+    readinessOf.mockResolvedValue([
+      { releaseId: "r1", checked: false, reason: "over-member-limit" },
+      { releaseId: "r2", checked: true, hard: [], soft: [], hidden: [] },
+    ]);
+    const result = await executeWidgetQuery(
+      { source: RELEASES_SOURCE_ID, op: "list", select: ["id", "issues"] },
+      caller
+    );
+    expect(items(result)).toEqual([
+      { id: "r1", issues: null },
+      { id: "r2", issues: 0 },
+    ]);
+  });
+
+  it("reads neither for a query that selects neither", async () => {
+    await executeWidgetQuery(
+      { source: RELEASES_SOURCE_ID, op: "list", select: ["id", "title"] },
+      caller
+    );
+    expect(memberCounts).not.toHaveBeenCalled();
+    expect(readinessOf).not.toHaveBeenCalled();
+  });
+});
+
+describe("what it refuses", () => {
+  it("refuses a `where`, rather than ignoring it", async () => {
+    // 🔴 The declared fields make a `where` expressible, and this resolver asks
+    // one fixed question. Accepting the filter and discarding it answers a
+    // DIFFERENT question than the one asked, with rows that look right.
+    await expect(
+      executeWidgetQuery(
+        {
+          source: RELEASES_SOURCE_ID,
+          op: "list",
+          where: { state: { equals: "draft" } },
+        },
+        caller
+      )
+    ).rejects.toThrow(/unavailable source or unsupported op/);
+    expect(upcomingWithAttention).not.toHaveBeenCalled();
+  });
+
+  it("refuses a `status` selector, rather than ignoring it", async () => {
+    // The validator accepts `status` for every source, and this resolver
+    // hard-codes `state: "scheduled"`. Accepting the selector and dropping it
+    // answers a question the caller did not ask, with plausible rows.
+    await expect(
+      executeWidgetQuery(
+        { source: RELEASES_SOURCE_ID, op: "list", status: "draft" },
+        caller
+      )
+    ).rejects.toThrow(/unavailable source or unsupported op/);
+    expect(upcomingWithAttention).not.toHaveBeenCalled();
+  });
+
+  it("refuses EVERY unconsumed field, named together", async () => {
+    // 🔴 The property is the boundary, not the three fields. A resolver that
+    // checked them one at a time is what let `status` through, so this asserts
+    // that a query carrying several is refused as a whole.
+    await expect(
+      executeWidgetQuery(
+        {
+          source: RELEASES_SOURCE_ID,
+          op: "list",
+          status: "draft",
+          sort: "-scheduledAt",
+          where: { state: { equals: "draft" } },
+        },
+        caller
+      )
+    ).rejects.toThrow(/unavailable source or unsupported op/);
+    expect(upcomingWithAttention).not.toHaveBeenCalled();
+  });
+
+  it("still answers a query that carries only consumed fields", async () => {
+    // The control. A refusal keyed on "any field present" would satisfy every
+    // case above and refuse the card's own query.
+    await expect(
+      executeWidgetQuery(
+        { source: RELEASES_SOURCE_ID, op: "list", select: ["title"], limit: 2 },
+        caller
+      )
+    ).resolves.toBeDefined();
+    expect(upcomingWithAttention).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a `sort`, rather than ignoring it", async () => {
+    await expect(
+      executeWidgetQuery(
+        { source: RELEASES_SOURCE_ID, op: "list", sort: "-scheduledAt" },
+        caller
+      )
+    ).rejects.toThrow(/unavailable source or unsupported op/);
+    expect(upcomingWithAttention).not.toHaveBeenCalled();
+  });
+
+  it("says nothing specific when the service is not registered", async () => {
+    has.mockReturnValue(false);
+
+    await expect(
+      executeWidgetQuery({ source: RELEASES_SOURCE_ID, op: "list" }, caller)
+    ).rejects.toThrow(/unexpected error|internal/i);
+  });
+});

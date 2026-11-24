@@ -1,0 +1,162 @@
+/**
+ * Which fields a caller may use to choose rows, judged from the field's read
+ * rule for that caller with no entry.
+ *
+ * Two ways a rule's answer can be right by accident and still open the field
+ * to probing, each pinned here: a rule that reads the entry, which with no
+ * entry and no user compares `undefined` with `undefined`; and a field whose
+ * read value is not its stored value, so a query on the stored value probes
+ * what every returned row hides.
+ */
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+// A field rule is handed the caller's roles and grants; with no database
+// behind this suite the real lookups refuse, so they answer here.
+vi.mock("../../../services/lib/permissions", async importOriginal => ({
+  ...(await importOriginal<
+    typeof import("../../../services/lib/permissions")
+  >()),
+  listRoleSlugsForUser: vi.fn(async () => []),
+  listEffectiveGrants: vi.fn(async () => []),
+}));
+
+import {
+  clearFieldFunctions,
+  registerFieldFunctions,
+} from "../field-level-registry";
+import {
+  assertFilterableFields,
+  assertSortableField,
+  filterSearchableFields,
+} from "../filterable-fields";
+
+const SLUG = "vaults";
+
+afterEach(() => {
+  clearFieldFunctions();
+});
+
+/** The serialized refusal, failing when the guard accepted. */
+async function refusalOf(run: Promise<void>): Promise<string> {
+  try {
+    await run;
+  } catch (error) {
+    return JSON.stringify(error);
+  }
+  return expect.unreachable("should have refused");
+}
+
+describe("a rule that reads the entry", () => {
+  it.each([
+    ["data", ({ data, req }: RuleArgs) => data?.owner === req.user?.id],
+    ["id", ({ id, req }: RuleArgs) => id === req.user?.id],
+  ])(
+    "is entry-dependent when it reads %s, whatever it answers",
+    async (_name, read) => {
+      registerFieldFunctions("collection", SLUG, [
+        { name: "note", type: "text", access: { read } },
+      ]);
+      // No user: the comparison is `undefined === undefined`, true by accident.
+      expect(
+        await refusalOf(
+          assertFilterableFields("collection", SLUG, { note: { equals: "x" } })
+        )
+      ).toContain("FIELD_NOT_FILTERABLE");
+      expect(
+        await refusalOf(assertSortableField("collection", SLUG, "note"))
+      ).toContain("FIELD_NOT_SORTABLE");
+      await expect(
+        filterSearchableFields("collection", SLUG, ["note"])
+      ).resolves.toEqual([]);
+    }
+  );
+
+  it("CONTROL: a rule that reads only the caller is judged by its answer", async () => {
+    registerFieldFunctions("collection", SLUG, [
+      {
+        name: "note",
+        type: "text",
+        access: { read: ({ req }: RuleArgs) => req.user?.id === "boss" },
+      },
+    ]);
+    await expect(
+      assertFilterableFields(
+        "collection",
+        SLUG,
+        { note: { equals: "x" } },
+        { caller: { user: { id: "boss" } } }
+      )
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe("a field transformed when it is read", () => {
+  function registerMasked(): void {
+    registerFieldFunctions("collection", SLUG, [
+      {
+        name: "card",
+        type: "text",
+        access: { read: () => true },
+        hooks: {
+          afterRead: [
+            ({ value }: { value: unknown }) => `****${String(value).slice(-4)}`,
+          ],
+        },
+      },
+    ]);
+  }
+
+  it("stays out of filters, sorts and search though its read rule allows", async () => {
+    // Every row shows the masked value, so a query on the stored one would
+    // probe exactly what the rows hide.
+    registerMasked();
+    expect(
+      await refusalOf(
+        assertFilterableFields("collection", SLUG, {
+          card: { like: "4111" },
+        })
+      )
+    ).toContain("FIELD_NOT_FILTERABLE");
+    expect(
+      await refusalOf(assertSortableField("collection", SLUG, "card"))
+    ).toContain("FIELD_NOT_SORTABLE");
+    await expect(
+      filterSearchableFields("collection", SLUG, ["card"])
+    ).resolves.toEqual([]);
+  });
+});
+
+describe("a sort of several keys", () => {
+  const denyAll = () => false;
+
+  it("is refused for a denied key in any position, naming every refused key", async () => {
+    registerFieldFunctions("collection", SLUG, [
+      { name: "title", type: "text" },
+      { name: "note", type: "text", access: { read: denyAll } },
+      { name: "card", type: "text", access: { read: denyAll } },
+    ]);
+    const refusal = await refusalOf(
+      assertSortableField("collection", SLUG, ["title", "note", "card"])
+    );
+    expect(refusal).toContain("FIELD_NOT_SORTABLE");
+    expect(refusal).toContain("sort.note");
+    expect(refusal).toContain("sort.card");
+    expect(refusal).not.toContain("sort.title");
+  });
+
+  it("CONTROL: passes when every key may be read", async () => {
+    registerFieldFunctions("collection", SLUG, [
+      { name: "title", type: "text" },
+      { name: "rank", type: "number" },
+    ]);
+    await expect(
+      assertSortableField("collection", SLUG, ["title", "rank"])
+    ).resolves.toBeUndefined();
+  });
+});
+
+interface RuleArgs {
+  req: { user?: { id?: unknown } };
+  id?: string;
+  data?: Record<string, unknown>;
+}

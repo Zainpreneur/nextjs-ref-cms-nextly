@@ -1,0 +1,698 @@
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import type {
+  WhereClause,
+  SqlParam,
+  DatabaseCapabilities,
+} from "@nextlyhq/adapter-drizzle/types";
+
+import { getDialectTables } from "../database/index";
+import { resolveRelations } from "../database/resolve-relations";
+
+import { normalizeDbTimestamp } from "./lib/date-formatting";
+import { adapterForReads, pooledAdapterOf } from "./lib/read-transaction-scope";
+import {
+  afterCommit,
+  runAdapterTransaction,
+} from "./lib/run-adapter-transaction";
+import type { Logger } from "./types";
+import type { DatabaseAdapter } from "./types/database-adapter";
+
+/**
+ * Base class for all Nextly services providing adapter-based database access.
+ *
+ * This class encapsulates the database adapter pattern, enabling services to work
+ * seamlessly across PostgreSQL, MySQL, and SQLite without database-specific code.
+ * All services should extend this class to gain consistent database access patterns,
+ * transaction management, and helper utilities.
+ *
+ * ## Key Features
+ *
+ * - **Database Abstraction**: Services use adapter interface, not direct Drizzle
+ * - **Transaction Management**: Built-in transaction wrapper with proper typing
+ * - **Query Helpers**: Convenient methods for building WHERE clauses
+ * - **Capability Detection**: Check database-specific feature support
+ * - **Logging**: Integrated logger for all database operations
+ *
+ * ## Architecture
+ *
+ * Services depend on the `DrizzleAdapter` interface, which automatically selects
+ * the correct database adapter (PostgreSQL, MySQL, or SQLite) based on environment
+ * configuration. This enables:
+ *
+ * 1. **Multi-database support** - Same service code works across all databases
+ * 2. **Tree-shaking** - Only the used adapter is bundled
+ * 3. **Type safety** - Full TypeScript support with no `any` casts
+ * 4. **Testability** - Easy to mock adapter for unit tests
+ *
+ * ## Usage Example
+ *
+ * ```typescript
+ * import { BaseService } from './base-service';
+ * import type { DrizzleAdapter } from '@nextlyhq/adapter-drizzle';
+ * import type { Logger } from './shared';
+ *
+ * export class UserService extends BaseService {
+ *   constructor(adapter: DrizzleAdapter, logger: Logger) {
+ *     super(adapter, logger);
+ *   }
+ *
+ *   async findUserById(id: string): Promise<User> {
+ *     // Access dialect for conditional logic
+ *     if (this.dialect === 'postgresql') {
+ *       // PostgreSQL-specific optimization
+ *     }
+ *
+ *     // Use adapter for queries
+ *     const user = await this.adapter.selectOne<User>('users', {
+ *       where: this.whereEq('id', id),
+ *     });
+ *
+ *     if (!user) {
+ *       throw new Error('User not found');
+ *     }
+ *
+ *     return user;
+ *   }
+ *
+ *   async updateUser(id: string, data: Partial<User>): Promise<User> {
+ *     // Use transaction wrapper
+ *     return this.withTransaction(async (tx) => {
+ *       const [updated] = await tx.update<User>(
+ *         'users',
+ *         data,
+ *         this.whereEq('id', id),
+ *         { returning: '*' }
+ *       );
+ *       return updated;
+ *     });
+ *   }
+ *
+ *   async searchUsers(email: string): Promise<User[]> {
+ *     // Check capability before using ILIKE
+ *     if (this.supportsFeature('supportsIlike')) {
+ *       return this.adapter.select<User>('users', {
+ *         where: { and: [{ column: 'email', op: 'ILIKE', value: `%${email}%` }] },
+ *       });
+ *     } else {
+ *       // Fallback for MySQL/SQLite (uses LOWER() LIKE)
+ *       return this.adapter.select<User>('users', {
+ *         where: { and: [{ column: 'email', op: 'LIKE', value: `%${email.toLowerCase()}%` }] },
+ *       });
+ *     }
+ *   }
+ * }
+ * ```
+ *
+ * ## Migration from Legacy BaseService
+ *
+ * If migrating from the old BaseService that accepted `db` and `tables`:
+ *
+ * **Before:**
+ * ```typescript
+ * class UserService extends BaseService<DatabaseInstance, Tables> {
+ *   constructor(db: DatabaseInstance, tables: Tables) {
+ *     super(db, tables);
+ *   }
+ *
+ *   async findById(id: string): Promise<User> {
+ *     const [user] = await this.db
+ *       .select()
+ *       .from(this.tables.users)
+ *       .where(eq(this.tables.users.id, id))
+ *       .limit(1);
+ *     return user;
+ *   }
+ * }
+ * ```
+ *
+ * **After:**
+ * ```typescript
+ * import { users } from '../database/schema'; // Import schema separately
+ *
+ * class UserService extends BaseService {
+ *   constructor(adapter: DrizzleAdapter, logger: Logger) {
+ *     super(adapter, logger);
+ *   }
+ *
+ *   async findById(id: string): Promise<User> {
+ *     const user = await this.adapter.selectOne<User>('users', {
+ *       where: this.whereEq('id', id),
+ *     });
+ *     return user;
+ *   }
+ * }
+ * ```
+ *
+ * @see {@link DrizzleAdapter} - Core adapter interface
+ * @see {@link TransactionContext} - Transaction context methods
+ * @see {@link WhereClause} - WHERE clause structure
+ * @see {@link DatabaseCapabilities} - Database feature flags
+ */
+export abstract class BaseService<
+  TAdapter extends DatabaseAdapter = DatabaseAdapter,
+> {
+  private _tables: TAdapter["tables"] | null = null;
+
+  /** The adapter this service was built with, on its pool. */
+  private readonly pooledAdapter: DrizzleAdapter;
+
+  constructor(
+    adapter: DrizzleAdapter,
+    protected readonly logger: Logger
+  ) {
+    // The adapter itself even when handed a view of it: a sub-service built
+    // on first use inside a read routed to a transaction must not keep that
+    // transaction's view once it has ended.
+    this.pooledAdapter = pooledAdapterOf(adapter);
+  }
+
+  /**
+   * The adapter this service reads and writes through.
+   *
+   * The one it was built with, except inside a read routed to a transaction
+   * the calling flow holds (`runReadsInTransaction`): there, a view of it
+   * whose reads run on that transaction's connection, so a read made from
+   * inside a write's transaction neither waits for a second pooled connection
+   * nor misses what the transaction wrote. {@link db} is built from it, so the
+   * two cannot disagree. See `shared/lib/read-transaction-scope`.
+   */
+  protected get adapter(): DrizzleAdapter {
+    return adapterForReads(this.pooledAdapter);
+  }
+
+  /**
+   * Raw Drizzle instance for relational queries (.query.TABLE.findFirst(), etc.).
+   * Prefer this.adapter methods for simple CRUD; use this.db only when you need
+   * Drizzle's query builder directly (JOINs, relational queries, aggregations).
+   *
+   * The v1 relational query API (db.query.users.findFirst with object
+   * filters) is powered by a relations config (defineRelations output),
+   * not a table map. Resolution goes through resolveRelations on EVERY
+   * access — never cached here — so a SchemaRegistry invalidation (table
+   * re-registered by a Builder save) propagates immediately instead of
+   * stranding this service on relations that close over dropped table
+   * objects. The adapter memoizes the drizzle instance per relations
+   * object, so an unchanged schema costs two map lookups.
+   */
+  protected get db(): TAdapter["db"] {
+    return this.drizzleOn(this.adapter);
+  }
+
+  /** `adapter`'s Drizzle handle, with the relations as they stand now. */
+  private drizzleOn(adapter: DrizzleAdapter): TAdapter["db"] {
+    const relations = resolveRelations(adapter.getCapabilities().dialect);
+    return adapter.getDrizzle<TAdapter["db"]>(relations);
+  }
+
+  /**
+   * Dialect-specific table schemas resolved from the current adapter.
+   * Cached after first access.
+   */
+  protected get tables(): TAdapter["tables"] {
+    if (!this._tables) {
+      this._tables = getDialectTables(this.adapter.getCapabilities().dialect);
+    }
+    return this._tables;
+  }
+
+  /**
+   * Get the current database dialect.
+   *
+   * Use this property for conditional logic when you need database-specific behavior.
+   * However, prefer using the adapter's built-in dialect handling when possible.
+   *
+   * @returns The database dialect: 'postgresql', 'mysql', or 'sqlite'
+   *
+   * @example
+   * ```typescript
+   * // Check dialect for conditional logic
+   * if (this.dialect === 'postgresql') {
+   *   // Use PostgreSQL-specific optimization
+   *   await this.adapter.execute('SELECT ... FOR UPDATE SKIP LOCKED');
+   * } else {
+   *   // Fallback for other databases
+   *   await this.adapter.select('users', { where: ... });
+   * }
+   * ```
+   *
+   * @example
+   * ```typescript
+   * // Log dialect for debugging
+   * this.logger.info(`Running query on ${this.dialect} database`);
+   * ```
+   */
+  protected get dialect(): "postgresql" | "mysql" | "sqlite" {
+    return this.adapter.getCapabilities().dialect;
+  }
+
+  /**
+   * Execute work within a database transaction using Drizzle ORM's fluent API.
+   *
+   * Transactions ensure ACID properties (Atomicity, Consistency, Isolation, Durability)
+   * across multiple database operations. If the callback throws, all changes are rolled
+   * back. If it returns, the transaction commits.
+   *
+   * The `tx` argument is a Drizzle instance that exposes the fluent query API
+   * (`tx.insert(table).values(data)`, `tx.update(table).set(data).where(cond)`, etc.).
+   * On PostgreSQL and MySQL this is a dialect-specific Drizzle transaction object
+   * (`NodePgTransaction` / `MySql2Transaction`). On SQLite it is the shared `this.db`
+   * instance, because better-sqlite3's native transaction API cannot run async callbacks
+   * — see the SQLite branch below for why.
+   *
+   * ## Transaction Behavior by Dialect
+   *
+   * - **PostgreSQL** — routes through Drizzle's `db.transaction(fn)` on the adapter's
+   *   handle, whose transactions are the adapter's: called inside a transaction the
+   *   flow is already in, it joins it, on that transaction's connection, as a
+   *   savepoint; otherwise it opens one on a client of its own. Supports isolation
+   *   levels and fully async callbacks. tx is a Drizzle handle on that connection.
+   * - **MySQL** — the same, joined flat: a failure inside a joined call fails the
+   *   transaction it joined, which then rolls back as a whole.
+   * - **SQLite** — better-sqlite3's `db.transaction()` rejects any callback that returns
+   *   a promise (`TypeError: Transaction function cannot return a promise`). Since
+   *   every Nextly service method is async, we cannot use Drizzle's native SQLite
+   *   transaction. Instead the callback runs inside the adapter's `transaction()`,
+   *   against `this.db`: all Drizzle queries against `this.db` execute on the same
+   *   synchronous connection and therefore participate in that transaction. The
+   *   adapter queues it behind any other transaction on the connection, and runs
+   *   it as a savepoint of the transaction it is called inside, if any — a
+   *   plugin's `ctx.db.transaction` or another service's — so it commits or rolls
+   *   back with that one.
+   *
+   * ## Why not the adapter's positional `TransactionContext`
+   *
+   * The adapter's `TransactionContext` (`tx.insert(table: string, data: object)`)
+   * builds raw SQL strings internally. Drizzle's fluent API uses the same
+   * parameterized query builder as the rest of the codebase, gives schema-based
+   * type safety, and is the pattern (db-adapters refactor) standardized on.
+   * The positional adapter context is only kept for legacy collection-service code
+   * paths that have not yet been migrated.
+   *
+   * @param work - Async function executed inside the transaction. Receives a
+   *   Drizzle instance (transaction on PG/MySQL, shared db on SQLite) as `tx`.
+   * @returns Promise resolving to the function's return value.
+   *
+   * @throws What `work` threw, as thrown, on every dialect. A failure of the
+   *   transaction itself — a `COMMIT` that does not go through — is the
+   *   driver's error on PostgreSQL and MySQL and the adapter's `DatabaseError`
+   *   on SQLite.
+   *
+   * @example Basic insert + insert atomic
+   * ```typescript
+   * async createUserWithProfile(userData: NewUser, profileData: NewProfile): Promise<User> {
+   *   return this.withTransaction(async (tx: any) => {
+   *     const [user] = await tx.insert(this.tables.users).values(userData).returning();
+   *     await tx.insert(this.tables.profiles).values({ ...profileData, userId: user.id });
+   *     return user;
+   *   });
+   * }
+   * ```
+   *
+   * @example Update with rollback on validation failure
+   * ```typescript
+   * async transferCredits(fromId: string, toId: string, amount: number): Promise<void> {
+   *   await this.withTransaction(async (tx: any) => {
+   *     await tx.update(this.tables.users)
+   *       .set({ credits: sql`${this.tables.users.credits} - ${amount}` })
+   *       .where(eq(this.tables.users.id, fromId));
+   *
+   *     await tx.update(this.tables.users)
+   *       .set({ credits: sql`${this.tables.users.credits} + ${amount}` })
+   *       .where(eq(this.tables.users.id, toId));
+   *
+   *     const [sender] = await tx.select().from(this.tables.users)
+   *       .where(eq(this.tables.users.id, fromId));
+   *
+   *     if (sender.credits < 0) {
+   *       // Throwing rolls back BOTH updates atomically.
+   *       throw new Error('Insufficient credits');
+   *     }
+   *   });
+   * }
+   * ```
+   */
+  // The tx argument is dialect-typed (NodePgTransaction / MySql2Transaction /
+  // BetterSQLite3Database). Importing all three would bind BaseService to all
+  // three driver packages and break tree-shaking, so we use `unknown` here and
+  // callers narrow with `(tx: any)` if they need fluent chaining. The fluent
+  // query API surface is identical across all three so most callers don't need
+  // a cast beyond that.
+  protected async withTransaction<T>(
+    work: (tx: unknown) => Promise<T>
+  ): Promise<T> {
+    // SQLite's better-sqlite3 driver is synchronous. Drizzle's
+    // sqlite-core `db.transaction(fn)` explicitly rejects async callbacks
+    // with `TypeError: Transaction function cannot return a promise`. Every
+    // Nextly service method is async (hooks, permission checks, email
+    // dispatch, etc.), so we can never use Drizzle's native SQLite
+    // transaction wrapper.
+    //
+    // The adapter's own `transaction()` carries async work on the one shared
+    // connection instead. We pass `this.db` as the `tx` argument — the same
+    // Drizzle instance `BaseService.db` exposes, on that same connection, so
+    // its queries participate in the transaction. Opening one here with a
+    // raw BEGIN would bypass the adapter: inside a transaction already open
+    // it fails with "cannot start a transaction within a transaction", and
+    // outside one it races the adapter's queue instead of waiting in it.
+    if (this.dialect === "sqlite") {
+      // The work's own error, not the adapter's classification of it: that is
+      // what PostgreSQL and MySQL hand back.
+      return runAdapterTransaction(
+        run => this.adapter.transaction(() => run()),
+        () => work(this.db)
+      );
+    }
+    // PG/MySQL: the adapter's Drizzle handle takes async callbacks, joins the
+    // transaction the calling flow is inside, and otherwise opens one on a
+    // pooled client, running BEGIN, COMMIT or ROLLBACK around the callback.
+    // The pooled handle's, even inside a read routed to a transaction: that
+    // one's handle is Drizzle's own, whose `transaction` would send a second
+    // BEGIN down the connection and COMMIT the outer transaction with it,
+    // while the pooled handle's joins it as a savepoint.
+    return this.drizzleOn(this.pooledAdapter).transaction(work);
+  }
+
+  /**
+   * Run what a write does outside the database (an event, an after-hook, a
+   * cache flush, a webhook drain) once the write is durable: after the
+   * outermost transaction enclosing this call commits, on every dialect, and
+   * never for one that rolls back; at once outside any transaction. See
+   * {@link afterCommit}.
+   */
+  protected afterCommit(effect: () => unknown): Promise<void> {
+    return afterCommit(this.adapter, effect);
+  }
+
+  /**
+   * Run `effect` over a view of a committed row once the write is durable.
+   *
+   * The view is a shallow copy of `entry` as it stands now. Without an
+   * enclosing transaction holding the effect, it runs before this resolves and
+   * whatever it set on the view is copied onto `entry`, exactly as if it had
+   * run on `entry` itself: a field `afterChange` reshapes the response this
+   * way. Inside an enclosing SQLite transaction it runs once that commits,
+   * after the call has returned, so it sees the row as written rather than
+   * the response the call then built from it in place (parsed, redacted), and
+   * it no longer reshapes that response.
+   */
+  protected async afterCommitOver<E extends Record<string, unknown>>(
+    entry: E,
+    effect: (committed: E) => Promise<unknown>
+  ): Promise<void> {
+    const committed = { ...entry };
+    let ranNow = false;
+    await this.afterCommit(async () => {
+      await effect(committed);
+      ranNow = true;
+    });
+    if (ranNow) Object.assign(entry, committed);
+  }
+
+  /**
+   * Build a simple WHERE clause for equality comparison.
+   *
+   * This is a convenience method for the most common WHERE clause pattern.
+   * For more complex queries, use `whereAnd()` or build the clause manually.
+   *
+   * @param column - Column name to filter
+   * @param value - Value to match (string, number, boolean, Date, null, or undefined)
+   * @returns WHERE clause object
+   *
+   * @example Basic equality
+   * ```typescript
+   * const user = await this.adapter.selectOne<User>('users', {
+   *   where: this.whereEq('email', 'user@example.com'),
+   * });
+   * ```
+   *
+   * @example With null value
+   * ```typescript
+   * const unverifiedUsers = await this.adapter.select<User>('users', {
+   *   where: this.whereEq('emailVerifiedAt', null),
+   * });
+   * ```
+   *
+   * @example In update operation
+   * ```typescript
+   * await this.adapter.update<User>(
+   *   'users',
+   *   { status: 'active' },
+   *   this.whereEq('id', userId),
+   *   { returning: '*' }
+   * );
+   * ```
+   *
+   * @example In delete operation
+   * ```typescript
+   * await this.adapter.delete('sessions', this.whereEq('userId', userId));
+   * ```
+   */
+  protected whereEq(column: string, value: unknown): WhereClause {
+    return {
+      and: [{ column, op: "=", value: value as SqlParam }],
+    };
+  }
+
+  /**
+   * Build a WHERE clause with multiple AND conditions.
+   *
+   * All conditions must be true for a row to match. This is equivalent to
+   * SQL: `WHERE column1 = value1 AND column2 = value2 AND ...`
+   *
+   * For single equality checks, prefer `whereEq()` for simplicity.
+   * For OR conditions, build the clause manually using the WhereClause structure.
+   *
+   * @param conditions - Object mapping column names to their values
+   * @returns WHERE clause object with AND conditions
+   *
+   * @example Multiple filters
+   * ```typescript
+   * const activeAdmins = await this.adapter.select<User>('users', {
+   *   where: this.whereAnd({
+   *     role: 'admin',
+   *     status: 'active',
+   *     emailVerified: true,
+   *   }),
+   * });
+   * ```
+   *
+   * @example With null values
+   * ```typescript
+   * const pendingUsers = await this.adapter.select<User>('users', {
+   *   where: this.whereAnd({
+   *     status: 'pending',
+   *     emailVerifiedAt: null,
+   *   }),
+   * });
+   * ```
+   *
+   * @example Combined with other options
+   * ```typescript
+   * const results = await this.adapter.select<Document>('documents', {
+   *   where: this.whereAnd({
+   *     collectionSlug: 'posts',
+   *     status: 'published',
+   *   }),
+   *   orderBy: [{ column: 'createdAt', direction: 'desc' }],
+   *   limit: 10,
+   * });
+   * ```
+   *
+   * @example In transaction
+   * ```typescript
+   * await this.withTransaction(async (tx) => {
+   *   const drafts = await tx.select<Document>('documents', {
+   *     where: this.whereAnd({
+   *       userId: currentUserId,
+   *       status: 'draft',
+   *     }),
+   *   });
+   *
+   *   // Process drafts...
+   * });
+   * ```
+   *
+   * @example For complex OR conditions, build manually
+   * ```typescript
+   * // For: WHERE (role = 'admin' AND status = 'active') OR (role = 'superadmin')
+   * const complexWhere: WhereClause = {
+   *   or: [
+   *     this.whereAnd({ role: 'admin', status: 'active' }),
+   *     this.whereEq('role', 'superadmin'),
+   *   ],
+   * };
+   * const users = await this.adapter.select<User>('users', { where: complexWhere });
+   * ```
+   */
+  protected whereAnd(conditions: Record<string, unknown>): WhereClause {
+    return {
+      and: Object.entries(conditions).map(([column, value]) => ({
+        column,
+        op: "=" as const,
+        value: value as SqlParam,
+      })),
+    };
+  }
+
+  /**
+   * Check if the current database supports a specific feature.
+   *
+   * Use this method to write database-agnostic code that gracefully handles
+   * database-specific features. The adapter will automatically provide fallbacks
+   * for unsupported features when possible.
+   *
+   * ## Database Capabilities
+   *
+   * | Feature              | PostgreSQL | MySQL | SQLite |
+   * |----------------------|------------|-------|--------|
+   * | supportsJsonb        | ✅         | ❌    | ❌     |
+   * | supportsJson         | ✅         | ✅    | ✅     |
+   * | supportsArrays       | ✅         | ❌    | ❌     |
+   * | supportsIlike        | ✅         | ❌    | ❌     |
+   * | supportsReturning    | ✅         | ❌    | ✅     |
+   * | supportsSavepoints   | ✅         | ❌    | ✅     |
+   * | supportsOnConflict   | ✅         | ✅    | ✅     |
+   * | supportsFts          | ✅         | ⚠️    | ❌     |
+   *
+   * @param feature - Feature name from DatabaseCapabilities
+   * @returns True if the database supports the feature
+   *
+   * @example Case-insensitive search
+   * ```typescript
+   * async searchByEmail(email: string): Promise<User[]> {
+   *   if (this.supportsFeature('supportsIlike')) {
+   *     // PostgreSQL: Use native ILIKE
+   *     return this.adapter.select<User>('users', {
+   *       where: { and: [{ column: 'email', op: 'ILIKE', value: `%${email}%` }] },
+   *     });
+   *   } else {
+   *     // MySQL/SQLite: Adapter handles LOWER() LIKE fallback
+   *     return this.adapter.select<User>('users', {
+   *       where: { and: [{ column: 'email', op: 'ILIKE', value: `%${email}%` }] },
+   *     });
+   *     // Note: Adapter automatically converts ILIKE to LOWER() LIKE for MySQL/SQLite
+   *   }
+   * }
+   * ```
+   *
+   * @example RETURNING clause support
+   * ```typescript
+   * async updateAndReturn(id: string, data: Partial<User>): Promise<User> {
+   *   if (this.supportsFeature('supportsReturning')) {
+   *     // PostgreSQL/SQLite: Use RETURNING
+   *     const [updated] = await this.adapter.update<User>(
+   *       'users',
+   *       data,
+   *       this.whereEq('id', id),
+   *       { returning: '*' }
+   *     );
+   *     return updated;
+   *   } else {
+   *     // MySQL: Adapter automatically does UPDATE + SELECT
+   *     const [updated] = await this.adapter.update<User>(
+   *       'users',
+   *       data,
+   *       this.whereEq('id', id),
+   *       { returning: '*' }
+   *     );
+   *     return updated;
+   *     // Note: Adapter handles the two-query pattern automatically
+   *   }
+   * }
+   * ```
+   *
+   * @example Savepoint usage
+   * ```typescript
+   * async complexUpdate(): Promise<void> {
+   *   await this.withTransaction(async (tx) => {
+   *     await tx.insert('audit_log', { action: 'started' });
+   *
+   *     if (this.supportsFeature('supportsSavepoints') && tx.savepoint) {
+   *       await tx.savepoint('before_update');
+   *
+   *       try {
+   *         await tx.update('sensitive_data', { value: 'new' }, this.whereEq('id', '1'));
+   *       } catch (error) {
+   *         await tx.rollbackToSavepoint!('before_update');
+   *         this.logger.warn('Update failed, rolled back to savepoint');
+   *       }
+   *     } else {
+   *       // MySQL: No savepoints, handle differently
+   *       await tx.update('sensitive_data', { value: 'new' }, this.whereEq('id', '1'));
+   *     }
+   *   });
+   * }
+   * ```
+   *
+   * @example JSON/JSONB storage
+   * ```typescript
+   * async storeMetadata(id: string, metadata: object): Promise<void> {
+   *   if (this.supportsFeature('supportsJsonb')) {
+   *     // PostgreSQL: Use JSONB for better performance
+   *     this.logger.info('Using JSONB column for metadata');
+   *   } else if (this.supportsFeature('supportsJson')) {
+   *     // MySQL/SQLite: Use JSON column
+   *     this.logger.info('Using JSON column for metadata');
+   *   }
+   *
+   *   await this.adapter.update(
+   *     'documents',
+   *     { metadata: JSON.stringify(metadata) },
+   *     this.whereEq('id', id)
+   *   );
+   * }
+   * ```
+   *
+   * @example All capabilities
+   * ```typescript
+   * logDatabaseCapabilities(): void {
+   *   const caps = this.adapter.getCapabilities();
+   *   this.logger.info('Database capabilities', {
+   *     dialect: caps.dialect,
+   *     jsonb: caps.supportsJsonb,
+   *     arrays: caps.supportsArrays,
+   *     ilike: caps.supportsIlike,
+   *     returning: caps.supportsReturning,
+   *     savepoints: caps.supportsSavepoints,
+   *     fts: caps.supportsFts,
+   *   });
+   * }
+   * ```
+   */
+  protected supportsFeature(feature: keyof DatabaseCapabilities): boolean {
+    const capabilities = this.adapter.getCapabilities();
+    return !!capabilities[feature];
+  }
+
+  /**
+   * Format a Date for database insertion.
+   *
+   * MySQL requires datetime in 'YYYY-MM-DD HH:MM:SS' format, while PostgreSQL
+   * and SQLite accept ISO 8601 format ('YYYY-MM-DDTHH:MM:SS.sssZ').
+   *
+   * @param date - Date to format (defaults to current date/time)
+   * @returns Formatted date string appropriate for the current database dialect
+   *
+   * @example
+   * ```typescript
+   * const now = this.formatDateForDb();
+   * await this.adapter.insert('records', { created_at: now });
+   * ```
+   */
+  protected formatDateForDb(date: Date = new Date()): Date {
+    return date;
+  }
+
+  /**
+   * Normalize a value from the database into a standard ISO 8601 UTC string.
+   *
+   * Crucial for dynamic tables (Singles) where the DB driver might parse
+   * naive datetime strings using the server's local timezone.
+   *
+   * @param value - The value from the database (Date, string, or unknown)
+   * @returns Optimized ISO string with explicit UTC 'Z' offset
+   */
+  protected normalizeDbTimestamp(value: unknown): string | null {
+    return normalizeDbTimestamp(value);
+  }
+}

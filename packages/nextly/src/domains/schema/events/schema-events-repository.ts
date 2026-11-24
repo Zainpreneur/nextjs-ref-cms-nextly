@@ -1,0 +1,686 @@
+/**
+ * Repository for `nextly_schema_events` — the consolidated bookkeeping table
+ * (spec §4.3). Provides record/transition/supersede/prune/query operations.
+ *
+ * This is the API that Plan C's pipeline rewire consumes. Plan B uses it for
+ * the `nextly upgrade` backfill. Dialect-agnostic: `db` is typed `unknown`
+ * (the schema-domain layer does not leak dialect-specific Drizzle types) and
+ * the correct per-dialect table is selected from `schemaEventsTables(dialect)`.
+ *
+ * @module domains/schema/events/schema-events-repository
+ * @since v0.0.3-alpha (Plan B)
+ */
+
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
+
+import { NextlyError } from "../../../errors";
+import { schemaEventsTables } from "../../../schemas/schema-events";
+import { selectPrunableEventIds } from "../../../schemas/schema-events/pruning";
+import type {
+  SchemaEventScopeKind,
+  SchemaEventSource,
+  SchemaEventStatus,
+  SchemaEventType,
+} from "../../../schemas/schema-events/types";
+import { assertSchemaLockHeld } from "../pipeline/schema-lock";
+
+import { pluginOfLedgerRow } from "./ledger-scope";
+import { standingOf } from "./migration-state";
+import { newestEventsByFilename } from "./newest-event";
+import { asRepositoryDb, type RepositoryDb } from "./repository-db";
+
+/**
+ * Ids deleted per statement. Each binds one parameter, and SQLite's default
+ * SQLITE_MAX_VARIABLE_NUMBER of 999 is the lowest across the supported
+ * dialects; the same run the versions repository deletes in.
+ */
+const DELETE_CHUNK_SIZE = 500;
+
+type Dialect = "postgresql" | "mysql" | "sqlite";
+
+/** A read-back schema-events row (camelCase, as Drizzle maps it). */
+export interface SchemaEventRow {
+  id: string;
+  eventType: SchemaEventType;
+  status: SchemaEventStatus;
+  source: SchemaEventSource;
+  filename: string | null;
+  sha256: string | null;
+  scopeKind: SchemaEventScopeKind | null;
+  scopeSlug: string | null;
+  startedAt: Date;
+  endedAt: Date | null;
+  durationMs: number | null;
+  note: string | null;
+  statementsExecuted: number | null;
+  supersededEventIds: string[] | null;
+  supersededBy: string | null;
+}
+
+export interface RecordStartInput {
+  eventType: SchemaEventType;
+  source: SchemaEventSource;
+  filename?: string | null;
+  sha256?: string | null;
+  scopeKind?: SchemaEventScopeKind | null;
+  scopeSlug?: string | null;
+}
+
+export interface MarkAppliedInput {
+  statementsExecuted?: number | null;
+  renamesApplied?: number | null;
+  durationMs?: number | null;
+  /**
+   * When set, the row is marked `applied` ONLY if no OTHER applied `file_apply`
+   * row already exists for this filename — the atomic "one applied row per
+   * file" guard. This replaces the SQLite partial unique index, which
+   * drizzle-kit 0.31.10 can't round-trip (drizzle-team/drizzle-orm#4688). On
+   * PG/MySQL the migrate lock already serializes runs; SQLite (single-writer,
+   * no explicit lock) relies on this check. If the guard blocks the update,
+   * `markApplied` resolves the row to `superseded` and returns `false` (another
+   * run already applied the file).
+   */
+  uniqueFilename?: string | null;
+}
+
+export interface MarkFailedInput {
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  errorJson?: unknown;
+}
+
+/**
+ * Storage bound for the `error_message` column.
+ *
+ * The column is `text` on every dialect, so this is not a schema limit. It is
+ * a guard against the one real ceiling: MySQL `TEXT` holds 65,535 bytes, and a
+ * write that exceeds it fails — which would leave the migration with no failed
+ * status at all, the worst outcome, since the operator then sees neither the
+ * error nor that one occurred.
+ *
+ * Sized well above any genuine message so the cause chain, which is the part
+ * worth reading and sits at the END of a description, is not cut off. A
+ * tighter cap would routinely discard the driver error while keeping the
+ * generic wrapper text in front of it.
+ */
+export const ERROR_MESSAGE_MAX_LEN = 8000;
+
+/** `note` added after the note a row already carries, if any. */
+function appendNote(existing: string | null, note: string): string {
+  return existing ? `${existing}; ${note}` : note;
+}
+
+/** Marks a truncated message; its length is reserved from the budget. */
+const TRUNCATION_SUFFIX = "...";
+
+/**
+ * Clamp a message to the `error_message` column bound, marking any cut.
+ *
+ * The suffix counts against the budget. Appending it to a full-length slice
+ * would return more characters than the bound allows, which defeats the point:
+ * the write this guards could still overflow, and it would do so exactly when
+ * a failure is being recorded.
+ */
+export function truncateErrorMessage(message: string | undefined): string {
+  // Callers reach this from optional error fields, so an absent message is a
+  // real input rather than a type violation.
+  if (!message) return "";
+  if (message.length <= ERROR_MESSAGE_MAX_LEN) return message;
+  return (
+    message.slice(0, ERROR_MESSAGE_MAX_LEN - TRUNCATION_SUFFIX.length) +
+    TRUNCATION_SUFFIX
+  );
+}
+
+export class SchemaEventsRepository {
+  private readonly db: RepositoryDb;
+  private readonly table: ReturnType<
+    typeof schemaEventsTables
+  >["nextlySchemaEvents"];
+  private readonly dialect: Dialect;
+
+  constructor(db: unknown, dialect: Dialect) {
+    this.db = asRepositoryDb(db);
+    this.table = schemaEventsTables(dialect).nextlySchemaEvents;
+    this.dialect = dialect;
+  }
+
+  /**
+   * The same ledger, written through another Drizzle handle: a migration
+   * transaction's own, so a row recorded through it commits or rolls back
+   * with the statements that transaction ran.
+   */
+  boundTo(db: unknown): SchemaEventsRepository {
+    return new SchemaEventsRepository(db, this.dialect);
+  }
+
+  /**
+   * The start time for an event being recorded NOW, strictly after every event
+   * already recorded for the same file, and for the same scope (a collection's,
+   * a Single's or a component's schema change).
+   *
+   * "Is this file applied?" is answered by the file's newest event, so two
+   * events for one file must never share a `startedAt`: the ledger is read
+   * with no ORDER BY and event ids are random, so a tie — an apply and the
+   * rollback recorded after it in the same millisecond — had no defined
+   * answer. Guaranteeing the order where events are WRITTEN makes every
+   * reader agree without each inventing a tie-break. The columns hold
+   * milliseconds on all three dialects, so one millisecond is enough.
+   *
+   * A scope's schema changes are read the same way: whether a collection's
+   * last change failed is answered by its newest, so a failed save and the
+   * retry that fixed it, recorded in the same millisecond, must not tie
+   * either. Ids are random UUIDs, so the table keeps no insertion order of
+   * its own to break the tie with on read.
+   */
+  private async startAfterNewest(
+    filename: string | null | undefined,
+    scope?: {
+      kind: SchemaEventScopeKind | null | undefined;
+      slug: string | null | undefined;
+    }
+  ): Promise<Date> {
+    const now = new Date();
+    let newest = Number.NEGATIVE_INFINITY;
+    if (filename !== undefined && filename !== null) {
+      const rows = (await this.db
+        .select()
+        .from(this.table)
+        .where(eq(this.table.filename, filename))) as { startedAt: Date }[];
+      for (const row of rows) {
+        newest = Math.max(newest, new Date(row.startedAt).getTime());
+      }
+    }
+    if (typeof scope?.kind === "string" && typeof scope.slug === "string") {
+      const [row] = (await this.db
+        .select()
+        .from(this.table)
+        .where(
+          and(
+            eq(this.table.scopeKind, scope.kind),
+            eq(this.table.scopeSlug, scope.slug)
+          )
+        )
+        .orderBy(desc(this.table.startedAt))
+        .limit(1)) as { startedAt: Date }[];
+      if (row !== undefined) {
+        newest = Math.max(newest, new Date(row.startedAt).getTime());
+      }
+    }
+    return newest >= now.getTime() ? new Date(newest + 1) : now;
+  }
+
+  /** Insert an in_progress event and return its generated id. */
+  async recordStart(input: RecordStartInput): Promise<string> {
+    // A run that lost the schema lock records nothing further (`assertSchemaLockHeld`).
+    await assertSchemaLockHeld();
+    const id = crypto.randomUUID();
+    const values: Record<string, unknown> = {
+      id,
+      eventType: input.eventType,
+      status: "in_progress",
+      source: input.source,
+      startedAt: await this.startAfterNewest(input.filename, {
+        kind: input.scopeKind,
+        slug: input.scopeSlug,
+      }),
+    };
+    if (input.filename !== undefined) values.filename = input.filename;
+    if (input.sha256 !== undefined) values.sha256 = input.sha256;
+    if (input.scopeKind !== undefined) values.scopeKind = input.scopeKind;
+    if (input.scopeSlug !== undefined) values.scopeSlug = input.scopeSlug;
+
+    await this.db.insert(this.table).values(values);
+    return id;
+  }
+
+  /**
+   * Insert an already-terminal event in one shot.
+   *
+   * Without a `startedAt` the event is being recorded now, and is stamped
+   * after its file's or its scope's newest event as `recordStart` is. An explicit one is
+   * kept as given: the upgrade backfill imports history whose times are facts,
+   * not "now".
+   */
+  async insertEvent(values: Record<string, unknown>): Promise<string> {
+    // A run that lost the schema lock records nothing further (`assertSchemaLockHeld`).
+    await assertSchemaLockHeld();
+    const id = (values.id as string | undefined) ?? crypto.randomUUID();
+    const startedAt =
+      values.startedAt ??
+      (await this.startAfterNewest(
+        typeof values.filename === "string" ? values.filename : undefined,
+        {
+          kind:
+            typeof values.scopeKind === "string"
+              ? (values.scopeKind as SchemaEventScopeKind)
+              : null,
+          slug: typeof values.scopeSlug === "string" ? values.scopeSlug : null,
+        }
+      ));
+    await this.db.insert(this.table).values({ id, ...values, startedAt });
+    return id;
+  }
+
+  /**
+   * Transition a row to applied. Returns whether this call actually applied it.
+   *
+   * With `uniqueFilename`, the update is guarded so only one applied `file_apply`
+   * row can exist per file (replaces the SQLite partial unique index, which
+   * drizzle-kit can't round-trip — drizzle-team/drizzle-orm#4688). If another
+   * run already applied the file (a concurrent-apply race), the guard matches
+   * zero rows and this returns `false`; the row is then resolved to `superseded`
+   * so it doesn't dangle at `in_progress` (which would read as a stuck migration
+   * in `migrate:status`). Without `uniqueFilename` it always applies.
+   */
+  async markApplied(id: string, input: MarkAppliedInput): Promise<boolean> {
+    // A run that lost the schema lock records nothing further (`assertSchemaLockHeld`).
+    await assertSchemaLockHeld();
+    const set: Record<string, unknown> = {
+      status: "applied",
+      endedAt: new Date(),
+    };
+    if (input.statementsExecuted !== undefined) {
+      set.statementsExecuted = input.statementsExecuted;
+    }
+    if (input.renamesApplied !== undefined) {
+      set.renamesApplied = input.renamesApplied;
+    }
+    if (input.durationMs !== undefined) set.durationMs = input.durationMs;
+
+    if (!input.uniqueFilename) {
+      await this.db
+        .update(this.table)
+        .set(set)
+        .where(sql`id = ${id}`);
+      return true;
+    }
+
+    // The NOT EXISTS subquery is wrapped in a derived table so MySQL accepts
+    // referencing the target table in an UPDATE (avoids error 1093); SQLite and
+    // Postgres accept it too.
+    await this.db.update(this.table).set(set)
+      .where(sql`id = ${id} AND NOT EXISTS (
+        SELECT 1 FROM (
+          SELECT 1 FROM nextly_schema_events
+           WHERE event_type = 'file_apply'
+             AND status = 'applied'
+             AND filename = ${input.uniqueFilename}
+             AND id <> ${id}
+        ) AS _dup
+      )`);
+
+    // A zero-row update (guard blocked) leaves the row at in_progress. Drivers
+    // don't expose affected-row counts uniformly across the three dialects, so
+    // read the resulting status: if it didn't reach applied, another run won the
+    // race — resolve this row to superseded so it doesn't dangle, and report it.
+    const row = await this.findById(id);
+    if (row?.status === "applied") return true;
+    await this.db
+      .update(this.table)
+      .set({
+        status: "superseded",
+        supersededAt: new Date(),
+        endedAt: new Date(),
+      })
+      .where(sql`id = ${id}`);
+    return false;
+  }
+
+  /**
+   * Delete an attempt that is still `in_progress`, for one whose work was
+   * rolled back whole after another run recorded the same migration first.
+   *
+   * Nothing of the attempt reached the database, and a row left behind it,
+   * whatever its status, would be the file's newest event over the other
+   * run's applied one, so readers would take the file for pending. A row
+   * that has reached any other status is left as it is.
+   */
+  async discardAttempt(id: string): Promise<void> {
+    // A run that lost the schema lock records nothing further (`assertSchemaLockHeld`).
+    await assertSchemaLockHeld();
+    await this.db
+      .delete(this.table)
+      .where(and(eq(this.table.id, id), eq(this.table.status, "in_progress")));
+  }
+
+  /** Transition a row to failed. */
+  async markFailed(id: string, input: MarkFailedInput): Promise<void> {
+    // A run that lost the schema lock records nothing further (`assertSchemaLockHeld`).
+    await assertSchemaLockHeld();
+    await this.db
+      .update(this.table)
+      .set({
+        status: "failed",
+        endedAt: new Date(),
+        errorCode: input.errorCode ?? null,
+        errorMessage: input.errorMessage ?? null,
+        errorJson: input.errorJson ?? null,
+      })
+      .where(sql`id = ${id}`);
+  }
+
+  /**
+   * Transition an attempt to `nothing_applied`: it ended knowing nothing of its unit took effect
+   * (a busy table waited out before anything was made durable), which resolves it, so the next run
+   * applies the unit as usual. The reason is kept as a failure's is.
+   */
+  async markNothingApplied(id: string, input: MarkFailedInput): Promise<void> {
+    // A run that lost the schema lock records nothing further (`assertSchemaLockHeld`).
+    await assertSchemaLockHeld();
+    await this.db
+      .update(this.table)
+      .set({
+        status: "nothing_applied",
+        endedAt: new Date(),
+        errorCode: input.errorCode ?? null,
+        errorMessage: input.errorMessage ?? null,
+        errorJson: input.errorJson ?? null,
+      })
+      .where(sql`id = ${id}`);
+  }
+
+  /**
+   * Whether the migration is applied: for an app migration, its latest
+   * outcome says so, and a record that is not an outcome (an attempt failed or
+   * stopped) leaves it as it was; a later `rolled_back` outcome un-applies it
+   * so the next `migrate` re-runs it. A plugin module keeps its history's
+   * rule, its newest record (`standingOf`).
+   */
+  async isFileApplied(filename: string): Promise<boolean> {
+    const rows = await this.findFileApplies(filename);
+    return standingOf(filename, rows).state === "applied";
+  }
+
+  /** Find a row by id. */
+  async findById(id: string): Promise<SchemaEventRow | undefined> {
+    const rows = (await this.db
+      .select()
+      .from(this.table)
+      .where(sql`id = ${id}`)) as unknown as SchemaEventRow[];
+    return rows[0];
+  }
+
+  /**
+   * Link consumed rows to the consuming event (spec §4.3.2). Sets the
+   * consumer's `superseded_event_ids` and flips each consumed row to
+   * `superseded` with back-references.
+   */
+  async supersede(args: {
+    supersededEventIds: string[];
+    byEventId: string;
+  }): Promise<void> {
+    // A run that lost the schema lock records nothing further (`assertSchemaLockHeld`).
+    await assertSchemaLockHeld();
+    await this.db
+      .update(this.table)
+      .set({ supersededEventIds: args.supersededEventIds })
+      .where(sql`id = ${args.byEventId}`);
+
+    const now = new Date();
+    for (const consumedId of args.supersededEventIds) {
+      await this.db
+        .update(this.table)
+        .set({
+          status: "superseded",
+          supersededAt: now,
+          supersededBy: args.byEventId,
+        })
+        .where(sql`id = ${consumedId}`);
+    }
+  }
+
+  /**
+   * Prune eligible rows (spec §4.3.3) honoring the superseded-row guard
+   * (§4.3.2). Returns the ids actually deleted.
+   */
+  async prune(options: {
+    retentionDays: number;
+    now: Date;
+  }): Promise<string[]> {
+    // A run that lost the schema lock records nothing further (`assertSchemaLockHeld`).
+    await assertSchemaLockHeld();
+    const rows = (await this.db
+      .select()
+      .from(this.table)) as unknown as SchemaEventRow[];
+
+    const prunable = selectPrunableEventIds(
+      rows.map(r => ({
+        id: r.id,
+        eventType: r.eventType,
+        startedAt: r.startedAt,
+        supersededEventIds: r.supersededEventIds,
+        supersededBy: r.supersededBy,
+      })),
+      options
+    );
+
+    for (const id of prunable) {
+      await this.db.delete(this.table).where(sql`id = ${id}`);
+    }
+    return prunable;
+  }
+
+  /**
+   * Delete every migration row a plugin's modules recorded, whatever the
+   * event (applies, rollbacks, failures) and whichever modules are still
+   * applied: a resumed uninstall no longer lists the modules it already
+   * undid, and their rows must go too, so a later install applies every
+   * module from the first. Matched by the ledger's own scope rule
+   * (`pluginOfLedgerRow`), never by a prefix a longer plugin name could
+   * share. `plugin_lifecycle` rows are never matched, so the record the boot
+   * reads stays.
+   */
+  async deletePluginModuleRows(pluginName: string): Promise<void> {
+    // A run that lost the schema lock records nothing further (`assertSchemaLockHeld`).
+    await assertSchemaLockHeld();
+    const rows = (await this.db
+      .select()
+      .from(this.table)
+      .where(
+        sql`event_type <> 'plugin_lifecycle' AND filename LIKE 'plugin:%'`
+      )) as unknown as SchemaEventRow[];
+    const ids = rows
+      .filter(row => pluginOfLedgerRow(row.filename) === pluginName)
+      .map(row => row.id);
+    // In runs: each id binds one parameter, and a plugin's rows can number
+    // more than one statement may bind.
+    for (let at = 0; at < ids.length; at += DELETE_CHUNK_SIZE) {
+      await this.db
+        .delete(this.table)
+        .where(inArray(this.table.id, ids.slice(at, at + DELETE_CHUNK_SIZE)));
+    }
+  }
+
+  /**
+   * Every `plugin_lifecycle` row, which `plugin-lifecycle-state.ts` reads the
+   * newest of per plugin.
+   */
+  async listPluginLifecycle(): Promise<SchemaEventRow[]> {
+    return (await this.db
+      .select()
+      .from(this.table)
+      .where(
+        sql`event_type = 'plugin_lifecycle'`
+      )) as unknown as SchemaEventRow[];
+  }
+
+  /**
+   * Mark that a ledger row names a file an earlier Schema Builder wrote, with
+   * the file's checksum. A one-shot record that is not an outcome: it changes
+   * no migration's state, which `file_apply` rows alone decide.
+   */
+  async recordOldBuilderMark(input: {
+    filename: string;
+    sha256: string;
+    source: SchemaEventSource;
+  }): Promise<string> {
+    return this.insertEvent({
+      eventType: "old_builder_file",
+      status: "applied",
+      source: input.source,
+      filename: input.filename,
+      sha256: input.sha256,
+    });
+  }
+
+  /** The newest mark for each file that has one, by file name. */
+  async currentOldBuilderMarks(): Promise<Map<string, SchemaEventRow>> {
+    const rows = (await this.db
+      .select()
+      .from(this.table)
+      .where(
+        sql`event_type = 'old_builder_file'`
+      )) as unknown as SchemaEventRow[];
+    return newestEventsByFilename(rows);
+  }
+
+  /** All `file_apply` rows, for `nextly migrate:status` (spec §4.3.1). */
+  async listFileApplies(): Promise<SchemaEventRow[]> {
+    return (await this.db
+      .select()
+      .from(this.table)
+      .where(sql`event_type = 'file_apply'`)) as unknown as SchemaEventRow[];
+  }
+
+  /**
+   * Every `file_rollback` row: rollbacks that failed, and rollbacks started
+   * where part of a DOWN can commit before it ends, whose row stays
+   * `in_progress` when the process stops before an outcome is recorded. Kept
+   * apart from `listFileApplies`, whose outcomes alone decide whether a
+   * migration is applied.
+   */
+  async listFailedRollbacks(): Promise<SchemaEventRow[]> {
+    return (await this.db
+      .select()
+      .from(this.table)
+      .where(sql`event_type = 'file_rollback'`)) as unknown as SchemaEventRow[];
+  }
+
+  /**
+   * Record that an applied app migration's file was removed from the folder
+   * on purpose (`migrate:resolve --removed`), with the checksum its applied
+   * outcome recorded. Its own event type, so no reader of a migration's state,
+   * which reads `file_apply` rows alone, takes it for an outcome.
+   */
+  async recordRemoval(input: {
+    filename: string;
+    sha256: string | null;
+  }): Promise<string> {
+    return this.insertEvent({
+      eventType: "file_removed",
+      status: "recorded",
+      source: "cli-migrate",
+      filename: input.filename,
+      sha256: input.sha256,
+      endedAt: new Date(),
+    });
+  }
+
+  /** Every recorded removal of an app migration's file (`recordRemoval`). */
+  async listFileRemovals(): Promise<SchemaEventRow[]> {
+    return (await this.db
+      .select()
+      .from(this.table)
+      .where(sql`event_type = 'file_removed'`)) as unknown as SchemaEventRow[];
+  }
+
+  /** All `file_apply` rows for a single filename (applied + failed + rolled_back). */
+  async findFileApplies(filename: string): Promise<SchemaEventRow[]> {
+    return (await this.db
+      .select()
+      .from(this.table)
+      .where(
+        sql`filename = ${filename} AND event_type = 'file_apply'`
+      )) as unknown as SchemaEventRow[];
+  }
+
+  /**
+   * Record a checksum on a row in place, with `note` added after any note it
+   * has: the checksum of an applied migration's file as it now stands, where
+   * `migrate:resolve --applied` accepts an edit to it, or where the row was
+   * recorded without one. Only the checksum and the note change, so the row
+   * is the same outcome it was, read the same way by every build.
+   */
+  async recordChecksum(
+    id: string,
+    sha256: string,
+    note: string
+  ): Promise<void> {
+    // A run that lost the schema lock records nothing further (`assertSchemaLockHeld`).
+    await assertSchemaLockHeld();
+    const row = await this.findById(id);
+    if (!row) return;
+    await this.db
+      .update(this.table)
+      .set({ sha256, note: appendNote(row.note, note) })
+      .where(sql`id = ${id}`);
+  }
+
+  /**
+   * Every `file_rollback` row for one filename: its down section's attempts,
+   * which `migrate:resolve --failed-cleanup` clears beside its UP's.
+   */
+  async findFileRollbacks(filename: string): Promise<SchemaEventRow[]> {
+    return (await this.db
+      .select()
+      .from(this.table)
+      .where(
+        sql`filename = ${filename} AND event_type = 'file_rollback'`
+      )) as unknown as SchemaEventRow[];
+  }
+
+  /**
+   * Transition a row to rolled_back (used by migrate:resolve --failed-cleanup).
+   *
+   * Only the status changes on the record of the attempt itself: its start
+   * and end times and its error stay as the attempt left them, so a cleared
+   * attempt still says when it ran and why it failed. A row with no end time
+   * gets one now, and `note` is added after any note the row already had.
+   */
+  async markRolledBack(
+    id: string,
+    input: { note?: string | null } = {}
+  ): Promise<void> {
+    // A run that lost the schema lock records nothing further (`assertSchemaLockHeld`).
+    await assertSchemaLockHeld();
+    const row = await this.findById(id);
+    if (!row) return;
+    const set: Record<string, unknown> = { status: "rolled_back" };
+    if (row.endedAt === null) set.endedAt = new Date();
+    if (input.note) set.note = appendNote(row.note, input.note);
+    await this.db
+      .update(this.table)
+      .set(set)
+      .where(sql`id = ${id}`);
+  }
+
+  /** Every event for a given scope, oldest-first (spec §4.3.1). */
+  async listByScope(
+    scopeKind: SchemaEventScopeKind,
+    scopeSlug: string
+  ): Promise<SchemaEventRow[]> {
+    return (await this.db
+      .select()
+      .from(this.table)
+      .where(
+        sql`scope_kind = ${scopeKind} AND scope_slug = ${scopeSlug}`
+      )) as unknown as SchemaEventRow[];
+  }
+
+  /**
+   * Optional pre-flight check that throws DUPLICATE if a file is already
+   * applied. The authoritative "one applied row per file" guard is the
+   * conditional `markApplied({ uniqueFilename })` (atomic) plus the migrate
+   * lock that serializes runs on PG/MySQL; this is a softer, earlier signal.
+   * Only PG keeps a DB-level partial unique index; SQLite/MySQL enforce in code.
+   */
+  async assertFileNotAlreadyApplied(filename: string): Promise<void> {
+    if (await this.isFileApplied(filename)) {
+      throw new NextlyError({
+        code: "DUPLICATE",
+        publicMessage: `Migration file already applied: ${filename}`,
+      });
+    }
+  }
+}

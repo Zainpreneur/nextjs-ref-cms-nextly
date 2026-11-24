@@ -1,0 +1,300 @@
+---
+title: Deployment
+description: Deploy a Nextly application to Vercel (recommended) or self-host on Node.js. Production checklist, environment variables, and database migrations.
+---
+
+A Nextly application is a standard Next.js app, so anywhere Next.js runs is fair game. This guide covers the two paths Nextly is built around:
+
+- **Vercel** (recommended) -- the default target. Zero-config Next.js, first-class Vercel Blob storage, build-step migrations.
+- **Self-host** -- Node.js 22.12+ or 24+ behind a process manager and reverse proxy. Linked out for the operator-side details rather than reproduced here.
+
+Whichever you choose, run database migrations on a CI/CD step (or your laptop) **before** the new app code takes traffic. The deployed app never touches schema -- see [Production migrations](/docs/guides/production-migrations) for why.
+
+## Production checklist (the short list)
+
+Before you ship, set the following:
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `NODE_ENV` | yes | Set to `production`. |
+| `DB_DIALECT` | yes | `postgresql`, `mysql`, or `sqlite`. PostgreSQL recommended. |
+| `DATABASE_URL` | yes (Postgres / MySQL) | Database connection string. |
+| `NEXTLY_SECRET` | yes | JWT signing secret, **at least 32 characters**. Generate with `openssl rand -base64 32`. |
+| `NEXT_PUBLIC_APP_URL` | yes | The public URL of your deployment (used in client code and email links). |
+| `NEXTLY_SETUP_TOKEN` | no | The token that opens `/admin/setup` in production, at least 43 characters with at least 16 distinct ones. Unset, Nextly generates one and prints it to the server's output. See [The first administrator](#the-first-administrator). |
+| `NEXTLY_ALLOWED_ORIGINS` | self-hosted | Comma-separated additional CSRF origins: the origin browsers use whenever it differs from the address a self-hosted server listens on -- behind a proxy, by IP or hostname, or in a container (the origin check otherwise sees only that address, and refuses sign-in and plugin-route writes with `CSRF_FAILED`), plus any other origin such as a separate frontend domain. |
+
+Plus storage env vars if you're using cloud storage (see [Media & Storage](/docs/guides/media-storage)) and email env vars if you're using a real provider (see [Email](/docs/guides/email)).
+
+> **Note:** Boot-time validation refuses to start in production unless `NEXTLY_SECRET` is at least 32 characters and `NEXT_PUBLIC_APP_URL` is set.
+
+## Deploy to Vercel
+
+Vercel is the recommended platform for Nextly. Next.js detection is automatic, the Vercel Blob adapter is the easiest storage option, and the build step doubles as a migration runner.
+
+### 1. Push to GitHub and import
+
+1. Push the project to GitHub, GitLab, or Bitbucket.
+2. Open the [Vercel Dashboard](https://vercel.com/new), import the repository.
+3. Vercel detects Next.js and configures the build pipeline. Override only if you've customised the build script (see step 3 below).
+
+### 2. Configure environment variables
+
+In **Project Settings -> Environment Variables**, add everything from the production checklist above, plus storage and email variables you intend to use.
+
+Set them for **Production** and **Preview** environments separately if you want preview deployments to talk to a staging database.
+
+### 3. Build command
+
+A scaffolded Nextly project ships this `build` script in `package.json`:
+
+```json
+{
+  "scripts": {
+    "build": "nextly migrate && next build"
+  }
+}
+```
+
+The `nextly migrate` step runs against the database referenced by `DATABASE_URL` during the Vercel build, so pending migrations are applied as part of every deploy. Keep it before the deploy serves: a production start writes no registry rows, permissions or role grants and creates or changes no table, so a new collection, field or permission reaches the database only through `nextly migrate` (see [What a production start writes](/docs/guides/production-migrations#what-a-production-start-writes) and [A production start changes no table](/docs/guides/production-migrations#a-production-start-changes-no-table)). A first deploy against an empty database needs it too: a production start there creates nothing and refuses with `NEXTLY_DATABASE_NOT_SET_UP`, naming `nextly migrate`. Migrations are forward-only -- to undo, write a new corrective migration. See [Production migrations](/docs/guides/production-migrations) for the deeper trade-offs (build-time vs. CI-step migrations) and recovery patterns.
+
+If you'd rather run migrations in a separate CI job before the Vercel deploy promotes (recommended once you have multiple developers / preview deploys), wire it into a GitHub Actions workflow as described in the migrations guide and remove `nextly migrate` from `build`.
+
+### 4. Storage on Vercel
+
+The default zero-config local-disk adapter does **not** work on Vercel -- serverless function instances are ephemeral, so `./public/uploads/` is wiped on cold start. Pick one of:
+
+- **Vercel Blob** (easiest) -- install `@nextlyhq/storage-vercel-blob`, set `BLOB_READ_WRITE_TOKEN`. The auto-detection picks it up:
+
+  ```typescript
+  // nextly.config.ts
+  import { defineConfig } from "nextly/config";
+  import { getStorageFromEnv } from "nextly/storage";
+
+  export default defineConfig({
+    storage: await getStorageFromEnv(),
+  });
+  ```
+
+- **S3 / R2 / DigitalOcean Spaces / etc.** -- install `@nextlyhq/storage-s3`, set `S3_BUCKET` + `S3_REGION` + `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (and `S3_ENDPOINT` + `S3_FORCE_PATH_STYLE` for non-AWS providers).
+
+Vercel's serverless functions also have a 4.5MB request-body limit. To accept larger files, store them on S3 (or an S3-compatible provider) and enable client-side direct uploads for that collection. Vercel Blob does not sign direct uploads.
+
+```typescript
+// nextly.config.ts
+import { defineConfig } from "nextly/config";
+import { s3Storage } from "@nextlyhq/storage-s3";
+
+export default defineConfig({
+  storage: [
+    s3Storage({
+      bucket: process.env.S3_BUCKET!,
+      region: process.env.S3_REGION!,
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+      collections: {
+        media: {
+          clientUploads: true,
+        },
+      },
+    }),
+  ],
+});
+```
+
+The browser asks `POST /api/nextly/storage/upload-url` for a URL with the file's `filename`, `mimeType`, `collection` and exact `size`, then sends the file to that URL. The file is checked before the URL is signed (see [Media upload security](/docs/configuration/media-upload-security)).
+
+See [Media & Storage](/docs/guides/media-storage) for the full storage reference.
+
+### 5. Database
+
+Use a managed PostgreSQL service that's reachable from Vercel's IP ranges:
+
+- [Vercel Postgres](https://vercel.com/storage/postgres)
+- [Neon](https://neon.tech)
+- [Supabase](https://supabase.com)
+- [PlanetScale](https://planetscale.com) (MySQL)
+
+SQLite is **not** suitable for Vercel deployments -- the file would be wiped on every cold start. See [Database](/docs/database) for adapter-specific guidance.
+
+#### Database connections on Vercel
+
+A Vercel function instance serves many requests and is suspended between them, and a suspended instance keeps the database connections it holds open. A pool sized for a long-running server, ten connections kept for thirty seconds, can then use up a small database's connection limit across a handful of instances, and new connections fail with "too many connections".
+
+So on Vercel (where `VERCEL` is set, in functions and builds) the PostgreSQL and MySQL adapters default to a small pool: at most 3 connections, none kept open, and an idle connection closed after 5 seconds. Install `@vercel/functions` in the app as well:
+
+```bash
+pnpm add @vercel/functions
+```
+
+With it installed, the adapter hands its pool to [`attachDatabasePool`](https://vercel.com/docs/functions/functions-api-reference/vercel-functions-package#attachdatabasepool), which keeps an instance alive until its idle connections have closed, rather than suspending it with them open. Without it the adapter logs one warning when it connects and relies on the short idle timeout alone.
+
+To size the pool yourself, set `DB_POOL_MAX`, `DB_POOL_MIN` or `DB_POOL_IDLE_TIMEOUT`, or pass `pool` to the adapter. Each setting replaces only its own default, so `DB_POOL_MAX=10` gives a larger pool that still closes idle connections after 5 seconds. Setting all three (`DB_POOL_MAX=10`, `DB_POOL_MIN=0`, `DB_POOL_IDLE_TIMEOUT=30000`) returns to the defaults of a long-running server, on PostgreSQL and MySQL alike.
+
+To check the budget, multiply the pool's maximum by the function instances you expect at peak, and add the build: each Next.js build worker opens its own pool while it prerenders. Keep the total under your database's connection limit, with room for migrations and your own tools.
+
+Nextly does not ship a connection pooler. When the budget does not fit, because traffic runs many instances or the plan allows few connections, put the provider's pooler in front of the database and point `DATABASE_URL` at it:
+
+- **Neon**: the pooled connection string (its host ends in `-pooler`).
+- **Supabase**: the Supavisor pooler's connection string from the project's database settings.
+- **Self-hosted PostgreSQL**: PgBouncer.
+
+A transaction-mode pooler hands each transaction whichever server connection is free, so session state does not carry from one transaction to the next. If you set the adapter's `schema`, Nextly sends `search_path` as a connection startup option; check that your pooler passes it through. See [PostgreSQL connection pool](/docs/database/postgres#connection-pool) and [MySQL connection pool](/docs/database/mysql#connection-pool).
+
+### 6. Client addresses
+
+Set `security.trustProxy: true` in `nextly.config.ts`, so sign-in is rate limited per client and audit records carry real addresses. Vercel's edge makes this safe: see [On Vercel](#on-vercel).
+
+## Self-host with Node.js
+
+Run Nextly on any host that supports Node.js 22.12+ or 24+. The deployment shape is intentionally boring: build the app, run it under a process manager, put a reverse proxy in front for SSL.
+
+### Requirements
+
+- **Node.js 22.12+ or 24+** (matches the `serverExternalPackages` and `sharp` ABI requirements).
+- **A process manager** -- pm2, systemd, Docker, or similar. Keep the Node process supervised so crashes auto-restart.
+- **A reverse proxy** -- nginx or Caddy in front for TLS termination, HTTP/2, and access logging.
+
+### Build and start
+
+```bash
+pnpm install --frozen-lockfile
+pnpm build
+pnpm start
+```
+
+The scaffolded `build` script runs `nextly migrate && next build`, and `pnpm start` is `next start`. If you'd rather run migrations as a separate step (recommended for production with zero-downtime deploys), drop `nextly migrate` from `build` and run it via your CI pipeline before promoting the new release.
+
+### Environment variables
+
+Configure the same variables listed in the production checklist above. On most hosts that means a `.env` file outside the repo (loaded by your process manager) or a secrets manager.
+
+### Process manager and reverse proxy
+
+Use a process manager (pm2, systemd, Docker, etc.) and a reverse proxy (nginx, Caddy, etc.) -- consult their documentation for setup specific to your distribution. The Nextly process is a plain Next.js server; nothing about it requires special configuration beyond ensuring the proxy forwards `Host` and `X-Forwarded-Proto` so callbacks resolve correctly.
+
+To rate-limit sign-in per client and record real client addresses, let Nextly read the address your proxy reports: see [Client addresses and the auth rate limit](#client-addresses-and-the-auth-rate-limit).
+
+### Migrations on deploy
+
+For self-hosted deploys, the same forward-only model applies. Run `nextly migrate` against the production database **before** the new app binary takes traffic. A production start does not bring the registry, the permissions, the role grants or the tables up to date itself: until `nextly migrate` runs, a declared field the database lacks answers `ENTITY_NOT_MIGRATED`, and against an empty database the start refuses, naming `nextly migrate`. A changed `dbName` needs a migration of its own (see [A changed `dbName`](/docs/guides/production-migrations#a-changed-dbname)), and a site whose tables its starts made before this release takes a baseline before upgrading (see [Upgrading a site whose starts made its tables](/docs/guides/production-migrations#upgrading-a-site-whose-starts-made-its-tables)).
+
+Do not move production back to a Nextly release from before the one where starts stopped writing this bookkeeping: such a release seeds the permissions and the preset role grants at every production start, from its own configuration, and nothing turns that off. See [Production migrations](/docs/guides/production-migrations) for GitHub Actions, Railway, Render, Fly.io, and AWS examples.
+
+## When the database is busy
+
+A request waits for a database connection for at most `pool.connectionTimeoutMs`, 15 seconds by default (20 on Neon, from the PostgreSQL adapter's provider defaults), on every dialect: for a free pooled connection on PostgreSQL and MySQL, and on SQLite for the one connection behind the transactions ahead of it. A request still waiting after that fails with the code `DATABASE_BUSY`, status 503, and a `Retry-After: 5` header. The statement or transaction that waited did not run, but anything the request committed before it stays committed: a request that does its writing in one transaction can be sent again as it is, and one that writes in several steps is safe to repeat only where those steps are.
+
+A steady stream of `DATABASE_BUSY` means the pool is too small for the traffic, or something holds its connections too long. Look for long transactions first, then raise `pool.max` within your database's connection limit, or raise `pool.connectionTimeoutMs` if a longer wait suits your traffic better than a retry. Both are set on the adapter: see the connection pool sections for [PostgreSQL](/docs/database/postgres#connection-pool), [MySQL](/docs/database/mysql#connection-pool) and [SQLite](/docs/database/sqlite#sqlite-specific-options).
+
+## Client addresses and the auth rate limit
+
+A Next.js request carries no peer address, so Nextly learns the client's address only from a header a proxy sets, and it reads that header only when `security.trustProxy` is `true`. That is off by default, because a header a client can set itself would let anyone pick their own address.
+
+While it is off, the [auth rate limit](/docs/guides/authentication#auth-rate-limit) counts each sign-in request against the account it names, under a shared ceiling, rather than per client. That keeps credential stuffing bounded, but someone who knows an address can spend that account's budget. Turn it on wherever a proxy you control always sets the header.
+
+### On Vercel
+
+Vercel's edge overwrites `x-forwarded-for` with the client's own address and does not pass on one a caller sent, so trusting it there is safe:
+
+```ts title="nextly.config.ts"
+export default defineConfig({
+  security: {
+    trustProxy: true,
+  },
+});
+```
+
+No `TRUSTED_PROXY_IPS` is needed. Until this is set, Nextly logs a warning at startup on Vercel naming the setting.
+
+This holds when requests reach Vercel directly. If another proxy or CDN sits in front of Vercel, Vercel's edge overwrites `x-forwarded-for` with that proxy's address rather than the client's ([Vercel's request headers](https://vercel.com/docs/headers/request-headers#x-forwarded-for)). Every client then reads as the proxy, and shares one budget. In that setup, configure Vercel's Trusted Proxy support so the client's address is passed through, or leave `security.trustProxy` off.
+
+### Behind your own reverse proxy
+
+Have the proxy append the address it received the request from to `X-Forwarded-For`, and set `security.trustProxy: true` as above. In nginx:
+
+```nginx
+location / {
+  proxy_pass http://127.0.0.1:3000;
+  proxy_set_header Host $host;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+Caddy's `reverse_proxy` sets `X-Forwarded-For` to the address it received the request from, with no extra configuration, when requests reach Caddy directly.
+
+Nextly reads `X-Forwarded-For` from the right, so with one proxy the last address is the client's. When something else sits in front of that proxy, such as a load balancer or CDN, its addresses appear in the header too. List them in `TRUSTED_PROXY_IPS` (comma-separated IPv4 CIDR ranges or addresses, and exact IPv6 addresses; an IPv6 range such as `2001:db8::/32` is not supported and is ignored) so Nextly skips them and reaches the client:
+
+```bash
+TRUSTED_PROXY_IPS=10.0.0.0/8,192.168.1.10
+```
+
+Caddy behind such a hop also needs to be told to trust it. By default Caddy ignores an incoming `X-Forwarded-For` and passes on only the address of the hop in front of it, so Nextly would count every client as that hop. Name the hops in Caddy's global options, and have Caddy read the header from the right as Nextly does:
+
+```caddyfile
+{
+  servers {
+    trusted_proxies static 10.0.0.0/8 192.168.1.10
+    trusted_proxies_strict
+  }
+}
+```
+
+See Caddy's [`reverse_proxy` defaults](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#defaults).
+
+Only turn `security.trustProxy` on when every request reaches Nextly through the proxy. If the app's own port is reachable directly, a caller can send any `X-Forwarded-For` they like and choose the address they are counted under.
+
+If requests arrive with proxy headers that Nextly still cannot use, because `security.trustProxy` is unset or every address in the header is listed as a trusted proxy, Nextly logs one warning per process naming both settings.
+
+## The first administrator
+
+> **Needs the release after 0.0.2-alpha.68.** Before it, setup has no token and closes once the first account exists, and registration is open: create the first administrator before the site is reachable, or keep it behind your host's access protection until you have.
+
+A production install with no administrator does not hand setup to whoever reaches it first. Create the first administrator in one of two ways.
+
+**With the setup token**, in the browser:
+
+1. Find the token. Either set your own before deploying, `NEXTLY_SETUP_TOKEN` (generate one with `pnpm nextly setup-token --generate`), or let Nextly generate one: at the first production start it prints a line starting with `[nextly] SETUP TOKEN` to the server's output. On Vercel, search the deployment's runtime logs for that prefix.
+2. Open `/admin/setup` on the site, enter the token, and create the account.
+
+A generated token lasts 24 hours and one setup. If you lost it, `pnpm nextly setup-token`, run with the production environment, replaces it and prints the new one. The token is spent by the setup it opens, so nothing opens setup again afterwards.
+
+**From the command line**, with no browser and no token:
+
+```bash
+NEXTLY_ADMIN_PASSWORD='<your password>' \
+  pnpm nextly users:create-admin --email admin@example.com --name "Site Admin"
+```
+
+Run it with the production environment (`DATABASE_URL`, and `DB_DIALECT` if you set it), from your machine or a CI step. The password must be 8 to 128 characters with a lowercase letter, an uppercase letter, a number and a symbol. Without `NEXTLY_ADMIN_PASSWORD`, it prompts for the password at a terminal.
+
+Both refuse once an administrator exists. The details, the refusals and the rules the password must pass are in [Authentication](/docs/guides/authentication#the-first-administrator).
+
+## Final checklist
+
+Before going live, verify:
+
+- [ ] `NODE_ENV=production`.
+- [ ] `NEXTLY_SECRET` is at least 32 characters (generated with `openssl rand -base64 32`).
+- [ ] `DATABASE_URL` points to a production database (not localhost / SQLite).
+- [ ] `NEXT_PUBLIC_APP_URL` is the public URL of your deployment.
+- [ ] `NEXTLY_ALLOWED_ORIGINS` lists the origin browsers use whenever it differs from the address the self-hosted server listens on (behind a proxy, by IP or hostname, or in a container), and any additional CSRF origins (separate frontend domain, mobile bundle, etc.).
+- [ ] Storage adapter is configured for non-ephemeral filesystems (no local disk on serverless).
+- [ ] An email provider is configured (Resend, SMTP, or SendLayer) -- without one, password-reset and verification tokens are returned in the API response as a development fallback.
+- [ ] The first administrator exists: created at `/admin/setup` with the setup token, or with `nextly users:create-admin`.
+- [ ] All pending migrations have been applied (`nextly migrate:status` reports zero pending and zero unfinished), by a `nextly migrate` that runs before each deploy serves: a production start writes no registry rows, permissions or role grants itself, and creates or changes no table.
+- [ ] The reverse proxy / load balancer terminates TLS and forwards real client headers.
+- [ ] `security.trustProxy` is `true` on Vercel or behind a proxy every request passes through, with `TRUSTED_PROXY_IPS` listing any hops in front of it (see [Client addresses and the auth rate limit](#client-addresses-and-the-auth-rate-limit)).
+- [ ] Database backups are configured (your hosting provider's snapshots, point-in-time recovery, etc.).
+- [ ] Monitoring / error reporting is wired up (Sentry, Datadog, etc.).
+- [ ] `.env*` files are not committed to version control.
+
+## Next steps
+
+- [Production migrations](/docs/guides/production-migrations) -- forward-only migration model, GitHub Actions and other CI examples.
+- [Authentication](/docs/guides/authentication) -- session, RBAC, and API key configuration.
+- [Media & Storage](/docs/guides/media-storage) -- adapter-specific configuration for S3, Vercel Blob, Uploadthing, local disk.
+- [Email](/docs/guides/email) -- provider setup and local Mailpit testing.
+- [Environment Variables](/docs/configuration/environment) -- full environment variable reference.
+- [Database](/docs/database) -- adapter setup and connection options.

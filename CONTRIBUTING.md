@@ -1,0 +1,639 @@
+# Contributing to Nextly
+
+Thanks for your interest in contributing to Nextly. This guide walks you through reporting issues, proposing features, and submitting pull requests. Whether it's a typo fix or a new database adapter, every contribution helps.
+
+This project and everyone participating in it are governed by our [Code of Conduct](./CODE_OF_CONDUCT.md). By participating, you're expected to uphold it.
+
+## Where to get help
+
+- **Have a question?** → [GitHub Discussions](https://github.com/nextlyhq/nextly/discussions)
+- **Found a bug?** → [Open an issue](https://github.com/nextlyhq/nextly/issues/new/choose) (use the bug template)
+- **Want to propose a feature?** → [Start a discussion](https://github.com/nextlyhq/nextly/discussions) or [open a feature request](https://github.com/nextlyhq/nextly/issues/new/choose)
+- **Found a security issue?** → See [Reporting security issues](#reporting-security-issues) below — do not open a public issue
+
+## Reporting bugs
+
+Before opening a bug, please:
+
+1. Search [existing issues](https://github.com/nextlyhq/nextly/issues?q=is%3Aissue) to avoid duplicates.
+2. Confirm you're on the latest version of the affected package.
+3. Use the [Bug Report template](https://github.com/nextlyhq/nextly/issues/new?template=bug_report.yml) — it asks the questions we need to triage quickly.
+
+The single biggest factor in how fast a bug gets fixed is **a minimal reproduction**. Issues without one are likely to be closed. The fastest way to start one: `pnpm create nextly-app@alpha`, push the failing scenario to a public repo, and link it in the bug report.
+
+## Reporting security issues
+
+**Do not open public issues for security vulnerabilities.** Please use GitHub's [private security advisory form](https://github.com/nextlyhq/nextly/security/advisories/new) instead. We'll respond as quickly as we can and coordinate disclosure with you.
+
+If you find a vulnerability of significant impact, we'd love to acknowledge your help in the eventual security advisory.
+
+## Feature requests and large changes
+
+Small features and bug fixes can go straight to a PR. For anything larger — new APIs, new packages, breaking changes, schema redesigns — please **start a [Discussion](https://github.com/nextlyhq/nextly/discussions) first**. New functionality often has implications across the monorepo, and it's much faster to align on the approach before writing code than after.
+
+We don't yet have a formal RFC process; significant proposals are discussed in GitHub Discussions until they're ready to become PRs.
+
+---
+
+## Development setup
+
+### Prerequisites
+
+- Node.js `^22.12.0 || >=24.0.0` (Node 24 LTS recommended, and
+  pinned at 24.22.1 in `.nvmrc` — `nvm use` picks it up). The ranges are
+  disjoint on purpose: they mirror what the test environment supports, so the
+  23.x line is excluded rather than merely untested, and Node 20 is not
+  supported. That range is what the PUBLISHED packages support; 24.22.1 is
+  what contributors and CI run, and the two move independently.
+- pnpm 12.5.1, pinned as `packageManager` in `package.json`. Do not install a
+  pnpm yourself: `corepack enable` once, and every `pnpm` in the repo resolves
+  to the pinned version. pnpm 10+ also self-corrects to it. Settings live in
+  `pnpm-workspace.yaml`, since pnpm reads only auth and registry settings from
+  `.npmrc`.
+- In VS Code, the "TypeScript (Native Preview)" extension
+  (`TypeScriptTeam.native-preview`), which `.vscode/extensions.json`
+  recommends. The repository compiles with TypeScript 7, and this extension is
+  its language server; VS Code's built-in TypeScript is an older compiler that
+  reports differently. Once installed it is the default, and the commands
+  "Disable/Enable TypeScript 7 Language Server" switch between the two.
+- Docker Desktop, optional. Only needed if you want to test against PostgreSQL or MySQL via `pnpm dev:postgres` / `pnpm dev:mysql`, or run the full integration test matrix. SQLite (the default) needs none.
+- On Windows, `.gitattributes` checks text files out with LF line endings, whatever `core.autocrlf` says, so the tests read files as they read them on Linux and macOS. A clone made before `.gitattributes` said so keeps its CRLF files until they are checked out again. With nothing uncommitted, run this once in the clone: `git rm -r -q --cached . && git reset -q --hard`.
+
+### One-command boot
+
+```bash
+git clone https://github.com/nextlyhq/nextly.git
+cd nextly
+pnpm install
+pnpm dev:app
+```
+
+That is it. `pnpm dev:app` runs pre-flight checks, syncs the SQLite schema, seeds a small demo dataset (1 super-admin, 5 posts, 2 categories, 3 tags, 2 media), then spawns `next dev`. First request to `/admin` issues a session cookie automatically (devAutoLogin), so no login form, no setup wizard. Wall-clock time on a stock machine: roughly one minute from clone to logged-in dashboard.
+
+The dev super-admin is `dev@nextly.local` / `DevPassword123!` if you ever need to log in by hand.
+
+### Dev commands
+
+| Command             | What it does                                                                                                                                                                |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm dev:app`      | The main one. SQLite by default. Doctor → schema sync → seed-if-empty → `next dev`.                                                                                         |
+| `pnpm dev:postgres` | Same flow, but against PostgreSQL. Auto-starts Docker if `localhost:5432` is not already reachable.                                                                         |
+| `pnpm dev:mysql`    | Same flow, but against MySQL. Auto-starts Docker (with `--profile mysql`) if `localhost:3306` is not already reachable.                                                     |
+| `pnpm dev:reset`    | Wipes the DB + uploads + caches + generated types/migrations and re-runs the seed. Does not start `next dev`.                                                               |
+| `pnpm dev:doctor`   | Runs the pre-flight checks standalone. Useful when something feels off and you want a quick "are my workspace symlinks intact, is `.env` present, is the port free" report. |
+| `pnpm db:seed`      | Re-runs the seed against the current database. Idempotent; skips when content already exists.                                                                               |
+
+### When to use `pnpm dev` vs `pnpm dev:app`
+
+`pnpm dev:app` boots the playground only. Edits to packages get picked up via the workspace symlinks but do NOT trigger upstream rebuilds. Use this for routine UI work and most contributions.
+
+`pnpm dev` is the heavyweight option: Turborepo orchestrates every workspace package's `dev` script in parallel, so edits to any package's source rebuild downstream consumers automatically. The workspace is bimodal:
+
+| Side             | Packages                                                           | How they're loaded in dev                                                                                                                                         |
+| ---------------- | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Client (browser) | `@nextlyhq/ui`, `@nextlyhq/admin`, `@nextlyhq/plugin-form-builder` | Turbopack reads `src/` directly — see [`apps/playground/next.config.ts`](apps/playground/next.config.ts) `turbopack.resolveAlias`. Edits HMR through immediately. |
+| Server (Node)    | `nextly`, all 4 adapters, all 3 storage packages                   | `serverExternalPackages` + each package's `tsdown --watch` keeps `dist/` fresh. Edits round-trip through dist (~1-2 s rebuild).                                   |
+
+Pick `pnpm dev` when you are actively editing a published package's source AND want the playground to reflect those edits without you running a build by hand. Pick `pnpm dev:app` for everything else; it boots faster.
+
+If you only want a subset of watchers running, targeted scripts still work:
+
+```bash
+pnpm dev:core    # only nextly in watch mode
+pnpm dev:admin   # only @nextlyhq/admin (JS + CSS via scripts/dev.mjs)
+```
+
+### When to use `pnpm build`
+
+Not for routine development. Use `pnpm build` when you need to:
+
+- Verify the production build path before opening a PR (`pnpm build` → 14 turbo tasks)
+- Reproduce a `next start` issue against built artifacts
+- Prepare a release (the changesets workflow runs build internally)
+
+### Common commands
+
+```bash
+# Type check all packages
+pnpm check-types
+
+# Run linter
+pnpm lint
+
+# Run tests (unit suite by default)
+pnpm test
+
+# Run the playground boot E2E smoke test (requires `npx playwright install chromium` once)
+pnpm --filter @nextlyhq/e2e test:e2e
+```
+
+For per-package commands, use `pnpm --filter <package-name> <script>`. For example: `pnpm --filter @nextlyhq/admin test`.
+
+### Troubleshooting boot
+
+If `pnpm dev:app` fails:
+
+1. **`pnpm dev:doctor`** is the first thing to try. It tells you which pre-flight check failed (missing workspace symlinks, missing `.env`, port-in-use) and the exact command to fix it.
+2. **Workspace symlinks broken** (you see "Cannot find module '@nextlyhq/...'" or similar): run `pnpm install --force`. If that does not fix it, `rm -rf node_modules packages/*/node_modules apps/*/node_modules && pnpm install`.
+3. **DB looks corrupt or out of sync**: `pnpm dev:reset` wipes local state and re-seeds. You will not lose anything outside the playground.
+4. **Port 3000 in use**: `PORT=3001 pnpm dev:app`.
+
+---
+
+## Monorepo structure
+
+Nextly uses a pnpm + Turborepo monorepo. Key directories:
+
+```
+nextly/
+├── apps/
+│   └── playground/          # Development/testing app
+├── packages/
+│   ├── nextly/              # Core CMS (nextly)
+│   ├── admin/               # Admin UI (@nextlyhq/admin)
+│   ├── ui/                  # Headless components (@nextlyhq/ui)
+│   ├── adapter-postgres/    # PostgreSQL adapter
+│   ├── adapter-mysql/       # MySQL adapter
+│   ├── adapter-sqlite/      # SQLite adapter
+│   ├── adapter-drizzle/     # Drizzle ORM adapter
+│   ├── storage-s3/          # S3-compatible storage
+│   ├── storage-vercel-blob/ # Vercel Blob storage
+│   ├── storage-uploadthing/ # UploadThing storage
+│   ├── plugin-form-builder/ # Form builder plugin
+│   ├── create-nextly-app/   # CLI scaffold
+│   ├── telemetry/           # Telemetry helper
+│   ├── eslint-config/       # Shared ESLint config
+│   ├── tsconfig/            # Shared TypeScript config
+│   └── prettier-config/     # Shared Prettier config
+├── scripts/                 # Monorepo scripts
+└── docs/                    # Documentation
+```
+
+---
+
+## Testing
+
+Nextly has two test suites split by filename convention:
+
+| Suite       | What it covers                                                                                | Run with                |
+| ----------- | --------------------------------------------------------------------------------------------- | ----------------------- |
+| Unit        | Logic that doesn't need a database. Pure functions, mocked services, type guards.             | `pnpm test:unit`        |
+| Integration | Anything that hits a real database — adapters, the schema pipeline, query builder edge cases. | `pnpm test:integration` |
+
+Test files declare their suite by filename:
+
+- `*.test.ts` — unit test (no DB)
+- `*.integration.test.ts` — integration test (real DB required)
+
+### Running the unit suite
+
+No setup needed:
+
+```bash
+pnpm test:unit
+```
+
+This skips all `*.integration.test.ts` files. Should pass quickly.
+
+### Running the integration suite
+
+**Step 1:** Boot the test stack
+
+```bash
+docker compose -f docker-compose.test.yml up -d
+```
+
+This starts:
+
+- PostgreSQL 15 on port 5434 (Nextly's minimum supported version)
+- PostgreSQL 17 on port 5435 (current latest)
+- PostgreSQL 16 on port 5433 (legacy default; will be removed in v2)
+- MySQL 8.0 on port 3307
+
+SQLite is in-memory and needs no service.
+
+**Step 2:** Run integration tests against the dialect of your choice
+
+```bash
+# All dialects (matches CI)
+pnpm test:integration
+
+# Single dialect (faster local iteration)
+pnpm test:integration:postgres15
+pnpm test:integration:postgres17
+pnpm test:integration:mysql
+pnpm test:integration:sqlite
+```
+
+Each script sets the appropriate `TEST_<DIALECT>_URL` env var. Tests skip themselves if their dialect's env var is unset.
+
+**Step 3:** Tear down
+
+```bash
+docker compose -f docker-compose.test.yml down
+```
+
+### Skipping integration tests locally
+
+If you only work on PG paths, you can skip the MySQL job:
+
+```bash
+# Boot only Postgres services
+docker compose -f docker-compose.test.yml up -d postgres15-test postgres17-test
+
+# Run only the postgres integration jobs
+pnpm test:integration:postgres15
+pnpm test:integration:postgres17
+```
+
+On a pull request, CI runs the integration legs (PostgreSQL, MySQL, SQLite) on
+every push, as the merge queue does. A documentation-only change (files under
+`docs/`, or Markdown) skips them everywhere.
+
+### Writing a new integration test
+
+1. Name the file `<basename>.integration.test.ts`. Example: `transaction-read-your-writes.integration.test.ts`.
+2. Use the helper:
+
+   ```ts
+   import { makeTestContext } from "nextly/database/__tests__/integration/helpers/test-db";
+
+   const ctx = makeTestContext("postgresql");
+
+   describe("query builder against PG", () => {
+     if (!ctx.available) {
+       it.skip("TEST_POSTGRES_URL not set; skipping", () => {});
+       return;
+     }
+     // your tests here, using ctx.url for the connection.
+     // ctx.prefix gives a unique 8-char hex prefix to stamp on
+     // schema/table names so parallel tests don't collide.
+   });
+   ```
+
+3. Stamp `ctx.prefix` on every schema, database, or table name your test creates.
+4. Drop everything you created in `afterAll`.
+
+### The upgrade gate
+
+An existing site that upgrades Nextly must meet no schema change nobody chose.
+`apps/playground/upgrade-gate/` holds the playground as the last published
+release built it, on each dialect: its database, schema and rows, and the app
+migrations that release wrote (`baseline/`, named in `baseline/meta.json`).
+`upgrade-plan.integration.test.ts` restores it, upgrades it with your checkout
+the way a site does (`nextly migrate:create`, `nextly migrate`, then
+`nextly migrate:check`), and compares the database's catalog before and after.
+Every table, column, index, constraint and trigger the upgrade added, dropped
+or changed is an operation, and the operations must be exactly the ones
+`upgrade-gate/allowlist.ts` holds for that dialect, no more and no fewer.
+
+It runs on every integration leg, after the fixture plugin's test, and takes
+about ten seconds a dialect. To run it locally, first build what the
+playground's config loads:
+
+```bash
+pnpm turbo build --filter=nextly --filter="@nextlyhq/adapter-*" \
+  --filter=@nextlyhq/plugin-page-builder --filter=@nextlyhq/plugin-form-builder \
+  --filter=@nextlyhq/plugin-seo
+```
+
+then, from `apps/playground`:
+
+```bash
+pnpm test:integration upgrade-gate                         # SQLite
+TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5435/<your test db> \
+  pnpm test:integration upgrade-gate                       # PostgreSQL
+TEST_MYSQL_URL=mysql://root:root@127.0.0.1:3307/<your test db> \
+  pnpm test:integration upgrade-gate                       # MySQL
+```
+
+**When it fails with operations the allowlist does not hold**, your change makes
+existing sites meet them on upgrade. The failure names each one, for example
+`create index user_roles.user_roles_stray_idx: (role_id, user_id)`, and prints
+the entry to add. Then either:
+
+- change the code so the upgrade no longer plans it, or
+- if it is intended, add the entry to `allowlist.ts` with a `reason` that says
+  what it does to an existing site's data and why that is safe (a new nullable
+  column, an index over an existing column), on each dialect the failure names.
+  A reviewer judges that reason as part of the pull request.
+
+A change to one of the playground's own collections, Singles or field groups,
+or to a first-party plugin's collections, shows up here too, since the
+baseline was built from the release's playground. Allowlist it the same way.
+
+**When it fails with operations the upgrade no longer plans**, remove those
+entries.
+
+**After a release**, record the baseline again from it and empty the allowlist
+of what the release now ships:
+
+```bash
+cd apps/playground
+TEST_POSTGRES_URL=... TEST_MYSQL_URL=... pnpm upgrade-gate:record \
+  [--release 0.0.2-alpha.76] [--pg-dump-container nextly-postgres17-test]
+```
+
+It installs that release's packages from npm (by default the `alpha` tag) beside
+the playground of the commit that versioned it, builds the playground with that
+release's `nextly migrate:create` and `nextly migrate` on each dialect, and
+writes the dumps. Then run the gate on each dialect and bring the allowlist to
+what it reports. `pg_dump` must be at least the server's major version;
+`--pg-dump-container` runs the one inside the test container instead.
+
+### Test conventions
+
+- Tests are co-located with source files in `__tests__/` directories
+- Test files use `.test.ts` (unit) or `.integration.test.ts` (integration)
+- Per-scenario integration tests live under `packages/nextly/src/database/__tests__/integration/`
+- pushSchema fixtures live under `packages/nextly/src/database/__tests__/integration/__fixtures__/pushSchema/`
+- Test framework: **Vitest**. Each package has `vitest.config.ts` (unit) and `vitest.integration.config.ts` (integration with 30s timeouts + singleFork pool)
+
+### CI test workflows
+
+The tests run in two GitHub Actions workflows on every PR:
+
+- [`ci.yml`](.github/workflows/ci.yml) — lint, typecheck, build, and the unit test suite. Its `CI gate` job is the check `main` requires.
+- [`integration.yml`](.github/workflows/integration.yml) — the integration suite, one job per dialect: Postgres 17, MySQL 8.4 and SQLite. Postgres 15 runs locally only, with `pnpm test:integration:postgres15`.
+
+`CI gate` collects the `ci.yml` jobs a merge needs: the change filter, the comment check, `Lint / Typecheck / Test / Build`, the nextly and admin unit tests, `Published admin build`, and the CLI entry-guard smoke test. `Published admin build` packs `@nextlyhq/admin` as a release does and refuses a build that would show a production user development-only behaviour: an error's message or stack trace, the query developer tools, the development reload stream opened on its own, or a schema-builder address with no page. Run it locally with `pnpm --filter @nextlyhq/admin check:published-build`, after a build. The browser tests, the scaffold and dev-script smoke tests, and the three `Pre-push gates (windows-latest…)` jobs report on their own and are not required to merge. Those three run the pre-push hook's gates on Windows: one runs the lints, the build, the type check and most unit suites, and the other two run nextly's and the admin's unit suites. They have passed on `main` since 2026-10-03, so treat a red one on your pull request as a failure of your change. `main` also requires the integration jobs, the secret scan and the other checks listed under [Branch protection](#branch-protection), and the merge queue runs them all.
+
+Before a pull request joins the queue, `node scripts/verify-merge.mjs <pr-number>` checks that every blocking review thread is resolved, and that every check whose absence would mean no coverage has reported. Threads from advisory reviewers (CodeRabbit by default, set by `CI_VERDICT_ADVISORY`) don't count toward its verdict, but `main` still requires every conversation resolved before a merge, so resolve those too. The checks it requires are `Lint / Typecheck / Test / Build`, `Small checks (title, AI credit, secret scan, review)`, the comment check and the three integration jobs. It doesn't cover the independent review, which runs only in the queue. After a merge, it checks that the pull request landed whole.
+
+---
+
+## Pre-commit hooks
+
+The following hooks run automatically:
+
+| Hook         | What runs                                                                              |
+| ------------ | -------------------------------------------------------------------------------------- |
+| `pre-commit` | Prettier formatting + oxlint on staged files (via lint-staged) + gitleaks secret scan  |
+| `commit-msg` | Validates conventional commit format (see [Commit messages](#commit-messages))         |
+| `pre-push`   | Lint, the production build and the type-check, then the unit tests the push can affect |
+
+If a hook fails, fix the issue and re-stage. **Never bypass with `--no-verify`** — the hooks exist to catch problems before CI does.
+
+The pre-push's unit tests are narrowed twice: to the packages the push touches (`scripts/gate-scope.mjs`), then, inside each, to the test files the change can affect (`scripts/test-changed.mjs`, which uses Vitest's `--changed` over the dependency records each test left on its last run). Tests that read files or spawn processes always run, since no record names what they read. A package runs in full when its own `tsconfig` or a workspace package it depends on changed too, and every package runs in full when the lockfile, `.nvmrc`, a root `tsconfig`, `packages/tsconfig` or a file turbo hashes into every task changed. A package whose test task declares a changed root file as an input (`turbo.jsonc`, e.g. `templates/**` for create-nextly-app) runs in full too. So does a package whose files changed since its last passing full run in a way this push does not account for (a pull, a rebase, a branch switch), since a dependency record lags behind an import the code gained. A package Vitest finds no test file in runs its own `test` script, which decides whether that passes. The root `scripts/` tests run when any file outside a workspace (a script, a hook, a workflow, the lockfile, the docs) or a Vitest config changed. They run before the package tests, and a failure there stops the push without running those, so a red on them takes minutes to show rather than a quarter of an hour. `NEXTLY_PREPUSH_ALL_TESTS=1 git push` runs every test of the same packages instead. CI always runs everything.
+
+---
+
+## Branch naming
+
+Use a short, descriptive branch name. The standard format:
+
+```
+<type>/<scope>/<short-description>
+```
+
+- **type**: `feat`, `fix`, `chore`, `docs`, `refactor`, `test`, `ci` (matches commit types below)
+- **scope**: the package directory name (e.g., `admin`, `adapter-postgres`, `plugin-form-builder`) or `root` for repo-wide changes
+- **description**: lowercase, hyphens only, ≤40 characters
+
+Examples:
+
+```
+feat/admin/role-manager-dialog
+fix/adapter-postgres/connection-pool-leak
+chore/root/upgrade-typescript
+docs/storage-s3/readme-update
+```
+
+Branch names aren't strictly enforced by CI — but consistent names make the merge log readable.
+
+## Commit messages
+
+We follow [Conventional Commits](https://www.conventionalcommits.org/). The `small-checks.yml` workflow enforces this on PR titles, and commitlint validates each commit locally via the `commit-msg` hook.
+
+```
+<type>(<scope>): <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+**Types**: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`
+
+**Scopes**: see the canonical list in [`.github/workflows/small-checks.yml`](.github/workflows/small-checks.yml). Match a package directory name (`admin`, `nextly`, `adapter-postgres`, etc.) or use `root`, `deps`, `release`, `ci`, or `docs` for repo-wide changes.
+
+**Description rules**: imperative mood ("add" not "added"), lowercase, no trailing period, ≤72 characters.
+
+Examples:
+
+```
+feat(admin): add user authentication with JWT
+fix(adapter-postgres): resolve connection pool memory leak
+docs(root): update README with launch checklist
+chore(deps): bump zod to 4.2.0
+```
+
+For breaking changes, add a `BREAKING CHANGE:` footer:
+
+```
+feat(nextly): require Postgres 15+ for new install path
+
+BREAKING CHANGE: Postgres 14 is no longer supported. See migration guide for
+upgrade steps.
+```
+
+To reference issues in the body or footer:
+
+```
+Fixes #123
+Closes #456
+```
+
+These keywords auto-close the linked issue when the PR merges.
+
+---
+
+## Submitting a pull request
+
+Every change reaches `dev`, the default branch, the same way: a short-lived branch off `dev`, one pull request into `dev`, squash-merged. CI and the integration tests run on the pull request and on every push to `dev`, but merging does not wait for them, so run `git fetch origin dev` and then `pnpm check:quick` first: it type-checks the packages your branch affects and runs the unit tests of the packages it changes, compared with your local `origin/dev`, usually in a minute or two. A stale `origin/dev` can hide a package your branch changed, so fetch it first; if your fork tracks this repository under another remote, fetch from that one and pass the ref, as in `pnpm check:quick upstream/dev`. Once a day, when `dev`'s CI and integration runs are green, `dev` is promoted to `main` through a pull request that `main`'s merge queue tests; a red `dev` holds the promotion back until the commit that broke it is fixed. Releases are cut from `main` only. There are no other long-lived branches — no release or integration branch — because the checks never run on a pull request into one, and a branch that gathers weeks of work is too large to review.
+
+1. **Fork** the repo and create a branch off `dev`, one branch per pull request.
+2. **Make your change.** Add or update tests when relevant.
+3. **Run locally**: `pnpm lint && pnpm check-types && pnpm test`.
+4. **Add a changeset** if your PR touches any publishable package (see [Release process](#release-process) below).
+5. **Open the PR against `dev`.** Fill out the [PR template](.github/pull_request_template.md) — it's auto-applied when you open a PR.
+6. **Watch CI.** Lint, typecheck, build, unit tests, and the integration matrix run on the PR; a red one is yours to fix, before or after the merge.
+
+### Landing a large feature in slices
+
+A feature too large for one pull request lands as several, each complete, tested and merged into `dev` on its own. Until the feature is complete, the public API it adds is marked with the TSDoc `@experimental` tag, which carries no compatibility guarantee; [`packages/ui/STABILITY.md`](packages/ui/STABILITY.md) shows the convention. Don't collect the slices on a branch of their own.
+
+### Reviewer expectations
+
+- At least one maintainer approval is required before merge, from a code owner for the files [`.github/CODEOWNERS`](.github/CODEOWNERS) names.
+- All conversations resolved.
+- All CI checks passing (no `continue-on-error` workarounds).
+- No need to bring a branch up to date with `dev` by hand unless it conflicts: the next push to `dev` tests it on top of everything merged before it (see [Merge strategy](#merge-strategy)).
+
+### Merge strategy
+
+Every pull request is squash-merged into `dev`. Its title becomes the commit message, so make sure it follows [Conventional Commits](#commit-messages).
+
+Two pull requests go to `main` instead, through GitHub's merge queue, which runs the required checks on each combined with the latest `main` and merges only what passes: the daily promotion of `dev`, merged with a merge commit so the two branches keep one history, and the Version Packages pull request. After a release, `main` is merged back into `dev`.
+
+### Branch protection
+
+`main` is protected by a ruleset. Direct pushes, force-pushes and deletion are blocked, so every change reaches it through a pull request. A pull request merges only through the merge queue, and only once:
+
+- a maintainer has approved it, and a code owner too for the files [`.github/CODEOWNERS`](.github/CODEOWNERS) names;
+- every conversation is resolved;
+- these checks pass: `CI gate`, `Comment convention (describes code, not process)`, `Integration (mysql)`, `Integration (postgres)`, `Integration (sqlite)` and `Small checks (title, AI credit, secret scan, review)`. That last one is a single job whose steps check the title, refuse AI credit, run gitleaks and, in the queue, require an independent review.
+
+---
+
+## Release process
+
+> **Status:** Nextly's release pipeline uses [Changesets](https://github.com/changesets/changesets) for versioning and [`changesets/action`](https://github.com/changesets/action) for the version-PR + publish flow, and publishes from CI through npm trusted publishing. The steps below are how releases run today.
+
+All publishable `@nextlyhq/*` packages are kept in lockstep (same version at all times) via the `fixed` array in `.changeset/config.json` — this matches Payload CMS's unified-versioning style.
+
+### When your PR needs a changeset
+
+You **must** add a changeset if your PR touches any publishable package under `packages/*` (excluding `@nextlyhq/eslint-config`, `@nextlyhq/prettier-config`, `@nextlyhq/tsconfig`, and the `playground` app, which are in the changeset `ignore` list).
+
+No CI job requires a changeset to be there, so reviewers check it. CI's `Changeset covers the lockstep group` step checks each changeset a PR adds or edits: it must name every package in the lockstep group.
+
+✅ **DO create a changeset for**: user-facing features, bug fixes, breaking changes, performance work, deprecations.
+
+❌ **SKIP changeset for**: internal refactors with no user impact, docs-only edits, test-only changes, CI/tooling.
+
+### Creating a changeset
+
+```bash
+pnpm changeset
+```
+
+The CLI asks which packages changed. Select every package in `fixed[]`, the lockstep group, private ones such as `@nextlyhq/tsconfig` included, and choose `patch`: while the packages are in alpha every changeset is `patch`. CI refuses a changeset that leaves out a package of the group, or uses another bump. Then write a short user-facing summary. A pull request that changes no published package (tests, CI, docs or internal tooling only) needs no changeset.
+
+Commit the generated `.changeset/*.md` file with your PR.
+
+### How a release happens
+
+1. You merge your PR (with its changeset) into `dev`, and the daily promotion carries it to `main`.
+2. [`.github/workflows/release.yml`](.github/workflows/release.yml) runs on `main` and opens a `Version Packages` PR that bumps every `fixed[]` package by the same amount and rewrites per-package `CHANGELOG.md` files.
+3. The Version Packages PR accumulates as more PRs land — so all pending changes ship together when it's merged.
+4. A maintainer reviews and merges the Version Packages PR.
+5. The release workflow runs again, this time publishing to npm:
+   - `pnpm build`
+   - `changeset publish` — publishes each package to `@nextlyhq/*` with `--provenance` attestation
+   - Creates one git tag `vX.Y.Z`
+   - Creates one consolidated GitHub Release containing all package CHANGELOGs
+6. Record the upgrade gate's baseline from the new release and trim its allowlist ([The upgrade gate](#the-upgrade-gate)).
+
+### Pre-releases (alpha / beta / rc)
+
+For pre-release versions, enter Changesets pre mode before merging changesets:
+
+```bash
+pnpm changeset pre enter alpha   # or beta, rc
+git commit -am "chore: enter alpha pre mode"
+git push
+```
+
+From this point, every release publishes alpha versions (`v1.0.0-alpha.0`, `v1.0.0-alpha.1`, …) tagged on npm with `--tag alpha`. Stable installs of `nextly` are unaffected.
+
+When ready for stable:
+
+```bash
+pnpm changeset pre exit
+git commit -am "chore: exit alpha pre mode"
+git push
+```
+
+The next release publishes `v1.0.0` stable.
+
+### Rollback
+
+If a bad version ships:
+
+```bash
+npm deprecate @nextlyhq/<pkg>@<bad-version> "reason"
+```
+
+Then open a revert PR with a fresh changeset to cut the next patch.
+
+---
+
+## Internal architecture reference
+
+The sections below document conventions inside specific packages. They're not required reading for casual contributions, but useful when working in `nextly` (core) or `@nextlyhq/admin`.
+
+### Path alias conventions
+
+Use path aliases instead of deep relative imports.
+
+**In `nextly`:**
+
+```ts
+// ✅ Good
+import { UserService } from "@nextly/services/users";
+import { hashPassword } from "@nextly/auth/password";
+import { PostgresAdapter } from "@nextly/database/adapters/postgres";
+
+// ❌ Bad
+import { UserService } from "../../../services/users";
+```
+
+Available aliases: `@nextly/*` → `packages/nextly/src/*`, plus subpath aliases (`@nextly/services`, `@nextly/database`, `@nextly/auth`, `@nextly/hooks`, `@nextly/storage`, `@nextly/types`).
+
+**In `@nextlyhq/admin`:**
+
+```ts
+// ✅ Good
+import { Button } from "@admin/components/ui/button";
+import { useAuth } from "@admin/hooks/useAuth";
+import { cn } from "@admin/lib/utils";
+```
+
+Available aliases: `@admin/*` → `packages/admin/src/*` (`@admin/components`, `@admin/hooks`, `@admin/lib`, `@admin/types`).
+
+### Component organization (`@nextlyhq/admin`)
+
+Admin components follow a 4-tier structure:
+
+```
+packages/admin/src/components/
+├── ui/           # Primitives (Button, Input, Dialog, Table)
+├── features/     # Domain features (Dashboard, MediaLibrary, RoleManagement)
+├── forms/        # Form components (field-types, FieldEditorDialog)
+├── layout/       # Layout components (Sidebar, PageContainer)
+├── shared/       # Cross-cutting (SearchBar, Pagination, ErrorFallbacks)
+├── guards/       # Route guards
+└── icons/        # Icon re-exports
+```
+
+- **Directories**: kebab-case (`user-dialog/`, `media-library/`)
+- **Files**: PascalCase for components (`RevokeApiKeyDialog.tsx`), `index.ts` for barrel exports
+- **Exports**: named exports preferred
+
+When creating a new component, pick the appropriate tier, create a kebab-case directory with an `index.ts` barrel, and use path aliases for internal imports.
+
+### Service guidelines (`nextly`)
+
+Services in the core package follow these conventions:
+
+- **File size**: keep service files under ~500 lines. Split large services into focused sub-services and compose.
+- **Single responsibility**: e.g. `services/users/` splits into `user-query-service.ts`, `user-mutation-service.ts`, `user-account-service.ts` rather than one monolithic file.
+- **Database access**: services access Drizzle ORM directly (no repository layer). Transactions are managed at the service level.
+- **Error handling**: throw `NextlyError` from `packages/nextly/src/errors`, through its static factories (`notFound`, `forbidden`, `validation`, `conflict`, ...), never a bare `Error`:
+
+  ```ts
+  import { NextlyError } from "../errors";
+
+  async findById(id: string): Promise<User> {
+    const [user] = await this.db.select().from(users).where(eq(users.id, id));
+    if (!user) {
+      throw NextlyError.notFound({ logContext: { userId: id } });
+    }
+    return user;
+  }
+  ```
+
+---
+
+Thank you for contributing! If anything in this guide is unclear or out of date, please open a PR or start a [Discussion](https://github.com/nextlyhq/nextly/discussions).

@@ -1,0 +1,373 @@
+/**
+ * ContextMenu Component
+ *
+ * A right-click menu built on Radix UI primitives. Same surface, items and keyboard model as
+ * `DropdownMenu`; what differs is how it opens — a pointer's secondary button, a long press on
+ * touch, or the platform's context-menu key — and that it opens AT the pointer rather than
+ * anchored to a trigger element.
+ *
+ * **Why a separate component rather than a `DropdownMenu` with a different trigger**: the two
+ * have different anchoring (a virtual point versus an element), different open semantics, and
+ * different ARIA. Radix models them separately for that reason, and collapsing them would mean
+ * reimplementing one of the two behaviours by hand.
+ *
+ * **Design specifications** (shared with `DropdownMenu`, so a right-click menu and a button menu
+ * cannot drift apart):
+ * - Border-radius: `rounded-lg` for the surface, `rounded-sm` for items
+ * - Padding: 4px (p-1); item padding 8px horizontal, 6px vertical
+ * - Shadow: `shadow-md`; z-index `z-50`; min-width 8rem
+ * - Highlight: `bg-muted`, driven off `data-[highlighted]` so pointer and keyboard agree
+ *
+ * **Accessibility**:
+ * - Opens on the context-menu event, so the keyboard route (Shift+F10, or the menu key) reaches
+ *   it — but only once the trigger can hold focus. Radix wires the event handlers onto whatever
+ *   `asChild` is given and does not make it focusable, so a plain `div` trigger is reachable by
+ *   pointer only. Use an already-focusable element, or give it `tabIndex` and a role, as the
+ *   example below does
+ * - Full keyboard navigation (arrows, Enter, Escape, Home/End, typeahead)
+ * - ARIA roles from Radix: `menu`, `menuitem`, `menuitemcheckbox`, `menuitemradio`
+ * - Focus returns to the element that opened the menu on close
+ *
+ * **Portalling**: content renders into the container from `PortalProvider`, like every other
+ * overlay in this kit. The scoped stylesheet only reaches inside `.nextly-ui`, and an overlay
+ * portalled to `document.body` is outside it, so the provider is what keeps it styled.
+ *
+ * @example
+ * ```tsx
+ * <ContextMenu>
+ *   <ContextMenuTrigger asChild>
+ *     <div className="p-8" tabIndex={0} role="group" aria-label="Canvas">
+ *       Right-click anywhere in here
+ *     </div>
+ *   </ContextMenuTrigger>
+ *   <ContextMenuContent>
+ *     <ContextMenuItem onSelect={duplicate}>Duplicate</ContextMenuItem>
+ *     <ContextMenuItem onSelect={remove}>Delete</ContextMenuItem>
+ *     <ContextMenuSeparator />
+ *     <ContextMenuCheckboxItem checked={locked} onCheckedChange={setLocked}>
+ *       Locked
+ *     </ContextMenuCheckboxItem>
+ *   </ContextMenuContent>
+ * </ContextMenu>
+ * ```
+ *
+ * @module
+ */
+
+"use client";
+
+import * as ContextMenuPrimitive from "@radix-ui/react-context-menu";
+import { Check, ChevronRight, Circle } from "lucide-react";
+import * as React from "react";
+
+import { cn } from "../lib/utils";
+import { usePortalContainer } from "../providers/portal-provider";
+
+/**
+ * The item highlight, taken from the same reasoning as `DropdownMenu`: Radix sets
+ * `data-highlighted` for both pointer hover and keyboard focus, so driving the highlight off
+ * that one state keeps the two in sync, and `bg-muted` reads against the popover surface
+ * without the full-contrast flip a solid `bg-primary` produces.
+ */
+const menuItemBase =
+  "cursor-pointer transition-colors data-[highlighted]:bg-muted data-[highlighted]:text-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50";
+
+/**
+ * The popover surface, shared by the root menu and every submenu.
+ *
+ * Shared rather than repeated because the two drifted once already: the submenu was written with
+ * `overflow-hidden` and no height bound, so a long one near the edge of the viewport clipped with
+ * nothing to scroll. A submenu opens beside its parent item, further down the screen with less
+ * room left than the menu that spawned it, so it needs the bound at least as much.
+ *
+ * The available-height variable is what supplies that bound: Radix measures the space the surface
+ * actually has and publishes it, so the menu scrolls instead of overflowing the viewport.
+ */
+const menuSurface =
+  "z-50 max-h-[var(--radix-context-menu-content-available-height)] min-w-[8rem] overflow-y-auto overflow-x-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 origin-[--radix-context-menu-content-transform-origin]";
+
+/** @experimental */
+const ContextMenu: typeof ContextMenuPrimitive.Root = ContextMenuPrimitive.Root;
+
+/** @experimental */
+const ContextMenuTrigger: typeof ContextMenuPrimitive.Trigger =
+  ContextMenuPrimitive.Trigger;
+
+/** @experimental */
+const ContextMenuGroup: typeof ContextMenuPrimitive.Group =
+  ContextMenuPrimitive.Group;
+
+/** @experimental */
+const ContextMenuSub: typeof ContextMenuPrimitive.Sub =
+  ContextMenuPrimitive.Sub;
+
+/** @experimental */
+const ContextMenuRadioGroup: typeof ContextMenuPrimitive.RadioGroup =
+  ContextMenuPrimitive.RadioGroup;
+
+type ContextMenuSubTriggerProps = React.ComponentPropsWithoutRef<
+  typeof ContextMenuPrimitive.SubTrigger
+> & {
+  inset?: boolean;
+};
+
+/** @experimental */
+const ContextMenuSubTrigger: React.ForwardRefExoticComponent<
+  React.PropsWithoutRef<ContextMenuSubTriggerProps> &
+    React.RefAttributes<
+      React.ElementRef<typeof ContextMenuPrimitive.SubTrigger>
+    >
+> = React.forwardRef<
+  React.ElementRef<typeof ContextMenuPrimitive.SubTrigger>,
+  ContextMenuSubTriggerProps
+>(({ className, inset, children, ...props }, ref) => (
+  <ContextMenuPrimitive.SubTrigger
+    ref={ref}
+    className={cn(
+      "flex select-none items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-none data-[state=open]:bg-muted [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
+      menuItemBase,
+      inset && "pl-8",
+      className
+    )}
+    {...props}
+  >
+    {children}
+    <ChevronRight className="ml-auto" />
+  </ContextMenuPrimitive.SubTrigger>
+));
+ContextMenuSubTrigger.displayName = ContextMenuPrimitive.SubTrigger.displayName;
+
+type ContextMenuSubContentProps = React.ComponentPropsWithoutRef<
+  typeof ContextMenuPrimitive.SubContent
+>;
+
+/** @experimental */
+const ContextMenuSubContent: React.ForwardRefExoticComponent<
+  React.PropsWithoutRef<ContextMenuSubContentProps> &
+    React.RefAttributes<
+      React.ElementRef<typeof ContextMenuPrimitive.SubContent>
+    >
+> = React.forwardRef<
+  React.ElementRef<typeof ContextMenuPrimitive.SubContent>,
+  ContextMenuSubContentProps
+>(({ className, ...props }, ref) => {
+  const portalContainer = usePortalContainer();
+
+  return (
+    <ContextMenuPrimitive.Portal container={portalContainer}>
+      <ContextMenuPrimitive.SubContent
+        ref={ref}
+        className={cn(menuSurface, className)}
+        {...props}
+      />
+    </ContextMenuPrimitive.Portal>
+  );
+});
+ContextMenuSubContent.displayName = ContextMenuPrimitive.SubContent.displayName;
+
+type ContextMenuContentProps = React.ComponentPropsWithoutRef<
+  typeof ContextMenuPrimitive.Content
+>;
+
+/** @experimental */
+const ContextMenuContent: React.ForwardRefExoticComponent<
+  React.PropsWithoutRef<ContextMenuContentProps> &
+    React.RefAttributes<React.ElementRef<typeof ContextMenuPrimitive.Content>>
+> = React.forwardRef<
+  React.ElementRef<typeof ContextMenuPrimitive.Content>,
+  ContextMenuContentProps
+>(({ className, ...props }, ref) => {
+  const portalContainer = usePortalContainer();
+
+  return (
+    <ContextMenuPrimitive.Portal container={portalContainer}>
+      <ContextMenuPrimitive.Content
+        ref={ref}
+        className={cn(menuSurface, className)}
+        {...props}
+      />
+    </ContextMenuPrimitive.Portal>
+  );
+});
+ContextMenuContent.displayName = ContextMenuPrimitive.Content.displayName;
+
+type ContextMenuItemProps = React.ComponentPropsWithoutRef<
+  typeof ContextMenuPrimitive.Item
+> & {
+  inset?: boolean;
+};
+
+/** @experimental */
+const ContextMenuItem: React.ForwardRefExoticComponent<
+  React.PropsWithoutRef<ContextMenuItemProps> &
+    React.RefAttributes<React.ElementRef<typeof ContextMenuPrimitive.Item>>
+> = React.forwardRef<
+  React.ElementRef<typeof ContextMenuPrimitive.Item>,
+  ContextMenuItemProps
+>(({ className, inset, ...props }, ref) => (
+  <ContextMenuPrimitive.Item
+    ref={ref}
+    className={cn(
+      "relative flex select-none items-center gap-2 rounded-sm px-2 py-1.5 text-sm outline-none [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
+      menuItemBase,
+      inset && "pl-8",
+      className
+    )}
+    {...props}
+  />
+));
+ContextMenuItem.displayName = ContextMenuPrimitive.Item.displayName;
+
+type ContextMenuCheckboxItemProps = React.ComponentPropsWithoutRef<
+  typeof ContextMenuPrimitive.CheckboxItem
+>;
+
+/** @experimental */
+const ContextMenuCheckboxItem: React.ForwardRefExoticComponent<
+  React.PropsWithoutRef<ContextMenuCheckboxItemProps> &
+    React.RefAttributes<
+      React.ElementRef<typeof ContextMenuPrimitive.CheckboxItem>
+    >
+> = React.forwardRef<
+  React.ElementRef<typeof ContextMenuPrimitive.CheckboxItem>,
+  ContextMenuCheckboxItemProps
+>(({ className, children, checked, ...props }, ref) => (
+  <ContextMenuPrimitive.CheckboxItem
+    ref={ref}
+    className={cn(
+      "relative flex select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none",
+      menuItemBase,
+      className
+    )}
+    checked={checked}
+    {...props}
+  >
+    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+      <ContextMenuPrimitive.ItemIndicator>
+        <Check className="h-4 w-4" />
+      </ContextMenuPrimitive.ItemIndicator>
+    </span>
+    {children}
+  </ContextMenuPrimitive.CheckboxItem>
+));
+ContextMenuCheckboxItem.displayName =
+  ContextMenuPrimitive.CheckboxItem.displayName;
+
+type ContextMenuRadioItemProps = React.ComponentPropsWithoutRef<
+  typeof ContextMenuPrimitive.RadioItem
+>;
+
+/** @experimental */
+const ContextMenuRadioItem: React.ForwardRefExoticComponent<
+  React.PropsWithoutRef<ContextMenuRadioItemProps> &
+    React.RefAttributes<React.ElementRef<typeof ContextMenuPrimitive.RadioItem>>
+> = React.forwardRef<
+  React.ElementRef<typeof ContextMenuPrimitive.RadioItem>,
+  ContextMenuRadioItemProps
+>(({ className, children, ...props }, ref) => (
+  <ContextMenuPrimitive.RadioItem
+    ref={ref}
+    className={cn(
+      "relative flex select-none items-center rounded-sm py-1.5 pl-8 pr-2 text-sm outline-none",
+      menuItemBase,
+      className
+    )}
+    {...props}
+  >
+    <span className="absolute left-2 flex h-3.5 w-3.5 items-center justify-center">
+      <ContextMenuPrimitive.ItemIndicator>
+        <Circle className="h-2 w-2 fill-current" />
+      </ContextMenuPrimitive.ItemIndicator>
+    </span>
+    {children}
+  </ContextMenuPrimitive.RadioItem>
+));
+ContextMenuRadioItem.displayName = ContextMenuPrimitive.RadioItem.displayName;
+
+type ContextMenuLabelProps = React.ComponentPropsWithoutRef<
+  typeof ContextMenuPrimitive.Label
+> & {
+  inset?: boolean;
+};
+
+/** @experimental */
+const ContextMenuLabel: React.ForwardRefExoticComponent<
+  React.PropsWithoutRef<ContextMenuLabelProps> &
+    React.RefAttributes<React.ElementRef<typeof ContextMenuPrimitive.Label>>
+> = React.forwardRef<
+  React.ElementRef<typeof ContextMenuPrimitive.Label>,
+  ContextMenuLabelProps
+>(({ className, inset, ...props }, ref) => (
+  <ContextMenuPrimitive.Label
+    ref={ref}
+    className={cn(
+      "px-2 py-1.5 text-sm font-semibold text-foreground",
+      inset && "pl-8",
+      className
+    )}
+    {...props}
+  />
+));
+ContextMenuLabel.displayName = ContextMenuPrimitive.Label.displayName;
+
+type ContextMenuSeparatorProps = React.ComponentPropsWithoutRef<
+  typeof ContextMenuPrimitive.Separator
+>;
+
+/** @experimental */
+const ContextMenuSeparator: React.ForwardRefExoticComponent<
+  React.PropsWithoutRef<ContextMenuSeparatorProps> &
+    React.RefAttributes<React.ElementRef<typeof ContextMenuPrimitive.Separator>>
+> = React.forwardRef<
+  React.ElementRef<typeof ContextMenuPrimitive.Separator>,
+  ContextMenuSeparatorProps
+>(({ className, ...props }, ref) => (
+  <ContextMenuPrimitive.Separator
+    ref={ref}
+    className={cn("-mx-1 my-1 h-px bg-border", className)}
+    {...props}
+  />
+));
+ContextMenuSeparator.displayName = ContextMenuPrimitive.Separator.displayName;
+
+/** What `ContextMenuShortcut` is: a `span` component with a `displayName`. */
+type ContextMenuShortcutComponent = {
+  (props: React.HTMLAttributes<HTMLSpanElement>): React.JSX.Element;
+  displayName: string;
+};
+
+/**
+ * A keyboard shortcut hint, right-aligned in the item.
+ *
+ * @experimental
+ */
+const ContextMenuShortcut: ContextMenuShortcutComponent = ({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLSpanElement>) => (
+  <span
+    className={cn(
+      "ml-auto text-xs tracking-widest text-muted-foreground",
+      className
+    )}
+    {...props}
+  />
+);
+ContextMenuShortcut.displayName = "ContextMenuShortcut";
+
+export {
+  ContextMenu,
+  ContextMenuCheckboxItem,
+  ContextMenuContent,
+  ContextMenuGroup,
+  ContextMenuItem,
+  ContextMenuLabel,
+  ContextMenuRadioGroup,
+  ContextMenuRadioItem,
+  ContextMenuSeparator,
+  ContextMenuShortcut,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
+  ContextMenuTrigger,
+};

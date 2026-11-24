@@ -1,0 +1,210 @@
+import type { SupportedDialect } from "@nextlyhq/adapter-drizzle/types";
+
+import type {
+  AddCheckOp,
+  AddForeignKeyOp,
+  IndexSpec,
+  Operation,
+  TableSpec,
+} from "../diff/types";
+import { generateSQL } from "../sql-templates";
+import { isMysqlTextOrBlobType } from "../sql-templates/create-index";
+
+import { emitAdditiveDdl } from "./additive";
+import { emitPostgresDdl } from "./postgres";
+
+// Op types the fast path can handle end-to-end on PostgreSQL.
+//
+// The rename/drop pre-resolution types
+// (rename_table / rename_column / drop_column / drop_table) are
+// intentionally NOT here — they are owned by `executePreResolutionOps`,
+// which runs before this routing decision; the emitter returns an
+// empty string list for them so a stray inclusion would still be a
+// no-op rather than a double-apply.
+//
+// drop_index is ALSO pre-resolution-owned (it must run before its
+// column's drop_column — SQLite rejects DROP COLUMN on an indexed
+// column) but stays in this set for ROUTING only: an apply whose ops
+// are all additive plus index drops must keep taking the fast path
+// rather than falling back to drizzle-kit's full re-introspection
+// (which can emit destructive DDL our differ never planned — see the
+// `_pkey` incident below). The emitter returns [] for it, same as the
+// other pre-resolved types.
+//
+// The three change_* ops are explicitly listed here because punting
+// them to drizzle-kit's pushSchema caused the silent-skip class of
+// bugs in the rext-site-v2 / dc_case_studies incident: drizzle-kit
+// considered `text` → `jsonb` a non-implicit cast and emitted zero
+// SQL, while the journal still recorded the apply as successful.
+// Owning the SQL here removes the silent-skip surface entirely —
+// the change either runs (logged in the journal) or fails loudly
+// when Postgres rejects the cast.
+const FAST_PATH_OP_TYPES = new Set<Operation["type"]>([
+  "add_column",
+  "add_table",
+  "change_column_type",
+  "change_column_nullable",
+  "change_column_default",
+  "add_index",
+  "drop_index",
+]);
+
+// Op types the fast path can handle on SQLite and MySQL — the purely
+// additive subset. change_* ops stay with drizzle-kit there: SQLite
+// implements them as a whole-table rebuild and MySQL as a full MODIFY
+// COLUMN definition, both of which the kit already owns correctly.
+const ADDITIVE_FAST_PATH_OP_TYPES = new Set<Operation["type"]>([
+  "add_column",
+  "add_table",
+  "add_index",
+  "drop_index",
+]);
+
+/**
+ * Decide whether this apply's operations can ALL be emitted by the fast
+ * in-memory DDL emitter for the given dialect. Conservative: any op
+ * outside the dialect's supported set routes the whole apply back to
+ * drizzle-kit (the existing slow path).
+ *
+ * An empty op list takes the fast path (which emits nothing) on EVERY
+ * dialect rather than calling drizzle-kit. Letting drizzle-kit handle a
+ * "no ops" apply means it runs its own catalog re-introspection + rename
+ * heuristics against the full live DB and can act on drift the diff
+ * engine explicitly decided was not there. Two observed failure modes:
+ * on Postgres it emitted a destructive `DROP INDEX "<table>_pkey"` for
+ * an unrelated managed table after a metadata-only field-type change
+ * (`textarea` -> `richText`, both stored as `text`); on SQLite/MySQL —
+ * where the kit has NO introspection filter — any live table absent from
+ * the desired schema (UI-created entities, `_locales` companions) reads
+ * as "deleted" and, paired against a "created" table, crashes the v1
+ * rename resolver (`resolver(table) was called without a HintsHandler`).
+ * Trusting our own diff for "is any DDL needed?" closes both surfaces.
+ */
+export function canEmitWithoutDrizzleKit(
+  ops: Operation[],
+  dialect: SupportedDialect
+): boolean {
+  if (ops.length === 0) return true;
+  if (dialect === "postgresql") {
+    return ops.every(op => FAST_PATH_OP_TYPES.has(op.type));
+  }
+  return ops.every(op => {
+    if (!ADDITIVE_FAST_PATH_OP_TYPES.has(op.type)) return false;
+    // MySQL refuses to index a TEXT/BLOB column without a key length, and a
+    // standalone `add_index` op carries only column NAMES — nothing says
+    // whether one of them is text-backed. An `add_table` brings its own
+    // column list, so the emitter can spell the prefix there; on its own, the
+    // apply goes to drizzle-kit, which introspects the types itself. Emitting
+    // a bare `(col)` here instead would abort the apply and keep failing
+    // identically on every retry.
+    if (dialect === "mysql" && op.type === "add_index") return false;
+    // A UNIQUE index is the one case where the prefix is not merely a
+    // spelling. `col(191)` constrains the first 191 characters, so two rows
+    // whose values differ only after that point are rejected as duplicates —
+    // uniqueness the author did not ask for, enforced silently on their data.
+    // The emitter has no way to express full-value uniqueness on a MySQL
+    // TEXT/BLOB column, so an `add_table` carrying one goes to drizzle-kit
+    // rather than being approximated here. Non-unique indexes keep the
+    // prefix: there it changes only how much of the value is indexed, which
+    // is exactly what the Builder's own DDL does for the same columns.
+    if (dialect === "mysql" && op.type === "add_table") {
+      return uniqueIndexesOnTextColumns(op.table).length === 0;
+    }
+    return true;
+  });
+}
+
+/**
+ * The UNIQUE indexes a table spec declares over a MySQL TEXT/BLOB column —
+ * the ones the emitter cannot spell, because a key prefix would constrain the
+ * data. The one answer both the routing decision and the kit-path stripping
+ * read, so they cannot disagree about which indexes those are.
+ */
+function uniqueIndexesOnTextColumns(table: TableSpec): IndexSpec[] {
+  const textColumns = new Set(
+    table.columns.filter(c => isMysqlTextOrBlobType(c.type)).map(c => c.name)
+  );
+  return (table.indexes ?? []).filter(
+    index =>
+      index.unique === true && index.columns.some(c => textColumns.has(c))
+  );
+}
+
+/**
+ * Strip the indexes this emitter cannot spell correctly for the dialect,
+ * for callers that emit an `add_table` the routing decision REJECTED.
+ *
+ * The kit-path pre-creation is exactly that caller: it creates the planned
+ * tables itself so drizzle-kit's differ has an empty created set (see the
+ * HintsHandler note at its call site), and it runs on every `add_table` in
+ * the apply — including one that `canEmitWithoutDrizzleKit` sent to the kit
+ * precisely because of an index. Without this, the routing decision would be
+ * bypassed by the very branch it routed to, and a MySQL UNIQUE index over a
+ * TEXT/BLOB column would still be created with the 191-character prefix,
+ * silently rejecting rows that differ past that point.
+ *
+ * Dropping the index rather than the whole table keeps the crash guard: the
+ * table body is still pre-created, and drizzle-kit adds the index afterwards
+ * from its own introspection, which knows the column types.
+ */
+export function withoutUnemittableIndexes(
+  op: Operation,
+  dialect: SupportedDialect
+): Operation {
+  if (op.type !== "add_table" || dialect !== "mysql") return op;
+  const unemittable = new Set(uniqueIndexesOnTextColumns(op.table));
+  if (unemittable.size === 0) return op;
+  const safe = (op.table.indexes ?? []).filter(
+    index => !unemittable.has(index)
+  );
+  return { ...op, table: { ...op.table, indexes: safe } };
+}
+
+/**
+ * Emit the SQL statements for a fast-path-eligible operation list.
+ * Precondition: canEmitWithoutDrizzleKit(ops, dialect) === true — except
+ * for the pipeline's kit-path add_table pre-creation, which may pass a
+ * pure add_table subset of a mixed op list on SQLite/MySQL, and must first
+ * run each op through `withoutUnemittableIndexes`.
+ */
+export function emitDdl(ops: Operation[], dialect: SupportedDialect): string[] {
+  const statements =
+    dialect === "postgresql"
+      ? ops.flatMap(op => emitPostgresDdl(op))
+      : // `dialect` is narrowed to "mysql" | "sqlite" here — exactly AdditiveDialect.
+        ops.flatMap(op => emitAdditiveDdl(op, dialect));
+  // A new table's checks and foreign keys, after EVERY statement above: a
+  // foreign key may point at a table this same apply creates later in the
+  // list. SQLite declared them inside its CREATE TABLE, the only place it
+  // accepts them.
+  if (dialect === "sqlite") return statements;
+  const constraints = ops.flatMap(op =>
+    op.type === "add_table" ? tableConstraintOps(op.table) : []
+  );
+  return [...statements, ...constraints.map(op => generateSQL(op, dialect))];
+}
+
+/**
+ * The checks and foreign keys a table declares, as the operations that add
+ * them to a table that already exists.
+ *
+ * One list for everything that creates a table without them in its CREATE
+ * statement: this emitter on PostgreSQL and MySQL, and first-run setup, whose
+ * drizzle-kit push leaves them off there. Checks first, then foreign keys.
+ */
+export function tableConstraintOps(
+  table: Pick<TableSpec, "name" | "checks" | "foreignKeys">
+): Array<AddCheckOp | AddForeignKeyOp> {
+  return [
+    ...(table.checks ?? []).map(check => ({
+      type: "add_check" as const,
+      tableName: table.name,
+      check,
+    })),
+    ...(table.foreignKeys ?? []).map(foreignKey => ({
+      type: "add_foreign_key" as const,
+      tableName: table.name,
+      foreignKey,
+    })),
+  ];
+}

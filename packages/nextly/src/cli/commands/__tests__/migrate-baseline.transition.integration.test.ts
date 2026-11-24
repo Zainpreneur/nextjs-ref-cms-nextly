@@ -1,0 +1,1869 @@
+/**
+ * Graduating a `db:sync` project to migrations, end to end.
+ *
+ * The unit tests around `planBaseline` prove the decisions; this proves the
+ * flow. It drives the real sequence a developer runs — `db:sync`, then
+ * `migrate:baseline`, then `migrate:create`, then `migrate` — against a real
+ * database, because every step of the defect lives in the seam between two of
+ * those commands and none of it is visible from inside one.
+ *
+ * The first test is the defect itself, kept as a test rather than as prose: on
+ * a database `db:sync` built, `migrate:create` alone emits `CREATE TABLE` for
+ * tables that already exist, and applying that file is refused. It is what the
+ * second test must not do.
+ *
+ * Both dialects run the same body. SQLite and PostgreSQL introspect through
+ * completely different queries, and the snapshot the baseline records is
+ * whatever introspection returned — so a baseline that round-trips on one says
+ * nothing about the other.
+ *
+ * Each run gets a database of its own. The baseline adopts every managed table
+ * in the database by design, so a `dc_` table left behind by another suite
+ * would be adopted here and then proposed for dropping by the next
+ * `migrate:create`.
+ */
+import { randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { readdir, readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
+
+import { Pool } from "pg";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+
+import { defineCollection, defineConfig, text } from "../../../config";
+import { getDialectTables } from "../../../database/index";
+import { createAdapter } from "../../../database/factory";
+import { SchemaRegistry } from "../../../database/schema-registry";
+import { getSchemaEventsDdl } from "../../../domains/schema/events/schema-events-ddl";
+import { SchemaEventsRepository } from "../../../domains/schema/events/schema-events-repository";
+import { clearCachedSnapshot } from "../../../init/schema-snapshot-cache";
+import { toMinimalEntities } from "../../../domains/schema/migrate-create/config-entities";
+import { introspectLiveSnapshot } from "../../../domains/schema/pipeline/diff/introspect-live";
+import { generateMigration } from "../../../domains/schema/migrate-create/generate";
+import {
+  historyAsOneLine,
+  sqlFiles,
+} from "../../../domains/schema/migrate-create/__tests__/helpers/history-one-line";
+import { writeCollectionSave } from "../../../domains/schema/builder-save/collection-save";
+import { isWriterOvertaken } from "../../../domains/schema/migrate-create/writer-hold";
+import { withSchemaChangeExcluded } from "../../../domains/schema/services/schema-change-exclusion";
+import { compileAppStreamTables } from "../../../domains/schema/migrate-create/app-stream";
+import { clearActiveExtensionSchema } from "../../../domains/schema/extension/active-schema";
+import type { SchemaHook } from "../../../domains/schema/extension/draft";
+import { col, defineTable } from "../../../domains/schema/extension/dsl";
+import { definePlugin } from "../../../plugins/plugin-context";
+import { resolveCollectionTableName } from "../../../domains/schema/utils/resolve-table-name";
+import { createLogger } from "../../utils/logger";
+import { baselineCore } from "../migrate-baseline";
+import {
+  ensureLocalizedCompanions,
+  publishExtensionSchema,
+  syncCollections,
+} from "../dev-build";
+import { ensureCoreTables } from "../dev-server";
+import { runFileMigrations, splitSqlStatements } from "../migrate";
+import { createScratchDatabase } from "../../../__tests__/helpers/fresh-database";
+import { checksumOf } from "../../../domains/schema/migrate/applied-checksums";
+import { parseSqlSections } from "../../../domains/schema/migrate/sql-sections";
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import type { SupportedDialect } from "@nextlyhq/adapter-drizzle/types";
+import type { UiSchemaEntity } from "../../../schemas/_zod/ui-schema";
+import type { CommandContext } from "../../program";
+import type { CLIDatabaseAdapter } from "../../utils/adapter";
+import type { LoadConfigResult } from "../../utils/config-loader";
+import type { ResolvedDevOptions } from "../db-sync";
+
+const PG_URL = process.env.TEST_POSTGRES_URL ?? "";
+
+/**
+ * Unique per run so a leftover database from a crashed run is never reused.
+ *
+ * Deliberately short. A junction table is named `<mainA>_<mainB>_<field>`, and
+ * PostgreSQL truncates an identifier at 63 bytes without complaining — so a
+ * long slug here would silently create a table under a different name than the
+ * one asserted, and the junction case would fail for a reason that has nothing
+ * to do with what it tests.
+ */
+const RUN_ID = randomBytes(4).toString("hex");
+
+const SLUG = `baseline_posts_${RUN_ID}`;
+const TABLE = resolveCollectionTableName(SLUG);
+
+/** The config before the change, and after it. One added field between them. */
+const configV1 = defineConfig({
+  collections: [
+    defineCollection({ slug: SLUG, fields: [text({ name: "title" })] }),
+  ],
+});
+const configV2 = defineConfig({
+  collections: [
+    defineCollection({
+      slug: SLUG,
+      fields: [text({ name: "title" }), text({ name: "subtitle" })],
+    }),
+  ],
+});
+
+/** A localized collection, whose translations live in a companion table. */
+const LOCALIZED_SLUG = `baseline_loc_${RUN_ID}`;
+const LOCALIZED_TABLE = resolveCollectionTableName(LOCALIZED_SLUG);
+const localizedConfig = defineConfig({
+  localization: { locales: ["en", "es"], defaultLocale: "en" },
+  collections: [
+    defineCollection({
+      slug: LOCALIZED_SLUG,
+      localized: true,
+      fields: [text({ name: "title", localized: true })],
+    }),
+  ],
+});
+
+/**
+ * A plugin with a table of its own, and an app hook that declares a table of
+ * the app's and contributes a column and an index to the plugin's — the shape
+ * `db.schema.extend` really arrives in, and the one a baseline has to graduate.
+ */
+const notesPlugin = definePlugin({
+  name: "fx",
+  version: "0.0.0",
+  nextly: "*",
+  contributes: {
+    schema: {
+      prefix: "fx",
+      tables: [
+        defineTable("notes", {
+          id: col.id(),
+          title: col.shortText(),
+        }),
+      ],
+    },
+  },
+});
+
+/** The app's own table, named per run so nothing else can hold it. */
+const APP_TABLE = `app_notes_${RUN_ID}`;
+
+/** The app hook: one table of the app's own, one contribution to the plugin's. */
+const extendsSchema: SchemaHook = ({ schema }) => {
+  schema.addTable(
+    defineTable(APP_TABLE, { id: col.id(), note: col.shortText() })
+  );
+  schema.extendTable("fx__notes", {
+    columns: { appRef: col.shortText({ nullable: true }) },
+    indexes: [{ columns: ["app_ref"], name: "idx_fx_notes_app_ref" }],
+  });
+};
+
+/** The config a `db:sync` project with that extension schema runs on. */
+const extensionConfig = defineConfig({
+  plugins: [notesPlugin],
+  collections: [],
+  db: { schema: { extend: [extendsSchema] } },
+});
+
+/**
+ * The drift-recovery shape: `db:sync` ran before the app contributed
+ * anything, and the config has gained the contribution since — so the
+ * database and the compiled stream disagree about it. No collection and no
+ * table of the app's own: the project's entire extension schema is the one
+ * contribution, which is itself the case that has to reach a baseline.
+ */
+const contributesToPlugin: SchemaHook = ({ schema }) => {
+  schema.extendTable("fx__notes", {
+    columns: { appRef: col.shortText({ nullable: true }) },
+    indexes: [{ columns: ["app_ref"], name: "idx_fx_notes_app_ref" }],
+  });
+};
+const pendingConfig = (extend: SchemaHook[]) =>
+  defineConfig({
+    plugins: [notesPlugin],
+    collections: [],
+    ...(extend.length > 0 ? { db: { schema: { extend } } } : {}),
+  });
+
+/** An enum contribution, whose CHECK is part of what the app ships. */
+const contributesEnum: SchemaHook = ({ schema }) => {
+  schema.extendTable("fx__notes", {
+    columns: {
+      reviewState: col.enum(["open", "done"], { nullable: true }),
+    },
+  });
+};
+
+const logger = createLogger({ quiet: true });
+const context = { logger, options: {} } as CommandContext;
+
+interface Harness {
+  adapter: CLIDatabaseAdapter;
+  db: unknown;
+  dialect: SupportedDialect;
+  migrationsDir: string;
+  /** Tear down the database and the temp directory. */
+  dispose: () => Promise<void>;
+}
+
+/**
+ * A database nothing else can reach, plus an empty `migrations/` beside it.
+ *
+ * PostgreSQL gets a real database created for the run: introspection is scoped
+ * to `public`, so a schema would not separate this suite's tables from any
+ * other's.
+ */
+async function makeHarness(
+  dialect: SupportedDialect,
+  suffix = ""
+): Promise<Harness> {
+  const dir = mkdtempSync(join(tmpdir(), "nextly-baseline-"));
+  const migrationsDir = join(dir, "migrations");
+
+  if (dialect === "sqlite") {
+    process.env.DB_DIALECT = "sqlite";
+    const adapter = await createAdapter({
+      type: "sqlite",
+      url: `file:${join(dir, "test.db")}`,
+    } as Parameters<typeof createAdapter>[0]);
+    return {
+      adapter: adapter as unknown as CLIDatabaseAdapter,
+      db: (adapter as unknown as DrizzleAdapter).getDrizzle(),
+      dialect,
+      migrationsDir,
+      dispose: async () => {
+        await adapter.disconnect();
+        rmSync(dir, { recursive: true, force: true });
+      },
+    };
+  }
+
+  if (dialect === "mysql") {
+    const scratch = await createScratchDatabase("mysql", "nextly_baseline");
+    process.env.DB_DIALECT = "mysql";
+    process.env.DATABASE_URL = scratch.url;
+    const adapter = await createAdapter({
+      type: "mysql",
+      url: scratch.url,
+    } as Parameters<typeof createAdapter>[0]);
+    return {
+      adapter: adapter as unknown as CLIDatabaseAdapter,
+      db: (adapter as unknown as DrizzleAdapter).getDrizzle(),
+      dialect,
+      migrationsDir,
+      dispose: async () => {
+        await adapter.disconnect();
+        await scratch.drop();
+        rmSync(dir, { recursive: true, force: true });
+      },
+    };
+  }
+
+  const dbName = `nextly_baseline_${RUN_ID}${suffix ? `_${suffix}` : ""}`;
+  const admin = new Pool({ connectionString: PG_URL });
+  await admin.query(`CREATE DATABASE "${dbName}"`);
+  await admin.end();
+
+  const url = new URL(PG_URL);
+  url.pathname = `/${dbName}`;
+  process.env.DB_DIALECT = "postgresql";
+  process.env.DATABASE_URL = url.toString();
+  const adapter = await createAdapter({
+    type: "postgresql",
+    url: url.toString(),
+  } as Parameters<typeof createAdapter>[0]);
+
+  return {
+    adapter: adapter as unknown as CLIDatabaseAdapter,
+    db: (adapter as unknown as DrizzleAdapter).getDrizzle(),
+    dialect,
+    migrationsDir,
+    dispose: async () => {
+      await adapter.disconnect();
+      const cleanup = new Pool({ connectionString: PG_URL });
+      await cleanup.query(`DROP DATABASE IF EXISTS "${dbName}"`);
+      await cleanup.end();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+/**
+ * What `nextly db:sync` does to a fresh database, minus the disk reads.
+ *
+ * Deliberately the real `syncCollections` rather than a hand-built
+ * `CREATE TABLE`: the point of the whole test is that the tables the baseline
+ * adopts are the ones the push pipeline actually produces, down to the column
+ * types introspection will report.
+ */
+async function runDbSync(h: Harness, config: LoadConfigResult["config"]) {
+  const drizzleAdapter = h.adapter as unknown as DrizzleAdapter;
+  const registry = new SchemaRegistry(h.dialect);
+  registry.registerStaticSchemas(getDialectTables(h.dialect));
+  drizzleAdapter.setTableResolver(registry);
+
+  const options = { cwd: "", autoSync: true } as ResolvedDevOptions;
+  await ensureCoreTables(h.adapter, options, context);
+  // The transition copy runs BEFORE the pushes, while an entity gaining
+  // localization still has the translatable columns on its main table for
+  // the copy to read, and the companion creation after.
+  await ensureLocalizedCompanions(config, h.adapter, context, "beforeApply");
+  // As `db:sync` does: published before the syncs, which plan plugin tables
+  // and contributed elements from it. For a config that declares none this
+  // publishes nothing, so the other tests' pushes are unchanged.
+  await publishExtensionSchema(
+    { config } as LoadConfigResult,
+    h.adapter,
+    context
+  );
+  await syncCollections(
+    { config } as LoadConfigResult,
+    h.adapter,
+    options,
+    context
+  );
+  await ensureLocalizedCompanions(config, h.adapter, context);
+
+  // Removed LAST, after the push pipeline has run: `ensureCoreTables` declares
+  // the ledger among the core schema and a push recreates it, so dropping it
+  // earlier would not leave the database in the state this is modelling. A
+  // db:sync project has never run `migrate`, which is what bootstraps the
+  // ledger, so `migrate:baseline` is the first thing that writes to it and has
+  // to create it. Creating it in the harness would supply the precondition the
+  // command is responsible for.
+  await dropLedger(h);
+}
+
+/** `migrate:create`, given a config, exactly as the CLI composes its arguments. */
+async function runMigrateCreate(
+  h: Harness,
+  config: LoadConfigResult["config"],
+  name: string
+) {
+  return generateMigration({
+    name,
+    dialect: h.dialect,
+    migrationsDir: h.migrationsDir,
+    collections: toMinimalEntities(config.collections, e =>
+      resolveCollectionTableName(e.slug, e.dbName)
+    ),
+    singles: [],
+    components: [],
+    nonInteractive: true,
+  });
+}
+
+/**
+ * Remove the migration ledger, putting the database in the state a db:sync
+ * project is really in: core tables present, nothing having ever migrated.
+ *
+ * `ensureCoreTables` declares the ledger among the core schema, so a fresh
+ * push creates it. A database that predates that declaration does not have it,
+ * and that is the case where a baseline that assumes the table would fail
+ * after writing its files.
+ */
+async function dropLedger(h: Harness): Promise<void> {
+  await (h.adapter as unknown as DrizzleAdapter).executeQuery(
+    "DROP TABLE IF EXISTS nextly_schema_events"
+  );
+}
+
+/**
+ * What `migrate` Phase 1 does before it applies anything.
+ *
+ * `runFileMigrations` is Phase 2 alone, so a test driving it directly has to
+ * stand in for Phase 1. Only the tests that reach `migrate` WITHOUT baselining
+ * first need it — after a baseline the ledger is already there, because
+ * creating it is part of adopting.
+ */
+async function bootstrapLedger(h: Harness): Promise<void> {
+  for (const stmt of getSchemaEventsDdl(h.dialect)) {
+    await (h.adapter as unknown as DrizzleAdapter).executeQuery(stmt);
+  }
+}
+
+/**
+ * An identifier, quoted the way the dialect quotes identifiers.
+ *
+ * The probes below hand SQL to the adapter directly, and a double-quoted
+ * identifier is a string literal on MySQL — every probe threw there and read
+ * as "absent", so a suite assertion expecting absence passed without asking
+ * the database anything.
+ */
+function id(h: Harness, name: string): string {
+  return h.dialect === "mysql" ? `\`${name}\`` : `"${name}"`;
+}
+
+/** Whether a table exists, probed the way the write path probes it. */
+async function tableExists(h: Harness, name: string): Promise<boolean> {
+  try {
+    await (h.adapter as unknown as DrizzleAdapter).executeQuery(
+      `SELECT 1 FROM ${id(h, name)} LIMIT 0`
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether the live table has a column, asked the way the drift engine asks. */
+async function hasColumn(h: Harness, column: string): Promise<boolean> {
+  try {
+    await (h.adapter as unknown as DrizzleAdapter).executeQuery(
+      `SELECT ${id(h, column)} FROM ${id(h, TABLE)} LIMIT 0`
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function runSuite(dialect: SupportedDialect): void {
+  let h: Harness;
+  let previousDialect: string | undefined;
+  let previousUrl: string | undefined;
+
+  beforeEach(async () => {
+    previousDialect = process.env.DB_DIALECT;
+    previousUrl = process.env.DATABASE_URL;
+    // The push pipeline caches the last applied desired-schema for the life of
+    // the process. Each test here starts on a database that has never been
+    // pushed to, so a hit carried over from the previous one would skip the
+    // push and leave the tables the whole flow is about uncreated.
+    clearCachedSnapshot();
+    h = await makeHarness(dialect);
+  });
+
+  afterEach(async () => {
+    await h.dispose();
+    // A test that published an extension schema leaves it active for the
+    // process, and the pushes the other tests run would plan from it.
+    clearActiveExtensionSchema();
+    // Integration files share one fork, so an environment left set here would
+    // be read by every file that follows.
+    if (previousDialect === undefined) delete process.env.DB_DIALECT;
+    else process.env.DB_DIALECT = previousDialect;
+    if (previousUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = previousUrl;
+  });
+
+  it("without adopting, the first migration re-creates tables that exist and is refused", async () => {
+    await runDbSync(h, configV1);
+
+    // This is the reported defect. The config gained one field, but with no
+    // snapshot to diff against, generation compares it to nothing.
+    const result = await runMigrateCreate(h, configV2, "add_subtitle");
+    expect(result).not.toBeNull();
+    const sql = await readFile(result!.sqlPath, "utf-8");
+    expect(sql).toContain("CREATE TABLE");
+    expect(sql).toContain(TABLE);
+
+    // And it cannot be applied: the database matches neither the empty
+    // baseline the file assumes nor the target it describes. All three
+    // recoveries the drift error offers fail from here, which is what leaves
+    // the operator stuck.
+    await bootstrapLedger(h);
+    await expect(
+      runFileMigrations({
+        adapter: h.adapter,
+        db: h.db,
+        dialect: h.dialect,
+        migrationsDir: h.migrationsDir,
+        logger,
+      })
+    ).rejects.toThrow(/drift/i);
+
+    expect(await hasColumn(h, "subtitle")).toBe(false);
+  });
+
+  it("adopts the database, then generates a delta that creates no table", async () => {
+    await runDbSync(h, configV1);
+
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+    });
+    expect(adopted.kind).toBe("baselined");
+    if (adopted.kind !== "baselined") throw new Error("expected a baseline");
+    expect(adopted.tableCount).toBe(1);
+
+    // Adopting created the ledger it recorded itself into. A database managed
+    // by `db:sync` has never run `migrate`, which is what normally bootstraps
+    // it, so a command that assumed the table would throw here — after both
+    // files were already on disk.
+    const recorded = await new SchemaEventsRepository(
+      h.db,
+      h.dialect
+    ).listFileApplies();
+    expect(recorded.map(r => r.filename)).toContain(basename(adopted.sqlPath));
+
+    const result = await runMigrateCreate(h, configV2, "add_subtitle");
+    expect(result).not.toBeNull();
+    const sql = await readFile(result!.sqlPath, "utf-8");
+    const up = splitSqlStatements(parseSqlSections(sql).upSql);
+
+    // The change itself, and nothing that rebuilds what is already standing.
+    // A `CREATE TABLE` here is the entire reported defect, so it is asserted
+    // against the parsed statements rather than the whole file — the header
+    // comment names the collection, and a substring check on the raw text
+    // would pass for the wrong reason.
+    expect(up.filter(s => /^ALTER TABLE .* ADD COLUMN/i.test(s))).toEqual([
+      expect.stringContaining("subtitle"),
+    ]);
+    // Filtered rather than `.some(...)`: a boolean assertion that fails says
+    // only "expected true to be false", and the statement it objected to is
+    // the whole diagnosis.
+    expect(up.filter(s => /^CREATE TABLE/i.test(s))).toEqual([]);
+    expect(up.filter(s => /^DROP /i.test(s))).toEqual([]);
+
+    // What remains is index creation, and it is expected here rather than a
+    // leak from the baseline. The schema the push pipeline generates for a
+    // collection declares no indexes at all, while the desired snapshot
+    // `migrate:create` builds declares the slug, created_by and created_at
+    // ones — so a database built by `db:sync` genuinely lacks them, the
+    // baseline records that truthfully, and the first migration after
+    // adoption is where they arrive.
+    const unexpected = up.filter(
+      s =>
+        s.trim().length > 0 &&
+        !/^ALTER TABLE .* ADD COLUMN/i.test(s) &&
+        !/^CREATE (UNIQUE )?INDEX/i.test(s)
+    );
+    expect(unexpected).toEqual([]);
+
+    // It applies. Exactly one file runs — the baseline was recorded as
+    // applied when it was written, so it is not replayed against the database
+    // it was taken from.
+    const applied = await runFileMigrations({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+    });
+    expect(applied).toBe(1);
+    expect(await hasColumn(h, "subtitle")).toBe(true);
+    // The column the baseline adopted is still there: adopting recorded the
+    // schema, it did not rebuild it.
+    expect(await hasColumn(h, "title")).toBe(true);
+  });
+
+  it("adopts the app's extension schema, so migrate:create owes nothing after it", async () => {
+    // The graduation the one compiled schema asks of a baseline: a db:sync
+    // database carrying a table the app declared through `db.schema.extend`
+    // and an element it contributed to a plugin's table. A baseline that
+    // never compiled the app stream left the app's table out of the snapshot
+    // (it carries no managed prefix) and recorded the contribution nowhere,
+    // so the first `migrate:create` after adopting re-created the one and
+    // re-emitted the other against a database that already had both.
+    await runDbSync(h, extensionConfig);
+
+    const appStream = await compileAppStreamTables({
+      config: extensionConfig,
+      dialect: h.dialect,
+      logger: { warn: () => {} },
+    });
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream,
+    });
+    if (adopted.kind !== "baselined")
+      throw new Error(`expected a baseline, got ${adopted.kind}`);
+
+    // The app's table is adopted like any other, from the database; the
+    // plugin's enters the snapshot as the compiled schema has it, with the
+    // app's elements named beside it, as every snapshot writer records them.
+    const recorded = JSON.parse(
+      await readFile(adopted.snapshotPath, "utf-8")
+    ) as {
+      snapshot: { tables: { name: string }[] };
+      contributions?: Record<
+        string,
+        {
+          columns: string[];
+          indexes: string[];
+          foreignKeys: string[];
+          checks: string[];
+        }
+      >;
+    };
+    const names = recorded.snapshot.tables.map(table => table.name);
+    expect(names).toContain(APP_TABLE);
+    expect(names).toContain("fx__notes");
+    expect(recorded.contributions?.fx__notes).toEqual({
+      columns: ["app_ref"],
+      indexes: ["idx_fx_notes_app_ref"],
+      foreignKeys: [],
+      checks: [],
+    });
+
+    // The body rebuilds the app's own table on a fresh environment. Neither
+    // the plugin's table nor the core's is ever this stream's to build —
+    // their lifecycles ride the plugin's migrations and the core's own ensure.
+    const up = splitSqlStatements(
+      parseSqlSections(await readFile(adopted.sqlPath, "utf-8")).upSql
+    );
+    /** The CREATE TABLE statements naming `table`, whichever dialect's quotes. */
+    const createsOf = (table: string): string[] =>
+      up.filter(statement => {
+        const named = /^CREATE TABLE\s+(?:"|`)([^"`]+)(?:"|`)/i.exec(statement);
+        return named?.[1] === table;
+      });
+    expect(createsOf(APP_TABLE)).not.toEqual([]);
+    expect(createsOf("fx__notes")).toEqual([]);
+
+    // The contributed elements are in the body, so a fresh environment —
+    // which gets the foreign tables from their owners' migrations and the
+    // elements from nowhere else — receives them from this file: an ALTER
+    // per contributed column and a CREATE per contributed index, never a
+    // CREATE of the foreign table. The snapshot above records the same
+    // elements as present, so without this the next `migrate:create` would
+    // owe nothing and the columns would never arrive.
+    expect(
+      up.filter(s => /^ALTER TABLE/i.test(s) && s.includes("app_ref"))
+    ).not.toEqual([]);
+    expect(
+      up.filter(
+        s =>
+          /^CREATE (UNIQUE )?INDEX/i.test(s) &&
+          s.includes("idx_fx_notes_app_ref")
+      )
+    ).not.toEqual([]);
+
+    // The graduation itself: with the origin recorded from the same compiled
+    // schema the generation reads, nothing is pending after the baseline.
+    const pending = await generateMigration({
+      name: "after_baseline",
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      collections: [],
+      singles: [],
+      components: [],
+      appStream,
+      nonInteractive: true,
+    });
+    expect(pending).toBeNull();
+  });
+
+  it("leaves a contribution the database has not received pending", async () => {
+    // The drift-recovery flow walks an operator into editing the config
+    // BEFORE adopting, so a contribution the last push never brought is the
+    // ordinary case rather than the exotic one. A baseline that recorded it
+    // as present would make every later generation owe nothing for a column
+    // no migration ever brought; adoption states what is there, and the
+    // change stays pending for the app's first migration after it.
+    await runDbSync(h, pendingConfig([]));
+
+    const appStream = await compileAppStreamTables({
+      config: pendingConfig([contributesToPlugin]),
+      dialect: h.dialect,
+      logger: { warn: () => {} },
+    });
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream,
+    });
+    if (adopted.kind !== "baselined")
+      throw new Error(`expected a baseline, got ${adopted.kind}`);
+
+    const recorded = JSON.parse(
+      await readFile(adopted.snapshotPath, "utf-8")
+    ) as {
+      snapshot: { tables: { name: string; columns?: { name: string }[] }[] };
+      contributions?: Record<string, unknown>;
+    };
+    // With no element standing in the database, the foreign table is omitted
+    // from both the snapshot and the contribution record — otherwise dropping
+    // the pending contribution afterwards would leave the snapshot holding a
+    // table the desired side no longer visits, planning a DROP TABLE on it.
+    expect(
+      recorded.snapshot.tables.find(t => t.name === "fx__notes")
+    ).toBeUndefined();
+    expect(recorded.contributions?.fx__notes).toBeUndefined();
+
+    // Nor does the body build what the adopting database never received.
+    const up = splitSqlStatements(
+      parseSqlSections(await readFile(adopted.sqlPath, "utf-8")).upSql
+    );
+    expect(up.filter(s => s.includes("app_ref"))).toEqual([]);
+
+    // Removing the pending contribution before the next generation produces no
+    // migration and never tries to drop the plugin's own table.
+    const withdrawn = await generateMigration({
+      name: "drop_pending",
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      collections: [],
+      singles: [],
+      components: [],
+      appStream: await compileAppStreamTables({
+        config: pendingConfig([]),
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+      nonInteractive: true,
+    });
+    expect(withdrawn).toBeNull();
+
+    // The change is still owed, and it is the app's migration that brings
+    // it — the whole point of leaving it unrecorded.
+    const pending = await generateMigration({
+      name: "contribute",
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      collections: [],
+      singles: [],
+      components: [],
+      appStream,
+      nonInteractive: true,
+    });
+    expect(pending).not.toBeNull();
+    const pendingUp = splitSqlStatements(
+      parseSqlSections(await readFile(pending!.sqlPath, "utf-8")).upSql
+    );
+    expect(
+      pendingUp.filter(s => /^ALTER TABLE/i.test(s) && s.includes("app_ref"))
+    ).not.toEqual([]);
+  });
+
+  it("refuses to adopt a contribution the config has withdrawn", async () => {
+    // The reverse drift: the last push carried the contribution, and the
+    // config has dropped it since. Nothing records whose a contribution was
+    // once it is withdrawn, so a baseline could neither carry the leftover
+    // to a fresh environment nor schedule its removal — this database would
+    // keep it while every other missed it. Refused and named, as a companion
+    // holding an undescribed column is.
+    await runDbSync(h, pendingConfig([contributesToPlugin]));
+
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream: await compileAppStreamTables({
+        config: pendingConfig([]),
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+    });
+    expect(adopted.kind).toBe("contribution-mismatch");
+    if (adopted.kind !== "contribution-mismatch")
+      throw new Error("expected a refusal");
+    expect(adopted.mismatches).toEqual([
+      { table: "fx__notes", elements: ["app_ref", "idx_fx_notes_app_ref"] },
+    ]);
+  });
+
+  it("refuses a withdrawn unique index sharing columns with a plugin index", async () => {
+    // Uniqueness is part of an index's identity: a plugin's non-unique index
+    // on `title` must not mask a withdrawn app unique index on `title`.
+    const indexedPlugin = definePlugin({
+      name: "fx",
+      version: "0.0.0",
+      nextly: "*",
+      contributes: {
+        schema: {
+          prefix: "fx",
+          tables: [
+            defineTable(
+              "notes",
+              { id: col.id(), title: col.shortText() },
+              { indexes: [{ columns: ["title"] }] }
+            ),
+          ],
+        },
+      },
+    });
+    const withUnique: SchemaHook = ({ schema }) => {
+      schema.extendTable("fx__notes", {
+        indexes: [
+          { columns: ["title"], unique: true, name: "uq_fx_notes_title" },
+        ],
+      });
+    };
+    await runDbSync(
+      h,
+      defineConfig({
+        plugins: [indexedPlugin],
+        collections: [],
+        db: { schema: { extend: [withUnique] } },
+      })
+    );
+
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream: await compileAppStreamTables({
+        config: defineConfig({ plugins: [indexedPlugin], collections: [] }),
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+    });
+    expect(adopted.kind).toBe("contribution-mismatch");
+    if (adopted.kind !== "contribution-mismatch")
+      throw new Error("expected a refusal");
+    expect(adopted.mismatches).toEqual([
+      { table: "fx__notes", elements: ["uq_fx_notes_title"] },
+    ]);
+  });
+
+  it("refuses an extra withdrawn index sharing an owner's index shape", async () => {
+    // A second live index sharing columns and uniqueness with an owner's
+    // declared index under another name is not accounted for by that single
+    // declaration, and must still be refused on adoption.
+    const indexedPlugin = definePlugin({
+      name: "fx",
+      version: "0.0.0",
+      nextly: "*",
+      contributes: {
+        schema: {
+          prefix: "fx",
+          tables: [
+            defineTable(
+              "notes",
+              { id: col.id(), title: col.shortText() },
+              { indexes: [{ columns: ["title"], unique: true }] }
+            ),
+          ],
+        },
+      },
+    });
+    await runDbSync(
+      h,
+      defineConfig({
+        plugins: [indexedPlugin],
+        collections: [],
+      })
+    );
+    await (h.adapter as unknown as DrizzleAdapter).executeQuery(
+      `CREATE UNIQUE INDEX ${id(h, "uq_fx_notes_title_app")} ON ${id(h, "fx__notes")} (${id(h, "title")})`
+    );
+
+    const refused = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream: await compileAppStreamTables({
+        config: defineConfig({ plugins: [indexedPlugin], collections: [] }),
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+    });
+    expect(refused.kind).toBe("contribution-mismatch");
+    if (refused.kind !== "contribution-mismatch")
+      throw new Error("expected a refusal");
+    expect(refused.mismatches).toEqual([
+      { table: "fx__notes", elements: ["uq_fx_notes_title_app"] },
+    ]);
+  });
+
+  it("refuses a withdrawn app index matching a pending owner index's shape", async () => {
+    // A pending owner index not yet present on the live table must not explain
+    // a differently named withdrawn app index that happens to share its shape.
+    const unindexedPlugin = definePlugin({
+      name: "fx",
+      version: "0.0.0",
+      nextly: "*",
+      contributes: {
+        schema: {
+          prefix: "fx",
+          tables: [
+            defineTable("notes", { id: col.id(), title: col.shortText() }),
+          ],
+        },
+      },
+    });
+    const indexedPlugin = definePlugin({
+      name: "fx",
+      version: "0.0.0",
+      nextly: "*",
+      contributes: {
+        schema: {
+          prefix: "fx",
+          tables: [
+            defineTable(
+              "notes",
+              { id: col.id(), title: col.shortText() },
+              { indexes: [{ columns: ["title"], unique: true }] }
+            ),
+          ],
+        },
+      },
+    });
+    await runDbSync(
+      h,
+      defineConfig({
+        plugins: [unindexedPlugin],
+        collections: [],
+      })
+    );
+    await (h.adapter as unknown as DrizzleAdapter).executeQuery(
+      `CREATE UNIQUE INDEX ${id(h, "uq_fx_notes_title_app")} ON ${id(h, "fx__notes")} (${id(h, "title")})`
+    );
+
+    const refused = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream: await compileAppStreamTables({
+        config: defineConfig({ plugins: [indexedPlugin], collections: [] }),
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+    });
+    expect(refused.kind).toBe("contribution-mismatch");
+    if (refused.kind !== "contribution-mismatch")
+      throw new Error("expected a refusal");
+    expect(refused.mismatches).toEqual([
+      { table: "fx__notes", elements: ["uq_fx_notes_title_app"] },
+    ]);
+  });
+
+  it("allows a pending owner index definition change while its name remains declared", async () => {
+    // When a plugin updates an explicitly named index (e.g. changing columns
+    // or uniqueness) and the migration has not applied yet, the live index
+    // still belongs to the plugin's declared stream and must not block adoption.
+    const pluginV1 = definePlugin({
+      name: "fx",
+      version: "0.0.0",
+      nextly: "*",
+      contributes: {
+        schema: {
+          prefix: "fx",
+          tables: [
+            defineTable(
+              "notes",
+              { id: col.id(), title: col.shortText() },
+              { indexes: [{ columns: ["title"], name: "idx_fx_notes_custom" }] }
+            ),
+          ],
+        },
+      },
+    });
+    const pluginV2 = definePlugin({
+      name: "fx",
+      version: "0.0.0",
+      nextly: "*",
+      contributes: {
+        schema: {
+          prefix: "fx",
+          tables: [
+            defineTable(
+              "notes",
+              { id: col.id(), title: col.shortText() },
+              {
+                indexes: [
+                  {
+                    columns: ["title"],
+                    unique: true,
+                    name: "idx_fx_notes_custom",
+                  },
+                ],
+              }
+            ),
+          ],
+        },
+      },
+    });
+    const appHook: SchemaHook = ({ schema }) => {
+      schema.extendTable("fx__notes", {
+        columns: { app_ref: col.shortText({ nullable: true }) },
+      });
+    };
+    await runDbSync(
+      h,
+      defineConfig({
+        plugins: [pluginV1],
+        collections: [],
+        db: { schema: { extend: [appHook] } },
+      })
+    );
+
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream: await compileAppStreamTables({
+        config: defineConfig({
+          plugins: [pluginV2],
+          collections: [],
+          db: { schema: { extend: [appHook] } },
+        }),
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+    });
+    expect(adopted.kind).toBe("baselined");
+  });
+
+  it("refuses a withdrawn index-only contribution on a core table", async () => {
+    // An app index added to an existing core column carries no contributed
+    // column beside it; withdrawing it must still be caught rather than skipped
+    // because the table is a core table.
+    const indexOnUsers: SchemaHook = ({ schema }) => {
+      schema.extendTable("users", {
+        indexes: [{ columns: ["name"], name: "idx_users_name_app" }],
+      });
+    };
+    await runDbSync(h, configV1);
+    await (h.adapter as unknown as DrizzleAdapter).executeQuery(
+      `CREATE INDEX ${id(h, "idx_users_name_app")} ON ${id(h, "users")} (${id(h, "name")})`
+    );
+
+    const refused = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream: await compileAppStreamTables({
+        config: defineConfig({ collections: [] }),
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+    });
+    expect(refused.kind).toBe("contribution-mismatch");
+    if (refused.kind !== "contribution-mismatch")
+      throw new Error("expected a refusal");
+    expect(refused.mismatches).toEqual([
+      { table: "users", elements: ["idx_users_name_app"] },
+    ]);
+
+    // And when the hook IS present in config, the same live index is
+    // explained and recorded rather than refused.
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream: await compileAppStreamTables({
+        config: defineConfig({
+          collections: [],
+          db: { schema: { extend: [indexOnUsers] } },
+        }),
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+    });
+    expect(adopted.kind).toBe("baselined");
+  });
+
+  it("refuses a withdrawn enum CHECK when the contributed column remains", async () => {
+    // Changing a contributed `col.enum()` to `col.shortText()` leaves the
+    // column name explained while withdrawing its CHECK constraint; dialects
+    // whose push and introspection carry the CHECK must refuse rather than
+    // silently leaving the live constraint behind.
+    const asText: SchemaHook = ({ schema }) => {
+      schema.extendTable("fx__notes", {
+        columns: { reviewState: col.shortText({ nullable: true }) },
+      });
+    };
+    await runDbSync(h, pendingConfig([contributesEnum]));
+
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream: await compileAppStreamTables({
+        config: pendingConfig([asText]),
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+    });
+    expect(adopted.kind).toBe("contribution-mismatch");
+    if (adopted.kind !== "contribution-mismatch")
+      throw new Error("expected a refusal");
+    expect(adopted.mismatches).toEqual([
+      { table: "fx__notes", elements: ["ck_fx__notes_review_state_enum"] },
+    ]);
+  });
+
+  it("builds the CHECK of a contributed enum column into the baseline", async () => {
+    // An enum's CHECK is part of what the app contributes: without it in the
+    // file, a fresh environment accepts values the adopted database rejects.
+    // The bare side of the diff declares no checks, and a dimension either
+    // side leaves untracked is one the diff skips — so the emission makes
+    // the bare side track what the recorded side tracks, as the app stream's
+    // own two-sided diff does.
+    await runDbSync(h, pendingConfig([contributesEnum]));
+
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream: await compileAppStreamTables({
+        config: pendingConfig([contributesEnum]),
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+    });
+    if (adopted.kind !== "baselined")
+      throw new Error(`expected a baseline, got ${adopted.kind}`);
+
+    const up = splitSqlStatements(
+      parseSqlSections(await readFile(adopted.sqlPath, "utf-8")).upSql
+    );
+    expect(
+      up.filter(s => /^ALTER TABLE/i.test(s) && s.includes("review_state"))
+    ).not.toEqual([]);
+    // A dialect whose introspection reports CHECK constraints carries the
+    // constraint itself; one whose does not still carries the column, and
+    // the next migration against the live table is where its constraint
+    // then arrives.
+    const checks = up.filter(
+      s => /CHECK/i.test(s) && s.includes("review_state")
+    );
+    if (h.dialect !== "sqlite") {
+      expect(checks).not.toEqual([]);
+    } else {
+      expect(up.filter(s => s.includes("review_state")).length).toBeGreaterThan(
+        0
+      );
+    }
+  });
+
+  it("still has nothing to adopt when the app declares no schema at all", async () => {
+    // The core tables stand in every database ever pushed, and so does the
+    // plugin's table — neither may read as an app schema to graduate. A
+    // project with no collection, no app table and no contribution keeps
+    // its empty-database answer rather than recording an origin that
+    // adopts nothing.
+    await runDbSync(h, pendingConfig([]));
+
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream: await compileAppStreamTables({
+        config: pendingConfig([]),
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+    });
+    expect(adopted.kind).toBe("empty-database");
+  });
+
+  it("keeps the retired media sizes and access_rules columns out of the orphan refusal", async () => {
+    // The core reconcile deliberately retains `media.sizes` and the retired
+    // `access_rules` columns on `dynamic_collections` and `dynamic_singles`
+    // until an operator removes them, so they stand there explained by nothing —
+    // and a refusal over them would block existing installations from
+    // graduating. They are retained per table, never an orphan, and never
+    // recorded either.
+    await runDbSync(h, configV1);
+    const colType = h.dialect === "mysql" ? "JSON" : "text";
+    for (const [table, column] of [
+      ["media", "sizes"],
+      ["dynamic_collections", "access_rules"],
+      ["dynamic_singles", "access_rules"],
+    ] as const) {
+      await (h.adapter as unknown as DrizzleAdapter).executeQuery(
+        `ALTER TABLE ${id(h, table)} ADD COLUMN ${id(h, column)} ${colType}`
+      );
+    }
+
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream: await compileAppStreamTables({
+        config: { collections: [] },
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+    });
+    if (adopted.kind !== "baselined")
+      throw new Error(`expected a baseline, got ${adopted.kind}`);
+    // Core tables are never adopted whole, so retained columns reach no
+    // snapshot: what this asserts is that adoption succeeded rather than
+    // refusing over any of the three retained columns.
+    const recorded = JSON.parse(
+      await readFile(adopted.snapshotPath, "utf-8")
+    ) as { snapshot: { tables: { name: string }[] } };
+    expect(recorded.snapshot.tables.some(t => t.name === "media")).toBe(false);
+    expect(
+      recorded.snapshot.tables.some(t => t.name === "dynamic_collections")
+    ).toBe(false);
+    expect(
+      recorded.snapshot.tables.some(t => t.name === "dynamic_singles")
+    ).toBe(false);
+  });
+
+  it("still refuses a withdrawn sizes column on a plugin table", async () => {
+    // The retained `sizes` exemption is scoped to `media`: a leftover `sizes`
+    // column on any other table is still a withdrawn contribution.
+    await runDbSync(h, pendingConfig([]));
+    await (h.adapter as unknown as DrizzleAdapter).executeQuery(
+      `ALTER TABLE ${id(h, "fx__notes")} ADD COLUMN ${id(h, "sizes")} text`
+    );
+
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream: await compileAppStreamTables({
+        config: pendingConfig([]),
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+    });
+    expect(adopted.kind).toBe("contribution-mismatch");
+    if (adopted.kind !== "contribution-mismatch")
+      throw new Error("expected a refusal");
+    expect(adopted.mismatches).toEqual([
+      { table: "fx__notes", elements: ["sizes"] },
+    ]);
+  });
+
+  it("carries a localized companion into the baseline SQL, but not the snapshot", async () => {
+    // The split is the point. A companion is derived, never declared by
+    // config, so recording it in the SNAPSHOT would make the next diff want to
+    // drop it. It still has to be in the SQL: `migrate:create` emits a
+    // companion only while the previous snapshot shows the translatable
+    // columns on the main table, and after a baseline that table is recorded
+    // already without them — which reads as "already localized, the companion
+    // exists" and emits nothing. So if the baseline does not carry it, no file
+    // ever will, and a fresh environment gets a main table with nowhere to put
+    // translations.
+    await runDbSync(h, localizedConfig);
+    expect(await tableExists(h, `${LOCALIZED_TABLE}_locales`)).toBe(true);
+
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      // The RAW collections, as the command passes them: the column
+      // descriptor reads storage inputs the diff engine's reduction drops.
+      localizedEntities: localizedConfig.collections.map(c => ({
+        slug: c.slug,
+        tableName: resolveCollectionTableName(c.slug),
+        fields: c.fields,
+        status: false,
+        builtBy: "codeFirst" as const,
+      })),
+      defaultLocale: "en",
+    });
+    if (adopted.kind !== "baselined") throw new Error("expected a baseline");
+
+    const up = splitSqlStatements(
+      parseSqlSections(await readFile(adopted.sqlPath, "utf-8")).upSql
+    );
+    const companionStatements = up.filter(st =>
+      st.includes(`${LOCALIZED_TABLE}_locales`)
+    );
+    expect(companionStatements).not.toEqual([]);
+    // Emitted through the production companion DDL, not rebuilt from the
+    // introspected shape: the snapshot model has no concept of a foreign key,
+    // so a companion reconstructed from one loses the cascade and deleting a
+    // document strands its translations.
+    expect(companionStatements.join("\n")).toMatch(/ON DELETE CASCADE/i);
+    expect(companionStatements.join("\n")).toContain(LOCALIZED_TABLE);
+
+    const recorded = JSON.parse(
+      await readFile(adopted.snapshotPath, "utf-8")
+    ) as { snapshot: { tables: { name: string; localized?: boolean }[] } };
+    const names = recorded.snapshot.tables.map(t => t.name);
+    expect(names).toContain(LOCALIZED_TABLE);
+    expect(names).not.toContain(`${LOCALIZED_TABLE}_locales`);
+
+    // And the main table is marked localized. An introspected snapshot records
+    // columns and nothing about localization, and `planCompanionMigrations`
+    // treats a missing marker as unknown rather than inferring from shape — so
+    // without this, later DISABLING localization emits only the column re-add
+    // and leaves the translations unrestored, unarchived and the companion
+    // undropped.
+    const main = recorded.snapshot.tables.find(
+      (t: { name: string }) => t.name === LOCALIZED_TABLE
+    ) as { localized?: boolean } | undefined;
+    expect(main?.localized).toBe(true);
+  });
+
+  it("records the companion columns the database has, not the ones config asks for", async () => {
+    // The drift error walks an operator into editing config BEFORE adopting,
+    // so the two disagreeing is the ordinary case rather than the exotic one.
+    // A baseline states where the schema starts, so it has to state what is
+    // actually there: recording a column the adopted database does not have
+    // describes a database that never existed, and the next `migrate:create`
+    // sees the companion already present and emits nothing to reconcile it.
+    await runDbSync(h, localizedConfig);
+    expect(await tableExists(h, `${LOCALIZED_TABLE}_locales`)).toBe(true);
+
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      // Config has moved on: `subtitle` is localized here but was never
+      // pushed, so the live companion carries `title` alone.
+      localizedEntities: [
+        {
+          slug: LOCALIZED_SLUG,
+          tableName: LOCALIZED_TABLE,
+          fields: [
+            ...localizedConfig.collections[0].fields,
+            text({ name: "subtitle", localized: true }),
+          ],
+          status: false,
+          builtBy: "codeFirst" as const,
+        },
+      ],
+      defaultLocale: "en",
+    });
+    if (adopted.kind !== "baselined") throw new Error("expected a baseline");
+
+    const up = splitSqlStatements(
+      parseSqlSections(await readFile(adopted.sqlPath, "utf-8")).upSql
+    );
+    const companion = up
+      .filter(st => st.includes(`${LOCALIZED_TABLE}_locales`))
+      .join("\n");
+
+    expect(companion).toContain("title");
+    expect(companion).not.toContain("subtitle");
+    // Structure still comes from the production DDL builder — it is the only
+    // source for a foreign key, which the snapshot model cannot express.
+    expect(companion).toMatch(/ON DELETE CASCADE/i);
+
+    // And the recorded localized columns match, since a later disable
+    // restores, archives and drops exactly these.
+    const recorded = JSON.parse(
+      await readFile(adopted.snapshotPath, "utf-8")
+    ) as {
+      snapshot: { tables: { name: string; localizedColumns?: string[] }[] };
+    };
+    const main = recorded.snapshot.tables.find(t => t.name === LOCALIZED_TABLE);
+    expect(main?.localizedColumns).toEqual(["title"]);
+  });
+
+  it("refuses to adopt a companion holding a column nothing describes", async () => {
+    // The other direction, and it cannot be resolved by preferring either
+    // side. A column standing in the database that no field describes has no
+    // logical kind, and introspection recovers only the physical type — so the
+    // companion cannot be rebuilt faithfully. Emitting it without the column
+    // would produce a baseline whose fresh environments come up missing
+    // translations, which is the failure this command exists to prevent.
+    await runDbSync(h, localizedConfig);
+    expect(await tableExists(h, `${LOCALIZED_TABLE}_locales`)).toBe(true);
+
+    const refused = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      // `title` was removed from the config while its column, and whatever
+      // translations it holds, are still in the database.
+      localizedEntities: [
+        {
+          slug: LOCALIZED_SLUG,
+          tableName: LOCALIZED_TABLE,
+          fields: [text({ name: "summary", localized: true })],
+          status: false,
+          builtBy: "codeFirst" as const,
+        },
+      ],
+      defaultLocale: "en",
+    });
+
+    expect(refused.kind).toBe("companion-mismatch");
+    if (refused.kind !== "companion-mismatch") return;
+    expect(refused.mismatches).toEqual([
+      { table: `${LOCALIZED_TABLE}_locales`, columns: ["title"] },
+    ]);
+
+    // Nothing was written: a refusal that left a half-adopted history behind
+    // would be worse than the state it refused. The directory is created by
+    // the write itself, so its absence counts as empty.
+    const files = await readdir(h.migrationsDir).catch(() => []);
+    expect(files.filter(f => f.endsWith(".sql"))).toEqual([]);
+  });
+
+  it("--adopt-unknown rebuilds the companion from the database, undescribed column and all", async () => {
+    // The escape hatch from the refusal above. The operator is mid-recovery and
+    // both other ways out are bad: re-declare a field they deliberately removed,
+    // or drop a column holding real translations. So the table is adopted as it
+    // stands, rendered from the live shape rather than from a config that cannot
+    // describe it.
+    await runDbSync(h, localizedConfig);
+    const companionTable = `${LOCALIZED_TABLE}_locales`;
+    expect(await tableExists(h, companionTable)).toBe(true);
+
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      adoptUnknown: true,
+      localizedEntities: [
+        {
+          slug: LOCALIZED_SLUG,
+          tableName: LOCALIZED_TABLE,
+          fields: [text({ name: "summary", localized: true })],
+          status: false,
+          builtBy: "codeFirst" as const,
+        },
+      ],
+      defaultLocale: "en",
+    });
+    if (adopted.kind !== "baselined") throw new Error("expected a baseline");
+
+    const up = splitSqlStatements(
+      parseSqlSections(await readFile(adopted.sqlPath, "utf-8")).upSql
+    );
+    const companionSql = up.filter(st => st.includes(companionTable));
+    expect(companionSql).not.toEqual([]);
+    // `title` has no field describing it and is carried anyway.
+    expect(companionSql.join("\n")).toContain("title");
+    expect(companionSql.join("\n")).toMatch(/ON DELETE CASCADE/i);
+
+    // Asserted by EXECUTING the statement against a database that does not have
+    // the table and reading the result back, not by matching the text. The
+    // dialects disagree about where a key may sit and how a default is spelled,
+    // and only the server settles it.
+    const source = await introspectLiveSnapshot(h.db, h.dialect, [
+      companionTable,
+    ]);
+    const target = await makeHarness(h.dialect, "adopted");
+    try {
+      for (const stmt of up) {
+        await (target.adapter as unknown as DrizzleAdapter).executeQuery(stmt);
+      }
+
+      const rebuilt = await introspectLiveSnapshot(target.db, target.dialect, [
+        companionTable,
+      ]);
+      expect(rebuilt.tables).toEqual(source.tables);
+      // Named explicitly as well, because a deep-equal of two snapshots that
+      // both lost the composite key would still pass. It is what makes a
+      // companion row addressable per (document, locale).
+      const keyed = (rebuilt.tables[0]?.columns ?? [])
+        .filter(c => c.primaryKey === true)
+        .map(c => c.name)
+        .sort();
+      expect(keyed).toEqual(["_locale", "_parent"]);
+    } finally {
+      await target.dispose();
+    }
+  });
+
+  it("rebuilds the same schema in an environment that has only the files", async () => {
+    // The reason a baseline writes real SQL instead of a marker: a new
+    // environment, a CI job, or `migrate:fresh` builds the schema from the
+    // history alone. Nothing proved that until here — the other tests assert
+    // what the file CONTAINS, and containing the right statements is not the
+    // same as producing the right schema.
+    //
+    // So the baseline is applied to a second, empty database and the two are
+    // introspected and compared. This is the assertion that was failing while
+    // generated `CREATE TABLE` omitted primary keys entirely.
+    await runDbSync(h, configV1);
+
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+    });
+    if (adopted.kind !== "baselined") throw new Error("expected a baseline");
+
+    const source = await introspectLiveSnapshot(h.db, h.dialect, [TABLE]);
+    const target = await makeHarness(h.dialect, "rebuilt");
+    try {
+      for (const stmt of splitSqlStatements(
+        parseSqlSections(await readFile(adopted.sqlPath, "utf-8")).upSql
+      )) {
+        await (target.adapter as unknown as DrizzleAdapter).executeQuery(stmt);
+      }
+
+      const rebuilt = await introspectLiveSnapshot(target.db, target.dialect, [
+        TABLE,
+      ]);
+      expect(rebuilt.tables).toEqual(source.tables);
+      // Named explicitly as well, because a deep-equal of two snapshots that
+      // both lost the key would still pass.
+      expect(
+        rebuilt.tables[0]?.columns.find(c => c.name === "id")?.primaryKey
+      ).toBe(true);
+    } finally {
+      await target.dispose();
+    }
+  });
+
+  it("keeps a relationship's junction table out of the snapshot but in the SQL", async () => {
+    // A many-to-many field creates `<mainA>_<mainB>_<field>`, which carries the
+    // managed prefix. Recorded in the snapshot, the next `migrate:create`
+    // compares it against a desired snapshot that declares only collections,
+    // singles and components, sees an extra table, and emits `DROP TABLE` —
+    // silently destroying every relationship row on the graduation path.
+    await runDbSync(h, configV1);
+    const junction = `${TABLE}_${TABLE}_related`;
+    await (h.adapter as unknown as DrizzleAdapter).executeQuery(
+      `CREATE TABLE ${id(h, junction)} (a text NOT NULL, b text NOT NULL)`
+    );
+
+    const adopted = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      localizedEntities: configV1.collections.map(c => ({
+        slug: c.slug,
+        tableName: resolveCollectionTableName(c.slug),
+        fields: c.fields,
+        status: false,
+        builtBy: "codeFirst" as const,
+      })),
+    });
+    if (adopted.kind !== "baselined") throw new Error("expected a baseline");
+
+    const recorded = JSON.parse(
+      await readFile(adopted.snapshotPath, "utf-8")
+    ) as { snapshot: { tables: { name: string }[] } };
+    expect(recorded.snapshot.tables.map(t => t.name)).not.toContain(junction);
+
+    // But a fresh environment still needs it, so it is in the SQL.
+    const up = splitSqlStatements(
+      parseSqlSections(await readFile(adopted.sqlPath, "utf-8")).upSql
+    );
+    expect(up.filter(st => st.includes(junction))).not.toEqual([]);
+
+    // And the next migration still APPLIES. Excluding the junction from the
+    // recorded snapshot is only half the job: `migrate`'s drift check builds
+    // its own live snapshot, and if that one still contains the junction it
+    // matches neither the baseline nor the target, so the first migration
+    // after adoption stops with drift no migration could ever resolve.
+    const delta = await runMigrateCreate(h, configV2, "add_subtitle");
+    expect(delta).not.toBeNull();
+    await expect(
+      runFileMigrations({
+        adapter: h.adapter,
+        db: h.db,
+        dialect: h.dialect,
+        migrationsDir: h.migrationsDir,
+        logger,
+      })
+    ).resolves.toBe(1);
+    expect(await hasColumn(h, "subtitle")).toBe(true);
+  });
+
+  describe("with another writer of the project's migration files", () => {
+    /** The baseline of the database `on` holds, written into this project's folder. */
+    const baseline = (on: Harness) =>
+      baselineCore({
+        adapter: on.adapter,
+        db: on.db,
+        dialect: on.dialect,
+        migrationsDir: h.migrationsDir,
+        logger,
+      });
+    /** The files and snapshots as one line, by the tables a snapshot records. */
+    const oneLine = () =>
+      historyAsOneLine(h.migrationsDir, table => table === TABLE);
+
+    it("two baselines together, of two databases sharing the folder, write one: the second finds the first's history", async () => {
+      // Each database is its own, so no database lock stands between the two.
+      const other = await makeHarness(dialect, "second");
+      try {
+        await runDbSync(h, configV1);
+        // The second database has not been pushed to: the first one's push is
+        // not taken for it.
+        clearCachedSnapshot();
+        await runDbSync(other, configV1);
+        expect(await tableExists(other, TABLE)).toBe(true);
+
+        const kinds = (await Promise.all([baseline(h), baseline(other)])).map(
+          result => result.kind
+        );
+
+        expect(kinds.sort()).toEqual(["already-baselined", "baselined"]);
+        expect(oneLine()).toEqual([[TABLE]]);
+      } finally {
+        await other.dispose();
+      }
+    });
+
+    it("a baseline and migrate:create together write the table once", async () => {
+      await runDbSync(h, configV1);
+
+      const [adopted, created] = await Promise.all([
+        baseline(h),
+        // The generator alone, with no command's hold: it takes the folder
+        // as it writes, and one that read the folder before the baseline
+        // went in writes nothing and says so.
+        runMigrateCreate(h, configV1, "create").catch((error: unknown) => {
+          if (isWriterOvertaken(error)) return null;
+          throw error;
+        }),
+      ]);
+
+      // Whichever wrote first, the other read its file: a baseline second
+      // refuses a project that has a history, and a create second writes only
+      // what the baseline's snapshot does not record, never the table again.
+      expect(adopted.kind === "baselined" || created !== null).toBe(true);
+      expect(oneLine().flat()).toEqual([TABLE]);
+    });
+
+    it("a baseline and a Schema Builder save together keep one line of history", async () => {
+      await runDbSync(h, configV1);
+      const noted = `baseline_notes_${RUN_ID}`;
+      const save = () =>
+        withSchemaChangeExcluded(
+          {
+            adapter: h.adapter as unknown as DrizzleAdapter,
+            logger: logger as never,
+            label: `create collection "${noted}"`,
+            issuesDdl: false,
+          },
+          () =>
+            writeCollectionSave(
+              {
+                adapter: h.adapter as unknown as DrizzleAdapter,
+                config: configV1,
+                projectRoot: dirname(h.migrationsDir),
+                migrationsDir: h.migrationsDir,
+                applies: false,
+                logger: { info: () => {}, warn: () => {}, error: () => {} },
+              },
+              {
+                slug: noted,
+                previous: null,
+                entity: {
+                  slug: noted,
+                  labels: { singular: "Note", plural: "Notes" },
+                  fields: [{ name: "title", type: "text" }],
+                } as UiSchemaEntity,
+                change: "create",
+              }
+            )
+        ).then(
+          () => "saved" as const,
+          (error: unknown) =>
+            (error as { publicMessage?: string }).publicMessage
+        );
+
+      const [adopted, saved] = await Promise.all([baseline(h), save()]);
+
+      // The save either wrote after the baseline or was refused at once while
+      // the baseline held the folder; a baseline that came second found the
+      // save's history and refused.
+      if (saved !== "saved") {
+        expect(saved).toMatch(/Save it again/);
+        expect(adopted.kind).toBe("baselined");
+      }
+      const notesTable = resolveCollectionTableName(noted);
+      const made = historyAsOneLine(
+        h.migrationsDir,
+        table => table === TABLE || table === notesTable
+      );
+      expect(made.flat().filter(table => table === TABLE).length).toBeLessThan(
+        2
+      );
+      expect(sqlFiles(h.migrationsDir).length).toBe(
+        (adopted.kind === "baselined" ? 1 : 0) + (saved === "saved" ? 1 : 0)
+      );
+    });
+  });
+
+  it("refuses to give a project that already migrated a second starting point", async () => {
+    await runDbSync(h, configV1);
+    await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+    });
+    const afterFirst = await readdir(join(h.migrationsDir, "meta"));
+
+    // Acceptance 3, in the form that can actually go wrong: a project with a
+    // history is not re-baselined. A second origin would leave every later
+    // diff depending on which one was read.
+    const again = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+    });
+    expect(again.kind).toBe("already-baselined");
+    expect(await readdir(join(h.migrationsDir, "meta"))).toEqual(afterFirst);
+  });
+
+  it("returns already-baselined rather than contribution-mismatch when a recorded contribution was withdrawn", async () => {
+    // Once a baseline exists, its recorded snapshot already carries any
+    // contributed element so `migrate:create` can plan its removal. Calling
+    // `migrate:baseline` again with the hook withdrawn must report
+    // `already-baselined`, not `contribution-mismatch`.
+    await runDbSync(h, pendingConfig([contributesToPlugin]));
+    const first = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream: await compileAppStreamTables({
+        config: pendingConfig([contributesToPlugin]),
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+    });
+    expect(first.kind).toBe("baselined");
+
+    const again = await baselineCore({
+      adapter: h.adapter,
+      db: h.db,
+      dialect: h.dialect,
+      migrationsDir: h.migrationsDir,
+      logger,
+      appStream: await compileAppStreamTables({
+        config: pendingConfig([]),
+        dialect: h.dialect,
+        logger: { warn: () => {} },
+      }),
+    });
+    expect(again.kind).toBe("already-baselined");
+  });
+}
+
+describe("db:sync to migrations (sqlite)", () => runSuite("sqlite"));
+
+/**
+ * `migrate:baseline` records the checksum of the file it writes, as a run
+ * records one, so a later edit to the baseline is caught: on every dialect.
+ */
+describe.each([
+  { dialect: "sqlite" as const, run: true },
+  { dialect: "postgresql" as const, run: PG_URL !== "" },
+  { dialect: "mysql" as const, run: (process.env.TEST_MYSQL_URL ?? "") !== "" },
+])(
+  "migrate:baseline records its file's checksum on $dialect",
+  ({ dialect, run }) => {
+    let h: Harness;
+    let previousDialect: string | undefined;
+    let previousUrl: string | undefined;
+
+    beforeEach(async () => {
+      if (!run) return;
+      previousDialect = process.env.DB_DIALECT;
+      previousUrl = process.env.DATABASE_URL;
+      clearCachedSnapshot();
+      h = await makeHarness(dialect, "checksum");
+    });
+
+    afterEach(async () => {
+      if (!run) return;
+      await h.dispose();
+      if (previousDialect === undefined) delete process.env.DB_DIALECT;
+      else process.env.DB_DIALECT = previousDialect;
+      if (previousUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = previousUrl;
+    });
+
+    it.runIf(run)("on the row it records applied", async () => {
+      await runDbSync(h, configV1);
+      const adopted = await baselineCore({
+        adapter: h.adapter,
+        db: h.db,
+        dialect: h.dialect,
+        migrationsDir: h.migrationsDir,
+        logger,
+      });
+      if (adopted.kind !== "baselined") throw new Error("expected a baseline");
+      const recorded = await new SchemaEventsRepository(
+        h.db,
+        h.dialect
+      ).listFileApplies();
+      expect(
+        recorded
+          .filter(r => r.filename === basename(adopted.sqlPath))
+          .map(r => [r.status, r.sha256])
+      ).toEqual([
+        ["applied", checksumOf(await readFile(adopted.sqlPath, "utf-8"))],
+      ]);
+    });
+
+    it.runIf(run)(
+      "at the one instant its run is stamped with, ending no earlier than it started",
+      async () => {
+        await runDbSync(h, configV1);
+        // The run's clock, which names the file: the row is stamped from it
+        // too, start and end alike, as nothing runs between them.
+        const now = new Date("2026-01-02T03:04:05.678Z");
+        const adopted = await baselineCore({
+          adapter: h.adapter,
+          db: h.db,
+          dialect: h.dialect,
+          migrationsDir: h.migrationsDir,
+          logger,
+          now,
+        });
+        if (adopted.kind !== "baselined") {
+          throw new Error("expected a baseline");
+        }
+        const recorded = await new SchemaEventsRepository(
+          h.db,
+          h.dialect
+        ).listFileApplies();
+        expect(
+          recorded
+            .filter(r => r.filename === basename(adopted.sqlPath))
+            .map(r => [
+              new Date(r.startedAt).getTime(),
+              r.endedAt === null ? null : new Date(r.endedAt).getTime(),
+            ])
+        ).toEqual([[now.getTime(), now.getTime()]]);
+      }
+    );
+  }
+);
+
+describe.skipIf(!PG_URL)("db:sync to migrations (postgres)", () =>
+  runSuite("postgresql")
+);
+
+/**
+ * The same suite on MySQL: each dialect introspects and renders DDL through
+ * completely different queries, so a baseline that round-trips on two says
+ * nothing about the third. `makeHarness` already supports it, and the suite
+ * self-skips wherever the dialect's URL is unset, as the postgres suite does.
+ */
+const MYSQL_URL = process.env.TEST_MYSQL_URL ?? "";
+describe.skipIf(!MYSQL_URL)("db:sync to migrations (mysql)", () =>
+  runSuite("mysql")
+);

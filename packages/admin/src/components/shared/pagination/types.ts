@@ -1,0 +1,46 @@
+/**
+ * Props for Pagination component
+ */
+export type PaginationProps = {
+  /** Current page index (0-based) */
+  currentPage: number;
+  /** Total number of pages */
+  totalPages: number;
+  /** Current page size (items per page) */
+  pageSize: number;
+  /** Available page size options for the selector */
+  /**
+   * Readonly because this component only maps over it. A mutable array type
+   * would reject the shared `as const` options tuple for no reason the caller
+   * could act on, which pushes every call site back to its own literal.
+   */
+  pageSizeOptions?: readonly number[];
+  /** Whether to show the page size selector */
+  showPageSizeSelector?: boolean;
+  /** Maximum number of visible page number buttons */
+  maxVisiblePages?: number;
+  /** Callback when page changes */
+  onPageChange: (page: number) => void;
+  /** Optional callback when page size changes */
+  onPageSizeChange?: (pageSize: number) => void;
+  /** Loading state (disables all controls) */
+  isLoading?: boolean;
+  /** Total number of items across all pages */
+  totalItems?: number;
+  /**
+   * `totalItems` is a lower bound: more items exist than were counted, so the
+   * count reads "1000+" and the last page, which is not known, is not offered.
+   */
+  totalCapped?: boolean;
+  /**
+   * How many items the current page holds. Ends the shown range when the
+   * total is capped, as the cap cannot say where the last page stops.
+   */
+  pageItemCount?: number;
+  /** Noun used in the count, e.g. "entries" -> "Showing 1-10 of 42 entries" */
+  itemLabel?: string;
+  /** Accessible name for the pagination landmark; "Pagination", in the interface language, when absent */
+  ariaLabel?: string;
+  /** Optional custom className for the container */
+  className?: string;
+};

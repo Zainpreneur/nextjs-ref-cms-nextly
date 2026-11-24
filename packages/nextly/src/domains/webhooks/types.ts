@@ -1,0 +1,294 @@
+/**
+ * Webhook domain — pure types.
+ *
+ * The public delivery contract for the durable-outbox webhook system: the
+ * event envelope that ships to endpoints, the endpoint registry shape, and the
+ * structured filter spec. These are storage-agnostic; the per-dialect Drizzle
+ * tables (`schemas/webhooks/*`) persist them, and the delivery engine (later
+ * slices) reads them back. No I/O lives here.
+ *
+ * @module domains/webhooks/types
+ */
+
+import type { StoredSecretEntry } from "./secret-entries";
+
+/**
+ * Canonical webhook event types, grouped by resource. Stable string ids; the
+ * envelope's `specversion` (not renames) carries breaking changes. A webhook
+ * subscribes to a set of these. Distinct from the internal event-bus names
+ * (`document.*`, `collection.<slug>.*`); the bus -> webhook-type mapping is
+ * wired in the capture slice.
+ */
+export const WEBHOOK_EVENT_TYPES = [
+  // Entries (per collection).
+  "entry.created",
+  "entry.updated",
+  "entry.deleted",
+  "entry.published",
+  "entry.unpublished",
+  "entry.status_changed",
+  // Singles.
+  "single.updated",
+  "single.published",
+  "single.unpublished",
+  // Media.
+  "media.uploaded",
+  "media.updated",
+  "media.deleted",
+  // Users (opt-in, sensitive; never carries password fields).
+  "user.created",
+  "user.deleted",
+  // Forms (via plugin-form-builder).
+  "form.submission.created",
+  // Workflows: a part's review stage or approval changed, about its entry or Single.
+  "workflow.stage_changed",
+] as const;
+
+/**
+ * What a stored static header's value is replaced with when an endpoint is
+ * read back.
+ *
+ * Static headers routinely carry a receiver credential (`Authorization`,
+ * `X-API-Key`), and delivery sends them verbatim. Reading an endpoint must not
+ * hand that credential to anyone allowed to look at the configuration, so the
+ * names survive a read and the values do not. Writes reject this exact value,
+ * so echoing a read back cannot store the placeholder as a real header.
+ */
+export const REDACTED_HEADER_VALUE = "<redacted>";
+
+/**
+ * Wildcard subscription token. An endpoint subscribed to this receives every
+ * event type, including types added in future versions — so a "subscribe to
+ * all" endpoint keeps working as the catalog grows, without a config edit. It
+ * is a subscription concept only; the finer `FilterSpec` never uses it.
+ */
+export const WEBHOOK_EVENT_WILDCARD = "*";
+
+/** A canonical webhook event type. */
+export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
+
+/**
+ * A webhook event type a plugin declares, once checked as the recording
+ * plugin's own. Branded so that only the declared-type check
+ * (`isOwnEventType`) produces one: core's write paths keep the closed
+ * {@link WebhookEventType}, and a string a plugin passes cannot reach the
+ * outbox unchecked.
+ */
+export type PluginEventType = string & { readonly __pluginEventType: true };
+
+/** The type a recorded event carries: one of core's, or a plugin's checked one. */
+export type RecordedEventType = WebhookEventType | PluginEventType;
+
+/**
+ * What an endpoint can subscribe to: one of core's event types, a type a
+ * plugin declares (`contributes.webhookEvents`, a string in the plugin's
+ * namespace), or the wildcard (all-and-future). Distinct from
+ * {@link WebhookEventType} because only the subscription list accepts the
+ * wildcard and plugins' types. Which strings are accepted is the event-type
+ * registry's to say, when a subscription is written.
+ */
+export type WebhookEventSubscription =
+  | WebhookEventType
+  | typeof WEBHOOK_EVENT_WILDCARD
+  | (string & Record<never, never>);
+
+/** Resource families an event can be about. */
+export const WEBHOOK_RESOURCE_KINDS = [
+  "entry",
+  "single",
+  "media",
+  "user",
+  "form",
+] as const;
+
+/** Resource families an event can be about. */
+export type WebhookResourceKind = (typeof WEBHOOK_RESOURCE_KINDS)[number];
+
+/** What triggered an event; feeds the audit trail. */
+export type WebhookActorType = "user" | "apiKey" | "system";
+
+/**
+ * The resource an event is about. Modeled as a discriminated union so the
+ * collection invariant is enforced by the type system: an `entry` always
+ * carries its collection slug, and every other kind forbids one.
+ */
+/**
+ * What the event is about. `locale` identifies WHICH translation changed on a
+ * localized resource: the document carries that locale's values, so without it
+ * an English and a German write to the same entry are indistinguishable and a
+ * receiver cannot route or reconcile them. Absent when the resource stores no
+ * per-locale data.
+ */
+export type WebhookResource =
+  | { kind: "entry"; collection: string; id?: string; locale?: string }
+  | {
+      kind: "single" | "media" | "user" | "form";
+      collection?: never;
+      /**
+       * The stable slug of the changed resource (e.g. the Single's slug), so a
+       * receiver can route `single.updated`/`single.published` without scanning
+       * for the opaque document id. Distinct from `entry.collection`: it never
+       * feeds the endpoint `collections` filter (that reads `collection`), so a
+       * single slug cannot be caught by a collection-scoped subscription.
+       */
+      slug?: string;
+      id?: string;
+      locale?: string;
+    }
+  | {
+      /**
+       * An event a plugin recorded, of a type it declares. `plugin` is its
+       * admin slug. Never a `collection`, so a collection-scoped endpoint
+       * never receives one, even from a plugin slugged as a collection is.
+       * `locale` is optional as on every other kind, so code that adds a
+       * language to any resource still types; `ctx.webhooks.record` sets
+       * none.
+       */
+      kind: "plugin";
+      plugin: string;
+      collection?: never;
+      slug?: never;
+      id?: string;
+      locale?: string;
+    };
+
+/** Who triggered the event. */
+export interface WebhookActor {
+  type: WebhookActorType;
+  id?: string;
+}
+
+/**
+ * The event envelope delivered to endpoints. One shape for every event: thin
+ * identity plus a full `data` section so any current or future filter/consumer
+ * has what it needs. Modeled on Standard Webhooks / CloudEvents.
+ */
+export interface WebhookEvent {
+  /** ULID; stable across retries; doubles as the idempotency / webhook-id key. */
+  id: string;
+  type: RecordedEventType;
+  /** Envelope schema version; bumped only on a breaking envelope change. */
+  specversion: "1";
+  /** Event time (not delivery time), ISO-8601. */
+  timestamp: string;
+  /** Origin site (from config), for multi-endpoint disambiguation. */
+  site?: string;
+  resource: WebhookResource;
+  /** Current state, with access-denied/secret fields already stripped. */
+  data: Record<string, unknown>;
+  /** Prior state on update/delete/status-change; null on create. */
+  previous: Record<string, unknown> | null;
+  /** Top-level keys whose value changed; drives changed-field filtering. */
+  changedFields: string[];
+  /**
+   * Every language the change involved: the one `resource.locale` names for a
+   * write in one language, every language for a publish of every language or
+   * a delete. Absent on a site without languages, and on a resource kind
+   * other than an entry or a Single. Additive + optional.
+   *
+   * @experimental
+   */
+  locales?: string[];
+  /**
+   * Whether the change moved the shared part, the fields kept the same in
+   * every language. Absent where the write did not say, and where `locales`
+   * is absent. Additive + optional.
+   *
+   * @experimental
+   */
+  shared?: boolean;
+  actor?: WebhookActor;
+  /**
+   * The status delta for a lifecycle event (`entry.published` /
+   * `entry.unpublished` / `entry.status_changed`). Present only on those events,
+   * so a `status_changed` subscriber reads from/to directly instead of diffing
+   * `data.status` against `previous.status`. `from` is null on a create-as-
+   * published. Additive + optional: existing subscribers are unaffected.
+   */
+  statusChange?: { from: string | null; to: string };
+  /**
+   * Whether the action this event describes succeeded.
+   *
+   * Absent means `success`, which is what every event recorded today is: the
+   * outbox row is written inside the transaction of a change that commits, so
+   * a recorded event is by construction a completed one. The field exists so
+   * that a refusal — a denied publish, a rejected write — can be recorded as
+   * the distinct thing it is rather than being indistinguishable from a change
+   * that happened. Additive + optional: existing subscribers are unaffected.
+   *
+   * `success | failure | unknown` is the one outcome vocabulary the audit and
+   * observability schemas agree on, and the only field NIST SP 800-53 AU-3(e)
+   * requires that this envelope did not already carry.
+   */
+  outcome?: WebhookEventOutcome;
+}
+
+/** The outcome vocabulary shared by every audit record. */
+export type WebhookEventOutcome = "success" | "failure" | "unknown";
+
+/** What a recorded event means when it states no outcome. */
+export const DEFAULT_EVENT_OUTCOME: WebhookEventOutcome = "success";
+
+/** Lifecycle of one delivery row in the outbox ledger. */
+export type DeliveryStatus =
+  | "pending"
+  | "processing"
+  | "delivered"
+  | "retrying"
+  | "failed";
+
+/**
+ * Structured, extensible per-webhook filter. v1 is a plain conjunction of
+ * optional constraints; a future expression filter is an additive
+ * discriminated member on the same `version` column, so v1 -> v2 needs no
+ * migration. Evaluated by the pure `matchesFilter`.
+ */
+export interface FilterSpecV1 {
+  version: 1;
+  /** OR across types; absent/empty = every subscribed type matches. */
+  eventTypes?: WebhookEventType[];
+  /** null/absent = all collections. */
+  collections?: string[] | null;
+  /** Fire only if any listed field changed; null/absent = no constraint. */
+  changedFields?: string[] | null;
+}
+
+/** Reserved for the future expression filter (not yet evaluated). */
+export interface FilterSpecExpression {
+  version: 2;
+  type: "expression";
+  expr: string;
+}
+
+export type FilterSpec = FilterSpecV1 | FilterSpecExpression;
+
+/**
+ * The outbound endpoint registry shape (mirrors `nextly_webhooks`). Secrets are
+ * never held raw: `secretHash` is the list of active-secret hashes (a list for
+ * zero-downtime rotation) and `secretPrefix` is a display-only prefix. The
+ * property name matches the Drizzle column so a hydrated row maps directly.
+ */
+export interface WebhookEndpoint {
+  id: string;
+  name: string;
+  url: string;
+  enabled: boolean;
+  /** Subscribed event types, or the wildcard for all-and-future. */
+  eventTypes: WebhookEventSubscription[];
+  /** Structured filter, or null for "match every subscribed type". */
+  filter: FilterSpec | null;
+  /** Static request headers merged into every delivery. */
+  headers: Record<string, string> | null;
+  /**
+   * Stored signing-secret entries (list-shaped for rotation). Carried for
+   * completeness; the delivery path reads and signs from its own row rather
+   * than this cached copy.
+   */
+  secretHash: StoredSecretEntry[];
+  secretPrefix: string;
+  /** Reserved per-endpoint field projection; not applied yet. */
+  fieldAllowlist: string[] | null;
+  createdBy: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}

@@ -1,0 +1,223 @@
+import {
+  checkbox,
+  defineCollection,
+  previewUrlFromTemplate,
+  relationship,
+  text,
+  type CollectionConfig,
+  type PreviewViewportsDeclaration,
+} from "nextly/config";
+
+import { blocks } from "../fields/blocksHelper";
+
+import { LAYOUTS_SLUG } from "./layouts";
+
+/** The slug pages are stored under, before any rename a host applies. */
+export const PAGES_SLUG = "pages";
+
+/** The pages' blocks field, which a page draws. */
+export const PAGES_CONTENT_FIELD = "content";
+
+/**
+ * There is no page-level custom CSS field.
+ *
+ * One existed, gated by its own permission, and nothing ever rendered what it
+ * stored: no renderer read the value and nothing sanitised it. A permission
+ * around a field implies its safety was considered, so the next change to add
+ * the missing render call would have had every reason to assume the text was
+ * already clean. Removing the field removes that implication along with it.
+ *
+ * Reinstating it means writing the sanitiser first — a stylesheet needs its
+ * selectors scoped and its properties allow-listed, which is a different job
+ * from the value-level checks the rich-text path performs.
+ */
+
+/**
+ * There is no builder Edit-view path any more.
+ *
+ * This named a full-screen edit view a host could register for a builder-only
+ * collection. The view is gone with the editor that backed it, and the constant
+ * went with it rather than being kept pointing at a component nothing exports —
+ * a registry path is a STRING, so an unresolvable one fails at render time in
+ * the admin rather than at build time here.
+ */
+
+/**
+ * The plugin-owned `pages` collection. A page is built from blocks.
+ *
+ * The FIELD decides how an entry is edited, and nothing decides it per entry.
+ * This previously carried a stored `editorMode` select beside both a blocks
+ * field and a rich-text one, either of which an entry could use.
+ *
+ * Three things were wrong with that, and only the first is cosmetic:
+ *
+ * A UI preference was stored as CONTENT. `editorMode` was a real column, so it
+ * travelled in API responses and exports, could be set by any writer, and formed
+ * part of the document a consumer reads.
+ *
+ * Both editors' content persisted at once. What hid one of them was
+ * `admin.condition`, which reaches the admin form and nothing else, so both
+ * columns stayed real and writable. An entry could hold a block document AND
+ * rich text with only one rendered, and switching neither migrated nor warned.
+ *
+ * And it applied HERE only. A collection built in the schema builder gets a
+ * blocks field and no switcher, so one capability behaved differently depending
+ * on who declared the collection.
+ */
+/**
+ * Where a page is served on the site — declared only when the host says so.
+ *
+ * A default was the obvious choice and it is the wrong one, because minting a
+ * preview link now REFUSES when a collection declares no preview URL. Those two
+ * behaviours interact: without a declaration an editor is told, in words, that a
+ * developer needs to configure one; with a defaulted declaration the mint
+ * succeeds and the reviewer gets a 404 that looks like an expired link.
+ *
+ * So a default would make an existing installation — one that upgrades while
+ * still calling `pageBuilder()` and has mounted no preview route — strictly
+ * worse off than declaring nothing, by replacing an explanation with a silent
+ * failure. The plugin cannot install the host's route or its draft gate, and it
+ * cannot discover where pages are mounted: a host may serve them at `/`, at
+ * `/blocks`, or under a locale segment.
+ *
+ * Passing `pagePreviewPath` is therefore how a host states that it has done the
+ * wiring. It costs one line and it is the only signal available that the link
+ * will land.
+ */
+/** What the plugin-owned `pages` collection is built with. */
+export interface PagesCollectionOptions {
+  /** The path a page previews at, as a `{field}` template. */
+  previewPath?: string;
+
+  /**
+   * The viewport widths this collection's preview offers.
+   *
+   * Ignored without a `previewPath`, because there is no preview to offer them
+   * on.
+   */
+  breakpoints?: PreviewViewportsDeclaration;
+
+  /**
+   * The `layout` field's own check, run on every write that sends a value for
+   * it, hooks or not: the floor that refuses a page put on a Layout being
+   * removed (`layout-removal/page-reference-guard`). Absent, the field checks
+   * nothing beyond its relationship.
+   */
+  validateLayout?: (value: unknown) => Promise<string | true>;
+}
+
+/*
+ * One options object rather than positional arguments, which is what two of
+ * them said to do as soon as a third arrived: the options are optional and
+ * unrelated, so a caller wanting only a later one had to pass `undefined` for
+ * the ones before it, and the call site stops being readable at exactly the
+ * point it starts carrying a preview declaration.
+ *
+ * Which classes a page references is answered by the class usage index
+ * rather than by anything on the page row. The index is keyed by class and
+ * maintained on every write, so it answers that question as a lookup; a column
+ * on the page can only be read once the page is already in hand, which is the
+ * opposite of the direction every caller asks in.
+ *
+ * So this collection stores no derived usage, and takes no document bounds:
+ * bounds exist to cap a derivation, and the derivation lives with the index.
+ */
+export function pagesCollection(
+  options: PagesCollectionOptions = {}
+): CollectionConfig {
+  const { previewPath, breakpoints, validateLayout } = options;
+
+  return defineCollection({
+    slug: PAGES_SLUG,
+    labels: { singular: "Page", plural: "Pages" },
+    // The site's own pages, though this plugin declares them: a plugin that
+    // extends every content type, such as one adding SEO fields, reaches
+    // them as it reaches the site's own collections.
+    siteContent: true,
+    // A page's address may sit beneath another (`docs/getting-started`),
+    // each part normalised as a one-part address is. A rule about the stored
+    // value only, outside the schema, so an existing site migrates nothing
+    // and every one-part address it holds stays as it is.
+    db: { slugPaths: true },
+    fields: [
+      text({ name: "title", required: true }),
+      text({ name: "slug", required: true, unique: true }),
+      // Named `content` because that is what the retired choice called its
+      // builder arm: a page already holding a block document keeps rendering
+      // rather than reading as empty against a field with a new name.
+      blocks({ name: PAGES_CONTENT_FIELD, label: "Page Builder" }),
+      // The Layout this page is drawn inside. Empty means the site's default,
+      // which is the ordinary case: a page names a Layout only to differ from
+      // the rest of the site. A named Layout that is not published falls back
+      // to the default rather than drawing unpublished regions.
+      //
+      // Hidden, as is the switch below: the form keeps both values, and the
+      // page builder draws ONE Layout picker that writes them together (in the
+      // editor's Settings and on the Page Builder card), so an author makes one
+      // choice rather than reconciling two controls.
+      relationship({
+        name: "layout",
+        label: "Header & footer",
+        relationTo: LAYOUTS_SLUG,
+        admin: {
+          description:
+            "Leave empty to use the site's default header & footer set.",
+          hidden: true,
+        },
+        // A function, so it is no part of the stored schema: adding it changes
+        // no column and needs no migration.
+        ...(validateLayout === undefined
+          ? {}
+          : { validate: (value: unknown) => validateLayout(value) }),
+      }),
+      // Draw this page with no header or footer at all. It wins over any
+      // Layout the page also names, whoever wrote either field: a landing page
+      // switched off stays switched off when someone later picks a Layout.
+      // Any writer that may update the page may set it; it changes this page
+      // only.
+      checkbox({
+        name: "noHeaderFooter",
+        label: "No header or footer",
+        defaultValue: false,
+        admin: { hidden: true },
+      }),
+    ],
+    status: true,
+    // Pages are what a site shows its visitors, so anyone may read one. A
+    // visitor is judged by the Public role, which boot grants a collection's
+    // read only where its rule answers `true`; with no rule, every page would
+    // answer a visitor 404. The rule needs no condition on the page's state: a
+    // visitor's read is held to published content whatever it asks for, so a
+    // draft, and the working draft of a published page, stay unseen.
+    access: { read: () => true },
+    // A save keeps a working draft and publishing is its own act, as it is for
+    // the components and Layouts a page is built from. Without the split, saving
+    // a published page puts the edit live at once while a header it embeds waits
+    // for a publish, so "publish" would mean two different things on one screen.
+    versions: { drafts: true },
+    admin: {
+      useAsTitle: "title",
+      // Present only when the host supplied a path. A code-first collection
+      // declares a FUNCTION — `urlTemplate` is the spelling a UI-created
+      // collection stores, since no column can hold a function — and the path is
+      // turned into one through the shared helper rather than a substitution
+      // written here, so a template and a function cannot resolve the same entry
+      // to two different addresses.
+      ...(previewPath === undefined
+        ? {}
+        : {
+            preview: {
+              // The slug is a path (`db.slugPaths`), so its `/` stays.
+              url: previewUrlFromTemplate(previewPath, {
+                pathFields: ["slug"],
+              }),
+              // Spread rather than set to `undefined`, so a collection that
+              // declares none has no `breakpoints` key at all — which is what
+              // `resolvePreviewViewports` reads as "offer nothing" without
+              // having to tell an absent declaration from a broken one.
+              ...(breakpoints === undefined ? {} : { breakpoints }),
+            },
+          }),
+    },
+  });
+}

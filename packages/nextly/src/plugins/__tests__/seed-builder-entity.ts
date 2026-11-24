@@ -1,0 +1,328 @@
+/**
+ * Test helper — seed a UI-Builder entity onto an already-booted adapter.
+ *
+ * Mirrors what the admin Builder does when a user creates a collection: write
+ * the `dynamic_collections` registry row (`source: "ui"`) and create the
+ * physical `dc_<slug>` table via the same `DynamicCollectionSchemaService` the
+ * dispatcher/dev-server use. Used by the plugin-access integration tests to
+ * simulate "a collection that exists only because the user made it in the UI",
+ * so a subsequent boot with a plugin can extend/relate to it.
+ *
+ * Requires the system tables to already exist — call AFTER a first boot (the
+ * `dynamic_collections` table is created during `registerServices`). The
+ * two-phase integration tests boot once (no plugins) to create system tables,
+ * seed here, `clearServices()` (which does NOT disconnect the adapter), then
+ * boot again with the plugin.
+ *
+ * @module plugins/__tests__/seed-builder-entity
+ */
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+
+import { FieldGroupRegistryService } from "../../domains/field-groups/services/field-group-registry-service";
+import { FieldGroupSchemaService } from "../../domains/field-groups/services/field-group-schema-service";
+import {
+  type CollectionMetadata,
+  DynamicCollectionRegistryService,
+} from "../../domains/dynamic-collections/services/dynamic-collection-registry-service";
+import { DynamicCollectionSchemaService } from "../../domains/dynamic-collections/services/dynamic-collection-schema-service";
+import { SingleRegistryService } from "../../domains/singles/services/single-registry-service";
+import type { FieldConfig } from "../../collections/fields/types";
+import { deriveCompanionSpec } from "../../domains/i18n/migration/derive-companion-spec";
+import { buildCompanionCreateOnlySql } from "../../domains/i18n/migration/generate-up";
+import { generateRuntimeSchema } from "../../domains/schema/services/runtime-schema-generator";
+import type { FieldDefinition } from "../../schemas/dynamic-collections";
+import { STORAGE_FORMAT } from "../../schemas/storage-format";
+import type { ResolvedVersionsConfig } from "../../schemas/versions/types";
+import type { Logger } from "../../services/shared";
+
+const silentLogger: Logger = {
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+};
+
+/** Reserved fields the schema service auto-adds; never user/plugin-owned. */
+const RESERVED = new Set(["id", "title", "slug", "created_at", "updated_at"]);
+
+// Collections also auto-add a `created_by` owner column; singles and components
+// do not, so a `created_by` user field is only reserved for collections.
+const RESERVED_COLLECTION = new Set([...RESERVED, "created_by"]);
+
+export interface SeedBuilderCollectionOptions {
+  slug: string;
+  /** User-defined fields (reserved names are dropped, as the real create flow does). */
+  fields: Array<
+    { name: string; type: string; source?: string } & Record<string, unknown>
+  >;
+  /** Draft/Published flag — adds a `status` system column when true. */
+  status?: boolean;
+  /** Versioning, as the registry stores it once resolved. */
+  versions?: ResolvedVersionsConfig | null;
+  /**
+   * Languages: translatable fields leave the main table for a
+   * `<table>_locales` companion, and every other field is shared by every
+   * language. Collections only.
+   */
+  localized?: boolean;
+  /**
+   * Lays the collection out per language without marking it translatable, as a site with
+   * `experimental.perLanguageStorage` keeps every collection: its translatable fields live in the
+   * companion, which has no `_status` since the collection publishes as a document.
+   */
+  storedPerLanguage?: boolean;
+}
+
+/**
+ * Create the `dc_<slug>` table + `dynamic_collections` row for a UI collection.
+ * Returns the slug + resolved physical table name.
+ */
+/**
+ * Put the just-created table into the adapter's live table resolver, as every
+ * real create path does: `CollectionMetadataService.registerRuntimeSchema` for
+ * a Builder collection, the single dispatcher for a Single, and
+ * `field-group-table-provisioning` for a field group. They register straight
+ * after the DDL so the table is addressable in the process that made it rather
+ * than only after the next boot.
+ *
+ * Without this step the seeded table exists physically and is absent from the
+ * resolver, which no create path leaves behind: every model-bound adapter call
+ * against it (select, update, count, delete) refuses with "not found in schema
+ * registry", and only raw SQL reaches it. A fixture in that state measures a
+ * database the runtime cannot address.
+ */
+function registerRuntimeTable(
+  adapter: DrizzleAdapter,
+  tableName: string,
+  table: unknown
+): void {
+  const resolver = (
+    adapter as unknown as {
+      tableResolver?: {
+        registerDynamicSchema?: (name: string, table: unknown) => void;
+      };
+    }
+  ).tableResolver;
+  resolver?.registerDynamicSchema?.(tableName, table);
+}
+
+export async function seedBuilderCollection(
+  adapter: DrizzleAdapter,
+  opts: SeedBuilderCollectionOptions
+): Promise<{ slug: string; tableName: string }> {
+  const slug = opts.slug.toLowerCase();
+  const tableName = `dc_${slug}`;
+
+  // Only non-reserved fields are user-defined; the schema service auto-adds
+  // id/title/slug/timestamps/created_by (and status when hasStatus).
+  const userFields = opts.fields
+    .map(f => ({ ...f, name: f.name.toLowerCase() }))
+    .filter(f => !RESERVED_COLLECTION.has(f.name))
+    // Tag as a user field so the reconciler can tell user vs plugin provenance.
+    .map(f => ({ source: "ui", ...f })) as unknown as FieldDefinition[];
+
+  const schemaService = new DynamicCollectionSchemaService(
+    undefined,
+    adapter.getCapabilities().dialect
+  );
+  const localized = opts.localized === true;
+  // Where the translatable values live, which a site keeping them per language decides for an
+  // untranslated collection too.
+  const perLanguage = localized || opts.storedPerLanguage === true;
+  const migrationSQL = schemaService.generateMigrationSQL(
+    tableName,
+    userFields,
+    {
+      hasStatus: opts.status === true,
+      localized: perLanguage,
+    }
+  );
+  await executeStatements(adapter, migrationSQL);
+  if (perLanguage) {
+    await executeStatements(
+      adapter,
+      companionCreateSql(adapter, { slug, tableName, fields: userFields, opts })
+    );
+  }
+
+  const metadata: CollectionMetadata = {
+    id: `seed_${slug}`,
+    slug,
+    tableName,
+    labels: { singular: slug, plural: `${slug}s` },
+    fields: userFields,
+    timestamps: true,
+    source: "ui",
+    locked: false,
+    status: opts.status === true,
+    ...(localized ? { localized } : {}),
+    ...(opts.versions === undefined ? {} : { versions: opts.versions }),
+    schemaHash: `seed_${slug}`,
+    schemaVersion: 1,
+    migrationStatus: "applied",
+  };
+
+  const registry = new DynamicCollectionRegistryService(adapter, silentLogger);
+  await registry.registerCollection(metadata);
+
+  const { table } = generateRuntimeSchema(
+    tableName,
+    userFields,
+    adapter.getCapabilities().dialect,
+    { status: opts.status === true, localized: perLanguage }
+  );
+  registerRuntimeTable(adapter, tableName, table);
+
+  return { slug, tableName };
+}
+
+/**
+ * The CREATE of a localized Builder collection's `<table>_locales`
+ * companion, from the same spec builders the Builder's create uses. Empty
+ * when no field is translatable.
+ */
+function companionCreateSql(
+  adapter: DrizzleAdapter,
+  args: {
+    slug: string;
+    tableName: string;
+    fields: FieldDefinition[];
+    opts: SeedBuilderCollectionOptions;
+  }
+): string {
+  const spec = deriveCompanionSpec({
+    slug: args.slug,
+    kind: "collection",
+    dbName: args.tableName,
+    fields: args.fields,
+    dialect: adapter.getCapabilities().dialect,
+    builtBy: "collection",
+    // Read only to seed existing rows, and a seeded table has none.
+    defaultLocale: "en",
+    collectionLocalized: true,
+    // Only a translated collection publishes each language on its own.
+    status: args.opts.localized === true && args.opts.status === true,
+  });
+  return spec ? buildCompanionCreateOnlySql(spec) : "";
+}
+
+/**
+ * Create the `single_<slug>` table + `dynamic_singles` row for a UI single.
+ */
+export async function seedBuilderSingle(
+  adapter: DrizzleAdapter,
+  opts: SeedBuilderCollectionOptions
+): Promise<{ slug: string; tableName: string }> {
+  const slug = opts.slug.toLowerCase();
+  const tableName = `single_${slug}`;
+
+  const userFields = opts.fields
+    .map(f => ({ ...f, name: f.name.toLowerCase() }))
+    .filter(f => !RESERVED.has(f.name))
+    .map(f => ({ source: "ui", ...f })) as unknown as FieldDefinition[];
+
+  const schemaService = new DynamicCollectionSchemaService(
+    undefined,
+    adapter.getCapabilities().dialect
+  );
+  const migrationSQL = schemaService.generateMigrationSQL(
+    tableName,
+    userFields,
+    {
+      isSingle: true,
+      hasStatus: opts.status === true,
+    }
+  );
+  await executeStatements(adapter, migrationSQL);
+
+  const registry = new SingleRegistryService(adapter, silentLogger);
+  await registry.registerSingle({
+    slug,
+    label: slug,
+    tableName,
+    fields: userFields as unknown as FieldConfig[],
+    source: "ui",
+    status: opts.status === true,
+    schemaHash: `seed_${slug}`,
+  });
+
+  const { table } = generateRuntimeSchema(
+    tableName,
+    userFields,
+    adapter.getCapabilities().dialect,
+    { status: opts.status === true }
+  );
+  registerRuntimeTable(adapter, tableName, table);
+
+  return { slug, tableName };
+}
+
+/**
+ * Create the `comp_<slug>` table + `dynamic_components` row for a UI component.
+ */
+export async function seedBuilderComponent(
+  adapter: DrizzleAdapter,
+  opts: SeedBuilderCollectionOptions
+): Promise<{ slug: string; tableName: string }> {
+  const slug = opts.slug.toLowerCase();
+  const tableName = `comp_${slug}`;
+  const dialect = adapter.getCapabilities().dialect;
+
+  const userFields = opts.fields
+    .map(f => ({ ...f, name: f.name.toLowerCase() }))
+    .filter(f => !RESERVED.has(f.name))
+    .map(f => ({ source: "ui", ...f })) as unknown as FieldConfig[];
+
+  const schemaService = new FieldGroupSchemaService(dialect);
+  const migrationSQL = schemaService.generateMigrationSQL(
+    tableName,
+    userFields
+  );
+  await executeStatements(adapter, migrationSQL);
+
+  const registry = new FieldGroupRegistryService(adapter, silentLogger);
+  await registry.registerComponent({
+    slug,
+    label: slug,
+    tableName,
+    fields: userFields,
+    source: "ui",
+    schemaHash: `seed_${slug}`,
+  });
+
+  // The discriminator is the constant the DDL above just wrote, which is what
+  // a table this process created resolves it from; the catalog lookup is for
+  // tables an earlier process built under a since-renamed column.
+  registerRuntimeTable(
+    adapter,
+    tableName,
+    schemaService.generateRuntimeSchema(tableName, userFields, {
+      typeColumn: STORAGE_FORMAT.columns.type,
+    })
+  );
+
+  return { slug, tableName };
+}
+
+/** Split generated migration SQL into statements and run them one at a time. */
+async function executeStatements(
+  adapter: DrizzleAdapter,
+  migrationSQL: string
+): Promise<void> {
+  const statements = migrationSQL
+    .split("--> statement-breakpoint")
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+
+  for (const statement of statements) {
+    const clean = statement
+      .split("\n")
+      .filter(line => !line.trim().startsWith("--"))
+      .join("\n")
+      .trim();
+    if (clean) {
+      await adapter.executeQuery(clean);
+    }
+  }
+}

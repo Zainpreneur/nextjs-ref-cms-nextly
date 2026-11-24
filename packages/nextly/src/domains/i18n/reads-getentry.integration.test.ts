@@ -1,0 +1,198 @@
+// M4a: getEntry resolves localized fields from the companion table with fallback.
+//
+// The code-first boot sync provisions the companion `dc_pages_locales` table (Option B), so
+// the seed upserts per-locale rows into it and the test reads through the real service stack
+// (CollectionsHandler → EntryService → QueryService) with a locale.
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import { defineCollection, text, number } from "../../config";
+import { createTestNextly, type TestNextly } from "../../plugins/test-nextly";
+
+let current: TestNextly | undefined;
+afterEach(async () => {
+  await current?.destroy();
+  current = undefined;
+});
+
+const pages = () =>
+  defineCollection({
+    slug: "pages",
+    localized: true,
+    fields: [
+      // Shared (stays on the main table) so we can create rows without the write path.
+      text({ name: "title", localized: false }),
+      number({ name: "views", localized: false }),
+      // Localized (lives in the companion `_locales` table).
+      text({ name: "heading" }),
+    ],
+  });
+
+async function boot(): Promise<TestNextly> {
+  current = await createTestNextly({
+    collections: [pages()],
+    localization: {
+      locales: ["en", "de"],
+      defaultLocale: "en",
+    },
+  });
+  return current;
+}
+
+/** Create the companion table + seed per-locale heading values for a parent id. */
+async function seedCompanion(
+  t: TestNextly,
+  rows: { parent: string; locale: string; heading: string }[]
+): Promise<void> {
+  const adapter = t.adapter as unknown as {
+    executeQuery: (sql: string) => Promise<unknown>;
+  };
+  await adapter.executeQuery(
+    'CREATE TABLE IF NOT EXISTS "dc_pages_locales" ("_parent" text, "_locale" text, "heading" text, PRIMARY KEY ("_parent","_locale"))'
+  );
+  for (const r of rows) {
+    // Upsert: the code-first boot sync already provisioned the companion, and the
+    // default-locale create may have seeded its row, so a bare INSERT would collide
+    // on the (_parent, _locale) primary key.
+    await adapter.executeQuery(
+      `INSERT INTO "dc_pages_locales" ("_parent","_locale","heading") VALUES ('${r.parent}','${r.locale}','${r.heading}') ON CONFLICT ("_parent","_locale") DO UPDATE SET "heading" = excluded."heading"`
+    );
+  }
+}
+
+function handlerOf(t: TestNextly) {
+  return t.getService("collectionsHandler") as unknown as {
+    getEntry: (p: Record<string, unknown>) => Promise<{
+      success: boolean;
+      data: Record<string, unknown> | null;
+    }>;
+  };
+}
+
+describe("getEntry — localized field resolution (M4a)", () => {
+  it("returns the requested locale's value, and falls back when missing", async () => {
+    const t = await boot();
+    const created = await t.nextly.create({
+      collection: "pages",
+      data: { title: "Page 1", views: 3 },
+    });
+    const id = (created as { item: { id: string } }).item.id;
+
+    // p1 has both German and English; a second logical entry has only English.
+    await seedCompanion(t, [
+      { parent: id, locale: "en", heading: "Hello" },
+      { parent: id, locale: "de", heading: "Hallo" },
+    ]);
+
+    const handler = handlerOf(t);
+
+    // Requested German → German value.
+    const de = await handler.getEntry({
+      collectionName: "pages",
+      entryId: id,
+      locale: "de",
+      overrideAccess: true,
+    });
+    expect(de.data?.heading).toBe("Hallo");
+    expect(de.data?.title).toBe("Page 1"); // shared field unchanged
+
+    // No locale → default (en).
+    const def = await handler.getEntry({
+      collectionName: "pages",
+      entryId: id,
+      overrideAccess: true,
+    });
+    expect(def.data?.heading).toBe("Hello");
+
+    // Invalid locale → default (en).
+    const fr = await handler.getEntry({
+      collectionName: "pages",
+      entryId: id,
+      locale: "fr",
+      overrideAccess: true,
+    });
+    expect(fr.data?.heading).toBe("Hello");
+  });
+
+  it("falls back to the default when the requested language is missing; fallback=none does not", async () => {
+    const t = await boot();
+    const created = await t.nextly.create({
+      collection: "pages",
+      data: { title: "Only EN", views: 1 },
+    });
+    const id = (created as { item: { id: string } }).item.id;
+    await seedCompanion(t, [{ parent: id, locale: "en", heading: "Hello" }]);
+
+    const handler = handlerOf(t);
+
+    // Requested de, no German row → falls back to English.
+    const withFallback = await handler.getEntry({
+      collectionName: "pages",
+      entryId: id,
+      locale: "de",
+      overrideAccess: true,
+    });
+    expect(withFallback.data?.heading).toBe("Hello");
+
+    // fallback disabled → raw German (absent) → null.
+    const noFallback = await handler.getEntry({
+      collectionName: "pages",
+      entryId: id,
+      locale: "de",
+      fallbackLocale: "none",
+      overrideAccess: true,
+    });
+    expect(noFallback.data?.heading).toBeNull();
+  });
+
+  it("direct-api findByID forwards locale to the query service", async () => {
+    const t = await boot();
+    const created = await t.nextly.create({
+      collection: "pages",
+      data: { title: "Page 1", views: 3 },
+    });
+    const id = (created as { item: { id: string } }).item.id;
+    await seedCompanion(t, [
+      { parent: id, locale: "en", heading: "Hello" },
+      { parent: id, locale: "de", heading: "Hallo" },
+    ]);
+
+    const doc = (await t.nextly.findByID({
+      collection: "pages",
+      id,
+      locale: "de",
+      overrideAccess: true,
+    } as Parameters<typeof t.nextly.findByID>[0])) as {
+      heading?: string;
+    } | null;
+    expect(doc?.heading).toBe("Hallo");
+  });
+
+  it("locale=all reads the default language, with every language's values beside it", async () => {
+    const t = await boot();
+    const created = await t.nextly.create({
+      collection: "pages",
+      data: { title: "Page 1", views: 3 },
+    });
+    const id = (created as { item: { id: string } }).item.id;
+    await seedCompanion(t, [
+      { parent: id, locale: "en", heading: "Hello" },
+      { parent: id, locale: "de", heading: "Hallo" },
+    ]);
+
+    const handler = handlerOf(t);
+    const all = await handler.getEntry({
+      collectionName: "pages",
+      entryId: id,
+      locale: "all",
+      overrideAccess: true,
+    });
+    // Every field keeps its type, read in the default language.
+    expect(all.data?.heading).toBe("Hello");
+    expect(all.data?.title).toBe("Page 1");
+    // Every language's values beside it.
+    expect(
+      (all.data?._allLocales as Record<string, unknown> | undefined)?.heading
+    ).toEqual({ en: "Hello", de: "Hallo" });
+  });
+});

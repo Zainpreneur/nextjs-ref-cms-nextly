@@ -1,0 +1,147 @@
+import type { GeneratedFiles } from "./generators/generated-files";
+
+/**
+ * Project type / template selection.
+ * "blog" is the first content template added for alpha.
+ * "plugin" scaffolds a publishable Nextly plugin package + embedded /dev playground (D44/D45).
+ */
+export type ProjectType = "blank" | "blog" | "plugin";
+
+/**
+ * Schema approach selection for content templates.
+ * - code-first: Full schema definitions in nextly.config.ts (like Payload CMS)
+ * - visual: Empty config, schemas created via Admin Panel UI (like Strapi/WordPress)
+ * - both: Core schemas in code, additional schemas creatable via Admin Panel
+ */
+export type ProjectApproach = "code-first" | "visual";
+
+/**
+ * Template manifest structure (matches template.json files).
+ * Each template directory contains a template.json with this shape.
+ */
+export interface TemplateManifest {
+  name: string;
+  label: string;
+  description: string;
+  hint: string;
+  approaches: ProjectApproach[];
+  defaultApproach: ProjectApproach | null;
+  collections: string[];
+  singles: string[];
+  hasDemoData: boolean;
+  hasFrontendPages: boolean;
+  recommendedDatabase: string;
+  release: string;
+}
+
+/**
+ * Supported database types
+ */
+export type DatabaseType = "postgresql" | "mysql" | "sqlite";
+
+/**
+ * Supported package managers
+ */
+export type PackageManager = "npm" | "yarn" | "pnpm" | "bun";
+
+/**
+ * Database configuration for scaffolding
+ */
+export interface DatabaseConfig {
+  type: DatabaseType;
+  adapter: string;
+  /** Database driver peer dependency (e.g., pg, better-sqlite3, mysql2) */
+  databaseDriver: string;
+  connectionUrl: string;
+  envExample: string;
+}
+
+/**
+ * Detected project information
+ */
+export interface ProjectInfo {
+  isNextJs: boolean;
+  isAppRouter: boolean;
+  hasTypescript: boolean;
+  packageManager: PackageManager;
+  nextVersion: string | null;
+  srcDir: boolean;
+  appDir: string;
+}
+
+/**
+ * Options for createNextly function
+ */
+export interface CreateNextlyOptions {
+  /** Working directory (defaults to process.cwd()) */
+  cwd?: string;
+  /** Skip interactive prompts and use defaults */
+  defaults?: boolean;
+  /** Pre-selected project type / template name */
+  projectType?: ProjectType;
+  /** Pre-selected database type */
+  database?: DatabaseType;
+  /** Skip dependency installation (useful for local testing before packages are published) */
+  skipInstall?: boolean;
+  /** Use yalc for local package installation (for testing before npm publish) */
+  useYalc?: boolean;
+  /**
+   * Project name derived from the CLI's positional `[directory]` argument.
+   * Must be a bare directory name (no slashes). Callers pass the basename
+   * of the user-provided argument.
+   */
+  projectNameFromArg?: string;
+  /**
+   * When true, the CLI was invoked with "." meaning "install in current directory".
+   * Different from projectNameFromArg which creates a subdirectory.
+   */
+  installInCwd?: boolean;
+  /** Schema approach for content templates (code-first, visual) */
+  approach?: ProjectApproach;
+  /** Path to local templates directory (for development, bypasses GitHub download) */
+  localTemplatePath?: string;
+  /** Git branch to take a template from; unset, it comes from this CLI's release */
+  branch?: string;
+  /**
+   * Whether to add the Nextly skills for coding agents to the project.
+   * False skips them without asking; otherwise the developer is asked, and
+   * defaults mode adds them.
+   */
+  skills?: boolean;
+  /**
+   * The database's connection string, from `--database-url`. A secret: it is
+   * written only to the ignored `.env` and printed nowhere.
+   */
+  databaseUrl?: string;
+  /**
+   * The connection string came in the process arguments, where shell history
+   * and process lists keep it, rather than from standard input.
+   */
+  databaseUrlInArguments?: boolean;
+  /**
+   * The command's own arguments. Every message masks any of them that may be
+   * a connection string, whichever flag it was given to, since an error can
+   * echo an argument back. Defaults to the process's arguments.
+   */
+  commandArguments?: readonly string[];
+  /** `--package-manager`: installs with it and pins its own version. */
+  packageManager?: PackageManager;
+  /** false for `--no-git`; acted on where the scaffold makes a repository. */
+  git?: boolean;
+  /**
+   * Whether a prompt can be shown. False (no terminal) makes a run that is
+   * missing an answer stop before writing anything, naming the flags to
+   * pass. Left out, prompts are allowed, as for a direct call.
+   */
+  interactive?: boolean;
+}
+
+/**
+ * Result of environment file generation: what was written, extended or left
+ * alone, and what the person should change in a value that was already there.
+ * Neither ever holds an env value.
+ */
+export interface EnvGenerationResult {
+  files: GeneratedFiles;
+  warnings: string[];
+}

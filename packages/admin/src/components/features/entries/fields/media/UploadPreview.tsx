@@ -1,0 +1,375 @@
+/**
+ * Upload Preview Component
+ *
+ * Displays a preview card for uploaded files with thumbnail support for images
+ * and color-coded file type icons for other file types.
+ *
+ * Features:
+ * - Image thumbnails with dimensions display
+ * - Color-coded file type icons (blue/purple/green/red)
+ * - Clickable preview to open file in new tab
+ * - Remove button on hover
+ * - File info overlay (filename, size, dimensions)
+ *
+ * @module components/entries/fields/media/UploadPreview
+ * @since 1.0.0
+ */
+
+import { Button, Card } from "@nextlyhq/ui";
+import type { JSX } from "react";
+
+import {
+  X,
+  File,
+  FileAudio,
+  FileImage,
+  FileText,
+  FileVideo,
+  ExternalLink,
+  Settings,
+} from "@admin/components/icons";
+import { cn } from "@admin/lib/utils";
+
+// ============================================================
+// Types
+// ============================================================
+
+export interface UploadedFile {
+  /**
+   * Unique identifier for the upload.
+   */
+  id: string;
+
+  /**
+   * Original filename.
+   */
+  filename: string;
+
+  /**
+   * URL to access the uploaded file.
+   */
+  url?: string;
+
+  /**
+   * URL to thumbnail (for images).
+   */
+  thumbnailUrl?: string;
+
+  /**
+   * MIME type of the file.
+   */
+  mimeType?: string;
+
+  /**
+   * File size in bytes.
+   */
+  filesize?: number;
+
+  /**
+   * Image width in pixels (for images).
+   */
+  width?: number;
+
+  /**
+   * Image height in pixels (for images).
+   */
+  height?: number;
+  /**
+   * Alt text for accessibility.
+   */
+  altText?: string;
+  /**
+   * Title for the media.
+   */
+  title?: string;
+  /**
+   * Caption for the media.
+   */
+  caption?: string;
+  /**
+   * Tags for organization.
+   */
+  tags?: string[];
+  /**
+   * Folder ID the media belongs to.
+   */
+  folderId?: string | null;
+  /**
+   * A stored upload the editor cannot see: media they may not read, or that no
+   * longer exists. Shown as a placeholder and kept when the form is saved.
+   */
+  restricted?: boolean;
+  /**
+   * The collection a restricted upload belongs to, when its field names
+   * several and stores each as a `{ relationTo, value }` pair.
+   */
+  relationTo?: string;
+}
+
+export interface UploadPreviewProps {
+  /**
+   * The uploaded file to display.
+   */
+  file: UploadedFile;
+
+  /**
+   * Callback when remove button is clicked.
+   */
+  onRemove: () => void;
+  /**
+   * Callback when edit button is clicked.
+   */
+  onEdit?: () => void;
+
+  /**
+   * Whether the remove button should be disabled.
+   * @default false
+   */
+  disabled?: boolean;
+
+  /**
+   * Additional CSS classes.
+   */
+  className?: string;
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+
+/**
+ * Get the icon for a MIME type.
+ *
+ * The glyph says what the file is; each type used to be tinted a different
+ * hue as well, which said the same thing a second time in a vocabulary the
+ * admin uses for something else — a document came out the red it uses for
+ * destructive actions, and audio the green it uses for success.
+ */
+function getFileIcon(mimeType?: string) {
+  if (!mimeType) {
+    return <File className="h-12 w-12 text-muted-foreground" />;
+  }
+
+  if (mimeType.startsWith("image/")) {
+    return <FileImage className="h-12 w-12 text-muted-foreground" />;
+  }
+  if (mimeType.startsWith("video/")) {
+    return <FileVideo className="h-12 w-12 text-muted-foreground" />;
+  }
+  if (mimeType.startsWith("audio/")) {
+    return <FileAudio className="h-12 w-12 text-muted-foreground" />;
+  }
+  if (
+    mimeType === "application/pdf" ||
+    mimeType.includes("document") ||
+    mimeType.includes("text")
+  ) {
+    return <FileText className="h-12 w-12 text-muted-foreground" />;
+  }
+
+  return <File className="h-12 w-12 text-muted-foreground" />;
+}
+
+/**
+ * Format file size for display.
+ */
+function formatFileSize(bytes?: number): string {
+  if (!bytes || bytes === 0) return "";
+
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+}
+
+/**
+ * Format image dimensions for display.
+ */
+function formatDimensions(width?: number, height?: number): string | null {
+  if (!width || !height) return null;
+  return `${width} × ${height}`;
+}
+
+// ============================================================
+// Component
+// ============================================================
+
+/**
+ * UploadPreview displays a preview card for an uploaded file.
+ *
+ * Features:
+ * - Image thumbnails for image files
+ * - Color-coded file type icons for non-image files
+ * - Filename display with truncation
+ * - File size and dimensions display
+ * - Remove button with hover reveal
+ * - Clickable preview to open file in new tab
+ *
+ * @example
+ * ```tsx
+ * <UploadPreview
+ *   file={{
+ *     id: "123",
+ *     filename: "photo.jpg",
+ *     url: "/uploads/photo.jpg",
+ *     thumbnailUrl: "/uploads/thumbnails/photo.jpg",
+ *     mimeType: "image/jpeg",
+ *     filesize: 1024000,
+ *     width: 1920,
+ *     height: 1080,
+ *   }}
+ *   onRemove={() => handleRemove("123")}
+ * />
+ * ```
+ */
+export function UploadPreview({
+  file,
+  onRemove,
+  onEdit,
+  disabled = false,
+  className,
+}: UploadPreviewProps): JSX.Element {
+  const isImage = file.mimeType?.startsWith("image/");
+  const isSvg = file.mimeType === "image/svg+xml";
+  // SVGs scale natively — Nextly's media pipeline sometimes leaves
+  // thumbnailUrl null for them, so always serve the full URL. For
+  // other images, prefer the generated thumbnail and fall back to
+  // the full URL if it's missing or fails to load (see onError below).
+  const thumbnailSrc = isSvg
+    ? file.url
+    : file.thumbnailUrl || (isImage ? file.url : undefined);
+  const dimensions = formatDimensions(file.width, file.height);
+  const fileSize = formatFileSize(file.filesize);
+
+  /**
+   * Handle click on the preview to open the file.
+   */
+  const handlePreviewClick = () => {
+    if (file.url) {
+      window.open(file.url, "_blank", "noopener,noreferrer");
+    }
+  };
+
+  return (
+    <Card className={cn("relative group overflow-hidden", className)}>
+      {/* Preview area - clickable to open file. A neutral backdrop with the
+          thumbnail fitted inside it, whole, as the library's tiles draw it. */}
+      <div
+        className={cn(
+          "aspect-square bg-muted flex items-center justify-center",
+          file.url && "cursor-pointer"
+        )}
+        onClick={handlePreviewClick}
+        role={file.url ? "button" : undefined}
+        tabIndex={file.url ? 0 : undefined}
+        onKeyDown={e => {
+          if (file.url && (e.key === "Enter" || e.key === " ")) {
+            e.preventDefault();
+            handlePreviewClick();
+          }
+        }}
+        aria-label={file.url ? `Open ${file.filename} in new tab` : undefined}
+      >
+        {thumbnailSrc ? (
+          <img
+            src={thumbnailSrc}
+            alt={file.filename}
+            className="w-full h-full object-contain"
+            onError={e => {
+              // If the generated thumbnail 404s (e.g., the storage
+              // adapter never produced one), fall back to the full
+              // URL. Guard against an infinite loop if the full URL
+              // is also broken.
+              if (file.url && e.currentTarget.src !== file.url) {
+                e.currentTarget.src = file.url;
+              }
+            }}
+          />
+        ) : (
+          <div className="flex flex-col items-center gap-2 p-4">
+            {getFileIcon(file.mimeType)}
+            <span className="text-xs text-muted-foreground truncate max-w-full px-2 text-center">
+              {file.filename}
+            </span>
+          </div>
+        )}
+
+        {/* External link indicator on hover (for files with URL). The wash is
+            `--nx-overlay-soft`, the lighter scrim meant for sitting over
+            content: the thumbnail beneath still has to read through it. Its
+            icon stays literal white, keyed to the media rather than the
+            palette. */}
+        {file.url && (
+          <div
+            className={cn(
+              "absolute inset-0 bg-overlay-soft flex items-center justify-center",
+              "opacity-0 group-hover:opacity-100 transition-opacity",
+              "pointer-events-none"
+            )}
+          >
+            <ExternalLink className="h-8 w-8 text-white" />
+          </div>
+        )}
+      </div>
+
+      {/* Remove button - visible on hover */}
+      {!disabled && (
+        <Button
+          type="button"
+          variant="destructive"
+          size="icon"
+          className={cn(
+            "absolute top-2 right-2 h-6 w-6",
+            "opacity-0 group-hover:opacity-100 transition-opacity",
+            "z-10"
+          )}
+          onClick={e => {
+            e.stopPropagation();
+            onRemove();
+          }}
+          aria-label={`Remove ${file.filename}`}
+        >
+          <X className="h-3 w-3" />
+        </Button>
+      )}
+
+      {/* Edit button - visible on hover */}
+      {!disabled && onEdit && (
+        <Button
+          type="button"
+          variant="secondary"
+          size="icon"
+          className={cn(
+            "absolute top-2 right-10 h-6 w-6",
+            "opacity-0 group-hover:opacity-100 transition-opacity",
+            "z-10"
+          )}
+          onClick={e => {
+            e.stopPropagation();
+            onEdit();
+          }}
+          aria-label={`Edit settings for ${file.filename}`}
+        >
+          <Settings className="h-3 w-3" />
+        </Button>
+      )}
+
+      {/* File info overlay. The gradient scrim and its caption stay literal:
+          they are composited over the thumbnail image, not over a themed
+          surface, so a token would leave the text unreadable on pale media. */}
+      <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/60 to-transparent p-2 pointer-events-none">
+        <p className="text-xs text-white truncate">{file.filename}</p>
+        <div className="flex items-center gap-2 text-xs text-white/70">
+          {fileSize && <span>{fileSize}</span>}
+          {fileSize && dimensions && <span>•</span>}
+          {dimensions && <span>{dimensions}</span>}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+// ============================================================
+// Exports
+// ============================================================

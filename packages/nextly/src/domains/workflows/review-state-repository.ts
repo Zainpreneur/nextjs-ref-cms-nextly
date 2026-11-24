@@ -1,0 +1,732 @@
+/**
+ * Read and write a workflow's review state, one row per document and part: a language, or the
+ * shared part (`nextly_review_states`).
+ *
+ * Every function takes the database it runs on, the adapter or the caller's transaction, so a step
+ * and the content write it belongs to land together. A write is a compare-and-set on the row's
+ * `revision`: it says whether it matched, and one that did not changed nothing.
+ *
+ * @module domains/workflows/review-state-repository
+ */
+import { createHash } from "node:crypto";
+
+import type {
+  TransactionContext,
+  WhereClause,
+  WhereCondition,
+} from "@nextlyhq/adapter-drizzle/types";
+
+import { REVIEW_STATES_TABLE } from "../../schemas/review-states";
+import type {
+  ReviewAssigneeKind,
+  ReviewScopeKind,
+} from "../../schemas/review-states/types";
+
+import type { WaitingPosition } from "./waiting-cursor";
+
+/** A document a workflow is attached to: a collection's entry, or a Single. */
+export interface ReviewDocument {
+  scopeKind: ReviewScopeKind;
+  scopeSlug: string;
+  entryId: string;
+}
+
+/** One part of a document: a language, or null for the shared part. */
+export interface ReviewPart extends ReviewDocument {
+  part: string | null;
+}
+
+/** Who a part is assigned to. */
+export interface ReviewAssignee {
+  kind: ReviewAssigneeKind;
+  id: string;
+}
+
+/** The approval a part holds. */
+export interface ReviewApproval {
+  /** The `versionNo` of the recorded version the reviewer was shown. */
+  versionNo: number;
+  digest: string;
+  by: string;
+  at: Date;
+}
+
+/** A part's review state as stored. */
+export interface ReviewState extends ReviewPart {
+  stage: string;
+  enteredAt: Date;
+  enteredBy: string | null;
+  assignee: ReviewAssignee | null;
+  dueAt: Date | null;
+  approval: ReviewApproval | null;
+  definitionHash: string;
+  revision: number;
+}
+
+/** What a step changes on a part. Left out, a value stays as it is. */
+export type ReviewStateChange = Partial<
+  Pick<
+    ReviewState,
+    | "stage"
+    | "enteredAt"
+    | "enteredBy"
+    | "assignee"
+    | "dueAt"
+    | "approval"
+    | "definitionHash"
+  >
+>;
+
+/** The database surface these need: the adapter, or a transaction's context, which has the same. */
+export interface ReviewStatesDb {
+  select<T = unknown>(
+    table: string,
+    options?: {
+      where?: WhereClause;
+      limit?: number;
+      offset?: number;
+      orderBy?: { column: string; direction?: "asc" | "desc" }[];
+    }
+  ): Promise<T[]>;
+  insert<T = unknown>(
+    table: string,
+    data: Record<string, unknown>,
+    options?: { returning?: string[] | "*" }
+  ): Promise<T>;
+  updateCount(
+    table: string,
+    data: Record<string, unknown>,
+    where: WhereClause
+  ): Promise<number>;
+  delete(table: string, where: WhereClause): Promise<number>;
+}
+
+/** A row as the adapter reads it, by property name. */
+interface ReviewStateRow {
+  scopeKind: ReviewScopeKind;
+  scopeSlug: string;
+  entryId: string;
+  part: string | null;
+  stage: string;
+  enteredAt: Date | string | number;
+  enteredBy: string | null;
+  assigneeKind: ReviewAssigneeKind | null;
+  assigneeId: string | null;
+  dueAt: Date | string | number | null;
+  approvedVersionNo: number | string | null;
+  approvedDigest: string | null;
+  approvedBy: string | null;
+  approvedAt: Date | string | number | null;
+  definitionHash: string;
+  revision: number | string;
+}
+
+/**
+ * The digest one row per document and part is enforced on. A digest because a null part cannot sit
+ * in a unique index on every dialect, and the readable composite would pass MySQL's key limit. A
+ * null part and a part named "" stay distinct.
+ */
+export function reviewStateKey(part: ReviewPart): string {
+  const joined = [
+    part.scopeKind,
+    part.scopeSlug,
+    part.entryId,
+    part.part === null ? "-" : `=${part.part}`,
+  ]
+    .map(encodeURIComponent)
+    .join(":");
+  return createHash("sha256").update(joined, "utf8").digest("hex");
+}
+
+/**
+ * The id of a part's review-state row, or null when it has none. The row is made afresh each time
+ * the part enters review again (a discard removes it), so the id names one review cycle, where the
+ * revision starts again at 1 with each.
+ */
+export async function readReviewStateId(
+  db: Pick<TransactionContext, "select">,
+  part: ReviewPart
+): Promise<string | null> {
+  const [row] = await db.select<{ id: string }>(REVIEW_STATES_TABLE, {
+    columns: ["id"],
+    where: {
+      and: [{ column: "partKey", op: "=", value: reviewStateKey(part) }],
+    },
+    limit: 1,
+  });
+  return row?.id ?? null;
+}
+
+/** A part's review state, or null when it has none, which reads as the workflow's first stage. */
+export async function readReviewState(
+  db: ReviewStatesDb,
+  part: ReviewPart
+): Promise<ReviewState | null> {
+  const [row] = await db.select<ReviewStateRow>(REVIEW_STATES_TABLE, {
+    where: {
+      and: [{ column: "partKey", op: "=", value: reviewStateKey(part) }],
+    },
+    limit: 1,
+  });
+  return row ? fromRow(row) : null;
+}
+
+/**
+ * Every part of a document that has a review state: the batched read below, asked of this one
+ * document, so the two cannot come to answer a document differently.
+ */
+export async function readDocumentReviewStates(
+  db: ReviewStatesDb,
+  document: ReviewDocument
+): Promise<ReviewState[]> {
+  return (
+    (await readScopeReviewStates(db, document, [document.entryId])).get(
+      document.entryId
+    ) ?? []
+  );
+}
+
+/**
+ * Every part with a review state of each of these documents of one collection or Single, by entry
+ * id; a document with none is absent. One read for all the ids given, so a caller holding more
+ * than one statement may bind reads them in runs; none when there are no ids.
+ */
+export async function readScopeReviewStates(
+  db: ReviewStatesDb,
+  scope: Pick<ReviewDocument, "scopeKind" | "scopeSlug">,
+  entryIds: readonly string[]
+): Promise<Map<string, ReviewState[]>> {
+  const states = new Map<string, ReviewState[]>();
+  if (entryIds.length === 0) return states;
+  const rows = await db.select<ReviewStateRow>(REVIEW_STATES_TABLE, {
+    where: {
+      and: [
+        { column: "scopeKind", op: "=", value: scope.scopeKind },
+        { column: "scopeSlug", op: "=", value: scope.scopeSlug },
+        { column: "entryId", op: "IN", value: [...new Set(entryIds)] },
+      ],
+    },
+  });
+  for (const state of rows.map(fromRow)) {
+    states.set(state.entryId, [...(states.get(state.entryId) ?? []), state]);
+  }
+  return states;
+}
+
+/** Ids per statement: SQLite binds 999 values at most, the lowest of the dialects. */
+const ENTRY_IDS_PER_READ = 500;
+
+/**
+ * Every part with a review state of each of `entryIds`, documents of one collection or Single:
+ * a page of a list read at once, a statement per 500 documents, never one per document.
+ *
+ * @experimental
+ */
+export async function readReviewStatesOfDocuments(
+  db: ReviewStatesDb,
+  scope: { scopeKind: ReviewDocument["scopeKind"]; scopeSlug: string },
+  entryIds: readonly string[]
+): Promise<ReviewState[]> {
+  const states: ReviewState[] = [];
+  for (let at = 0; at < entryIds.length; at += ENTRY_IDS_PER_READ) {
+    const rows = await db.select<ReviewStateRow>(REVIEW_STATES_TABLE, {
+      where: {
+        and: [
+          { column: "scopeKind", op: "=", value: scope.scopeKind },
+          { column: "scopeSlug", op: "=", value: scope.scopeSlug },
+          {
+            column: "entryId",
+            op: "IN",
+            value: entryIds.slice(at, at + ENTRY_IDS_PER_READ),
+          },
+        ],
+      },
+    });
+    states.push(...rows.map(fromRow));
+  }
+  return states;
+}
+
+/** A stage of one collection or Single, as a filter on review states names it. */
+export interface ScopedStageFilter {
+  kind: ReviewScopeKind;
+  slug: string;
+  stage: string;
+}
+
+/**
+ * How one stage of one collection or Single splits for a caller's waiting list. Parts assigned to
+ * the caller or one of their roles (`mine` in {@link WaitingTerms}), and, where `unassigned`,
+ * parts no one is assigned, wait for them by the stage alone: their own work. The rest of the stage
+ * waits for them only where the part itself says so: its assignee, or its stage's default reviewer,
+ * may not take it on that part (lost the step, or brought the part in where the step refuses
+ * that).
+ *
+ * @experimental
+ */
+export interface WaitingStageTerms extends ScopedStageFilter {
+  unassigned: boolean;
+}
+
+/**
+ * A caller's waiting list's terms: who they stand for (`mine`, the same in every stage, so named
+ * once) and each stage they take a step out of.
+ *
+ * @experimental
+ */
+export interface WaitingTerms {
+  mine: readonly ReviewAssignee[];
+  stages: readonly WaitingStageTerms[];
+}
+
+/** Which of a stage's parts a read takes: the caller's own work, or the rest of the stage. */
+export type WaitingShare = "own" | "rest";
+
+/** "Assigned to any of `assignees`", or null where that names no one. */
+function assignedTo(assignees: readonly ReviewAssignee[]): WhereClause | null {
+  const assigned: WhereClause[] = (["user", "role"] as const)
+    .map(kind => ({ kind, ids: idsOfKind(assignees, kind) }))
+    .filter(({ ids }) => ids.length > 0)
+    .map(({ kind, ids }) => ({
+      and: [
+        { column: "assigneeKind", op: "=", value: kind },
+        { column: "assigneeId", op: "IN", value: ids },
+      ],
+    }));
+  return assigned.length === 0 ? null : { or: assigned };
+}
+
+/** "Assigned to anyone but `assignees`": the complement of `assignedTo` among assigned parts. */
+function assignedToOthers(assignees: readonly ReviewAssignee[]): WhereClause {
+  return {
+    or: (["user", "role"] as const).map((kind): WhereClause => {
+      const ids = idsOfKind(assignees, kind);
+      return {
+        and: [
+          { column: "assigneeKind", op: "=", value: kind },
+          ...(ids.length > 0
+            ? [{ column: "assigneeId", op: "NOT IN" as const, value: ids }]
+            : []),
+        ],
+      };
+    }),
+  };
+}
+
+function idsOfKind(
+  assignees: readonly ReviewAssignee[],
+  kind: ReviewAssigneeKind
+): string[] {
+  return assignees
+    .filter(assignee => assignee.kind === kind)
+    .map(assignee => assignee.id);
+}
+
+const UNASSIGNED: WhereClause = {
+  and: [{ column: "assigneeKind", op: "IS NULL", value: null }],
+};
+
+/** One stage of one collection or Single, as a filter. */
+function inStage(scoped: ScopedStageFilter): WhereClause {
+  return {
+    and: [
+      { column: "scopeKind", op: "=", value: scoped.kind },
+      { column: "scopeSlug", op: "=", value: scoped.slug },
+      { column: "stage", op: "=", value: scoped.stage },
+    ],
+  };
+}
+
+/**
+ * The filter for `share` of the one stage `term` names, given `assigned` (the share's assignee
+ * filter, built once for every stage), or null where it can match nothing. The two shares split
+ * every part of a stage between them, each part into exactly one.
+ */
+function waitingWhere(
+  term: WaitingStageTerms,
+  share: WaitingShare,
+  assigned: WhereClause | null
+): WhereClause | null {
+  const unassigned = share === "own" ? term.unassigned : !term.unassigned;
+  const whose = [assigned, unassigned ? UNASSIGNED : null].filter(
+    (clause): clause is WhereClause => clause !== null
+  );
+  return whose.length === 0 ? null : { and: [inStage(term), { or: whose }] };
+}
+
+/**
+ * "Past `after` in the waiting list's order": entered the stage later, or at the same time with a
+ * greater key. Entry time and key order every part exactly once, so a read from a position never
+ * repeats or skips one.
+ */
+function pastPosition(after: WaitingPosition): WhereClause {
+  return {
+    or: [
+      { column: "enteredAt", op: ">", value: after.enteredAt },
+      {
+        and: [
+          { column: "enteredAt", op: "=", value: after.enteredAt },
+          { column: "partKey", op: ">", value: after.partKey },
+        ],
+      },
+    ],
+  };
+}
+
+/**
+ * `share` of the review states in the stages `terms` names, oldest entry into their stage first, at
+ * most `limit` of them, starting just past `after` where it is given: the candidates a waiting list
+ * decides part by part, read checks and pages from. Bounded, as a stage may hold any number of
+ * parts.
+ *
+ * Read a stage at a time, each read in the waiting index's order within its one stage (so its limit
+ * stops the index scan, where an OR across stages would sort every match first), and merged: the
+ * first `limit` of all of them are the first `limit` of the share.
+ *
+ * @experimental
+ */
+export async function readWaitingReviewStates(
+  db: ReviewStatesDb,
+  terms: WaitingTerms,
+  share: WaitingShare,
+  limit: number,
+  // The position of the last state an earlier read consumed: a keyset, so a read deep in a long
+  // list costs what its first does.
+  after?: WaitingPosition
+): Promise<ReviewState[]> {
+  // Who the share's parts are assigned to, the caller's ids named once for every stage.
+  const assigned =
+    share === "own" ? assignedTo(terms.mine) : assignedToOthers(terms.mine);
+  const merged: ReviewState[] = [];
+  for (const term of terms.stages) {
+    const whose = waitingWhere(term, share, assigned);
+    if (whose === null) continue;
+    const rows = await db.select<ReviewStateRow>(REVIEW_STATES_TABLE, {
+      where:
+        after === undefined ? whose : { and: [whose, pastPosition(after)] },
+      // Stable across pages: entry into the stage, then the row's own key.
+      orderBy: [
+        { column: "enteredAt", direction: "asc" },
+        { column: "partKey", direction: "asc" },
+      ],
+      limit,
+    });
+    merged.push(...rows.map(fromRow));
+  }
+  return merged.sort(waitingOrder).slice(0, limit);
+}
+
+/**
+ * Where `state` stands in the waiting list's order: its entry into the stage and its key.
+ *
+ * @experimental
+ */
+export function waitingPosition(state: ReviewState): WaitingPosition {
+  return { enteredAt: state.enteredAt, partKey: orderKey(state) };
+}
+
+/**
+ * Orders review states as a waiting read does: entry into the stage, then the row's own key (a
+ * lowercase hex digest, so the database's order and this one agree).
+ *
+ * @experimental
+ */
+export function waitingOrder(a: ReviewState, b: ReviewState): number {
+  const at = a.enteredAt.getTime() - b.enteredAt.getTime();
+  if (at !== 0) return at;
+  const ka = orderKey(a);
+  const kb = orderKey(b);
+  return ka < kb ? -1 : ka > kb ? 1 : 0;
+}
+
+// A sort compares each row many times; its key, a digest, is worked out once per row.
+const orderKeys = new WeakMap<ReviewState, string>();
+function orderKey(state: ReviewState): string {
+  let key = orderKeys.get(state);
+  if (key === undefined) {
+    key = reviewStateKey(state);
+    orderKeys.set(state, key);
+  }
+  return key;
+}
+
+/**
+ * Gives a part its first review state, at revision 1. Refused by the unique index when the part
+ * already has one, so two callers starting the same part do not both succeed.
+ */
+export async function createReviewState(
+  db: ReviewStatesDb,
+  part: ReviewPart,
+  state: Pick<ReviewState, "stage" | "enteredAt" | "definitionHash"> &
+    ReviewStateChange
+): Promise<ReviewState> {
+  const now = new Date();
+  await db.insert(REVIEW_STATES_TABLE, {
+    id: crypto.randomUUID(),
+    scopeKind: part.scopeKind,
+    scopeSlug: part.scopeSlug,
+    entryId: part.entryId,
+    part: part.part,
+    partKey: reviewStateKey(part),
+    enteredBy: null,
+    ...toColumns({
+      assignee: null,
+      dueAt: null,
+      approval: null,
+      ...state,
+    }),
+    revision: 1,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return {
+    ...part,
+    enteredBy: null,
+    assignee: null,
+    dueAt: null,
+    approval: null,
+    ...state,
+    revision: 1,
+  };
+}
+
+/**
+ * Applies `change` to a part's review state if its revision is still `expectedRevision`, raising
+ * it by one. False, changing nothing, when someone wrote the row since or it is gone.
+ */
+export async function updateReviewState(
+  db: ReviewStatesDb,
+  part: ReviewPart,
+  expectedRevision: number,
+  change: ReviewStateChange
+): Promise<boolean> {
+  const affected = await db.updateCount(
+    REVIEW_STATES_TABLE,
+    {
+      ...toColumns(change),
+      // Always moves, so MySQL, which counts changed rows rather than matched ones, reports a write
+      // that changes nothing else as the write it is rather than as a miss.
+      revision: expectedRevision + 1,
+      updatedAt: new Date(),
+    },
+    {
+      and: [
+        { column: "partKey", op: "=", value: reviewStateKey(part) },
+        { column: "revision", op: "=", value: expectedRevision },
+      ],
+    }
+  );
+  return affected > 0;
+}
+
+/**
+ * The review states of every document of a collection or Single that also meet `conditions`, in
+ * one read: what a sweep over one collection's documents reads, rather than a read per document.
+ */
+export async function readEntityReviewStates(
+  db: ReviewStatesDb,
+  entity: Pick<ReviewDocument, "scopeKind" | "scopeSlug">,
+  conditions: readonly WhereCondition[] = []
+): Promise<ReviewState[]> {
+  const rows = await db.select<ReviewStateRow>(REVIEW_STATES_TABLE, {
+    where: {
+      and: [
+        { column: "scopeKind", op: "=", value: entity.scopeKind },
+        { column: "scopeSlug", op: "=", value: entity.scopeSlug },
+        ...conditions,
+      ],
+    },
+  });
+  return rows.map(fromRow);
+}
+
+/**
+ * The review states of every document of a collection or Single other than those `attached`
+ * names, in one read: the states a workflow no longer covers.
+ */
+export async function readReviewStatesOutside(
+  db: ReviewStatesDb,
+  attached: { collections: readonly string[]; singles: readonly string[] }
+): Promise<ReviewState[]> {
+  // An empty list names no scope, and `NOT IN ()` is no condition every dialect accepts.
+  const outside = (
+    scopeKind: ReviewScopeKind,
+    slugs: readonly string[]
+  ): WhereClause => ({
+    and: [
+      { column: "scopeKind", op: "=", value: scopeKind },
+      ...(slugs.length > 0
+        ? [{ column: "scopeSlug", op: "NOT IN" as const, value: [...slugs] }]
+        : []),
+    ],
+  });
+  const rows = await db.select<ReviewStateRow>(REVIEW_STATES_TABLE, {
+    where: {
+      or: [
+        outside("collection", attached.collections),
+        outside("single", attached.singles),
+      ],
+    },
+  });
+  return rows.map(fromRow);
+}
+
+/**
+ * The collections and Singles that stored review states name, each once: the entities a
+ * definition sweep may write through, an entity whose workflow was detached among them.
+ */
+export async function readReviewStateScopes(db: {
+  select<T = unknown>(
+    table: string,
+    options?: { columns?: string[]; distinct?: boolean }
+  ): Promise<T[]>;
+}): Promise<{ collections: string[]; singles: string[] }> {
+  const rows = await db.select<{ scopeKind: string; scopeSlug: string }>(
+    REVIEW_STATES_TABLE,
+    { columns: ["scopeKind", "scopeSlug"], distinct: true }
+  );
+  const of = (kind: ReviewScopeKind) =>
+    rows.filter(row => row.scopeKind === kind).map(row => row.scopeSlug);
+  return { collections: of("collection"), singles: of("single") };
+}
+
+/**
+ * Points every review state of a collection or Single written under `from` at the definition
+ * hash `to`, leaving the rest of each row as it is. Answers how many moved.
+ */
+export function restampReviewStates(
+  db: ReviewStatesDb,
+  entity: Pick<ReviewDocument, "scopeKind" | "scopeSlug">,
+  from: string,
+  to: string
+): Promise<number> {
+  return db.updateCount(
+    REVIEW_STATES_TABLE,
+    { definitionHash: to, updatedAt: new Date() },
+    {
+      and: [
+        { column: "scopeKind", op: "=", value: entity.scopeKind },
+        { column: "scopeSlug", op: "=", value: entity.scopeSlug },
+        { column: "definitionHash", op: "=", value: from },
+      ],
+    }
+  );
+}
+
+/** Removes one part's review state. Answers how many rows went: 1, or 0 when it had none. */
+export function deletePartReviewState(
+  db: ReviewStatesDb,
+  part: ReviewPart
+): Promise<number> {
+  return db.delete(REVIEW_STATES_TABLE, {
+    and: [{ column: "partKey", op: "=", value: reviewStateKey(part) }],
+  });
+}
+
+/**
+ * Removes one part's review state if its revision is still `expectedRevision`. False, removing
+ * nothing, when someone wrote the row since or it is gone.
+ */
+export async function deletePartReviewStateAt(
+  db: ReviewStatesDb,
+  part: ReviewPart,
+  expectedRevision: number
+): Promise<boolean> {
+  const removed = await db.delete(REVIEW_STATES_TABLE, {
+    and: [
+      { column: "partKey", op: "=", value: reviewStateKey(part) },
+      { column: "revision", op: "=", value: expectedRevision },
+    ],
+  });
+  return removed > 0;
+}
+
+/** Removes the review state of every part of a document. */
+export function deleteDocumentReviewStates(
+  db: ReviewStatesDb,
+  document: ReviewDocument
+): Promise<number> {
+  return db.delete(REVIEW_STATES_TABLE, documentWhere(document));
+}
+
+/** Removes the review state of every document of a collection or Single. */
+export function deleteEntityReviewStates(
+  db: ReviewStatesDb,
+  entity: Pick<ReviewDocument, "scopeKind" | "scopeSlug">
+): Promise<number> {
+  return db.delete(REVIEW_STATES_TABLE, {
+    and: [
+      { column: "scopeKind", op: "=", value: entity.scopeKind },
+      { column: "scopeSlug", op: "=", value: entity.scopeSlug },
+    ],
+  });
+}
+
+function documentWhere(document: ReviewDocument): WhereClause {
+  return {
+    and: [
+      { column: "scopeKind", op: "=", value: document.scopeKind },
+      { column: "scopeSlug", op: "=", value: document.scopeSlug },
+      { column: "entryId", op: "=", value: document.entryId },
+    ],
+  };
+}
+
+/** The columns `change` sets, by property name; the assignee and approval each as their columns. */
+function toColumns(change: ReviewStateChange): Record<string, unknown> {
+  const columns: Record<string, unknown> = {};
+  if (change.stage !== undefined) columns.stage = change.stage;
+  if (change.enteredAt !== undefined) columns.enteredAt = change.enteredAt;
+  if (change.enteredBy !== undefined) columns.enteredBy = change.enteredBy;
+  if (change.dueAt !== undefined) columns.dueAt = change.dueAt;
+  if (change.definitionHash !== undefined) {
+    columns.definitionHash = change.definitionHash;
+  }
+  if (change.assignee !== undefined) {
+    columns.assigneeKind = change.assignee?.kind ?? null;
+    columns.assigneeId = change.assignee?.id ?? null;
+  }
+  if (change.approval !== undefined) {
+    columns.approvedVersionNo = change.approval?.versionNo ?? null;
+    columns.approvedDigest = change.approval?.digest ?? null;
+    columns.approvedBy = change.approval?.by ?? null;
+    columns.approvedAt = change.approval?.at ?? null;
+  }
+  return columns;
+}
+
+/** Dialects return a timestamp as a Date, an ISO string or epoch milliseconds. */
+function asDate(value: Date | string | number): Date {
+  return value instanceof Date ? value : new Date(value);
+}
+
+function fromRow(row: ReviewStateRow): ReviewState {
+  return {
+    scopeKind: row.scopeKind,
+    scopeSlug: row.scopeSlug,
+    entryId: row.entryId,
+    part: row.part,
+    stage: row.stage,
+    enteredAt: asDate(row.enteredAt),
+    enteredBy: row.enteredBy,
+    assignee:
+      row.assigneeKind !== null && row.assigneeId !== null
+        ? { kind: row.assigneeKind, id: row.assigneeId }
+        : null,
+    dueAt: row.dueAt === null ? null : asDate(row.dueAt),
+    approval:
+      row.approvedVersionNo !== null &&
+      row.approvedDigest !== null &&
+      row.approvedBy !== null &&
+      row.approvedAt !== null
+        ? {
+            versionNo: Number(row.approvedVersionNo),
+            digest: row.approvedDigest,
+            by: row.approvedBy,
+            at: asDate(row.approvedAt),
+          }
+        : null,
+    definitionHash: row.definitionHash,
+    revision: Number(row.revision),
+  };
+}

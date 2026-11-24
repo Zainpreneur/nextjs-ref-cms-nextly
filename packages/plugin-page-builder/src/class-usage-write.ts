@@ -1,0 +1,408 @@
+/**
+ * Bringing one written document's index rows into agreement with it.
+ *
+ * The half that runs on every save. `class-usage-maintenance` reconciles ONE
+ * subject against ONE document; this decides which subjects a save owes an
+ * update to, obtains the document behind each, and reports what happened
+ * without ever failing the save.
+ *
+ * ## Why every locale and variant is visited, not the one that changed
+ *
+ * The hook is not told which locale or variant was written. `_status` is
+ * stripped from the payload before a hook sees it, and the write locale is
+ * known at the call site and never forwarded. So "reconcile what changed" is
+ * not expressible here: the only sound reading is that the document as a whole
+ * may have changed, and every subject it owns is re-derived.
+ *
+ * That costs a read per subject on a save that touched one of them. It is the
+ * price of not silently leaving a stale subject behind, and a stale subject is
+ * the failure that licences deleting a class a page still renders.
+ *
+ * ## Why nothing here throws
+ *
+ * Collection `after*` hooks run AFTER the write commits. A throw would surface
+ * to the caller as a failed save for a document that is already on disk, so the
+ * author is told their work was lost while it was not. Every failure is
+ * therefore captured and reported, never raised: an index that disagrees with a
+ * document is recoverable by a rebuild, and a false error is not recoverable at
+ * all.
+ *
+ * @module class-usage-write
+ */
+import type { DocumentLimits } from "@nextlyhq/blocks-engine";
+
+import {
+  blocksFieldsOf,
+  type BlocksFieldsCollection,
+} from "./class-usage-blocks-fields";
+import {
+  forgetAbsentDocuments,
+  maintainUsage,
+  type ClassUsageIndexStore,
+  type ClassUsageMaintenanceReport,
+} from "./class-usage-maintenance";
+import {
+  classUsageIndex,
+  type ClassUsageSubject,
+} from "./class-usage-reconcile";
+import { classUsageSubjectsFor } from "./class-usage-subjects";
+import type { ClassUsageVariant } from "./collections/class-usage-index";
+import type { UsageIndex, UsageScope, UsageSubject } from "./usage-index";
+
+/**
+ * How the caller obtains the document behind one subject.
+ *
+ * Injected rather than reached for, because the subject names a locale and a
+ * variant and only the caller knows how its own runtime addresses those. It
+ * also keeps this module testable against values.
+ *
+ * Answering `null` means the document does not exist in that locale and
+ * variant, which is an ordinary state rather than an error — a collection with
+ * drafts holds a published row for a document that has no pending draft, and a
+ * localized field has no value in a locale nobody has translated yet.
+ */
+export interface ClassUsageDocumentReader {
+  (subject: ClassUsageSubject): Promise<unknown>;
+}
+
+/** The collection a write landed on, as the host configured it. */
+export interface WrittenCollectionConfig extends BlocksFieldsCollection {
+  /** Whether `slug` names a collection or a Single; a collection when absent. */
+  scope?: UsageScope;
+  /** The collection's slug, or the Single's, stored as the `entity` of every row. */
+  slug: string;
+  /**
+   * Whether this collection stores a working draft beside its published row.
+   *
+   * Resolved by the caller through the published draft-split question rather
+   * than read from `status`, which is true for collections that keep no draft
+   * at all. Guessing it wrong in either direction writes rows against a
+   * document that does not exist, or omits the classes only a draft applies.
+   */
+  hasDrafts: boolean;
+}
+
+/** What one subject's reconciliation did, or why it did nothing. */
+export interface ClassUsageSubjectOutcome {
+  subject: ClassUsageSubject;
+  inserted: number;
+  removed: number;
+  /** True when the document could not be read whole and a marker was written. */
+  undetermined: boolean;
+  /**
+   * Absent on success.
+   *
+   * Present when any index for this subject could not be brought into
+   * agreement with the document. The others may still have been, and
+   * `inserted` and `removed` count what actually landed — a failing index does
+   * not stop its siblings, so this is not a claim that the subject is
+   * unchanged.
+   */
+  failure?: unknown;
+  /** True when no document exists in this locale and variant. */
+  absent: boolean;
+}
+
+/** What a whole save did to the index. */
+export interface ClassUsageWriteReport {
+  /** Every subject the document owns, whether or not it changed. */
+  subjects: number;
+  /** Subjects whose rows were brought into agreement with a document. */
+  reconciled: number;
+  /** Subjects with no document in that locale and variant. */
+  absent: number;
+  /**
+   * Subjects that failed.
+   *
+   * Non-empty means the index disagrees with the document for those subjects
+   * until a rebuild runs. It never means the save failed.
+   */
+  failures: ClassUsageSubjectOutcome[];
+  /** Per-subject detail, in enumeration order. */
+  outcomes: ClassUsageSubjectOutcome[];
+}
+
+/**
+ * One index and the store its rows live in.
+ *
+ * A LIST of these rather than one store, because a written document is read
+ * ONCE and every index derives from that read. Maintaining a second index by
+ * registering a second hook would re-read the collection config, re-resolve the
+ * draft split and re-read every locale and variant of the document on every
+ * save — the write amplification the design names in as many words.
+ */
+export interface UsageTarget {
+  maintain(args: {
+    subject: UsageSubject;
+    document: unknown;
+    limits: DocumentLimits;
+  }): Promise<ClassUsageMaintenanceReport>;
+  /**
+   * Remove this index's rows for documents a rebuild's walk never saw.
+   *
+   * A METHOD rather than an exposed store, because the sweep decodes rows
+   * through the index's own descriptor and one index's reader answers null for
+   * another's rows. Handing a caller the bare store let it sweep the component
+   * index through the class reader, which examined no rows at all and reported
+   * a clean pass having removed nothing — a sweep that cannot see its own rows
+   * fails silently and in the direction that keeps them.
+   *
+   * Behind the method the row type stays erased, exactly as `maintain` keeps
+   * it, so a list of targets can still hold indexes whose rows differ.
+   */
+  forgetAbsent(args: {
+    scope: UsageScope;
+    entity: string;
+    field: string;
+    locale: string;
+    variant: ClassUsageVariant;
+    visited: ReadonlySet<string>;
+    stillExists: (entityKey: string) => Promise<boolean>;
+  }): Promise<{ removed: number }>;
+}
+
+/**
+ * A target for one index against one store.
+ *
+ * The index's row type is captured here and does not escape. A list of
+ * `UsageTarget<TRow>` could not hold two indexes with different rows —
+ * `UsageIndex` is invariant in its row — and widening the list to the shared
+ * subject would make every member accept rows belonging to another index,
+ * which is precisely the confusion the reconciler's mismatch guard exists to
+ * catch. Erasing the row behind one method keeps both properties.
+ */
+export function usageTarget<TRow extends UsageSubject>(
+  index: UsageIndex<TRow>,
+  store: ClassUsageIndexStore
+): UsageTarget {
+  return {
+    maintain: args => maintainUsage(index, { ...args, store }),
+    forgetAbsent: args => forgetAbsentDocuments({ ...args, index, store }),
+  };
+}
+
+/**
+ * Reconcile every subject a written document owns.
+ *
+ * Returns an empty report for the collections this index does not track, which
+ * is most of them: `blocksFieldsOf` finds no field, so the document owns no
+ * subject and nothing is read. That filter reads the collection configuration
+ * passed in rather than a list captured when the plugin was wired, so a
+ * collection created after that moment is tracked rather than missed.
+ *
+ * A failure against one subject does not stop the others. Each subject's rows
+ * are independent, and stopping would leave the subjects after the failure
+ * stale as well as the one that failed — turning one recoverable disagreement
+ * into several for no gain, since reconciliation is idempotent and a rerun
+ * repairs whatever this pass could not.
+ */
+export async function reconcileWrittenDocument(args: {
+  store: ClassUsageIndexStore;
+  read: ClassUsageDocumentReader;
+  collection: WrittenCollectionConfig;
+  /** The written document's id, stored as `entityKey`. */
+  documentId: string;
+  /** The site's configured locales, or empty when localization is off. */
+  locales: readonly string[];
+  /** The bounds the rows are derived under. Required, never defaulted here. */
+  limits: DocumentLimits;
+  /**
+   * Every index to maintain from this one read.
+   *
+   * Defaults to the class index alone, against `store`, which is what this
+   * function did before a second index existed — so a caller that knows about
+   * one keeps working, and its tests stay the oracle for that behaviour.
+   */
+  targets?: readonly UsageTarget[];
+}): Promise<ClassUsageWriteReport> {
+  // No early return for an untracked collection, deliberately. `blocksFieldsOf`
+  // answers `[]` for one, `classUsageSubjectsFor` answers `[]` for no fields,
+  // and the loop below then does nothing — so a guard here would be a branch
+  // with no behaviour of its own, unreachable by any test that could tell it
+  // from its absence.
+  const fields = blocksFieldsOf(args.collection);
+  const subjects = classUsageSubjectsFor({
+    collection: args.collection.slug,
+    entityKey: args.documentId,
+    fields,
+    locales: args.locales,
+    hasDrafts: args.collection.hasDrafts,
+    ...(args.collection.scope === undefined
+      ? {}
+      : { scope: args.collection.scope }),
+  });
+
+  // Resolved once, here, rather than per subject: the default allocates a
+  // target and a caller that supplied its own should not have the list rebuilt
+  // for every locale and variant of the document.
+  const targets = args.targets ?? [usageTarget(classUsageIndex, args.store)];
+
+  const outcomes: ClassUsageSubjectOutcome[] = [];
+
+  for (const subject of subjects) {
+    outcomes.push(await reconcileOne({ ...args, targets }, subject));
+  }
+
+  return {
+    subjects: subjects.length,
+    reconciled: outcomes.filter(o => o.failure === undefined && !o.absent)
+      .length,
+    absent: outcomes.filter(o => o.absent).length,
+    failures: outcomes.filter(o => o.failure !== undefined),
+    outcomes,
+  };
+}
+
+/**
+ * One subject, with every failure captured rather than raised.
+ *
+ * The read and the reconciliation are caught together deliberately. Both fail
+ * the same way from here — the subject is left holding whatever it held — and
+ * separating them would suggest a caller could respond to one differently,
+ * which after the write has committed it cannot.
+ */
+/**
+ * Maintain EVERY index from one read, whatever any single one of them does.
+ *
+ * A target that throws does not stop the ones after it. The content save has
+ * already committed, so a failure isolated to one derived store has no reason
+ * to leave the others stale as well — and a failure that PERSISTS would
+ * otherwise mean a sibling index never records anything at all: every save
+ * fails at the same target first, so the sibling stays empty, and an empty
+ * index answers "references nothing" for every document. That is the answer a
+ * delete check acts on.
+ *
+ * This is the rule `reconcileWrittenDocument` already applies ACROSS SUBJECTS,
+ * applied across the indexes of one subject for the same reason: stopping
+ * turns one recoverable disagreement into several, for no gain, since
+ * maintenance is idempotent and a rebuild repairs whatever did not land.
+ *
+ * The subject still FAILS when any target did. A caller cannot act on "one of
+ * your indexes is stale" differently from "this subject is stale", and the
+ * remedy is the same rebuild either way.
+ */
+/**
+ * The value that will be carried as a subject's failure.
+ *
+ * Never `undefined` when there was a failure, whatever was thrown. A rejection
+ * carries any value at all — `Promise.reject()` supplies none — and the field
+ * this feeds is read as "did this fail", so an undefined cause and no cause at
+ * all would be the same answer.
+ */
+function reportableFailure(failures: readonly unknown[]): unknown {
+  const named = failures.map(failure =>
+    failure === undefined
+      ? new Error("a usage index rejected without a reason")
+      : failure
+  );
+  return named.length === 1
+    ? named[0]
+    : new AggregateError(
+        named,
+        "more than one usage index failed for this subject"
+      );
+}
+
+async function maintainEvery(
+  targets: readonly UsageTarget[],
+  args: { subject: UsageSubject; document: unknown; limits: DocumentLimits }
+): Promise<{
+  inserted: number;
+  removed: number;
+  undetermined: boolean;
+  failure?: unknown;
+}> {
+  let inserted = 0;
+  let removed = 0;
+  let undetermined = false;
+  const failures: unknown[] = [];
+
+  for (const target of targets) {
+    try {
+      const report = await target.maintain(args);
+      inserted += report.inserted;
+      removed += report.removed;
+      undetermined = undetermined || report.undetermined;
+    } catch (failure) {
+      failures.push(failure);
+    }
+  }
+
+  if (failures.length === 0) return { inserted, removed, undetermined };
+  return {
+    inserted,
+    removed,
+    undetermined,
+    // A lone failure is reported AS ITSELF, so a consumer already reading this
+    // field gets the cause rather than a wrapper around it. Several are
+    // aggregated rather than reduced to the first, because separate targets
+    // fail for separate reasons and only one would ever be seen.
+    //
+    // Except when the thrown value IS `undefined`, which `Promise.reject()`
+    // and `throw undefined` both produce. Callers identify a failed subject by
+    // `failure !== undefined`, so passing that value through would report the
+    // subject as reconciled while its index stayed stale — the failure erased
+    // by the very field that exists to carry it. A stand-in error is
+    // substituted, because "a target rejected and said nothing" is still a
+    // failure and must read as one.
+    failure: reportableFailure(failures),
+  };
+}
+
+async function reconcileOne(
+  args: {
+    read: ClassUsageDocumentReader;
+    limits: DocumentLimits;
+    targets: readonly UsageTarget[];
+  },
+  subject: ClassUsageSubject
+): Promise<ClassUsageSubjectOutcome> {
+  try {
+    const document = await args.read(subject);
+    // An absent document leaves this subject's rows ALONE.
+    //
+    // Absence cannot be made definite through any read available here. A list
+    // read applies `beforeOperation` and `beforeRead` regardless of
+    // `overrideAccess` — they settle the predicate before any seam touches it
+    // — so a tenant scope or a soft-delete filter withholds the row and the
+    // page comes back empty. Nothing distinguishes that from a document that
+    // is genuinely gone.
+    //
+    // The asymmetry decides it. Keeping a row that should have gone OVERCOUNTS
+    // a class: the UI warns, a deletion is refused, and the next rebuild
+    // corrects it. Deleting a row that should have stayed UNDERCOUNTS: the
+    // class reads as unused, the safe-delete check permits it, and the pages
+    // that render it lose it. One is a recoverable annoyance; the other is the
+    // data loss this index exists to prevent.
+    //
+    // Rows for a variant that has genuinely gone are removed by the rebuild's
+    // sweep, which walks the documents and can tell those apart.
+    if (document === undefined || document === null) {
+      return {
+        subject,
+        inserted: 0,
+        removed: 0,
+        undetermined: false,
+        absent: true,
+      };
+    }
+
+    // Every index derives from THIS read.
+    const maintained = await maintainEvery(args.targets, {
+      subject,
+      document,
+      limits: args.limits,
+    });
+
+    return { subject, ...maintained, absent: false };
+  } catch (failure) {
+    return {
+      subject,
+      inserted: 0,
+      removed: 0,
+      undetermined: false,
+      absent: false,
+      failure,
+    };
+  }
+}

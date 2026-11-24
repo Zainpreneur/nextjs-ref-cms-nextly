@@ -1,0 +1,1160 @@
+/**
+ *
+ * Tests for `listEntries` and `countEntries` — the read/query surface of
+ * CollectionEntryService. These tests capture the current behaviour before
+ * decomposition so that any split preserves the public contract.
+ *
+ * Covers:
+ * - listEntries: default pagination, custom page/limit, search, where clause
+ *   filtering (eq/ne/gt/lt/like/in), sorting (asc/desc), field selection,
+ *   component data population, error handling,
+ *   collection-not-found 404, empty results, and response structure.
+ * - countEntries: basic count, count with search, count with where, access
+ *   denied, error handling.
+ */
+
+import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
+
+import { CollectionEntryService } from "../../../services/collections/collection-entry-service";
+import { runFieldHooks } from "../../../shared/lib/field-level-registry";
+import { CollectionQueryService } from "../services/collection-query-service";
+
+import {
+  createMockSchema,
+  createMockDb,
+  createMockAdapter,
+  silentLogger,
+  createMockFileManager,
+  createMockCollectionService,
+  createMockRelationshipService,
+  createMockHookRegistry,
+  createMockRbacAccessControlService,
+  createMockComponentDataService,
+  createMockCollection,
+  createSampleEntry,
+  createSampleEntries,
+  callerMay,
+  fakeActorForUser,
+  fakeUserHoldsPermission,
+  fakeUserIsSuperAdmin,
+  resetCallerAccess,
+} from "./collection-test-helpers";
+import { loadDialectTables } from "../../../database/dialect-tables";
+
+// The postgresql tables this file reads; the unit setup loads only
+// the run's own dialect, as an app's adapter would.
+beforeAll(async () => {
+  await Promise.all(["postgresql"].map(d => loadDialectTables(d)));
+});
+
+// ── Module mocks ──────────────────────────────────────────────────────────
+
+// The caller the collection gate decides for: a signed-in user's actions are
+// set per test (`callerMay`), and every test starts from one holding all.
+vi.mock("../../../auth/access/resolve-actor", async importOriginal => ({
+  ...(await importOriginal<object>()),
+  ...(await (async () => {
+    const fake = await import("./collection-test-helpers");
+    return {
+      actorForUser: fake.fakeActorForUser,
+      actorForVisitor: fake.fakeActorForVisitor,
+      userHoldsPermission: fake.fakeUserHoldsPermission,
+      userIsSuperAdmin: fake.fakeUserIsSuperAdmin,
+    };
+  })()),
+}));
+
+vi.mock("../../../di/container", () => ({
+  container: {
+    get: vi.fn(),
+    has: vi.fn().mockReturnValue(false),
+  },
+}));
+
+vi.mock("../../../database/index", () => ({
+  getDialectTables: vi.fn(() => ({})),
+}));
+
+vi.mock("../../../collections/fields/guards", () => ({
+  isFieldGroupField: vi.fn().mockReturnValue(false),
+}));
+
+vi.mock("../../../lib/case-conversion", () => ({
+  keysToCamelCase: vi.fn((obj: unknown) => obj),
+  toSnakeCase: vi.fn((str: string) =>
+    str.replace(/([A-Z])/g, "_$1").toLowerCase()
+  ),
+}));
+
+vi.mock("../../../types/pagination", () => ({
+  buildPaginatedResponse: vi.fn(
+    (
+      docs: unknown[],
+      opts: { total: number; page: number; limit: number }
+    ) => ({
+      docs,
+      totalDocs: opts.total,
+      page: opts.page,
+      limit: opts.limit,
+      totalPages: Math.ceil(opts.total / opts.limit) || 1,
+      hasNextPage: opts.page < Math.ceil(opts.total / opts.limit),
+      hasPrevPage: opts.page > 1,
+      nextPage:
+        opts.page < Math.ceil(opts.total / opts.limit) ? opts.page + 1 : null,
+      prevPage: opts.page > 1 ? opts.page - 1 : null,
+      pagingCounter: (opts.page - 1) * opts.limit + 1,
+    })
+  ),
+  clampLimit: vi.fn((limit: number) => Math.min(Math.max(1, limit), 500)),
+  calculateOffset: vi.fn((page: number, limit: number) => (page - 1) * limit),
+  PAGINATION_DEFAULTS: { page: 1, limit: 10, maxLimit: 500 },
+}));
+
+vi.mock("../../../services/collections/query-operators", () => ({
+  buildWhereClause: vi.fn().mockReturnValue(null),
+  extractGeoFilters: vi.fn((where: unknown) => ({
+    geoFilters: [],
+    cleanedWhere: where,
+  })),
+  extractComponentFieldConditions: vi.fn((where: unknown) => ({
+    componentFilters: [],
+    cleanedWhere: where,
+  })),
+  // No key reaches a component table, as no condition is a component one.
+  componentFilterTargets: vi.fn(() => []),
+}));
+
+vi.mock("../../../services/collections/geo-utils", () => ({
+  applyGeoFilters: vi.fn(),
+  sortByDistance: vi.fn(),
+}));
+
+vi.mock("@nextly/hooks/context-builder", () => ({
+  buildContext: vi.fn((opts: Record<string, unknown>) => opts),
+}));
+
+vi.mock("@nextly/hooks/stored-hook-executor", () => {
+  class MockStoredHookExecutor {
+    execute = vi.fn().mockResolvedValue({ data: undefined, errors: [] });
+  }
+  return { StoredHookExecutor: MockStoredHookExecutor };
+});
+
+vi.mock("@nextly/lib/field-transform", () => ({
+  transformRichTextFields: vi.fn((entry: unknown) => entry),
+}));
+
+// Only the field-level afterRead hook runner is doubled; everything else in the
+// module stays real, because other read machinery resolves through it. The
+// owner-column tests below make this hook write, to reach the one redaction
+// pass that runs after it.
+vi.mock("../../../shared/lib/field-level-registry", async importActual => ({
+  ...(await importActual<
+    typeof import("../../../shared/lib/field-level-registry")
+  >()),
+  runFieldHooks: vi.fn(),
+}));
+
+// ── Test suite ────────────────────────────────────────────────────────────
+
+describe("CollectionEntryService — Query Contracts", () => {
+  let service: CollectionEntryService;
+  let schema: ReturnType<typeof createMockSchema>;
+  let selectData: { rows: unknown[] };
+  let mockDb: ReturnType<typeof createMockDb>;
+  let mockFileManager: ReturnType<typeof createMockFileManager>;
+  let mockCollectionService: ReturnType<typeof createMockCollectionService>;
+  let mockRelationshipService: ReturnType<typeof createMockRelationshipService>;
+  let mockHookRegistry: ReturnType<typeof createMockHookRegistry>;
+  let mockRbac: ReturnType<typeof createMockRbacAccessControlService>;
+  let mockComponentDataService: ReturnType<
+    typeof createMockComponentDataService
+  >;
+
+  beforeEach(() => {
+    resetCallerAccess();
+    fakeActorForUser.mockClear();
+    fakeUserHoldsPermission.mockClear();
+    fakeUserIsSuperAdmin.mockClear();
+    vi.clearAllMocks();
+
+    schema = createMockSchema();
+    selectData = { rows: [] };
+    mockDb = createMockDb(selectData);
+    const mockAdapter = createMockAdapter(mockDb);
+    mockFileManager = createMockFileManager(schema);
+    mockCollectionService = createMockCollectionService();
+    mockRelationshipService = createMockRelationshipService();
+    mockHookRegistry = createMockHookRegistry();
+    mockRbac = createMockRbacAccessControlService();
+    mockComponentDataService = createMockComponentDataService();
+
+    service = new CollectionEntryService(
+      mockAdapter as never,
+      silentLogger as never,
+      mockFileManager as never,
+      mockCollectionService as never,
+      mockRelationshipService as never,
+      mockHookRegistry as never,
+      mockComponentDataService as never,
+      mockRbac as never
+    );
+  });
+
+  // ── listEntries ───────────────────────────────────────────────────────
+
+  describe("listEntries", () => {
+    it("should return a successful paginated response with empty docs", async () => {
+      selectData.rows = [];
+
+      const result = await service.listEntries({
+        collectionName: "posts",
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.statusCode).toBe(200);
+      expect(result.message).toBe("Entries fetched successfully");
+      expect(result.data).toBeDefined();
+      expect(result.data!.docs).toEqual([]);
+      expect(result.data!.totalDocs).toBe(0);
+    });
+
+    it("should load the dynamic schema for the requested collection", async () => {
+      selectData.rows = [];
+
+      await service.listEntries({
+        collectionName: "products",
+      });
+
+      expect(mockFileManager.loadDynamicSchema).toHaveBeenCalledWith(
+        "products"
+      );
+    });
+
+    it("should expand relationships via batchExpandRelationships", async () => {
+      const entries = createSampleEntries(2);
+      selectData.rows = entries;
+
+      await service.listEntries({
+        collectionName: "posts",
+      });
+
+      expect(
+        mockRelationshipService.batchExpandRelationships
+      ).toHaveBeenCalled();
+      const call =
+        mockRelationshipService.batchExpandRelationships.mock.calls[0];
+      expect(call[1]).toBe("posts");
+    });
+
+    it("should populate component data when fieldGroupDataService is available", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      await service.listEntries({
+        collectionName: "posts",
+      });
+
+      expect(
+        mockComponentDataService.populateComponentDataMany
+      ).toHaveBeenCalled();
+    });
+
+    it("should execute beforeOperation and beforeRead hooks", async () => {
+      selectData.rows = [];
+
+      await service.listEntries({
+        collectionName: "posts",
+      });
+
+      expect(mockHookRegistry.executeBeforeOperation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          collection: "posts",
+          operation: "read",
+        })
+      );
+      expect(mockHookRegistry.execute).toHaveBeenCalledWith(
+        "beforeRead",
+        expect.any(Object)
+      );
+    });
+
+    // The counterpart of the by-id assertion in the `getEntry` block: a list
+    // handler receives the page, and the two shapes must not be swapped.
+    it("should hand afterRead the page as an array", async () => {
+      selectData.rows = createSampleEntries(2);
+
+      await service.listEntries({ collectionName: "posts" });
+
+      const call = mockHookRegistry.execute.mock.calls.find(
+        (c: unknown[]) => c[0] === "afterRead"
+      );
+      const data = (call?.[1] as { data: unknown }).data;
+      expect(Array.isArray(data)).toBe(true);
+      expect(data).toHaveLength(2);
+    });
+
+    it("should execute afterRead hooks", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      await service.listEntries({
+        collectionName: "posts",
+      });
+
+      expect(mockHookRegistry.execute).toHaveBeenCalledWith(
+        "afterRead",
+        expect.any(Object)
+      );
+    });
+
+    it("should return 404 when collection does not exist", async () => {
+      mockFileManager.loadDynamicSchema.mockRejectedValueOnce(
+        new Error("Collection 'nonexistent' not found")
+      );
+
+      // Trusted, so the missing collection answers rather than a visitor's
+      // refusal: the Public role grants nothing on a collection that is not.
+      const result = await service.listEntries({
+        collectionName: "nonexistent",
+        overrideAccess: true,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(404);
+      expect(result.data).toBeNull();
+    });
+
+    it("should return 500 on unexpected errors", async () => {
+      mockFileManager.loadDynamicSchema.mockRejectedValueOnce(
+        new Error("Database connection failed")
+      );
+
+      const result = await service.listEntries({
+        collectionName: "posts",
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(500);
+      expect(result.message).toBe("Database connection failed");
+    });
+
+    // ── Pagination ──────────────────────────────────────────────────────
+
+    it("should use default pagination (page 1, limit 10)", async () => {
+      selectData.rows = [];
+
+      await service.listEntries({
+        collectionName: "posts",
+      });
+
+      // The mock should be called with limit/offset applied to the chain
+      expect(mockDb._selectChain.limit).toHaveBeenCalled();
+      expect(mockDb._selectChain.offset).toHaveBeenCalled();
+    });
+
+    it("should use custom page and limit", async () => {
+      selectData.rows = [];
+
+      await service.listEntries({
+        collectionName: "posts",
+        page: 3,
+        limit: 25,
+      });
+
+      expect(mockDb._selectChain.limit).toHaveBeenCalled();
+      expect(mockDb._selectChain.offset).toHaveBeenCalled();
+    });
+
+    it("should clamp page to minimum 1", async () => {
+      selectData.rows = [];
+
+      const result = await service.listEntries({
+        collectionName: "posts",
+        page: -5,
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    // ── Search ──────────────────────────────────────────────────────────
+
+    it("should pass search param through the query pipeline", async () => {
+      selectData.rows = [];
+
+      const result = await service.listEntries({
+        collectionName: "posts",
+        search: "tutorial",
+      });
+
+      expect(result.success).toBe(true);
+      // Search goes through getSearchableFields → buildSearchCondition → query
+      expect(mockCollectionService.getCollection).toHaveBeenCalledWith("posts");
+    });
+
+    it("should skip search when query is too short", async () => {
+      selectData.rows = [];
+      // Default minSearchLength is 2, so single char should be skipped
+      mockCollectionService.getCollection.mockResolvedValue(
+        createMockCollection({
+          schemaDefinition: {
+            fields: [{ name: "title", type: "text" }],
+            search: { minSearchLength: 3 },
+          },
+        })
+      );
+
+      const result = await service.listEntries({
+        collectionName: "posts",
+        search: "ab", // Length 2, min is 3
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    // ── Sorting ──────────────────────────────────────────────────────────
+
+    it("should apply ascending sort", async () => {
+      selectData.rows = [];
+
+      const result = await service.listEntries({
+        collectionName: "posts",
+        sort: "title",
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockDb._selectChain.orderBy).toHaveBeenCalled();
+    });
+
+    it("should apply descending sort with - prefix", async () => {
+      selectData.rows = [];
+
+      const result = await service.listEntries({
+        collectionName: "posts",
+        sort: "-createdAt",
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockDb._selectChain.orderBy).toHaveBeenCalled();
+    });
+
+    // ── Field Selection ─────────────────────────────────────────────────
+
+    it("should apply field selection when select param is provided", async () => {
+      selectData.rows = [
+        createSampleEntry({
+          id: "entry-1",
+          title: "Test",
+          content: "Full content",
+          status: "published",
+        }),
+      ];
+
+      const result = await service.listEntries({
+        collectionName: "posts",
+        select: { title: true },
+      });
+
+      expect(result.success).toBe(true);
+      // The id field should always be included
+      const docs = result.data?.docs as Record<string, unknown>[];
+      if (docs && docs.length > 0) {
+        expect(docs[0]).toHaveProperty("id");
+        expect(docs[0]).toHaveProperty("title");
+      }
+    });
+
+    // ── Where clause ────────────────────────────────────────────────────
+
+    it("should accept and process a where clause", async () => {
+      selectData.rows = [];
+
+      const result = await service.listEntries({
+        collectionName: "posts",
+        where: { status: { equals: "published" } },
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    // ── Count/row agreement ─────────────────────────────────────────────
+
+    // The total is produced by a second query, and both queries resolve the
+    // Draft/Published filter from `status` and `overrideAccess`. If the count
+    // is not given the pair the rows were fetched under, it falls back to the
+    // public default and counts published-only: a trusted reader gets its
+    // drafts listed but not counted, and totalPages then hides the tail of
+    // the very result set it is describing.
+    // Spied on the prototype rather than the service: the count is an
+    // internal call the query service makes on itself, so it never passes
+    // through the facade the tests hold.
+    it("should count under the same trust level the rows were listed under", async () => {
+      selectData.rows = [];
+      const countSpy = vi.spyOn(
+        CollectionQueryService.prototype,
+        "countEntries"
+      );
+
+      await service.listEntries({
+        collectionName: "posts",
+        overrideAccess: true,
+      });
+
+      expect(countSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ overrideAccess: true }),
+        // The page's own access, so the total counts what the page read.
+        expect.anything()
+      );
+    });
+
+    it("should count under the same explicit status the rows were listed under", async () => {
+      selectData.rows = [];
+      const countSpy = vi.spyOn(
+        CollectionQueryService.prototype,
+        "countEntries"
+      );
+
+      await service.listEntries({
+        collectionName: "posts",
+        status: "draft",
+      });
+
+      expect(countSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ status: "draft" }),
+        // The page's own access, so the total counts what the page read.
+        expect.anything()
+      );
+    });
+
+    it("should count under the same caller and route attestation the rows were listed under", async () => {
+      selectData.rows = [];
+      const countSpy = vi.spyOn(
+        CollectionQueryService.prototype,
+        "countEntries"
+      );
+      const user = { id: "user-1", roles: ["editor"] };
+
+      await service.listEntries({
+        collectionName: "posts",
+        user,
+        routeAuthorized: true,
+      });
+
+      // A count evaluated for a different caller than the rows would report a
+      // total the caller cannot page through.
+      expect(countSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ user, routeAuthorized: true }),
+        // The page's own access, so the total counts what the page read.
+        expect.anything()
+      );
+    });
+
+    it("should count under the same API-key scope the rows were listed under", async () => {
+      selectData.rows = [];
+      const countSpy = vi.spyOn(
+        CollectionQueryService.prototype,
+        "countEntries"
+      );
+      const authenticatedScope = {
+        actorType: "apiKey" as const,
+        permissions: ["read-posts"],
+      };
+
+      await service.listEntries({
+        collectionName: "posts",
+        // A super-admin owns the key. The scope is what keeps the session
+        // predicate in place, so a count taken without it takes the account's
+        // bypass and reports the unscoped total beside filtered rows.
+        user: { id: "user-1", roles: ["super-admin"] },
+        routeAuthorized: true,
+        authenticatedScope,
+      });
+
+      expect(countSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ authenticatedScope }),
+        // The page's own access, so the total counts what the page read.
+        expect.anything()
+      );
+    });
+
+    // ── Depth / Relationship expansion ──────────────────────────────────
+
+    it("should pass depth parameter to relationship expansion", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      await service.listEntries({
+        collectionName: "posts",
+        depth: 0,
+      });
+
+      expect(
+        mockRelationshipService.batchExpandRelationships
+      ).toHaveBeenCalledWith(expect.any(Array), "posts", expect.any(Array), {
+        depth: 0,
+        // Expansion copies whole related rows in, so it also carries the caller
+        // its related rows are redacted for.
+        enforceFieldAccess: true,
+        // ...and defers WHEN those rules run, because this path finishes with
+        // the post-assembly pass and a rule that masks on a denied sibling has
+        // to see it first.
+        fieldAccessStage: "assembled",
+        locale: undefined,
+        status: undefined,
+        user: undefined,
+        overrideAccess: undefined,
+        // The listing's caches, which its components share.
+        targetPolicies: expect.any(Map),
+        targetCompanions: expect.any(Map),
+        targetVerdicts: expect.any(Map),
+        // Which of a target's rows its read rule's filter matched, per target.
+        targetRuleMatches: expect.any(Map),
+      });
+    });
+
+    it("should default depth to undefined (service applies internal default)", async () => {
+      selectData.rows = [createSampleEntry()];
+
+      await service.listEntries({
+        collectionName: "posts",
+      });
+
+      expect(
+        mockRelationshipService.batchExpandRelationships
+      ).toHaveBeenCalledWith(expect.any(Array), "posts", expect.any(Array), {
+        depth: undefined,
+        enforceFieldAccess: true,
+        fieldAccessStage: "assembled",
+        user: undefined,
+        overrideAccess: undefined,
+        targetPolicies: expect.any(Map),
+        targetCompanions: expect.any(Map),
+        targetVerdicts: expect.any(Map),
+        // Which of a target's rows its read rule's filter matched, per target.
+        targetRuleMatches: expect.any(Map),
+      });
+    });
+
+    // ── Response structure ──────────────────────────────────────────────
+
+    it("should return CollectionServiceResult shape", async () => {
+      selectData.rows = [];
+
+      const result = await service.listEntries({
+        collectionName: "posts",
+      });
+
+      // Verify the response matches CollectionServiceResult<PaginatedResponse>
+      expect(result).toHaveProperty("success");
+      expect(result).toHaveProperty("statusCode");
+      expect(result).toHaveProperty("message");
+      expect(result).toHaveProperty("data");
+      expect(typeof result.success).toBe("boolean");
+      expect(typeof result.statusCode).toBe("number");
+      expect(typeof result.message).toBe("string");
+    });
+
+    it("should return proper paginated response fields", async () => {
+      selectData.rows = createSampleEntries(3);
+
+      const result = await service.listEntries({
+        collectionName: "posts",
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.data).toHaveProperty("docs");
+      expect(result.data).toHaveProperty("totalDocs");
+      expect(result.data).toHaveProperty("page");
+      expect(result.data).toHaveProperty("limit");
+      expect(result.data).toHaveProperty("totalPages");
+    });
+  });
+
+  // ── countEntries ──────────────────────────────────────────────────────
+
+  describe("countEntries", () => {
+    it("should return a count result on success", async () => {
+      // countEntries builds its own query with count(*)
+      // Mock the chain to resolve with count
+      selectData.rows = [{ value: 42 }];
+
+      const result = await service.countEntries({
+        collectionName: "posts",
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.statusCode).toBe(200);
+      expect(result.data).toBeDefined();
+    });
+
+    it("should load the dynamic schema", async () => {
+      selectData.rows = [{ value: 0 }];
+
+      await service.countEntries({
+        collectionName: "products",
+      });
+
+      expect(mockFileManager.loadDynamicSchema).toHaveBeenCalledWith(
+        "products"
+      );
+    });
+
+    it("should check collection-level access", async () => {
+      selectData.rows = [{ value: 0 }];
+
+      await service.countEntries({
+        collectionName: "posts",
+        user: { id: "user-1", role: "viewer" },
+      });
+
+      expect(fakeUserHoldsPermission).toHaveBeenCalled();
+    });
+
+    it("should return 403 when access is denied", async () => {
+      callerMay();
+
+      const result = await service.countEntries({
+        collectionName: "posts",
+        user: { id: "user-1", role: "viewer" },
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(403);
+    });
+
+    it("judges access itself where a second argument is not the list's own", async () => {
+      // A caller inside the package that holds the query service and passes
+      // what looks like settled access is still judged: only the list's own
+      // count can skip the gate.
+      callerMay();
+      const query = (
+        service as unknown as {
+          queryService: {
+            countEntries(
+              params: unknown,
+              settled: unknown
+            ): Promise<{ success: boolean; statusCode: number }>;
+          };
+        }
+      ).queryService;
+      const result = await query.countEntries(
+        { collectionName: "posts", user: { id: "user-1", role: "viewer" } },
+        { denied: null }
+      );
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(403);
+    });
+
+    it("should skip access control when overrideAccess is true", async () => {
+      selectData.rows = [{ value: 5 }];
+
+      const result = await service.countEntries({
+        collectionName: "posts",
+        user: { id: "user-1" },
+        overrideAccess: true,
+      });
+
+      expect(result.success).toBe(true);
+      // checkCollectionAccess returns null under overrideAccess, so the gate is
+      // skipped entirely.
+      expect(fakeActorForUser).not.toHaveBeenCalled();
+      expect(fakeUserHoldsPermission).not.toHaveBeenCalled();
+    });
+
+    it("should return 500 when collection not found (no 404 distinction)", async () => {
+      mockFileManager.loadDynamicSchema.mockRejectedValueOnce(
+        new Error("Collection 'missing' does not exist")
+      );
+
+      // Trusted, so the missing collection answers rather than a visitor's
+      // refusal: the Public role grants nothing on a collection that is not.
+      const result = await service.countEntries({
+        collectionName: "missing",
+        overrideAccess: true,
+      });
+
+      expect(result.success).toBe(false);
+      // countEntries always returns 500 on error — it doesn't detect "not found"
+      expect(result.statusCode).toBe(500);
+    });
+
+    it("should return 500 on unexpected error", async () => {
+      mockFileManager.loadDynamicSchema.mockRejectedValueOnce(
+        new Error("Unexpected failure")
+      );
+
+      const result = await service.countEntries({
+        collectionName: "posts",
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(500);
+    });
+
+    it("should accept a where clause", async () => {
+      selectData.rows = [{ value: 3 }];
+
+      const result = await service.countEntries({
+        collectionName: "posts",
+        where: { status: { equals: "published" } },
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it("should accept a search query", async () => {
+      selectData.rows = [{ value: 1 }];
+
+      const result = await service.countEntries({
+        collectionName: "posts",
+        search: "typescript",
+      });
+
+      expect(result.success).toBe(true);
+    });
+  });
+
+  // ── getEntry ──────────────────────────────────────────────────────────
+
+  // The by-id read shares its response pipeline with `listEntries` and its row
+  // predicate with both list and count, so these pin the contract each of those
+  // seams has to keep. Access parity itself is asserted separately, against the
+  // real where-builder, in `collection-read-access-parity.test.ts`.
+  describe("getEntry", () => {
+    it("should return the entry for an existing id", async () => {
+      selectData.rows = [createSampleEntry({ id: "entry-1" })];
+
+      const result = await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.statusCode).toBe(200);
+      expect(result.message).toBe("Entry fetched successfully");
+      expect((result.data as Record<string, unknown>).id).toBe("entry-1");
+    });
+
+    it("should return 404 when the row does not match the predicate", async () => {
+      // A row filtered out by the access or status predicate is
+      // indistinguishable from a missing one on purpose: a 403 would confirm
+      // the id exists.
+      selectData.rows = [];
+
+      const result = await service.getEntry({
+        collectionName: "posts",
+        entryId: "missing",
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(404);
+      expect(result.message).toBe("Entry not found");
+    });
+
+    it("should return 403 when collection access is denied", async () => {
+      callerMay();
+
+      const result = await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+        user: { id: "user-1", roles: ["viewer"] },
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(404); // May not read it either, so answered as missing.
+    });
+
+    it("should load the dynamic schema for the requested collection", async () => {
+      selectData.rows = [createSampleEntry({ id: "entry-1" })];
+
+      await service.getEntry({
+        collectionName: "products",
+        entryId: "entry-1",
+      });
+
+      expect(mockFileManager.loadDynamicSchema).toHaveBeenCalledWith(
+        "products"
+      );
+    });
+
+    it("should limit the row query to one row", async () => {
+      selectData.rows = [createSampleEntry({ id: "entry-1" })];
+
+      await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      expect(mockDb._selectChain.limit).toHaveBeenCalledWith(1);
+    });
+
+    it("should run beforeOperation and beforeRead before the row is read", async () => {
+      selectData.rows = [createSampleEntry({ id: "entry-1" })];
+
+      await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      expect(mockHookRegistry.executeBeforeOperation).toHaveBeenCalledWith(
+        expect.objectContaining({ operation: "read" })
+      );
+      expect(mockHookRegistry.execute).toHaveBeenCalledWith(
+        "beforeRead",
+        expect.anything()
+      );
+    });
+
+    it("should run afterRead hooks over the fetched document", async () => {
+      selectData.rows = [createSampleEntry({ id: "entry-1" })];
+
+      await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      expect(mockHookRegistry.execute).toHaveBeenCalledWith(
+        "afterRead",
+        expect.anything()
+      );
+    });
+
+    // The by-id path hands afterRead the DOCUMENT; the list path hands it the
+    // page. A handler on a detail read does `ctx.data.title`, so wrapping the
+    // document in a one-element array gives it `undefined` for every field —
+    // silently, because the hook still runs and still returns. Asserting only
+    // that the hook was CALLED cannot see that, which is why this asserts the
+    // payload it was called WITH.
+    it("should hand afterRead the document itself, not a one-element array", async () => {
+      selectData.rows = [createSampleEntry({ id: "entry-1", title: "T" })];
+
+      await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      const call = mockHookRegistry.execute.mock.calls.find(
+        (c: unknown[]) => c[0] === "afterRead"
+      );
+      const data = (call?.[1] as { data: Record<string, unknown> }).data;
+      expect(Array.isArray(data)).toBe(false);
+      expect(data.title).toBe("T");
+    });
+
+    it("should expand relationships for the fetched document", async () => {
+      selectData.rows = [createSampleEntry({ id: "entry-1" })];
+
+      await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+        depth: 2,
+      });
+
+      expect(mockRelationshipService.expandRelationships).toHaveBeenCalledWith(
+        expect.anything(),
+        "posts",
+        expect.anything(),
+        expect.objectContaining({ depth: 2 })
+      );
+    });
+
+    it("should sanitize a related row a hook wrote a denied field back onto", async () => {
+      selectData.rows = [createSampleEntry({ id: "entry-1" })];
+
+      // The scenario the pass exists for, rather than a spy on the pass. A code
+      // hook reintroduces a denied field onto a related row after that row was
+      // first projected; only a sanitization running AFTER the hook can remove
+      // it again.
+      mockHookRegistry.execute.mockImplementation(
+        (phase: string, ctx: { data?: Record<string, unknown> }) => {
+          if (phase === "afterRead" && ctx?.data) {
+            ctx.data.author = { id: "user-1", secret: "leaked" };
+          }
+          return Promise.resolve(undefined);
+        }
+      );
+
+      // The authoritative pass, doing what the real one does to the rows it is
+      // handed. A double that returns `undefined` cannot distinguish a pipeline
+      // that runs it from one that does not, which is what this replaces.
+      mockRelationshipService.reprojectRelatedRows.mockImplementation(
+        (rows: unknown) => {
+          for (const doc of Array.isArray(rows) ? rows : [rows]) {
+            const author = (doc as { author?: Record<string, unknown> })
+              ?.author;
+            if (author) delete author.secret;
+          }
+          return Promise.resolve(undefined);
+        }
+      );
+
+      const result = await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      const author = (
+        result.data as { author?: Record<string, unknown> } | null
+      )?.author;
+
+      // The positive control, and it carries the whole test: without it
+      // `secret` is `undefined` because the hook never reached the document,
+      // which is indistinguishable from the field having been removed.
+      expect(author).toBeDefined();
+      expect(author?.id).toBe("user-1");
+      // Removed by the pass that runs after the hook. A pipeline that skips it,
+      // or runs it before the hook, returns the denied value to the caller.
+      expect(author?.secret).toBeUndefined();
+    });
+
+    it("should apply field selection to the returned document", async () => {
+      selectData.rows = [
+        createSampleEntry({ id: "entry-1", title: "T", slug: "s" }),
+      ];
+
+      const result = await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+        select: { title: true },
+      });
+
+      const data = result.data as Record<string, unknown>;
+      expect(data.title).toBe("T");
+      // `id` survives selection by contract; a dropped field must not.
+      expect(data.id).toBe("entry-1");
+      expect(data).not.toHaveProperty("slug");
+    });
+
+    it("should return 500 on unexpected errors", async () => {
+      mockFileManager.loadDynamicSchema.mockRejectedValueOnce(
+        new Error("Database connection failed")
+      );
+
+      const result = await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.statusCode).toBe(500);
+      expect(result.message).toBe("Database connection failed");
+    });
+  });
+
+  // ── The owner column never leaves the server ──────────────────────────
+
+  // `created_by` holds the creator's stable user id. Owner-only access filters
+  // on it in SQL, so its value never needs to reach a caller, and returning it
+  // leaks a stable id to anyone who can read a collection whose rows other
+  // users created.
+  //
+  // Both read paths strip it twice: once before the afterRead hooks, so no hook
+  // is handed it, and once at the response boundary, so a hook that writes it
+  // BACK cannot publish it. The second pair of tests is what covers the second
+  // strip — the first pair passes with the boundary strip deleted, since the
+  // pre-hook strip already removed it.
+  describe("system owner column redaction", () => {
+    const OWNED = { id: "entry-1", title: "T", created_by: "user-9" };
+
+    /** A field-level afterRead hook that puts the owner id back on the row. */
+    function reintroduceOwnerFromFieldHook() {
+      vi.mocked(runFieldHooks).mockImplementation(
+        (args: { data: unknown }): Promise<void> => {
+          (args.data as Record<string, unknown>).created_by = "user-9";
+          return Promise.resolve();
+        }
+      );
+    }
+
+    it("is absent from a listed row", async () => {
+      selectData.rows = [{ ...OWNED }];
+
+      const result = await service.listEntries({ collectionName: "posts" });
+
+      const [doc] = result.data!.docs as Record<string, unknown>[];
+      expect(doc.title).toBe("T");
+      expect(doc).not.toHaveProperty("created_by");
+    });
+
+    it("is absent from a document read by id", async () => {
+      selectData.rows = [{ ...OWNED }];
+
+      const result = await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      const doc = result.data as Record<string, unknown>;
+      expect(doc.title).toBe("T");
+      expect(doc).not.toHaveProperty("created_by");
+    });
+
+    it("is stripped again when a code afterRead hook writes it back to a listed row", async () => {
+      selectData.rows = [{ id: "entry-1", title: "T" }];
+      mockHookRegistry.execute.mockImplementation(
+        (phase: string, ctx: { data: unknown }) => {
+          if (phase !== "afterRead") return Promise.resolve(undefined);
+          const rows = ctx.data as Record<string, unknown>[];
+          for (const row of rows) row.created_by = "user-9";
+          return Promise.resolve(rows);
+        }
+      );
+
+      const result = await service.listEntries({ collectionName: "posts" });
+
+      const [doc] = result.data!.docs as Record<string, unknown>[];
+      // The pre-hook strip cannot catch this one: the value did not exist when
+      // it ran.
+      expect(doc.title).toBe("T");
+      expect(doc).not.toHaveProperty("created_by");
+    });
+
+    it("is stripped again when a code afterRead hook writes it back to a document read by id", async () => {
+      selectData.rows = [{ id: "entry-1", title: "T" }];
+      // The by-id path hands afterRead the DOCUMENT, so this writes onto it
+      // directly — the same shape a real handler on a detail read receives.
+      mockHookRegistry.execute.mockImplementation(
+        (phase: string, ctx: { data: unknown }) => {
+          if (phase !== "afterRead") return Promise.resolve(undefined);
+          const doc = ctx.data as Record<string, unknown>;
+          doc.created_by = "user-9";
+          return Promise.resolve(doc);
+        }
+      );
+
+      const result = await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      const doc = result.data as Record<string, unknown>;
+      expect(doc.title).toBe("T");
+      expect(doc).not.toHaveProperty("created_by");
+    });
+
+    // The last strip in the pipeline is the only one that runs after the
+    // FIELD-LEVEL afterRead hooks, so it is the only one these two can cover:
+    // every earlier strip has already happened by the time a field hook writes.
+    it("is stripped at the response boundary when a field hook writes it back to a listed row", async () => {
+      selectData.rows = [{ id: "entry-1", title: "T" }];
+      reintroduceOwnerFromFieldHook();
+
+      const result = await service.listEntries({ collectionName: "posts" });
+
+      const [doc] = result.data!.docs as Record<string, unknown>[];
+      expect(doc.title).toBe("T");
+      expect(doc).not.toHaveProperty("created_by");
+    });
+
+    it("is stripped at the response boundary when a field hook writes it back to a document read by id", async () => {
+      selectData.rows = [{ id: "entry-1", title: "T" }];
+      reintroduceOwnerFromFieldHook();
+
+      const result = await service.getEntry({
+        collectionName: "posts",
+        entryId: "entry-1",
+      });
+
+      const doc = result.data as Record<string, unknown>;
+      expect(doc.title).toBe("T");
+      expect(doc).not.toHaveProperty("created_by");
+    });
+  });
+});

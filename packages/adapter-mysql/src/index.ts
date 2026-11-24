@@ -1,0 +1,2028 @@
+/**
+ * @nextlyhq/adapter-mysql
+ *
+ * MySQL database adapter for Nextly.
+ * Extends DrizzleAdapter from @nextlyhq/adapter-drizzle to provide MySQL-specific functionality.
+ *
+ * @remarks
+ * This adapter uses the mysql2 package for database connectivity and provides:
+ * - Connection pooling via mysql2 Pool
+ * - Full transaction support with isolation levels
+ * - CRUD operations with workarounds for missing RETURNING clause
+ * - MySQL-specific error classification
+ * - Automatic retry for deadlocks (error 1213)
+ *
+ * @example
+ * ```typescript
+ * import { createMySqlAdapter } from '@nextlyhq/adapter-mysql';
+ *
+ * const adapter = createMySqlAdapter({
+ *   url: process.env.DATABASE_URL!,
+ * });
+ *
+ * await adapter.connect();
+ *
+ * // Query data
+ * const users = await adapter.select('users', {
+ *   where: { and: [{ column: 'status', op: '=', value: 'active' }] },
+ *   limit: 10,
+ * });
+ *
+ * await adapter.disconnect();
+ * ```
+ *
+ * @packageDocumentation
+ */
+
+import { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import {
+  SERVERLESS_POOL_DEFAULTS,
+  isVercelFunction,
+  loadVercelPoolAttacher,
+} from "@nextlyhq/adapter-drizzle/serverless";
+// F17: connect-time DB version check shared across all adapters.
+import {
+  createDatabaseError,
+  isDatabaseError,
+  type MySqlAdapterConfig,
+  type ConnectionInspection,
+  type DatabaseCapabilities,
+  type PoolStats,
+  type TransactionContext,
+  type TransactionOptions,
+  type SessionOptions,
+  type StatementSession,
+  type SqlParam,
+  type WhereClause,
+  type WhereCondition,
+  type WhereOperator,
+  type SelectOptions,
+  type InsertOptions,
+  type UpdateOptions,
+  type DeleteOptions,
+  type UpsertOptions,
+  type OrderBySpec,
+  type JoinSpec,
+  type DatabaseError,
+  type DatabaseErrorKind,
+  type BaseAdapterConfig,
+  type AdapterLogger,
+  type PoolConfig,
+  type SslConfig,
+} from "@nextlyhq/adapter-drizzle/types";
+import {
+  acceptsForShare,
+  checkDialectVersion,
+} from "@nextlyhq/adapter-drizzle/version-check";
+import { and, eq, getColumns } from "drizzle-orm";
+import type { AnyRelations, Column, SQL } from "drizzle-orm";
+import {
+  getTableConfig,
+  mysqlTable,
+  timestamp,
+  type MySqlTable,
+} from "drizzle-orm/mysql-core";
+import { drizzle, type MySql2Database } from "drizzle-orm/mysql2";
+import type {
+  Pool as CallbackPool,
+  Connection as CallbackConnection,
+} from "mysql2";
+import mysql from "mysql2/promise";
+import type {
+  ConnectionOptions,
+  PoolOptions,
+  RowDataPacket,
+  ResultSetHeader,
+} from "mysql2/promise";
+
+import { sweepIdleConnections, type SweepablePool } from "./idle-sweep";
+import { boundPoolWait, type QueueingPool } from "./pool-wait";
+import { vercelPoolView } from "./vercel-pool";
+
+/**
+ * A date field's column as the schema generator declares it on MySQL:
+ * `timestamp`. Its encoder writes the UTC wall clock, which is what a `Date`
+ * bound to an undeclared key is spelled as, whatever zone mysql2 is given.
+ */
+const DATE_FIELD_COLUMN = mysqlTable("nextly_date_field", {
+  at: timestamp("at"),
+}).at;
+
+// mysql2 type definitions use mixin patterns that TypeScript struggles with.
+// We define explicit interfaces for the methods we need.
+
+/**
+ * Query result type - either rows or a result header
+ */
+type QueryResult = RowDataPacket[] | RowDataPacket[][] | ResultSetHeader;
+
+/**
+ * Queryable interface for mysql2 connections
+ */
+interface Queryable {
+  query<T extends QueryResult>(sql: string): Promise<[T, unknown]>;
+  query<T extends QueryResult>(
+    sql: string,
+    values: unknown[]
+  ): Promise<[T, unknown]>;
+}
+
+/**
+ * mysql2 Pool interface with query method
+ */
+interface Pool extends Queryable {
+  getConnection(): Promise<PoolConnection>;
+  end(): Promise<void>;
+  pool?: {
+    _allConnections?: { length: number };
+    _freeConnections?: { length: number };
+    _connectionQueue?: { length: number };
+  };
+}
+
+/**
+ * A mysql2 connection of its own, outside the pool
+ */
+interface OwnConnection extends Queryable {
+  /** Closes the connection. */
+  destroy(): void;
+}
+
+/**
+ * mysql2 PoolConnection interface with query and release methods
+ */
+interface PoolConnection extends Queryable {
+  /** Returns the connection to the pool, for the next request to use. */
+  release(): void;
+  /** Closes the connection and removes it from the pool. */
+  destroy(): void;
+}
+
+/**
+ * What a transaction changed on its connection's session, to put back before
+ * the connection returns to the pool; null when it changed nothing.
+ *
+ * MySQL has no transaction-scoped form of `innodb_lock_wait_timeout` or
+ * `sql_mode`: a `SET SESSION` outlives the transaction, and the pooled
+ * connection would carry one transaction's setting into every later query
+ * handed it. Each field present is the session's value from before the
+ * change, or null when it could not be read, and then the connection cannot
+ * be put back.
+ */
+type SessionRestore = {
+  lockWaitTimeout?: number | null;
+  sqlMode?: string | null;
+} | null;
+
+/**
+ * Puts back what a transaction changed on its connection's session. False
+ * when that could not be done, and the connection must not be pooled.
+ */
+async function restoreSession(
+  connection: PoolConnection,
+  restore: SessionRestore
+): Promise<boolean> {
+  if (restore === null) return true;
+  if (restore.lockWaitTimeout === null || restore.sqlMode === null) {
+    return false;
+  }
+  try {
+    if (restore.lockWaitTimeout !== undefined) {
+      // An integer read from the server, never caller input.
+      await connection.query(
+        `SET SESSION innodb_lock_wait_timeout = ${restore.lockWaitTimeout}`
+      );
+    }
+    if (restore.sqlMode !== undefined) {
+      // Read from the server, and bound as a value all the same.
+      await connection.query("SET SESSION sql_mode = ?", [restore.sqlMode]);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ends a transaction's hold on its connection: back to the pool once its
+ * session is as the transaction found it, or closed when it is not. A
+ * connection whose ROLLBACK failed (`rollbackFailed`) may still be inside
+ * the transaction, and the next request handed it would write into a
+ * transaction nobody commits.
+ */
+async function returnTransactionConnection(
+  connection: PoolConnection,
+  rollbackFailed: boolean,
+  restore: SessionRestore
+): Promise<void> {
+  if (!rollbackFailed && (await restoreSession(connection, restore))) {
+    connection.release();
+  } else {
+    connection.destroy();
+  }
+}
+
+/**
+ * A newly opened pooled connection, as far as the time-zone pin needs one.
+ *
+ * The callback form of `query` is load-bearing twice: a pin that failed with
+ * nothing handling the error would end up an unhandled `error` event on the
+ * connection, and a failure swallowed without this `destroy` would leave an
+ * unpinned session in the pool to serve shifted values.
+ */
+interface PinnableConnection {
+  query(sql: string, callback: (error: Error | null) => void): void;
+  destroy(): void;
+}
+
+/**
+ * The part of mysql2's callback pool the time-zone pin uses. Declared here
+ * because mysql2's mixin typings drop the EventEmitter methods its pool has.
+ */
+interface PinnablePool {
+  on(
+    event: "connection",
+    listener: (connection: PinnableConnection) => void
+  ): unknown;
+}
+
+/**
+ * mysql2 accepts only `local`, `Z` and `±HH:MM` spellings for its driver
+ * zone, and the ones that resolve to UTC are exactly these. `local` resolves
+ * to the Node process's own zone, so it agrees with a UTC session only on a
+ * UTC host.
+ */
+function isUtcDriverZone(zone: string): boolean {
+  if (zone === "local") return new Date().getTimezoneOffset() === 0;
+  return zone === "Z" || zone === "+00:00" || zone === "-00:00";
+}
+
+// Re-export types for convenience
+export type {
+  MySqlAdapterConfig,
+  DatabaseCapabilities,
+  PoolStats,
+  TransactionContext,
+  TransactionOptions,
+  SqlParam,
+  WhereClause,
+  WhereCondition,
+  WhereOperator,
+  SelectOptions,
+  InsertOptions,
+  UpdateOptions,
+  DeleteOptions,
+  UpsertOptions,
+  OrderBySpec,
+  JoinSpec,
+  DatabaseError,
+  DatabaseErrorKind,
+  BaseAdapterConfig,
+  AdapterLogger,
+  PoolConfig,
+  SslConfig,
+};
+
+/**
+ * Package version
+ */
+export const VERSION = "0.1.0";
+
+/**
+ * Default pool configuration values on a long-running server: the PostgreSQL
+ * adapter's for a standard server, so the same `pool` settings and
+ * `DB_POOL_*` variables mean the same pool on both. With `min` 0, every
+ * connection idle for 30 seconds is closed (`sweepIdleConnections`).
+ */
+const DEFAULT_POOL_CONFIG = {
+  min: 0,
+  max: 10,
+  idleTimeoutMs: 30000,
+  // How long a request waits for a connection, in the queue or opening one:
+  // the same bound, and the same default, as the PostgreSQL adapter's.
+  connectionTimeoutMs: 15000,
+};
+
+/**
+ * `@vercel/functions`' pool attaching, imported only on Vercel, at connect.
+ *
+ * An optional peer: an app outside Vercel never installs it, so the import is
+ * dynamic and its failure is a warning (`loadVercelPoolAttacher`), never a
+ * module that fails to load. The adapter is a server external package
+ * (`withNextly`'s `serverExternalPackages`), so Node resolves this at run time;
+ * the comments keep a bundler that bundles the adapter anyway from requiring
+ * the package at build time. The `db-connections` subpath loads the attaching
+ * alone, not the package's other helpers.
+ */
+function loadVercelDbConnections(): Promise<unknown> {
+  return import(
+    /* webpackIgnore: true */ /* turbopackIgnore: true */ "@vercel/functions/db-connections"
+  );
+}
+
+/**
+ * MySQL error codes mapping to DatabaseErrorKind.
+ *
+ * @see https://dev.mysql.com/doc/mysql-errors/8.0/en/server-error-reference.html
+ */
+const MYSQL_ERROR_CODES: Record<number, DatabaseErrorKind> = {
+  // Unique/Duplicate key violations
+  1022: "unique_violation", // ER_DUP_KEY
+  1062: "unique_violation", // ER_DUP_ENTRY
+  1169: "unique_violation", // ER_DUP_UNIQUE
+  1586: "unique_violation", // ER_DUP_ENTRY_WITH_KEY_NAME
+
+  // Foreign key violations
+  1216: "foreign_key_violation", // ER_NO_REFERENCED_ROW
+  1217: "foreign_key_violation", // ER_ROW_IS_REFERENCED
+  1451: "foreign_key_violation", // ER_ROW_IS_REFERENCED_2
+  1452: "foreign_key_violation", // ER_NO_REFERENCED_ROW_2
+
+  // Not null violations
+  1048: "not_null_violation", // ER_BAD_NULL_ERROR
+  1364: "not_null_violation", // ER_NO_DEFAULT_FOR_FIELD
+
+  // Check constraint violations (MySQL 8.0.16+)
+  3819: "check_violation", // ER_CHECK_CONSTRAINT_VIOLATED
+
+  // Deadlock
+  1213: "deadlock", // ER_LOCK_DEADLOCK
+
+  // Timeout
+  1205: "timeout", // ER_LOCK_WAIT_TIMEOUT
+
+  // Connection errors
+  1040: "connection", // ER_CON_COUNT_ERROR - Too many connections
+  1042: "connection", // ER_BAD_HOST_ERROR
+  1043: "connection", // ER_HANDSHAKE_ERROR
+  1044: "connection", // ER_DBACCESS_DENIED_ERROR
+  1045: "connection", // ER_ACCESS_DENIED_ERROR
+  1129: "connection", // ER_HOST_IS_BLOCKED
+  1130: "connection", // ER_HOST_NOT_PRIVILEGED
+  2002: "connection", // CR_CONNECTION_ERROR
+  2003: "connection", // CR_CONN_HOST_ERROR
+  2006: "connection", // CR_SERVER_GONE_ERROR
+  2013: "connection", // CR_SERVER_LOST
+
+  // Query errors
+  1064: "query", // ER_PARSE_ERROR
+  1146: "query", // ER_NO_SUCH_TABLE
+  1054: "query", // ER_BAD_FIELD_ERROR
+};
+
+/** ER_LOCK_DEADLOCK: the transaction lost a race, and running it again may succeed. */
+const DEADLOCK = 1213;
+
+/**
+ * The MySQL error number an error carries: its own, or that of the driver
+ * error it wraps, as a classified or a Drizzle query error does.
+ */
+function errnoOf(error: unknown): number | undefined {
+  for (let at: unknown = error, hops = 0; hops < 4; hops++) {
+    if (typeof at !== "object" || at === null) return undefined;
+    const errno: unknown = Reflect.get(at, "errno");
+    if (typeof errno === "number") return errno;
+    at = Reflect.get(at, "cause");
+  }
+  return undefined;
+}
+
+/**
+ * MySQL database adapter for Nextly.
+ *
+ * Extends the base DrizzleAdapter to provide MySQL-specific functionality
+ * using the mysql2 package.
+ *
+ * @remarks
+ * MySQL has some limitations compared to PostgreSQL:
+ * - No native RETURNING clause (requires INSERT then SELECT)
+ * - No native ILIKE (uses LOWER() LIKE workaround)
+ * - No native JSONB (uses JSON type)
+ * - No array types
+ * - A transaction opened inside another's work joins it flat (its context still takes savepoints)
+ *
+ * @example
+ * ```typescript
+ * const adapter = new MySqlAdapter({
+ *   url: 'mysql://user:pass@localhost:3306/mydb',
+ *   pool: { max: 20 },
+ * });
+ *
+ * await adapter.connect();
+ * ```
+ */
+export class MySqlAdapter extends DrizzleAdapter {
+  // getDrizzle memoization: drizzle v1's constructor builds a relational
+  // query builder per table in the relations config (~40 tables), and the
+  // service layer resolves an instance on every db access — construct once
+  // per relations object (identity-stable: the schema registry caches it
+  // and hands out a NEW object on invalidation, which naturally misses
+  // this cache and produces a fresh instance).
+  private drizzleByRelations = new WeakMap<AnyRelations, unknown>();
+  private drizzleBare: unknown;
+
+  /**
+   * The database dialect - always 'mysql' for this adapter.
+   */
+  readonly dialect = "mysql" as const;
+
+  /**
+   * Adapter configuration.
+   */
+  protected readonly config: MySqlAdapterConfig;
+
+  /**
+   * Connection pool instance.
+   */
+  private pool: Pool | null = null;
+
+  /** Stops closing the pool's idle connections; a no-op until a pool exists. */
+  private stopIdleSweep: () => void = () => {};
+
+  /** The `withSession` calls running, each on a connection of its own, for `disconnect` to wait for. */
+  private readonly sessions = new Set<Promise<unknown>>();
+
+  /**
+   * Connection state flag.
+   */
+  private connected = false;
+
+  /**
+   * Whether the server accepts `SELECT ... FOR SHARE`, read from its version
+   * string at connect. Undefined until then, which callers treat as not known.
+   */
+  private sharedRowLock: boolean | undefined;
+  private functionalIndexes: boolean | undefined;
+  private enforcesCheckConstraints: boolean | undefined;
+  private serverVersion: string | undefined;
+
+  /**
+   * Whether a transaction context sets savepoints, read from the server's
+   * variant at connect. TiDB refuses `SAVEPOINT` before 6.2, and in a
+   * pessimistic transaction unless `tidb_constraint_check_in_place_pessimistic`
+   * is on, so on TiDB the context offers none and its callers run their work
+   * without one. MySQL and the other variants take them.
+   */
+  private takesSavepoints = true;
+
+  /**
+   * Creates a new MySQL adapter instance.
+   *
+   * @param config - Adapter configuration
+   */
+  constructor(config: MySqlAdapterConfig) {
+    super();
+    this.config = config;
+  }
+
+  /**
+   * Connect to the MySQL database.
+   * Creates a connection pool using mysql2.
+   *
+   * @remarks
+   * This method initializes the connection pool and verifies connectivity
+   * by executing a simple query. It is idempotent - calling it multiple
+   * times will not create multiple pools.
+   *
+   * @throws {DatabaseError} If connection fails
+   */
+  async connect(): Promise<void> {
+    if (this.connected && this.pool) {
+      return;
+    }
+
+    // On Vercel, what hands the pool built below to `attachDatabasePool`.
+    const attachPool = await loadVercelPoolAttacher({
+      load: loadVercelDbConnections,
+      dialect: "MySQL",
+      logger: this.config.logger,
+    });
+
+    try {
+      // Warned once, here, rather than on every session configuration the
+      // standalone connections build: the configuration cannot change
+      // between calls.
+      this.warnOnDriverZoneDisagreement();
+      const poolConfig = this.buildPoolConfig();
+      const pool = mysql.createPool(poolConfig);
+      // mysql2's own idle closing is off (`buildPoolConfig`); this closes
+      // connections idle past the timeout and keeps `min` of them.
+      this.stopIdleSweep = sweepIdleConnections(
+        pool.pool as unknown as SweepablePool,
+        this.idleSweepOptions(poolConfig)
+      );
+      // Attached as soon as it exists, as Vercel's docs say, so the smoke
+      // test's own connection is one `@vercel/functions` waits on as well.
+      // Handed as the shape `attachDatabasePool` reads (`vercelPoolView`).
+      attachPool?.(
+        vercelPoolView(
+          pool.pool,
+          poolConfig.idleTimeout ?? DEFAULT_POOL_CONFIG.idleTimeoutMs
+        )
+      );
+      // Pin the session time zone the moment each pooled connection opens.
+      // Left unpinned, a session serves in whatever zone the server starts it
+      // in — `SYSTEM` on the containers, anything on a self-hosted server —
+      // and writes, window bounds and session-zone computations all follow
+      // it. mysql2 emits `connection` when a physical connection is
+      // established and BEFORE it reaches any caller, and each connection
+      // queues its commands in order, so this SET has always run by the time
+      // the first query handed the connection is sent; a replaced connection
+      // is pinned again by the same listener.
+      (pool.pool as unknown as PinnablePool).on("connection", connection => {
+        connection.query("SET SESSION time_zone = '+00:00'", error => {
+          // A session that could not be pinned must never be pooled: it
+          // would serve in whatever zone it answers in.
+          if (error) connection.destroy();
+        });
+      });
+      // mysql2 queues a request for a connection without limit; it fails as
+      // busy past the same bound a new connection gets to open.
+      boundPoolWait(
+        pool.pool as unknown as QueueingPool,
+        poolConfig.connectTimeout ?? 0
+      );
+      // Cast to our Pool interface - mysql2's mixin types don't resolve properly
+      this.pool = pool as unknown as Pool;
+
+      // Verify connection with smoke test, then check dialect version.
+      // Why: F17 hard-fails at connect on real MySQL <8.0 (no variant
+      // token detected). Recognized variants (MariaDB, TiDB, Aurora,
+      // PlanetScale, Vitess) log a warning via the adapter logger and
+      // proceed. Truly unparseable strings hard-fail so users see the
+      // issue at boot rather than mid-apply.
+      const connection = await this.pool.getConnection();
+      try {
+        await connection.query("SELECT 1");
+        const {
+          variant,
+          functionalIndexes,
+          enforcesCheckConstraints,
+          serverVersion,
+        } = await checkDialectVersion(connection, "mysql", {
+          // Why: route variant warnings through the adapter's logger so
+          // users see a single, consistent log surface.
+          onWarning: msg => this.config.logger?.warn?.(msg),
+        });
+        // MariaDB and TiDB connect through this adapter too, and reject
+        // `FOR SHARE`; the capability tells callers which lock they can take.
+        this.sharedRowLock = acceptsForShare(variant);
+        // Whether a unique index may key on an expression, which per-language uniqueness of a
+        // translated value does.
+        this.functionalIndexes = functionalIndexes;
+        // Whether a declared CHECK holds anything on this server, and the
+        // version string a refusal names: MySQL before 8.0.16 parses a CHECK
+        // and ignores it, and the variants are not spoken for.
+        this.enforcesCheckConstraints = enforcesCheckConstraints;
+        this.serverVersion = serverVersion;
+        this.takesSavepoints = variant !== "tidb";
+        this.connected = true;
+
+        if (this.config.logger?.info) {
+          this.config.logger.info("MySQL connection established", {
+            host: this.config.host ?? "from URL",
+            database: this.config.database ?? "from URL",
+          });
+        }
+      } finally {
+        connection.release();
+      }
+    } catch (error) {
+      // Clean up on failure
+      this.stopIdleSweep();
+      if (this.pool) {
+        await this.pool.end().catch(() => {});
+        this.pool = null;
+      }
+      throw this.classifyError(error);
+    }
+  }
+
+  /**
+   * Disconnect from the MySQL database.
+   * Gracefully closes the connection pool.
+   *
+   * @remarks
+   * This method is idempotent - calling it multiple times is safe.
+   * It waits for all connections to be released before shutting down,
+   * including each running `withSession`'s connection of its own.
+   */
+  async disconnect(): Promise<void> {
+    // Detach the pool FIRST, then drop the memoized drizzle instances —
+    // this closes the repopulation window where a concurrent getDrizzle()
+    // call during the (async) pool.end() could cache an instance wrapping
+    // the closing pool.
+    const pool = this.pool;
+    this.pool = null;
+    // The pool's end closes every connection; the sweep must not close one
+    // under it.
+    this.stopIdleSweep();
+    this.drizzleBare = undefined;
+    this.drizzleByRelations = new WeakMap();
+    if (!pool) {
+      return;
+    }
+
+    try {
+      // With the pool detached no session starts; those running end first.
+      await Promise.allSettled([...this.sessions]);
+      await pool.end();
+
+      if (this.config.logger?.info) {
+        this.config.logger.info("MySQL connection closed");
+      }
+    } finally {
+      this.connected = false;
+    }
+  }
+
+  /**
+   * Check if connected to the database.
+   */
+  isConnected(): boolean {
+    return this.connected && this.pool !== null;
+  }
+
+  /**
+   * Get connection pool statistics.
+   * Returns null if not connected.
+   *
+   * @remarks
+   * MySQL2 pool exposes different stats than pg:
+   * - _allConnections: all connections
+   * - _freeConnections: idle connections
+   * - _connectionQueue: waiting requests
+   */
+  getPoolStats(): PoolStats | null {
+    if (!this.pool) {
+      return null;
+    }
+
+    // mysql2 Pool internal properties (cast to access internals)
+    const poolInternal = this.pool as unknown as {
+      pool?: {
+        _allConnections?: { length: number };
+        _freeConnections?: { length: number };
+        _connectionQueue?: { length: number };
+      };
+    };
+
+    const internal = poolInternal.pool;
+    if (!internal) {
+      return {
+        total: 0,
+        idle: 0,
+        waiting: 0,
+        active: 0,
+      };
+    }
+
+    const total = internal._allConnections?.length ?? 0;
+    const idle = internal._freeConnections?.length ?? 0;
+    const waiting = internal._connectionQueue?.length ?? 0;
+
+    return {
+      total,
+      idle,
+      waiting,
+      active: total - idle,
+    };
+  }
+
+  /**
+   * The connection as a health check reads it, on one pooled connection: the
+   * server's version, timed for the round trip, then that session's
+   * `Ssl_cipher` status, which names the cipher when the session's connection
+   * is encrypted and is empty when it is not.
+   *
+   * @remarks
+   * The status and the connection's own socket are weighed by
+   * `encryptionOf`: behind a proxy the status can describe the proxy's own
+   * connection to the server, while this connection's socket is TLS. The
+   * socket is read as it is, never inferred from the `ssl` setting.
+   *
+   * Whether the database is on this machine is judged from the configured
+   * address, which never leaves this method. Any failure answers `"unknown"`.
+   */
+  override async inspectConnection(): Promise<ConnectionInspection> {
+    const local = this.isLocalHost(this.connectionHost());
+    let connection: PoolConnection | undefined;
+    try {
+      connection = await this.ensurePool().getConnection();
+      const started = performance.now();
+      const [versionRows] = await connection.query<RowDataPacket[]>(
+        "SELECT VERSION() AS version"
+      );
+      const roundTripMs = Math.max(0, Math.round(performance.now() - started));
+      const [statusRows] = await connection.query<RowDataPacket[]>(
+        "SHOW SESSION STATUS LIKE 'Ssl_cipher'"
+      );
+      const cipher: unknown = statusRows[0]?.Value;
+      const version: unknown = versionRows[0]?.version;
+      return {
+        encryption: this.encryptionOf({
+          session: typeof cipher === "string" ? cipher !== "" : undefined,
+          ownSocketTls: this.ownSocketIsTls(connection),
+        }),
+        local,
+        roundTripMs,
+        ...(typeof version === "string" && version !== ""
+          ? { serverVersion: version.split("-")[0] }
+          : {}),
+      };
+    } catch {
+      return { encryption: "unknown", local };
+    } finally {
+      connection?.release();
+    }
+  }
+
+  /**
+   * The host this adapter connects to, as mysql2 resolves it: the connection
+   * string's when one is set, else the `host` option, else `localhost`.
+   * `undefined` when the connection string cannot be read.
+   */
+  private connectionHost(): string | undefined {
+    const configured = this.config.url
+      ? this.hostOfUrl(this.config.url)
+      : (this.config.host ?? "");
+    return configured === "" ? "localhost" : configured;
+  }
+
+  /**
+   * Execute a raw SQL query.
+   *
+   * @param sql - SQL query string with ? placeholders
+   * @param params - Query parameters
+   * @returns Query results
+   *
+   * @throws {DatabaseError} If query execution fails
+   */
+  async executeQuery<T = unknown>(
+    sql: string,
+    params: SqlParam[] = []
+  ): Promise<T[]> {
+    const pool = this.ensurePool();
+    const startTime = Date.now();
+
+    try {
+      // Outside the calling flow's transaction, if it has one (`notePoolAccess`).
+      this.notePoolAccess(sql);
+      const [rows] = await pool.query<RowDataPacket[]>(
+        sql,
+        params as unknown[]
+      );
+
+      // Log query if logger configured
+      if (this.config.logger?.query) {
+        const durationMs = Date.now() - startTime;
+        this.config.logger.query(sql, params, durationMs);
+      }
+
+      return rows as T[];
+    } catch (error) {
+      throw this.classifyError(error, sql);
+    }
+  }
+
+  /**
+   * Execute work within a transaction.
+   *
+   * @param work - Function containing transactional operations
+   * @param options - Transaction options (isolation level, timeout, retry)
+   * @returns Result of the work function
+   *
+   * @remarks
+   * MySQL transactions support isolation levels. Automatic retry is
+   * implemented for deadlocks (error 1213) when `retryCount` is specified.
+   *
+   * A call made inside another transaction's work therefore joins it flat,
+   * on its connection: its statements are the outer's. Its failure cannot be
+   * undone alone, so it fails the whole transaction, even when the outer
+   * catches it: the outer's COMMIT is refused, it rolls back, and it rejects
+   * with the error that failed the joined call; any later joined call fails
+   * with that error at once. A joined call keeps the outer's options and is
+   * never retried itself. `retryWhen` is asked first, of every error that
+   * ends an attempt, application ones included.
+   */
+  transaction<T>(
+    work: (tx: TransactionContext) => Promise<T>,
+    options?: TransactionOptions
+  ): Promise<T> {
+    return this.openOrJoin(work, options, {
+      run: (_attempt, openedAt) => this.runAttempt(work, options, openedAt),
+      retryable: error => errnoOf(error) === DEADLOCK,
+      describe: error => {
+        const errno = errnoOf(error);
+        return {
+          label: errno === DEADLOCK ? "deadlock" : "a retryable error",
+          detail: { errno },
+        };
+      },
+      logger: this.config.logger,
+    });
+  }
+
+  /**
+   * Runs `work` on a connection of its own, opened for it with the pool's
+   * connection settings, outside a transaction, each statement committing as
+   * it runs.
+   *
+   * @remarks
+   * Not a pooled connection: on a server whose sessions start with autocommit
+   * off, one can hold a transaction an earlier caller left open, and turning
+   * autocommit on would commit that caller's writes. A new connection holds
+   * nothing. It does not count against `pool.max`.
+   *
+   * Each statement commits as it runs, whatever the server's own autocommit
+   * default. With `strictSqlMode` the session runs in strict mode, as a
+   * transaction given the same option does, so a statement that would cut a
+   * value short fails and changes nothing. The connection is closed
+   * afterwards, whether `work` finished or threw, so whatever `work` set on
+   * its session (a temporary table, a session variable, a lock) ends with it.
+   */
+  override async withSession<T>(
+    work: (session: StatementSession) => Promise<T>,
+    options?: SessionOptions
+  ): Promise<T> {
+    // A precondition: before any connection is opened.
+    this.refuseSessionInTransaction();
+    // Connected first, as every other call requires.
+    this.ensurePool();
+    // Tracked before its connection opens: `disconnect` waits for it.
+    const running = this.runSession(work, options);
+    this.sessions.add(running);
+    try {
+      return await running;
+    } finally {
+      this.sessions.delete(running);
+    }
+  }
+
+  /** `withSession`'s work, on a connection it opens and closes. */
+  private async runSession<T>(
+    work: (session: StatementSession) => Promise<T>,
+    options?: SessionOptions
+  ): Promise<T> {
+    let connection: OwnConnection;
+    try {
+      // mysql2's connection already satisfies `OwnConnection`, so it is assigned as it comes.
+      connection = await mysql.createConnection(this.buildConnectionConfig());
+    } catch (error) {
+      throw this.classifyError(error);
+    }
+    try {
+      try {
+        // A server whose sessions start with autocommit off would otherwise
+        // hold every statement in a transaction nobody commits.
+        await connection.query("SET SESSION autocommit = 1");
+        // The connection opened outside the pool, so the pool's `connection`
+        // listener never pins it; its driver already parses in UTC, and a
+        // session still in the server's zone would shift every value a
+        // round-trip fails to cancel. The work below never runs unpinned.
+        await connection.query("SET SESSION time_zone = '+00:00'");
+        if (options?.strictSqlMode) {
+          // Nothing to put back: the connection is closed afterwards.
+          await this.enterStrictMode(connection, {});
+        }
+      } catch (error) {
+        throw this.classifyError(error);
+      }
+      return await work({
+        execute: async <R = unknown>(
+          statement: string,
+          params: SqlParam[] = []
+        ): Promise<R[]> => {
+          const startTime = Date.now();
+          try {
+            const [rows] = await connection.query<RowDataPacket[]>(
+              statement,
+              params as unknown[]
+            );
+            if (this.config.logger?.query) {
+              this.config.logger.query(
+                statement,
+                params,
+                Date.now() - startTime
+              );
+            }
+            return rows as R[];
+          } catch (error) {
+            throw this.classifyError(error, statement);
+          }
+        },
+      });
+    } finally {
+      connection.destroy();
+    }
+  }
+
+  /** One attempt at an outermost transaction, on a connection of its own. */
+  private async runAttempt<T>(
+    work: (tx: TransactionContext) => Promise<T>,
+    options: TransactionOptions | undefined,
+    openedAt: string | undefined
+  ) {
+    const pool = this.ensurePool();
+    // A checkout, taken from the pool like `executeQuery`'s queries are.
+    this.notePoolAccess();
+    const connection = await pool.getConnection();
+    // Set when the ROLLBACK failed (`returnTransactionConnection`).
+    let rollbackFailed = false;
+    // What `beginTransaction` changed on the session, to put back once the
+    // transaction has ended. Filled in as each change lands, so a setup that
+    // fails part way still puts back what it had already changed.
+    const restore: NonNullable<SessionRestore> = {};
+    const settled = await this.settleOutermost(
+      {
+        context: this.createTransactionContext(connection),
+        join: this.joinSteps(connection),
+        openedAt,
+        begin: () => this.beginTransaction(connection, options, restore),
+        commit: async () => {
+          await connection.query("COMMIT");
+        },
+        // A failure is recorded for the return and rethrown, so the base
+        // knows the ROLLBACK is unconfirmed.
+        rollback: async () => {
+          await connection.query("ROLLBACK").catch((rollbackError: unknown) => {
+            rollbackFailed = true;
+            throw rollbackError;
+          });
+        },
+      },
+      work,
+      options
+    );
+    // Returned before anything held runs, so an effect that opens a
+    // transaction takes one connection, not two.
+    await returnTransactionConnection(connection, rollbackFailed, restore);
+    return settled;
+  }
+
+  /**
+   * How a call made inside a transaction on `connection` joins it: flat, on
+   * the same connection, with nothing to send. Any failure inside it fails
+   * the whole transaction, since no savepoint can undo the part alone.
+   */
+  private joinSteps(connection: PoolConnection) {
+    const callbackConnection = (
+      connection as unknown as { connection: CallbackConnection }
+    ).connection;
+    return this.joinStepsOn(
+      () => this.createTransactionContext(connection),
+      relations =>
+        relations
+          ? drizzle({ client: callbackConnection, relations })
+          : drizzle({ client: callbackConnection }),
+      context => ({
+        context,
+        begin() {},
+        commit() {},
+        rollback() {},
+        dooms: () => true,
+      })
+    );
+  }
+
+  /**
+   * Get MySQL database capabilities.
+   *
+   * @remarks
+   * MySQL has some limitations:
+   * - No JSONB (uses JSON)
+   * - No arrays
+   * - No native ILIKE
+   * - No RETURNING clause
+   * - No savepoint for a nested transaction: one opened inside another's work
+   *   joins it flat (`joinSteps`), so `supportsSavepoints` is false. The
+   *   transaction context's own savepoint methods are a separate matter.
+   */
+  getCapabilities(): DatabaseCapabilities {
+    return {
+      dialect: "mysql",
+      supportsJsonb: false, // MySQL uses JSON, not JSONB
+      supportsJson: true,
+      supportsArrays: false, // MySQL doesn't support array types
+      supportsGeneratedColumns: true, // MySQL 5.7.6+
+      supportsFts: true, // MySQL has FULLTEXT indexes
+      supportsIlike: false, // No native ILIKE, use LOWER() LIKE
+      supportsReturning: false, // No RETURNING clause in MySQL
+      supportsSavepoints: false, // A nested transaction joins flat; no savepoint isolates it
+      supportsOnConflict: true, // ON DUPLICATE KEY UPDATE
+      maxParamsPerQuery: 65535, // MySQL limit
+      maxIdentifierLength: 64, // MySQL limit
+      sharedRowLock: this.sharedRowLock, // Known once connected
+      functionalIndexes: this.functionalIndexes, // Known once connected
+      enforcesCheckConstraints: this.enforcesCheckConstraints, // Known once connected
+      serverVersion: this.serverVersion, // Known once connected
+    };
+  }
+
+  /**
+   * Build a placeholder for MySQL (uses ? instead of $1, $2, etc.)
+   *
+   * @param _index - Parameter index (ignored for MySQL)
+   * @returns The ? placeholder
+   */
+  protected buildPlaceholder(_index: number): string {
+    return "?";
+  }
+
+  /**
+   * Build multiple placeholders for MySQL.
+   *
+   * @param count - Number of placeholders needed
+   * @param _startIndex - Starting index (ignored for MySQL)
+   * @returns Comma-separated ? placeholders
+   */
+  protected buildPlaceholders(count: number, _startIndex: number = 0): string {
+    return Array(count).fill("?").join(", ");
+  }
+
+  /**
+   * Escape an identifier for MySQL (uses backticks instead of double quotes).
+   *
+   * @param identifier - The identifier to escape
+   * @returns Escaped identifier with backticks
+   */
+  protected escapeIdentifier(identifier: string): string {
+    // MySQL uses backticks for identifiers
+    return `\`${identifier.replace(/`/g, "``")}\``;
+  }
+
+  // ============================================================
+  // Protected Helper Methods
+  // ============================================================
+
+  /**
+   * Ensures pool is connected and returns it.
+   *
+   * @throws {DatabaseError} If not connected
+   */
+  private ensurePool(): Pool {
+    if (!this.pool) {
+      throw createDatabaseError({
+        kind: "connection",
+        message: "MySqlAdapter is not connected. Call connect() first.",
+      });
+    }
+    return this.pool;
+  }
+
+  /**
+   * Return the typed Drizzle instance for MySQL.
+   * Guarded for server-only usage and requires an active connection.
+   *
+   * @param schema - Optional schema for relational queries (db.query.*)
+   * @returns Drizzle ORM instance wrapping the mysql2 pool connection
+   * @throws {Error} If called in browser or not connected
+   */
+  getDrizzle<T = MySql2Database<AnyRelations>>(relations?: AnyRelations): T {
+    if (typeof window !== "undefined") {
+      throw new Error("getDrizzle() is server-only");
+    }
+    const pool = this.ensurePool();
+    if (!relations) {
+      this.drizzleBare ??= this.poolDrizzle(pool);
+      return this.drizzleBare as T;
+    }
+    let cached = this.drizzleByRelations.get(relations);
+    if (!cached) {
+      cached = this.poolDrizzle(pool, relations);
+      this.drizzleByRelations.set(relations, cached);
+    }
+    return cached as T;
+  }
+
+  /**
+   * A Drizzle handle on the pool, for `getDrizzle`.
+   *
+   * Its `transaction` runs on a connection this adapter checks out and
+   * returns itself (`pinDrizzleTransactions`): destroyed rather than pooled
+   * when no ROLLBACK could be confirmed on it. And it counts for
+   * `transactionOpenInFlow`, as the adapter's does.
+   */
+  private poolDrizzle(pool: Pool, relations?: AnyRelations) {
+    // drizzle v1's mysql2 driver takes the CALLBACK pool and connection,
+    // which the mysql2/promise wrappers expose on `.pool` and `.connection`:
+    // handed a wrapper, it throws ("Cannot set properties of undefined
+    // (setting 'supportBigNumbers')"). The pre-v1 `mode` option is gone.
+    const onClient = (client: CallbackPool | CallbackConnection) =>
+      relations ? drizzle({ client, relations }) : drizzle({ client });
+    // The handle's own queries go to the pool, so it is handed a view of the
+    // pool that reports them (`observedPool`).
+    const callbackPool = this.observedPool(
+      (pool as unknown as { pool: CallbackPool }).pool,
+      ["query", "execute", "getConnection"]
+    );
+    // Its transactions join the one the calling flow is inside, as the
+    // adapter's `transaction()` does, and open one of this adapter's
+    // otherwise (`joiningHandle`).
+    return this.joiningHandle(
+      onClient(callbackPool),
+      async () => {
+        const connection = await pool.getConnection();
+        return {
+          drizzle: onClient(
+            (connection as unknown as { connection: CallbackConnection })
+              .connection
+          ),
+          rollback: () => connection.query("ROLLBACK"),
+          release: dirty => {
+            if (dirty) connection.destroy();
+            else connection.release();
+          },
+          join: this.joinSteps(connection),
+        };
+      },
+      relations
+    );
+  }
+
+  /**
+   * Warns when a caller's configured driver zone does not agree with the
+   * pinned UTC session.
+   *
+   * mysql2's driver-level `timezone` decides how it parses the date strings
+   * the pinned session answers with and how it binds raw Date parameters, so
+   * a non-UTC spelling there would shift values a round-trip fails to
+   * cancel. The configuration is aligned to the pin (`buildConnectionConfig`
+   * sets UTC unconditionally, for pooled and standalone connections alike),
+   * never rewritten silently: the caller configured a reading, and this is
+   * where that reading is named as lost. Runs from `connect`, once per pool
+   * build — the configuration cannot change between calls.
+   */
+  private warnOnDriverZoneDisagreement(): void {
+    // mysql2's own default is `local`, so an unset configuration is judged
+    // the same way: it agrees only on a UTC host.
+    const requestedZone = this.config.timezone ?? "local";
+    if (isUtcDriverZone(requestedZone)) return;
+    this.config.logger?.warn?.(
+      `Driver timezone "${requestedZone}" is not UTC; it is aligned to the pinned UTC session and no longer shifts reads or writes.`
+    );
+  }
+
+  /**
+   * Builds mysql2 Pool configuration from adapter config.
+   */
+  private buildPoolConfig(): PoolOptions {
+    const config: PoolOptions = this.buildConnectionConfig();
+
+    // Pool settings - mysql2 uses different property names.
+    const defaults = this.poolDefaults();
+    config.connectionLimit = this.config.pool?.max ?? defaults.max;
+    config.idleTimeout =
+      this.config.pool?.idleTimeoutMs ?? defaults.idleTimeoutMs;
+    // mysql2 never closes an idle connection by itself with `maxIdle` equal
+    // to the limit: below it, it closes every connection idle past
+    // `idleTimeout` and keeps no minimum. The adapter closes them instead,
+    // past `idleTimeout` and down to `min` (`sweepIdleConnections`), and
+    // `idleTimeout` stays set so the pool's config reads as it behaves.
+    config.maxIdle = config.connectionLimit;
+
+    // A request waits for a connection when the pool is full. The queue has
+    // no length limit; each wait in it is bounded instead (`boundPoolWait`).
+    config.waitForConnections = true;
+    config.queueLimit = 0;
+
+    return config;
+  }
+
+  /**
+   * The pool defaults where this runs. Inside Vercel functions they are the
+   * serverless ones, a small pool whose idle connections close quickly, since
+   * a suspended instance keeps whatever it holds open; each setting the
+   * config gives still wins on its own.
+   */
+  private poolDefaults(): { min: number; max: number; idleTimeoutMs: number } {
+    return isVercelFunction() ? SERVERLESS_POOL_DEFAULTS : DEFAULT_POOL_CONFIG;
+  }
+
+  /** Which idle connections the pool built from `poolConfig` closes, and when. */
+  private idleSweepOptions(poolConfig: PoolOptions): {
+    min: number;
+    idleTimeoutMs: number;
+  } {
+    return {
+      min: this.config.pool?.min ?? this.poolDefaults().min,
+      idleTimeoutMs:
+        poolConfig.idleTimeout ?? DEFAULT_POOL_CONFIG.idleTimeoutMs,
+    };
+  }
+
+  /**
+   * Builds the settings every connection opens with, pooled or not, from
+   * adapter config.
+   */
+  private buildConnectionConfig(): ConnectionOptions {
+    const config: ConnectionOptions = this.buildAddressConfig();
+
+    config.connectTimeout =
+      this.config.pool?.connectionTimeoutMs ??
+      DEFAULT_POOL_CONFIG.connectionTimeoutMs;
+
+    // SSL configuration
+    if (this.config.ssl) {
+      config.ssl = this.buildSslConfig(this.config.ssl);
+    }
+
+    // MySQL-specific options. Every connection this adapter opens serves a
+    // UTC session (see the pins in `connect` and `runSession`), so the
+    // driver zone is pinned with them: mysql2 parses the date strings a
+    // pinned session answers with and binds raw Date parameters, and a
+    // driver in one zone beside a session in another shifts values every
+    // time a round-trip fails to cancel. A configured zone that is not UTC
+    // is aligned rather than refused — the pin is the deliberate boundary —
+    // and `connect` warns the caller, once, that the shift they configured
+    // is gone.
+    config.timezone = "Z";
+
+    if (this.config.charset) {
+      config.charset = this.config.charset;
+    }
+
+    // Enable multiple statements if needed (disabled by default for security)
+    config.multipleStatements = false;
+
+    // Date handling
+    config.dateStrings = false; // Return Date objects
+
+    return config;
+  }
+
+  /** Where to connect: the connection string, or the explicit options. */
+  private buildAddressConfig(): ConnectionOptions {
+    if (this.config.url) return { uri: this.config.url };
+    const { host, port, database, user, password } = this.config;
+    const config: ConnectionOptions = { host, port, database, user, password };
+    // An option left unset is left out, for mysql2's own default.
+    for (const key of Object.keys(config) as (keyof ConnectionOptions)[]) {
+      if (!config[key]) delete config[key];
+    }
+    return config;
+  }
+
+  /** mysql2's `ssl` option for the adapter's `ssl` setting. */
+  private buildSslConfig(
+    ssl: NonNullable<MySqlAdapterConfig["ssl"]>
+  ): ConnectionOptions["ssl"] {
+    if (typeof ssl === "boolean") {
+      return ssl ? {} : undefined;
+    }
+    return {
+      rejectUnauthorized: ssl.rejectUnauthorized,
+      ca: ssl.ca,
+      cert: ssl.cert,
+      key: ssl.key,
+    };
+  }
+
+  /**
+   * Begins a transaction with the specified options, recording in `changed`
+   * each session setting it changes, as it changes it, for `restoreSession`
+   * to put back.
+   */
+  private async beginTransaction(
+    connection: PoolConnection,
+    options: TransactionOptions | undefined,
+    changed: NonNullable<SessionRestore>
+  ): Promise<void> {
+    // Set isolation level if specified (must be done before BEGIN)
+    if (options?.isolationLevel) {
+      const isolationMap: Record<string, string> = {
+        "read uncommitted": "READ UNCOMMITTED",
+        "read committed": "READ COMMITTED",
+        "repeatable read": "REPEATABLE READ",
+        serializable: "SERIALIZABLE",
+      };
+      const level = isolationMap[options.isolationLevel];
+      if (level) {
+        await connection.query(`SET TRANSACTION ISOLATION LEVEL ${level}`);
+      }
+    }
+
+    // Set read-only mode if specified
+    if (options?.readOnly) {
+      await connection.query("SET TRANSACTION READ ONLY");
+    }
+
+    // Begin the transaction
+    await connection.query("START TRANSACTION");
+
+    // Set lock wait timeout if specified
+    if (options?.timeoutMs) {
+      // Read first, so the session's own value can be put back once the
+      // transaction has ended (`SessionRestore`).
+      const [rows] = await connection.query<RowDataPacket[]>(
+        "SELECT @@SESSION.innodb_lock_wait_timeout AS timeout"
+      );
+      const previous = Number(rows[0]?.timeout);
+      // MySQL uses seconds for lock_wait_timeout
+      const timeoutSeconds = Math.ceil(options.timeoutMs / 1000);
+      await connection.query(
+        `SET SESSION innodb_lock_wait_timeout = ${timeoutSeconds}`
+      );
+      changed.lockWaitTimeout = Number.isInteger(previous) ? previous : null;
+    }
+
+    if (options?.strictSqlMode) {
+      await this.enterStrictMode(connection, changed);
+    }
+  }
+
+  /**
+   * Strict mode for the rest of this connection's session: an INSERT, UPDATE
+   * or ALTER that would cut a string to its column's length, or clamp a
+   * number to its range, fails instead of applying with a warning. Added to
+   * the session's own mode, so every other flag it had still holds, and
+   * recorded in `changed` for `restoreSession` to put back.
+   */
+  private async enterStrictMode(
+    connection: Queryable,
+    changed: NonNullable<SessionRestore>
+  ): Promise<void> {
+    const [rows] = await connection.query<RowDataPacket[]>(
+      "SELECT @@SESSION.sql_mode AS mode"
+    );
+    const previous: unknown = rows[0]?.mode;
+    // Recorded before the SET: one the server applied but whose reply was
+    // lost still has its mode put back.
+    changed.sqlMode = typeof previous === "string" ? previous : null;
+    await connection.query(
+      "SET SESSION sql_mode = TRIM(BOTH ',' FROM CONCAT(@@SESSION.sql_mode, ',STRICT_ALL_TABLES'))"
+    );
+  }
+
+  /**
+   * Creates a TransactionContext for the given connection.
+   */
+  /**
+   * Upsert with the meaning `INSERT … ON CONFLICT (target)` has on PostgreSQL
+   * and SQLite, on the tables where MySQL can keep that promise.
+   *
+   * MySQL cannot limit a duplicate to one key: `ON DUPLICATE KEY UPDATE`
+   * fires on a collision with ANY unique key, and a failed insert does not
+   * say reliably which one. So the conflict target must be the table's only
+   * unique key apart from its primary key, and any other table is refused
+   * before anything is written. On such a table the row is inserted first —
+   * its validation and triggers apply, as they do before `ON CONFLICT`
+   * elsewhere — and a duplicate is resolved by a locking read of the target
+   * key, which sees the latest committed row rather than the transaction's
+   * snapshot. The row found is kept as it is when there is nothing to update
+   * (a no-op assignment would still run its update triggers), or updated by
+   * its key. No row there means the collision was on the primary key, and it
+   * is refused as `ON CONFLICT (target)` refuses it.
+   *
+   * The steps run in the caller's transaction, or in one of their own, since a
+   * locking read locks nothing past its statement under autocommit. Rows are
+   * read back by their primary key, so a trigger that rewrites the conflict
+   * value still returns the row stored. The conflict columns must also be
+   * given values: MySQL cannot look a row up by a key the database would only
+   * fill in itself. A conflict is resolved on the caller's key value: a
+   * BEFORE INSERT trigger that moves the key onto another row's value is
+   * refused as a unique violation rather than resolved onto that row. A failed insert rolls back only itself on MySQL, so a
+   * caller's transaction stays usable.
+   */
+  override async upsert<T = unknown>(
+    table: string,
+    data: Record<string, unknown>,
+    options: UpsertOptions,
+    executor?: unknown
+  ): Promise<T> {
+    const tableObj = this.getTableObject(table) as MySqlTable | undefined;
+    // Unknown table: the base method reports it as every CRUD method does.
+    if (!tableObj) return super.upsert<T>(table, data, options, executor);
+    let target: { where: SQL | undefined; nullKey: boolean };
+    try {
+      // Judged before anything else, so a refused call takes no connection.
+      target = this.upsertTarget(tableObj, table, data, options);
+    } catch (error) {
+      throw this.handleQueryError(error, "upsert", table);
+    }
+    // A locking read holds its lock only inside a transaction: under autocommit
+    // it is released when its own statement ends, and the next statement may
+    // run on another pooled connection. Without the caller's transaction, the
+    // insert, the read and the update get one of their own, on one connection.
+    if (executor === undefined) {
+      return this.transaction(tx => tx.upsert<T>(table, data, options));
+    }
+    try {
+      const db = executor as MySql2Database<AnyRelations>;
+      // A conflict key holding NULL never conflicts: a unique index admits any
+      // number of NULLs. It is a plain insert, read back by its primary key.
+      if (target.nullKey) {
+        return ((await this.insertRow(db, tableObj, data)) ?? data) as T;
+      }
+      return (await this.insertOrResolve(
+        db,
+        tableObj,
+        data,
+        options,
+        target.where
+      )) as T;
+    } catch (error) {
+      throw this.handleQueryError(error, "upsert", table);
+    }
+  }
+
+  /**
+   * What an upsert is keyed on: the target's condition, and whether its key
+   * holds a NULL. Refuses a target this dialect cannot keep to, and a conflict
+   * column left for the database to fill — MySQL cannot look a row up by a key
+   * value only the database would supply.
+   */
+  private upsertTarget(
+    tableObj: MySqlTable,
+    table: string,
+    data: Record<string, unknown>,
+    options: UpsertOptions
+  ): { where: SQL | undefined; nullKey: boolean } {
+    // MySQL needs every conflict value whether or not it updates: the row is
+    // found by them after a duplicate, so the keep-existing rule applies to
+    // every call here.
+    this.assertUpsertTarget(table, data, options, true);
+    const key = this.conflictKey(tableObj, table, options.conflictColumns);
+    const values = options.conflictColumns.map(column => data[column]);
+    return {
+      where: and(...key.map((column, i) => eq(column, values[i] as never))),
+      nullKey: values.some(value => value === null),
+    };
+  }
+
+  /**
+   * The table's columns for a conflict target, refusing a target MySQL cannot
+   * keep to: one that is not a primary or unique key, which an update could
+   * spread over several rows, and one beside which the table has another
+   * unique key, a collision on which MySQL would not tell apart.
+   */
+  private conflictKey(
+    tableObj: MySqlTable,
+    table: string,
+    conflictColumns: readonly string[]
+  ): Column[] {
+    const record = tableObj as unknown as Record<string, Column | undefined>;
+    const columns = conflictColumns.map(name => record[name]);
+    const names = new Set(columns.map(column => column?.name));
+    const isTarget = (key: readonly string[]) =>
+      key.length === names.size && key.every(name => names.has(name));
+    const { primary, unique } = keysOf(tableObj);
+    // Every row this upsert returns is read back by its primary key, so a
+    // table without one has no stable way to find the row it wrote.
+    if (primary.length === 0) {
+      throw createDatabaseError({
+        kind: "query",
+        message: `upsert on ${table}: MySQL upserts need a table with a primary key, to read back the row they write.`,
+      });
+    }
+    const known = columns.every(column => column !== undefined);
+    if (
+      !known ||
+      !(isTarget(primary) || unique.some(k => isTarget(k.columns)))
+    ) {
+      throw createDatabaseError({
+        kind: "query",
+        message: `upsert on ${table}: the conflict columns (${conflictColumns.join(", ")}) are not a primary or unique key of the table.`,
+      });
+    }
+    const others = unique.filter(key => !isTarget(key.columns));
+    if (others.length > 0) {
+      throw createDatabaseError({
+        kind: "query",
+        message: `upsert on ${table}: MySQL cannot limit a duplicate to the conflict columns (${conflictColumns.join(", ")}) while the table has other unique keys (${others.map(key => key.name).join(", ")}). Upsert only on a table whose one unique key besides the primary key is the conflict target, or insert and update inside a transaction.`,
+      });
+    }
+    return columns;
+  }
+
+  /** The update an upsert applies to an existing row: never its key. */
+  private updateValues(
+    data: Record<string, unknown>,
+    options: UpsertOptions
+  ): Record<string, unknown> {
+    const key = new Set(options.conflictColumns);
+    const update: Record<string, unknown> = {};
+    for (const column of options.updateColumns ?? Object.keys(data)) {
+      if (!key.has(column) && column in data) update[column] = data[column];
+    }
+    return update;
+  }
+
+  /** The row matching `where`, by a locking (current) read. */
+  private async lockedRow(
+    db: MySql2Database<AnyRelations>,
+    tableObj: MySqlTable,
+    where: SQL | undefined
+  ): Promise<unknown> {
+    const rows = await db
+      .select()
+      .from(tableObj)
+      .where(where)
+      .limit(1)
+      .for("update");
+    return rows[0];
+  }
+
+  /**
+   * Insert the row, or resolve a duplicate on the target key. The insert is
+   * read back by the primary key it reports, not by the conflict key: a
+   * BEFORE INSERT trigger may have rewritten the conflict value, and the row
+   * stored is the one to return.
+   *
+   * A duplicate is resolved when a row holds the TARGET key, whichever unique
+   * key MySQL names in its error. PostgreSQL checks the target's index before
+   * any other, so a row colliding on the target and on another key resolves
+   * on the target there too; refusing it here because MySQL happened to check
+   * the other index first would answer that case differently. A target row
+   * committed by another transaction after this insert failed is the order in
+   * which that transaction ran first, where PostgreSQL also resolves on it.
+   */
+  private async insertOrResolve(
+    db: MySql2Database<AnyRelations>,
+    tableObj: MySqlTable,
+    data: Record<string, unknown>,
+    options: UpsertOptions,
+    where: SQL | undefined
+  ): Promise<unknown> {
+    let failure: unknown;
+    try {
+      const stored = await this.insertRow(db, tableObj, data);
+      return stored ?? (await this.lockedRow(db, tableObj, where));
+    } catch (error) {
+      // Classified as everything else is, through the driver's own error
+      // under Drizzle's wrapper (`classifyError`).
+      if (this.classifyError(error).kind !== "unique_violation") throw error;
+      failure = error;
+    }
+    const existing = await this.lockedRow(db, tableObj, where);
+    // No row holds the target key: the collision was on another unique key,
+    // refused as `ON CONFLICT (target)` refuses it, as the unique violation the
+    // classifier reads it to be.
+    if (existing === undefined) throw failure;
+    const update = this.updateValues(data, options);
+    if (Object.keys(update).length === 0) return existing;
+    await db.update(tableObj).set(update).where(where);
+    // Read back by the row's primary key as the update left it: the update may
+    // set the key itself (every given column is updated by default, as `ON
+    // CONFLICT DO UPDATE` does elsewhere), and a BEFORE UPDATE trigger may
+    // have changed the conflict value the update was keyed on. A trigger that
+    // changed the primary key instead leaves the conflict value standing, so
+    // the row is looked for there next; one that changed both is not found.
+    const identity = this.byIdentity(tableObj, {
+      ...(existing as Record<string, unknown>),
+      ...update,
+    });
+    const updated =
+      identity === undefined
+        ? undefined
+        : await this.lockedRow(db, tableObj, identity);
+    return updated ?? this.lockedRow(db, tableObj, where);
+  }
+
+  /**
+   * Insert a row and read it back by its primary key: the value the caller
+   * gave, or the one MySQL or the model generated, which `$returningId()`
+   * reports and a given value it does not. Undefined when the table has no
+   * primary key to read by.
+   */
+  private async insertRow(
+    db: MySql2Database<AnyRelations>,
+    tableObj: MySqlTable,
+    data: Record<string, unknown>
+  ): Promise<unknown> {
+    const [generated] = (await db
+      .insert(tableObj)
+      .values(data as never)
+      .$returningId()) as Record<string, unknown>[];
+    // A key the caller gave wins; one given as undefined or null does not hide
+    // the value MySQL generated for it.
+    const given = Object.fromEntries(
+      Object.entries(data).filter(
+        ([, value]) => value !== undefined && value !== null
+      )
+    );
+    const identity = this.byIdentity(tableObj, { ...generated, ...given });
+    return identity === undefined
+      ? undefined
+      : this.lockedRow(db, tableObj, identity);
+  }
+
+  /**
+   * A row's primary key as a condition, from a record keyed as the model's
+   * properties are. Undefined when the table has no primary key or the record
+   * lacks part of it.
+   */
+  private byIdentity(
+    tableObj: MySqlTable,
+    record: Record<string, unknown>
+  ): SQL | undefined {
+    const primary = new Set(keysOf(tableObj).primary);
+    const parts = Object.entries(getColumns(tableObj)).filter(([, column]) =>
+      primary.has(column.name)
+    );
+    if (
+      parts.length === 0 ||
+      parts.some(
+        ([name]) => record[name] === undefined || record[name] === null
+      )
+    ) {
+      return undefined;
+    }
+    return and(
+      ...parts.map(([name, column]) => eq(column, record[name] as never))
+    );
+  }
+
+  /** A `Date` on an undeclared key is spelled as a date field's column spells it. */
+  protected override undeclaredDateColumn(): {
+    mapToDriverValue(value: unknown): unknown;
+  } {
+    return DATE_FIELD_COLUMN;
+  }
+
+  /** A table-level `primaryKey({ columns })`, read through the MySQL table config. */
+  protected override compositePrimaryKey(
+    tableObj: Record<string, unknown>
+  ): object[] {
+    return getTableConfig(
+      tableObj as unknown as MySqlTable
+    ).primaryKeys.flatMap(key => key.columns);
+  }
+
+  private createTransactionContext(
+    connection: PoolConnection
+  ): TransactionContext {
+    // Bind a Drizzle instance to this transaction's checked-out connection so
+    // the delegated CRUD methods run inside the transaction and see its
+    // uncommitted rows. drizzle's mysql2 driver needs the underlying CALLBACK
+    // connection, which the mysql2/promise wrapper exposes on `.connection`
+    // (mirrors the `.pool` unwrap in getDrizzle()); getDrizzle() itself wraps
+    // the pool, which would use a different connection. Built lazily and
+    // memoized: transactions that use only raw execute/insert never construct
+    // it.
+    const txConnection = (
+      connection as unknown as { connection: CallbackConnection }
+    ).connection;
+    const txHandles = this.transactionDrizzleHandles(relations =>
+      relations
+        ? drizzle({ client: txConnection, relations })
+        : drizzle({ client: txConnection })
+    );
+    const txDb = txHandles.bare;
+    return {
+      drizzleWithRelations: txHandles.withRelations,
+
+      execute: async <T = unknown>(
+        sql: string,
+        params: SqlParam[] = []
+      ): Promise<T[]> => {
+        const [rows] = await connection.query<RowDataPacket[]>(
+          sql,
+          params as unknown[]
+        );
+        return rows as T[];
+      },
+
+      // Run on the transaction-bound Drizzle instance rather than the pool, so
+      // the statement is part of this transaction and sees its uncommitted rows.
+      runStatement: async (statement: SQL): Promise<void> => {
+        await txDb().execute(statement);
+      },
+
+      // mysql2 answers a `[rows, fields]` tuple; the transaction-bound instance
+      // keeps the read inside this transaction so it sees its uncommitted writes.
+      queryStatement: async <T = Record<string, unknown>>(
+        statement: SQL
+      ): Promise<T[]> => {
+        const result = await txDb().execute(statement);
+        // A tuple's first element is the rows. Anything else was not understood,
+        // and must not reach a caller as "there is nothing there" — the same
+        // reason the pooled `queryStatement` refuses rather than answering
+        // empty.
+        if (!Array.isArray(result)) {
+          throw this.createDatabaseError(
+            "query",
+            "Drizzle statement returned a result shape this adapter does not recognise; refusing to report it as an empty result.",
+            undefined
+          );
+        }
+        return result[0] as unknown as T[];
+      },
+
+      lockRow: async (table: string, id: SqlParam): Promise<void> => {
+        const idColumn = this.escapeIdentifier("id");
+        await connection.query(
+          `SELECT ${idColumn} FROM ${this.escapeIdentifier(table)} ` +
+            `WHERE ${idColumn} = ? FOR UPDATE`,
+          [id] as unknown[]
+        );
+      },
+
+      insert: async <T = unknown>(
+        table: string,
+        data: Record<string, unknown>,
+        options?: InsertOptions
+      ): Promise<T> => {
+        // Refused before any statement, as the pooled insert is: a table this
+        // instance never registered may not match what its code would write.
+        const insertTableObj = this.resolvedTableObject(table);
+        const mapped = this.mapRowToRawSql(insertTableObj, data);
+        const columns = Object.keys(mapped);
+        const values = Object.values(mapped);
+        const placeholders = this.buildPlaceholders(values.length, 0);
+
+        const sql = `INSERT INTO ${this.escapeIdentifier(table)} (${columns.map(c => this.escapeIdentifier(c)).join(", ")}) VALUES (${placeholders})`;
+
+        const [result] = await connection.query<ResultSetHeader>(sql, values);
+
+        const ret = options?.returning;
+        // No columns requested: skip the select-back reread entirely.
+        if (Array.isArray(ret) && ret.length === 0) {
+          return undefined as T;
+        }
+
+        // MySQL has no RETURNING; select the inserted row back. Project only the
+        // requested columns so a large JSON snapshot is not read unless asked.
+        // Each timestamp's wall clock, spelled out by the database. mysql2
+        // turns one into a `Date` in the LOCAL zone before this code sees it,
+        // and that conversion cannot be undone: a wall clock inside a
+        // daylight-saving gap is normalized away.
+        const aliases = this.dateWallClockAliases(insertTableObj, ret ?? "*");
+        const spelled = aliases
+          .map(
+            a =>
+              `DATE_FORMAT(${this.escapeIdentifier(a.sqlName)}, '%Y-%m-%dT%H:%i:%s.%f') AS ${this.escapeIdentifier(a.alias)}`
+          )
+          .join(", ");
+        const projected =
+          !ret || ret === "*"
+            ? "*"
+            : this.mapColumnNamesToSql(insertTableObj, ret)
+                .map(c => this.escapeIdentifier(c))
+                .join(", ");
+        const selectList = spelled ? `${projected}, ${spelled}` : projected;
+
+        // Prefer the primary key: auto-increment via insertId, otherwise a
+        // supplied id (manually-keyed tables like nextly_versions). Matching by
+        // all values is a last resort because `col = NULL` never matches, so a
+        // row with nullable columns would not be found by that path.
+        const idValue = result.insertId ? result.insertId : mapped.id;
+        if (idValue !== undefined) {
+          const [rows] = await connection.query<RowDataPacket[]>(
+            `SELECT ${selectList} FROM ${this.escapeIdentifier(table)} WHERE id = ?`,
+            [idValue]
+          );
+          return this.mapRowFromRawSql(insertTableObj, rows[0] as T, aliases);
+        }
+
+        const whereClauses = columns.map(
+          c => `${this.escapeIdentifier(c)} = ?`
+        );
+        const [rows] = await connection.query<RowDataPacket[]>(
+          `SELECT ${selectList} FROM ${this.escapeIdentifier(table)} WHERE ${whereClauses.join(" AND ")} LIMIT 1`,
+          values
+        );
+        return this.mapRowFromRawSql(insertTableObj, rows[0] as T, aliases);
+      },
+
+      insertMany: async <T = unknown>(
+        table: string,
+        data: Record<string, unknown>[],
+        options?: InsertOptions
+      ): Promise<T[]> => {
+        if (data.length === 0) return [];
+        const retMany = options?.returning;
+        const skipReread = Array.isArray(retMany) && retMany.length === 0;
+
+        // Refused before any statement, as `insert` above is.
+        const tableObj = this.resolvedTableObject(table);
+        const mappedRecords = data.map(r => this.mapRowToRawSql(tableObj, r));
+        const columns = Object.keys(mappedRecords[0]);
+        const allValues: unknown[] = [];
+        const valuesClauses: string[] = [];
+
+        for (const record of mappedRecords) {
+          const placeholders: string[] = [];
+          for (const col of columns) {
+            allValues.push(record[col]);
+            placeholders.push("?");
+          }
+          valuesClauses.push(`(${placeholders.join(", ")})`);
+        }
+
+        const sql = `INSERT INTO ${this.escapeIdentifier(table)} (${columns.map(c => this.escapeIdentifier(c)).join(", ")}) VALUES ${valuesClauses.join(", ")}`;
+
+        const [result] = await connection.query<ResultSetHeader>(
+          sql,
+          allValues
+        );
+
+        // For bulk insert, we need to SELECT the inserted rows
+        // MySQL's insertId gives the first auto-increment ID
+        if (!skipReread && result.insertId && result.affectedRows > 0) {
+          const ids: number[] = [];
+          for (let i = 0; i < result.affectedRows; i++) {
+            ids.push(result.insertId + i);
+          }
+          const placeholders = ids.map(() => "?").join(", ");
+          const bulkAliases = this.dateWallClockAliases(tableObj, "*");
+          const bulkSpelled = bulkAliases
+            .map(
+              a =>
+                `DATE_FORMAT(${this.escapeIdentifier(a.sqlName)}, '%Y-%m-%dT%H:%i:%s.%f') AS ${this.escapeIdentifier(a.alias)}`
+            )
+            .join(", ");
+          const [rows] = await connection.query<RowDataPacket[]>(
+            `SELECT *${bulkSpelled ? `, ${bulkSpelled}` : ""} FROM ${this.escapeIdentifier(table)} WHERE id IN (${placeholders})`,
+            ids
+          );
+          return (rows as T[]).map(r =>
+            this.mapRowFromRawSql(tableObj, r, bulkAliases)
+          );
+        }
+
+        // Fallback: return empty if we can't determine inserted rows
+        return [];
+      },
+
+      // Adapter-built, as `insert` above is; `transactionUpdate` says why.
+      // A column the model does not declare binds natively, except a `Date`,
+      // spelled as a date field's column spells it (as this path's insert
+      // spells one), and a structured value, sent as JSON
+      // (`bindUnmodeledStructuredAsJson`).
+      update: this.transactionUpdate(
+        txDb,
+        async statement => {
+          // No RETURNING on MySQL: nothing to report, the read-back is by
+          // the caller's predicate.
+          await txDb().execute(statement);
+          return undefined;
+        },
+        // Structured values as JSON text: mysql2's formatter spells an object
+        // as `key = value` pairs and an array as a value list, neither JSON.
+        value => this.bindUnmodeledStructuredAsJson(value)
+      ),
+
+      ...this.createTransactionForwarders(txDb),
+
+      // InnoDB's savepoints, on this transaction's connection, so a part of the transaction can be
+      // undone alone (a failed item of a batch, say) and the rest kept, as on PostgreSQL and SQLite.
+      // A transaction opened inside this one's work still joins it flat: see `joinSteps`. Left
+      // undefined on a server that may refuse them (`takesSavepoints`), so a caller runs its work
+      // without one rather than fail on the SAVEPOINT. The effects held for the transaction are
+      // scoped to each savepoint (`contextSavepointMethods`).
+      ...(this.takesSavepoints
+        ? this.contextSavepointMethods(async statement => {
+            await connection.query(statement);
+          })
+        : {}),
+    };
+  }
+
+  /**
+   * Classifies a MySQL error into a DatabaseError.
+   *
+   * @param error - Original error from mysql2
+   * @param sql - SQL statement that caused the error (optional)
+   * @returns DatabaseError with proper classification
+   */
+  protected override classifyError(
+    error: unknown,
+    sql?: string
+  ): DatabaseError {
+    // Why short-circuit on existing DatabaseError: F17's
+    // UnsupportedDialectVersionError is already a typed DatabaseError with
+    // kind: "unsupported_version" plus detectedVersion/requiredVersion
+    // fields. Re-wrapping it here would erase those fields and re-tag it
+    // as kind: "unknown".
+    if (isDatabaseError(error)) return error;
+
+    // Classified from mysql2's own error, which Drizzle puts on `cause` when it
+    // wraps a failed query (`driverErrorIn`); it is the one carrying `errno`.
+    const mysqlError = this.driverErrorIn<{
+      errno?: number;
+      code?: string;
+      sqlState?: string;
+      message?: string;
+      sql?: string;
+      cause?: unknown;
+    }>(error, candidate => typeof candidate.errno === "number");
+
+    // Determine error kind from MySQL error number
+    const kind: DatabaseErrorKind =
+      (mysqlError.errno && MYSQL_ERROR_CODES[mysqlError.errno]) || "unknown";
+
+    // Build error message
+    let message = mysqlError.message ?? String(error);
+    if (sql && kind === "query") {
+      message = `Query failed: ${message}`;
+    }
+
+    return createDatabaseError({
+      kind,
+      message,
+      code: mysqlError.code ?? mysqlError.errno?.toString(),
+      detail: mysqlError.sql,
+      cause: error instanceof Error ? error : undefined,
+    });
+  }
+}
+
+/** A table's keys by database column name, as its model declares them. */
+interface TableKeys {
+  primary: string[];
+  unique: { name: string; columns: string[] }[];
+}
+
+const TABLE_KEYS = new WeakMap<MySqlTable, TableKeys>();
+
+/**
+ * A table's primary key and its unique keys other than the primary key, read
+ * from its model once and kept for the table's lifetime: a model is not
+ * changed in place, a new schema brings new table objects.
+ */
+function keysOf(tableObj: MySqlTable): TableKeys {
+  const cached = TABLE_KEYS.get(tableObj);
+  if (cached) return cached;
+  const config = getTableConfig(tableObj);
+  const primary = [
+    ...config.columns.filter(column => column.primary),
+    ...config.primaryKeys.flatMap(key => key.columns),
+  ].map(column => column.name);
+  const unique = [
+    ...config.columns
+      .filter(column => column.isUnique && !column.primary)
+      .map(column => ({
+        // Drizzle's own name for an unnamed column-level unique key.
+        name: column.uniqueName ?? `${config.name}_${column.name}_unique`,
+        columns: [column.name],
+      })),
+    ...config.uniqueConstraints.map(constraint => ({
+      name: constraint.name,
+      columns: constraint.columns.map(column => column.name),
+    })),
+    ...config.indexes
+      .filter(index => index.config.unique === true)
+      .map(index => ({
+        name: index.config.name,
+        columns: (index.config.columns as { name: string }[]).map(
+          column => column.name
+        ),
+      })),
+  ];
+  const keys = { primary, unique };
+  TABLE_KEYS.set(tableObj, keys);
+  return keys;
+}
+
+/**
+ * Create a MySQL database adapter.
+ *
+ * @param config - MySQL adapter configuration
+ * @returns A new MySqlAdapter instance
+ *
+ * @example
+ * ```typescript
+ * // Simple usage with URL
+ * const adapter = createMySqlAdapter({
+ *   url: 'mysql://user:pass@localhost:3306/mydb',
+ * });
+ *
+ * // Full configuration
+ * const adapter = createMySqlAdapter({
+ *   url: process.env.DATABASE_URL!,
+ *   pool: {
+ *     min: 2,
+ *     max: 20,
+ *     idleTimeoutMs: 30000,
+ *     connectionTimeoutMs: 10000,
+ *   },
+ *   ssl: {
+ *     rejectUnauthorized: true,
+ *   },
+ * });
+ *
+ * await adapter.connect();
+ * ```
+ */
+export function createMySqlAdapter(config: MySqlAdapterConfig): MySqlAdapter {
+  return new MySqlAdapter(config);
+}
+
+/**
+ * Type guard to check if a value is a MySqlAdapter.
+ *
+ * @param value - Value to check
+ * @returns True if value is a MySqlAdapter instance
+ *
+ * @example
+ * ```typescript
+ * if (isMySqlAdapter(adapter)) {
+ *   // TypeScript knows adapter is MySqlAdapter
+ *   console.log('Using MySQL');
+ * }
+ * ```
+ */
+export function isMySqlAdapter(value: unknown): value is MySqlAdapter {
+  return value instanceof MySqlAdapter;
+}

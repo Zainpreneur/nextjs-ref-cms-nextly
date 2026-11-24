@@ -1,0 +1,129 @@
+/**
+ * `registerCoreWidgetComponents` actually REGISTERS, at runtime.
+ *
+ * 🔴 A sibling test compares the two lists as text and cannot prove this. A
+ * syntax scan sees call-shaped source; it does not see the call run. If the
+ * module-scope invocation in `WidgetGrid` were removed, a registration moved
+ * behind a branch that never executes, or the function returned early, both
+ * scanned lists would still agree while `PluginSlot` drew its unresolved
+ * fallback for every reader.
+ *
+ * ## Why the mocks, and what they cost
+ *
+ * `core-components.ts` cannot be imported directly: it imports the dashboard's
+ * cards, and a card reaching the `@admin/hooks/queries` barrel reaches
+ * `pages/dashboard/index.tsx`, which imports `WidgetGrid`, which
+ * calls `registerCoreWidgetComponents()` at module scope -- re-entering the
+ * module being evaluated. Importing it throws before a single case runs, and
+ * that cycle is pre-existing rather than introduced by these cards.
+ *
+ * Each card component is replaced with a stub, which cuts the graph at the
+ * first edge and leaves the module under test untouched. What that costs is
+ * honest to state: this proves the registry receives a component for each path,
+ * not that the component is the real one -- the sibling text scan is what pins
+ * the paths themselves. The two together are the boundary; neither alone is.
+ */
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const stub = () => null;
+
+// Cut at the components, not at the registry: the registry is the thing under
+// test, and mocking it would leave this asserting its own mock.
+vi.mock("@admin/components/features/dashboard/SetupCard", () => ({
+  SetupCard: stub,
+}));
+vi.mock("@admin/components/features/dashboard/TeamSummary", () => ({
+  TeamSummary: stub,
+}));
+// The card the dashboard draws, answered by `system:activity`; the section of
+// the same name is deprecated and no longer registered.
+vi.mock("@admin/components/features/dashboard/TeamActivity", () => ({
+  TeamActivityCard: stub,
+}));
+vi.mock("@admin/components/features/dashboard/UpcomingReleases", () => ({
+  UpcomingReleasesCard: stub,
+}));
+
+describe("core widget components register at runtime", () => {
+  beforeEach(async () => {
+    const { componentRegistry } = await import(
+      "@admin/lib/plugins/component-registry-internal"
+    );
+    componentRegistry.clear();
+  });
+
+  it("registers every path a core card names", async () => {
+    const { hasComponent } = await import(
+      "@admin/lib/plugins/component-registry"
+    );
+    const { registerCoreWidgetComponents } = await import("../core-components");
+
+    // The control, BEFORE the call: every path must be absent first, or a
+    // registry left populated by another module would satisfy the assertions
+    // below without this function having run at all.
+    expect(hasComponent("core#TeamActivity")).toBe(false);
+    expect(hasComponent("core#TeamSummary")).toBe(false);
+
+    registerCoreWidgetComponents();
+
+    for (const path of [
+      "core#Setup",
+      "core#ContentTable",
+      "core#TeamSummary",
+      "core#TeamActivity",
+      "core#UpcomingReleases",
+    ]) {
+      expect(hasComponent(path), `${path} is not registered`).toBe(true);
+    }
+  });
+
+  it("no longer registers the Content tile card's path, only the table's", async () => {
+    const { hasComponent } = await import(
+      "@admin/lib/plugins/component-registry"
+    );
+    const { registerCoreWidgetComponents } = await import("../core-components");
+
+    registerCoreWidgetComponents();
+
+    // The control: the call ran, so an absence below is the path being gone.
+    expect(hasComponent("core#ContentTable")).toBe(true);
+    expect(hasComponent("core#CollectionQuickLinks")).toBe(false);
+  });
+
+  it("registers Continue where you left off, and no longer Recently edited", async () => {
+    const { hasComponent } = await import(
+      "@admin/lib/plugins/component-registry"
+    );
+    const { registerCoreWidgetComponents } = await import("../core-components");
+
+    registerCoreWidgetComponents();
+
+    // The control: the call ran, so an absence below is the path being gone.
+    expect(hasComponent("core#ContinueCard")).toBe(true);
+    expect(hasComponent("core#RecentlyEdited")).toBe(false);
+  });
+
+  it("registers no Create card: creating is the header's New button", async () => {
+    const { hasComponent } = await import(
+      "@admin/lib/plugins/component-registry"
+    );
+    const { registerCoreWidgetComponents } = await import("../core-components");
+    registerCoreWidgetComponents();
+    // Registration ran, so its absence is the registry's answer, not an empty one.
+    expect(hasComponent("core#TeamSummary")).toBe(true);
+    expect(hasComponent("core#QuickCreate")).toBe(false);
+  });
+
+  it("resolves each path to something renderable", async () => {
+    const { getComponent } = await import(
+      "@admin/lib/plugins/component-registry"
+    );
+    const { registerCoreWidgetComponents } = await import("../core-components");
+
+    registerCoreWidgetComponents();
+
+    // `hasComponent` alone would pass on a path registered with `undefined`,
+    // which is the shape a broken import produces.
+    expect(typeof getComponent("core#TeamActivity")).toBe("function");
+  });
+});

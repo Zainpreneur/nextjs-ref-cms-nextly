@@ -1,0 +1,231 @@
+/**
+ * `core/list` — an ordered or unordered list.
+ *
+ * Items are stored as an array of strings and rendered as real `<li>` elements,
+ * so the list is announced with its length and position ("item 2 of 5"). A
+ * paragraph of manually typed bullets loses all of that.
+ *
+ * @module blocks/list
+ */
+import {
+  type BlockDefinition,
+  defineBlock,
+  itemPropName,
+} from "@nextlyhq/blocks-engine";
+import type { ReactElement } from "react";
+
+import type { BlockRenderArgs, PageContext } from "../context";
+
+import { CONTENT } from "./categories";
+import { number, oneOf, text } from "./props";
+
+export const LIST_KINDS = ["unordered", "ordered", "checks", "none"] as const;
+
+/** The mark a bulleted list drawn another way carries: its kind. */
+const KIND_ATTRIBUTE = "data-nx-list";
+
+/**
+ * The markers Checks and None draw, which no stored style can say: a tick in
+ * the text's colour (a `::marker` takes the item's colour), or none. Under
+ * the page's root, so it outweighs the list's own default marker and loses
+ * to a marker an author set on the block. None keeps `role="list"` on the
+ * element, since a list drawn with no markers is otherwise not announced as
+ * one by every screen reader. Hoisted and deduped by React, one per page.
+ */
+const LIST_KIND_CSS = [
+  `.nx-pb-page [${KIND_ATTRIBUTE}="checks"]{list-style-type:"\\2713\\00a0"}`,
+  `.nx-pb-page [${KIND_ATTRIBUTE}="none"]{list-style-type:none}`,
+].join("");
+
+/** The key the list kinds' rule is hoisted under. */
+const LIST_KIND_STYLE_KEY = "nx-list-kinds";
+
+/**
+ * How many items are rendered from one stored list.
+ *
+ * A stored array has no length of its own — the document's caps bound node count
+ * and depth, never a prop array — so `items` arrives at whatever length was
+ * written. Past the renderer's own inspection budget the normalizer refuses the
+ * whole output, and the block becomes a broken-block placeholder: an
+ * accidentally long list loses EVERY item rather than the ones past the end.
+ *
+ * Clamping trades the tail for the body, which is the better failure by a wide
+ * margin. The number sits far above any list a person writes and far below the
+ * budget, so the block still has room for its wrapper and nothing hand-authored
+ * ever reaches it.
+ */
+const MAX_ITEMS = 1_000;
+
+export interface ListProps {
+  /**
+   * How the items are marked: bullets, numbers (the order is meaningful),
+   * ticks, or nothing.
+   */
+  kind?: (typeof LIST_KINDS)[number];
+  /** The items, in order. */
+  items?: string[];
+  /** The first number of an ordered list. */
+  start?: number;
+}
+
+export function renderList({
+  props,
+  className,
+  markProp,
+}: BlockRenderArgs<ListProps>): ReactElement {
+  // A stored array can hold anything, and a non-string item would reach React
+  // as a child it cannot render. Coerced rather than dropped, so an item typed
+  // as a number still appears where its author put it.
+  const stored: unknown = props.items;
+  // Sliced BEFORE the map, so an oversized array is never walked in full: the
+  // work this bounds is the work of reading it, not just of rendering it.
+  const items = Array.isArray(stored)
+    ? stored.slice(0, MAX_ITEMS).map(item => text(item))
+    : [];
+  const children = items.map((item, index) => (
+    // The index is the key because the items have no identity of their own:
+    // they are strings in an array, and two identical strings are the same
+    // value. Reordering re-renders the text, which is all there is to preserve.
+    // Each item marked with its own address, so the canvas edits it as a
+    // line of its own and writes the list back.
+    <li key={index} {...markProp?.(itemPropName("items", index))}>
+      {item}
+    </li>
+  ));
+
+  const kind = oneOf(props.kind, LIST_KINDS, "unordered");
+  if (kind === "ordered") {
+    const start = number(props.start, { min: 1, max: 1_000_000, fallback: 1 });
+    return (
+      <ol className={className} {...(start === 1 ? {} : { start })}>
+        {children}
+      </ol>
+    );
+  }
+  if (kind === "unordered") return <ul className={className}>{children}</ul>;
+  return (
+    <ul
+      className={className}
+      {...{ [KIND_ATTRIBUTE]: kind }}
+      {...(kind === "none" ? { role: "list" } : {})}
+    >
+      <style href={LIST_KIND_STYLE_KEY} precedence="default">
+        {LIST_KIND_CSS}
+      </style>
+      {children}
+    </ul>
+  );
+}
+
+// Defined against the ENGINE's `defineBlock`, not the plugin SDK's: the engine
+// declares the contract and the SDK re-exports it for third parties. The
+// context is named rather than augmented, so a block compiled against the
+// published types is typed the same as one compiled here. See `./index.ts`.
+/**
+ * What restores a list's markers after a reset has removed them.
+ *
+ * A list without markers is not a plainer list, it is a stack of paragraphs:
+ * the one thing that distinguishes an item from a line of text is gone, and the
+ * reader loses the grouping the markup still claims. Tailwind's Preflight sets
+ * `list-style: none` on every `ul` and `ol` and says so in a comment, and this
+ * library's own scaffold imports it — so on a site built from `create-nextly-app`
+ * this is a repair rather than a decoration.
+ *
+ * **`revert` rather than a marker, because one rule serves two elements.** This
+ * block renders `<ul>` or `<ol>` from a PROP, and both wear the same block-type
+ * class, so a rule naming `disc` would put bullets on ordered lists. `revert`
+ * rolls back to the user-agent value for whichever element it lands on, which
+ * is discs for one and numerals for the other, and it stays correct if the prop
+ * grows a third kind.
+ *
+ * The inline padding is the other half. A marker is drawn OUTSIDE the content
+ * box, so restoring one to a list whose padding a reset has zeroed paints it
+ * beyond the element's own edge — clipped by any ancestor that hides overflow,
+ * which `core/card` does in order to make its own rounding mean something.
+ *
+ * **`2.5em`, which is what a browser itself reserves.** Measured at 16px system
+ * UI rather than reasoned about: `99.` is 23.6px, `999.` is 33.4px, `9999.` is
+ * 43.3px, and a bullet is 7.2px. An earlier `2.5ch` gutter came to 25.2px and
+ * so began clipping at THREE digits — an ordinary list of a hundred items, not
+ * an exotic one. `2.5em` is 40px and carries three comfortably.
+ *
+ * It does not carry four, and no fixed gutter carries the `start` this block
+ * accepts, which runs to 1,000,000. That is a property of the range rather than
+ * of this default, and a browser's own list has exactly the same limit at
+ * exactly the same width; a list numbered into the thousands wants a gutter its
+ * author chose. What this value must not do is clip a case a browser would have
+ * shown, and at 40px it does not.
+ */
+const LIST_BASE_STYLES = {
+  base: {
+    base: {
+      listStyleType: "revert",
+      padding: { inlineStart: "2.5em" },
+    },
+  },
+} as const;
+
+export const list: BlockDefinition<ListProps, PageContext> = defineBlock({
+  name: "core/list",
+  version: 1,
+  // What an author reads, in the Add panel and the block card: one plain line.
+  // What the block does, for whoever maintains it: An ordered or unordered list
+  // of items, rendered as real list elements so its length and positions are
+  // announced.
+  description: "A bulleted or numbered list.",
+  // Palette metadata. The category is imported rather than spelled here so
+  // nineteen blocks cannot drift into nineteen headings; keywords are what
+  // let a search for a word the description never uses still find this.
+  editor: {
+    label: "List",
+    icon: "list",
+    category: CONTENT,
+    keywords: ["bullets", "ordered", "unordered", "items"],
+  },
+  baseStyles: LIST_BASE_STYLES,
+  props: {
+    kind: {
+      label: "List as",
+      optionLabels: {
+        unordered: "Bullets",
+        ordered: "Numbers",
+        checks: "Checks",
+        none: "None",
+      },
+      type: "select",
+      options: [...LIST_KINDS],
+    },
+    // Typed on the canvas item by item: Enter adds the next, Backspace in an
+    // empty one removes it.
+    items: {
+      label: "Items",
+      role: "content",
+      type: "array",
+      of: "text",
+      inline: true,
+    },
+    // Only a numbered list counts, so the number it starts at is offered only
+    // while the list is one; a stored start on a bulleted list is kept.
+    start: {
+      label: "Start at",
+      type: "number",
+      min: 1,
+      onlyWhen: { kind: ["ordered"] },
+    },
+  },
+  defaultProps: { kind: "unordered", items: [] },
+  example: { props: { kind: "unordered", items: ["First", "Second"] } },
+  supports: {
+    // The one block whose rendered element has markers to control.
+    list: true,
+    typography: true,
+    color: true,
+    background: true,
+    spacing: true,
+    dimensions: true,
+    border: true,
+    effects: true,
+    position: true,
+  },
+  render: renderList,
+});

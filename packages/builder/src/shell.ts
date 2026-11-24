@@ -1,0 +1,1063 @@
+/**
+ * The editor shell, published as its own entry because it is a CLIENT one.
+ *
+ * The shell is a client component, and Rollup drops per-module `"use client"`
+ * directives while bundling, so the directive has to be re-applied to the built
+ * file as a banner. A banner applies to the WHOLE artifact and to everything it
+ * re-exports — which is why this is a separate entry rather than part of the
+ * root barrel.
+ *
+ * Put in the root barrel, the shell's banner would have marked the frame
+ * geometry as client-only too. Those helpers are plain arithmetic that a Server
+ * Component is meant to be able to call, and they were part of this package's
+ * public surface before the shell existed, so the banner would have been a
+ * silent regression for anyone already importing them: the export map would go
+ * on advertising a callable function while the artifact delivered a client
+ * reference. Splitting the entry keeps the boundary where the React actually is.
+ *
+ * The props type is still described from the root entry — a type is erased, so
+ * it carries no boundary with it.
+ *
+ * @module @nextlyhq/builder/shell
+ */
+
+export { BuilderShell } from "./shell/builder-shell";
+export type { BuilderShellProps } from "./shell/builder-shell";
+/**
+ * The shell's preferences kept per signed-in user, for a host that knows who
+ * is signed in: pass it as `store`. @experimental
+ */
+export { userPreferenceStore } from "./shell-state";
+/**
+ * Opens a store under a key, for a host whose browser storage follows rules
+ * of its own: pass it to `userPreferenceStore`. @experimental
+ */
+export type { OpenPreferenceStore } from "./shell-state";
+
+/**
+ * The compiled cascade behind the page, for chrome that names where a value
+ * came from.
+ *
+ * On the CLIENT entry rather than the root one. It reaches
+ * `@nextlyhq/blocks-react` to compile, so publishing it from the server-safe
+ * barrel would pull a React dependency into an artifact whose whole contract is
+ * that a Server Component can call everything in it.
+ *
+ * Exported at all because the HOST is the only surface holding both halves the
+ * compile needs — the document and the site's breakpoints — while the panel that
+ * reads the answer sits several layers below. Compiling once at the top is what
+ * keeps the cascade from being walked per control; `style-trace.ts` says why it
+ * is compiled a second time.
+ */
+/*
+ * The inspector's own answer to whether it can show anything for a selection,
+ * exported because a HOST needs it.
+ *
+ * A host drawing both the panel and the canvas has to keep them agreeing about
+ * the interaction state, and the panel withholds its whole tab strip — the
+ * state control with it — for a selection it cannot inspect. An unregistered
+ * block type is that case and reads as one ordinary selection to anything
+ * counting ids, so a host deriving the answer itself gets it wrong on exactly
+ * the input the predicate exists for.
+ *
+ * A pure function over a document, so it crosses this entry carrying no state
+ * and no React.
+ */
+export { lockViewOf, selectionIsInspectable } from "./inspector/inspector";
+export { pageStyleTrace } from "./styles/style-trace";
+
+/**
+ * Whether the surrounding shell is interactive.
+ *
+ * Exported for slot content that PORTALS out of the shell, which the shell cannot reach with
+ * `hidden` and `inert` and so has to inform instead.
+ */
+export { useShellIsActive } from "./shell/shell-active";
+
+/**
+ * The command palette, published here beside the shell because it is a client
+ * component for the same reason: it holds React state and registers a keyboard
+ * binding through the shell's provider, so it belongs behind the same banner.
+ *
+ * Its types are described from the root entry, which stays server-callable.
+ */
+export { COMMAND_PALETTE_KEYS, CommandPalette } from "./shell/command-palette";
+export type {
+  BuilderCommand,
+  CommandPaletteProps,
+} from "./shell/command-palette";
+
+/**
+ * The canvas, behind the same client banner and for a stricter reason than the
+ * shell's: it holds a pointer handler and renders `PageRenderer`, so it is
+ * interactive in its own right rather than merely stateful.
+ *
+ * `CANVAS_ROOT_CLASS` and `nodeIdFromEvent` ship beside it rather than from the
+ * root entry even though neither touches React. They describe how a DOM element
+ * is matched to a node id, which is only answerable where that DOM exists, and
+ * splitting them across two entries would let a host read the attribute name
+ * from a server module while the writer lives behind the boundary — two halves
+ * of one contract that could then be versioned apart.
+ */
+export {
+  CANVAS_ROOT_CLASS,
+  Canvas,
+  DropRefusal,
+  nodeIdFromEvent,
+  revealedDefinitions,
+} from "./canvas/canvas";
+
+/**
+ * @experimental Which blocks' visibility conditions the page can't check, for
+ * a host to hand the canvas so it badges them in red: judged as the save
+ * judges them, with the collections the editor's services list.
+ */
+export { useConditionsUnchecked } from "./conditions/condition-checks";
+
+/**
+ * @experimental The frame the canvas is drawn in, and how the code around the
+ * canvas learns about it.
+ *
+ * `CanvasFrame` is both the component and the type `useCanvasFrame` answers
+ * with: what the frame is, its document and window, its painted scale and
+ * viewport, and the point mapping between it and the editor. The provider
+ * goes ABOVE the editor's shell, so the panels, the toolbar and the keys
+ * outside the canvas see the frame the canvas registers into it.
+ *
+ * `CanvasMarks` draws the selection and the drop container over the page.
+ *
+ * A `CanvasFrameSource` says where the frame's page comes from: the editor's
+ * blank page, or a page the site serves so the canvas is drawn inside the
+ * site's own layout, with `onSourceFallback` told when that page cannot be
+ * shown.
+ */
+export {
+  CanvasFrame,
+  CANVAS_FRAME_TITLE_PREFIX,
+  canvasFrameTitle,
+} from "./canvas/canvas-frame";
+export type {
+  BlankFrameSource,
+  CanvasFrameFallback,
+  CanvasFrameProps,
+  CanvasFrameSource,
+  SiteChromeDrawn,
+  SiteFrameSource,
+} from "./canvas/canvas-frame";
+export {
+  CanvasFrameProvider,
+  useCanvasFrame,
+} from "./canvas/canvas-frame-context";
+/**
+ * @experimental Where the docs explain the canvas route, for a note saying the
+ * canvas is drawn without the site's layout.
+ */
+export {
+  CANVAS_ROUTE_DOCS_HREF,
+  SITE_CODE_POLICY_DOCS_HREF,
+} from "./shell/docs-links";
+export { CanvasMarks } from "./canvas/canvas-marks";
+/**
+ * @experimental The line where the Add panel's highlighted tile would land,
+ * drawn in the canvas's overlay.
+ */
+export { InsertionLine } from "./canvas/insertion-line";
+
+/**
+ * @experimental Hold the editor's shortcuts while something modal is over it.
+ *
+ * From THIS entry rather than the root, which carries no `"use client"` banner
+ * and is documented as callable from a Server Component. The hook reaches
+ * `useShortcuts`, so exporting it there would pull the design system's client
+ * barrel into a module a server build is entitled to load — the contract the
+ * root entry states about itself, broken by one re-export.
+ *
+ * Published at all because a modal the editor RAISES is not always the editor's
+ * own: a host draws the form its verbs open, and a focus trap does nothing about
+ * shortcuts — the canvas's bindings sit on the document, so Delete and
+ * Alt+Arrow reach the page behind the dialog.
+ */
+export { useModalKeyboardHold } from "./shell/modal-keyboard-hold";
+export type { CanvasProps } from "./canvas/canvas";
+// The regions of a page's layout around the page on the canvas, and which one
+// is selected.
+export type {
+  CanvasRegion,
+  EmptyRegionAnchor,
+  EmptyRegionBandProps,
+} from "./canvas/canvas-regions";
+export {
+  EMPTY_REGION_ATTRIBUTE,
+  REGION_ATTRIBUTE,
+} from "./canvas/canvas-regions";
+export {
+  useRegionSelection,
+  type RegionSelection,
+} from "./canvas/region-selection";
+/*
+ * A region of the page's layout edited in place: which document the editor
+ * edits and the second state that edits a region, the canvas's input for it,
+ * the bar for the strip above the canvas and the dim over the page.
+ * Experimental until editing a header or footer in place settles.
+ */
+export type { CanvasEditingRegion } from "./canvas/canvas-props";
+export {
+  RegionEditingScrim,
+  type RegionEditingScrimProps,
+} from "./canvas/region-editing-scrim";
+export {
+  canvasEditingOf,
+  regionEscape,
+  useEditingTarget,
+  type EditingTarget,
+  type EditingTargetState,
+  type RegionEditing,
+  type RegionEditingWords,
+  type RegionStateArgs,
+} from "./shell/editing-target";
+export {
+  RegionEditingBar,
+  type RegionEditingBarProps,
+} from "./shell/region-editing-bar";
+
+/**
+ * The inserter, behind the same client banner as the shell it fills: it holds
+ * search state and composes the command primitives, so it is interactive in its
+ * own right.
+ *
+ * Published here rather than from the root for the reason the canvas is — the
+ * root entry stays server-callable, and a value re-export of a client component
+ * would make importing the frame geometry pull React into a server bundle.
+ *
+ * The derivations it draws from are deliberately NOT re-exported beside it.
+ * They are the editor's internal answer to what may be inserted where, and
+ * publishing them would invite a host to compute a palette of its own — which
+ * is the second implementation of the nesting rule that the engine exists to
+ * prevent.
+ */
+/**
+ * The inspector, behind the same client banner: it holds draft field state and
+ * writes through the store.
+ *
+ * The derivations it draws from are not re-exported beside it, for the reason
+ * the inserter's are not — which props a block exposes is the editor's answer,
+ * and publishing it invites a host to build a second inspector that disagrees
+ * with this one about the merge rule for a patch.
+ */
+export { InspectorPanel } from "./inspector/inspector-panel";
+export type {
+  BlockInspectorResolver,
+  InspectorPanelProps,
+} from "./inspector/inspector-panel";
+/**
+ * A bound image's Fallback row: an image address, shown with its picture,
+ * and a reserved place for choosing a library file. The inspector draws it
+ * under a bound image's chip; exported so the same row can be given more
+ * ways to fill it without a second implementation. @experimental
+ */
+export { ImageBindingFallback } from "./bindings/image-binding-fallback";
+export type { ImageBindingFallbackProps } from "./bindings/image-binding-fallback";
+// What a host tells the inspector about the component it edits, beside it.
+export type { ComponentFieldsHost } from "./panels/components/component-fields";
+// The banner over a component's own view: its name, its reach, and Back.
+export { ComponentBanner } from "./shell/component-banner";
+export type { ComponentBannerProps } from "./shell/component-banner";
+// And about its variants: how many placements chose one, for the delete dialog.
+export type {
+  ComponentVariantsHost,
+  VariantPreviewBinding,
+  VariantUse,
+} from "./panels/components/component-variants";
+// The variant open in a component's view, previewed on the host's canvas.
+export { useVariantPreview, VariantPreviewTag } from "./canvas/variant-preview";
+export type { VariantPreviewState } from "./canvas/variant-preview";
+// The one row of tags over the canvas: the variant previewed.
+export { CanvasPreviewTags } from "./canvas/canvas-preview-tags";
+export type { CanvasPreviewTagsProps } from "./canvas/canvas-preview-tags";
+
+/**
+ * The Style half of the same inspector.
+ *
+ * Exported beside it rather than only through it, because a host embedding the
+ * editor in a surface of its own may have somewhere else to put styling — and
+ * withholding it would invite exactly the second implementation the note above
+ * is about. Mounting BOTH is the ordinary case and needs nothing here:
+ * `InspectorPanel` already renders this one under its Style tab.
+ */
+export { StyleInspectorPanel } from "./inspector/style-inspector/style-inspector-panel";
+export type { StyleInspectorPanelProps } from "./inspector/style-inspector/style-inspector-panel";
+
+export { InsertPanel } from "./panels/add/insert-panel";
+export type {
+  InsertPanelProps,
+  LibraryTierState,
+} from "./panels/add/insert-panel";
+/**
+ * The in-place picker: a small dialog that adds a block where the author is
+ * looking, from the Add panel's own offers. A host keeps its state with
+ * `useInsertPicker`, opens it with an anchor (`elementAnchor` for a control,
+ * `selectionAnchor` for "/"), and provides where insert counts are kept with
+ * `InsertUsageContext`. @experimental
+ */
+export { InsertPicker, useInsertPicker } from "./panels/add/insert-picker";
+export type { InsertPickerState } from "./panels/add/insert-picker";
+export type {
+  InsertPickerProps,
+  InsertPickerTarget,
+  InsertPlace,
+} from "./panels/add/insert-picker-types";
+export {
+  elementAnchor,
+  selectionAnchor,
+} from "./panels/add/insert-picker-anchor";
+export { InsertUsageContext } from "./panels/add/insert-usage";
+export { ComponentsPanel } from "./panels/components/components-panel";
+export type { ComponentsPanelProps } from "./panels/components/components-panel";
+// The shape a host hands the panel for the pattern tier. Published beside the
+// panel because supplying `patterns` is impossible without it: a caller loads
+// rows from a plugin's collection and has to know which fields the palette
+// reads before it can map them.
+export type { SavedPattern } from "./panels/add/inserter";
+// What the panel's `renderPicture` is handed: a saved section as offered,
+// carrying the document its picture is drawn from.
+export type { PatternInsertEntry } from "./panels/add/inserter";
+
+/**
+ * A small picture of a document, wherever an author chooses one: drawn by the
+ * canvas's renderer, inert, waiting until it is on screen, with plain icons
+ * for nothing to draw and for a document that can't be drawn. The host
+ * decides what to draw; a session it keeps for as long as it edits lets its
+ * pictures share what async blocks drew. @experimental
+ */
+export { DocumentMiniature } from "./shared/document-miniature";
+export type {
+  DocumentMiniatureProps,
+  MiniatureRender,
+} from "./shared/document-miniature";
+/**
+ * The parts a picture is made of, for a surface that sizes its own box (the
+ * entry page's miniature): when it is first seen, the scale that fits the
+ * composed width, and the inert surface drawn at it. @experimental
+ */
+export {
+  createMiniatureSession,
+  MINIATURE_RENDER_WIDTH,
+  MiniatureSurface,
+  useFirstSeen,
+  useMiniatureSession,
+  useWidthScale,
+} from "./shared/miniature-surface";
+export type {
+  MiniatureSession,
+  MiniatureSurfaceProps,
+} from "./shared/miniature-surface";
+
+/**
+ * The site's breakpoints, as a trigger and the dialog behind it.
+ *
+ * The MANAGER is published and the dialog is not. A host needs the pair —
+ * something to click and something to edit in — and publishing the dialog alone
+ * would leave every host inventing the same open state, while publishing both
+ * would offer two ways to mount one feature that must agree about when the
+ * saved set has actually been read.
+ */
+export {
+  authoredBreakpoints,
+  BASE_DEVICE_LABEL,
+  sameBreakpoints,
+} from "./styles/breakpoints";
+export { BreakpointManager } from "./shell/breakpoint-manager";
+export type { BreakpointManagerProps } from "./shell/breakpoint-manager";
+
+/**
+ * The control that sizes the canvas, and the derivations behind it.
+ *
+ * Published together because they are one answer read from two places. The
+ * switcher SETS a width; `editedBreakpointAtWidth` and `breakpointsAtWidth`
+ * turn the width the box actually got into the tier an edit lands in and the
+ * tiers that are live. A host given only the control would have to derive those
+ * itself, and a second derivation of "which tier is this box in" is exactly the
+ * disagreement between the canvas and the inspector that deriving from one
+ * width exists to make unrepresentable.
+ *
+ * On the CLIENT entry: the switcher is a component, and the derivations travel
+ * with it rather than from the root barrel so a host imports the pair from one
+ * place.
+ */
+export { BreakpointSwitcher } from "./shell/breakpoint-switcher";
+export type { BreakpointSwitcherProps } from "./shell/breakpoint-switcher";
+// The top bar's light and dark preview, placed by the host beside the devices.
+export { DarkPreviewSwitch } from "./shell/dark-preview-switch";
+export type { DarkPreviewSwitchProps } from "./shell/dark-preview-switch";
+
+/**
+ * The canvas zoom, and the control that names it.
+ *
+ * The control is a client component and belongs here; the model beside it is
+ * pure and is exported from the root entry as well, so a host can read a stored
+ * preference without pulling a component into a server render.
+ */
+export { CanvasZoomControl } from "./canvas/canvas-zoom-control";
+export type { CanvasZoomControlProps } from "./canvas/canvas-zoom-control";
+// The type alone: a host threading a zoom through this entry should not have
+// to import the model from a second one.
+export type { CanvasZoom } from "./canvas/canvas-zoom";
+export {
+  breakpointsAtWidth,
+  DESKTOP_PREVIEW_WIDTH,
+  editedBreakpointAtWidth,
+  editingBreakpointOf,
+  offeredTiers,
+  previewHeight,
+  previewWidth,
+  selectableTiers,
+  widthForBreakpoint,
+} from "./canvas/canvas-width";
+
+/**
+ * The editor's keyboard actions — moving, deleting, undoing — behind the same
+ * client banner.
+ *
+ * ONE component rather than a set, because they share a live region: two
+ * regions announcing the same author's actions read them twice, and a listener
+ * has no way to tell which to believe.
+ *
+ * Published as a component as well as a hook because the shell provides the
+ * shortcut context: whatever renders the shell is outside it, so only a child
+ * of the shell can register bindings.
+ */
+export {
+  BlockKeyboardActions,
+  useBlockActionsContext,
+  useBlockKeyboardActions,
+} from "./shell/keyboard-actions";
+export type {
+  BlockActions,
+  BlockKeyboardActionsOptions,
+  BlockKeyboardActionsResult,
+  ComponentVerbsHost,
+  SharedStyleVerbHost,
+} from "./shell/keyboard-actions";
+// Which way "Turn into component…" may go, as the host is told when it opens.
+export type { TurnIntoChoice } from "./canvas/toolbar-actions";
+
+/**
+ * The floating toolbar, from this entry because it is a client component and
+ * because it only works below `BlockKeyboardActions`.
+ *
+ * It presses the verbs that component publishes rather than applying ops of its
+ * own, which is what keeps one gesture having one answer — and what lets both
+ * the button and the keystroke announce into the single live region.
+ */
+/**
+ * The command palette, assembled and mounted for the editor.
+ *
+ * From this entry because it is a client component and because it only works
+ * below `BlockKeyboardActions`, whose verbs it runs. A host that wants to build
+ * its own list uses `CommandPalette` with `builderCommands` instead.
+ */
+export { EditorCommandPalette } from "./shell/editor-command-palette";
+export type { EditorCommandPaletteProps } from "./shell/editor-command-palette";
+
+/**
+ * The right-click menu over the canvas.
+ *
+ * Beside the palette because the two are the same kind of thing: a surface the
+ * editor assembles from the verbs context so a host does not have to know the
+ * three separate facts that mounting one correctly requires.
+ */
+export { BlockContextMenu } from "./canvas/block-context-menu";
+export type { BlockContextMenuProps } from "./canvas/block-context-menu";
+
+export { BlockToolbar } from "./canvas/block-toolbar";
+export type { BlockToolbarProps } from "./canvas/block-toolbar";
+
+/**
+ * The selected block's margin and padding, drawn over the page.
+ *
+ * A canvas overlay like the drop indicator, and composed the same way — it goes
+ * in `Canvas`'s `overlay`, because it is positioned in the canvas's own content
+ * coordinates and the canvas root is what establishes them.
+ *
+ * It reads the RENDERED page rather than the stored style tier, so what it
+ * reports is what the author is looking at: the browser has already resolved the
+ * logical sides to physical ones, `auto` to a used value, percentages against
+ * the containing block, and the whole cascade to a winner.
+ */
+export { SpacingOverlay } from "./canvas/spacing-overlay";
+export type { SpacingOverlayProps } from "./canvas/spacing-overlay";
+/*
+ * The notice a host renders above the canvas while a locked area holds what
+ * its lock doesn't allow: it shows the repair's steps and applies them, once
+ * confirmed, as one edit. `@experimental` until the editor's lock surfaces
+ * ship together.
+ */
+export { RepairNotice } from "./shell/repair-notice";
+/*
+ * The scrub context a host has to supply for a handle to write anywhere but the
+ * base breakpoint of the resting state. The overlay defaults to that tier and
+ * says so; a host drawing tiers or compiling under a scope passes this instead.
+ */
+export type {
+  SpacingScrubContext,
+  SpacingSubject,
+} from "./canvas/spacing-handles";
+
+/**
+ * A labelled "+" drawn over every container that has nothing in it.
+ *
+ * A canvas overlay like the two above, and composed the same way — it goes in
+ * `Canvas`'s `overlay`, because it is positioned in the canvas's own content
+ * coordinates and the canvas root is what establishes them. It is a client
+ * component for the same reason `SpacingOverlay` is: it holds React state for
+ * what it has measured, so it belongs behind this entry's banner rather than
+ * the root's.
+ */
+export { EmptyContainerAppenders } from "./canvas/empty-container-appender";
+export type { EmptyContainerAppendersProps } from "./canvas/empty-container-appender";
+/**
+ * An Image's empty state over each Image with no picture: "Add an image"
+ * with Upload, Media library and Link, a file dropped on it, and a missing
+ * library file's Replace. A canvas overlay composed like the one above, given
+ * the host's media library upload and picker.
+ *
+ * @experimental
+ */
+export { ImageStates } from "./canvas/image-states";
+export type { ImageStatesProps } from "./canvas/image-states";
+export { EmbedStates } from "./canvas/embed-states";
+export type { EmbedStatesProps } from "./canvas/embed-states";
+/**
+ * What the canvas says over a Form block: a picked form that is a draft,
+ * closed or deleted, with "Pick another form", and a simple form whose
+ * answers have nowhere to go. A canvas overlay composed like the one above,
+ * given the host's reads of the author's forms.
+ *
+ * @experimental
+ */
+export { FormStates } from "./canvas/form-states";
+export type { FormStatesProps } from "./canvas/form-states";
+/**
+ * The round a page's picked forms are drawn in, which goes up each time the
+ * author comes back to the editor while the page picks a form: a host draws
+ * its Forms afresh for each, so a form changed in its own tab shows as it is.
+ *
+ * @experimental
+ */
+export { useFormsShownAgain } from "./inspector/content/form-source-control";
+/**
+ * The chooser a block just added asks for, drawn over it on the canvas while
+ * the editor's first-add step holds: the Columns layouts with Skip. A canvas
+ * overlay composed like the ones above, from the editor alone.
+ *
+ * @experimental
+ */
+export { FirstAddChoosers } from "./canvas/first-add-choosers";
+export type { FirstAddChoosersProps } from "./canvas/first-add-choosers";
+/**
+ * "+ Add a question" under a selected Accordion's last question, drawn over
+ * the canvas: it adds the next numbered question, opens it and types its
+ * title, through the host's way into a block's text.
+ *
+ * @experimental
+ */
+export { AccordionAddQuestion } from "./canvas/accordion-add-question";
+export type { AccordionAddQuestionProps } from "./canvas/accordion-add-question";
+/**
+ * The badge on a block whose bound value a visitor will not see, drawn in the
+ * canvas's overlay from the host's `visitorUnreadableBindings` answer.
+ */
+export { VisitorUnreadableBadges } from "./shell/visitor-unreadable-badges";
+export type { VisitorUnreadableBadgesProps } from "./shell/visitor-unreadable-badges";
+export { VisitorUnreadableProvider } from "./shell/visitor-unreadable-context";
+/**
+ * @experimental Where the host keeps the signed-in author's Recent colours,
+ * provided once around the shell so every colour picker in it, a block's and
+ * a colour variable's, reads and adds to the one list.
+ */
+export { RecentColoursStore } from "./panels/design/recent-colours";
+/**
+ * @experimental The colours every colour picker in the builder leaves out
+ * while the site hides its unused built-in colours, provided once around
+ * the shell, and the read a host provides it from.
+ */
+export {
+  HiddenColours,
+  useHiddenColoursRead,
+} from "./panels/design/built-in-colours";
+/**
+ * @experimental A template's document with an entry's own blocks composed
+ * into its Entry content block, as the canvas draws it, for a host asking
+ * for the sources the drawn page's bindings read.
+ */
+export { useComposedEntryContent } from "./canvas/entry-content-canvas";
+export type { EntryContentLimits } from "./canvas/entry-content-canvas";
+/**
+ * @experimental The entry a template is previewed with: the host provides it
+ * around a template's editor, and anything inside reads it. `undefined`
+ * outside a template.
+ */
+export {
+  PREVIEWED_ENTRY_KEYS,
+  PreviewedEntryProvider,
+  usePreviewedCollection,
+  usePreviewedEntry,
+} from "./canvas/previewed-entry";
+export type {
+  PreviewedBlocksField,
+  PreviewedCollection,
+  PreviewedEntry,
+} from "./canvas/previewed-entry";
+/**
+ * @experimental Visibility conditions applied for the entry a template is
+ * previewed with: what the host hands the canvas (`conditionsApplied`) and
+ * the Previewing strip's switch and count.
+ */
+export {
+  conditionedBlocksIn,
+  type AppliedConditions,
+  type ConditionsPreview,
+  type HiddenBlock,
+} from "./conditions/applied-conditions";
+export {
+  conditionsPreviewOf,
+  useAppliedConditions,
+  useItemHiddenAs,
+  type AppliedConditionsOptions,
+  type ItemHiddenOptions,
+} from "./conditions/use-applied-conditions";
+export { PageInserters } from "./canvas/page-inserters";
+export type { PageInsertersProps, StartOptions } from "./canvas/page-inserters";
+export type { StarterPage } from "./canvas/page-start-area";
+// Starting an empty page from a starter page's blocks, as one undo step.
+export {
+  applyStarterPage,
+  planStarterPage,
+  type StarterPageSources,
+} from "./shell/starter-page";
+
+/**
+ * The editor's document state, published beside the canvas because it is a hook
+ * and therefore client-only for the same reason the shell is.
+ *
+ * It is the ONLY place a document changes: the canvas, the panels, a keyboard
+ * handler and an agent all reach the same `apply`, so undo covers every one of
+ * them rather than only the path that happened to implement it.
+ */
+export { MAX_HISTORY, useDocumentView, useEditorState } from "./editor-state";
+
+/**
+ * A handler that keeps its identity across renders and calls the newest one,
+ * for a surface memoised so a selection draws it nothing again.
+ */
+export {
+  useLatestCallback,
+  useLatestOptionalCallback,
+} from "./shell/latest-callback";
+export type {
+  EditorDocumentView,
+  EditorState,
+  UseEditorStateArgs,
+} from "./editor-state";
+
+/**
+ * Why `EditorState.lockRefusalFor` refuses an edit: a slot lock a block
+ * declares, or a block an author locked in Layers. The answer is a union, and
+ * `isLayersLockFacts` tells the two apart: a Layers lock names the locked
+ * block (`label`, `relation`, `verb`), a slot lock names its holder
+ * (`holderType`, `lock`). `lockRefusalWording` words either.
+ */
+export {
+  isLayersLockFacts,
+  lockRefusalWording,
+  type LayersLockRefusalFacts,
+  type LockedRelation,
+  type LockedVerb,
+  type LockRefusalFacts,
+  type SlotLockRefusalFacts,
+} from "./lock-refusal";
+
+/**
+ * Dragging blocks on the canvas, behind the same client banner: the hook holds
+ * a gesture and the indicator draws its answer.
+ *
+ * Published together because neither is useful alone — the hook's whole output
+ * is something to draw, and the indicator has nothing to draw without it.
+ *
+ * The RULES the drag obeys are not here. Which positions exist, which the
+ * nesting rule permits and which one a pointer means are decided in
+ * `drop-targets`, and when the answer may change is decided in `target-switch`;
+ * both are plain functions over numbers and ship from the root entry, where a
+ * caller can reach them without loading React.
+ */
+export { DropIndicator, useCanvasDrag } from "./canvas/canvas-drag";
+/**
+ * Typing a block's text in place on the canvas.
+ *
+ * The hook owns the caret and the handover; the rules about WHAT may be edited
+ * are `inline-text`'s, and a block declares its own through its prop schemas.
+ */
+export { useInlineText, EDITING_ATTRIBUTE } from "./canvas/use-inline-text";
+export type {
+  InlineTextEditing,
+  UseInlineTextResult,
+} from "./canvas/use-inline-text";
+export {
+  inlineTargets,
+  inlineTarget,
+  inlineTextOp,
+} from "./canvas/inline-text";
+/**
+ * Typing a block's PASSAGE directly on the canvas, and the one gesture that
+ * reaches either surface.
+ *
+ * `useInlineEditing` is what a host wires to the canvas: it owns both the plain
+ * and the rich edit, decides from the block's own schema which a double-click
+ * opened, and keeps at most one of them live. A host that supplies no rich-text
+ * loader still edits plain text; passages simply do not open.
+ *
+ * The rich editor is loaded on first edit, not on mount, because its node
+ * classes carry a 630KB chunk that an author who never edits a passage should
+ * never fetch.
+ */
+export { useInlineEditing } from "./canvas/use-inline-editing";
+/**
+ * The registry an inspector rich-text field holds its open passage in, so the
+ * host's `useInlineEditing` finishes it before the document is stored.
+ * Made once per editor and lent to both the inspector and the inline editing.
+ *
+ * @experimental
+ */
+export { createOpenPassages } from "./canvas/open-passages";
+export type { OpenPassages } from "./canvas/open-passages";
+export type { UseInlineEditingResult } from "./canvas/use-inline-editing";
+/**
+ * What a host says when a double-click lands on text a component does not
+ * expose: the hook selects the placement and hands the host its id, and the
+ * host reads the placement with `inspectInstance` against its own library.
+ */
+export {
+  inspectInstance,
+  partOfComponentSentence,
+} from "./inspector/instance-inspector";
+/**
+ * What finishing an inline edit did.
+ *
+ * A host must branch on this rather than on the presence of a document. A
+ * refused commit has kept the surface open because the author's words are in it
+ * and nowhere else — closing, navigating or opening another value on top of
+ * that is what loses them.
+ */
+export {
+  documentAfter,
+  INLINE_EDIT_DISCARDED,
+  INLINE_EDIT_UNCHANGED,
+} from "./canvas/inline-edit-outcome";
+export type {
+  InlineEditOutcome,
+  InlineEditDiscarded,
+  InlineEditRefusal,
+  InlineEditRefused,
+  InlineEditUnchanged,
+  InlineEditWritten,
+} from "./canvas/inline-edit-outcome";
+export { useInlineRichText } from "./canvas/use-inline-rich-text";
+export type {
+  InlineRichTextEditing,
+  InlineRichTextEditorLoader,
+  InlineRichTextFinished,
+  UseInlineRichTextResult,
+} from "./canvas/use-inline-rich-text";
+export {
+  richInlineTargets,
+  richInlineTarget,
+  richInlineTextOp,
+  richTextChanged,
+} from "./canvas/inline-rich-text";
+export type { InlineRichTextTarget } from "./canvas/inline-rich-text";
+export { inlinePropKind } from "./canvas/inline-prop-kind";
+export { namedTarget, firstInlineProp } from "./canvas/inline-target";
+export type { FirstInlineProp } from "./canvas/inline-target";
+export type { InlinePropKind } from "./canvas/inline-prop-kind";
+/**
+ * The first-run checklist: what an author has not done on this page yet.
+ *
+ * Every step is DERIVED from the document rather than tracked, so it describes
+ * the page rather than a person's history with it.
+ */
+export {
+  OnboardingChecklist,
+  useBuilderChecklist,
+  CHECKLIST_STORAGE_KEY,
+} from "./shell/onboarding-checklist";
+export type {
+  OnboardingChecklistProps,
+  UseBuilderChecklistOptions,
+  UseBuilderChecklistResult,
+} from "./shell/onboarding-checklist";
+export {
+  builderChecklist,
+  checklistComplete,
+  checklistDoneCount,
+} from "./shell/onboarding";
+export type { ChecklistStep } from "./shell/onboarding";
+export type { InlineTextTarget } from "./canvas/inline-text";
+export type {
+  CanvasDrag,
+  CanvasDragHandlers,
+  CanvasDragState,
+  DropIndicatorProps,
+  UseCanvasDragOptions,
+} from "./canvas/canvas-drag";
+
+/**
+ * The layers panel and the ancestor breadcrumb, behind the same client banner.
+ *
+ * Together because they answer one question from two directions — where does
+ * this block sit — and they read the SAME tree to answer it, so shipping one
+ * without the other would leave a host able to show a trail the panel could
+ * contradict.
+ *
+ * The tree they draw is derived in `layers`, which is plain functions over a
+ * document and ships from the root entry.
+ */
+export { LayersPanel } from "./panels/layers/layers-panel";
+export type { LayersPanelProps } from "./panels/layers/layers-panel";
+export type {
+  LayersEditedRegion,
+  LayersRegionRow,
+} from "./panels/layers/layers-regions";
+/*
+ * The tokens studio. A host that mounts it owns the site style document and
+ * decides when an edit is persisted; this exports the surface, not the save.
+ */
+export { GroupToggle } from "./panels/design/design-group-toggle";
+export { TokensPanel, useVariablesHeader } from "./panels/design/tokens-panel";
+export type {
+  GroupFolds,
+  TokensPanelProps,
+  VariablesHeader,
+} from "./panels/design/tokens-panel";
+// What a host's variables write made at once answers it stored, so an import
+// can say a save the site took only in part as exactly that.
+export type { VariablesStored } from "./panels/design/variables-transfer";
+// Which variable groups each Design tab lists, and the one variable search,
+// so a tab's count and the rows it lists come from the same rule.
+export {
+  DESIGN_TAB_GROUPS,
+  searchVariableGroups,
+  variableMatchesByTab,
+} from "./panels/design/tokens-studio";
+// How many of the Styles tab's styles a search matches, by the tab's own rule,
+// and the way a host hands the tab its search.
+export { stylesTabMatches } from "./panels/design/styles-tab-matches";
+export { SharedStylesHostSearch } from "./panels/design/shared-styles-panel";
+// Where a block type's styles sit in the Styles tab, so a host sending the
+// author there ("Edit block styles") reveals the group the tab draws.
+export { blockStyleFoldId } from "./panels/design/block-looks-group";
+// The site's fonts, for every Font control the host draws: the block panel's
+// and a font variable's in Design.
+export { FontChoicesContext } from "./panels/design/font-family-field";
+export type { FontChoices } from "./panels/design/font-family-field";
+// The top of Design's Type tab: the Body and Headings fonts every page uses.
+export { SiteFontRoles } from "./panels/design/site-font-roles";
+export type { SiteFontRolesProps } from "./panels/design/site-font-roles";
+export type { DesignTab, VariableGroup } from "./panels/design/tokens-studio";
+/*
+ * How widely variables are used, as a host reads it for the Variables view.
+ * Experimental, as the view's `usage` is.
+ */
+export type {
+  VariableReach,
+  VariablesAccess,
+  VariablesTogether,
+  VariablesUsage,
+  VariableUse,
+  VariableUseKind,
+  VariableUsesPage,
+} from "./panels/design/variable-usage";
+export { SelectionBreadcrumb } from "./shell/breadcrumb";
+export type { SelectionBreadcrumbProps } from "./shell/breadcrumb";
+/*
+ * The page reads meter: the reads a page makes against its allowance, from
+ * 80% of it a warning, and over it the blocks that went unread.
+ */
+export { ReadBudgetMeter } from "./shell/read-budget-meter";
+export type { ReadBudgetMeterProps } from "./shell/read-budget-meter";
+export { readBudgetStanding, READ_WARNING_SHARE } from "./shell/read-budget";
+export type {
+  PageReadReport,
+  ReadBudgetStanding,
+  ReadKind,
+  UnreadBlock,
+} from "./shell/read-budget";
+/*
+ * The editor's words, spelled once, for every surface a host draws beside the
+ * shell's own: a panel it mounts names its places with these.
+ */
+export { EDITOR_WORDS } from "./editor-words";
+export type { EditorWord } from "./editor-words";
+/*
+ * The two class surfaces, and the rules both answer from.
+ *
+ * Split because the actions are: applying a class happens while styling one
+ * element and belongs beside the style controls, while auditing and deleting is
+ * occasional and needs a list. A host that mounts either owns the site style
+ * document and decides when an edit is persisted; these export the surfaces,
+ * not the save.
+ */
+export { ClassSelector } from "./styles/class-selector";
+export type { ClassSelectorProps } from "./styles/class-selector";
+/*
+ * Saving a block's look as a shared style: the dialog the host raises from
+ * the block verb, and what the Style tab borrows from the host to edit a
+ * shared style as its target.
+ */
+export { SaveSharedStyleDialog } from "./panels/design/shared-style-save-dialog";
+export type { SaveSharedStyleDialogProps } from "./panels/design/shared-style-save-dialog";
+export type { SharedStylesHost } from "./inspector/style-inspector/style-target";
+export type {
+  SharedStyleChange,
+  SharedStyleOffer,
+} from "./styles/shared-style-target";
+export { sharedStyleNameTaken } from "./styles/shared-style-target";
+/*
+ * The notice QUEUE is published; the region is not.
+ *
+ * `BuilderShell` renders the region for whichever queue it holds, and it takes
+ * the host's through its `notices` prop — so a host that raises notices from
+ * above the shell (an editor it builds there refusing an edit for room) builds
+ * the queue with `useNoticeQueue`, hands it to the shell, and raises into it.
+ * Building one and NOT handing it over would place nothing and report nothing,
+ * which is why the region stays unpublished: the shell is the one place a
+ * queue is drawn.
+ */
+export { useNoticeQueue } from "./shell/builder-notices";
+export type { NoticeQueue, RaiseNotice } from "./shell/builder-notices";
+export { SharedStylesPanel } from "./panels/design/shared-styles-panel";
+/**
+ * Design → Type → "Text styles": the site's text styles and their parts.
+ *
+ * @experimental Settles with text styles.
+ */
+export { TextStylesSection } from "./panels/design/text-styles-section";
+export type { TextStylesSectionProps } from "./panels/design/text-styles-section";
+// The whole-list class write the Styles tab's Block styles make, copy,
+// rename and hide block styles and move ★ through.
+export type { ClassListEdit, EditClasses } from "./styles/block-style-actions";
+export type {
+  ClassRenameOutcome,
+  PageClassBlocks,
+  SharedStylesAccess,
+  SharedStylesPanelProps,
+} from "./panels/design/shared-styles-panel";
+export type {
+  SharedStyleHereParts,
+  SharedStyleKind,
+  SharedStyleReach,
+  SharedStyleRefusal,
+  SharedStylesCount,
+  SharedStylesUsage,
+  SharedStyleUse,
+  SharedStyleUsesPage,
+} from "./styles/shared-style-library";
+export {
+  classRows,
+  filterClassRows,
+  deletionWarning,
+  newClassName,
+  renamedClassName,
+  nodeHasRoom,
+  siteClasses,
+  usageSummary,
+  withClassApplied,
+  withClassRemoved,
+} from "./styles/class-library";
+export type {
+  ApplyRefusal,
+  ClassApplyOutcome,
+  ClassChoice,
+  ClassFilter,
+  ClassNameOutcome,
+  ClassRow,
+  ClassUsageCounts,
+  DeletionWarning,
+  NameRefusal,
+} from "./styles/class-library";
+
+/**
+ * The Design panel's Fonts tab, and the rules it draws from.
+ *
+ * It lists the site's fonts and font variables, adds a font by uploading a
+ * file or through the host's Google Fonts catalogue, and removes one. Font
+ * variables are listed here and changed in Variables.
+ *
+ * @experimental The catalogue's shapes may change while the feature settles.
+ */
+export { FontsPanel } from "./panels/design/fonts-panel";
+/**
+ * The one Fonts screen around that list: what the builder opens over its
+ * Design panel and the admin draws as its Fonts page.
+ *
+ * @experimental Its props may change while the screen settles.
+ */
+export { FontsScreen } from "./panels/design/fonts-panel";
+export type {
+  CatalogueAddRequest,
+  CatalogueFamilyView,
+  FontCatalogue,
+  FontsPanelProps,
+  FontsScreenProps,
+  FontFaceUpload,
+} from "./panels/design/fonts-panel";
+export {
+  fontTokenRows,
+  readStack,
+  rowsNeedingAttention,
+  withoutFamily,
+} from "./panels/design/font-library";
+export type {
+  FamilyReading,
+  FamilySource,
+  FontTokenRow,
+  SiteFamily,
+  StackReading,
+} from "./panels/design/font-library";
+
+/**
+ * Which values each placement of a new component may change: the picker the
+ * host's "Turn into component" form draws.
+ */
+export { ExposurePicker, selectionAsComponent } from "./shell/exposure-picker";
+export type { ExposurePickerProps } from "./shell/exposure-picker";
+
+/**
+ * Page checks: the count beside Publish that opens the list and walks it
+ * while the author fixes things, and the list itself. The checks they run
+ * are on the root entry, callable without a DOM.
+ *
+ * @experimental
+ */
+export { PageChecksChip } from "./page-checks/page-checks-chip";
+export type { PageChecksChipProps } from "./page-checks/page-checks-chip";
+export { PageChecksList } from "./page-checks/page-checks-list";
+export type { PageChecksListProps } from "./page-checks/page-checks-list";
+
+/**
+ * Ending every run of typing at once, for a host's save: a field still being
+ * typed in when the page is stored keeps writing into a new step, so undo
+ * after the save takes back only what came after it. `typingEpoch` says which
+ * stretch of typing the editor is in.
+ *
+ * @experimental
+ */
+export { endTypingRuns, typingEpoch } from "./typing-run";
+
+/**
+ * A draft held in a field of the block settings panel, for a host's save:
+ * the page has unsaved work from the draft's first keystroke, and a store
+ * writes the draft first, as leaving the field would, with focus left in it.
+ *
+ * @experimental
+ */
+export { finishFieldEdit, useFieldDraftHeld } from "./field-edit";

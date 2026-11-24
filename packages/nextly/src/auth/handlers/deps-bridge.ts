@@ -1,0 +1,1106 @@
+/**
+ * Dependency bridge: maps Nextly DI container services to AuthRouterDeps.
+ *
+ * This bridge connects our new auth handlers (which expect an explicit deps interface)
+ * with the existing service layer (registered in the DI container). It provides the
+ * database operations needed for login, refresh tokens, and brute-force protection.
+ *
+ * For operations that already exist on AuthService (register, password reset, etc.),
+ * we delegate directly. For new operations (refresh tokens, brute-force tracking),
+ * we use the database adapter directly.
+ */
+
+import type { SupportedDialect } from "@nextlyhq/adapter-drizzle/types";
+import type { eq as drizzleEq } from "drizzle-orm";
+
+import { getDialectTables } from "../../database/index";
+import { resolveRelations } from "../../database/resolve-relations";
+import { container } from "../../di/container";
+import type { NextlyServiceConfig } from "../../di/register";
+import {
+  buildAuditLogWriter,
+  isStrategyName,
+} from "../../domains/audit/audit-log-writer";
+import type { LimitStore } from "../../domains/limits/limit-store";
+import { NextlyError } from "../../errors";
+import { getHookRegistry } from "../../hooks/hook-registry";
+import { env } from "../../lib/env";
+import {
+  isRateLimitStore,
+  type RateLimitStore,
+} from "../../middleware/rate-limit";
+import {
+  bootNameOf,
+  NO_PLUGIN_GRANTS,
+  type PluginGrants,
+} from "../../plugins/plugin-consent";
+import {
+  createPluginContext,
+  type PluginContext,
+  type PluginDefinition,
+} from "../../plugins/plugin-context";
+import { affectedRowCount } from "../../shared/lib/affected-row-count";
+import { readUnderRowLock, type LockableRead } from "../../shared/lib/row-lock";
+import {
+  runAdapterTransaction,
+  serializeOnSqlite,
+  type SerializingAdapter,
+} from "../../shared/lib/run-adapter-transaction";
+import type { AuthUser } from "../../types/auth";
+import { readProxyTrustSettings } from "../../utils/proxy-trust";
+import { passwordCredentialDeps } from "../credentials/credential-deps";
+import { verifyCredentials } from "../credentials/verify-credentials";
+import { ChallengeRegistry } from "../pipeline/challenge";
+import { AuthHookRegistry } from "../pipeline/hooks";
+import { createPasswordStrategy } from "../pipeline/password-strategy";
+import { databaseSpentChallenges } from "../pipeline/spent-challenges";
+import type { AuthHooks, ChallengeDefinition } from "../pipeline/types";
+import type { AccountState } from "../session/account-state";
+import { readSessionRoles } from "../session/read-session-roles";
+import type { SessionRoles } from "../session/session-roles";
+import { claimFirstSetup, sharedRecordReader } from "../setup-token/setup-gate";
+import {
+  readSetupTokenRecord,
+  spendSetupToken,
+  verifySetupToken,
+  type SetupTokenMeta,
+} from "../setup-token/setup-token";
+
+import { aggregateAuthUi } from "./auth-ui";
+import type { AuthRouterDeps } from "./router";
+import type { SessionRowTransaction } from "./session-row";
+import type { SetupHandlerDeps } from "./setup";
+
+/** The router's dependencies as Nextly builds them: always with a setup token store. */
+export type BridgedAuthRouterDeps = AuthRouterDeps &
+  Required<Pick<AuthRouterDeps, "setupToken">>;
+
+/**
+ * Build AuthRouterDeps from the DI container services.
+ * Call this after services are initialized (ensureServicesInitialized).
+ *
+ * @param getService - The DI container's getService function
+ */
+export function buildAuthRouterDeps(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  getService: (name: string) => any
+): BridgedAuthRouterDeps {
+  const credentialDeps = passwordCredentialDeps(() => getService("adapter"));
+  const base: Omit<
+    BridgedAuthRouterDeps,
+    | "authStrategies"
+    | "authHooks"
+    | "challengeRegistry"
+    | "pluginCtx"
+    | "challengeTokenTTL"
+    | "maxChallengeAttempts"
+    | "authUi"
+  > = {
+    // The password sign-in's lookup, attempt counting and limits — shared
+    // with the Direct API's `login`, so the two count and refuse alike.
+    ...credentialDeps,
+    // The router's OTHER handlers (the session check, dev auto-login,
+    // password reset) treat an unreadable user as an absent one and degrade
+    // quietly; only the sign-in itself surfaces the failure.
+    findUserByEmail: (email: string) =>
+      credentialDeps.findUserByEmail(email).catch(() => null),
+    secret: env.NEXTLY_SECRET || "",
+    isProduction: env.NODE_ENV === "production",
+    accessTokenTTL: 900, // 15 minutes
+    refreshTokenTTL: 7 * 24 * 60 * 60, // 7 days
+    loginStallTimeMs: 500,
+    // Spec §13.2: read the host-app's auth.revealRegistrationConflict flag
+    // from the registered NextlyConfig. Defaults to false (silent-success on
+    // email conflict) when config is not yet initialised or the flag is
+    // unset. The schema is already populated by sanitizeConfig.
+    revealRegistrationConflict: readAuthFlag(
+      getService,
+      "revealRegistrationConflict"
+    ),
+    // Off unless the app turns it on (staff-only by default).
+    allowRegistration: readAuthFlag(getService, "allowRegistration"),
+    devAutoLogin: readDevAutoLogin(getService),
+    allowedOrigins: env.NEXTLY_ALLOWED_ORIGINS_PARSED || [],
+    ...readProxyTrustSettings(() => getService("config")),
+    authRateLimit: readAuthRateLimit(getService),
+    limitStore: readLimitStore(getService),
+    // Resolved per call, like the lookups below: the adapter is the
+    // container's, and nothing here should hold one captured at build time.
+    spentChallenges: {
+      isSpent: mark =>
+        databaseSpentChallenges(getService("adapter")).isSpent(mark),
+      spend: (mark, expiresAt) =>
+        databaseSpentChallenges(getService("adapter")).spend(mark, expiresAt),
+    },
+    auditLog: buildAuditLogWriter(getService),
+
+    findUserById: async (userId: string) => {
+      // Errors propagate intentionally. The refresh handler relies on this
+      // lookup to decide whether to rotate or `clearAndDeny`; a swallowed
+      // DB error returning `null` was indistinguishable from "user
+      // genuinely missing" and tore down the session on every transient
+      // hiccup. The refresh handler now wraps the lookup and surfaces
+      // failures as a 503 envelope without clearing cookies.
+      const adapter = getService("adapter");
+      const db = adapter.getDrizzle();
+      const schema = getDialectTables();
+      const { eq } = await import("drizzle-orm");
+      const result = await db
+        .select()
+        .from(schema.users)
+        .where(eq(schema.users.id, userId))
+        .limit(1);
+      return result[0] || null;
+    },
+
+    fetchAccountState: async (userId: string) => {
+      // Errors propagate, like findUserById above: a swallowed DB error
+      // returning null would be read as "account unusable" and tear down a
+      // healthy session on a transient hiccup.
+      const adapter = getService("adapter");
+      const { eq } = await import("drizzle-orm");
+      const result = await accountStateQuery(adapter.getDrizzle(), eq, userId);
+      return toAccountState(result[0]);
+    },
+
+    // The roles the token carries and the soonest moment one lapses, read the
+    // way the Direct API's `login` reads them too (`readSessionRoles`).
+    fetchSessionRoles: (userId: string): Promise<SessionRoles> =>
+      readSessionRoles(getService("adapter"), userId),
+
+    fetchCustomFields: async (userId: string) => {
+      // No key for a value that is not known — no `user_ext` row, fields not
+      // loaded, an unreadable row — rather than a null, which a rule would
+      // read as a value: `doc.tenantId === user.tenantId` matches every
+      // document without a tenant. A hook cannot fill the gap either: the
+      // registry reserves every configured field's claim name.
+      try {
+        // user_ext is a dynamic table created at runtime when custom user
+        // fields are configured via defineConfig({ users: { fields: [...] } }).
+        // We use the same approach as the old Auth.js JWT callback:
+        // generate the Drizzle table schema at runtime and query with it.
+        const { container } = await import("../../di/container");
+        if (
+          !container.has("config") ||
+          !container.has("userExtSchemaService")
+        ) {
+          return {};
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const config = container.get<any>("config");
+        const userFields = config?.users?.fields;
+        if (!userFields?.length) return {};
+
+        const userExtSchemaService = getService("userExtSchemaService");
+        if (!userExtSchemaService?.hasMergedFields()) return {};
+
+        const extTable = userExtSchemaService.generateRuntimeSchema(userFields);
+        const { eq } = await import("drizzle-orm");
+        const adapter = getService("adapter");
+
+        const db = adapter.getDrizzle();
+
+        const rows = (await db
+          .select()
+          .from(extTable)
+
+          .where(eq(extTable.user_id, userId))
+          .limit(1)) as Record<string, unknown>[];
+
+        if (!rows[0]) return {};
+
+        // Remove internal fields (id, user_id), return only custom fields
+        const { id: _id, user_id: _uid, ...customFields } = rows[0];
+        return customFields;
+      } catch {
+        return {};
+      }
+    },
+
+    storeRefreshToken: async record => {
+      const adapter = getService("adapter");
+      const db = adapter.getDrizzle();
+      const schema = getDialectTables();
+      await db.insert(schema.refreshTokens).values(record);
+    },
+
+    findRefreshTokenByHash: async (tokenHash: string) => {
+      const adapter = getService("adapter");
+      const db = adapter.getDrizzle();
+      const schema = getDialectTables();
+      const { eq } = await import("drizzle-orm");
+      const rows = await db
+        .select()
+        .from(schema.refreshTokens)
+        .where(eq(schema.refreshTokens.tokenHash, tokenHash))
+        .limit(1);
+      return rows[0] || null;
+    },
+
+    deleteRefreshToken: async (id: string) => {
+      await deleteRefreshTokenById(getService, id);
+    },
+
+    withSessionRowTransaction: async work => {
+      const adapter = getService("adapter") as SessionRowAdapter;
+      const dialect = adapter.getCapabilities().dialect;
+      const { eq } = await import("drizzle-orm");
+      // The work's own error, not the adapter's classification of it, so a
+      // refusal raised inside reaches the caller as the refusal it is.
+      return runAdapterTransaction(
+        run =>
+          adapter.transaction(tx =>
+            run(sessionRowTransaction(tx.getDrizzle(), dialect, eq))
+          ),
+        work
+      );
+    },
+
+    // Sign-out and ending all of an account's sessions delete through
+    // `serializeOnSqlite`: a revocation another request's rollback undid
+    // would leave a session the user was told had ended.
+    deleteRefreshTokenByHash: async (tokenHash: string) => {
+      const { eq } = await import("drizzle-orm");
+      const { refreshTokens } = getDialectTables();
+      await deleteRefreshTokens(
+        getService,
+        eq(refreshTokens.tokenHash, tokenHash)
+      );
+    },
+
+    deleteAllRefreshTokensForUser: async (userId: string) => {
+      const { eq } = await import("drizzle-orm");
+      const { refreshTokens } = getDialectTables();
+      await deleteRefreshTokens(getService, eq(refreshTokens.userId, userId));
+    },
+
+    hasAdministrator: async () => {
+      // Errors propagate intentionally: this gates setup and setup-status,
+      // and collapsing an unknown answer to "no administrator" would both lie
+      // about setup state and risk a second super-admin. Callers convert
+      // failures to a 503 envelope. The same question the first-administrator
+      // grant asks, through the same query; a yes is kept under the role
+      // version, since setup-status asks it on every admin screen.
+      const { administratorExists } = await import(
+        "../../domains/users/services/administrator-known"
+      );
+      return administratorExists(getService("adapter"), getDialectTables());
+    },
+
+    setupToken: setupTokenDeps(getService, env.NODE_ENV === "production"),
+
+    createSuperAdmin: async data => {
+      const { seedPermissions } = await import(
+        "../../database/seeders/permissions"
+      );
+      const { seedSuperAdmin } = await import(
+        "../../database/seeders/super-admin"
+      );
+      const { ServiceContainer } = await import("../../services/index");
+      const { isFirstAdministratorTaken } = await import(
+        "../../domains/users/services/last-super-admin"
+      );
+      const adapter = getService("adapter");
+
+      // Seed permissions first (seedSuperAdmin needs them to assign to the admin)
+      await seedPermissions(adapter, { silent: true });
+
+      // The account is created as setup's: it becomes the install's first
+      // administrator, through the grant made under the role row's lock, or
+      // is not created at all. Of setups racing on an empty install exactly
+      // one wins, and a loser's transaction rolls back before its account or
+      // `user.created` event exist. An address that already has an account,
+      // which may be a stranger's sign-up, is refused as a duplicate.
+      let created: { id: string | number };
+      try {
+        created = await new ServiceContainer(adapter).users.createLocalUser(
+          {
+            email: data.email,
+            name: data.name,
+            password: data.password,
+            isActive: true,
+            emailVerification: "admin-vouched",
+          },
+          undefined,
+          "setup"
+        );
+      } catch (error) {
+        if (isFirstAdministratorTaken(error)) return null;
+        throw error;
+      }
+
+      // The role's permissions; the account already holds the role.
+      const result = await seedSuperAdmin(adapter, {
+        email: data.email,
+        password: data.password,
+        name: data.name,
+        silent: true,
+        assignRole: false,
+      });
+      if (!result.success) {
+        throw new Error(
+          result.errorMessages?.[0] || "Failed to create admin account"
+        );
+      }
+
+      return { id: String(created.id), email: data.email, name: data.name };
+    },
+
+    seedPermissions: async () => {
+      const { seedPermissions } = await import(
+        "../../database/seeders/permissions"
+      );
+      const adapter = getService("adapter");
+      await seedPermissions(adapter, { silent: true });
+    },
+
+    registerUser: async data => {
+      const authService = getService("authService");
+      const user = await authService.registerUser(data);
+      return { id: user.id, email: user.email, name: user.name };
+    },
+
+    generatePasswordResetToken: async (email, redirectPath) => {
+      const authService = getService("authService");
+      const result = await authService.generatePasswordResetToken(email, {
+        redirectPath,
+      });
+      return { token: result.token };
+    },
+
+    resetPasswordWithToken: async (token, newPassword) => {
+      const authService = getService("authService");
+      const result = await authService.resetPasswordWithToken(
+        token,
+        newPassword
+      );
+      return { email: result.email };
+    },
+
+    // Read-only lookups the auth limiter counts a token request against; each
+    // leaves its token usable for the handler that consumes it.
+    findTokenOwner: async (kind, token) => {
+      const authService = getService("authService");
+      switch (kind) {
+        case "reset":
+          return await authService.resetTokenOwner(token);
+        case "verification":
+          return await authService.verificationTokenOwner(token);
+        case "invite":
+          return await authService.inviteTokenOwner(token);
+      }
+    },
+
+    acceptInvite: async (token, newPassword) => {
+      const authService = getService("authService");
+      return await authService.acceptInvite(token, newPassword);
+    },
+
+    setInitialPassword: async (userId, newPassword) => {
+      const authService = getService("authService");
+      return await authService.setInitialPassword(userId, newPassword);
+    },
+
+    changePassword: async (userId, currentPassword, newPassword) => {
+      const authService = getService("authService");
+      try {
+        await authService.changePassword(userId, currentPassword, newPassword);
+        return { success: true };
+      } catch (err) {
+        // Spec section 13.8 public-surface safety: only NextlyError.publicMessage
+        // is vetted; fall back to a generic string for anything else.
+        return {
+          success: false,
+          error: NextlyError.is(err)
+            ? err.publicMessage
+            : "Failed to change password",
+        };
+      }
+    },
+
+    verifyEmail: async token => {
+      const authService = getService("authService");
+      try {
+        const result = await authService.verifyEmail(token);
+        return {
+          success: true,
+          email: result.email,
+        };
+      } catch (err) {
+        // Spec section 13.8 public-surface safety: only NextlyError.publicMessage
+        // is vetted; fall back to a generic string for anything else.
+        return {
+          success: false,
+          error: NextlyError.is(err)
+            ? err.publicMessage
+            : "Failed to verify email",
+        };
+      }
+    },
+
+    resendVerificationEmail: async email => {
+      try {
+        const authService = getService("authService");
+        await authService.generateEmailVerificationToken(email);
+        return { success: true };
+      } catch {
+        // Always return success to prevent enumeration
+        return { success: true };
+      }
+    },
+  };
+
+  // ── Auth extensibility pipeline (D71) ──────────────────────────────────
+  // Built-in `password` strategy: wraps verifyCredentials with base's lockout
+  // deps so the legacy login behavior is preserved exactly (zero-regression).
+  const passwordStrategy = createPasswordStrategy({
+    verify: async ({ email, password }) => {
+      const u = await verifyCredentials({ email, password }, credentialDeps);
+      return {
+        id: u.id as AuthUser["id"],
+        email: u.email,
+        name: u.name,
+        image: u.image,
+        mustChangePassword: u.mustChangePassword,
+        passwordUpdatedAt: u.passwordUpdatedAt,
+        sessionEpoch: u.sessionEpoch,
+      };
+    },
+  });
+
+  // Base plugin-context resolver for the auth pipeline.
+  //
+  // createPluginContext resolves "db" as the drizzle instance (not a raw DI
+  // service), so translate "db" → adapter.getDrizzle() the same way di/register
+  // does; everything else delegates to the container. The ADAPTER entry is
+  // what lets a plugin's own settings store transact on SQLite.
+  const ctxGetService = ((name: string) => {
+    if (name === "db") {
+      const adapter = getService("adapter") as { getDrizzle: () => unknown };
+      return adapter.getDrizzle();
+    }
+    // The relations config behind `ctx.db.query`, translated for the same
+    // reason `db` is: neither is a container entry, and `getService` would
+    // throw rather than resolve one. Asked for per relational access, so it is
+    // resolved here per call rather than captured.
+    //
+    // This is the OTHER place a plugin context is built — the auth router's.
+    // When `ctx.db` gained relational queries only `di/register.ts` learned
+    // the new name, so every login through a plugin strategy threw
+    // `Service "relationalDb" is not registered in container` before reaching
+    // the strategy at all. A name added to the plugin service list has to be
+    // answered here too.
+    if (name === "relations") {
+      const adapter = getService("adapter") as {
+        getCapabilities: () => { dialect: SupportedDialect };
+      };
+      return resolveRelations(adapter.getCapabilities().dialect);
+    }
+    // Also not a DI service. The container registers the adapter, and the
+    // dialect is something it is asked for; a plugin's settings store picks
+    // its table metadata and its upsert spelling from this answer, and the
+    // restricted database handle it receives carries no dialect to infer one
+    // from.
+    if (name === "dialect") {
+      const adapter = getService("adapter") as {
+        getCapabilities: () => { dialect: SupportedDialect };
+      };
+      return adapter.getCapabilities().dialect;
+    }
+    if (name === "adapter") {
+      // The transaction-capable adapter, reached LAZILY like the handle:
+      // the context can be built before the database is connected.
+      return getService(name);
+    }
+    // The jobs runner's database is the container's adapter, under the
+    // name the plugin context asks for it by.
+    if (name === "jobsDatabase") return getService("adapter");
+    // Optional where webhooks are not registered, so asked for without
+    // throwing: the context reads `null` and offers no drain.
+    if (name === "webhookFastDrainScheduler") {
+      return container.has(name) ? container.get(name) : null;
+    }
+    return getService(name);
+  }) as Parameters<typeof createPluginContext>[0];
+  const pluginCtx = createPluginContext(ctxGetService, getHookRegistry());
+  // Collect plugin contributes.auth (hooks + challenges) + app-config
+  // strategies.
+  //
+  // ENABLED plugins only, so the runtime registries and the served auth UI
+  // are derived from one set. Registering a disabled plugin's hooks let its
+  // `afterAuthenticate` challenge fire on a successful login while the login
+  // page — which filters disabled plugins — had no view for it, leaving that
+  // login unfinishable until the plugin was removed or enabled.
+  const config = readServiceConfig(getService);
+  // What the boot granted, decided when it resolved the plugin list. Each
+  // plugin's context reads this rather than the plugin's manifest, so a
+  // manifest edited after the boot grants nothing here either.
+  const grants = readPluginGrants(getService);
+  const authHooks = new AuthHookRegistry({
+    userFieldClaims: userFieldClaimNames(config),
+  });
+  const challengeRegistry = new ChallengeRegistry();
+  for (const plugin of (config?.plugins ?? []).filter(
+    p => p.enabled !== false
+  )) {
+    const authContrib = plugin.contributes?.auth;
+    if (!authContrib) continue;
+    // Each contribution receives the OWNING plugin's context, not the
+    // system one: a hook that reads its plugin's settings, fetches through
+    // its declared hosts, or audits under its prefix needs exactly the
+    // surfaces every other lifecycle method of that plugin gets — a TOTP
+    // hook reading its encrypted secret from ctx.settings threw on a
+    // context whose `self` was empty and whose settings were absent.
+    const ownCtx = createPluginContext(
+      ctxGetService,
+      getHookRegistry(),
+      plugin,
+      grants
+    );
+    if (authContrib.hooks) {
+      authHooks.add(
+        bindHooksToContext(
+          determineUserIfGranted(authContrib.hooks, plugin, grants),
+          ownCtx
+        )
+      );
+    }
+    for (const def of authContrib.challenges ?? []) {
+      challengeRegistry.add(bindChallengeToContext(def, ownCtx));
+    }
+  }
+  const configStrategies = config?.auth?.strategies ?? [];
+  assertConfiguredStrategyNames(configStrategies);
+
+  return {
+    ...base,
+    authStrategies: [...configStrategies, passwordStrategy],
+    authHooks,
+    challengeRegistry,
+    pluginCtx,
+    challengeTokenTTL: 300,
+    maxChallengeAttempts: 5,
+    authUi: aggregateAuthUi(config?.plugins ?? []),
+  };
+}
+
+/**
+ * Refuse an app-configured strategy whose name the audit trail cannot carry.
+ *
+ * The same rule `completeLogin` enforces on a plugin's own strategy, applied
+ * at boot to the config's. The rule is not stylistic: the audit writer admits
+ * a strategy to a row only when the name matches it, so a name with an
+ * uppercase letter or a dot authenticated normally while being silently
+ * omitted from every success row — the attribution this field exists to
+ * carry, missing on exactly the installs that configured a custom strategy.
+ * Failing the boot names the strategy and the rule where the operator is
+ * still reading configuration, rather than leaving a working login with no
+ * trail.
+ */
+export function assertConfiguredStrategyNames(
+  strategies: readonly { name: string }[]
+): void {
+  for (const strategy of strategies) {
+    if (!isStrategyName(strategy.name)) {
+      throw NextlyError.internal({
+        logContext: {
+          reason: "auth-strategy-name-invalid",
+          strategy: strategy.name,
+          rule: "lowercase letters, digits, :, _ or -; starts with a letter or digit; at most 64 characters",
+        },
+      });
+    }
+  }
+}
+
+/**
+ * The Drizzle surface the session-row operations use. Structural, because the
+ * concrete database types differ per dialect while this fluent API does not.
+ */
+interface SessionRowDb {
+  select(fields: unknown): {
+    from(table: unknown): {
+      where(condition: unknown): {
+        limit(count: number): LockableRead<AccountStateRow[]>;
+      };
+    };
+  };
+  insert(table: unknown): { values(data: unknown): Promise<unknown> };
+  delete(table: unknown): { where(condition: unknown): Promise<unknown> };
+}
+
+/** The adapter surface the session-row transaction runs on. */
+interface SessionRowAdapter {
+  getCapabilities(): { dialect: SupportedDialect };
+  transaction<T>(work: (tx: { getDrizzle<D>(): D }) => Promise<T>): Promise<T>;
+}
+
+// Type only: the bridge loads drizzle-orm lazily, on first use.
+type Eq = typeof drizzleEq;
+
+/** The account-state read as the row holds it, before {@link toAccountState}. */
+type AccountStateRow = Omit<AccountState, "sessionEpoch"> & {
+  sessionEpoch: number | null;
+};
+
+/**
+ * The row as the gate and the mint read it. A row written before the session
+ * epoch column existed holds null there, which is epoch zero, where every
+ * account starts.
+ */
+function toAccountState(row: AccountStateRow | undefined): AccountState | null {
+  if (!row) return null;
+  return { ...row, sessionEpoch: Number(row.sessionEpoch ?? 0) };
+}
+
+/**
+ * The account-state read, as one query for both its uses: the plain read the
+ * gate makes, and the read under a row lock the session-row write makes.
+ */
+function accountStateQuery(db: SessionRowDb, eq: Eq, userId: string) {
+  const { users } = getDialectTables();
+  return db
+    .select({
+      userId: users.id,
+      isActive: users.isActive,
+      lockedUntil: users.lockedUntil,
+      emailVerified: users.emailVerified,
+      mustChangePassword: users.mustChangePassword,
+      passwordUpdatedAt: users.passwordUpdatedAt,
+      email: users.email,
+      name: users.name,
+      image: users.image,
+      sessionEpoch: users.sessionEpoch,
+    })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+}
+
+/**
+ * The session-row operations bound to one transaction's Drizzle handle.
+ *
+ * The account read takes the session row lock (`readUnderRowLock`: `FOR
+ * SHARE` on Postgres, `FOR UPDATE` on MySQL): a revocation's update of the
+ * same user row waits for this transaction, and this read waits for a
+ * revocation already holding it, then reads what it committed. SQLite's
+ * transaction holds the database's write lock from its `BEGIN IMMEDIATE`, so
+ * the plain read is already serialised against every writer.
+ */
+function sessionRowTransaction(
+  db: SessionRowDb,
+  dialect: SupportedDialect,
+  eq: Eq
+): SessionRowTransaction {
+  const { refreshTokens } = getDialectTables();
+  return {
+    lockAccountState: async userId => {
+      const rows = await readUnderRowLock(
+        accountStateQuery(db, eq, userId),
+        { dialect },
+        "session"
+      );
+      return toAccountState(rows[0]);
+    },
+    insertRefreshToken: async record => {
+      await db.insert(refreshTokens).values(record);
+    },
+    // The count is what spends a token once: two rotations racing on one row
+    // both run this delete, and only one of them removes it. Read through
+    // `affectedRowCount`, since each driver reports it in a different field.
+    consumeRefreshToken: async id =>
+      affectedRowCount(
+        await db.delete(refreshTokens).where(eq(refreshTokens.id, id)),
+        dialect
+      ) === 1,
+  };
+}
+
+/** Delete one refresh row by id. */
+async function deleteRefreshTokenById(
+  getService: (name: string) => unknown,
+  id: string
+): Promise<void> {
+  const { eq } = await import("drizzle-orm");
+  const { refreshTokens } = getDialectTables();
+  await deleteRefreshTokens(getService, eq(refreshTokens.id, id));
+}
+
+/**
+ * Delete the refresh rows `condition` matches, through `serializeOnSqlite`, so
+ * on SQLite the delete waits for another request's open transaction instead
+ * of running inside it and being undone by its rollback.
+ */
+async function deleteRefreshTokens(
+  getService: (name: string) => unknown,
+  condition: unknown
+): Promise<void> {
+  const adapter = getService("adapter") as SerializingAdapter & {
+    getDrizzle: () => {
+      delete: (table: unknown) => {
+        where: (cond: unknown) => Promise<unknown>;
+      };
+    };
+  };
+  const { refreshTokens } = getDialectTables();
+  await serializeOnSqlite(adapter, () =>
+    adapter.getDrizzle().delete(refreshTokens).where(condition)
+  );
+}
+
+/**
+ * The grants the boot registered, or none when the container holds no boot:
+ * a context built without one is granted nothing.
+ */
+function readPluginGrants(getService: (name: string) => unknown): PluginGrants {
+  try {
+    return (
+      (getService("pluginGrants") as PluginGrants | undefined) ??
+      NO_PLUGIN_GRANTS
+    );
+  } catch {
+    return NO_PLUGIN_GRANTS;
+  }
+}
+
+/**
+ * `determineUser` decides who is signed in, which is one spelling of the
+ * login capability, so it registers only from a plugin the boot granted the
+ * login grant — meaning the hook was in the manifest when the consent rule
+ * ran and the app listed the plugin. A hook that appears only after boot,
+ * on a plugin holding no grant, registers nothing: `init` runs after the
+ * consent rule and can mutate its own `contributes`, and this bridge reads
+ * those contributions afterwards, so binding them alone would register
+ * whatever `init` added rather than what the app consented to. The other
+ * auth hooks are ordinary contributions rather than login-capability
+ * declarations, and bind as before.
+ */
+export function determineUserIfGranted(
+  hooks: AuthHooks,
+  plugin: PluginDefinition,
+  grants: PluginGrants
+): AuthHooks {
+  if (grants.login.includes(bootNameOf(plugin))) {
+    return hooks;
+  }
+  // The copy is unconditional, whatever this read of `determineUser` sees:
+  // the gate and the binder read the hooks object twice — `determineUser`
+  // here, every property again in `bindHooksToContext` — and the definition
+  // the property sits on is writable after the boot (`init` runs as a
+  // method on it), so an accessor installed there could answer `undefined`
+  // for this read and the function for the binder's; returning the live
+  // object registered whatever the second read produced. The copy reads
+  // every property once, and `determineUser` stays undefined on it.
+  return { ...hooks, determineUser: undefined };
+}
+
+/** Read the sanitized NextlyServiceConfig from the DI container, if present. */
+function readServiceConfig(
+  getService: (name: string) => unknown
+): NextlyServiceConfig | undefined {
+  try {
+    return (getService("config") as NextlyServiceConfig) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The production setup token, read and spent through `nextly_meta`, where
+ * every instance of the install sees the same row.
+ */
+function setupTokenDeps(
+  getService: (name: string) => unknown,
+  isProduction: boolean
+): SetupHandlerDeps["setupToken"] {
+  const meta = () => getService("metaService") as SetupTokenMeta;
+  return {
+    required: isProduction,
+    verify: presented =>
+      verifySetupToken({ presented, readRecord: sharedRecordReader(meta()) }),
+    confirm: presented =>
+      verifySetupToken({
+        presented,
+        readRecord: () => readSetupTokenRecord(meta()),
+      }),
+    spend: () => spendSetupToken(meta()),
+    claim: () => claimFirstSetup(meta()),
+  };
+}
+
+/**
+ * Read a boolean `auth.<name>` flag from the NextlyConfig registered in the DI
+ * container. Only `true` turns a flag on; an unset or non-boolean value, or a
+ * container not yet initialised, answers `false`, each flag's safe default.
+ */
+function readAuthFlag(
+  getService: (name: string) => unknown,
+  name: "revealRegistrationConflict" | "allowRegistration"
+): boolean {
+  try {
+    const config = getService("config");
+    if (config && typeof config === "object" && "auth" in config) {
+      const auth = (config as { auth?: unknown }).auth;
+      if (auth && typeof auth === "object" && name in auth) {
+        return (auth as Record<string, unknown>)[name] === true;
+      }
+    }
+    return false;
+  } catch {
+    // DI container not initialised yet — fall back to the safe default.
+    return false;
+  }
+}
+
+/**
+ * Read `admin.devAutoLogin` from the NextlyConfig registered in the DI
+ * container. Returns `false` when the container isn't initialised, the
+ * field is unset, or the field's shape is invalid. The runtime check in
+ * the session handler still gates this on NODE_ENV !== "production" - this
+ * function only resolves what the host configured.
+ */
+function readDevAutoLogin(
+  getService: (name: string) => unknown
+): false | { email: string; password?: string } {
+  try {
+    const config = getService("config");
+    if (config && typeof config === "object" && "admin" in config) {
+      const admin = (config as { admin?: unknown }).admin;
+      if (admin && typeof admin === "object" && "devAutoLogin" in admin) {
+        const dal = (admin as { devAutoLogin?: unknown }).devAutoLogin;
+        if (
+          dal &&
+          typeof dal === "object" &&
+          "email" in dal &&
+          typeof (dal as { email?: unknown }).email === "string"
+        ) {
+          const typed = dal as { email: string; password?: string };
+          return {
+            email: typed.email,
+            password: typed.password,
+          };
+        }
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read `security.authRateLimit` from the NextlyConfig registered in the
+ * DI container. Falls back to the default 30 req/IP/hour, 1-hour window
+ * when unset or the container is not yet initialised.
+ */
+/**
+ * A nested object off the DI config, or `undefined` when it is not there.
+ *
+ * The config service is `unknown` at this boundary — the bridge deliberately
+ * does not import its type — so every read is a shape check. Doing that once
+ * here rather than inline at each level is what keeps the reader below flat:
+ * the same three checks repeated per level is where this function's complexity
+ * came from, not the number of values it reads.
+ */
+function configBlock(
+  source: unknown,
+  key: string
+): Record<string, unknown> | undefined {
+  if (source === null || typeof source !== "object" || !(key in source)) {
+    return undefined;
+  }
+  const value = (source as Record<string, unknown>)[key];
+  return value !== null && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/** A configured number, or the fallback when it is absent or the wrong type. */
+function numberOr(value: unknown, fallback: number): number {
+  return typeof value === "number" ? value : fallback;
+}
+
+/**
+ * The limit store the site selected, or undefined where the container has
+ * none registered (a context built without the limit services).
+ */
+function readLimitStore(
+  getService: (name: string) => unknown
+): LimitStore | undefined {
+  try {
+    return getService("limitStore") as LimitStore;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Where core's own limits count, as the container registered it, or the app's
+ * own store of the older contract where the container has none.
+ */
+function countsIn(
+  getService: (name: string) => unknown,
+  configured?: RateLimitStore
+): { counts?: RateLimitStore } {
+  try {
+    const counts = getService("coreRateLimitStore");
+    if (isRateLimitStore(counts)) return { counts };
+  } catch {
+    // A container built without the limit services.
+  }
+  return configured === undefined ? {} : { counts: configured };
+}
+
+/**
+ * The configured per-IP auth limit.
+ *
+ * Exported so a plugin route opting into `rateLimit: "auth"` uses the same
+ * limit and window as core's, rather than a second set of numbers that can
+ * drift from it.
+ */
+export function readAuthRateLimit(getService: (name: string) => unknown): {
+  requestsPerHour: number;
+  windowMs: number;
+  /** An app's store of the older contract, when it configured one. */
+  store?: RateLimitStore;
+  /**
+   * Where core's own limits count: that store, or the selected limit store.
+   * Undefined only where the container has neither registered.
+   */
+  counts?: RateLimitStore;
+} {
+  const fallback = {
+    requestsPerHour: 30,
+    windowMs: 3_600_000,
+    ...countsIn(getService),
+  };
+  try {
+    const config = getService("config");
+
+    // The limits and the store come from DIFFERENT blocks: the numbers are
+    // security config, the window's home is rate-limit config, and one app has
+    // one store. Read independently so a deployment that configures a store but
+    // leaves the auth limits at their defaults still gets a shared window — the
+    // case that would otherwise look configured and behave per-process.
+    const store = configBlock(config, "rateLimit")?.["store"] as
+      | RateLimitStore
+      | undefined;
+    const limits = configBlock(
+      configBlock(config, "security"),
+      "authRateLimit"
+    );
+
+    const counted = countsIn(getService, store);
+    return {
+      requestsPerHour: numberOr(
+        limits?.["requestsPerHour"],
+        fallback.requestsPerHour
+      ),
+      windowMs: numberOr(limits?.["windowMs"], fallback.windowMs),
+      // The app's own store as core's limits use it: where the container
+      // registered core's store, that is the same store held to the limit
+      // store's time and watched for an outage, under the keys core always
+      // gave it. The second-factor fallback reads `store`, so a store that
+      // stops answering is answered there within that time too.
+      ...(store === undefined ? {} : { store: counted.counts ?? store }),
+      ...counted,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * The boot warning owed when a second-factor attempt budget is per process.
+ *
+ * The budget lives in an app's own store of the earlier contract when one is
+ * configured, and otherwise in the selected limit store. With the memory
+ * store on serverless or any multi-instance deployment each instance counts
+ * its own wrong answers, so the effective cap grows with the instance count.
+ * That is a sound default for one process and a silent weakening for many, so
+ * an install that registers a challenge without a shared store, and without
+ * saying it runs one instance, is told once, at boot, rather than never.
+ * Single use is not at stake: a correct answer is marked in the database.
+ */
+export function challengeBudgetWarning(
+  plugins: readonly PluginDefinition[],
+  config: unknown
+): string | null {
+  const challenges = plugins
+    .filter(plugin => plugin.enabled !== false)
+    .flatMap(plugin => plugin.contributes?.auth?.challenges ?? []);
+  if (challenges.length === 0) return null;
+  if (readAuthRateLimit(() => config).store !== undefined) return null;
+  const rateLimit = configBlock(config, "rateLimit");
+  if (rateLimit?.["singleInstance"] === true) return null;
+  const selected = rateLimit?.["limitStore"];
+  if (
+    selected === "database" ||
+    (typeof selected === "object" &&
+      selected !== null &&
+      (selected as { shared?: unknown }).shared === true)
+  ) {
+    return null;
+  }
+  return (
+    "[nextly] Second-factor challenges are registered but no shared rate-limit " +
+    "store is selected, so each instance counts its own wrong answers: with " +
+    "several instances the attempt cap is multiplied by their number. Select " +
+    'the database store (rateLimit.store: "database"), or set ' +
+    "rateLimit.singleInstance if the site runs one instance. A correct answer " +
+    "is accepted once on every instance either way."
+  );
+}
+
+/**
+ * Bind every phase of a plugin's auth hooks to that plugin's context.
+ *
+ * The registries pass ONE context to whatever they invoke; the owning
+ * plugin's is the only correct one — `ctx.settings`, `ctx.fetch`,
+ * `ctx.audit` and `ctx.self` are per-plugin surfaces, and a hook reading
+ * its own encrypted settings through a system context threw on a `self`
+ * that was empty. Wrapping at registration keeps the registries and the
+ * AuthHooks contract untouched.
+ */
+export function bindHooksToContext(
+  hooks: AuthHooks,
+  ctx: PluginContext
+): AuthHooks {
+  const bound: Record<string, unknown> = {};
+  for (const [phase, fn] of Object.entries(hooks)) {
+    if (typeof fn !== "function") continue;
+    void phase;
+    // Every phase takes its arguments and receives the context LAST; the
+    // wrapper swaps whatever context the registry passes for the owning
+    // plugin's, so phases and contract stay untouched.
+    bound[phase] = (...args: unknown[]) =>
+      (fn as (...a: unknown[]) => unknown)(...args.slice(0, -1), ctx);
+  }
+  return bound;
+}
+
+/** Bind a plugin's challenge definition to that plugin's context. */
+export function bindChallengeToContext(
+  def: ChallengeDefinition,
+  ctx: PluginContext
+): ChallengeDefinition {
+  return {
+    id: def.id,
+    resolve: (args, _ctx) => def.resolve(args, ctx),
+  };
+}
+
+/**
+ * The claim names the configured custom user fields are carried under: each
+ * field's name, which is the key the `user_ext` read returns its value under.
+ */
+function userFieldClaimNames(
+  config: NextlyServiceConfig | undefined
+): string[] {
+  return (config?.users?.fields ?? []).flatMap(field =>
+    "name" in field && typeof field.name === "string" && field.name
+      ? [field.name]
+      : []
+  );
+}

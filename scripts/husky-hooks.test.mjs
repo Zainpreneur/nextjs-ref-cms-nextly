@@ -1,0 +1,513 @@
+/**
+ * What the husky hooks must clear before they run anything, and why.
+ *
+ * Git exports GIT_DIR into every hook. In a linked worktree that names the
+ * worktree's admin directory rather than a plain .git, and turbo — which
+ * shells out to git to hash its inputs — inherits it and hangs forever:
+ * `turbo run build` printed its task list and then held at ~2s of CPU over 25
+ * minutes. Measured four ways: the same build in the same worktree finishes
+ * with GIT_DIR unset, hangs with it set, finishes again when the hook clears
+ * it, and never hangs from the main checkout, where GIT_DIR is an ordinary
+ * .git. Pushing from any worktree was impossible until the hook cleared it.
+ *
+ * pre-commit clears it too, and not because it hangs: its own two commands,
+ * gitleaks and lint-staged, both drive the git CLI, which resolves the pointer
+ * correctly — committing from a worktree completes either way, including
+ * lint-staged's stash-and-restore. That is a fact about those two commands and
+ * it lapses the moment either changes or a third joins them, with turbo
+ * standing as proof that a git-shelling tool can take the pointer badly.
+ * Clearing it in both hooks makes the invariant belong to the hooks rather
+ * than to whatever they happen to call, and leaves nothing asserted about
+ * third-party internals.
+ *
+ * Both hooks are POSIX sh — husky invokes them with `sh -e`, which is dash on
+ * Ubuntu, the system sh on macOS, and Git Bash's sh on Windows. These cases
+ * pin both halves: that the variable is cleared at all, and that it is cleared
+ * before the first tool runs — clearing it afterwards would leave the hang in
+ * place while looking like a fix.
+ *
+ * @module husky-hooks.test
+ */
+import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+const hook = async name =>
+  readFile(path.join(HERE, "..", ".husky", name), "utf-8");
+
+/**
+ * Comments are prose, and every pattern below describes a shell construct, so
+ * the comments are removed before any of them run.
+ *
+ * Both hooks are more comment than command, and the words these patterns match
+ * are ordinary English: "the source of truth" is phrasing this repository
+ * reaches for, and it contains no `source` command. A guard that fails on a
+ * sentence, under a message about dash on Ubuntu, sends the next reader hunting
+ * for a construct that was never written — and a guard that cries wolf gets
+ * deleted rather than fixed.
+ *
+ * Trailing comments go too. That can only ever remove text a pattern might
+ * have matched, so the failure direction is a missed bashism inside a comment,
+ * never a rejected correct hook.
+ */
+const shellCode = source =>
+  source
+    .split("\n")
+    .map(line => line.replace(/\s#.*$/, ""))
+    .filter(line => !/^\s*#/.test(line))
+    .join("\n");
+
+/**
+ * The first command either hook spawns. `command -v` counts: it is how
+ * pre-commit reaches gitleaks, and a clear placed after it would already be
+ * too late for anything that call touched. So does `exec`: it is how pre-push
+ * hands itself to `scripts/bounded.mjs`, and turbo runs under what that
+ * inherits.
+ */
+const FIRST_TOOL =
+  /^\s*(?:if\s+command\s+-v\s+|if\s+|exec\s+)?(?:pnpm|npx|node|turbo|gitleaks)\b/m;
+
+/**
+ * The first GATE pre-push runs. Not the same as the first tool: the hand-over
+ * to `scripts/bounded.mjs` runs this same hook again, and that second run
+ * reaches the gates.
+ */
+const FIRST_GATE = /^\s*pnpm\b/m;
+const CLEARS_GIT_DIR = /^unset .*\bGIT_DIR\b/m;
+
+describe.each(["pre-push", "pre-commit", "commit-msg"])("the %s hook", name => {
+  it("clears GIT_DIR", async () => {
+    expect(shellCode(await hook(name))).toMatch(CLEARS_GIT_DIR);
+  });
+
+  it("clears GIT_WORK_TREE alongside it, since git reads the two as a pair", async () => {
+    expect(shellCode(await hook(name))).toMatch(/^unset .*\bGIT_WORK_TREE\b/m);
+  });
+
+  it("clears it before invoking any tool, not after", async () => {
+    const source = shellCode(await hook(name));
+
+    const unsetAt = source.search(CLEARS_GIT_DIR);
+    const firstTool = source.search(FIRST_TOOL);
+
+    expect(unsetAt).toBeGreaterThan(-1);
+    expect(firstTool).toBeGreaterThan(-1);
+    expect(unsetAt).toBeLessThan(firstTool);
+  });
+
+  it("uses no bashisms the Ubuntu default shell would reject", async () => {
+    const source = shellCode(await hook(name));
+
+    // dash is not bash: these are the constructs that silently work on a
+    // developer's bash and fail on Ubuntu, where /bin/sh is dash.
+    expect(source).not.toMatch(/\[\[/); // [[ ... ]]
+    expect(source).not.toMatch(/^\s*function\s+\w+/m); // function foo()
+    expect(source).not.toMatch(/\$\(\(.*\+\+/); // $((i++))
+    expect(source).not.toMatch(/\bsource\s+/); // source, not .
+  });
+});
+
+describe("the pre-push hook specifically", () => {
+  /*
+   * The runner answers whether this is CI, so the hook and the heavy commands
+   * cannot disagree — and the hook asks before it does anything heavy.
+   */
+  it("asks the runner whether this is CI, before the hand-over or any gate", async () => {
+    const source = shellCode(await hook("pre-push"));
+
+    const ciGuard = source.search(/^if node scripts\/bounded\.mjs --is-ci; then$/m);
+    const handover = source.search(/^\s*exec node scripts\/bounded\.mjs /m);
+
+    expect(ciGuard).toBeGreaterThan(-1);
+    expect(ciGuard).toBeLessThan(handover);
+    expect(ciGuard).toBeLessThan(source.search(FIRST_GATE));
+  });
+
+  it("declares a POSIX shell, so dash and Git Bash both accept it", async () => {
+    expect(await hook("pre-push")).toMatch(/^#!\/usr\/bin\/env sh\r?\n/);
+  });
+
+  it("does not let the repo-wide typecheck refuse the push", async () => {
+    /*
+     * The only gate here whose scope is the whole repository, so it can be red
+     * for a package the author never touched. A hook that refuses over someone
+     * else's breakage is one people pass `--no-verify` to, which costs every
+     * gate rather than this one. CI blocks on the same command.
+     */
+    const source = shellCode(await hook("pre-push"));
+
+    expect(source).toMatch(/^set \+e\n\s*pnpm turbo check-types/m);
+    expect(source).toMatch(/^TYPES_STATUS=\$\?/m);
+    // Reported, so it is not silent either.
+    expect(source).toMatch(/if \[ "\$TYPES_STATUS" -ne 0 \]/);
+  });
+
+  it("typechecks the whole repo, which nothing here did before", async () => {
+    // `lint` and `build` above already run repo-wide, so types were the one
+    // whole-repo question this hook was not asking — and an API or type break
+    // is how a shared package breaks the packages that depend on it.
+    expect(shellCode(await hook("pre-push"))).toMatch(
+      /^\s*pnpm turbo check-types\b/m
+    );
+  });
+
+  it("typechecks AFTER the build, which is what makes it answerable", async () => {
+    /*
+     * `check-types` depends on `^check-types` and never builds, so it reads
+     * whatever `dist` survived. Run before the build it fails on an unbuilt
+     * tree for a reason that has nothing to do with the diff — a red that
+     * teaches the next person to stop reading this hook's output.
+     */
+    const source = shellCode(await hook("pre-push"));
+
+    const buildAt = source.search(/^\s*pnpm run build\b/m);
+    const typesAt = source.search(/^\s*pnpm turbo check-types\b/m);
+
+    expect(buildAt).toBeGreaterThan(-1);
+    expect(typesAt).toBeGreaterThan(-1);
+    expect(buildAt).toBeLessThan(typesAt);
+  });
+
+  it("lints AFTER the build, which is what lets a fresh checkout pass", async () => {
+    /*
+     * Every type-aware rule resolves a workspace import through the
+     * sibling's `dist`. Linting first refused every push from a checkout that
+     * had never been built — 16 of 23 lint tasks, all on unresolved imports —
+     * and a new worktree is exactly that checkout.
+     *
+     * The line is `pnpm lint` exactly: `pnpm lint:design` and the other
+     * lints that read no `dist` run before the build on purpose.
+     */
+    const source = shellCode(await hook("pre-push"));
+
+    const buildAt = source.search(/^\s*pnpm run build\b/m);
+    const lintAt = source.search(/^\s*pnpm lint\s*$/m);
+
+    expect(buildAt).toBeGreaterThan(-1);
+    expect(lintAt).toBeGreaterThan(-1);
+    expect(buildAt).toBeLessThan(lintAt);
+  });
+
+  it("runs the root scripts tests BEFORE every workspace's tests, so a failure there stops first", async () => {
+    /*
+     * The scripts tests take a few minutes and the workspace suites a quarter
+     * of an hour. Run after them, a push that failed the scripts tests learned
+     * it only once both were done. Under `set -e` the first failure ends the
+     * hook, so the order is what decides how long a red takes.
+     */
+    const source = shellCode(await hook("pre-push"));
+
+    const scriptsAt = source.search(/^\s*node scripts\/test-changed\.mjs --scripts-only\s*$/m);
+    const everyWorkspaceAt = source.search(/^\s*pnpm turbo test\b/m);
+
+    expect(scriptsAt).toBeGreaterThan(-1);
+    expect(everyWorkspaceAt).toBeGreaterThan(-1);
+    expect(scriptsAt).toBeLessThan(everyWorkspaceAt);
+  });
+
+  it("records what is uncommitted BEFORE the first gate runs", async () => {
+    /*
+     * Every gate here runs against the working tree while Git pushes HEAD, so
+     * a green describes a different tree whenever anything is uncommitted.
+     * Reading the status after the gates would let lint-staged, a formatter or
+     * a build artefact decide the answer.
+     */
+    const source = shellCode(await hook("pre-push"));
+
+    const recordAt = source.search(/^DIRTY=/m);
+    const firstGate = source.search(FIRST_GATE);
+
+    expect(recordAt).toBeGreaterThan(-1);
+    expect(recordAt).toBeLessThan(firstGate);
+  });
+
+  it("reports it LAST, so it is still on screen when the push proceeds", async () => {
+    const source = shellCode(await hook("pre-push"));
+
+    const recordAt = source.search(/^DIRTY=/m);
+    const reportAt = source.search(/^if \[ -n "\$DIRTY" \]/m);
+
+    expect(reportAt).toBeGreaterThan(-1);
+    expect(reportAt).toBeGreaterThan(recordAt);
+    // Nothing runs after it, which is the whole point of where it sits.
+    expect(source.slice(reportAt)).not.toMatch(FIRST_TOOL);
+  });
+
+  it("does not refuse the push over a status it could not read", async () => {
+    // A hook that cannot answer a question it only WARNS about must not turn
+    // that into a refusal — this runs under `set -e`.
+    expect(shellCode(await hook("pre-push"))).toMatch(
+      /^DIRTY=.*\|\| true\)"?$/m
+    );
+  });
+});
+
+/*
+ * What pre-push does before any gate, run for real.
+ *
+ * `node` and `pnpm` are replaced on PATH by stubs that print what they were
+ * asked and exit 99. Nothing here can start a gate: the first command that
+ * would is a stub, and its exit status says how far the hook got. Run from the
+ * repository root, as husky runs it, and without CI, which skips the hook.
+ */
+describe("the pre-push hook before its gates", () => {
+  const ROOT = path.join(HERE, "..");
+  let stubs;
+
+  beforeAll(() => {
+    stubs = mkdtempSync(path.join(tmpdir(), "pre-push-stubs-"));
+    for (const name of ["node", "pnpm"]) {
+      const file = path.join(stubs, name);
+      // The one real call let through is the CI question, which the runner
+      // answers and which starts nothing.
+      const passThrough =
+        name === "node"
+          ? `if [ "$1" = "scripts/bounded.mjs" ] && [ "$2" = "--is-ci" ]; then exec ${JSON.stringify(process.execPath)} "$@"; fi\n`
+          : "";
+      writeFileSync(file, `#!/bin/sh\n${passThrough}echo "stub ${name} $*" >&2\nexit 99\n`);
+      chmodSync(file, 0o755);
+    }
+  });
+
+  afterAll(() => rmSync(stubs, { recursive: true, force: true }));
+
+  const ZERO = "0".repeat(40);
+  const SHA = "a".repeat(40);
+  const deletion = branch => `refs/heads/${branch} ${ZERO} refs/heads/${branch} ${SHA}\n`;
+  const update = branch => `refs/heads/${branch} ${SHA} refs/heads/${branch} ${ZERO}\n`;
+
+  function push(stdin, extra = {}) {
+    const env = { ...process.env };
+    for (const name of ["CI", "NEXTLY_BOUNDED"]) delete env[name];
+    return spawnSync("sh", ["-e", ".husky/pre-push", "origin", "git@example.com:o/r.git"], {
+      cwd: ROOT,
+      input: stdin,
+      encoding: "utf8",
+      env: { ...env, PATH: `${stubs}${path.delimiter}${env.PATH}`, ...extra },
+    });
+  }
+
+  it.runIf(process.platform !== "win32")("lets a push that only deletes branches through without a gate", () => {
+    const result = push(deletion("gone") + deletion("also-gone"));
+    expect(result.status).toBe(0);
+    expect(result.stdout).toMatch(/only deleting remote branches/);
+    expect(result.stderr).not.toMatch(/stub/);
+  });
+
+  it.runIf(process.platform !== "win32")("hands a push that carries code to the bounded runner", () => {
+    const result = push(update("feature"));
+    expect(result.status).toBe(99);
+    expect(result.stderr).toMatch(/^stub node scripts\/bounded\.mjs sh -e \.husky\/pre-push origin /m);
+  });
+
+  it.runIf(process.platform !== "win32")("gates a push that deletes one branch and updates another", () => {
+    expect(push(deletion("gone") + update("feature")).status).toBe(99);
+  });
+
+  /*
+   * "Every ref is a deletion" is true of no refs at all. Reading that as an
+   * all-clear is the vacuous pass this repository keeps finding, so an empty
+   * list — and a line with no sha to judge — is gated.
+   */
+  it.runIf(process.platform !== "win32")("does not read an empty or malformed ref list as only deletions", () => {
+    expect(push("").status).toBe(99);
+    expect(push("refs/heads/feature\n").status).toBe(99);
+  });
+
+  /*
+   * "CI" means what `detectIsCi` in packages/telemetry says: set, and neither
+   * "0" nor "false". A presence test skipped every gate for a developer with
+   * CI=false in their environment.
+   */
+  /*
+   * 🔴 Read as CI, a deployment platform's variable loaded into a developer's
+   * shell — VERCEL=1 from a pulled `.env` — skipped every gate.
+   */
+  it.runIf(process.platform !== "win32")("gates a push whose shell carries a deployment platform's variable", () => {
+    expect(push(update("feature"), { VERCEL: "1" }).status).toBe(99);
+    expect(push(update("feature"), { NETLIFY: "true" }).status).toBe(99);
+  });
+
+  it.runIf(process.platform !== "win32")("skips in CI, and gates a machine whose CI is set to false or 0", () => {
+    const skipped = push(update("feature"), { CI: "true" });
+    expect(skipped.status).toBe(0);
+    expect(skipped.stdout).toMatch(/skipped in CI/);
+    for (const value of ["false", "0", ""]) {
+      expect(push(update("feature"), { CI: value }).status).toBe(99);
+    }
+  });
+
+  it.runIf(process.platform !== "win32")("goes straight to the gates in the run the runner started", () => {
+    const result = push(deletion("gone"), { NEXTLY_BOUNDED: "1" });
+    expect(result.status).toBe(99);
+    expect(result.stderr).toMatch(/^stub node scripts\/local-limits\.mjs/m);
+  });
+});
+
+/*
+ * A push of screenshots alone: `pnpm visual-check --publish` pushes a branch
+ * under `pr-screenshots/` whose every commit holds PNG files and nothing else.
+ * It carries no code, so it is let through ungated like a deletion — and only
+ * when git's own objects say so. A branch named that way that holds code, or
+ * sits on history that does, is gated like any other.
+ *
+ * Run in a repository of its own, made here, so the commits the hook reads
+ * are real ones and nothing is written into this checkout's object store. The
+ * hook and the runner it asks about CI are the checkout's own; `node` and
+ * `pnpm` are stubs that end the run where a gate would start.
+ */
+describe("the pre-push hook and a push of screenshots", () => {
+  const ROOT = path.join(HERE, "..");
+  const ZERO = "0".repeat(40);
+  let dir;
+  let stubs;
+  const commits = {};
+
+  // Without the hook's own repository pointers, should this run inside one: the commits
+  // belong in the repository made here.
+  const gitEnv = { ...process.env };
+  delete gitEnv.GIT_DIR;
+  delete gitEnv.GIT_WORK_TREE;
+  const git = (...args) => spawnSync("git", args, { cwd: dir, encoding: "utf8", env: gitEnv }).stdout.trim();
+
+  beforeAll(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "pre-push-screenshots-"));
+    stubs = mkdtempSync(path.join(tmpdir(), "pre-push-screenshot-stubs-"));
+    for (const name of ["node", "pnpm"]) {
+      const passThrough =
+        name === "node"
+          ? `if [ "$1" = "scripts/bounded.mjs" ] && [ "$2" = "--is-ci" ]; then exec ${JSON.stringify(process.execPath)} ${JSON.stringify(path.join(ROOT, "scripts", "bounded.mjs"))} --is-ci; fi\n`
+          : "";
+      writeFileSync(path.join(stubs, name), `#!/bin/sh\n${passThrough}echo "stub ${name} $*" >&2\nexit 99\n`);
+      chmodSync(path.join(stubs, name), 0o755);
+    }
+    spawnSync("git", ["init", "--quiet", dir], { env: gitEnv });
+    const blob = content => {
+      const file = path.join(dir, "blob");
+      writeFileSync(file, content);
+      return git("hash-object", "-w", file);
+    };
+    const tree = entries =>
+      spawnSync("git", ["mktree"], {
+        cwd: dir,
+        env: gitEnv,
+        input: entries.map(([name, sha]) => `100644 blob ${sha}\t${name}\n`).join(""),
+        encoding: "utf8",
+      }).stdout.trim();
+    const commit = (treeSha, parent) =>
+      git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit-tree", treeSha, ...(parent ? ["-p", parent] : []), "-m", "c");
+    const png = blob("png");
+    commits.images = commit(tree([["admin-390-light.png", png]]));
+    commits.imagesAgain = commit(tree([["admin-390-dark.png", png]]), commits.images);
+    commits.code = commit(tree([["admin-390-light.png", png], ["code.mjs", blob("export {};\n")]]));
+    commits.imagesOnCode = commit(tree([["admin-390-light.png", png]]), commits.code);
+  });
+
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(stubs, { recursive: true, force: true });
+  });
+
+  function push(stdin) {
+    const env = { ...process.env };
+    for (const name of ["CI", "NEXTLY_BOUNDED"]) delete env[name];
+    return spawnSync("sh", ["-e", path.join(ROOT, ".husky", "pre-push"), "origin", "git@example.com:o/r.git"], {
+      cwd: dir,
+      input: stdin,
+      encoding: "utf8",
+      env: { ...env, PATH: `${stubs}${path.delimiter}${env.PATH}` },
+    });
+  }
+
+  const to = (sha, branch) => `refs/heads/local ${sha} refs/heads/${branch} ${ZERO}\n`;
+
+  // Every commit made, so a fixture that silently failed cannot pass as a malformed line.
+  it.runIf(process.platform !== "win32")("made every commit it reads", () => {
+    for (const sha of Object.values(commits)) expect(sha).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  it.runIf(process.platform !== "win32")("lets screenshots alone through to a pr-screenshots branch without a gate", () => {
+    for (const sha of [commits.images, commits.imagesAgain]) {
+      const result = push(to(sha, "pr-screenshots/posts-list"));
+      expect(result.status).toBe(0);
+      expect(result.stdout).toMatch(/nothing to gate/);
+      expect(result.stderr).not.toMatch(/stub/);
+    }
+    const deletion = `refs/heads/gone ${ZERO} refs/heads/gone ${"a".repeat(40)}\n`;
+    expect(push(to(commits.images, "pr-screenshots/posts-list") + deletion).status).toBe(0);
+  });
+
+  it.runIf(process.platform !== "win32")("gates the same images pushed to any other branch", () => {
+    expect(push(to(commits.images, "feature")).status).toBe(99);
+  });
+
+  it.runIf(process.platform !== "win32")("gates a pr-screenshots branch that holds code, or sits on code", () => {
+    expect(push(to(commits.code, "pr-screenshots/posts-list")).status).toBe(99);
+    expect(push(to(commits.imagesOnCode, "pr-screenshots/posts-list")).status).toBe(99);
+    expect(push(to(commits.images, "pr-screenshots/posts-list") + to(commits.code, "feature")).status).toBe(99);
+  });
+
+  it.runIf(process.platform !== "win32")("gates a pr-screenshots push whose commit it cannot read", () => {
+    expect(push(to("b".repeat(40), "pr-screenshots/posts-list")).status).toBe(99);
+  });
+});
+
+/*
+ * The commit-msg hook, run for real: its credit check refuses before
+ * commitlint runs, and a clean message reaches commitlint.
+ *
+ * `npx` is replaced on PATH by a stub that records its arguments, so
+ * commitlint itself never runs; `node` is the real one, running the real
+ * check. The author and committer come from the environment, as git hands a
+ * hook the identities a commit is about to carry. Every crediting example is
+ * assembled at run time, so no line of this file spells one.
+ */
+describe("the commit-msg hook's credit check", () => {
+  const ROOT = path.join(HERE, "..");
+  const spell = (...parts) => parts.join("");
+  const PERSON = { GIT_AUTHOR_NAME: "Jane Doe", GIT_AUTHOR_EMAIL: "jane@example.com", GIT_COMMITTER_NAME: "Jane Doe", GIT_COMMITTER_EMAIL: "jane@example.com" };
+  let dir;
+
+  beforeAll(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "commit-msg-"));
+    writeFileSync(path.join(dir, "npx"), `#!/bin/sh\necho "$*" > ${JSON.stringify(path.join(dir, "npx-called"))}\n`);
+    chmodSync(path.join(dir, "npx"), 0o755);
+  });
+
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  function commitMsg(message, identity = {}) {
+    rmSync(path.join(dir, "npx-called"), { force: true });
+    const file = path.join(dir, "COMMIT_EDITMSG");
+    writeFileSync(file, message);
+    const env = { ...process.env, ...PERSON, ...identity, PATH: `${dir}${path.delimiter}${process.env.PATH}` };
+    const result = spawnSync("sh", ["-e", ".husky/commit-msg", file], { cwd: ROOT, encoding: "utf8", env });
+    return { ...result, commitlint: existsSync(path.join(dir, "npx-called")) ? readFileSync(path.join(dir, "npx-called"), "utf8").trim() : null };
+  }
+
+  it.runIf(process.platform !== "win32")("refuses a crediting message before commitlint runs", () => {
+    const result = commitMsg(["fix: a change", "", spell("Co-authored-by: Clau", "de Opus 5 <noreply@", "anthro", "pic.com>")].join("\n"));
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/This commit credits an AI tool/);
+    expect(result.commitlint).toBeNull();
+  });
+
+  it.runIf(process.platform !== "win32")("refuses an AI tool as the commit's author", () => {
+    const result = commitMsg("fix: a change", { GIT_AUTHOR_NAME: spell("Clau", "de"), GIT_AUTHOR_EMAIL: spell("noreply@", "anthro", "pic.com") });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/the author, .+, is an AI tool's identity/);
+  });
+
+  it.runIf(process.platform !== "win32")("hands a clean message to commitlint", () => {
+    const result = commitMsg("fix: change how Claude Code loads skills");
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.commitlint).toMatch(/^--no-install commitlint --edit \S+COMMIT_EDITMSG$/);
+  });
+});

@@ -1,0 +1,15 @@
+{
+  "title": "Configuration",
+  "pages": [
+    "index",
+    "nextly-config",
+    "collections",
+    "singles",
+    "public-addresses",
+    "field-groups",
+    "fields",
+    "environment",
+    "limit-store",
+    "media-upload-security"
+  ]
+}

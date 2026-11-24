@@ -1,0 +1,242 @@
+/**
+ * Folding Schema-Builder collections into a config-derived desired schema.
+ *
+ * A desired schema built from `nextly.config.ts` alone omits every collection
+ * created through the Schema Builder, and on SQLite/MySQL the diff introspects
+ * the whole database, so those omissions come back as orphan DROPs.
+ */
+import { describe, expect, it, vi } from "vitest";
+
+import { DEMOTED_FROM_CODE } from "../demoted-from-code";
+import {
+  configTheCodeOwns,
+  isHandedToBuilder,
+  mergeRegisteredCollections,
+  mergeRegisteredCollectionsSafely,
+  mergeRegisteredEntities,
+  withoutHandedToBuilder,
+  type RegisteredCollectionRow,
+} from "../registered-collections";
+import type { DesiredCollection } from "../types";
+
+function configCollection(slug: string): DesiredCollection {
+  return {
+    slug,
+    tableName: `dc_${slug}`,
+    fields: [],
+  } as DesiredCollection;
+}
+
+describe("mergeRegisteredCollections", () => {
+  it("keeps a registry-only collection that the config never mentions", () => {
+    // The bug this exists to prevent: `db:sync` proposed dropping dc_city,
+    // dc_fan and dc_test1 because they were created by clicking, not in code.
+    const merged = mergeRegisteredCollections(
+      { posts: configCollection("posts") },
+      [{ slug: "city", tableName: "dc_city", fields: [] }]
+    );
+
+    expect(Object.keys(merged).sort()).toEqual(["city", "posts"]);
+    expect(merged.city.tableName).toBe("dc_city");
+  });
+
+  it("lets the config win over a registry row for the same slug", () => {
+    // Otherwise a field deleted from the config would be resurrected from the
+    // registry row that still carries it, and the removal would never apply.
+    const fromConfig = configCollection("posts");
+    const merged = mergeRegisteredCollections({ posts: fromConfig }, [
+      { slug: "posts", tableName: "dc_stale_name", fields: [{ name: "gone" }] },
+    ]);
+
+    expect(merged.posts).toBe(fromConfig);
+    expect(merged.posts.tableName).toBe("dc_posts");
+  });
+
+  it("carries the localized flag so translatable columns stay in the companion table", () => {
+    const merged = mergeRegisteredCollections({}, [
+      { slug: "city", tableName: "dc_city", fields: [], localized: true },
+    ]);
+    expect(merged.city.localized).toBe(true);
+  });
+
+  it("supplies localized to every entity kind, not just collections", () => {
+    // Singles and components keep translatable columns in their own companion
+    // tables too. A mapper that omitted the flag dropped it silently, and the
+    // next diff re-added those columns to the main table.
+    const merged = mergeRegisteredEntities(
+      {},
+      [{ slug: "hero", tableName: "single_hero", fields: [], localized: true }],
+      (_row, base) => base
+    );
+    expect(merged.hero.localized).toBe(true);
+  });
+
+  it("states Builder ownership for every registry-sourced entity", () => {
+    // A row only reaches this merge when the registry holds it and no config entry claimed the
+    // slug, which is exactly what it means for the Schema Builder to own it. Left unstated, such an
+    // entity is described the way a code-first table is, and a db:sync or HMR pass reports its
+    // columns as drift — on MySQL, an existing unbounded text column as a narrowing to 255.
+    const merged = mergeRegisteredEntities(
+      {},
+      [{ slug: "hero", tableName: "single_hero", fields: [] }],
+      (_row, base) => base
+    );
+
+    expect(merged.hero.builderOwned).toBe(true);
+  });
+
+  // A code-first or plugin entity dropped from the config keeps its registry row on purpose, so
+  // reaching this merge does not make it the Builder's. Calling it so would rewrite its columns on
+  // the next sync against a table that orphan retention exists to leave alone.
+  it.each([
+    ["a locked row", { locked: true }],
+    ["a code-sourced row", { source: "code" }],
+    ["a plugin-sourced row", { source: "plugin:seo" }],
+  ])("does not claim %s for the Builder", (_, ownership) => {
+    const merged = mergeRegisteredEntities(
+      {},
+      [{ slug: "orphan", tableName: "dc_orphan", fields: [], ...ownership }],
+      (_row, base) => base
+    );
+
+    expect(merged.orphan.builderOwned).toBe(false);
+  });
+
+  it("defaults localized to false rather than undefined", () => {
+    const merged = mergeRegisteredEntities(
+      {},
+      [{ slug: "x", tableName: "comp_x", fields: [] }],
+      (_row, base) => base
+    );
+    expect(merged.x.localized).toBe(false);
+  });
+
+  it("skips rows too incomplete to diff", () => {
+    const merged = mergeRegisteredCollections({}, [
+      { slug: "no-table" },
+      { tableName: "dc_no_slug" },
+      {} as RegisteredCollectionRow,
+    ]);
+    expect(merged).toEqual({});
+  });
+
+  it("does not mutate the caller's config map", () => {
+    const fromConfig = { posts: configCollection("posts") };
+    mergeRegisteredCollections(fromConfig, [
+      { slug: "city", tableName: "dc_city", fields: [] },
+    ]);
+    expect(Object.keys(fromConfig)).toEqual(["posts"]);
+  });
+});
+
+describe("mergeRegisteredCollectionsSafely", () => {
+  it("merges when the registry reads cleanly", async () => {
+    const merged = await mergeRegisteredCollectionsSafely(
+      { posts: configCollection("posts") },
+      async () => [{ slug: "city", tableName: "dc_city", fields: [] }]
+    );
+    expect(Object.keys(merged).sort()).toEqual(["city", "posts"]);
+  });
+
+  it("falls back to the config schema and warns when the registry cannot be read", async () => {
+    // Refusing to sync at all would be worse than syncing a subset, but the
+    // consequence (Schema-Builder collections may be flagged for drop) is not
+    // visible from the output unless it is said out loud.
+    const warn = vi.fn();
+    const merged = await mergeRegisteredCollectionsSafely(
+      { posts: configCollection("posts") },
+      () => Promise.reject(new Error("no such column: localized")),
+      { warn }
+    );
+
+    expect(Object.keys(merged)).toEqual(["posts"]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain("no such column: localized");
+    expect(warn.mock.calls[0][0]).toContain("flagged for drop");
+  });
+
+  it("survives an unreadable registry with no logger attached", async () => {
+    await expect(
+      mergeRegisteredCollectionsSafely({}, () =>
+        Promise.reject(new Error("boom"))
+      )
+    ).resolves.toEqual({});
+  });
+});
+
+describe("a collection a demote handed to the Schema Builder", () => {
+  const handedOver: RegisteredCollectionRow = {
+    slug: "posts",
+    tableName: "dc_posts",
+    source: "ui",
+    configPath: DEMOTED_FROM_CODE,
+  };
+  // A collection made in the Builder whose address a code entry later took: no demote moved it.
+  const madeInBuilder: RegisteredCollectionRow = {
+    slug: "pages",
+    tableName: "dc_pages",
+    source: "ui",
+  };
+  const coded = [{ slug: "posts" }, { slug: "pages" }, { slug: "tags" }];
+
+  it("is told by its source and the demote's mark together", () => {
+    expect(isHandedToBuilder(handedOver)).toBe(true);
+    expect(isHandedToBuilder(madeInBuilder)).toBe(false);
+    // The mark on a row code owns again says nothing: the row's source decides.
+    expect(isHandedToBuilder({ ...handedOver, source: "code" })).toBe(false);
+  });
+
+  it("leaves the app's code entry out, and only that one", () => {
+    expect(
+      withoutHandedToBuilder(coded, [handedOver, madeInBuilder], new Set())
+    ).toEqual([{ slug: "pages" }, { slug: "tags" }]);
+  });
+
+  it("keeps a plugin's entry under the same address", () => {
+    expect(
+      withoutHandedToBuilder(coded, [handedOver], new Set(["posts"]))
+    ).toEqual(coded);
+  });
+
+  it("then lets the merge take the Builder's row for that address", () => {
+    const fromConfig = Object.fromEntries(
+      withoutHandedToBuilder(
+        [configCollection("posts"), configCollection("tags")],
+        [handedOver],
+        new Set()
+      ).map(entry => [entry.slug, entry])
+    );
+    const merged = mergeRegisteredCollections(fromConfig, [
+      { ...handedOver, fields: [{ name: "subtitle", type: "text" }] },
+    ]);
+    expect(merged.posts.builderOwned).toBe(true);
+    expect(merged.posts.fields).toEqual([{ name: "subtitle", type: "text" }]);
+  });
+
+  it("is left out of the configuration code still owns, with every other part kept", () => {
+    const config = {
+      collections: coded,
+      singles: [{ slug: "home" }],
+      localization: { defaultLocale: "en" },
+    };
+    expect(configTheCodeOwns(config, [handedOver, madeInBuilder])).toEqual({
+      ...config,
+      collections: [{ slug: "pages" }, { slug: "tags" }],
+    });
+    // The caller's configuration is left as it was.
+    expect(config.collections).toEqual(coded);
+  });
+
+  it("stays in the configuration code owns where a plugin contributes the address", () => {
+    const config = {
+      collections: coded,
+      plugins: [
+        {
+          name: "@acme/blog",
+          contributes: { collections: [{ slug: "posts" }] },
+        },
+      ],
+    };
+    expect(configTheCodeOwns(config, [handedOver])).toBe(config);
+  });
+});

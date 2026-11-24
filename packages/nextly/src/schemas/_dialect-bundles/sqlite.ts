@@ -1,0 +1,152 @@
+/**
+ * Flat SQLite dialect bundle.
+ *
+ * Replaces the legacy `database/schema/sqlite.ts` runtime surface deleted in
+ * Plan A Task 17. See `./postgres.ts` for the rationale — including why
+ * relations are sourced from `<feature>/sqlite-relations.ts` rather than
+ * re-exported by the table modules (avoids a table↔relations import cycle).
+ *
+ * @module schemas/_dialect-bundles/sqlite
+ * @since v0.0.3-alpha (Plan A Task 17 — replaces database/schema/sqlite.ts)
+ */
+// Every dialect's bundle exports its own tables under the same names, by
+// design: one is chosen by dialect at runtime.
+// fallow-ignore-file duplicate-export
+
+export { users } from "../users/sqlite";
+
+// The field-group storage migration's mutual-exclusion row. Present here, and not only in
+// `getCoreSchema`, because this bundle is what decides whether the table EXISTS: it is what
+// `reconcileCore` hands drizzle-kit.
+export { nextlyFieldGroupLock } from "../field-group-lock/sqlite";
+// The one schema lock every schema change takes; the field-group lock above is held beside it
+// for processes of an earlier version.
+export { nextlySchemaLock } from "../field-group-lock/sqlite";
+export { nextlyDocumentLock } from "../document-lock/sqlite";
+export { nextlyRbacEpoch } from "../rbac-epoch/sqlite";
+export { nextlyDeletedPrincipals } from "../deleted-principals/sqlite";
+// Where a plugin's configuration lives. In the bundle as well as in
+// CORE_TABLE_NAMES: the manifest decides what is EXPECTED, this decides what
+// is CREATED, and a table in one but not the other is never made.
+export { nextlyPluginSettings } from "../plugin-settings/sqlite";
+export { nextlyOneTimeSecrets } from "../one-time-secrets/sqlite";
+export { nextlyReceivedWebhooks } from "../received-webhooks/sqlite";
+export {
+  nextlyPluginEvents,
+  nextlyPluginEventDeliveries,
+} from "../plugin-events/sqlite";
+export { nextlyLimitStore } from "../limit-store/sqlite";
+export { nextlyCacheTagExpiries } from "../cache-tag-expiries/sqlite";
+export { nextlySpentChallenges } from "../spent-challenges/sqlite";
+export { nextlySchemaOwners } from "../schema-owners/sqlite";
+export { nextlyWidgetLayout } from "../widget-layout/sqlite";
+
+export {
+  emailVerificationTokens,
+  passwordResetTokens,
+  userInviteTokens,
+  refreshTokens,
+} from "../auth-tokens/sqlite";
+
+export {
+  roles,
+  permissions,
+  rolePermissions,
+  userRoles,
+  roleInherits,
+} from "../rbac/sqlite";
+
+export { apiKeys } from "../api-keys/sqlite";
+
+export { auditLog, activityLog } from "../audit/sqlite";
+
+export { media, mediaFolders } from "../media/sqlite";
+
+export { nextlyMeta } from "../nextly-meta/sqlite";
+
+export { dynamicCollectionsSqlite as dynamicCollections } from "../dynamic-collections/sqlite";
+export { dynamicSinglesSqlite as dynamicSingles } from "../dynamic-singles/sqlite";
+export { dynamicFieldGroupsSqlite as dynamicFieldGroups } from "../dynamic-field-groups/sqlite";
+
+export { siteSettingsSqlite as siteSettings } from "../site-settings/sqlite";
+export { userFieldDefinitionsSqlite as userFieldDefinitions } from "../user-field-definitions/sqlite";
+export { emailProvidersSqlite as emailProviders } from "../email-providers/sqlite";
+export { emailDeliveriesSqlite as emailDeliveries } from "../email-deliveries/sqlite";
+export { emailSendClaimsSqlite as emailSendClaims } from "../email-send-claims/sqlite";
+export { emailQueueSqlite as emailQueue } from "../email-queue/sqlite";
+export { emailQueueRecipientsSqlite as emailQueueRecipients } from "../email-queue-recipients/sqlite";
+export { emailTemplatesSqlite as emailTemplates } from "../email-templates/sqlite";
+
+export { nextlySchemaEventsSqlite as nextlySchemaEvents } from "../schema-events/sqlite";
+
+// Content-version store; in the bundle so the adapter table resolver can
+// resolve `nextly_versions` (a managed core table) for runtime CRUD.
+export { nextlyVersionsSqlite as nextlyVersions } from "../versions/sqlite";
+
+// Localization archive; in the bundle so freshPushSchema creates it. Being in
+// getCoreSchema alone only makes it diffable: the apply pushes this map, so a
+// table missing here is proposed on every reconcile and created by none.
+export { nextlyI18nArchive } from "../nextly-i18n-archive/sqlite";
+
+// Webhook + event system tables. Must be in this flat bundle (not just
+// getCoreSchema) so freshPushSchema creates them on a fresh database.
+export {
+  nextlyEvents,
+  nextlyWebhooks,
+  nextlyWebhookDeliveries,
+} from "../webhooks/sqlite";
+
+// Content releases; in the bundle so freshPushSchema creates them on a fresh
+// database. Being in getCoreSchema alone only makes a table diffable — the
+// apply pushes THIS map, so one missing here is proposed on every reconcile
+// and created by none.
+export {
+  nextlyReleasesSqlite as nextlyReleases,
+  nextlyReleaseMembersSqlite as nextlyReleaseMembers,
+} from "../releases/sqlite";
+
+// Version pins; in the bundle so freshPushSchema creates the table on a fresh
+// database, for the reason the release tables above give.
+export { nextlyVersionPinsSqlite as nextlyVersionPins } from "../version-pins/sqlite";
+
+// Background jobs; see the releases note above for why the bundle entry is
+// required and not merely tidy.
+export { nextlyJobsSqlite as nextlyJobs } from "../jobs/sqlite";
+
+// Each person's own notices; in the bundle for the reason the releases note
+// above gives — this map is what the push creates.
+export { nextlyNoticesSqlite as nextlyNotices } from "../notices/sqlite";
+// Each reader's pinned entries and dashboard preferences; in the bundle for
+// the reason the releases note above gives — this map is what the push
+// creates.
+export { nextlyDashboardPinsSqlite as nextlyDashboardPins } from "../dashboard-pins/sqlite";
+export { nextlyDashboardPreferencesSqlite as nextlyDashboardPreferences } from "../dashboard-preferences/sqlite";
+// Which media items each document uses; in the bundle for the reason the
+// releases note above gives — this map is what the push creates.
+export { nextlyMediaUsageSqlite as nextlyMediaUsage } from "../media-usage/sqlite";
+
+// The site's email brand settings; in the bundle for the reason the releases
+// note above gives — this map is what the push creates.
+export { nextlyEmailBrandSqlite as nextlyEmailBrand } from "../email-brand/sqlite";
+
+// The external identities a person signed in with; in the bundle for the
+// reason the email brand above gives — this map is what the push creates.
+export { nextlyExternalIdentitiesSqlite as nextlyExternalIdentities } from "../external-identities/sqlite";
+
+// Version view markers; in the bundle so freshPushSchema creates the table on
+// a fresh database, for the reason the release tables above give.
+export { nextlyVersionViewsSqlite as nextlyVersionViews } from "../version-views/sqlite";
+export { nextlyReviewStatesSqlite as nextlyReviewStates } from "../review-states/sqlite";
+export { nextlyTranslationProvenanceSqlite as nextlyTranslationProvenance } from "../translation-provenance/sqlite";
+export { nextlyWorkflowSettingsSqlite as nextlyWorkflowSettings } from "../workflow-settings/sqlite";
+export { nextlyScheduleWindowsSqlite as nextlyScheduleWindows } from "../schedule-windows/sqlite";
+// The record of content events; in the bundle so freshPushSchema creates the
+// tables on a fresh database, for the reason the release tables above give.
+export {
+  nextlyContentEventsSqlite as nextlyContentEvents,
+  nextlyContentEventPartsSqlite as nextlyContentEventParts,
+} from "../content-events/sqlite";
+// Recorded preview links; in the bundle so freshPushSchema creates the table on
+// a fresh database, for the reason the release tables above give.
+export { nextlyPreviewLinksSqlite as nextlyPreviewLinks } from "../preview-links/sqlite";
+export { nextlyLanguagesSqlite as nextlyLanguages } from "../languages/sqlite";

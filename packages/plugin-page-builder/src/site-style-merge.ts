@@ -1,0 +1,761 @@
+/**
+ * Merging an author's change to one Site Style section onto the section as
+ * it is stored now.
+ *
+ * A Design studio saves a whole section, built from the copy it read (the
+ * base). When someone else saved the section since, writing the author's
+ * copy as it is would undo their save, so the change is merged three ways:
+ * the base, the author's section (mine) and the newest stored one (theirs).
+ *
+ * ## By entry, then field by field
+ *
+ * Entries are matched by their identity: a token by `tokenIdentity` (as the
+ * Single's own token rules read it), a class by its id, a font face by
+ * `faceIdentity`. Inside an entry each value is merged on its own by one
+ * rule, {@link mergedValue}: what only one side changed takes that side's
+ * value. So two edits to different fields of one class, a padding and a
+ * lock, are both kept, and a lock that landed meanwhile holds. A font face is
+ * one value whole, its files and descriptors together.
+ *
+ * ## True conflicts
+ *
+ * A value both sides changed differently, or an entry one side removed while
+ * the other changed it, is a true conflict. It is settled for mine on a
+ * forward save and for theirs on an undo or redo, which can no longer take
+ * back what has been replaced, and it is reported so the editor can say so.
+ *
+ * Entries the readers cannot key (no identity, or a second entry under one
+ * identity) are kept from theirs exactly as stored, never dropped.
+ *
+ * Isomorphic and pure: the editor runs it before each section write, and the
+ * class rebase onto the site's code runs the same leaf rule.
+ *
+ * @module site-style-merge
+ */
+import {
+  fluidValue,
+  isPlainRecord,
+  isTokenRef,
+  type FluidRangeWidths,
+} from "@nextlyhq/blocks-engine";
+
+import { faceIdentity } from "./site-style";
+import { storedVariableIdentity } from "./site-style-storage";
+import { readStoredJson, sameStoredValue } from "./stored-json";
+
+/** Whose value a true conflict keeps. */
+export type MergeWinner = "mine" | "theirs";
+
+/** The sections a studio saves whole, and so the ones merged. */
+export type MergeableSection = "tokens" | "classes" | "fonts";
+
+/**
+ * What a true conflict was: both changed the entry differently, they removed
+ * what mine changed, or mine removed what they changed (a face they added to
+ * a family mine removed among them).
+ */
+export type ConflictKind = "changed" | "removed-by-them" | "removed-by-me";
+
+/** One true conflict the merge settled, with every side of it. */
+export interface EntryConflict {
+  /**
+   * The entry's identity: a token's id or name, a class's id, a face's
+   * identity. For a section-wide setting, the setting's name.
+   */
+  readonly key: string;
+  /** Whether `key` names a section-wide setting (`prefix`, `darkMode`). */
+  readonly setting: boolean;
+  readonly kind: ConflictKind;
+  /** Whose value the merged section holds. */
+  readonly kept: MergeWinner;
+  /** The entry as the base, mine and theirs held it; absent where removed. */
+  readonly base: unknown;
+  readonly mine: unknown;
+  readonly theirs: unknown;
+}
+
+/** A merged section, and the true conflicts settled in it. */
+export interface SectionMerge {
+  readonly value: unknown;
+  readonly conflicts: readonly EntryConflict[];
+}
+
+/** How a merge settles a value both sides changed differently. */
+export interface MergeSettle {
+  readonly prefer: MergeWinner;
+  /** Told of each value both sides changed differently. */
+  readonly conflict?: () => void;
+  /**
+   * Keep a value no side changed exactly as it is, an empty record included.
+   * Set for a stored entry, whose fields stay; a rebase onto code leaves it
+   * unset, so a record left empty is dropped.
+   */
+  readonly keepUnchanged?: boolean;
+}
+
+/** A record's own entry at a key, or `undefined`. */
+export function ownValueAt(value: unknown, key: string): unknown {
+  return typeof value === "object" &&
+    value !== null &&
+    Object.hasOwn(value, key)
+    ? (value as Record<string, unknown>)[key]
+    : undefined;
+}
+
+/** The keys any of several records holds, in first-seen order. */
+export function ownKeysOf(...records: unknown[]): string[] {
+  return [
+    ...new Set(
+      records.flatMap(record =>
+        typeof record === "object" && record !== null && !Array.isArray(record)
+          ? Object.keys(record)
+          : []
+      )
+    ),
+  ];
+}
+
+/** A record built with own keys, whatever their names. */
+export function ownRecordOf<T>(
+  entries: readonly [string, T][]
+): Record<string, T> {
+  const out: Record<string, T> = {};
+  for (const [key, value] of entries) {
+    Object.defineProperty(out, key, {
+      value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return out;
+}
+
+/** A value merged key by key (a padding's sides), not a token reference or a scalar. */
+function isComposite(value: unknown): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    !isTokenRef(value)
+  );
+}
+
+/**
+ * One value merged three ways: what mine left as the base had it takes
+ * theirs; what theirs left takes mine; the same change on both is kept; two
+ * different changes are a true conflict, settled by `settle`. `undefined` is
+ * a value cleared or never set.
+ */
+function mergedLeaf(
+  base: unknown,
+  mine: unknown,
+  theirs: unknown,
+  settle: MergeSettle
+): unknown {
+  if (sameStoredValue(mine, base)) return theirs;
+  if (sameStoredValue(theirs, base) || sameStoredValue(mine, theirs)) {
+    return mine;
+  }
+  settle.conflict?.();
+  return settle.prefer === "mine" ? mine : theirs;
+}
+
+/**
+ * A value merged three ways: a composite key by key, so one side owning one
+ * side of a padding, or one field of an entry, does not take the other's
+ * value for another; anything else whole, by {@link mergedLeaf}. Answers
+ * `undefined` once nothing is left. Compared as stored JSON, so a key order
+ * a database chose is no change.
+ */
+export function mergedValue(
+  base: unknown,
+  mine: unknown,
+  theirs: unknown,
+  settle: MergeSettle
+): unknown {
+  // Unchanged on every side is kept as it is, an empty record among them,
+  // which the walk below would otherwise answer as cleared.
+  if (
+    settle.keepUnchanged === true &&
+    sameStoredValue(mine, base) &&
+    sameStoredValue(theirs, base)
+  ) {
+    return theirs;
+  }
+  const sides = [mine, base, theirs].filter(value => value !== undefined);
+  if (sides.length > 0 && sides.every(isComposite)) {
+    const out: [string, unknown][] = [];
+    for (const key of ownKeysOf(mine, base, theirs)) {
+      const value = mergedValue(
+        ownValueAt(base, key),
+        ownValueAt(mine, key),
+        ownValueAt(theirs, key),
+        settle
+      );
+      if (value !== undefined) out.push([key, value]);
+    }
+    return out.length > 0 ? ownRecordOf(out) : undefined;
+  }
+  return mergedLeaf(base, mine, theirs, settle);
+}
+
+/** How one section's entries are keyed and merged. */
+interface EntryRules {
+  /** The entry's identity, or `undefined` for one that cannot be keyed. */
+  readonly keyOf: (entry: unknown) => string | undefined;
+  /** Two present entries merged, both changed. */
+  readonly merge: (
+    base: unknown,
+    mine: unknown,
+    theirs: unknown,
+    settle: MergeSettle
+  ) => unknown;
+  /**
+   * Whether an entry only theirs holds goes with something mine removed
+   * (a face added to a family mine removed): a true conflict.
+   */
+  readonly goneWithMine?: (theirs: unknown) => boolean;
+}
+
+/** An entry's place in the merge: its identity, and which entry of that identity it is. */
+interface Placed {
+  /** The identity, as conflicts name the entry. */
+  readonly key: string;
+  /** The identity and the occurrence together, which the sides are matched by. */
+  readonly at: string;
+}
+
+/**
+ * Each entry's place, or `undefined` for one that cannot be keyed.
+ *
+ * A list may hold two entries of one identity (a second file uploaded for a
+ * face already there), so the sides are matched by identity AND occurrence:
+ * the second entry of an identity meets the other sides' second, rather than
+ * being passed over as a duplicate of the first and dropped from the merge.
+ * The first keeps its identity alone as its place.
+ */
+function placesOf(
+  list: readonly unknown[],
+  keyOf: EntryRules["keyOf"]
+): (Placed | undefined)[] {
+  const counts = new Map<string, number>();
+  return list.map(entry => {
+    const key = keyOf(entry);
+    if (key === undefined) return undefined;
+    const n = counts.get(key) ?? 0;
+    counts.set(key, n + 1);
+    return { key, at: n === 0 ? key : `${key}\u0000${String(n)}` };
+  });
+}
+
+/** A list's keyed entries, by place, each with its identity. */
+function keyed(
+  list: readonly unknown[],
+  keyOf: EntryRules["keyOf"]
+): Map<string, { readonly key: string; readonly entry: unknown }> {
+  const out = new Map<string, { key: string; entry: unknown }>();
+  placesOf(list, keyOf).forEach((place, index) => {
+    if (place !== undefined) {
+      out.set(place.at, { key: place.key, entry: list[index] });
+    }
+  });
+  return out;
+}
+
+/** An entry's sides: present, or `undefined` where that side has none. */
+interface Sides {
+  readonly base: unknown;
+  readonly mine: unknown;
+  readonly theirs: unknown;
+}
+
+/**
+ * Which removal a true conflict over an entry is: mine removed what they
+ * changed (or a face they added to a family mine removed), or they removed
+ * what mine changed. `undefined` when neither side removed it.
+ */
+function removalOf(sides: Sides, rules: EntryRules): ConflictKind | undefined {
+  const { base, mine, theirs } = sides;
+  if (base === undefined) {
+    return mine === undefined &&
+      theirs !== undefined &&
+      rules.goneWithMine?.(theirs) === true
+      ? "removed-by-me"
+      : undefined;
+  }
+  if (mine === undefined) return "removed-by-me";
+  return theirs === undefined ? "removed-by-them" : undefined;
+}
+
+/**
+ * An entry only one side changed, or both the same way: its value, wrapped,
+ * or `undefined` when the sides are a true conflict. Absent on two sides is
+ * the same as unchanged between them.
+ */
+function cleanEntry(
+  sides: Sides,
+  rules: EntryRules
+): { value: unknown } | undefined {
+  const { base, mine, theirs } = sides;
+  if (sameStoredValue(mine, base)) {
+    // Unchanged by mine, unless mine removed the family theirs added to.
+    const gone = base === undefined && removalOf(sides, rules) !== undefined;
+    return gone ? undefined : { value: theirs };
+  }
+  if (sameStoredValue(theirs, base) || sameStoredValue(mine, theirs)) {
+    return { value: mine };
+  }
+  return undefined;
+}
+
+/**
+ * One entry merged from its three sides, or `undefined` when the merged
+ * list holds none, with the true conflict it was, if any.
+ */
+function mergedEntry(
+  key: string,
+  sides: Sides,
+  rules: EntryRules,
+  prefer: MergeWinner
+): { value: unknown; conflict?: EntryConflict } {
+  const clean = cleanEntry(sides, rules);
+  if (clean !== undefined) return clean;
+  const conflict = (kind: ConflictKind): EntryConflict => ({
+    key,
+    setting: false,
+    kind,
+    kept: prefer,
+    ...sides,
+  });
+  const removal = removalOf(sides, rules);
+  if (removal !== undefined) {
+    // The side kept is the one preferred, absent where it removed the entry.
+    return {
+      value: prefer === "mine" ? sides.mine : sides.theirs,
+      conflict: conflict(removal),
+    };
+  }
+  let conflicted = false;
+  const value = rules.merge(sides.base, sides.mine, sides.theirs, {
+    prefer,
+    keepUnchanged: true,
+    conflict: () => {
+      conflicted = true;
+    },
+  });
+  return conflicted ? { value, conflict: conflict("changed") } : { value };
+}
+
+/**
+ * A list of entries merged: theirs' order, with entries only mine holds
+ * added after in mine's order. An entry theirs holds that cannot be keyed is
+ * kept where it stands, as stored.
+ */
+function mergedEntries(
+  base: readonly unknown[],
+  mine: readonly unknown[],
+  theirs: readonly unknown[],
+  rules: EntryRules,
+  prefer: MergeWinner,
+  conflicts: EntryConflict[]
+): unknown[] {
+  const bases = keyed(base, rules.keyOf);
+  const mines = keyed(mine, rules.keyOf);
+  const out: unknown[] = [];
+  const seen = new Set<string>();
+  const place = (key: string, sides: Sides): void => {
+    const merged = mergedEntry(key, sides, rules, prefer);
+    if (merged.conflict !== undefined) conflicts.push(merged.conflict);
+    if (merged.value !== undefined) out.push(merged.value);
+  };
+  const theirPlaces = placesOf(theirs, rules.keyOf);
+  theirs.forEach((entry, index) => {
+    const at = theirPlaces[index];
+    if (at === undefined) {
+      out.push(entry);
+      return;
+    }
+    seen.add(at.at);
+    place(at.key, {
+      base: bases.get(at.at)?.entry,
+      mine: mines.get(at.at)?.entry,
+      theirs: entry,
+    });
+  });
+  for (const [at, { key, entry }] of mines) {
+    if (seen.has(at)) continue;
+    seen.add(at);
+    place(key, { base: bases.get(at)?.entry, mine: entry, theirs: undefined });
+  }
+  return out;
+}
+
+/** A stored list, or none for anything that is not one. */
+function listOf(value: unknown): readonly unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+/**
+ * A class merged three ways, field by field as any entry is, except that each
+ * device's fluid size is ONE value with the sizes it was made from: the
+ * `fontSize` at rest and that device's `fluidSizes` pair are taken together
+ * from one side, so a merge never stores one side's size beside the other
+ * side's sizes, or one end of each side's pair.
+ */
+function mergedClass(
+  base: unknown,
+  mine: unknown,
+  theirs: unknown,
+  settle: MergeSettle
+): unknown {
+  const merged = mergedValue(base, mine, theirs, settle);
+  const devices = ownKeysOf(
+    ...[base, mine, theirs].map(side => ownValueAt(side, "fluidSizes"))
+  );
+  if (devices.length === 0 || !isPlainRecord(merged)) return merged;
+  let out: Record<string, unknown> = merged;
+  for (const device of devices) {
+    const kept = mergedLeaf(
+      fluidUnitOf(base, device),
+      fluidUnitOf(mine, device),
+      fluidUnitOf(theirs, device),
+      settle
+    );
+    out = withFluidUnit(out, device, kept);
+  }
+  return out;
+}
+
+/** One device's fluid size and the size at rest it made, as one value. */
+interface FluidUnit {
+  readonly fontSize: unknown;
+  readonly sizes: unknown;
+}
+
+/** A class's fluid unit on one device, as that side holds it. */
+function fluidUnitOf(entry: unknown, device: string): FluidUnit {
+  const atRest = ownValueAt(ownValueAt(entry, "styles"), "base");
+  return {
+    fontSize: ownValueAt(ownValueAt(atRest, device), "fontSize"),
+    sizes: ownValueAt(ownValueAt(entry, "fluidSizes"), device),
+  };
+}
+
+/** A record with one key set, or taken out where `value` is `undefined`. */
+function withKey(
+  record: unknown,
+  key: string,
+  value: unknown
+): Record<string, unknown> {
+  const kept = ownKeysOf(record)
+    .filter(each => each !== key)
+    .map((each): [string, unknown] => [each, ownValueAt(record, each)]);
+  return ownRecordOf(value === undefined ? kept : [...kept, [key, value]]);
+}
+
+/** `value` unless it is an empty record, which a merge leaves out. */
+function unlessEmpty(value: Record<string, unknown>): unknown {
+  return Object.keys(value).length === 0 ? undefined : value;
+}
+
+/**
+ * The merged class with one device's size at rest and its fluid sizes set
+ * from the unit kept, copied along the path so no side is changed.
+ */
+function withFluidUnit(
+  entry: Record<string, unknown>,
+  device: string,
+  unit: unknown
+): Record<string, unknown> {
+  const kept = isPlainRecord(unit) ? unit : {};
+  const styles = ownValueAt(entry, "styles");
+  const atRest = ownValueAt(styles, "base");
+  const values = withKey(ownValueAt(atRest, device), "fontSize", kept.fontSize);
+  const base = withKey(atRest, device, unlessEmpty(values));
+  const withStyles = withKey(
+    entry,
+    "styles",
+    withKey(styles, "base", unlessEmpty(base))
+  );
+  const sizes = withKey(ownValueAt(entry, "fluidSizes"), device, kept.sizes);
+  return withKey(withStyles, "fluidSizes", unlessEmpty(sizes));
+}
+
+/** A class's identity: its id. */
+function classKey(entry: unknown): string | undefined {
+  return isPlainRecord(entry) && typeof entry.id === "string" && entry.id !== ""
+    ? entry.id
+    : undefined;
+}
+
+/** Whether a stored descriptor is absent or a string, as a face states it. */
+const optionalText = (value: unknown): value is string | undefined =>
+  value === undefined || typeof value === "string";
+
+/** A face's identity, for a record that states what the identity reads. */
+function faceKey(entry: unknown): string | undefined {
+  if (!isPlainRecord(entry)) return undefined;
+  const { family, weight, style, unicodeRange } = entry;
+  if (
+    typeof family !== "string" ||
+    !optionalText(weight) ||
+    !optionalText(style) ||
+    !optionalText(unicodeRange)
+  ) {
+    return undefined;
+  }
+  return faceIdentity({
+    family,
+    ...(weight === undefined ? {} : { weight }),
+    ...(style === undefined ? {} : { style }),
+    ...(unicodeRange === undefined ? {} : { unicodeRange }),
+  });
+}
+
+/** The families a list of faces holds. */
+function familiesOf(list: readonly unknown[]): Set<string> {
+  const out = new Set<string>();
+  for (const entry of list) {
+    if (isPlainRecord(entry) && typeof entry.family === "string") {
+      out.add(entry.family);
+    }
+  }
+  return out;
+}
+
+/** Section-wide token settings merged as one value, never field by field. */
+const WHOLE_SETTINGS: ReadonlySet<string> = new Set(["fluidRange"]);
+
+/**
+ * The site's text merged row by row, each row whole: a row is a size and the
+ * line height that goes with it, so one author's size never lands beside the
+ * other's line height. An empty row is kept, as the rows it stands beside.
+ */
+function mergedRows(
+  base: unknown,
+  mine: unknown,
+  theirs: unknown,
+  settle: MergeSettle
+): unknown {
+  const out: [string, unknown][] = [];
+  for (const role of ownKeysOf(mine, base, theirs)) {
+    const row = mergedLeaf(
+      ownValueAt(base, role),
+      ownValueAt(mine, role),
+      ownValueAt(theirs, role),
+      settle
+    );
+    if (row !== undefined) out.push([role, row]);
+  }
+  return out.length > 0 ? ownRecordOf(out) : undefined;
+}
+
+/** A token set's entries merged, and its section-wide settings beside them. */
+function mergedTokenSet(
+  base: unknown,
+  mine: unknown,
+  theirs: unknown,
+  prefer: MergeWinner,
+  conflicts: EntryConflict[]
+): unknown {
+  const settings: [string, unknown][] = [];
+  for (const key of ownKeysOf(theirs, mine, base)) {
+    if (key === "tokens") continue;
+    let conflicted = false;
+    const sides = { base: ownValueAt(base, key), mine: ownValueAt(mine, key) };
+    const settle: MergeSettle = {
+      prefer,
+      keepUnchanged: true,
+      conflict: () => {
+        conflicted = true;
+      },
+    };
+    // The fluid range is one value: merged width by width, a width one side
+    // left alone takes the other side's, and the pair is no range at all.
+    const merge = WHOLE_SETTINGS.has(key)
+      ? mergedLeaf
+      : key === "siteText"
+        ? mergedRows
+        : mergedValue;
+    const value = merge(
+      sides.base,
+      sides.mine,
+      ownValueAt(theirs, key),
+      settle
+    );
+    if (conflicted) {
+      conflicts.push({
+        key,
+        setting: true,
+        kind: "changed",
+        kept: prefer,
+        ...sides,
+        theirs: ownValueAt(theirs, key),
+      });
+    }
+    if (value !== undefined) settings.push([key, value]);
+  }
+  const tokens = mergedEntries(
+    listOf(ownValueAt(base, "tokens")),
+    listOf(ownValueAt(mine, "tokens")),
+    listOf(ownValueAt(theirs, "tokens")),
+    { keyOf: storedVariableIdentity, merge: mergedValue },
+    prefer,
+    conflicts
+  );
+  const merged = ownRecordOf(settings);
+  // A size made with Fluid… is written from its two sizes and the range, and
+  // the merge keeps each of the three on its own: one author's range beside
+  // another's sizes. Written again from what was kept, the stored value is
+  // the one "Fluid…" shows.
+  // Only across a range the tier stores, which it does wherever it holds a
+  // fluid size: one it leaves to the code is not known here, and the default
+  // is no stand-in for it.
+  // A Site text row made with Fluid… likewise, its size written again.
+  const range = fluidRangeIn(merged.fluidRange);
+  return range === undefined
+    ? { ...merged, tokens }
+    : {
+        ...merged,
+        tokens: tokens.map(token => withFluidValue(token, range)),
+        ...withFluidRows(merged.siteText, range),
+      };
+}
+
+/**
+ * The Site text rows with each fluid row's size written again from its two
+ * sizes and the range; nothing where the set holds no rows.
+ */
+function withFluidRows(
+  rows: unknown,
+  range: FluidRangeWidths
+): { siteText?: unknown } {
+  if (!isPlainRecord(rows)) return {};
+  return {
+    siteText: Object.fromEntries(
+      Object.entries(rows).map(([role, row]) => [
+        role,
+        withFluidSize(row, range),
+      ])
+    ),
+  };
+}
+
+/** A row with its size written from its two sizes, where it has them. */
+function withFluidSize(row: unknown, range: FluidRangeWidths): unknown {
+  const sizes = isPlainRecord(row) ? fluidSizesOf(row.fluid) : undefined;
+  if (!isPlainRecord(row) || sizes === undefined) return row;
+  const fontSize = fluidValue(sizes, range);
+  return row.fontSize === fontSize ? row : { ...row, fontSize };
+}
+
+/** A stored fluid range, or `undefined` where none, or none readable, is set. */
+function fluidRangeIn(value: unknown): FluidRangeWidths | undefined {
+  return isPlainRecord(value) &&
+    typeof value.min === "number" &&
+    typeof value.max === "number" &&
+    value.min < value.max
+    ? { min: value.min, max: value.max }
+    : undefined;
+}
+
+/** The two sizes a fluid value was made from, where it holds them. */
+function fluidSizesOf(
+  fluid: unknown
+): { small: number; large: number } | undefined {
+  return isPlainRecord(fluid) &&
+    typeof fluid.small === "number" &&
+    typeof fluid.large === "number"
+    ? { small: fluid.small, large: fluid.large }
+    : undefined;
+}
+
+/** A token with its light value written from its two sizes, where it has them. */
+function withFluidValue(token: unknown, range: FluidRangeWidths): unknown {
+  if (!isPlainRecord(token) || !isPlainRecord(token.values)) return token;
+  const sizes = fluidSizesOf(token.fluid);
+  if (sizes === undefined) return token;
+  const light = fluidValue(sizes, range);
+  return token.values.light === light
+    ? token
+    : { ...token, values: { ...token.values, light } };
+}
+
+/**
+ * Whether a stored section can be merged into: nothing stored, or the shape
+ * its section has (a token set's record, a list of classes or faces).
+ */
+function mergeable(section: MergeableSection, value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  return section === "tokens" ? isPlainRecord(value) : Array.isArray(value);
+}
+
+/**
+ * The author's section (`mine`, built from `base`) merged onto the section
+ * as stored now (`theirs`), with the true conflicts settled for `prefer`.
+ *
+ * When nobody else saved the section since the base, the answer is mine as
+ * it is; when mine changed nothing, it is theirs. A stored section of a shape
+ * no reader can merge into is answered with mine, as the section was written
+ * before merging.
+ */
+export function mergeSiteStyleSection(
+  section: MergeableSection,
+  base: unknown,
+  mine: unknown,
+  theirs: unknown,
+  prefer: MergeWinner
+): SectionMerge {
+  // SQLite hands a `json` column back as text.
+  const [b, m, t] = [base, mine, theirs].map(readStoredJson);
+  if (sameStoredValue(t, b) || sameStoredValue(m, t)) {
+    return { value: mine, conflicts: [] };
+  }
+  if (sameStoredValue(m, b)) return { value: t, conflicts: [] };
+  if (!mergeable(section, t)) return { value: mine, conflicts: [] };
+  const conflicts: EntryConflict[] = [];
+  if (section === "tokens") {
+    return {
+      value: mergedTokenSet(b, m, t, prefer, conflicts),
+      conflicts,
+    };
+  }
+  const rules: EntryRules =
+    section === "classes"
+      ? { keyOf: classKey, merge: mergedClass }
+      : fontRules(listOf(b), listOf(m));
+  return {
+    value: mergedEntries(
+      listOf(b),
+      listOf(m),
+      listOf(t),
+      rules,
+      prefer,
+      conflicts
+    ),
+    conflicts,
+  };
+}
+
+/**
+ * Faces merged whole, each a value of its own. A face theirs added to a
+ * family mine removed goes with the family when mine wins.
+ */
+function fontRules(
+  base: readonly unknown[],
+  mine: readonly unknown[]
+): EntryRules {
+  const kept = familiesOf(mine);
+  const removed = new Set(
+    [...familiesOf(base)].filter(family => !kept.has(family))
+  );
+  return {
+    keyOf: faceKey,
+    merge: mergedLeaf,
+    goneWithMine: theirs =>
+      isPlainRecord(theirs) &&
+      typeof theirs.family === "string" &&
+      removed.has(theirs.family),
+  };
+}

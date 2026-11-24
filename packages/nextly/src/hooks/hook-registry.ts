@@ -1,0 +1,1391 @@
+/**
+ * Database Lifecycle Hooks System - Hook Registry
+ *
+ * Centralized registry for managing and executing database lifecycle hooks.
+ * Implements a singleton pattern with Map-based storage for efficient hook lookups.
+ *
+ * @module hooks/hook-registry
+ * @since 1.0.0
+ */
+
+import { withCurrentPrincipal } from "../auth/principal-scope";
+import { NextlyError } from "../errors/nextly-error";
+import { consoleLogger } from "../shared/types";
+
+import { withHookLanguage } from "./hook-language";
+import { normalizeHookError } from "./normalize-hook-error";
+import { recordSideEffectWarning } from "./side-effect-warnings";
+import { HOOK_TYPES } from "./types";
+import type {
+  BeforeOperationArgs,
+  BeforeOperationContext,
+  BeforeOperationHandler,
+  CollectionDeleteRunner,
+  HookContext,
+  HookContextPhase,
+  HookHandler,
+  HookOwner,
+  HookType,
+  InTransactionRunner,
+} from "./types";
+
+export type { HookOwner };
+
+/**
+ * The phases whose handlers exist for their effects, not to reshape data.
+ *
+ * These run after the write has already committed, so there is nothing left for
+ * a return value to change. Honouring one would mean a second handler is shown
+ * whatever the first happened to return instead of the row that was persisted,
+ * and returning the result of a side-effect call -- a logger, a fetch, a cache
+ * write -- is an easy accident to make.
+ *
+ * `afterRead` is deliberately absent: it reshapes the response by design, and
+ * the read paths consume what it returns.
+ */
+/**
+ * A side-effect hook that threw after the write had already committed.
+ *
+ * Reported rather than raised: the row is durable and this phase cannot change
+ * it, so failing the operation would tell a caller its write did not happen and
+ * invite a retry that writes it twice.
+ */
+/**
+ * A registered handler and who owns it.
+ *
+ * Provenance is stored per REGISTRATION rather than per function, because the
+ * same function can legitimately be registered more than once -- listed twice
+ * in one array, or shared between two phases -- and those registrations can
+ * have different owners.
+ */
+interface RegisteredHook<H> {
+  handler: H;
+  owner: HookOwner;
+}
+
+/**
+ * The handlers one owner contributes to one collection.
+ *
+ * `beforeOperation` is held apart from the rest because its handlers take the
+ * operation's args rather than a document, and the two signatures are not
+ * interchangeable.
+ */
+export interface OwnedHookSet {
+  byPhase: Array<{ hookType: HookContextPhase; handlers: HookHandler[] }>;
+  beforeOperation: BeforeOperationHandler[];
+  /**
+   * @experimental The owner's in-transaction handlers. Absent means none: the
+   * config declares no handler for that phase, so a config rebuild that leaves
+   * it out holds none afterwards, as it would after a restart.
+   */
+  inTransaction?: InTransactionRunner[];
+}
+
+export interface SideEffectHookFailure {
+  /** The phase whose handler threw. */
+  phase: HookType;
+  /** The collection or single the operation was for. */
+  collection: string;
+  /** The normalized error, with its type and context preserved. */
+  error: NextlyError;
+  /**
+   * The row the handler was running for, when it is known.
+   *
+   * A bulk operation runs its items concurrently, so warning order cannot be
+   * matched against the ordered `successes` array. Without the id a caller
+   * knows a side effect failed for one of the rows it just wrote and cannot
+   * tell which, which is not enough to remediate.
+   */
+  entryId?: string;
+}
+
+const SIDE_EFFECT_HOOK_TYPES: ReadonlySet<HookType> = new Set([
+  "afterCreate",
+  "afterUpdate",
+  "afterDelete",
+]);
+
+/**
+ * Whether a phase runs AFTER the write has committed.
+ *
+ * Shared by every executor so the two cannot disagree about which phases may
+ * fail an operation: a stored hook and a code-registered one in the same phase
+ * have to behave identically.
+ */
+export function isSideEffectHookType(hookType: HookType): boolean {
+  return SIDE_EFFECT_HOOK_TYPES.has(hookType);
+}
+
+/**
+ * `context` as a `hookType` handler is handed it: without `afterCommit`
+ * unless the phase runs after the write.
+ *
+ * `afterCommit` waits for the write a hook belongs to. A before-hook runs
+ * before that write opens its transaction, so there is nothing yet to wait
+ * for: an effect handed over there would run at once, for a write a later
+ * hook, validation or the insert itself may still refuse. Withheld here, where
+ * the phase is known, rather than where contexts are built, so every executor
+ * offers it to the same phases.
+ */
+export function contextForPhase<C extends { afterCommit?: unknown }>(
+  hookType: HookType,
+  context: C
+): C {
+  if (isSideEffectHookType(hookType) || context.afterCommit === undefined) {
+    return context;
+  }
+  const withheld = { ...context };
+  delete withheld.afterCommit;
+  return withheld;
+}
+
+/**
+ * Global hook registry singleton
+ *
+ * Manages registration and execution of database lifecycle hooks.
+ * Supports collection-specific hooks and global wildcard hooks.
+ *
+ * **Features:**
+ * - Collection-specific hooks: Register hooks for individual collections
+ * - Global wildcard hooks: Register hooks for all collections using `*`
+ * - Series execution: Hooks run in registration order (FIFO)
+ * - Data transformation: `before*` hooks can modify data
+ * - Side effects: `after*` hooks run for side effects only
+ * - Performance optimization: `hasHooks()` check to skip execution
+ *
+ * **Usage:**
+ * ```typescript
+ * import { getHookRegistry } from 'nextly/hooks';
+ *
+ * const registry = getHookRegistry();
+ *
+ * // Register a hook
+ * registry.register('beforeCreate', 'posts', async (context) => {
+ *   return { ...context.data, slug: slugify(context.data.title) };
+ * });
+ *
+ * // Execute hooks
+ * const modifiedData = await registry.execute('beforeCreate', {
+ *   collection: 'posts',
+ *   operation: 'create',
+ *   data: { title: 'My Post' },
+ *   context: {}
+ * });
+ * ```
+ *
+ * @class HookRegistry
+ */
+/**
+ * What a CALLER of `executeBeforeOperation` must supply.
+ *
+ * The same context a handler reads, except that `req` has to be named. This
+ * phase is documented for global rate limiting and auditing, which are the
+ * rules that most need to know whether a request exists at all, and an
+ * optional field here is one an operation can forget while still telling every
+ * such handler, confidently, that there was no visitor. Optional on the
+ * handler-facing {@link BeforeOperationContext}, because a handler reads it
+ * rather than supplying it.
+ */
+export type BeforeOperationInput<T = unknown> = BeforeOperationContext<T> & {
+  req: BeforeOperationContext["req"];
+};
+
+/**
+ * Turn whatever a hook threw into the error the boundary should see.
+ *
+ * A hook that rejects its input does so deliberately, and says how: a
+ * validation error carries field issues, a forbidden one carries a status.
+ * Rebuilding it as a generic error throws all of that away and the boundary
+ * answers 500, so a hook enforcing a rule reports a server fault instead of
+ * the rule.
+ *
+ * Anything else really is unexpected. The original is kept as `cause` rather
+ * than flattened into a message, so its stack survives, and the hook and
+ * collection travel in log context where they are useful without being
+ * disclosed to the caller.
+ */
+export class HookRegistry {
+  /**
+   * Internal storage for hooks
+   *
+   * Key format: `${hookType}:${collection}`
+   * Examples: "beforeCreate:posts", "afterUpdate:users", "beforeCreate:*"
+   *
+   * Wildcard key "*" matches all collections.
+   */
+  private hooks: Map<string, RegisteredHook<HookHandler>[]> = new Map();
+
+  /**
+   * `beforeOperation` handlers, kept apart from the rest.
+   *
+   * Every other phase receives a `HookContext` and reshapes `data`;
+   * `beforeOperation` receives a `BeforeOperationContext` and reshapes `args`.
+   * Those are different function types, so storing them together would mean
+   * recovering the real one with a cast on the way out -- and a cast is exactly
+   * what let a handler be declared against the wrong context in the first place.
+   */
+  private beforeOperationHooks: Map<
+    string,
+    RegisteredHook<BeforeOperationHandler>[]
+  > = new Map();
+
+  /**
+   * In-transaction handlers, kept apart from the rest, as `beforeOperation`'s
+   * are.
+   *
+   * The phase is not one of `HOOK_TYPES`: adding a member to that published
+   * list would break an exhaustive switch over `HookType` downstream. Its
+   * handlers also take the write's transaction, which no other phase's do.
+   * Keyed `inTransaction:<collection>`, the shape every other key has, so the
+   * owner scans below read the collection out of it the same way.
+   */
+  private inTransactionHooks: Map<
+    string,
+    RegisteredHook<InTransactionRunner>[]
+  > = new Map();
+
+  /**
+   * Collection-delete handlers, in registration order. Not keyed by
+   * collection: a plugin's handler is asked about every collection deleted,
+   * since what it holds for one is its own to know.
+   */
+  private collectionDeleteHooks: RegisteredHook<CollectionDeleteRunner>[] = [];
+
+  /**
+   * Owners whose handlers stay registered but do not run.
+   *
+   * Disabling a plugin has to stop everything it contributed, and its
+   * declarations are rebuilt from the config so removing those is safe. Its
+   * `ctx.hooks.on` registrations are not: they were made during `init`, which a
+   * config reload does not re-run, so deleting them would leave re-enabling the
+   * plugin in the same session silently short of its handlers until a restart.
+   * Suspending is what makes the switch work in both directions.
+   */
+  private suspendedOwners: Set<HookOwner> = new Set();
+
+  /**
+   * Replace the set of suspended owners.
+   *
+   * Whole-set rather than incremental so it can be recomputed from the config
+   * on each reload: an owner absent from the new set resumes by construction,
+   * which is what re-enabling a plugin needs, and nothing has to remember what
+   * a previous reload suspended.
+   */
+  setSuspendedOwners(owners: Iterable<HookOwner>): void {
+    this.suspendedOwners = new Set(owners);
+  }
+
+  /** The currently suspended owners, for a caller that has to restore them. */
+  getSuspendedOwners(): HookOwner[] {
+    return [...this.suspendedOwners];
+  }
+
+  /** Drop the entries whose owner is suspended, cheaply when none is. */
+  private runnable<H>(entries: RegisteredHook<H>[]): H[] {
+    return this.runnableEntries(entries).map(e => e.handler);
+  }
+
+  /** {@link runnable}, keeping who owns each handler. */
+  private runnableEntries<H>(
+    entries: RegisteredHook<H>[]
+  ): RegisteredHook<H>[] {
+    if (this.suspendedOwners.size === 0) return entries;
+    return entries.filter(e => !this.suspendedOwners.has(e.owner));
+  }
+
+  /**
+   * How many handlers each key held at the moment the config last registered.
+   *
+   * Recorded rather than inferred. Where the config's handlers belong is decided
+   * by boot -- `registerServices` runs `initializePlugins`, then
+   * `registerCollectionHooks` -- but the entries that precede that point are not
+   * all plugins: an app's `registerHook` runs when its module is evaluated,
+   * which may be before the first `getNextly()` or long after. Two rounds of
+   * deriving the position from the entries present (rank the owners; anchor to
+   * the plugins) each reproduced boot for some arrangements and inverted it for
+   * others, because the ordering is a fact about WHEN something registered and
+   * the entries do not carry it.
+   */
+  private configBoundaries: Map<string, WeakSet<object>> = new Map();
+
+  /**
+   * Note where the config's handlers start, immediately before boot registers
+   * them.
+   *
+   * Everything already present belongs ahead of the config, whoever owns it, so
+   * a handler the config declares for the first time during a reload lands where
+   * a restart would put it.
+   */
+  markConfigRegistrationPoint(): void {
+    this.configBoundaries.clear();
+    // The entries themselves, not how many there were. A count goes wrong the
+    // moment one of them is unregistered: it still claims that many handlers
+    // precede the config, so a first-time config handler lands behind whatever
+    // replaced them. Identities stay correct because a removed entry simply is
+    // not there to be found.
+    for (const [key, entries] of this.hooks) {
+      this.configBoundaries.set(key, new WeakSet<object>(entries));
+    }
+    for (const [key, entries] of this.beforeOperationHooks) {
+      this.configBoundaries.set(key, new WeakSet<object>(entries));
+    }
+    for (const [key, entries] of this.inTransactionHooks) {
+      this.configBoundaries.set(key, new WeakSet<object>(entries));
+    }
+  }
+
+  /** Append to a handler list, creating it on first use. */
+  // (helpers below operate on RegisteredHook entries)
+  private pushHandler<H>(
+    store: Map<string, RegisteredHook<H>[]>,
+    key: string,
+    handler: RegisteredHook<H>
+  ) {
+    const existing = store.get(key);
+    if (existing) {
+      existing.push(handler);
+      return;
+    }
+    store.set(key, [handler]);
+  }
+
+  /** Remove one handler by identity, dropping the list once it is empty. */
+  private removeHandler<H>(
+    store: Map<string, RegisteredHook<H>[]>,
+    key: string,
+    handler: H,
+    owner: HookOwner
+  ) {
+    const handlers = store.get(key);
+    if (!handlers) return;
+
+    // Matched on the handler AND its owner: a caller unregisters the function
+    // it registered and does not know which entry wraps it, but the same
+    // function can be registered by more than one owner -- a plugin's exported
+    // handler that the app also lists in its config. Matching on identity alone
+    // takes the first entry, so a plugin's `off` would remove the config's
+    // registration and leave its own running, and a later config reload would
+    // then preserve the very handler the plugin asked to remove.
+    const index = handlers.findIndex(
+      e => e.handler === handler && e.owner === owner
+    );
+    if (index > -1) {
+      handlers.splice(index, 1);
+    }
+
+    // Clean up empty arrays to avoid memory leaks
+    if (handlers.length === 0) {
+      store.delete(key);
+    }
+  }
+
+  /**
+   * Register a hook for a specific collection and hook type
+   *
+   * Hooks are executed in the order they are registered (FIFO).
+   * Multiple hooks can be registered for the same hook type and collection.
+   *
+   * @param hookType - Type of hook (beforeCreate, afterCreate, etc.)
+   * @param collection - Collection name or '*' for global hooks
+   * @param handler - Hook function to execute
+   *
+   * @example
+   * ```typescript
+   * const registry = getHookRegistry();
+   *
+   * // Collection-specific hook
+   * registry.register('beforeCreate', 'users', async (context) => {
+   *   context.data.password = await bcrypt.hash(context.data.password, 10);
+   *   return context.data;
+   * });
+   *
+   * // Global hook (runs for all collections)
+   * registry.register('afterCreate', '*', async (context) => {
+   *   console.log(`Created ${context.collection}:`, context.data.id);
+   * });
+   * ```
+   */
+  register(
+    hookType: HookContextPhase,
+    collection: string,
+    handler: HookHandler,
+    // Defaults to the app rather than to its config, because this method is
+    // public and its own documentation tells an app to call it directly. Only a
+    // registrar that reads the config -- and can therefore rebuild what it
+    // removes -- may claim `"code"`, and those pass it explicitly. Anything
+    // else defaults to surviving a reload, which costs a stale handler at
+    // worst; the opposite default costs a handler that vanishes for good.
+    owner: HookOwner = "app"
+  ): void {
+    // The type already excludes `beforeOperation`, but JavaScript callers and
+    // untypechecked code do not see that. Storing it here would put the handler
+    // where `executeBeforeOperation` never looks, so it would simply never run
+    // -- a silent no-op is worse than a loud refusal.
+    this.rejectBeforeOperation(hookType, "register", "registerBeforeOperation");
+    this.pushHandler(this.hooks, this.makeKey(hookType, collection), {
+      handler,
+      owner,
+    });
+  }
+
+  /**
+   * Refuse `beforeOperation` on a method that cannot honour it, naming the one
+   * that can.
+   */
+  private rejectBeforeOperation(
+    hookType: HookType,
+    method: string,
+    replacement: string
+  ): void {
+    if (hookType !== "beforeOperation") return;
+
+    throw NextlyError.invalidInput({
+      message: `Use ${replacement}() for a beforeOperation hook: its handler receives the operation's args rather than a document, so it is stored and executed separately from the other phases. "beforeOperation" cannot be passed to ${method}().`,
+      logContext: { hookType, method, replacement },
+    });
+  }
+
+  /**
+   * Register a `beforeOperation` hook.
+   *
+   * Separate from {@link register} because the handler signature is different:
+   * it is handed the operation's `args` -- the data, id or where clause the
+   * operation is about to use -- and returning a modified set replaces them.
+   * Handlers for every other phase receive `data` instead, and the two are not
+   * interchangeable.
+   *
+   * @param collection - Collection name or '*' for global hooks
+   * @param handler - Hook function to execute
+   */
+  registerBeforeOperation<T = unknown>(
+    collection: string,
+    handler: BeforeOperationHandler<T>,
+    owner: HookOwner = "app"
+  ): void {
+    this.pushHandler(
+      this.beforeOperationHooks,
+      this.makeKey("beforeOperation", collection),
+      { handler: handler as BeforeOperationHandler, owner }
+    );
+  }
+
+  /**
+   * Unregister a specific hook
+   *
+   * Removes the exact handler function from the registry.
+   * Useful for cleanup when hooks are no longer needed.
+   *
+   * @param hookType - Type of hook
+   * @param collection - Collection name or '*'
+   * @param handler - The exact handler function to remove
+   *
+   * @example
+   * ```typescript
+   * const myHook = async (context) => { ... };
+   *
+   * registry.register('beforeCreate', 'posts', myHook);
+   * // Later...
+   * registry.unregister('beforeCreate', 'posts', myHook);
+   * ```
+   */
+  unregister(
+    hookType: HookContextPhase,
+    collection: string,
+    handler: HookHandler,
+    // Removal is scoped to the caller's own registrations, so unregistering
+    // reaches only what that owner registered.
+    owner: HookOwner = "app"
+  ): void {
+    this.rejectBeforeOperation(
+      hookType,
+      "unregister",
+      "unregisterBeforeOperation"
+    );
+    this.removeHandler(
+      this.hooks,
+      this.makeKey(hookType, collection),
+      handler,
+      owner
+    );
+  }
+
+  /**
+   * Unregister a specific `beforeOperation` hook, the counterpart to
+   * {@link registerBeforeOperation}.
+   *
+   * @param collection - Collection name or '*'
+   * @param handler - The exact handler function to remove
+   */
+  unregisterBeforeOperation<T = unknown>(
+    collection: string,
+    handler: BeforeOperationHandler<T>,
+    owner: HookOwner = "app"
+  ): void {
+    this.removeHandler(
+      this.beforeOperationHooks,
+      this.makeKey("beforeOperation", collection),
+      handler as BeforeOperationHandler,
+      owner
+    );
+  }
+
+  /**
+   * @experimental Register an in-transaction handler: it runs last inside a
+   * write's own transaction, before the commit, and again on each retried
+   * attempt (see `hooks/in-transaction-phase`).
+   *
+   * @param collection - Collection name, `single:<slug>`, or '*' for every one
+   * @param runner - Called with the write's transaction and the write
+   */
+  registerInTransaction(
+    collection: string,
+    runner: InTransactionRunner,
+    owner: HookOwner = "app"
+  ): void {
+    this.pushHandler(this.inTransactionHooks, inTransactionKey(collection), {
+      handler: runner,
+      owner,
+    });
+  }
+
+  /**
+   * @experimental Unregister an in-transaction handler, the counterpart to
+   * {@link registerInTransaction}. Only the caller's own registration of it
+   * is removed, as for the other phases.
+   */
+  unregisterInTransaction(
+    collection: string,
+    runner: InTransactionRunner,
+    owner: HookOwner = "app"
+  ): void {
+    this.removeHandler(
+      this.inTransactionHooks,
+      inTransactionKey(collection),
+      runner,
+      owner
+    );
+  }
+
+  /**
+   * @experimental Whether any in-transaction handler would run for a
+   * collection: its own or a '*' one, not counting a suspended owner's.
+   *
+   * What a write asks before it loads the phase, so a write with nothing to
+   * run loads nothing and does nothing more than it did before the phase
+   * existed.
+   */
+  hasInTransaction(collection: string): boolean {
+    return this.inTransactionRunners(collection).length > 0;
+  }
+
+  /**
+   * @experimental The in-transaction handlers to run for a collection, in
+   * order: the '*' ones first, then the collection's own, each in
+   * registration order, without a suspended owner's.
+   *
+   * @internal
+   */
+  inTransactionRunners(collection: string): InTransactionRunner[] {
+    return this.inTransactionEntries(collection).map(e => e.handler);
+  }
+
+  /**
+   * @experimental {@link inTransactionRunners}, with the owner of each, which
+   * the phase names when a handler does something it should not.
+   *
+   * @internal
+   */
+  inTransactionEntries(
+    collection: string
+  ): ReadonlyArray<{ handler: InTransactionRunner; owner: HookOwner }> {
+    return [
+      ...this.runnableEntries(
+        this.inTransactionHooks.get(inTransactionKey("*")) ?? []
+      ),
+      ...(collection === "*"
+        ? []
+        : this.runnableEntries(
+            this.inTransactionHooks.get(inTransactionKey(collection)) ?? []
+          )),
+    ];
+  }
+
+  /**
+   * @experimental Register a plugin's collection-delete handlers: asked what
+   * deleting a collection takes with it, and run inside the delete's
+   * transaction before the collection is removed.
+   */
+  registerCollectionDelete(
+    runner: CollectionDeleteRunner,
+    owner: HookOwner = "app"
+  ): void {
+    this.collectionDeleteHooks.push({ handler: runner, owner });
+  }
+
+  /**
+   * @experimental Unregister collection-delete handlers, the counterpart to
+   * {@link registerCollectionDelete}: only the caller's own registration.
+   */
+  unregisterCollectionDelete(
+    runner: CollectionDeleteRunner,
+    owner: HookOwner = "app"
+  ): void {
+    const index = this.collectionDeleteHooks.findIndex(
+      e => e.handler === runner && e.owner === owner
+    );
+    if (index > -1) this.collectionDeleteHooks.splice(index, 1);
+  }
+
+  /**
+   * @experimental The collection-delete handlers to ask and run, in
+   * registration order, with the owner of each, without a suspended owner's.
+   *
+   * @internal
+   */
+  collectionDeleteEntries(): ReadonlyArray<{
+    handler: CollectionDeleteRunner;
+    owner: HookOwner;
+  }> {
+    return this.runnableEntries(this.collectionDeleteHooks);
+  }
+
+  /**
+   * Remove only the handlers a given owner registered for a collection.
+   *
+   * A config reload has to replace the app's own handlers while leaving a
+   * plugin's alone: a plugin can register directly into a collection's
+   * namespace -- the form builder does exactly that on `forms` -- so clearing
+   * the namespace wholesale deletes contributions the reload knows nothing
+   * about and cannot put back. Singles registration documents the same hazard
+   * and avoids it by never clearing at all, which trades a wipe for a leak.
+   *
+   * Reaches every store, because `beforeOperation` and the in-transaction
+   * phase live apart and a partial clear would leave one phase of a reloaded
+   * collection stale.
+   */
+  clearCollectionOwnedBy(collection: string, owner: HookOwner): void {
+    this.replaceCollectionOwnedBy(collection, owner, {
+      byPhase: [],
+      beforeOperation: [],
+      inTransaction: [],
+    });
+  }
+
+  /**
+   * Swap one owner's handlers for a collection, leaving them WHERE THEY WERE.
+   *
+   * Execution is in registration order, and owners interleave: a plugin
+   * registers during its `init`, the config right after, and an app whenever the
+   * module holding its `registerHook` call is evaluated -- which can be later
+   * than both. Removing an owner's entries and appending the replacements would
+   * move that owner behind everyone registered after it, so an unrelated config
+   * save would silently reorder a transforming chain and change the data it
+   * produces. The replacements go in at the index the first old one held, so a
+   * reload perturbs nothing it is not replacing.
+   */
+  replaceCollectionOwnedBy(
+    collection: string,
+    owner: HookOwner,
+    replacement: OwnedHookSet
+  ): void {
+    const byPhase = new Map(
+      replacement.byPhase.map(entry => [entry.hookType, entry.handlers])
+    );
+
+    for (const hookType of HOOK_TYPES) {
+      if (hookType === "beforeOperation") continue;
+      const key = this.makeKey(hookType, collection);
+      const handlers = byPhase.get(hookType) ?? [];
+      // Nothing to add and nothing there to remove.
+      if (handlers.length === 0 && !this.hooks.has(key)) continue;
+      this.spliceOwned(this.hooks, key, owner, handlers);
+    }
+
+    const beforeOperationKey = this.makeKey("beforeOperation", collection);
+    if (
+      replacement.beforeOperation.length > 0 ||
+      this.beforeOperationHooks.has(beforeOperationKey)
+    ) {
+      this.spliceOwned(
+        this.beforeOperationHooks,
+        beforeOperationKey,
+        owner,
+        replacement.beforeOperation
+      );
+    }
+
+    const inTransaction = replacement.inTransaction ?? [];
+    const inTransactionAt = inTransactionKey(collection);
+    if (
+      inTransaction.length > 0 ||
+      this.inTransactionHooks.has(inTransactionAt)
+    ) {
+      this.spliceOwned(
+        this.inTransactionHooks,
+        inTransactionAt,
+        owner,
+        inTransaction
+      );
+    }
+  }
+
+  /**
+   * Drop one owner's entries under a key and put `handlers` back at the index
+   * the first of them held, appending only when the owner had none there.
+   */
+  private spliceOwned<H>(
+    store: Map<string, RegisteredHook<H>[]>,
+    key: string,
+    owner: HookOwner,
+    handlers: H[]
+  ): void {
+    const existing = store.get(key) ?? [];
+    const firstOwned = existing.findIndex(e => e.owner === owner);
+    const kept = existing.filter(e => e.owner !== owner);
+    // Counted against the entries that REMAIN: the owner's own entries are gone
+    // by now, so an index into the original array would land too far right by
+    // however many of them preceded it.
+    //
+    // With no previous entry there is no position to preserve. For the config
+    // that is the recorded boundary: everything present when boot registered it
+    // belongs ahead of it, whoever owns those entries, and anything appended
+    // since is genuinely later. Every other owner appends -- nothing fixes when
+    // an app or a late plugin registration should run, so inventing a position
+    // for it would impose an order boot never produced.
+    // Immediately after the last surviving entry that was already there when
+    // boot registered the config. No record for a key means it held nothing
+    // then, so the config would have created it and its handlers belong first.
+    const atBoot = this.configBoundaries.get(key);
+    const lastPreConfig = atBoot
+      ? kept.reduce(
+          (index, entry, at) => (atBoot.has(entry) ? at + 1 : index),
+          0
+        )
+      : 0;
+    const firstTimeAt = owner === "code" ? lastPreConfig : kept.length;
+    const insertAt =
+      firstOwned === -1
+        ? firstTimeAt
+        : existing.slice(0, firstOwned).filter(e => e.owner !== owner).length;
+
+    kept.splice(insertAt, 0, ...handlers.map(handler => ({ handler, owner })));
+
+    if (kept.length === 0) store.delete(key);
+    else store.set(key, kept);
+  }
+
+  /**
+   * The owners under one key, in the order their handlers run.
+   *
+   * Ordering between owners is a real part of the contract -- transforming
+   * handlers feed each other -- and neither a count nor the handler snapshot
+   * can express it, so it is observable rather than inferred from internals.
+   *
+   * @internal
+   */
+  describeOwners(hookType: HookType, collection: string): HookOwner[] {
+    const key = this.makeKey(hookType, collection);
+    if (hookType === "beforeOperation") {
+      return (this.beforeOperationHooks.get(key) ?? []).map(e => e.owner);
+    }
+    return (this.hooks.get(key) ?? []).map(e => e.owner);
+  }
+
+  /**
+   * Every owner that currently holds at least one registration.
+   *
+   * A caller reconciling owners against a config needs to know who is REGISTERED,
+   * not only who the config still mentions: a plugin deleted outright is absent
+   * from the new config entirely, so a set derived from that config alone can
+   * never name it, and it would go on running.
+   */
+  registeredOwners(): HookOwner[] {
+    const owners = new Set<HookOwner>();
+    for (const entries of this.hooks.values()) {
+      for (const entry of entries) owners.add(entry.owner);
+    }
+    for (const entries of this.beforeOperationHooks.values()) {
+      for (const entry of entries) owners.add(entry.owner);
+    }
+    // A plugin that only ever registered an in-transaction handler is an owner
+    // too: left out, a deleted plugin's handler would never be suspended.
+    for (const entries of this.inTransactionHooks.values()) {
+      for (const entry of entries) owners.add(entry.owner);
+    }
+    // And one that registered only collection-delete handlers, for the same
+    // reason: a deleted plugin's handler would otherwise go on running.
+    for (const entry of this.collectionDeleteHooks) owners.add(entry.owner);
+    return [...owners];
+  }
+
+  /**
+   * Every collection namespace holding at least one handler for `owner`.
+   *
+   * Lets a caller that rebuilds an owner's registrations find the namespaces it
+   * is no longer going to rebuild -- a collection deleted or renamed in the
+   * config still has its handlers here, and its table is deliberately retained
+   * rather than dropped, so it stays addressable and would go on running them.
+   *
+   * The wildcard is never reported: it belongs to no single entity, so a caller
+   * reconciling against a list of entities can only ever conclude it is absent.
+   */
+  collectionsOwnedBy(owner: HookOwner): string[] {
+    const found = new Set<string>();
+
+    const collect = (key: string, entries: RegisteredHook<unknown>[]): void => {
+      if (!entries.some(e => e.owner === owner)) return;
+      const collection = key.slice(key.indexOf(":") + 1);
+      if (collection !== "*") found.add(collection);
+    };
+
+    for (const [key, entries] of this.hooks) collect(key, entries);
+    for (const [key, entries] of this.beforeOperationHooks) {
+      collect(key, entries);
+    }
+    for (const [key, entries] of this.inTransactionHooks) {
+      collect(key, entries);
+    }
+
+    return [...found];
+  }
+
+  /**
+   * Unregister all hooks for a specific collection
+   *
+   * Removes all hooks associated with a collection.
+   * Useful when a collection is deleted or during testing cleanup.
+   *
+   * @param collection - Collection name or '*' for global hooks
+   *
+   * @example
+   * ```typescript
+   * // Remove all hooks for 'posts' collection
+   * registry.clearCollection('posts');
+   *
+   * // Remove all global hooks
+   * registry.clearCollection('*');
+   * ```
+   */
+  clearCollection(collection: string): void {
+    // Iterated from the list the HookType union is built from. A local array
+    // annotated `HookType[]` type-checks while missing a phase, so a phase
+    // added later went on being registered and never cleared -- which makes
+    // re-registration append a second copy of every handler.
+    for (const hookType of HOOK_TYPES) {
+      const key = this.makeKey(hookType, collection);
+      this.hooks.delete(key);
+    }
+
+    // `beforeOperation` lives in its own store, so clearing a collection has to
+    // reach both or a cleared collection keeps running its operation hooks.
+    this.beforeOperationHooks.delete(
+      this.makeKey("beforeOperation", collection)
+    );
+    // And so does the in-transaction phase, kept in a third store.
+    this.inTransactionHooks.delete(inTransactionKey(collection));
+  }
+
+  /**
+   * Clear all hooks from the registry
+   *
+   * Removes all registered hooks for all collections.
+   * Primarily used for testing cleanup.
+   *
+   * @example
+   * ```typescript
+   * // In test cleanup
+   * afterEach(() => {
+   *   registry.clear();
+   * });
+   * ```
+   */
+  clear(): void {
+    this.hooks.clear();
+    this.beforeOperationHooks.clear();
+    this.inTransactionHooks.clear();
+    this.collectionDeleteHooks = [];
+    // Suspension describes handlers, so it cannot outlive them. A registry
+    // cleared at shutdown and registered into again would otherwise filter out
+    // the fresh handlers of a plugin that is now enabled, leaving it inert
+    // until some later reload happened to recompute the set.
+    this.suspendedOwners.clear();
+    this.configBoundaries.clear();
+  }
+
+  /**
+   * Execute all registered hooks for a given type and collection
+   *
+   * Hooks run in series (one after another) in registration order.
+   * Global wildcard hooks (*) execute BEFORE collection-specific hooks.
+   *
+   * **Execution Order:**
+   * 1. Global hooks (registered with '*')
+   * 2. Collection-specific hooks
+   *
+   * **Data Flow:**
+   * - For `before*` hooks: Each hook can modify data, which is passed to the next hook
+   * - For the after-write hooks in {@link SIDE_EFFECT_HOOK_TYPES}: return values
+   *   are ignored, so every handler and the caller see the persisted row
+   * - For `afterRead`: the return reshapes the response and is passed on
+   *
+   * **Error Handling:**
+   * - If any hook throws an error, execution stops immediately
+   * - The error is propagated to the caller (usually CollectionsHandler)
+   * - This will cause the database transaction to rollback
+   *
+   * @template T - Type of the data being operated on
+   * @param hookType - Type of hook to execute
+   * @param context - Hook context with operation metadata
+   * @returns Modified data (for before hooks) or void
+   * @throws Error if any hook fails
+   *
+   * @example
+   * ```typescript
+   * // beforeCreate hook modifies data
+   * const modifiedData = await registry.execute('beforeCreate', {
+   *   collection: 'posts',
+   *   operation: 'create',
+   *   data: { title: 'My Post' },
+   *   context: {}
+   * });
+   *
+   * // afterCreate hook runs side effects
+   * await registry.execute('afterCreate', {
+   *   collection: 'posts',
+   *   operation: 'create',
+   *   data: createdPost,
+   *   context: sharedContext
+   * });
+   * ```
+   */
+  async execute<T>(
+    hookType: HookContextPhase,
+    context: HookContext<T>,
+    options?: {
+      /**
+       * Called for each side-effect handler that throws, so the caller can
+       * report it alongside the successful write. Omitting it does not make
+       * the failure silent -- it is logged either way.
+       */
+      onSideEffectError?: (failure: SideEffectHookFailure) => void;
+    }
+  ): Promise<T | void> {
+    // `beforeOperation` handlers live in the other store and take a different
+    // context, so this method cannot run them. Reaching here with that phase
+    // would return `context.data` having executed nothing, which reads as "no
+    // hooks are registered" rather than "this is the wrong method".
+    this.rejectBeforeOperation(hookType, "execute", "executeBeforeOperation");
+
+    // Get hooks for specific collection + global hooks
+    const specificKey = this.makeKey(hookType, context.collection);
+    const globalKey = this.makeKey(hookType, "*");
+
+    const globalHandlers = this.runnable(this.hooks.get(globalKey) ?? []);
+    const specificHandlers = this.runnable(this.hooks.get(specificKey) ?? []);
+
+    // Global hooks run first, then collection-specific hooks
+    const allHandlers = [...globalHandlers, ...specificHandlers];
+
+    // If no hooks registered, return early (optimization)
+    if (allHandlers.length === 0) {
+      return context.data;
+    }
+
+    let data = context.data;
+
+    // A side-effect phase runs after the write has committed, so a return value
+    // has nothing left to change: the row stays the persisted one for every
+    // later handler and for the caller.
+    const isSideEffectPhase = SIDE_EFFECT_HOOK_TYPES.has(hookType);
+
+    // Execute hooks in series (FIFO order)
+    for (const handler of allHandlers) {
+      try {
+        // Pass current data to hook
+        const result = await handler(
+          withCurrentPrincipal(
+            withHookLanguage({ ...contextForPhase(hookType, context), data })
+          )
+        );
+
+        // If hook returns data (including null), use it for next hook
+        // If hook returns undefined, keep current data unchanged
+        // This allows before* hooks to intentionally set null values
+        // while after* hooks can skip returning (undefined) for side effects
+        if (!isSideEffectPhase && result !== undefined) {
+          data = result;
+        }
+      } catch (error: unknown) {
+        const normalized = normalizeHookError(
+          error,
+          hookType,
+          context.collection
+        );
+        // A transforming phase runs before the write, so raising is how it
+        // refuses one -- that is the whole point of `before*`.
+        if (!isSideEffectPhase) throw normalized;
+
+        // A side-effect phase runs after the write committed. Raising here
+        // would report a durable row as a failure and invite a retry that
+        // writes it a second time, so the failure is reported instead.
+        //
+        // The remaining handlers still run: they are independent side effects,
+        // and letting the first failure cancel the rest turns one broken hook
+        // into several silently skipped ones.
+        // Logged here because nothing above this frame will: the operation
+        // reports success, so a side effect that vanished without a trace is
+        // exactly the failure this has to avoid. Written through the masked
+        // console logger: a hook's error can quote the address it was handling.
+        consoleLogger.error(
+          `Hook "${hookType}" failed for "${context.collection}" after the write committed`,
+          { error: normalized }
+        );
+        // `normalizeHookError` rethrows a typed error untouched and wraps an
+        // untyped one, so this is a NextlyError in practice; the guard is what
+        // makes that a fact rather than an assumption.
+        // Post-commit phases see the persisted row, so its id is on the data
+        // they were handed. Read defensively: a handler may have replaced the
+        // document with something else before this phase.
+        const entryId =
+          typeof (context.data as { id?: unknown } | undefined)?.id === "string"
+            ? (context.data as { id: string }).id
+            : undefined;
+        const failure: SideEffectHookFailure = {
+          phase: hookType,
+          collection: context.collection,
+          ...(entryId ? { entryId } : {}),
+          error: NextlyError.is(normalized)
+            ? normalized
+            : NextlyError.internal({
+                logContext: { hookType, collection: context.collection },
+              }),
+        };
+        options?.onSideEffectError?.(failure);
+        // Also published to whatever is collecting for the current operation,
+        // so a caller gets the warning without every write path having to
+        // accept and forward the callback above.
+        recordSideEffectWarning(failure);
+      }
+    }
+
+    return data;
+  }
+
+  /**
+   * Execute beforeOperation hooks for a collection
+   *
+   * beforeOperation hooks run BEFORE operation-specific hooks (beforeCreate, etc.)
+   * and can modify operation arguments or throw to abort the operation.
+   *
+   * **Execution Order:**
+   * 1. Global beforeOperation hooks (registered with '*')
+   * 2. Collection-specific beforeOperation hooks
+   * 3. Then operation-specific hooks (beforeCreate, beforeUpdate, etc.)
+   *
+   * **Args Flow:**
+   * - Each hook can modify args (data, id, where), which is passed to the next hook
+   * - If hook returns undefined/void, args remain unchanged
+   * - If hook throws, operation is aborted
+   *
+   * **Use Cases:**
+   * - Global logging/auditing of all operations
+   * - Rate limiting across all operations
+   * - Global validation or normalization
+   * - Modifying operation arguments before they reach specific hooks
+   *
+   * @template T - Type of the data being operated on
+   * @param context - BeforeOperation context with operation metadata and args
+   * @returns Modified args or void (if no modification)
+   * @throws Error if any hook fails
+   *
+   * @example
+   * ```typescript
+   * // Global logging for all operations
+   * registry.registerBeforeOperation('*', async (context) => {
+   *   console.log(`[${context.operation}] ${context.collection}`, context.args);
+   * });
+   *
+   * // Execute beforeOperation hooks
+   * const modifiedArgs = await registry.executeBeforeOperation({
+   *   collection: 'posts',
+   *   operation: 'create',
+   *   args: { data: { title: 'My Post' } },
+   *   context: {}
+   * });
+   *
+   * // Use modifiedArgs.data for the actual create operation
+   * ```
+   */
+  async executeBeforeOperation<T>(
+    context: BeforeOperationInput<T>
+  ): Promise<BeforeOperationArgs<T> | void> {
+    // Get hooks for specific collection + global hooks
+    const specificKey = this.makeKey("beforeOperation", context.collection);
+    const globalKey = this.makeKey("beforeOperation", "*");
+
+    const globalHandlers: BeforeOperationHandler<T>[] = this.runnable(
+      this.beforeOperationHooks.get(globalKey) ?? []
+    );
+    const specificHandlers: BeforeOperationHandler<T>[] = this.runnable(
+      this.beforeOperationHooks.get(specificKey) ?? []
+    );
+
+    // Global hooks run first, then collection-specific hooks
+    const allHandlers: BeforeOperationHandler<T>[] = [
+      ...globalHandlers,
+      ...specificHandlers,
+    ];
+
+    // If no hooks registered, return early (optimization)
+    if (allHandlers.length === 0) {
+      return context.args;
+    }
+
+    let args = context.args;
+
+    // Execute hooks in series (FIFO order)
+    for (const handler of allHandlers) {
+      try {
+        // Pass current args to hook
+        const result = await handler(
+          withCurrentPrincipal(withHookLanguage({ ...context, args }))
+        );
+
+        // If hook returns args, use it for next hook
+        // If hook returns undefined/void, keep current args unchanged
+        if (result !== undefined) {
+          args = result;
+        }
+      } catch (error: unknown) {
+        throw normalizeHookError(error, "beforeOperation", context.collection);
+      }
+    }
+
+    return args;
+  }
+
+  /**
+   * Check if any hooks are registered for a given type/collection
+   *
+   * Performance optimization: Allows callers to skip hook execution
+   * if no hooks are registered, avoiding unnecessary overhead.
+   *
+   * @param hookType - Type of hook to check
+   * @param collection - Collection name
+   * @returns True if hooks are registered (global or specific)
+   *
+   * @example
+   * ```typescript
+   * if (registry.hasHooks('beforeCreate', 'posts')) {
+   *   const modifiedData = await registry.execute('beforeCreate', context);
+   * }
+   * ```
+   */
+  hasHooks(hookType: HookType, collection: string): boolean {
+    return (
+      this.runnableCountAt(hookType, collection) > 0 ||
+      this.runnableCountAt(hookType, "*") > 0
+    );
+  }
+
+  /**
+   * How many handlers under one key would actually run.
+   *
+   * A suspended owner's entries stay registered but never execute, so a
+   * presence check that counted them would tell a caller to run a phase that
+   * does nothing -- and `hasHooks` exists precisely so a caller can skip that
+   * work. Registration counts stay raw in {@link getHookCount}, which is
+   * introspection rather than a decision.
+   */
+  private runnableCountAt(hookType: HookType, collection: string): number {
+    const key = this.makeKey(hookType, collection);
+    // Split per store rather than unioning the two entry types: their handlers
+    // take different contexts, and merging them is what a cast would paper over.
+    if (hookType === "beforeOperation") {
+      return this.runnable(this.beforeOperationHooks.get(key) ?? []).length;
+    }
+    return this.runnable(this.hooks.get(key) ?? []).length;
+  }
+
+  /**
+   * How many handlers one key holds, in whichever store owns that phase.
+   *
+   * Introspection stays whole-registry -- a caller asking whether a phase has
+   * hooks means every phase, including `beforeOperation` -- so the split in
+   * storage must not become a split in what can be counted.
+   */
+  private countAt(hookType: HookType, collection: string): number {
+    const key = this.makeKey(hookType, collection);
+    if (hookType === "beforeOperation") {
+      return this.beforeOperationHooks.get(key)?.length ?? 0;
+    }
+    return this.hooks.get(key)?.length ?? 0;
+  }
+
+  /**
+   * Get count of registered hooks for a specific type/collection
+   *
+   * Useful for debugging and monitoring.
+   *
+   * @param hookType - Type of hook
+   * @param collection - Collection name or '*'
+   * @returns Number of registered hooks
+   *
+   * @example
+   * ```typescript
+   * const count = registry.getHookCount('beforeCreate', 'posts');
+   * console.log(`${count} beforeCreate hooks registered for posts`);
+   * ```
+   */
+  getHookCount(hookType: HookType, collection: string): number {
+    return this.countAt(hookType, collection);
+  }
+
+  /**
+   * Get all registered hooks (for debugging/introspection)
+   *
+   * Returns a snapshot of all registered hooks.
+   * Useful for debugging and testing.
+   *
+   * Excludes `beforeOperation`, whose handlers take a different context and are
+   * stored separately -- see {@link getAllBeforeOperation}.
+   *
+   * @returns Map of hook keys to handler arrays
+   * @internal
+   */
+  getAll(): Map<string, HookHandler[]> {
+    // Copied, and unwrapped to bare handlers: provenance is a registry concern
+    // and this snapshot is for debugging what will run.
+    return new Map(
+      [...this.hooks].map(([key, entries]) => [
+        key,
+        entries.map(e => e.handler),
+      ])
+    );
+  }
+
+  /**
+   * Snapshot of the registered `beforeOperation` hooks, the counterpart to
+   * {@link getAll}.
+   *
+   * @returns Map of hook keys to handler arrays
+   * @internal
+   */
+  getAllBeforeOperation(): Map<string, BeforeOperationHandler[]> {
+    return new Map(
+      [...this.beforeOperationHooks].map(([key, entries]) => [
+        key,
+        entries.map(e => e.handler),
+      ])
+    );
+  }
+
+  /**
+   * Generate storage key for hook type + collection
+   * @private
+   */
+  private makeKey(hookType: HookType, collection: string): string {
+    return `${hookType}:${collection}`;
+  }
+}
+
+/**
+ * The in-transaction store's key for a collection, in the `<phase>:<collection>`
+ * shape the other stores use, so a scan reading the collection back out of a
+ * key reads this one the same way.
+ */
+function inTransactionKey(collection: string): string {
+  return `inTransaction:${collection}`;
+}
+
+/**
+ * Global singleton instance of HookRegistry
+ *
+ * Immediately initialized to prevent race conditions in concurrent environments.
+ * This ensures true singleton behavior without lazy initialization checks.
+ */
+// Use globalThis to survive ESM module duplication in Next.js/Turbopack.
+// Without this, each re-evaluation creates a new registry, causing hooks
+// registered during registerServices() to be lost.
+const globalForHooks = globalThis as unknown as {
+  __nextly_hookRegistry?: HookRegistry;
+};
+
+if (!globalForHooks.__nextly_hookRegistry) {
+  globalForHooks.__nextly_hookRegistry = new HookRegistry();
+}
+
+const globalRegistry: HookRegistry = globalForHooks.__nextly_hookRegistry;
+
+/**
+ * Get the global hook registry singleton
+ *
+ * Always use this function to access the registry to ensure
+ * a single instance is shared across the application.
+ *
+ * @returns Global HookRegistry instance
+ *
+ * @example
+ * ```typescript
+ * import { getHookRegistry } from 'nextly/hooks';
+ *
+ * const registry = getHookRegistry();
+ * registry.register('beforeCreate', 'posts', myHook);
+ * ```
+ */
+export function getHookRegistry(): HookRegistry {
+  return globalRegistry;
+}
+
+/**
+ * The registry `registerServices` actually wrote to.
+ *
+ * A caller may supply its own instance, and that is where the built-in,
+ * configured and plugin handlers went. Anything that later replaces or clears
+ * those registrations has to reach the same instance: writing to the global
+ * singleton instead would leave the live one holding the handlers it was
+ * supposed to lose, while the edited ones sit where no service will run them.
+ *
+ * On globalThis, like the singleton itself, so it survives the module
+ * re-evaluation Next.js and Turbopack do.
+ */
+const globalForActiveRegistry = globalThis as unknown as {
+  __nextly_activeHookRegistry?: HookRegistry;
+};
+
+/** Record which registry service registration bound its handlers to. */
+export function setActiveHookRegistry(
+  registry: HookRegistry | undefined
+): void {
+  globalForActiveRegistry.__nextly_activeHookRegistry = registry;
+}
+
+/**
+ * The registry in use, falling back to the process-global singleton when
+ * nothing has registered yet -- which is also the instance registration would
+ * pick by default.
+ */
+export function getActiveHookRegistry(): HookRegistry {
+  return globalForActiveRegistry.__nextly_activeHookRegistry ?? globalRegistry;
+}
+
+/**
+ * Clear every hook from the global registry.
+ *
+ * Called when services shut down or are cleared, because the registry outlives
+ * the DI container: handlers are registered from config on each init, so a
+ * registry left populated would hand a second instance in the same process a
+ * duplicate of every handler plus the dead instance's own.
+ *
+ * @internal
+ * @example
+ * ```typescript
+ * // In test cleanup
+ * afterEach(() => {
+ *   resetHookRegistry();
+ * });
+ * ```
+ */
+export function resetHookRegistry(): void {
+  globalRegistry.clear();
+}

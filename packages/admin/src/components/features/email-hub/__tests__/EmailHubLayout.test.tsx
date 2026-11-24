@@ -1,0 +1,145 @@
+// @vitest-environment jsdom
+/**
+ * The hub's tabs run across the top, each shown only to a reader holding a
+ * grant that reads what it shows, and choosing one navigates to its route.
+ */
+import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { SETTINGS_NAV } from "@admin/components/layout/sidebar/lib/settings-nav";
+import { MAIN_MENU_ITEMS } from "@admin/components/layout/sidebar/sidebar-types";
+import { EMAIL_HUB_PERMISSIONS } from "@admin/constants/email-hub";
+import { ROUTES } from "@admin/constants/routes";
+import { useCurrentUserPermissions } from "@admin/hooks/useCurrentUserPermissions";
+import { holdsPermission } from "@admin/lib/permissions/holds-permission";
+
+import { EmailHubLayout } from "../EmailHubLayout";
+
+vi.mock("@admin/hooks/useCurrentUserPermissions", () => ({
+  useCurrentUserPermissions: vi.fn(),
+}));
+
+const navigateTo = vi.fn();
+vi.mock("@admin/lib/navigation", () => ({
+  navigateTo: (path: string) => navigateTo(path),
+}));
+
+function holding(slugs: string[], hasAnswer = true) {
+  vi.mocked(useCurrentUserPermissions).mockReturnValue({
+    // Asked as the product asks it.
+    hasPermission: (slug: string) => holdsPermission(new Set(slugs), slug),
+    isLoading: !hasAnswer,
+    hasAnswer,
+    error: null,
+  } as unknown as ReturnType<typeof useCurrentUserPermissions>);
+}
+
+function tabs(): string[] {
+  return screen.getAllByRole("tab").map(tab => tab.textContent ?? "");
+}
+
+function renderHub() {
+  render(
+    <EmailHubLayout tab="messages">
+      <p>the tab</p>
+    </EmailHubLayout>
+  );
+}
+
+beforeEach(() => {
+  navigateTo.mockClear();
+});
+
+describe("the Email hub's tabs", () => {
+  it("shows every tab to someone who may see templates and providers", () => {
+    holding(["read-email-templates", "read-email-providers"]);
+    renderHub();
+    expect(tabs()).toEqual(["Messages", "Design", "Sending"]);
+    expect(screen.getByText("the tab")).toBeTruthy();
+  });
+
+  it("shows only Messages and Design to someone who may see templates", () => {
+    holding(["read-email-templates"]);
+    renderHub();
+    expect(tabs()).toEqual(["Messages", "Design"]);
+  });
+
+  it("shows only Sending to someone who may see providers", () => {
+    holding(["read-email-providers"]);
+    renderHub();
+    expect(tabs()).toEqual(["Sending"]);
+  });
+
+  it("does not let a create-only grant reveal a list it can't read", () => {
+    holding(["create-email-templates"]);
+    renderHub();
+    expect(screen.queryAllByRole("tab")).toEqual([]);
+  });
+
+  it("shows every tab while the grants are loading, as the rail does", () => {
+    holding([], false);
+    renderHub();
+    expect(tabs()).toEqual(["Messages", "Design", "Sending", "Activity"]);
+  });
+
+  it("navigates to a tab's route when it's chosen", () => {
+    holding(["read-email-templates", "read-email-providers"]);
+    renderHub();
+    const sending = screen.getByRole("tab", { name: "Sending" });
+    fireEvent.mouseDown(sending, { button: 0 });
+    fireEvent.click(sending);
+    expect(navigateTo).toHaveBeenCalledWith("/admin/settings/email/sending");
+  });
+});
+
+describe("the hub's place in Settings", () => {
+  /** The trail's crumbs, as label and link, in order. */
+  function trail(): Array<[string, string | null]> {
+    const nav = screen.getByRole("navigation", { name: "Breadcrumb" });
+    return Array.from(nav.querySelectorAll("li"), item => [
+      item.textContent ?? "",
+      item.querySelector("a")?.getAttribute("href") ?? null,
+    ]);
+  }
+
+  it("reads Settings › Email in its trail", () => {
+    holding(["read-settings", "read-email-templates"]);
+    renderHub();
+    expect(trail()).toEqual([
+      ["Dashboard", ROUTES.DASHBOARD],
+      ["Settings", ROUTES.SETTINGS],
+      ["Email", null],
+    ]);
+  });
+
+  /*
+   * `/admin/settings` is General Settings, which refuses a reader without
+   * `read-settings`. Someone who may only see Email is sent to the first
+   * Settings page they can open, which is the hub itself.
+   */
+  it("leads the Settings crumb to a page the reader can open", () => {
+    holding(["read-email-templates"]);
+    renderHub();
+    expect(trail()[1]).toEqual(["Settings", ROUTES.EMAIL]);
+  });
+
+  it("has no rail entry of its own, and an entry in the Settings panel", () => {
+    expect(MAIN_MENU_ITEMS.map(item => item.id)).not.toContain("email");
+    // The control: the rail is populated, Settings among it.
+    expect(MAIN_MENU_ITEMS.map(item => item.id)).toContain("settings");
+
+    const entry = SETTINGS_NAV.flatMap(group => group.items).find(
+      item => item.id === "email"
+    );
+    expect(entry?.href).toBe(ROUTES.EMAIL);
+    expect(ROUTES.EMAIL).toBe("/admin/settings/email");
+    // Any grant that shows a tab shows the entry.
+    expect(entry?.gate).toEqual({
+      kind: "anyOf",
+      permissions: EMAIL_HUB_PERMISSIONS,
+    });
+    expect(EMAIL_HUB_PERMISSIONS).toEqual(
+      expect.arrayContaining(["read-email-templates", "read-email-providers"])
+    );
+  });
+});

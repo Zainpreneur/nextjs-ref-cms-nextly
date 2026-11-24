@@ -1,0 +1,770 @@
+---
+title: Routing and SEO
+description: Turn content into pages with correct metadata, sitemap, and robots. The nextly/runtime helpers resolve a slug to a published, access-enforced entry, build a Next.js Metadata object from an seo field group, and deliver sitemap.xml and robots.txt.
+---
+
+Nextly ships a small set of Next.js helpers for the last mile of a content
+site: resolve a URL to the right entry, build its `<head>` metadata, and serve
+`sitemap.xml` / `robots.txt`. They live in `nextly/runtime` and read your
+content through the [Direct API](/docs/api-reference/direct-api), so every read
+is publish-state aware, access aware, and cached with
+[F1 tag-based ISR](/docs/guides/isr-caching).
+
+SEO **data** (the `metaTitle` / `metaDescription` / `ogImage` / `canonical` /
+`noindex` fields) is opt-in via the agnostic
+[`@nextlyhq/plugin-seo`](/docs/plugins) plugin; the **behavior** below is
+Next-only and lives in `nextly/runtime`. Nothing here forces `next` onto a
+headless or admin-only deployment — every `next` import is type-only and
+`next/navigation` is resolved lazily.
+
+**Which Nextly they read through.** `resolveContent`, `createContentRoute` and
+`createPublicContentRoute` read content, and take a `nextly` option. Without it, they use the instance already started in this process
+and throws "Nextly services not initialized" if there is none, which is the case
+on a new project's first public request. Pass the instance from
+`await getNextly({ config })` (`getNextly` from `nextly`, `config` from your
+`nextly.config.ts`) as `nextly`. The samples below leave it out for brevity.
+
+## resolveContent — slug to a published entry
+
+`resolveContent(collection, slug, options?)` resolves a URL slug to a single
+entry and returns `null` on a genuine miss (render `notFound()`), rethrowing a
+transient read error so a DB blip never bakes a permanently-cached 404.
+
+```ts
+import { resolveContent, type ContentEntry } from "nextly/runtime";
+import { notFound } from "next/navigation";
+
+// `ContentEntry` is `Record<string, unknown>`: the entry is whatever the
+// collection holds, so read fields off it deliberately rather than assuming a
+// shape. `nextly generate:types` is what turns this into a named type.
+function Post({ entry }: { entry: ContentEntry }) {
+  return <article>{String(entry.title ?? "")}</article>;
+}
+
+export default async function PostPage({
+  params,
+}: {
+  params: Promise<{ slug: string }>;
+}) {
+  const { slug } = await params;
+  const post = await resolveContent("posts", slug, { depth: 2 });
+  if (!post) notFound();
+  return <Post entry={post} />;
+}
+```
+
+**Publish state.** By default `resolveContent` reads `status: "published"`.
+This is the lifecycle-aware scope, not a `where` clause on a `status` column, so
+it also constrains a localized collection's per-locale companion status — a
+draft translation under a published main row is never returned. On a status-less
+collection (no built-in Draft/Published lifecycle) the scope is a no-op and
+every row is live, so you can mix lifecycle and status-less collections freely.
+
+**Pending edits.** Publish state is only half the picture. An entry that has
+never been published is covered by `status`, but pending edits to an
+**already-published** entry are stored as a separate working draft that no
+`status` scope can see — the live row keeps serving until you publish. Pass
+`draft: true` to read those instead:
+
+```ts
+// The page as the editor last saved it, not as visitors see it.
+await resolveContent("posts", slug, {
+  draft: true,
+  overrideAccess: true,
+  trustedCollections: ["posts"],
+});
+```
+
+The two layers are gated differently, and that difference is the important part:
+
+- **Pending edits** are judged per row, by an update-capability probe, so asking
+  for them is safe from anywhere. A caller who cannot edit the document gets the
+  published row instead.
+- **Never-published entries** are judged by nothing — the query simply returns
+  them. So `draft: true` widens `status` to `"all"` **only on a trusted read**
+  (`overrideAccess: true`). Without that, a draft read still sees published rows
+  and overlays their pending edits.
+
+That split exists because a `draft` flag wired from an untrusted request would
+otherwise publish unpublished pages. An explicit `status` always wins.
+
+A draft read is **never cached**, because cache tags are busted by writes to the
+live row while a draft changes on every save.
+
+**Access.** By default `resolveContent` **enforces** the collection's read
+policy (`overrideAccess: false`) — the code-defined `access.read` on its
+`defineCollection` config. A collection that declares none still renders; one
+whose rule refuses an anonymous caller is hidden from an unauthenticated request
+and resolves to `null` (→ `notFound()`, so the URL does not reveal that the
+entry exists). Pass a `user` to render member content, or `overrideAccess: true`
+for a fully trusted read.
+
+```ts
+// Anonymous public read (default): the collection's access rule is enforced.
+await resolveContent("posts", slug);
+
+// Render member-only content for a signed-in reader.
+await resolveContent("posts", slug, { user: { id, role } });
+
+// Trusted read that ignores access rules (e.g. a preview route you gate yourself).
+// `trustedCollections` is required with `overrideAccess: true`: it names the
+// collections the trust reaches as relationships are expanded. Others are read
+// as a visitor would read them. `TRUSTS_EVERY_COLLECTION` (from "nextly")
+// trusts all of them.
+await resolveContent("posts", slug, {
+  overrideAccess: true,
+  trustedCollections: ["posts"],
+  status: "all",
+});
+```
+
+> An anonymous read hands the collection's `access.read` rule a real anonymous
+> context (`user: null`, no roles, no permissions) and lets it decide, so a
+> rule like `read: ({ user }) => !!user` hides the content as written, and a
+> rule that admits only by role or permission refuses the anonymous reader by
+> construction. Content meant for a signed-in audience belongs behind an
+> authenticated read (pass a `user`) rather than the anonymous default.
+
+**Caching.** Only a **trusted** (`overrideAccess: true`) read with no `user` is
+F1-cached — an enforced read is never cached, because its result depends on an
+access decision that a content-tag bust can't invalidate (a rule can answer
+differently without any entry being written). So a public site that wants cached pages should
+read its public content with `overrideAccess: true` and the `trustedCollections`
+it may reach; access-gated or member content runs fresh per request.
+
+Other options: `nextly` (above), `trustedCollections` (required with
+`overrideAccess: true`), `slugField` (default `"slug"`), `depth`, `locale`,
+`richTextFormat`, `richTextStyles` (`"none"` for class-only rich text HTML), `tags`
+(extra cache tags for populated relations),
+`revalidate` (a time-based safety net for cached reads), and `cacheScope` (a
+discriminator when distinct readers — per tenant or database — resolve the same
+slug).
+
+## createContentRoute — the optional catch-all
+
+For the pages-collection model (add an `/about` entry and it just works), wire
+one `app/[[...slug]]/page.tsx` optional catch-all:
+
+```tsx
+// app/[[...slug]]/page.tsx
+import { createContentRoute, buildMetadata } from "nextly/runtime";
+
+const route = createContentRoute({
+  collections: ["pages"],
+  render: entry => <Page entry={entry} />,
+  buildMetadata: entry => buildMetadata(entry),
+});
+
+export const generateMetadata = route.generateMetadata;
+export default route.ContentPage;
+```
+
+`createContentRoute` reads **access-enforced** content: the collections' read
+rules decide, so the answer depends on who is asking and the page renders per
+request. It deliberately returns no `generateStaticParams` — Next classifies a
+route as static because that export exists, and a route that must render
+dynamically cannot also claim to be static.
+
+When the content in those collections is public, say so and the route
+pre-renders:
+
+```tsx
+// app/[[...slug]]/page.tsx
+import { createPublicContentRoute, buildMetadata } from "nextly/runtime";
+
+const route = createPublicContentRoute({
+  collections: ["pages"],
+  render: entry => <Page entry={entry} />,
+  buildMetadata: entry => buildMetadata(entry),
+});
+
+export const generateStaticParams = route.generateStaticParams;
+export const generateMetadata = route.generateMetadata;
+export default route.ContentPage;
+```
+
+A path the build did not list renders on its first request, so the route needs
+no `dynamicParams` export, which Cache Components refuses.
+
+A public route reads trusted, so its reads are cacheable and its paths
+pre-renderable. It refuses `draft` and `staticParamsLimit: 0` at construction —
+both would force the render dynamic while the route still told Next it was
+static. Use `createContentRoute` for preview or for a site that pre-renders
+nothing.
+
+Both factories resolve a path across the configured collections (first match
+wins) and call `notFound()` on a genuine miss or a reserved path (`/admin`,
+`/api`, `/_next`, `/static`, and metadata files like `sitemap.xml`). `status`
+behaves as in `resolveContent`.
+
+To do something for each miss, such as logging the address, pass your own
+`notFound`, a function that answers it as Next.js's does. The route calls it in
+place of `notFound()` from the page and from `generateMetadata` alike, so one
+request may call it twice. A handler that returns is followed by `notFound()`,
+so the request is still answered not found. `createSingleRoute`, and the page
+builder's `createContentPage`, `createBlocksPage` and `createSinglePage`, take
+the same option. It is experimental: its name and shape may change before 1.0.
+
+Without Cache Components, `createPublicContentRoute` renders a path once, at
+build or on its first request, and keeps the answer, and Next.js refuses a
+kept render that reads the request (`headers()`, `cookies()`). Give a public
+route a handler that reads the request only with Cache Components on. The page
+builder's public forms leave the handler out themselves where their answers are
+kept.
+
+### One route for every language
+
+On a [translated site](/docs/localization), put the catch-all under a
+`[locale]` segment and the route reads the language from it: one route serves
+every language, each page at its own translated address, and a segment that
+names none of the site's languages answers not found. Leave the route's
+`locale` option out there. List the languages in the segment's layout, and
+each language's paths are pre-rendered in it:
+
+```tsx
+// app/[locale]/layout.tsx
+export function generateStaticParams() {
+  return [{ locale: "en" }, { locale: "de" }];
+}
+```
+
+```tsx
+// app/[locale]/[[...slug]]/page.tsx
+import { createPublicContentRoute } from "nextly/runtime";
+
+const route = createPublicContentRoute({
+  collections: ["pages"],
+  render: (entry, context) => <Page entry={entry} locale={context.locale} />,
+});
+
+export const generateStaticParams = route.generateStaticParams;
+export const generateMetadata = route.generateMetadata;
+export default route.ContentPage;
+```
+
+The addresses the route hands on, a list's first-page redirect and the address
+its head is asked for, are formed by the site's
+[language rule](/docs/localization#each-languages-address). A Single route
+under the segment reads its language the same way: pass the page's props on.
+
+### A paginated list's pages
+
+Give either factory `listPages`, a function from a resolved entry to how many pages its
+paginated list has (or `null` when it paginates none), and the route also serves
+`<address>/page/<n>`. `render` and `buildMetadata` receive `context.page`, from 2, on a
+later page; the entry's own address is page 1. They also receive `context.listPagePath(n)`,
+the address of page `n` as the route serves it, for the list's links. A route mounted
+below the site root (`app/blocks/[[...slug]]`) says so with `mountPath: "/blocks"`, so its
+addresses and redirects carry the prefix. `/page/1` redirects permanently to the
+entry's own address, and a number past the last page, or spelled any other way (`0`, `02`,
+`1.5`), calls `notFound()`. A path matching an entry exactly is served as that entry
+first, so a page stored at `news/page/2` keeps its address. On the public route,
+`generateStaticParams` also lists each later page, up to the count at build and within
+`staticParamsLimit`; pages that come to exist later render on their first request. Blocks
+routes (`createBlocksPage`, `createPublicBlocksPage`) set `listPages` themselves for a page
+whose Collection list is split into pages. `listPages`, `mountPath`, `context.page`, `context.listPagePath` and the helpers
+`listPageOf`, `listPageNumber`, `slugToPath` and `LIST_PAGE_SEGMENT` (from `nextly/runtime`
+and `nextly/route-path`) are experimental.
+
+**Which factory you call decides whether access rules are consulted at all, so
+choose it per collection set, not per preference.**
+
+- `createContentRoute` reads **enforced**. A collection with no `access.read`
+  still renders; one whose rule refuses an anonymous caller is hidden from
+  these anonymous requests.
+- `createPublicContentRoute` reads **trusted** — access rules are not consulted,
+  on the resolved read and on the `generateStaticParams` scan alike. That is
+  what makes its reads cacheable and its paths pre-renderable, and it means
+  **every collection you list must be public**. A restricted collection listed
+  here has its entries read trusted and its paths pre-rendered into public HTML.
+  That statement is now exactly true: the collections you list are the ones
+  trusted, and a relationship reaching past them is read enforced unless you
+  name it (see below).
+
+### What a populated relationship is read as
+
+A page often populates a relationship — a post reaching its author, a page
+reaching its hero image. That target is a collection you did **not** list: it
+was reached through a field.
+
+**`createPublicContentRoute` reads those targets as a visitor would**, unless
+you say otherwise. Their own access rules apply, and only their published rows
+come back. Name the ones your pages populate to have them read trusted too:
+
+```ts
+export const { ContentPage, generateMetadata, generateStaticParams } =
+  createPublicContentRoute({
+    collections: ["posts"],
+    // Posts populate an author; authors are public too.
+    trustedCollections: ["posts", "authors"],
+    depth: 1,
+    render: (entry) => <Post entry={entry} />,
+  });
+```
+
+`trustedCollections` defaults to the `collections` you listed, so a route that
+populates nothing needs no extra config, and one that does gets an explicit
+decision rather than an inherited one.
+
+> **Trusting a collection does not admit its drafts.** A public route
+> pre-renders, so an unpublished row pulled in through a relationship is written
+> into a static artifact and stays there after the row is unpublished —
+> unpublishing cannot take back a page already built. Trust decides _who_ may
+> read a row; being published decides whether it is ready for anyone. Nothing in
+> this config widens a lifecycle.
+
+`createContentRoute` needs none of this for its ordinary reads — it reads
+enforced already, and **its previews trust nothing by default.** A draft grant
+turns the bypass on for one request, but it authorizes ONE document and says
+nothing about what that document points at — including a sibling row in the
+same collection. So a preview populates relations exactly as an anonymous
+visitor would see them. Name a target in `trustedCollections` if you know it is
+public and want it populated in preview too.
+
+> **Cached pages are point-in-time copies.** A public route pre-renders, so a
+> target whose read policy tightens after the build is not reflected until that
+> page is revalidated — and the same is true of the page's own content, bound or
+> not. Name the related collections in `tags` so a write to one busts the page,
+> and use `revalidate` as a time-based safety net for a policy change, which
+> writes no row and therefore busts no tag.
+
+**`createPublicContentRoute` defaults to `depth: 0`** — no relation expansion at
+all — so a route that never populates anything cannot be surprised by any of
+this. Set `depth` when your pages do populate relations.
+
+**The route factories take no `overrideAccess` option** — unlike
+`resolveContent`, which still does, because a page calling it directly knows who
+is asking. Two settings that had to agree is what produced a route behaving
+differently depending on whether the database had rows in it when the build ran;
+for a route, the posture is now the name of the function you call.
+
+This route always resolves **anonymously** — its config is captured once at
+module scope, so it cannot carry a per-request user. For a route that renders
+per-visitor member content, call `resolveContent` with the request's `user`
+inside your own page rather than using `createContentRoute`.
+
+### Previewing drafts
+
+Whether a visitor is previewing is a per-request fact, and route config is not —
+so `draft` takes a function the route asks on every request. Wire it to Next's
+draft mode:
+
+The function is handed the collection and slug being resolved, so the answer can
+be scoped to a document:
+
+```ts
+import { createContentRoute, readPreviewScope } from "nextly/runtime";
+
+const route = createContentRoute({
+  collections: ["pages"],
+  draft: async ({ collection }) => {
+    const scope = await readPreviewScope();
+    // A Single's token names no collection, so it cannot grant this route's draft.
+    if (scope === null || !("collection" in scope)) return false;
+    if (scope.collection !== collection) return false;
+    // Name the entry, do not just answer yes: slugs are not unique.
+    return { entryId: scope.entryId };
+  },
+  render: page => <Page {...page} />,
+});
+```
+
+Return `{ entryId }` rather than `true` whenever a token is backing the
+decision. A slug need not be unique — the resolver supports duplicates and
+settles them by sorting on `id` — so a bare `true` grants whichever row the
+route happens to resolve, which may not be the one the token named. With an
+`entryId` the route discards the draft when the path resolved elsewhere.
+
+**Use that argument.** Next's draft mode is a single boolean for the whole host:
+`draftMode().isEnabled` tells you a visitor opened _a_ valid preview link, never
+_which_ document it was for. Answering from it alone turns a link scoped to one
+unpublished page into a key to every unpublished page in the configured
+collections, for the life of the session — which is exactly what a preview
+token's scope exists to prevent.
+
+**Returning `true` is an authorization decision, not a display preference.** The
+route resolves anonymously and the working draft is only shown to a caller who
+could edit the document, so a request this returns `true` for is read trusted.
+Put the check inside that function — a verified preview cookie, a session — and
+never in a query parameter a visitor controls.
+
+`draft` belongs to `createContentRoute` only. `createPublicContentRoute` refuses
+it at construction: a draft read is never cacheable, so it marks the render
+dynamic — while the public route's `generateStaticParams` tells Next the route
+is static, and a dynamic marking inside a static render is an error. Preview and
+pre-rendering are not compatible on one route; mount previewable paths on a
+dynamic one.
+
+A literal `draft: true` is accepted for a route mounted behind your own auth. It
+means **every** visitor sees unpublished content, which is almost never what a
+public site wants.
+
+> **Next 16 Cache Components:** an exported `generateStaticParams` must return at
+> least one entry under Cache Components. For a no-prerender or empty-site setup
+> in that mode, export only `ContentPage` and `generateMetadata` and let paths
+> render on demand.
+
+### Under Cache Components
+
+With [Cache Components](https://nextjs.org/docs/app/api-reference/config/next-config-js/cacheComponents)
+on, a page may read the request only beneath a `<Suspense>` boundary: the rest
+of the page is prerendered as a static shell, and what reads the request streams
+in at request time. `ContentPage` reads the request (its `params`, the `draft`
+decision's cookie and every access-enforced read), and so does `SinglePage` from
+`createSingleRoute`, so render each inside a boundary of your own:
+
+```tsx
+// app/[[...slug]]/page.tsx
+import { Suspense } from "react";
+import { createContentRoute } from "nextly/runtime";
+
+const route = createContentRoute({
+  collections: ["pages"],
+  render: entry => <Page entry={entry} />,
+});
+
+export const generateMetadata = route.generateMetadata;
+
+export default function ContentPage(props: {
+  params: Promise<{ slug?: string[] }>;
+}) {
+  return (
+    <Suspense fallback={null}>
+      <route.ContentPage {...props} />
+    </Suspense>
+  );
+}
+```
+
+A boundary has a cost: whatever renders beneath it is sent after the rest of
+the page, in a hidden part of the HTML that React's script reveals. A visitor
+or crawler without JavaScript never sees it, and React sends even a finished
+boundary that way once it holds an eagerly loaded image or follows more than a
+few kilobytes of the page. So put a boundary only around what has to read the
+request.
+
+The blocks page helpers in `@nextlyhq/blocks-react/next` follow that rule
+themselves, so their pages are exported as they are:
+
+- `createBlocksPage` and `createSinglePage` read with access enforced, so their
+  page is rendered beneath a boundary of their own. Under Cache Components its
+  content needs JavaScript to be seen.
+- `createPublicBlocksPage`, `createPublicSinglePage` and
+  `createPublicContentPage` render their page with no boundary, so its whole
+  content is in the HTML a build or the cache sends. Export the
+  `generateStaticParams` that `createPublicBlocksPage` and
+  `createPublicContentPage` return: a path it doesn't list is rendered on its
+  first request and kept. Only a miss answered by your own `notFound` (the SEO
+  plugin's `notFoundLogged`, for example, which reads the request) is rendered
+  beneath a boundary.
+- A page rendered on the server draws each asynchronous block in place and
+  waits for it, on every route, so the response holds every block. Render
+  such a page with a streaming renderer that waits for it
+  (`renderToReadableStream` and its `allReady`, or `prerender` from
+  `react-dom/static`): `renderToString` and `renderToStaticMarkup` can't wait,
+  and throw on an asynchronous block such as a Button or an Image. A
+  `blockFallback` you pass, `null` included, streams each one in a boundary of
+  its own instead, which a visitor sees only with JavaScript. In the browser,
+  and on an editor surface, each always streams, so a `PageRenderer` in a
+  client component that is also rendered on the server needs a
+  `blockFallback`, or the two renders disagree.
+- Nothing else above the page may add a boundary back: a `loading.tsx` in the
+  route's segment, or a `<Suspense>` in its layout around `children`, puts the
+  page beneath one again. A boundary that holds the `<body>` is the exception
+  (below): React never sends it hidden.
+- Under Cache Components a public page is built whole, so everything it reads
+  has to finish while the build renders it: cached reads, as an app made by
+  `create-nextly-app` registers them (`src/nextly/cached-read.ts`), and blocks
+  that never read the request. A read still waiting when the build stops fails
+  the build, where it used to leave a part to fill at request time.
+- Under Cache Components, hold your root layout's `<body>` in a `<Suspense>`.
+  A page the build kept is drawn again on its first visit after a write that
+  expires it, such as a database seeded or edited after `next build` on a
+  fresh deploy. That draw is a prerender too, and a read in it that isn't
+  cached, with no boundary above it, answers 500 on every visit. A boundary
+  that holds the body lets the page finish on the request instead. React never
+  sends that boundary hidden, so the page still arrives whole, and a page
+  whose reads are all cached is still kept whole. Without Cache Components it
+  changes nothing.
+
+```tsx title="app/layout.tsx"
+import { Suspense } from "react";
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="en">
+      <Suspense>
+        <body>{children}</body>
+      </Suspense>
+    </html>
+  );
+}
+```
+
+A page that isn't there (an unknown slug, or an entry that is unpublished or
+the visitor may not read) renders your not-found page with
+`<meta name="robots" content="noindex">`. Under Cache Components the static
+shell is sent before the route knows the entry is missing, so the HTTP status
+is already 200; a public blocks page with no `notFound` of yours, which
+renders with no boundary, answers 404. A route that reads with access
+enforced, such as
+`createContentRoute` or `createBlocksPage`, decides on every request, so it
+answers 200 with `noindex` every time, crawlers included. Next.js answers a
+real 404 only where it can keep the finished not-found render, which needs a
+cached existence check; see its
+[streaming guide](https://nextjs.org/docs/app/guides/streaming). Without Cache
+Components, a missing page answers 404.
+
+Not every blog needs this: if you already have typed per-type routes
+(`/blog/[slug]`, `/authors/[slug]`), keep them and use `resolveContent` +
+`buildMetadata` inside each — `createContentRoute` is for the single-catch-all
+pages model.
+
+## buildMetadata — the seo group to Next Metadata
+
+`buildMetadata(entry, options?)` turns the plugin's `seo` field group into a
+Next.js `Metadata` object (title, description, canonical, OpenGraph, Twitter
+card, and `robots` from `noindex`). Blank `seo` fields fall back to the values
+you pass; caller `openGraph` / `twitter` extras win.
+
+```ts
+import { buildMetadata, type MetadataEntry } from "nextly/runtime";
+
+// Your own read of one post by its slug, with the fields used below.
+declare function getPostBySlug(slug: string): Promise<
+  | (MetadataEntry & {
+      title: string;
+      excerpt?: string;
+      featuredImage?: { url: string };
+      publishedAt?: string;
+    })
+  | null
+>;
+
+export async function generateMetadata({
+  params,
+}: {
+  params: Promise<{ slug: string }>;
+}) {
+  const { slug } = await params;
+  const post = await getPostBySlug(slug);
+  if (!post) return {};
+  return buildMetadata(post, {
+    fallback: {
+      title: post.title,
+      description: post.excerpt,
+      image: post.featuredImage?.url,
+      canonical: `/blog/${slug}`,
+    },
+    openGraph: { type: "article", publishedTime: post.publishedAt },
+  });
+}
+```
+
+A `canonical` is validated to a root-relative path or an absolute http(s) URL
+(a `mailto:`/`javascript:` value falls back), and a page ships `index, follow`
+unless `seo.noindex` is set.
+
+## When a plugin provides page metadata
+
+A plugin can take over every page's head by providing page metadata (see
+[Providing page metadata](/docs/plugins/api-reference#providing-page-metadata)). With one
+installed, the route helpers ask it for each page they serve: `createContentRoute`,
+`createPublicContentRoute`, `createSingleRoute`, `createPublicSingleRoute`, and the Page
+Builder's `createBlocksPage` and `createContentPage`. A route needs no `buildMetadata` for this.
+
+A route that still passes `buildMetadata`, or `metadata` on a Page Builder route, keeps working,
+but its result becomes one input rather than the answer:
+
+- its title, description and social card values are used where nobody set one for the page;
+- its `robots` can hide the page, never list one the plugin hides: a `noindex` (or `nofollow`) the
+  route sets is kept whatever the answer says, and the directives it adds, such as Google's
+  `max-image-preview`, `max-snippet` and `max-video-preview` limits, are kept beside the answer's;
+- its canonical gives way to the plugin's, and is kept for a page the plugin gives none, such as
+  one whose type declares no public address;
+- anything else it sets, such as an Open Graph `type` or `publishedTime`, is kept.
+
+The plugin's title is the page's whole title, its site name included where the site's title
+pattern adds it, so it is handed to Next.js as `title: { absolute }`: a root layout's
+`title.template` (`%s | Acme`) does not add the name a second time. The route's own title, where
+it is the one served, keeps the form the route gave it. The social card's titles follow the same
+rule. See the [Next.js `title` field](https://nextjs.org/docs/app/api-reference/functions/generate-metadata#title).
+
+Without such a plugin, a route's metadata is served exactly as it returns it.
+
+Where the plugin's answer carries structured data, the page's `render` is handed it as
+`context.structuredData`: JSON-LD text, written so that no value can end its script element. Place
+it with `jsonLdScriptProps`, so it is in the HTML a crawler receives rather than added in the
+browser:
+
+```tsx
+import { createPublicContentRoute, jsonLdScriptProps } from "nextly/runtime";
+
+export const { generateStaticParams, generateMetadata, ContentPage } =
+  createPublicContentRoute({
+    collections: ["posts"],
+    render: (entry, context) => (
+      <article>
+        {context.structuredData && (
+          <script {...jsonLdScriptProps(context.structuredData)} />
+        )}
+        <h1>{String(entry.title)}</h1>
+      </article>
+    ),
+  });
+
+export default ContentPage;
+```
+
+`jsonLdScriptProps` takes the plugin's text or nodes the site builds itself, and escapes them so
+no value can end the element: a site never writes that escaping by hand. A Single route's `render`
+is handed the structured data the same way.
+
+### A site that renders its own pages
+
+A site that reads its own content and renders it in its own routes asks for the same head and
+structured data, without a content route or a Single route. Each function asks the plugin as the
+route helpers do, and returns the route's own metadata unchanged where no plugin provides page
+metadata.
+
+| The page                       | Its head                                                 | Its structured data                                            |
+| ------------------------------ | -------------------------------------------------------- | -------------------------------------------------------------- |
+| An entry of a collection       | `contentPageMetadata(config, entry, context, path)`      | `contentPageStructuredData(config, entry, context, path)`      |
+| A Single                       | `singlePageMetadata(config, document, context, path?)`   | `singlePageStructuredData(config, document, context, path?)`   |
+| A page built in code, no entry | `seoMetadata(path, options)` from `@nextlyhq/plugin-seo` | `seoStructuredData(path, options)` from `@nextlyhq/plugin-seo` |
+
+`config` holds the route's own `buildMetadata` (and optionally `derivedMetadata`, `tags` and
+`revalidate`); `context` names the entry's collection and slug, or the Single's slug, and the
+language where the site has several. `path` is the address the request was served at. A Single
+asked without one is answered at its own public address; asked with a later page of its list, such
+as `/blog/page/2` for a blog Single at `/blog`, that page is its own page to search engines, with
+its own canonical. A Single route takes the same address as its `path` option, as a string or
+worked out from the route's params.
+
+```tsx
+// app/about/page.tsx
+import {
+  jsonLdScriptProps,
+  singlePageMetadata,
+  singlePageStructuredData,
+  type SingleDocument,
+} from "nextly/runtime";
+
+// Your own read of the "about-page" Single.
+declare function readAbout(): Promise<SingleDocument>;
+
+const config = {
+  buildMetadata: () => ({ title: "About", description: "Who we are." }),
+};
+const context = { slug: "about-page" };
+
+export async function generateMetadata() {
+  return singlePageMetadata(config, await readAbout(), context, "/about");
+}
+
+export default async function AboutPage() {
+  const about = await readAbout();
+  const structuredData = await singlePageStructuredData(
+    config,
+    about,
+    context,
+    "/about"
+  );
+  return (
+    <main>
+      {structuredData && <script {...jsonLdScriptProps(structuredData)} />}
+      <h1>{String(about.title)}</h1>
+    </main>
+  );
+}
+```
+
+Ask the head and the structured data with the same arguments: they then read one cached answer.
+Each starts Nextly first where nothing in the worker has yet, as a page whose reads were all cache
+hits, or one `next build` prerenders, may be served before anything else has.
+
+When Nextly is unavailable while a page renders (its start failed, the database is busy or could
+not be reached, or a read timed out), what happens depends on where the page is rendered:
+
+| Where the page renders              | What happens                                                                                   |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------- |
+| A production server revalidating it | The render fails, and Next.js keeps serving the page's last good render until the next attempt |
+| A production server, first request  | The request answers with an error, and nothing is cached for the page                          |
+| `next build`                        | The build fails, so pages are never shipped without their head; the deployment before it stays |
+| `next dev`, or tests                | The route's own metadata is served, and the failure is logged                                  |
+
+A failure that would happen again on the next render is not an outage, and the route's own
+metadata is served for it everywhere, with the failure logged: an answer of the wrong shape, a
+plugin's bug, or a worker where nothing can start Nextly because the app registered no way to
+start it. That last one logs a warning once per worker. A new app's
+`src/nextly/cached-read.ts` registers how it starts Nextly with `registerNextlyStart`, which is
+what lets a page prerendered by `next build` start it; an app made before then adds the same.
+
+## Metadata in the first HTML
+
+Next.js streams a page's metadata in after the `<head>` to a browser, and waits for it only for the
+crawlers named in `htmlLimitedBots`. Its own list leaves out the main Googlebot, which runs
+scripts but takes its first reading from the HTML it is sent, and the AI crawlers, which run
+none. `nextlyHtmlLimitedBots`, from `nextly/next`, is Next.js's list with those added, so each of
+them reads the page's whole head in the first response. A new app's `next.config` sets it, and so
+does `withNextly()` where the app sets no list of its own. An app made before then adds it:
+
+```ts title="next.config.ts"
+import { nextlyHtmlLimitedBots } from "nextly/next";
+
+const nextConfig = {
+  htmlLimitedBots: nextlyHtmlLimitedBots,
+  // ...the rest of your config
+};
+```
+
+Setting `htmlLimitedBots` replaces Next.js's list rather than adding to it, so a list of your own
+should start from `nextlyHtmlLimitedBots.source`.
+
+## nextlySitemap and nextlyRobots
+
+`nextlySitemap({ entries, tags })` builds the default export for
+`app/sitemap.ts` from a caller-supplied `entries` provider and caches it with
+F1. Pass each collection's `nextlyTags(...)` so a publish or delete busts
+`/sitemap.xml` in lockstep with the pages. With no tags and no `revalidate` it
+reads uncached (and marks the render dynamic) so it never freezes stale.
+
+```ts
+// app/sitemap.ts
+import { nextlySitemap, nextlyTags } from "nextly/runtime";
+import { buildSitemapUrls, type SitemapServices } from "@nextlyhq/plugin-seo";
+
+// The services your app reads its collections through, and its address.
+declare const services: SitemapServices;
+const baseUrl = "https://example.com";
+
+export default nextlySitemap({
+  tags: nextlyTags("posts"),
+  entries: async () =>
+    (await buildSitemapUrls(services, { collections: ["posts"], baseUrl })).map(
+      u => ({ url: u.loc, lastModified: u.lastModified })
+    ),
+});
+```
+
+`nextlyRobots({ sitemap })` builds `app/robots.ts`, keeping `/admin` and `/api`
+out of the index on a path boundary (so `/administration` is not swallowed) and
+advertising the sitemap:
+
+```ts
+// app/robots.ts
+import { nextlyRobots } from "nextly/runtime";
+export default nextlyRobots({ sitemap: "https://example.com/sitemap.xml" });
+```
+
+## Reference: the blog template
+
+The `blog` template dogfoods these helpers: `app/robots.ts` is `nextlyRobots`,
+`app/sitemap.ts` is `nextlySitemap` over the published post/category/tag/author
+slugs, and the post detail page's `generateMetadata` is `buildMetadata` reading
+the Posts `seo` group. Its per-type typed routes keep `resolveContent`-style
+reads inside each page rather than a single catch-all.

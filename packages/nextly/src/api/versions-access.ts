@@ -1,0 +1,1760 @@
+/**
+ * Shared access gate for the version-history routes.
+ *
+ * Version rows carry a full snapshot of a document, so reading them must be at
+ * least as restricted as reading the document itself. A coarse `read-<slug>`
+ * permission is not sufficient: a collection additionally applies
+ * draft/published filtering and field-level `access.read` redaction, neither of
+ * which the version table knows about.
+ *
+ * The gate therefore resolves the caller, then reads the LIVE document through
+ * the same service a normal read uses. If that read denies or finds nothing,
+ * the caller may not see this document's history either. Snapshots returned
+ * afterwards are additionally passed through field-level read redaction.
+ *
+ * @module api/versions-access
+ */
+
+import { z } from "zod";
+
+import { withVersionLanguage } from "../auth/access/rule-language";
+import { apiKeyScopeFrom } from "../auth/authenticated-scope";
+import type { AuthenticatedScope } from "../auth/authenticated-scope";
+import { authorizationGroups } from "../auth/entity-read-access";
+import { READ_DOCUMENT_HISTORY } from "../auth/middleware";
+import type { FieldConfig } from "../collections/fields/types";
+import { getService } from "../di";
+import { container } from "../di/container";
+import type { FieldGroupDataService } from "../domains/field-groups/services/field-group-data-service";
+import {
+  appLocalization,
+  configuredLocales,
+} from "../domains/i18n/configured-locales";
+import { storesPerLanguage } from "../domains/i18n/per-language-storage";
+import {
+  resolveSingleDocumentId,
+  singleDocumentEditable,
+} from "../domains/singles/services/single-document-access";
+import type { UserContext } from "../domains/singles/types";
+import {
+  resolveComparisonPair,
+  sharedPartVersions,
+} from "../domains/versions/comparison-baselines";
+import {
+  applyComponentReadAccess,
+  fieldsCarryingReadRules,
+  nestedWithheldPaths,
+} from "../domains/versions/component-read-access";
+import type { VersionDiff } from "../domains/versions/diff";
+import { hydrateDiffReferences } from "../domains/versions/diff-references";
+import { HistoryDividers } from "../domains/versions/history-dividers";
+import { readPartIsLive } from "../domains/versions/part-liveness";
+import { hasLifecycle } from "../domains/versions/recorded-status";
+import { hydrateSnapshotReferences } from "../domains/versions/snapshot-references";
+import {
+  resolveComponentFieldMap,
+  stripPasswordsThroughComponents,
+} from "../domains/versions/tag-component-types";
+import {
+  lastLookedAtByPart,
+  markLastViewed,
+} from "../domains/versions/version-views";
+import {
+  VersionsRepository,
+  type VersionRef,
+} from "../domains/versions/versions-repository";
+import type { VersionListOptions } from "../domains/versions/versions-service";
+import { documentTableOn } from "../domains/workflows/part-versions";
+import { sharedValuesOf } from "../domains/workflows/shared-values";
+import { NextlyError } from "../errors/nextly-error";
+import { rethrowIfRuleCouldNotRun } from "../errors/rule-could-not-run";
+import type {
+  ResolvedVersionsConfig,
+  VersionScopeKind,
+} from "../schemas/versions/types";
+import {
+  documentReadableIn,
+  type DocumentReadHookInputs,
+} from "../services/lib/document-readable-in";
+import { resolveRoleSlugs } from "../services/lib/permissions";
+import {
+  applyFieldReadAccess,
+  callerAccessGrants,
+} from "../shared/lib/field-level-registry";
+
+import { requireRouteCollectionAccess } from "./route-auth";
+
+/**
+ * Boot services, authenticate, and confirm the caller may read the live
+ * document behind `scopeKind`/`slug`/`entryId`.
+ *
+ * Services are initialized BEFORE the access check: on a cold process the
+ * permission lookup itself needs the adapter and RBAC services registered, so
+ * gating first would make the first request to a fresh process fail instead of
+ * auto-initializing.
+ *
+ * `locale` is the language the request names, which both the route gate and
+ * the document gate ask the read rule in. Naming none, each is answered where
+ * any language the history holds is readable, and what is returned is
+ * narrowed to the readable ones afterwards.
+ *
+ * @returns The resolved caller, for redacting whatever is returned next, and
+ *   the languages the document gate found it may read the history in.
+ */
+export async function requireRouteVersionReadAccess(
+  request: Request,
+  scopeKind: VersionScopeKind,
+  slug: string,
+  entryId: string,
+  locale?: string
+): Promise<{
+  user: UserContext;
+  authenticatedScope?: AuthenticatedScope;
+  readableLanguages: ReadonlySet<string>;
+}> {
+  // The boot entry is loaded when a history is asked for, so the dispatchers
+  // that import this module's helpers do not load the whole boot with them.
+  const { getCachedNextly } = await import("../init");
+  await getCachedNextly();
+
+  // A history names one document: a caller who may not read it is answered
+  // as if it were missing, as the dispatcher's history routes answer. The
+  // rule is asked in the language the request names, or where it names none,
+  // in each language alone (`READ_DOCUMENT_HISTORY`).
+  const named = locale !== undefined && locale !== "" ? locale : undefined;
+  const auth = await requireRouteCollectionAccess(request, "read", slug, {
+    method: READ_DOCUMENT_HISTORY,
+    params: named === undefined ? {} : { locale: named },
+    namesOne: true,
+  });
+
+  // Resolved role slugs so field-level `access.read` evaluates against the
+  // caller's roles (session auth carries role ids; API-key auth carries slugs).
+  const roles = await resolveRoleSlugs(auth);
+  const user: UserContext = {
+    id: auth.userId,
+    name: auth.userName,
+    email: auth.userEmail,
+    roles,
+    // A representative singular `role`, so callbacks reading `user.role` see an
+    // authorized value rather than stripping fields for a legitimate caller.
+    role: roles?.[0],
+  };
+
+  // For an API-key request the live-document read gate must judge the key's OWN
+  // read grant, not the key owner's roles — otherwise a super-admin-owned key
+  // scoped for read could see a document's history while bypassing the
+  // collection's own read gate (the dispatcher path does the same).
+  const authenticatedScope: AuthenticatedScope | undefined =
+    auth.authMethod === "api-key" ? apiKeyScopeFrom(auth) : undefined;
+
+  const readableLanguages = await assertVersionDocumentReadable(
+    scopeKind,
+    slug,
+    entryId,
+    user,
+    authenticatedScope,
+    {},
+    named === undefined ? [] : [named]
+  );
+
+  return { user, authenticatedScope, readableLanguages };
+}
+
+/**
+ * What the document's read hooks are handed besides the caller. Declared
+ * beside the per-language document check that hands them on, and re-exported
+ * here for the history gates' callers.
+ */
+export type { DocumentReadHookInputs };
+
+/**
+ * Confirm a caller may see this document's history, assuming they are already
+ * authenticated and coarsely authorized.
+ *
+ * The dispatcher authorizes centrally before dispatching, so it needs the
+ * document-level half of the gate on its own — draft/published visibility,
+ * and (for Singles) the live-id match. Keeping this
+ * separate from {@link requireRouteVersionReadAccess} means those rules are defined
+ * once instead of drifting between the two entry points.
+ *
+ * @returns The languages asked about that the caller may read the history
+ *   in: the named ones, or else every readable language the history holds.
+ *   Empty for a history that names no language.
+ * @throws NextlyError.notFound when the caller may not see the document.
+ */
+export async function assertVersionDocumentReadable(
+  scopeKind: VersionScopeKind,
+  slug: string,
+  entryId: string,
+  user: UserContext,
+  // The caller's authenticated scope. Version history is a read of the live
+  // document, so a scoped API key is judged on its OWN read grant here — a
+  // super-admin-owned key does not skip the document's own read gate before
+  // its snapshots are exposed.
+  authenticatedScope?: AuthenticatedScope,
+  hookInputs: DocumentReadHookInputs = {},
+  // The languages the read names or returns, each asked about in its own
+  // right; null is a part with no language, which the read above covers.
+  locales: readonly (string | null)[] = []
+): Promise<ReadonlySet<string>> {
+  // The document's history is open to a caller who may read the document in
+  // a language its history is about: the languages the read names when it
+  // names any, otherwise any language its history can be asked about. Never
+  // the default language alone, which a read rule may refuse while admitting
+  // another. One answer serves both halves of the gate.
+  const named = [
+    ...new Set(locales.filter((l): l is string => l !== null && l !== "")),
+  ];
+  const asked =
+    named.length > 0 ? named : [...(await historyLanguagesOf(scopeKind, slug))];
+  const allowed =
+    asked.length === 0
+      ? new Set<string>()
+      : await readableHistoryLocales(
+          scopeKind,
+          slug,
+          entryId,
+          user,
+          authenticatedScope,
+          hookInputs,
+          asked
+        );
+  // A history that names no language (a site without languages) is the
+  // document's own, read once as it is.
+  const readable =
+    asked.length === 0
+      ? await canReadLiveDocument(
+          scopeKind,
+          slug,
+          entryId,
+          user,
+          authenticatedScope,
+          hookInputs
+        )
+      : allowed.size > 0;
+  if (!readable) {
+    // Deliberately "not found" rather than "forbidden": a distinct 403 would
+    // confirm the document exists to a caller not allowed to know that.
+    throw NextlyError.notFound({
+      logContext: {
+        reason: "version-document-not-readable",
+        scopeKind,
+        scopeSlug: slug,
+        entryId,
+        userId: user.id,
+      },
+    });
+  }
+  if (named.some(locale => !allowed.has(locale))) {
+    // Not found, as the document half answers, so a refused language does
+    // not confirm that the document has history in it.
+    throw NextlyError.notFound({
+      logContext: {
+        reason: "version-language-not-readable",
+        scopeKind,
+        scopeSlug: slug,
+        entryId,
+        userId: user.id,
+      },
+    });
+  }
+  return allowed;
+}
+
+/**
+ * What a history listing reads, by language: the one it names, or else every
+ * language its caller may read it in. Derived from the answer of
+ * {@link assertVersionDocumentReadable}, asked with the same `locale`, which
+ * has refused a named language the caller may not read; so every listing
+ * narrows alike and no language is asked about twice.
+ */
+export function historyListLanguages(
+  locale: string | undefined,
+  readable: ReadonlySet<string>
+): Pick<VersionListOptions, "locale" | "locales"> {
+  return locale !== undefined && locale !== ""
+    ? { locale }
+    : { locales: [...readable] };
+}
+
+/**
+ * Refuse a read of a document's history in a language its caller may not read
+ * the document in. The language half of {@link assertVersionDocumentReadable},
+ * for a read that learns the language only once it has loaded a version: the
+ * document half has run by then and is not asked twice.
+ *
+ * @throws NextlyError.notFound when any named language is not readable.
+ */
+export async function assertHistoryLocalesReadable(
+  scopeKind: VersionScopeKind,
+  slug: string,
+  entryId: string,
+  user: UserContext,
+  authenticatedScope: AuthenticatedScope | undefined,
+  hookInputs: DocumentReadHookInputs,
+  // Null is a part with no language: the whole document, already read.
+  locales: readonly (string | null)[]
+): Promise<void> {
+  const named = [
+    ...new Set(locales.filter((l): l is string => l !== null && l !== "")),
+  ];
+  if (named.length === 0) return;
+  const allowed = await readableHistoryLocales(
+    scopeKind,
+    slug,
+    entryId,
+    user,
+    authenticatedScope,
+    hookInputs,
+    named
+  );
+  if (named.some(locale => !allowed.has(locale))) {
+    // Not found, as the document half answers, so a refused language does
+    // not confirm that the document has history in it.
+    throw NextlyError.notFound({
+      logContext: {
+        reason: "version-language-not-readable",
+        scopeKind,
+        scopeSlug: slug,
+        entryId,
+        userId: user.id,
+      },
+    });
+  }
+}
+
+/**
+ * The languages a document's history can be asked about: the configured ones
+ * for a localized collection or Single, and for one that is not, the default
+ * language alone. An unlocalized document reads the same in every language, so
+ * no other language can be asked about it, and history it holds from when it
+ * was localized stays withheld. The default language stays, because a save of
+ * an unlocalized document can be recorded under it.
+ */
+export async function historyLanguagesOf(
+  scopeKind: VersionScopeKind,
+  slug: string
+): Promise<ReadonlySet<string>> {
+  const configured = configuredLocales() ?? new Set<string>();
+  const entity = await registryEntityOf(scopeKind, slug);
+  // A save of an entity kept per language is recorded in its language: a translated one, or any
+  // under `experimental.perLanguageStorage`.
+  if (entity !== null && storesPerLanguage(entity)) {
+    return configured;
+  }
+  const defaultLocale = appLocalization()?.defaultLocale ?? null;
+  return new Set(
+    defaultLocale !== null && configured.has(defaultLocale)
+      ? [defaultLocale]
+      : []
+  );
+}
+
+/**
+ * Refuse a caller the language of one version, before anything is written or
+ * returned about it. Returns the version's part, or undefined when there is no
+ * such version, which the read or write that follows refuses in its own way.
+ * Shared by REST's version routes and the plugin service's checked label.
+ */
+export async function assertVersionLanguageReadable(
+  document: {
+    scopeKind: VersionScopeKind;
+    slug: string;
+    entryId: string;
+    user: UserContext;
+    authenticatedScope?: AuthenticatedScope;
+  },
+  versionNo: number,
+  // What the caller's own read carries, for the language's read hooks.
+  hookInputs: DocumentReadHookInputs = {}
+): Promise<string | null | undefined> {
+  const part = await getService("versionsService").partOfVersion(
+    {
+      scopeKind: document.scopeKind,
+      scopeSlug: document.slug,
+      entryId: document.entryId,
+    },
+    versionNo
+  );
+  if (part === undefined) return undefined;
+  await assertHistoryLocalesReadable(
+    document.scopeKind,
+    document.slug,
+    document.entryId,
+    document.user,
+    document.authenticatedScope,
+    hookInputs,
+    [part]
+  );
+  return part;
+}
+
+/**
+ * The languages of a document the caller may read its history in.
+ *
+ * Asked of the document's read in each language, because a read rule or hook
+ * may answer differently per language: it is handed that language's values,
+ * and the collection's or Single's own read rule is asked in that language
+ * rather than taken as answered by the route's allow.
+ * A language no longer configured is never readable here. A read in it would
+ * resolve to the default language and answer for that instead, which is not
+ * an answer about the entries written in it. That includes every language
+ * once an install configures none: history recorded in a language before
+ * localization was removed stays, and nothing can be asked about it.
+ *
+ * Asked in bounded groups: each question is a full document read, and an
+ * install may configure any number of languages.
+ *
+ * `among` narrows the question to the languages a read names, so a read of
+ * one language asks once rather than once per configured language.
+ *
+ * The caller has already passed {@link assertVersionDocumentReadable}; this
+ * answers which of the document's languages, not whether the document.
+ */
+export async function readableHistoryLocales(
+  scopeKind: VersionScopeKind,
+  slug: string,
+  entryId: string,
+  user: UserContext,
+  authenticatedScope: AuthenticatedScope | undefined,
+  hookInputs: DocumentReadHookInputs = {},
+  among?: readonly string[]
+): Promise<ReadonlySet<string>> {
+  const languages = await historyLanguagesOf(scopeKind, slug);
+  const asked = (among ?? [...languages]).filter(locale =>
+    languages.has(locale)
+  );
+  const readable = new Set<string>();
+  for (const group of authorizationGroups(asked)) {
+    const verdicts = await Promise.all(
+      group.map(locale =>
+        canReadLiveDocument(
+          scopeKind,
+          slug,
+          entryId,
+          user,
+          authenticatedScope,
+          hookInputs,
+          locale
+        )
+      )
+    );
+    group.forEach((locale, index) => {
+      if (verdicts[index]) readable.add(locale);
+    });
+  }
+  return readable;
+}
+
+/**
+ * Confirm the caller may UPDATE the live document, for writes to its history.
+ *
+ * Renaming or otherwise editing a version changes a record of the document, so
+ * it owes the document's own update rules. The route-level `update-<slug>`
+ * permission is coarse: it says the caller may update documents of this kind,
+ * not that they may reach THIS one. A document the caller cannot load — it is a
+ * draft they may not see, or a Single whose live id has moved — is refused by
+ * the read path while that coarse permission still stands, and without this gate
+ * the history would stay editable.
+ *
+ * Read access is assumed to have been established already. That is why a
+ * refusal here is 403 rather than the read gate's 404: the caller has proven
+ * they can see this document, so concealing its existence protects nothing and
+ * only makes the refusal harder to act on.
+ *
+ * Both entity kinds are covered deliberately. A gate that reached only one
+ * would read as complete and would not be.
+ */
+export async function assertDocumentUpdatable(
+  scopeKind: VersionScopeKind,
+  slug: string,
+  entryId: string,
+  user: UserContext,
+  // The caller's authenticated scope. A version-label edit is a route-authorized
+  // `update`, so a scoped API key is judged on its OWN update grant here and a
+  // super-admin-owned key does not skip stored owner/role update rules.
+  authenticatedScope?: AuthenticatedScope,
+  // The language the write acts in, which a collection rule's filter is
+  // matched in; the default where it names none.
+  locale?: string
+): Promise<void> {
+  const allowed =
+    scopeKind === "single"
+      ? await canUpdateLiveSingle(slug, entryId, user, authenticatedScope)
+      : await getService("collectionsHandler").canUpdateEntry({
+          collectionName: slug,
+          entryId,
+          user,
+          // As the read gate does: route authorization already ran, so skip
+          // only the redundant coarse re-check. The stored per-document rules
+          // this gate exists for still run.
+          routeAuthorized: true,
+          authenticatedScope,
+          locale,
+        });
+
+  if (!allowed) {
+    throw NextlyError.forbidden({
+      logContext: {
+        reason: "document-not-updatable",
+        scopeKind,
+        scopeSlug: slug,
+        entryId,
+        userId: user.id,
+      },
+    });
+  }
+}
+
+/**
+ * Single variant of the update gate.
+ *
+ * Reads the row directly rather than through `SingleEntryService`, which
+ * materializes a missing Single. The live id is compared with the requested
+ * one for the same reason the read gate compares it: version rows outlive the
+ * document they came from, so a Single recreated under a new id must not have
+ * the previous document's history edited through it.
+ */
+async function canUpdateLiveSingle(
+  slug: string,
+  entryId: string,
+  user: UserContext,
+  authenticatedScope?: AuthenticatedScope
+): Promise<boolean> {
+  const liveId = await resolveSingleDocumentId(slug);
+  if (liveId === null || liveId !== entryId) return false;
+
+  // The access evaluation itself is shared with draft preview, which authorizes
+  // the same disclosure for the same reason. Only the identity comparison above
+  // is this gate's own.
+  return singleDocumentEditable(slug, {
+    user,
+    // A version-label edit is a route-authorized `update`, so the coarse gate
+    // for the operation being probed here has already run.
+    routeAuthorized: true,
+    ...(authenticatedScope === undefined ? {} : { actor: authenticatedScope }),
+  });
+}
+
+/**
+ * Whether the caller can read the live document, in `locale` (the default
+ * language where it names none), for its history in that language.
+ *
+ * Asked of {@link documentReadableIn}, the one per-language document check
+ * the workflow notices' Single rows ask too, with nothing attested: the
+ * collection's or Single's own read rule is asked in the language its history
+ * is about, so a language the rule refuses this caller has no readable
+ * history. That check keeps what this gate needs: `status: "all"` so a draft
+ * still has history, a scoped API key judged on its own grant, the read's own
+ * report of the row it loaded for a collection, and for a Single its live id
+ * resolved without materializing it. A refusal and a missing document both
+ * answer `false`; any other failure is thrown with the read's own error.
+ *
+ * A history scope other than a Single is read as a collection, as it always
+ * has been.
+ */
+async function canReadLiveDocument(
+  scopeKind: VersionScopeKind,
+  slug: string,
+  entryId: string,
+  user: UserContext,
+  authenticatedScope: AuthenticatedScope | undefined,
+  hookInputs: DocumentReadHookInputs,
+  // The language to read the document in; absent reads the default one.
+  locale?: string
+): Promise<boolean> {
+  return documentReadableIn(
+    {
+      kind: scopeKind === "single" ? "single" : "collection",
+      slug,
+      entryId,
+    },
+    {
+      user,
+      ...(authenticatedScope === undefined ? {} : { authenticatedScope }),
+    },
+    locale,
+    hookInputs
+  );
+}
+
+/**
+ * Re-exported from the Singles domain, where it now lives beside the read probe
+ * it guards. A DOMAIN module needs the same resolution — the dashboard's
+ * pending-edit cards must not materialize a Single while deciding what to show —
+ * and `domains/` must not import from `api/`.
+ */
+export { resolveSingleDocumentId };
+
+/** An entity's current schema, as redaction reads it. */
+export interface RedactionSchema {
+  fields: FieldConfig[];
+  componentFields: Awaited<ReturnType<typeof currentComponentFields>>;
+}
+
+/**
+ * The entity's current fields and the components they reach, as redaction
+ * judges a snapshot against them. The STRICT resolver: `null` means the
+ * lookup failed, which is refused rather than read as an entity with no
+ * fields, since skipping redaction then would hand back what a live read
+ * hides.
+ */
+export async function currentRedactionSchema(
+  scopeKind: "collection" | "single",
+  slug: string
+): Promise<RedactionSchema> {
+  const fields = await tryResolveCurrentFields(scopeKind, slug);
+  if (fields === null) {
+    throw NextlyError.internal({
+      logContext: {
+        reason: "version-redaction-field-resolution-failed",
+        scopeKind,
+        scopeSlug: slug,
+      },
+    });
+  }
+  return { fields, componentFields: await currentComponentFields(fields) };
+}
+
+/**
+ * Strip fields the caller may not read from a stored snapshot, using the same
+ * field-level `access.read` rules a normal read applies. Mutates in place.
+ *
+ * Snapshots are stored as opaque JSON, so a non-object snapshot (or one written
+ * before a field gained an access rule) is left alone rather than throwing —
+ * the surrounding gate has already established the caller may read the
+ * document, and redaction is a narrowing pass on top of that.
+ *
+ * Every read rule applies, the entity's own and, through
+ * `applyComponentReadAccess`, each component's on the instances it holds, at
+ * any depth. A scoped API key is judged on its own grants, as the document
+ * read judges it.
+ *
+ * Returns what the read rules removed: top-level keys, and dotted paths below
+ * them (`banner.secret`), with a list row named by its index in this version
+ * (`items.1.secret`), so a comparison can say a field is hidden from this
+ * reader, in the row it was hidden in, rather than leave it out unexplained. Password values are stripped
+ * too, but are not reported: a comparison never shows a password field at all.
+ *
+ * Fails closed: if the rules cannot be evaluated, every field carrying a read
+ * rule is withheld rather than the snapshot returned as stored.
+ *
+ * Takes the version itself, its snapshot and the language it records, and
+ * runs every rule in that language (`withVersionLanguage`): a field rule
+ * answering by language withholds from a version what it withholds from a
+ * read in the version's language. The one redaction every surface returning a
+ * stored snapshot or a judgment of one calls, so none can judge it in another
+ * language.
+ */
+export async function redactSnapshotForUser(
+  version: { snapshot: unknown; locale: string | null },
+  scopeKind: VersionScopeKind,
+  slug: string,
+  user: UserContext,
+  authenticatedScope?: AuthenticatedScope,
+  /**
+   * The entity's current schema, already resolved (`currentRedactionSchema`):
+   * a caller judging many snapshots of one document reads it once rather than
+   * once per snapshot. Resolved here when absent.
+   */
+  schema?: RedactionSchema
+): Promise<ReadonlySet<string>> {
+  const withheld = new Set<string>();
+  const { snapshot } = version;
+  if (typeof snapshot !== "object" || snapshot === null) return withheld;
+  if (scopeKind !== "collection" && scopeKind !== "single") return withheld;
+
+  const entry = snapshot as Record<string, unknown>;
+
+  // Strip anything the CURRENT schema marks as a password, mirroring the normal
+  // read path. Capture already strips password values, but a field converted to
+  // `password` after a snapshot was written — or history imported from before
+  // that rule existed — would otherwise hand back a value the live read hides.
+  // The STRICT resolver: `null` means the lookup failed, which is different
+  // from an entity that genuinely has no user-defined fields. Collapsing the
+  // two would skip redaction entirely on a transient failure and hand back a
+  // value the live read hides -- an assertion satisfied by absence, in the one
+  // place where absence must stop the read.
+  const { fields, componentFields } =
+    schema ?? (await currentRedactionSchema(scopeKind, slug));
+  if (fields.length > 0) {
+    stripPasswordsThroughComponents(entry, fields, componentFields);
+  }
+
+  const before = structuredClone(entry);
+  const readable = new Set(Object.keys(entry));
+  const caller = {
+    user,
+    authenticatedScope,
+    grants: callerAccessGrants(user, authenticatedScope),
+  };
+  try {
+    await withVersionLanguage(version.locale, async () => {
+      await applyFieldReadAccess({
+        kind: scopeKind,
+        slug,
+        entry,
+        user,
+        authenticatedScope,
+        grants: caller.grants,
+        overrideAccess: false,
+      });
+      await applyComponentReadAccess(entry, fields, componentFields, caller);
+    });
+  } catch (error) {
+    // A rule that could not run never answered: the request ends with that,
+    // not with every field carrying a read rule withheld.
+    rethrowIfRuleCouldNotRun(error);
+    // Rules that could not be evaluated decide nothing, so nothing they guard
+    // is shown: every field carrying a read rule is withheld, and named.
+    for (const key of fieldsCarryingReadRules(
+      scopeKind,
+      fields,
+      componentFields,
+      slug
+    )) {
+      delete entry[key];
+    }
+    getService("logger").warn(
+      "Version redaction could not evaluate read rules",
+      {
+        scopeKind,
+        scopeSlug: slug,
+        error: error instanceof Error ? error.message : String(error),
+      }
+    );
+  }
+  for (const key of readable) {
+    if (!(key in entry)) withheld.add(key);
+  }
+  for (const path of nestedWithheldPaths(
+    before,
+    entry,
+    fields,
+    componentFields
+  )) {
+    withheld.add(path);
+  }
+  return withheld;
+}
+
+/** The current schemas of the components `fields` reach, by slug. */
+async function currentComponentFields(
+  fields: FieldConfig[]
+): Promise<Map<string, FieldConfig[]>> {
+  if (fields.length === 0) return new Map();
+  const dataService = container.has("fieldGroupDataService")
+    ? container.get<FieldGroupDataService>("fieldGroupDataService")
+    : null;
+  return dataService
+    ? resolveComponentFieldMap(fields, componentSlug =>
+        dataService.getComponentFields(componentSlug)
+      )
+    : new Map<string, FieldConfig[]>();
+}
+
+/**
+ * Current field configs for an entity. Used by redaction to decide what to
+ * strip, and by the diff orchestration as the schema to walk. A lookup failure
+ * yields an empty list rather than failing the request (redaction then falls
+ * back to field-level access alone; a diff falls back to raw-key comparison).
+ */
+/**
+ * The entity's stored versioning policy, as the registry persisted it.
+ *
+ * Deliberately NOT wrapped in a catch. `tryResolveCurrentFields` flattens a
+ * failed lookup because its callers can degrade safely; a policy check cannot.
+ * "I could not read the setting" and "the setting permits this" must never be
+ * the same answer on a path that decides whether to store unpublished content,
+ * so a lookup failure propagates and the caller refuses.
+ *
+ * Returns `null` for an entity that records no versions at all, which is a
+ * definite answer rather than missing information: the registry writes the
+ * property and sets it to null when versioning is off.
+ */
+export async function resolveVersionsPolicy(
+  scopeKind: "collection" | "single",
+  slug: string
+): Promise<ResolvedVersionsConfig | null> {
+  if (scopeKind === "single") {
+    const registry = getService("singleRegistryService");
+    const record = await registry.getSingleBySlug(slug);
+    return (
+      (record as { versions?: ResolvedVersionsConfig | null } | null)
+        ?.versions ?? null
+    );
+  }
+  const collections = getService("collectionService");
+  const collection = await collections.getCollection(slug, {});
+  return (
+    (collection as { versions?: ResolvedVersionsConfig | null } | null)
+      ?.versions ?? null
+  );
+}
+
+/**
+ * Current fields, or `null` when the lookup itself failed.
+ *
+ * Separated from `resolveCurrentFields` because the two answers are different:
+ * a valid entity can legitimately have NO user-defined fields (a freshly
+ * created Single whose identity columns alone form a document), and collapsing
+ * that into the same empty array as a failed lookup forces every caller to
+ * guess which happened. Callers that must fail closed read this one.
+ */
+export async function tryResolveCurrentFields(
+  scopeKind: "collection" | "single",
+  slug: string
+): Promise<FieldConfig[] | null> {
+  try {
+    // An entity that is not there is a lookup that found nothing, not one
+    // with no fields: answered as `null`, so a caller that must fail closed
+    // does, rather than treating a missing schema as nothing to look for.
+    if (scopeKind === "single") {
+      const registry = getService("singleRegistryService");
+      const record = await registry.getSingleBySlug(slug);
+      return record ? (record.fields ?? []) : null;
+    }
+    const collections = getService("collectionService");
+    // Metadata lookup only; the context carries no user because the access
+    // decision was already made above and this is just a field-shape read.
+    const collection = await collections.getCollection(slug, {});
+    if (!collection) return null;
+    return ((collection as { fields?: unknown[] }).fields ??
+      []) as FieldConfig[];
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Leave a recovery point's password-field values out of `snapshot`, in place.
+ *
+ * The snapshot of an autosave arrives from whoever is editing, so it carries
+ * whatever they have typed, a new password included, which no write has hashed
+ * yet. Durable capture never faces this: it snapshots the stored row, where the
+ * value is already hashed or absent. One function for every door that records
+ * an autosave, REST and the plugin service alike, with the same schema-driven
+ * recursive helper the version reads use, so no door stores a value another
+ * would have left out.
+ */
+export async function stripAutosavePasswords(
+  scopeKind: VersionScopeKind,
+  slug: string,
+  snapshot: unknown
+): Promise<void> {
+  // `page` scopes hold block documents rather than user-defined fields, and
+  // field resolution has no answer for them.
+  if (scopeKind !== "collection" && scopeKind !== "single") return;
+  // An object or a list of rows: the stripper walks both. REST's autosave
+  // takes only an object; a plugin's may be any value the store takes.
+  if (!snapshot || typeof snapshot !== "object") return;
+  const fields = await autosaveFieldsOrRefuse(scopeKind, slug);
+  if (fields.length === 0) return;
+
+  // Walks the SNAPSHOT rather than an expanded schema. A component may
+  // reference itself, so a schema-side expansion has to stop at some
+  // depth, and everything below that cut-off would keep its passwords.
+  // The data is finite, so this terminates on its own and strips every
+  // level that actually exists.
+  stripPasswordsThroughComponents(
+    snapshot,
+    fields,
+    await autosaveComponentFields(fields, scopeKind, slug)
+  );
+}
+
+/**
+ * The entity's fields, or a refusal when they cannot be read.
+ *
+ * Fail CLOSED on a failed LOOKUP, which is what `null` means here. An empty
+ * list is a different answer: a valid entity can have no user-defined fields
+ * at all (a freshly created Single, whose identity columns alone form a
+ * document), and there is genuinely nothing to strip from one. Treating those
+ * alike would refuse every autosave for such an entity, while treating a
+ * failed lookup as "nothing to strip" would write whatever the editor sent,
+ * credentials included, exactly when the lookup meant to find them had broken.
+ */
+async function autosaveFieldsOrRefuse(
+  scopeKind: "collection" | "single",
+  slug: string
+): Promise<FieldConfig[]> {
+  const fields = await tryResolveCurrentFields(scopeKind, slug);
+  if (fields === null) {
+    throw NextlyError.internal({
+      logContext: {
+        reason: "autosave-field-resolution-failed",
+        scopeKind,
+        scopeSlug: slug,
+      },
+    });
+  }
+  return fields;
+}
+
+/**
+ * The schemas of the components `fields` reference, by slug.
+ *
+ * A `component` field is a REFERENCE: its schema lives under another slug, so
+ * the stripper sees `{ type: "component" }` and has nothing to descend into. A
+ * password declared inside a referenced component would survive in the
+ * snapshot. Resolved here so the stripper can rewrite the references into the
+ * container shapes it already walks, and strip once.
+ */
+async function autosaveComponentFields(
+  fields: FieldConfig[],
+  scopeKind: "collection" | "single",
+  slug: string
+): Promise<Map<string, FieldConfig[]>> {
+  const dataService = container.has("fieldGroupDataService")
+    ? container.get<FieldGroupDataService>("fieldGroupDataService")
+    : null;
+  // Fail CLOSED where a reference cannot be resolved. `resolveComponentFieldMap`
+  // propagates a lookup error rather than reporting the component absent, so
+  // an unresolvable schema arrives here as a thrown error and refuses the
+  // write; what this guards is the other case, a registry that is not wired at
+  // all while the schema still declares references.
+  if (!dataService) {
+    if (declaresComponentReference(fields)) {
+      throw NextlyError.internal({
+        logContext: {
+          reason: "autosave-component-schema-unavailable",
+          scopeKind,
+          scopeSlug: slug,
+        },
+      });
+    }
+    return new Map();
+  }
+  // No executor: autosave runs outside any transaction by design, and the
+  // parameter exists so an in-transaction caller can read on its own
+  // connection rather than take a second one.
+  return resolveComponentFieldMap(fields, component =>
+    dataService.getComponentFields(component)
+  );
+}
+
+/**
+ * Whether any field in this schema references a component by slug, at any
+ * depth. Used to decide whether an unavailable component registry is a problem
+ * for THIS entity: a schema with no references has nothing unresolvable in it.
+ */
+function declaresComponentReference(fields: FieldConfig[]): boolean {
+  for (const field of fields) {
+    // Either spelling declares a reference: a migrated definition whose keys
+    // went unread would skip the registry-unavailable guard entirely.
+    if (typeof (field as { component?: unknown }).component === "string") {
+      return true;
+    }
+    if (typeof (field as { fieldGroup?: unknown }).fieldGroup === "string") {
+      return true;
+    }
+    if (Array.isArray((field as { components?: unknown }).components)) {
+      return true;
+    }
+    if (Array.isArray((field as { fieldGroups?: unknown }).fieldGroups)) {
+      return true;
+    }
+    const children = (field as { fields?: unknown }).fields;
+    if (
+      Array.isArray(children) &&
+      declaresComponentReference(children as FieldConfig[])
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Current fields, with a failed lookup flattened to an empty list.
+ *
+ * Kept for the redaction paths, where "no fields" and "could not look" lead to
+ * the same conservative behaviour. Derived from the strict form above rather
+ * than repeating the lookups.
+ */
+export async function resolveCurrentFields(
+  scopeKind: "collection" | "single",
+  slug: string
+): Promise<FieldConfig[]> {
+  return (await tryResolveCurrentFields(scopeKind, slug)) ?? [];
+}
+
+/**
+ * Current fields enriched with resolved component sub-schemas, so the diff
+ * engine can walk into component fields. `enrichFieldsWithComponentSchemas`
+ * takes and returns a `Record`-based shape; the enriched result is a structural
+ * superset of `FieldConfig` (the same fields plus attached sub-schemas), which
+ * the engine reads structurally. The casts are isolated here rather than at the
+ * call site, matching the enrichment idiom the schema-detail routes use.
+ */
+async function resolveEnrichedFields(
+  scopeKind: "collection" | "single",
+  slug: string
+): Promise<FieldConfig[]> {
+  const rawFields = await resolveCurrentFields(scopeKind, slug);
+  const fieldGroupRegistry = getService("fieldGroupRegistryService");
+  const enriched = await fieldGroupRegistry.enrichFieldsWithComponentSchemas(
+    rawFields as unknown as Record<string, unknown>[]
+  );
+  return enriched as unknown as FieldConfig[];
+}
+
+/**
+ * History rows with the restored fields each names (`fieldSources`) narrowed
+ * to the ones this reader may read.
+ *
+ * A source says a field was restored, and from which version, so naming one
+ * the reader's field rules withhold would disclose the field and its history.
+ * Each named field is judged the way a version read judges it: the row's own
+ * snapshot goes through `redactSnapshotForUser`, and a field it withholds
+ * loses its source. A field the snapshot does not hold is still judged, as an
+ * empty value, rather than passed unexamined. The rows that name no source
+ * are returned as they are; the others' snapshots are read in one query.
+ */
+export async function readableFieldSources<
+  Row extends {
+    // Null on an autosave row, which records no sources.
+    versionNo: number | null;
+    // The row's language, which its snapshot is judged in.
+    locale: string | null;
+    fieldSources?: Readonly<Record<string, number>> | null;
+  },
+>(
+  rows: readonly Row[],
+  args: {
+    ref: VersionRef;
+    user: UserContext;
+    authenticatedScope?: AuthenticatedScope;
+  }
+): Promise<Row[]> {
+  const naming = rows.filter(
+    (row): row is Row & { versionNo: number } =>
+      row.versionNo !== null &&
+      !!row.fieldSources &&
+      Object.keys(row.fieldSources).length > 0
+  );
+  if (naming.length === 0) return [...rows];
+  // The schema read once for the page, not once per row. Only a collection or
+  // a Single has one; another scope is left to `redactSnapshotForUser`, which
+  // withholds every field of it.
+  const { scopeKind, scopeSlug } = args.ref;
+  const schema =
+    scopeKind === "collection" || scopeKind === "single"
+      ? await currentRedactionSchema(scopeKind, scopeSlug)
+      : undefined;
+  const snapshots = await new VersionsRepository(
+    getService("adapter")
+  ).snapshotsByVersionNo(
+    args.ref,
+    naming.map(row => row.versionNo)
+  );
+  return Promise.all(
+    rows.map(async row => {
+      const sources = row.fieldSources;
+      if (!sources || Object.keys(sources).length === 0) return row;
+      // A row naming sources with no version number of its own was never
+      // read above, so its snapshot is judged as empty: every source is still
+      // judged, never passed unexamined.
+      const entry = structuredClone(
+        snapshotObject(
+          row.versionNo === null ? undefined : snapshots.get(row.versionNo)
+        )
+      );
+      for (const name of Object.keys(sources)) {
+        if (!(name in entry)) entry[name] = null;
+      }
+      const withheld = await redactSnapshotForUser(
+        { snapshot: entry, locale: row.locale },
+        args.ref.scopeKind,
+        args.ref.scopeSlug,
+        args.user,
+        args.authenticatedScope,
+        schema
+      );
+      const readable = Object.entries(sources).filter(
+        ([name]) => !withheld.has(name)
+      );
+      // The row as given, with only its readable sources: the same shape.
+      return {
+        ...row,
+        fieldSources: readable.length > 0 ? Object.fromEntries(readable) : null,
+      };
+    })
+  );
+}
+
+/** A stored snapshot as a plain object, or an empty object if it is not one. */
+function snapshotObject(snapshot: unknown): Record<string, unknown> {
+  return snapshot !== null &&
+    typeof snapshot === "object" &&
+    !Array.isArray(snapshot)
+    ? (snapshot as Record<string, unknown>)
+    : {};
+}
+
+/** Validate the version pair a diff compares before any read runs. */
+export function assertDiffVersionPair(from: number, to: number): void {
+  for (const [value, path] of [
+    [from, "from"],
+    [to, "to"],
+  ] as const) {
+    if (!Number.isInteger(value) || value < 1) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path,
+            code: "INVALID_VALUE",
+            message: `${path} must be a positive integer.`,
+          },
+        ],
+      });
+    }
+  }
+  if (from === to) {
+    throw NextlyError.validation({
+      errors: [
+        {
+          path: "to",
+          code: "INVALID_VALUE",
+          message: "Cannot compare a version with itself.",
+        },
+      ],
+    });
+  }
+}
+
+/**
+ * Resolve the relationship and upload references in a version snapshot to the
+ * value kit's display shape, in place, for the caller.
+ *
+ * Runs AFTER redaction, on the same enriched schema the diff walks, so a
+ * preview renders labels through the one value kit and a field the caller may
+ * not read is dropped before its references are ever resolved. The dispatcher
+ * read and the standalone route both call this, so the fields-resolution and
+ * hydration are defined once rather than duplicated between them.
+ */
+export async function hydrateVersionSnapshot(
+  snapshot: unknown,
+  scopeKind: VersionScopeKind,
+  slug: string,
+  user: UserContext,
+  authenticatedScope?: AuthenticatedScope,
+  // The version's locale, so a localized display column on a referenced target
+  // resolves in the language the snapshot was captured in.
+  locale?: string | null
+): Promise<void> {
+  const lookupKind = scopeKind === "single" ? "single" : "collection";
+  const fields = await resolveEnrichedFields(lookupKind, slug);
+  await hydrateSnapshotReferences(
+    snapshot,
+    fields,
+    user,
+    authenticatedScope,
+    locale
+  );
+}
+
+/** A comparison request, as every surface that compares reads it. */
+export interface ComparisonQuery {
+  from?: number;
+  to?: number;
+  /** A registered comparison baseline's name. */
+  baseline?: string;
+  /** The part to open on when no `to` is named. */
+  locale?: string;
+  /**
+   * `shared` compares the shared part: the fields every language shares, across
+   * languages, from the shared part's own baselines. Absent, a comparison is of
+   * one language as it always was, and a pair in two languages is refused.
+   */
+  part?: ComparisonPart;
+  modifiedOnly: boolean;
+}
+
+/** The workflow part a comparison may name: the shared fields. */
+const comparisonPartSchema = z.literal("shared");
+
+/** A comparison's `part`: `shared`, the fields every language shares. */
+export type ComparisonPart = z.infer<typeof comparisonPartSchema>;
+
+const comparisonQuerySchema = z.object({
+  from: z.string().trim().optional(),
+  to: z.string().trim().optional(),
+  baseline: z.string().trim().optional(),
+  locale: z.string().trim().optional(),
+  part: z.string().trim().optional(),
+  modifiedOnly: z.string().optional(),
+});
+
+/**
+ * A comparison's `part`: absent, or `shared`. Anything else is refused naming
+ * the parameter, rather than compared as one language. The one parser REST's
+ * query and the Direct API's `versions.compare` both read `part` through.
+ */
+export function parseComparisonPart(
+  value: unknown
+): ComparisonPart | undefined {
+  if (value === undefined) return undefined;
+  const parsed = comparisonPartSchema.safeParse(value);
+  if (parsed.success) return parsed.data;
+  throw NextlyError.validation({
+    errors: [
+      {
+        path: "part",
+        code: "INVALID_VALUE",
+        message: 'part must be "shared", the fields every language shares.',
+      },
+    ],
+  });
+}
+
+/**
+ * Parse a comparison's query parameters, the same way for the REST routes,
+ * the dispatcher and the published handler, so the surfaces never answer one
+ * request differently. An absent or blank parameter is absent; a version
+ * number that is not a whole number is left for `assertComparisonRequest` to
+ * refuse with the parameter's name.
+ */
+export function parseComparisonQuery(
+  input: Record<string, unknown>
+): ComparisonQuery {
+  const text = (value: unknown) =>
+    typeof value === "string" ? value : undefined;
+  const query = comparisonQuerySchema.parse({
+    from: text(input.from),
+    to: text(input.to),
+    baseline: text(input.baseline),
+    locale: text(input.locale),
+    part: text(input.part),
+    modifiedOnly: text(input.modifiedOnly),
+  });
+  const present = (value: string | undefined) =>
+    value === undefined || value === "" ? undefined : value;
+  const number = (value: string | undefined) => {
+    const raw = present(value);
+    return raw === undefined ? undefined : Number(raw);
+  };
+  return {
+    from: number(query.from),
+    to: number(query.to),
+    baseline: present(query.baseline),
+    locale: present(query.locale),
+    part: parseComparisonPart(present(query.part)),
+    modifiedOnly: query.modifiedOnly === "1" || query.modifiedOnly === "true",
+  };
+}
+
+/**
+ * Validate a comparison request before anything is read, so malformed input
+ * fails as a validation error naming its parameter, whatever the document's
+ * history holds. Either an explicit pair (`from` and `to`) or a target and a
+ * baseline, each optional; not a `from` and a `baseline` together.
+ */
+export function assertComparisonRequest(query: ComparisonQuery): void {
+  // The shared part spans every language, so a language to pair in has no
+  // meaning beside it.
+  if (query.part !== undefined && query.locale !== undefined) {
+    throw NextlyError.validation({
+      errors: [
+        {
+          path: "locale",
+          code: "INVALID_VALUE",
+          message: "Name either `part` or `locale`, not both.",
+        },
+      ],
+    });
+  }
+  if (query.from !== undefined) {
+    if (query.baseline !== undefined) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path: "baseline",
+            code: "INVALID_VALUE",
+            message: "Name either `from` or `baseline`, not both.",
+          },
+        ],
+      });
+    }
+    assertDiffVersionPair(query.from, query.to ?? Number.NaN);
+    return;
+  }
+  if (query.to !== undefined && (!Number.isInteger(query.to) || query.to < 1)) {
+    throw NextlyError.validation({
+      errors: [
+        {
+          path: "to",
+          code: "INVALID_VALUE",
+          message: "to must be a positive integer.",
+        },
+      ],
+    });
+  }
+}
+
+/**
+ * The id of the person reading, or null for an API key, a principal or the
+ * system. One answer for every place that reads or records what a person last
+ * looked at, so a key never reaches its owner's marker on any of them.
+ */
+export function readingPersonId(
+  user: UserContext | undefined,
+  authenticatedScope?: AuthenticatedScope
+): string | null {
+  const actorType = authenticatedScope?.actorType ?? "user";
+  return actorType === "user" && user?.id ? String(user.id) : null;
+}
+
+/**
+ * A page of a document's history with each part's "You last looked here" row
+ * marked, for a person; anyone else's page comes back as it was. Reads only:
+ * looking at the history moves no marker.
+ */
+export async function withLastViewedMarks<
+  T extends { versionNo: number | null; locale: string | null },
+>(
+  rows: T[],
+  args: {
+    ref: VersionRef;
+    user: UserContext | undefined;
+    authenticatedScope?: AuthenticatedScope;
+  }
+): Promise<(T & { lastViewed?: true })[]> {
+  const personId = readingPersonId(args.user, args.authenticatedScope);
+  if (personId === null) return rows;
+  const adapter = getService("adapter");
+  const looked = await lastLookedAtByPart(adapter, personId, args.ref);
+  // Each part's divider, found in the database in one read: the version
+  // looked at, or the nearest older one kept, whichever page it falls on.
+  const dividers = await new HistoryDividers(
+    adapter,
+    getService("logger")
+  ).nearestKeptByPart(args.ref, looked);
+  return markLastViewed(rows, dividers);
+}
+
+/**
+ * Compare two versions of a document AFTER the caller's read access to it is
+ * confirmed: an explicit pair as given, or a target and baseline resolved from
+ * the document's own history (`resolveComparisonPair`), then diffed through
+ * `diffDocumentVersions`. Every surface that compares calls this, after its own
+ * read gate.
+ *
+ * A baseline is told who is comparing only when that is a person: an API key,
+ * a principal or the system compares with no user, so a baseline that reads a
+ * person's own records never reaches the key owner's.
+ *
+ * With `part: "shared"` the pair is the shared part's: found over every
+ * language's versions, its baselines the shared part's own (its approval pin,
+ * the newest publish in any language), and only the shared fields compared.
+ * Without it, nothing changes: one language's pair, as before.
+ */
+export async function compareDocumentVersions(args: {
+  scopeKind: VersionScopeKind;
+  slug: string;
+  entryId: string;
+  /**
+   * The person comparing, judged and redacted for. Absent for trusted server
+   * code, which reads every language and field, as its other reads do.
+   */
+  user?: UserContext;
+  authenticatedScope?: AuthenticatedScope;
+  query: ComparisonQuery;
+}): Promise<VersionDiff> {
+  const { query } = args;
+  // The language whose history finds the pair is asked about before anything
+  // of it is read, or a refusal said: the target's own when one is named,
+  // since the baseline is found in its part, and otherwise the `locale` the
+  // server pairs in. An explicit pair names no language here; its two rows are
+  // asked about below.
+  if (args.user) {
+    await assertHistoryLocalesReadable(
+      args.scopeKind,
+      args.slug,
+      args.entryId,
+      args.user,
+      args.authenticatedScope,
+      {},
+      [await pairingPart(args, query)]
+    );
+  }
+  let pair: { from: number; to: number };
+  let baseline: VersionDiff["baseline"];
+  if (query.from !== undefined && query.to !== undefined) {
+    pair = { from: query.from, to: query.to };
+  } else {
+    const versions = getService("versionsService");
+    const ref = {
+      scopeKind: args.scopeKind,
+      scopeSlug: args.slug,
+      entryId: args.entryId,
+    };
+
+    const [partVersions, workingDraftParts, entity] = await Promise.all([
+      versions.listPartVersions(ref),
+      versions.listWorkingDraftParts(ref),
+      registryEntityOf(args.scopeKind, args.slug),
+    ]);
+    const resolved = await resolveComparisonPair(
+      {
+        ref,
+        to: query.to,
+        baseline: query.baseline,
+        locale: query.locale,
+        userId: readingPersonId(args.user, args.authenticatedScope),
+        workingDraftParts,
+        partIsLive: part =>
+          partIsLiveNow(entity, args.scopeKind, args.entryId, part),
+        // Whether a `status` is the lifecycle's or the document's own word:
+        // without the lifecycle every version was served, whatever it says.
+        lifecycle: hasLifecycle(entity),
+        // The shared part's versions span languages: the target and the
+        // baseline are each asked about in their own language before any
+        // baseline speaks, so a person who may not read one learns nothing of
+        // it, as for a document that is not there.
+        ...(query.part === "shared" && args.user
+          ? {
+              authorizeVersion: versionLanguageGate(
+                args,
+                args.user,
+                partVersions
+              ),
+            }
+          : {}),
+      },
+      query.part === "shared" ? sharedPartVersions(partVersions) : partVersions
+    );
+    pair = { from: resolved.from, to: resolved.to };
+    baseline = resolved.baseline;
+  }
+  assertDiffVersionPair(pair.from, pair.to);
+
+  const diff = await diffDocumentVersions({
+    scopeKind: args.scopeKind,
+    slug: args.slug,
+    entryId: args.entryId,
+    user: args.user,
+    from: pair.from,
+    to: pair.to,
+    modifiedOnly: query.modifiedOnly,
+    authenticatedScope: args.authenticatedScope,
+    ...(query.part === undefined ? {} : { part: query.part }),
+  });
+  return baseline ? { ...diff, baseline } : diff;
+}
+
+/**
+ * Asks whether `user` may read one version of the document in its own
+ * language (`versions` names each version's language), refusing as not found
+ * where they may not: the shared part's comparison asks it of its target and
+ * baseline before any baseline answers.
+ */
+function versionLanguageGate(
+  document: {
+    scopeKind: VersionScopeKind;
+    slug: string;
+    entryId: string;
+    authenticatedScope?: AuthenticatedScope;
+  },
+  user: UserContext,
+  versions: readonly { versionNo: number; locale: string | null }[]
+): (versionNo: number) => Promise<void> {
+  return versionNo =>
+    assertHistoryLocalesReadable(
+      document.scopeKind,
+      document.slug,
+      document.entryId,
+      user,
+      document.authenticatedScope,
+      {},
+      [versions.find(v => v.versionNo === versionNo)?.locale ?? null]
+    );
+}
+
+/**
+ * The part a comparison's pair is found in, before it is resolved: the
+ * target's, when the comparison names one and not a pair, else the `locale`
+ * it names. Null when it names neither, or names a pair.
+ */
+async function pairingPart(
+  document: { scopeKind: VersionScopeKind; slug: string; entryId: string },
+  query: ComparisonQuery
+): Promise<string | null> {
+  if (query.from !== undefined) return null;
+  if (query.to === undefined) return query.locale ?? null;
+  const part = await getService("versionsService").partOfVersion(
+    {
+      scopeKind: document.scopeKind,
+      scopeSlug: document.slug,
+      entryId: document.entryId,
+    },
+    query.to
+  );
+  return part ?? null;
+}
+
+/**
+ * Whether two versions' language tags name one part of the document. A
+ * document without languages has a single part, and its versions may be
+ * tagged with the default language (a component read in it) or with none:
+ * both name that part. A localized document's parts are its languages.
+ */
+async function onePart(
+  scopeKind: VersionScopeKind,
+  slug: string,
+  a: string | null,
+  b: string | null
+): Promise<boolean> {
+  if (a === b) return true;
+  const entity = await registryEntityOf(scopeKind, slug);
+  if ((entity as { localized?: boolean } | null)?.localized === true) {
+    return false;
+  }
+  const defaultLocale = appLocalization()?.defaultLocale ?? null;
+  return [a, b].every(tag => tag === null || tag === defaultLocale);
+}
+
+/**
+ * The collection's or Single's registry record, or null when it is gone. Read for what it
+ * decides about a history read (its languages, which part is live), never a write, so a
+ * collection's comes from the registry row cache, as a Single's does: an editor's screens ask
+ * it on every open.
+ */
+async function registryEntityOf(scopeKind: VersionScopeKind, slug: string) {
+  return scopeKind === "single"
+    ? getService("singleRegistryService").getSingleBySlug(slug)
+    : getService("collectionRegistryService").getCollectionBySlugForRead(slug);
+}
+
+/**
+ * Whether a part of the document is served now, read from the document's own
+ * rows. A document whose entity is gone is not served at all.
+ */
+async function partIsLiveNow(
+  entity: Awaited<ReturnType<typeof registryEntityOf>>,
+  scopeKind: VersionScopeKind,
+  entryId: string,
+  part: string | null
+): Promise<boolean> {
+  if (!entity) return false;
+  return readPartIsLive({
+    adapter: getService("adapter"),
+    scopeKind,
+    entity,
+    entryId,
+    part,
+    defaultLocale: appLocalization()?.defaultLocale ?? null,
+  });
+}
+
+/**
+ * Compute a diff of two versions AFTER the caller has confirmed read access to
+ * the document. The dispatcher method and the standalone route both call this,
+ * so the get/redact/walk logic has exactly one definition and each surface
+ * applies its own read gate (mirroring how both reuse `versions.get`).
+ *
+ * Both snapshots are redacted for the caller before the pure engine sees them,
+ * so the diff can never surface a field the caller may not read. The two
+ * versions must share a locale: each snapshot records one locale's values, so a
+ * cross-locale comparison is meaningless. The shared part (`part: "shared"`) is
+ * the exception: every language's snapshot carries the fields all languages
+ * share, so its two versions may be in two languages, and only those fields are
+ * compared. The schema is enriched with component sub-schemas so nested
+ * component fields diff field-by-field.
+ */
+export async function diffDocumentVersions(args: {
+  scopeKind: VersionScopeKind;
+  slug: string;
+  entryId: string;
+  /** The person comparing; absent for trusted server code (see above). */
+  user?: UserContext;
+  from: number;
+  to: number;
+  modifiedOnly?: boolean;
+  authenticatedScope?: AuthenticatedScope;
+  /** `shared`: the shared fields alone, across languages (see above). */
+  part?: ComparisonPart;
+}): Promise<VersionDiff> {
+  const shared = args.part === "shared";
+  const versions = getService("versionsService");
+  const ref = {
+    scopeKind: args.scopeKind,
+    scopeSlug: args.slug,
+    entryId: args.entryId,
+  };
+  const [fromRow, toRow] = await Promise.all([
+    versions.get(ref, args.from),
+    versions.get(ref, args.to),
+  ]);
+  // Each version is of the language it records, asked about before either is
+  // compared, or a mismatch reported.
+  if (args.user) {
+    await assertHistoryLocalesReadable(
+      args.scopeKind,
+      args.slug,
+      args.entryId,
+      args.user,
+      args.authenticatedScope,
+      {},
+      [fromRow.locale, toRow.locale]
+    );
+  }
+
+  if (
+    !shared &&
+    !(await onePart(args.scopeKind, args.slug, fromRow.locale, toRow.locale))
+  ) {
+    throw NextlyError.validation({
+      errors: [
+        {
+          path: "to",
+          code: "LOCALE_MISMATCH",
+          message: "The two versions belong to different locales.",
+        },
+      ],
+      logContext: {
+        reason: "version-diff-locale-mismatch",
+        scopeKind: args.scopeKind,
+        slug: args.slug,
+        from: args.from,
+        to: args.to,
+      },
+    });
+  }
+
+  // The pair's language: either's tag, since they name one part. The shared
+  // part's two versions may be in two languages: the target's names the
+  // language its references are labelled in.
+  const pairLocale = shared ? toRow.locale : (fromRow.locale ?? toRow.locale);
+
+  // Redact each snapshot for the caller BEFORE diffing, so the diff can never
+  // surface a field the caller may not read. What either side withheld is
+  // named to the engine, which reports it as hidden in its place.
+  // Trusted server code reads every field, so nothing is withheld from it.
+  const user = args.user;
+  const withheldFrom = user
+    ? await redactSnapshotForUser(
+        fromRow,
+        args.scopeKind,
+        args.slug,
+        user,
+        args.authenticatedScope
+      )
+    : new Set<string>();
+  const withheldTo = user
+    ? await redactSnapshotForUser(
+        toRow,
+        args.scopeKind,
+        args.slug,
+        user,
+        args.authenticatedScope
+      )
+    : new Set<string>();
+
+  // Page scope has no HTTP diff surface; collection and single are the only
+  // callers, so anything else resolves as a collection for field lookup.
+  const lookupKind = args.scopeKind === "single" ? "single" : "collection";
+  const fields = await resolveEnrichedFields(lookupKind, args.slug);
+  const compared = shared
+    ? await sharedFieldsView({
+        scopeKind: lookupKind,
+        scopeSlug: args.slug,
+        entryId: args.entryId,
+      })
+    : wholeSnapshotView;
+
+  // Loaded here, by the one request that compares two versions: no other
+  // route needs the diff engine.
+  const { computeVersionDiff } = await import("../domains/versions/diff");
+  const body = computeVersionDiff(
+    compared.snapshot(fromRow.snapshot),
+    compared.snapshot(toRow.snapshot),
+    fields,
+    {
+      modifiedOnly: args.modifiedOnly,
+      // Each version's own: a list row is named by its index in that
+      // version, so merging the two would hide a field in the wrong row.
+      withheldFrom: compared.withheld(withheldFrom),
+      withheldTo: compared.withheld(withheldTo),
+      // `redactSnapshotForUser` ran each component's own read rules.
+      componentRulesApplied: true,
+      entity: lookupKind,
+      // The shared fields of a translated document are the ones the content
+      // type declares now: a field it no longer has may have been translated.
+      declaredOnly: compared.declaredOnly,
+    }
+  );
+
+  // Resolve relationship and upload ids in the diff to display labels through
+  // the same access-checked path a read uses: an unreadable target stays a bare
+  // id. Labels attach beside the ids rather than replacing them, so the diff
+  // wire stays id-stable for any non-admin consumer of this surface. Both
+  // versions share a locale (asserted above), so the target reads resolve in
+  // that language.
+  // Labels are read as the person comparing may read them; trusted server
+  // code, which names no person, gets the ids alone.
+  if (args.user) {
+    await hydrateDiffReferences(
+      body.fields,
+      args.user,
+      args.authenticatedScope,
+      pairLocale
+    );
+  }
+
+  return {
+    from: args.from,
+    to: args.to,
+    locale: pairLocale,
+    ...(shared ? { part: "shared" as const } : {}),
+    hasChanges: body.hasChanges,
+    incomplete: body.incomplete,
+    fields: body.fields,
+  };
+}
+
+/** What a comparison reads of each snapshot, and of what was withheld from it. */
+interface ComparedView {
+  snapshot(snapshot: unknown): Record<string, unknown>;
+  withheld(paths: ReadonlySet<string>): ReadonlySet<string>;
+  /** Whether keys the content type no longer declares are left out. */
+  declaredOnly: boolean;
+}
+
+/** A comparison of one language: each snapshot whole. */
+const wholeSnapshotView: ComparedView = {
+  snapshot: snapshotObject,
+  withheld: paths => paths,
+  declaredOnly: false,
+};
+
+/**
+ * A comparison of the shared part: each snapshot's shared values, with the
+ * fields each language keeps on its own named as a workflow's review names them
+ * (`documentTableOn`, `sharedValuesOf`), so the shared fields compared are the
+ * ones their approval covers. A field withheld under a translated field goes
+ * with it. A document without languages shares every field. A key the content
+ * type no longer declares is left out by the diff itself (`declaredOnly`).
+ */
+async function sharedFieldsView(document: {
+  scopeKind: "collection" | "single";
+  scopeSlug: string;
+  entryId: string;
+}): Promise<ComparedView> {
+  const { translated } = await documentTableOn(document);
+  if (translated === null) return wholeSnapshotView;
+  const own = new Set(translated);
+  return {
+    snapshot: snapshot => sharedValuesOf(document, snapshot, translated),
+    withheld: paths =>
+      new Set([...paths].filter(path => !own.has(topLevelNameOf(path)))),
+    declaredOnly: true,
+  };
+}
+
+/** The top-level field a withheld path names: `banner` of `banner.secret`. */
+function topLevelNameOf(path: string): string {
+  const dot = path.indexOf(".");
+  return dot === -1 ? path : path.slice(0, dot);
+}

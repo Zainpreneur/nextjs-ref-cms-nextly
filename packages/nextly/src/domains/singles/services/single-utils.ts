@@ -1,0 +1,794 @@
+/**
+ * Single Utilities
+ *
+ * Pure helper functions extracted from the monolithic SingleEntryService.
+ * These functions handle field type detection, default value generation,
+ * JSON serialization, media ID normalization, and recursive media expansion
+ * for nested fields (group, repeater).
+ *
+ * All functions in this module are pure — they accept their dependencies
+ * as arguments and perform no direct side effects. This allows them to be
+ * shared between SingleQueryService and SingleMutationService without
+ * introducing coupling between the services.
+ *
+ * @module domains/singles/services/single-utils
+ * @since 1.0.0
+ */
+
+import type { FieldConfig } from "../../../collections/fields/types";
+import { NextlyError } from "../../../errors";
+import { errorEnvelopeFields } from "../../../errors/from-service-envelope";
+import { addressableFields } from "../../../shared/addressable-fields";
+import { convertTimestampsToCamelCase } from "../../../shared/lib/case-conversion";
+import type { ValidatableField } from "../../../shared/lib/entry-validation";
+import { validateEntryData } from "../../../shared/lib/entry-validation";
+import { toJsonColumnValue } from "../../../shared/lib/json-column-value";
+import {
+  pluginEmptyValue,
+  storageTypeToken,
+} from "../../../shared/lib/plugin-storage";
+import type { Logger } from "../../../shared/types";
+import { decodeEachLanguage } from "../../i18n/read-in-language";
+import { getFieldType } from "../../schema/field-types/field-type-registry";
+import { relationshipStoresJson } from "../../schema/services/field-column-descriptor";
+import type { SingleDocument, SingleResult } from "../types";
+
+// ============================================================
+// Field Type Helpers
+// ============================================================
+
+/**
+ * Valid empty Lexical editor document.
+ *
+ * The Lexical editor crashes with `{}` or `""` — it requires a root node
+ * with at least one paragraph child.
+ */
+export const EMPTY_LEXICAL_DOCUMENT: string = JSON.stringify({
+  root: {
+    type: "root",
+    format: "",
+    indent: 0,
+    version: 1,
+    children: [
+      {
+        type: "paragraph",
+        format: "",
+        indent: 0,
+        version: 1,
+        children: [],
+        direction: null,
+        textFormat: 0,
+      },
+    ],
+    direction: null,
+  },
+});
+
+/**
+ * Check if a field should be treated as a JSON field.
+ *
+ * Mirrors the logic in RuntimeSchemaGenerator to ensure consistent handling.
+ */
+export function shouldTreatAsJson(field: FieldConfig): boolean {
+  // Classified by what a plugin type stores rather than by its own token,
+  // which names none of these: a json-backed field would otherwise reach its
+  // JSON column as a live object. No storage primitive is `select`,
+  // `relationship` or `upload`, so the branches below read the declared type.
+  if (
+    ["json", "repeater", "group", "richText", "chips"].includes(
+      storageTypeToken(field) ?? field.type
+    )
+  ) {
+    return true;
+  }
+
+  // Select, text, and number fields are JSON if they have multiple values
+  if (
+    (field.type === "select" ||
+      field.type === "text" ||
+      field.type === "number") &&
+    "hasMany" in field &&
+    field.hasMany
+  ) {
+    return true;
+  }
+
+  // A relationship or upload is JSON when it holds a list: hasMany, or several targets. The column
+  // descriptor asks the same rule, so the Single's column and its serializer agree.
+  return relationshipStoresJson(field);
+}
+
+/**
+ * Run a contributed type's own `validate` over a resolved default.
+ *
+ * A single's row is auto-created on first read by inserting its defaults
+ * directly, so this value never passes through the write path that validates
+ * ordinary writes. A static default is caught when the config loads, but a
+ * function default produces its value only when resolved against real data,
+ * which first happens here. Left unchecked it is persisted by a READ, and a
+ * contributed control may be read-only — so the row could not then be repaired
+ * from the UI.
+ *
+ * The value is checked against the type's declared STORAGE PRIMITIVE and then
+ * against the type's own rules — the same order, and the same implementation,
+ * the write path uses. Checking only the type's own rules would let a type that
+ * declares none accept anything: a `number`-backed default resolving to
+ * `"not-a-number"` would reach the insert and fail at the database on a strict
+ * dialect, or store the wrong representation on SQLite.
+ *
+ * Two rules are deliberately NOT applied, by handing the walker a declaration
+ * without them. `required` cannot be violated by a default, which IS the value.
+ * The field's own `validate` is the author's rule about submitted content; it
+ * has never run against a default, and applying it now would newly refuse
+ * configs that boot today. Everything else is kept, because a contributed
+ * type's rule reads the field's own options — which kinds a document accepts —
+ * and would judge an unrestricted policy if handed only a name and a type.
+ */
+export async function assertValidPluginDefault(
+  field: { name?: string; type?: string },
+  value: unknown,
+  singleSlug: string
+): Promise<void> {
+  if (typeof field.type !== "string" || value === null || value === undefined) {
+    return;
+  }
+  // Nothing to say about a type core does not know: an unregistered token is
+  // refused by the boot gate, not here.
+  if (!getFieldType(field.type)) return;
+
+  const name = field.name ?? "";
+  const {
+    required: _required,
+    validate: _validate,
+    ...checked
+  } = field as ValidatableField;
+
+  const issues = await validateEntryData({ [name]: value }, [checked], {
+    mode: "create",
+    // The value IS the default, so an empty one is what the column will hold
+    // rather than a field the writer left alone. Judged as an omission it
+    // skipped both the primitive check and the type's own rules.
+    emptyIsAValue: true,
+  });
+
+  if (issues.length === 0) return;
+
+  throw NextlyError.validation({
+    errors: issues.map(issue => ({
+      path: issue.path || name,
+      code: issue.code,
+      message: issue.message,
+    })),
+    logContext: { single: singleSlug, field: field.name, reason: "default" },
+  });
+}
+
+/**
+ * Reject a `defaultValue` declared on a password field.
+ *
+ * A single's defaults are inserted straight onto the auto-created row,
+ * bypassing the write path that runs `hashPasswordFieldValues`. A resolved
+ * password default would therefore be persisted in PLAINTEXT, so it is refused
+ * here rather than silently stored.
+ */
+export function assertNoPasswordDefault(
+  field: { name?: string; type?: string },
+  singleSlug: string
+): void {
+  if (field.type !== "password") return;
+  throw NextlyError.validation({
+    errors: [
+      {
+        path: field.name ?? "",
+        code: "PASSWORD_DEFAULT_UNSUPPORTED",
+        message: `A password field cannot declare a defaultValue; set "${field.name ?? "password"}" explicitly so it is hashed.`,
+      },
+    ],
+    logContext: {
+      single: singleSlug,
+      field: field.name,
+      reason: "password-default",
+    },
+  });
+}
+
+/**
+ * {@link assertNoPasswordDefault} for every child of a group or repeater, at
+ * any depth: a nested default is resolved onto the same direct insert, which
+ * never hashes, so a password child's default would be stored in plaintext.
+ */
+export function assertNoNestedPasswordDefault(
+  field: { name?: string; type?: string; fields?: unknown },
+  singleSlug: string
+): void {
+  if (!Array.isArray(field.fields)) return;
+  for (const child of field.fields as {
+    name?: string;
+    type?: string;
+    fields?: unknown;
+    defaultValue?: unknown;
+  }[]) {
+    if (child.defaultValue !== undefined) {
+      assertNoPasswordDefault(child, singleSlug);
+    }
+    assertNoNestedPasswordDefault(child, singleSlug);
+  }
+}
+
+/**
+ * Get a type-appropriate default value for a field type.
+ * Used when a required field has no explicit defaultValue.
+ */
+export function getDefaultValue(field: FieldConfig): unknown {
+  if (field.type === "richText") {
+    return EMPTY_LEXICAL_DOCUMENT;
+  }
+
+  // A contributed type states what it holds when empty, the same declaration
+  // the DDL backfill reads, so a structured type is seeded with its own shape
+  // rather than the primitive's `{}`. Serialized only where the column stores
+  // JSON as text — a boolean-backed type's `false` must reach the driver as a
+  // boolean, not as the truthy string "false".
+  const contributed = pluginEmptyValue(field);
+  if (contributed !== undefined) {
+    return shouldTreatAsJson(field) ? JSON.stringify(contributed) : contributed;
+  }
+
+  if (shouldTreatAsJson(field)) {
+    if (field.type === "repeater" || ("hasMany" in field && field.hasMany)) {
+      return "[]";
+    }
+    return "{}";
+  }
+
+  // Seeded by what the column holds, as the JSON predicate above already is: a
+  // plugin type names none of the cases below, so it would fall through to the
+  // text default and put `""` into a numeric or boolean column, or a value
+  // `new Date()` cannot read.
+  switch (storageTypeToken(field) ?? field.type) {
+    case "text":
+    case "textarea":
+    // An icon id is a string; empty means no icon chosen yet.
+    case "email":
+    case "icon":
+    case "password":
+    case "code":
+      return "";
+
+    case "number":
+      return 0;
+
+    case "checkbox":
+      return false;
+
+    case "json":
+      return "{}";
+    case "repeater":
+      return "[]";
+    case "chips":
+      return "[]";
+    case "group":
+      return "{}";
+
+    case "select":
+    case "radio":
+      return "";
+
+    case "date":
+      // A required field's column is NOT NULL — `getColumnDescriptor` derives
+      // that from `required` — so seeding null there fails the insert and the
+      // single is never auto-created on first read. The other required
+      // primitives seed an empty value of their own kind; for a timestamp the
+      // only bindable one is a real date.
+      return "required" in field && field.required ? new Date() : null;
+
+    // The migrated spelling seeds identically: a different empty value here
+    // would persist through `logicalDefaults` and make a later functional
+    // default depend on which side of the storage migration wrote the field.
+    case "relationship":
+    case "upload":
+    case "component":
+    case "fieldGroup":
+      return null;
+
+    default:
+      return "";
+  }
+}
+
+// ============================================================
+// Nested Field Structure Helpers
+// ============================================================
+
+/** Check if a field is an upload field. */
+export function isUploadField(field: FieldConfig): boolean {
+  return field.type === "upload";
+}
+
+/** Check if a field is a repeater field (repeating rows of nested fields). */
+export function isRepeaterField(field: FieldConfig): boolean {
+  return field.type === "repeater";
+}
+
+/** Check if a field is a group field (container with nested fields). */
+export function isGroupField(field: FieldConfig): boolean {
+  return field.type === "group";
+}
+
+/**
+ * Gets nested fields from a repeater or group field.
+ */
+export function getNestedFields(field: FieldConfig): FieldConfig[] {
+  const candidate = field as { fields?: unknown };
+  if (Array.isArray(candidate.fields)) {
+    return candidate.fields as FieldConfig[];
+  }
+  return [];
+}
+
+/**
+ * Safely parses JSON data if it's a string, otherwise returns as-is.
+ * Handles cases where repeater/group field data hasn't been deserialized yet.
+ */
+export function parseJsonIfString(data: unknown): unknown {
+  if (typeof data === "string") {
+    try {
+      return JSON.parse(data);
+    } catch {
+      return data;
+    }
+  }
+  return data;
+}
+
+// ============================================================
+// Upload/Media ID Normalization
+// ============================================================
+
+/**
+ * Extract an ID string from an unknown value that may be a string,
+ * an object with `value` or `id`, or something else.
+ */
+function extractIdFromItem(item: unknown): string {
+  if (typeof item === "string") return item;
+  if (typeof item === "object" && item !== null) {
+    const obj = item as { value?: unknown; id?: unknown };
+    if (typeof obj.value === "string") return obj.value;
+    if (typeof obj.id === "string") return obj.id;
+    // Object branch: avoid `[object Object]` from default toString. JSON.stringify
+    // gives a deterministic representation and satisfies no-base-to-string.
+    try {
+      return JSON.stringify(item);
+    } catch {
+      return "[unstringifiable]";
+    }
+  }
+  return String(item);
+}
+
+/**
+ * Normalizes a field value to an array of IDs.
+ * Handles various formats: single ID, array, PostgreSQL array string, JSON array string.
+ */
+export function normalizeToIdArray(value: unknown): string[] {
+  if (value == null) return [];
+
+  // Already an array
+  if (Array.isArray(value)) {
+    return value.map(extractIdFromItem);
+  }
+
+  // PostgreSQL array string format: {uuid1,uuid2}
+  if (
+    typeof value === "string" &&
+    value.startsWith("{") &&
+    value.endsWith("}")
+  ) {
+    const inner = value.slice(1, -1);
+    if (inner === "") return [];
+    const items: string[] = [];
+    let current = "";
+    let inQuotes = false;
+    for (let i = 0; i < inner.length; i++) {
+      const char = inner[i];
+      if (char === '"' && (i === 0 || inner[i - 1] !== "\\")) {
+        inQuotes = !inQuotes;
+      } else if (char === "," && !inQuotes) {
+        items.push(current.replace(/^"|"$/g, ""));
+        current = "";
+      } else {
+        current += char;
+      }
+    }
+    if (current) {
+      items.push(current.replace(/^"|"$/g, ""));
+    }
+    return items;
+  }
+
+  // JSON array string
+  if (typeof value === "string" && value.startsWith("[")) {
+    try {
+      const jsonParsed: unknown = JSON.parse(value);
+      if (Array.isArray(jsonParsed)) {
+        return jsonParsed.map(extractIdFromItem);
+      }
+    } catch {
+      // Not valid JSON, fall through to single string handling
+    }
+  }
+
+  // Single string ID
+  if (typeof value === "string") {
+    return [value];
+  }
+
+  // Object with id or value
+  if (typeof value === "object" && value !== null) {
+    const obj = value as { value?: unknown; id?: unknown };
+    const id = typeof obj.value === "string" ? obj.value : obj.id;
+    if (typeof id === "string" && id) return [id];
+  }
+
+  return [];
+}
+
+/**
+ * Recursively collects all media IDs from a data object based on field definitions.
+ * Handles nested upload fields inside repeater and group fields.
+ */
+export function collectAllMediaIds(
+  data: unknown,
+  fields: FieldConfig[]
+): string[] {
+  if (!data || typeof data !== "object") return [];
+
+  const record = data as Record<string, unknown>;
+  const mediaIds: string[] = [];
+
+  for (const field of fields) {
+    if (!("name" in field) || !field.name) continue;
+
+    const fieldName = field.name;
+    if (record[fieldName] === undefined || record[fieldName] === null) continue;
+
+    if (isUploadField(field)) {
+      const ids = normalizeToIdArray(record[fieldName]);
+      mediaIds.push(...ids);
+    } else if (isRepeaterField(field)) {
+      const nestedFields = getNestedFields(field);
+      const arrayData = parseJsonIfString(record[fieldName]);
+      if (Array.isArray(arrayData)) {
+        for (const row of arrayData) {
+          if (row && typeof row === "object") {
+            const nestedIds = collectAllMediaIds(row, nestedFields);
+            mediaIds.push(...nestedIds);
+          }
+        }
+      }
+    } else if (isGroupField(field)) {
+      const nestedFields = getNestedFields(field);
+      const groupData = parseJsonIfString(record[fieldName]);
+      if (
+        groupData &&
+        typeof groupData === "object" &&
+        !Array.isArray(groupData)
+      ) {
+        const nestedIds = collectAllMediaIds(groupData, nestedFields);
+        mediaIds.push(...nestedIds);
+      }
+    }
+  }
+
+  return mediaIds;
+}
+
+/**
+ * Recursively expands media IDs in a data object using the provided media lookup map.
+ * Handles nested upload fields inside repeater and group fields.
+ */
+export function expandMediaInData(
+  data: unknown,
+  fields: FieldConfig[],
+  mediaMap: Map<string, Record<string, unknown>>
+): unknown {
+  if (!data || typeof data !== "object") return data;
+
+  const source = data as Record<string, unknown>;
+  const result: Record<string, unknown> = Array.isArray(data)
+    ? ([...(data as unknown[])] as unknown as Record<string, unknown>)
+    : { ...source };
+
+  for (const field of fields) {
+    if (!("name" in field) || !field.name) continue;
+
+    const fieldName = field.name;
+    if (result[fieldName] === undefined) continue;
+
+    if (isUploadField(field)) {
+      const value = result[fieldName];
+      if (value === null || value === undefined) continue;
+
+      const hasMany = "hasMany" in field && field.hasMany === true;
+      const ids = normalizeToIdArray(value);
+
+      if (ids.length === 0) {
+        result[fieldName] = hasMany ? [] : null;
+      } else if (hasMany) {
+        result[fieldName] = ids
+          .map(id => mediaMap.get(String(id)))
+          .filter((m): m is Record<string, unknown> => Boolean(m));
+      } else {
+        result[fieldName] = mediaMap.get(String(ids[0])) ?? null;
+      }
+    } else if (isRepeaterField(field)) {
+      const nestedFields = getNestedFields(field);
+      const arrayData = parseJsonIfString(result[fieldName]);
+      if (Array.isArray(arrayData)) {
+        result[fieldName] = arrayData.map(row => {
+          if (row && typeof row === "object") {
+            return expandMediaInData(row, nestedFields, mediaMap);
+          }
+          return row;
+        });
+      }
+    } else if (isGroupField(field)) {
+      const nestedFields = getNestedFields(field);
+      const groupData = parseJsonIfString(result[fieldName]);
+      if (
+        groupData &&
+        typeof groupData === "object" &&
+        !Array.isArray(groupData)
+      ) {
+        result[fieldName] = expandMediaInData(
+          groupData,
+          nestedFields,
+          mediaMap
+        );
+      }
+    }
+  }
+
+  return result;
+}
+
+// ============================================================
+// JSON Serialization
+// ============================================================
+
+/**
+ * The fields whose values a Single's row holds: those at the top of `fields`, and those inside a
+ * group with no name, which only lays fields out and stores them where it sits. Read through the
+ * shared walk, as the row's columns are (`fieldsStoredOnRow`), so a value inside such a group is
+ * encoded, decoded and normalised as one beside it is.
+ */
+function rowFieldsOf(fields: readonly FieldConfig[]): FieldConfig[] {
+  return addressableFields(fields) as unknown as FieldConfig[];
+}
+
+/**
+ * Deserialize JSON fields from database format to in-memory objects.
+ *
+ * Also normalizes snake_case timestamp columns (`created_at`, `updated_at`)
+ * into their camelCase equivalents using the provided normalizer.
+ */
+export function deserializeJsonFields(
+  doc: SingleDocument,
+  fields: FieldConfig[],
+  logger: Logger,
+  normalizeTimestamp: (value: unknown) => string | null
+): SingleDocument {
+  const result = { ...doc } as Record<string, unknown>;
+
+  // The fields stored on the row, those inside a group with no name among them (`rowFieldsOf`).
+  for (const field of rowFieldsOf(fields)) {
+    if (!("name" in field) || !field.name) continue;
+
+    // Every language's values beside the document, read as stored, decode as
+    // the document's own value does.
+    if (shouldTreatAsJson(field)) {
+      const name = field.name;
+      decodeEachLanguage(result, name, stored => {
+        try {
+          return JSON.parse(stored);
+        } catch {
+          logger.warn("Failed to parse JSON field", { field: name });
+          return stored;
+        }
+      });
+    }
+
+    if (shouldTreatAsJson(field) && result[field.name] != null) {
+      const value = result[field.name];
+      if (typeof value === "string") {
+        try {
+          result[field.name] = JSON.parse(value);
+        } catch {
+          logger.warn("Failed to parse JSON field", {
+            field: field.name,
+          });
+        }
+      }
+    }
+  }
+
+  convertTimestampsToCamelCase(result, { normalize: normalizeTimestamp });
+
+  return result as SingleDocument;
+}
+
+/**
+ * Serialize JSON fields for database storage (stringify objects).
+ */
+export function serializeJsonFields(
+  data: Record<string, unknown>,
+  fields: FieldConfig[]
+): Record<string, unknown> {
+  const result = { ...data };
+
+  // The fields stored on the row, those inside a group with no name among them (`rowFieldsOf`).
+  for (const field of rowFieldsOf(fields)) {
+    if (!("name" in field) || !field.name) continue;
+
+    if (shouldTreatAsJson(field) && result[field.name] != null) {
+      result[field.name] = toJsonColumnValue(result[field.name]);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Normalize upload field values on update input. The admin form receives
+ * expanded media objects like `{ id, url, filename, mimeType, ... }` from
+ * the read API (depth > 0) and sends them back on update. Without this
+ * normalization the object reaches the DB layer and causes errors.
+ *
+ * Mutates `data` in place, replacing expanded objects with their id strings.
+ */
+export function normalizeUploadFields(
+  data: Record<string, unknown>,
+  fields: FieldConfig[]
+): void {
+  // The fields stored on the row, those inside a group with no name among them (`rowFieldsOf`).
+  for (const field of rowFieldsOf(fields)) {
+    if (field.type !== "upload") continue;
+    if (!("name" in field) || !field.name) continue;
+
+    const val = data[field.name];
+    if (val == null) continue;
+
+    if (typeof val === "object" && !Array.isArray(val)) {
+      const obj = val as { id?: unknown };
+      data[field.name] = typeof obj.id === "string" ? obj.id : null;
+    } else if (Array.isArray(val)) {
+      data[field.name] = val.map((item: unknown) => {
+        if (typeof item === "string") return item;
+        if (typeof item === "object" && item !== null) {
+          const obj = item as { id?: unknown };
+          return typeof obj.id === "string" ? obj.id : item;
+        }
+        return item;
+      });
+    }
+  }
+}
+
+// ============================================================
+// Error Handling
+// ============================================================
+
+/**
+ * Build a failure SingleResult from an arbitrary error.
+ *
+ * Recognises NextlyError (canonical throw type) — exposes `statusCode` and
+ * `publicMessage`. Falls back to the generic shape for non-NextlyError errors
+ * so unknown failures don't leak driver text onto the wire.
+ *
+ * Used only by the legacy result-shape callers (single-mutation-service,
+ * single-query-service). Once those migrate to throw-based handlers,
+ * buildSingleErrorResult and the SingleResult error branch can be deleted.
+ */
+/**
+ * The envelope for a Single this read answers no document for: one that is
+ * not registered, or one holding nothing the caller's status view may see.
+ *
+ * ONE shape for both, deliberately. A draft-only Single and a nonexistent one
+ * answer a public caller identically, so the existence of unpublished work
+ * stays invisible -- the message is the same and so is the payload.
+ * `publicData.single` names only what the caller already named: which Single
+ * this refusal is ABOUT. That is what lets a caller reading the Single on
+ * behalf of a card tell the read's own refusal from a `NOT_FOUND` a hook or a
+ * related read raised for something else, without the two cases above coming
+ * apart.
+ */
+export function singleAbsentResult(slug: string): SingleResult {
+  return {
+    success: false,
+    statusCode: 404,
+    message: `Single "${slug}" not found`,
+    publicData: { single: slug },
+  };
+}
+
+/**
+ * The answer for a registered Single that holds no stored document, when the
+ * caller asked not to create one (`createIfMissing: false`): a success with no
+ * `data`. Distinct from {@link singleAbsentResult}, which is a refusal; this
+ * is the read working as asked, and the Direct API turns it into `null`.
+ */
+export function singleWithoutDocumentResult(): SingleResult {
+  return { success: true, statusCode: 200 };
+}
+
+export function buildSingleErrorResult(
+  error: unknown,
+  defaultMessage: string
+): SingleResult {
+  // NextlyError — the canonical error class. Use publicMessage so the wire
+  // never sees logMessage / cause / stack.
+  if (NextlyError.is(error)) {
+    // Per-field validation issues ride the result so the wire envelope can
+    // carry field paths (the SingleResult errors shape predates the
+    // canonical one; map path → field for its consumers).
+    const validationErrors =
+      error.code === "VALIDATION_ERROR"
+        ? (
+            error.publicData as
+              | {
+                  errors?: Array<{
+                    path: string;
+                    code?: string;
+                    message: string;
+                  }>;
+                }
+              | undefined
+          )?.errors
+        : undefined;
+    return {
+      success: false,
+      statusCode: error.statusCode,
+      message: error.publicMessage,
+      ...(validationErrors
+        ? {
+            errors: validationErrors.map(e => ({
+              field: e.path,
+              // The per-field reason travels with the issue. Without it a
+              // boundary normalising this array has to invent one, and a
+              // hook's `REQUIRED` arrives at the client as a generic
+              // `INVALID`.
+              ...(e.code !== undefined ? { code: e.code } : {}),
+              message: e.message,
+            })),
+          }
+        : {}),
+      // Without the code, a Single hook's `authRequired()` or `rateLimited()`
+      // took the boundary's status fallback and reached the caller as a
+      // generic 500, losing the rate-limit backoff with it.
+      ...errorEnvelopeFields(error),
+    };
+  }
+
+  // Every branch routes through the helper, including the ones with no typed
+  // fields to lift. A raw database rejection has nothing to contribute to the
+  // envelope except itself, and that is precisely what the boundary needs to
+  // chain — a branch that returns early is a branch that silently opts out.
+  if (error instanceof Error) {
+    return {
+      success: false,
+      statusCode: 500,
+      message: error.message || defaultMessage,
+      ...errorEnvelopeFields(error),
+    };
+  }
+
+  // A thrown non-Error carries no provenance, and the helper says so by
+  // returning nothing — spread here anyway so the shape of this function is
+  // the same on every path.
+  return {
+    success: false,
+    statusCode: 500,
+    message: defaultMessage,
+    ...errorEnvelopeFields(error),
+  };
+}

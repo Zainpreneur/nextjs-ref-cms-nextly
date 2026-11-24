@@ -1,0 +1,62 @@
+"use client";
+
+import { useQueryClient } from "@tanstack/react-query";
+
+import { toast } from "@admin/components/ui/toaster";
+import { getCsrfToken } from "@admin/lib/api/csrf";
+import { invalidateSessionCache } from "@admin/lib/auth/session";
+import { resetSetupStatusCache } from "@admin/lib/auth/setup-status";
+import {
+  announceSignedOut,
+  forgetPerson,
+} from "@admin/lib/device-memory/device-memory";
+import { navigateTo } from "@admin/lib/navigation";
+
+import { ROUTES } from "../constants/routes";
+
+import { useApi } from "./useApi";
+
+/**
+ * Sign the current user out: end the session server-side, drop every cached
+ * query, and land on the login page with a toast.
+ *
+ * `message` replaces the toast's text, for a sign-out the user did not ask for
+ * directly — one that follows a change which ended their own sessions.
+ */
+export function useLogout(): (opts?: { message?: string }) => Promise<void> {
+  const { api } = useApi();
+  const queryClient = useQueryClient();
+
+  const logout = async (opts?: { message?: string }) => {
+    try {
+      // Use the shared CSRF helper so the wire-shape contract lives in
+      // one place (lib/api/csrf.ts). Pre-Phase-4 this hook duplicated the
+      // fetch and read the legacy `{ data: { csrfToken } }` shape, which
+      // silently broke after the dispatcher was migrated to canonical
+      // `{ token }` per spec §7.6.
+      const csrfToken = await getCsrfToken();
+
+      // Call logout endpoint (protected)
+      await api.protected.post("/auth/logout", { csrfToken });
+      // Clear all cached query data so the next user starts with a clean slate
+      invalidateSessionCache();
+      resetSetupStatusCache();
+      queryClient.clear();
+      // Signed out on purpose: everything this device remembered about the
+      // person goes (the menu, the schemas, their preferences and the
+      // signed-in record, so the next visit opens on the sign-in form), and
+      // every other open tab is told to sign out too. The site's public
+      // branding stays, so the sign-in page keeps its look.
+      forgetPerson();
+      announceSignedOut();
+      // Show success message and redirect
+      toast.success(opts?.message ?? "You have been logged out successfully.");
+      // Redirect to login page
+      navigateTo(ROUTES.LOGIN);
+    } catch (_error: unknown) {
+      toast.error("Logout failed. Please try again later.");
+    }
+  };
+
+  return logout;
+}

@@ -1,0 +1,216 @@
+/**
+ * A status-less "save working draft" returns `_isWorkingDraft` from the server,
+ * but the optimistic merge only writes the status-less PAYLOAD (which carries no
+ * such flag). This pins that the mutation seeds the server RESPONSE into the same
+ * detail query the editor reads, so the Changed state and Publish/Discard
+ * controls appear at once rather than only after the invalidation's refetch —
+ * which may be slow or fail.
+ */
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { renderHook } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const { updateSpy, onScreen } = vi.hoisted(() => ({
+  updateSpy: vi.fn(),
+  onScreen: { localizationEnabled: false },
+}));
+
+vi.mock("@admin/services/entryApi", async importOriginal => {
+  const actual =
+    await importOriginal<typeof import("@admin/services/entryApi")>();
+  return { ...actual, entryApi: { ...actual.entryApi, update: updateSpy } };
+});
+
+vi.mock("@admin/hooks/useLocalization", () => ({
+  useLocalization: () => ({ enabled: onScreen.localizationEnabled }),
+}));
+
+vi.mock("@admin/components/ui", () => ({
+  toast: { success: vi.fn(), error: vi.fn(), dismiss: vi.fn() },
+}));
+
+import { entryKeys } from "@admin/services/entryApi";
+
+import { useUpdateEntry } from "../useUpdateEntry";
+
+function makeWrapper(client: QueryClient) {
+  return function Wrapper({ children }: { children: ReactNode }) {
+    return (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    );
+  };
+}
+
+function makeClient() {
+  return new QueryClient({
+    defaultOptions: { mutations: { retry: false } },
+  });
+}
+
+describe("useUpdateEntry", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    onScreen.localizationEnabled = false;
+  });
+
+  it("seeds the server response into the detail query the editor reads", async () => {
+    const client = makeClient();
+    // The key the editor reads a drafts entry with (working-draft overlay).
+    const key = entryKeys.detailScoped("posts", "e1", {
+      locale: undefined,
+      fallbackLocale: undefined,
+      translationStatus: false,
+      draft: true,
+    });
+    // Cached without the flag, as the status-less optimistic merge leaves it.
+    client.setQueryData(key, { id: "e1", status: "published", title: "old" });
+    // The server's response to a status-less save DOES carry the flag.
+    // Wrapped in the mutation envelope the client returns, so the double is
+    // not looser than the thing it stands in for.
+    updateSpy.mockResolvedValue({
+      item: {
+        id: "e1",
+        status: "published",
+        title: "new",
+        _isWorkingDraft: true,
+      },
+    });
+
+    const { result } = renderHook(
+      () =>
+        useUpdateEntry({
+          collectionSlug: "posts",
+          entryId: "e1",
+          draft: true,
+          showToast: false,
+        }),
+      { wrapper: makeWrapper(client) }
+    );
+
+    await result.current.mutateAsync({ title: "new" });
+
+    // The editor's cached entry now carries the flag without waiting on a refetch.
+    expect(client.getQueryData(key)).toMatchObject({
+      _isWorkingDraft: true,
+      title: "new",
+    });
+  });
+
+  it("leaves a save refused because the entry changed since to the conflict, and reads the current version", async () => {
+    const { toast } = await import("@admin/components/ui");
+    const client = makeClient();
+    const key = entryKeys.detailScoped("posts", "e1", {
+      locale: undefined,
+      fallbackLocale: undefined,
+      translationStatus: false,
+      draft: true,
+    });
+    client.setQueryData(key, { id: "e1", title: "old", _rev: "3" });
+    updateSpy.mockRejectedValue(
+      Object.assign(
+        new Error("This document changed since the version you gave."),
+        {
+          status: 409,
+          code: "STALE_VERSION",
+          data: { currentVersion: "4" },
+        }
+      )
+    );
+
+    const { result } = renderHook(
+      () =>
+        useUpdateEntry({
+          collectionSlug: "posts",
+          entryId: "e1",
+          draft: true,
+          showToast: true,
+        }),
+      { wrapper: makeWrapper(client) }
+    );
+
+    await expect(
+      result.current.mutateAsync({ title: "mine", _rev: "3" })
+    ).rejects.toMatchObject({ code: "STALE_VERSION" });
+
+    // The editor's conflict says it, with the choices; a toast would say it twice.
+    expect(toast.error).not.toHaveBeenCalled();
+    // The entry is read again, so the current version reaches the editor,
+    // whose pinned form keeps the refused edits until the author chooses.
+    expect(client.getQueryState(key)?.isInvalidated).toBe(true);
+  });
+
+  it("clears a stale _isWorkingDraft when the response omits it (publish)", async () => {
+    const client = makeClient();
+    const key = entryKeys.detailScoped("posts", "e1", {
+      locale: undefined,
+      fallbackLocale: undefined,
+      translationStatus: false,
+      draft: true,
+    });
+    // Cached as a pending working draft (Changed state on screen).
+    client.setQueryData(key, {
+      id: "e1",
+      status: "draft",
+      title: "old",
+      _isWorkingDraft: true,
+    });
+    // Publishing returns the live document WITHOUT the synthetic flag.
+    updateSpy.mockResolvedValue({
+      item: { id: "e1", status: "published", title: "new" },
+    });
+
+    const { result } = renderHook(
+      () =>
+        useUpdateEntry({
+          collectionSlug: "posts",
+          entryId: "e1",
+          draft: true,
+          showToast: false,
+        }),
+      { wrapper: makeWrapper(client) }
+    );
+
+    await result.current.mutateAsync({ status: "published" });
+
+    // The stale `true` did not survive the spread — Changed clears at once.
+    expect(client.getQueryData(key)).toMatchObject({
+      _isWorkingDraft: false,
+      status: "published",
+    });
+  });
+
+  it("writes to the document read without translation state where it may not be read", async () => {
+    // A localized editor whose user may not read every language's state reads
+    // the document without `translationStatus`; the save writes to that same
+    // entry, not to one keyed as if the state were asked.
+    onScreen.localizationEnabled = true;
+    const client = makeClient();
+    const key = entryKeys.detailScoped("posts", "e1", {
+      locale: "de",
+      fallbackLocale: "none",
+      translationStatus: false,
+      draft: false,
+    });
+    client.setQueryData(key, { id: "e1", title: "old" });
+    updateSpy.mockResolvedValue({ item: { id: "e1", title: "new" } });
+
+    const { result } = renderHook(
+      () =>
+        useUpdateEntry({
+          collectionSlug: "posts",
+          entryId: "e1",
+          locale: "de",
+          draft: false,
+          // As the editor decides it for this user.
+          translationStatus: false,
+          showToast: false,
+        }),
+      { wrapper: makeWrapper(client) }
+    );
+
+    await result.current.mutateAsync({ title: "new" });
+
+    expect(client.getQueryData(key)).toMatchObject({ title: "new" });
+  });
+});

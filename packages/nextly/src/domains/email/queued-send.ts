@@ -1,0 +1,1556 @@
+/**
+ * A queued email: stored with the caller's change, attempted once that
+ * change commits, and retried through the job queue until it is sent or
+ * fails for good.
+ *
+ * - **Stored, not sent.** `storeQueuedEmail` writes the email's row and the
+ *   job that attempts it in the caller's transaction, so both exist only if
+ *   the caller's change commits. The job's input is the row's id alone: the
+ *   message lives in `email_queue`, sealed under the install's secret, and
+ *   the jobs table holds nothing of it.
+ * - **Attempted by its job.** The first attempt is the job's first run,
+ *   started once the change commits (`runJobNow`), so a jobs trigger running
+ *   at the same moment cannot attempt it twice. A process that stops before
+ *   then leaves the job pending, and the next trigger runs it.
+ * - **Sent under one key.** Every attempt sends with the caller's
+ *   idempotency key, or one derived from the queued email's id, so a retry
+ *   after a lost response is not delivered twice where the provider takes a
+ *   key.
+ * - **Retried only when it may succeed.** A retryable failure is thrown back
+ *   to the job queue, which tries again with backoff up to
+ *   `QUEUED_EMAIL_MAX_ATTEMPTS`; a failure that is not retryable, or the last
+ *   attempt's, fails the email without another attempt.
+ * - **A template is rendered at each attempt**, from the template as saved
+ *   then, so an attempt after the template is fixed sends the fixed version.
+ *
+ * @module domains/email/queued-send
+ */
+
+import { randomUUID } from "node:crypto";
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import type { TransactionContext } from "@nextlyhq/adapter-drizzle/types";
+import { and, desc, eq, gt, inArray, isNotNull } from "drizzle-orm";
+
+import { loadedDialect } from "../../database/dialect-tables";
+import { getDialectTables } from "../../database/index";
+import { NextlyError } from "../../errors";
+import { getNextlyLogger } from "../../observability/logger";
+import type { PrincipalRef } from "../../plugins/principals/types";
+import type { emailQueueMysql } from "../../schemas/email-queue/mysql";
+import type { emailQueuePg } from "../../schemas/email-queue/postgres";
+import type { emailQueueSqlite } from "../../schemas/email-queue/sqlite";
+import { EMAIL_QUEUE_TABLE } from "../../schemas/email-queue/table-name";
+import type { emailQueueRecipientsMysql } from "../../schemas/email-queue-recipients/mysql";
+import type { emailQueueRecipientsPg } from "../../schemas/email-queue-recipients/postgres";
+import type { emailQueueRecipientsSqlite } from "../../schemas/email-queue-recipients/sqlite";
+import type { RowLockServer } from "../../shared/lib/row-lock";
+import { runAdapterTransaction } from "../../shared/lib/run-adapter-transaction";
+import {
+  type PrincipalDigestDb,
+  principalDigestTablesOf,
+  readPrincipalDigests,
+} from "../audit/principal-digest";
+import {
+  defineJob,
+  type JobContext,
+  type JobDefinition,
+} from "../jobs/job-registry";
+import { enqueueInTransaction } from "../jobs/jobs-repository";
+import { openSetting, sealSetting } from "../plugins/settings-crypto";
+
+import { deliveriesTableFor } from "./deliveries-table";
+import { recipientDigest, storableError } from "./delivery-record";
+import { type EmailFailure, httpFailure } from "./failure";
+import { pruneQueuedEmails } from "./prune";
+import {
+  QUEUED_EMAIL_JOB,
+  QUEUED_EMAIL_MAX_ATTEMPTS,
+  QUEUED_EMAIL_PRUNE_JOB,
+} from "./queued-email-job";
+import type { QueuedErasureDb } from "./queued-erasure";
+import {
+  changeRecipients,
+  changesObserved,
+  type FinalRecipient,
+  notifyQueuedEmailChange,
+  type QueuedEmailChange,
+  type QueuedEmailRecipient,
+} from "./queued-send-changes";
+import type { EmailService, SentProvider } from "./services/email-service";
+import { markHtml, TrustedHtml } from "./services/liquid-engine";
+import { toAddressList } from "./services/recipients";
+import { notAcceptedFailure } from "./services/send-failures";
+import { isTemplateCaused } from "./template-failure";
+
+/**
+ * Where a queued email stands.
+ *
+ * - `waiting`: stored, and its next attempt not yet made. Retrying is
+ *   `waiting` with a failure recorded.
+ * - `sending`: an attempt is with the provider.
+ * - `sent`, `failed`, `cancelled`: settled, with no attempt to follow.
+ */
+export type QueuedEmailState =
+  | "waiting"
+  | "sending"
+  | "sent"
+  | "failed"
+  | "cancelled";
+
+/** @experimental A queued email, as `queue` and `queueWithTemplate` return it. */
+export interface QueuedEmail {
+  /** The queued email's id. */
+  id: string;
+  /**
+   * Where it stands when the call returns: `waiting` when queued inside a
+   * transaction, whose commit starts the first attempt; else where that
+   * first attempt left it.
+   */
+  state: QueuedEmailState;
+}
+
+type SendOptions = Parameters<EmailService["send"]>[0];
+type TemplateOptions = NonNullable<
+  Parameters<EmailService["sendWithTemplate"]>[3]
+>;
+
+/** What a queued email sends: a message, or a template with its variables. */
+export type QueuedMessage =
+  | { kind: "message"; send: Omit<SendOptions, "templateSlug"> }
+  | {
+      kind: "template";
+      slug: string;
+      to: string | string[];
+      variables: Record<string, unknown>;
+      options: TemplateOptions;
+      /**
+       * The copies the template added when it was queued. Sent as the
+       * template has them at each attempt; held here, sealed with the
+       * message, so erasing one finds the email, across every re-seal.
+       */
+      templateCopies?: { cc: string[]; bcc: string[] };
+    };
+
+/** The longest template slug the queue records, as its column holds. */
+const TEMPLATE_SLUG_LENGTH = 255;
+
+/**
+ * The names the queue records in clear: any a template can have, but not one
+ * with whitespace or an `@`, the shape of an address passed by mistake, which
+ * is kept only sealed and recorded as no template.
+ */
+const TEMPLATE_SLUG_SHAPE = /^[^\s@]+$/;
+
+/** The queue's table for a dialect. */
+export type EmailQueueTable =
+  | typeof emailQueuePg
+  | typeof emailQueueMysql
+  | typeof emailQueueSqlite;
+
+export function emailQueueTableFor(dialect: string): EmailQueueTable {
+  switch (dialect) {
+    case "postgresql":
+    case "mysql":
+    case "sqlite":
+      // The loaded dialect's own table, so only that dialect's file is
+      // imported; `createAdapter` loads it.
+      return loadedDialect(dialect).tables.emailQueue;
+    default:
+      throw NextlyError.internal({
+        logContext: {
+          reason: "unsupported dialect for the email queue",
+          dialect: String(dialect),
+        },
+      });
+  }
+}
+
+/** The recipients' digests table for a dialect. */
+function emailQueueRecipientsTableFor(
+  dialect: string
+):
+  | typeof emailQueueRecipientsPg
+  | typeof emailQueueRecipientsMysql
+  | typeof emailQueueRecipientsSqlite {
+  // The loaded dialect's own table, so only that dialect's file is imported;
+  // `createAdapter` loads it, and `emailQueueTableFor` has refused any other
+  // dialect by now.
+  return loadedDialect(dialect).tables.emailQueueRecipients;
+}
+
+/** The Drizzle surface the queue needs. */
+interface QueueDb extends QueuedErasureDb {
+  insert(table: unknown): { values(row: unknown): PromiseLike<unknown> };
+}
+
+// ============================================================
+// The sealed message
+// ============================================================
+
+/** The owner the seal authenticates, as core's other sealed values name it. */
+const SEAL_OWNER = "nextly core";
+/** Marks a message sealed under the install's secret. */
+const SEALED = "sealed:";
+/**
+ * Marks a message stored without a seal, which happens only where the
+ * install has no secret to seal under: never in production, which requires
+ * one. As the principal digest key is stored in the same case.
+ */
+const UNSEALED = "unsealed:";
+
+/**
+ * The seal's associated data: the table and the row, so a message copied
+ * into another row fails to open rather than being sent as that row's.
+ */
+function sealPath(id: string): string[] {
+  return [EMAIL_QUEUE_TABLE, id];
+}
+
+/**
+ * A variable's value as stored, tagged by what it was so it reads back as
+ * the same kind of value. Every object is wrapped, so data a caller passed
+ * can never be read back as markup `markHtml` trusted.
+ */
+type StoredValue =
+  | null
+  | boolean
+  | number
+  | string
+  | { h: string }
+  | { d: string }
+  | { a: StoredValue[] }
+  | { o: Record<string, StoredValue> };
+
+/**
+ * A variable's value as stored. What JSON would drop (`undefined`, a
+ * function, a symbol) is dropped, `toJSON` is honoured as JSON honours it,
+ * and a `markHtml` mark and a date keep what they are.
+ */
+function storedValue(
+  value: unknown,
+  seen: Set<object>
+): StoredValue | undefined {
+  if (value === null || typeof value !== "object") return storedScalar(value);
+  if (TrustedHtml.is(value)) return { h: value.html };
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : { d: value.toISOString() };
+  }
+  return storedObject(value, seen);
+}
+
+/** A value that is not an object, as JSON would store it. */
+function storedScalar(value: unknown): StoredValue | undefined {
+  switch (typeof value) {
+    case "string":
+    case "boolean":
+      return value;
+    case "number":
+      return Number.isFinite(value) ? value : null;
+    case "bigint":
+      return value.toString();
+    default:
+      // `null` here; `undefined`, a function and a symbol are dropped.
+      return value === null ? null : undefined;
+  }
+}
+
+/** A list or an object, each entry stored as `storedValue` stores it. */
+function storedObject(
+  value: object,
+  seen: Set<object>
+): StoredValue | undefined {
+  if (seen.has(value)) {
+    throw NextlyError.validation({
+      errors: [
+        {
+          path: "variables",
+          code: "INVALID",
+          message: "An email's variables must not refer to themselves.",
+        },
+      ],
+    });
+  }
+  seen.add(value);
+  try {
+    const json = (value as { toJSON?: unknown }).toJSON;
+    if (typeof json === "function") {
+      return storedValue((json as () => unknown).call(value), seen);
+    }
+    if (Array.isArray(value)) {
+      return { a: value.map(item => storedValue(item, seen) ?? null) };
+    }
+    // No prototype, so a key named `__proto__` is stored as the key it is
+    // rather than taken for the prototype setter and lost.
+    const entries = Object.create(null) as Record<string, StoredValue>;
+    for (const [key, item] of Object.entries(value)) {
+      const stored = storedValue(item, seen);
+      if (stored !== undefined) entries[key] = stored;
+    }
+    return { o: entries };
+  } finally {
+    seen.delete(value);
+  }
+}
+
+/** A stored value read back as the value it was stored from. */
+function readValue(stored: StoredValue): unknown {
+  if (stored === null || typeof stored !== "object") return stored;
+  if ("h" in stored) return markHtml(stored.h);
+  if ("d" in stored) return new Date(stored.d);
+  if ("a" in stored) return stored.a.map(readValue);
+  return Object.fromEntries(
+    Object.entries(stored.o).map(([key, item]) => [key, readValue(item)])
+  );
+}
+
+/** The message as the text that is sealed. */
+function messageText(message: QueuedMessage): string {
+  if (message.kind === "message") return JSON.stringify(message);
+  return JSON.stringify({
+    ...message,
+    variables: storedValue(message.variables, new Set()) ?? { o: {} },
+  });
+}
+
+/** `messageFromText`, undefined rather than a throw for text that does not parse. */
+function parsedMessage(text: string): QueuedMessage | undefined {
+  try {
+    return messageFromText(text);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether `value` has every field a queued email's recipients are read
+ * from. A message whose authentication holds can still be of a shape that
+ * lacks them, and is unreadable rather than a throw part way through a scan.
+ */
+function whole(value: unknown): value is QueuedMessage {
+  const record = (item: unknown): item is Record<string, unknown> =>
+    typeof item === "object" && item !== null;
+  const list = (item: unknown) => item === undefined || Array.isArray(item);
+  const addressed = (fields: unknown, copies: unknown) =>
+    record(fields) &&
+    (typeof fields.to === "string" || Array.isArray(fields.to)) &&
+    list(fields.cc) &&
+    list(fields.bcc) &&
+    record(copies) &&
+    list(copies.cc) &&
+    list(copies.bcc);
+  if (!record(value)) return false;
+  if (value.kind === "message") return addressed(value.send, {});
+  return (
+    value.kind === "template" &&
+    typeof value.slug === "string" &&
+    addressed(
+      { ...(record(value.options) ? value.options : {}), to: value.to },
+      value.templateCopies ?? {}
+    )
+  );
+}
+
+/** The text that was sealed, as the message it was made from. */
+function messageFromText(text: string): QueuedMessage | undefined {
+  const parsed = JSON.parse(text) as unknown;
+  if (!whole(parsed)) return undefined;
+  if (parsed.kind === "message") return parsed;
+  const variables = readValue(parsed.variables as unknown as StoredValue);
+  return {
+    ...parsed,
+    variables:
+      typeof variables === "object" && variables !== null
+        ? (variables as Record<string, unknown>)
+        : {},
+  };
+}
+
+/**
+ * The message as stored: sealed under the current secret, the first of
+ * `secrets`, when the install has one.
+ */
+export function sealQueuedMessage(
+  message: QueuedMessage,
+  id: string,
+  secrets: readonly string[]
+): string {
+  const text = messageText(message);
+  const [current] = secrets;
+  return current === undefined
+    ? `${UNSEALED}${text}`
+    : `${SEALED}${sealSetting(text, current, SEAL_OWNER, sealPath(id))}`;
+}
+
+/**
+ * A stored message, opened with whichever of `secrets` sealed it. Undefined
+ * when it cannot be read: sealed under a secret the install no longer has,
+ * moved from another row, or damaged.
+ */
+export function openQueuedMessage(
+  stored: string,
+  id: string,
+  secrets: readonly string[]
+): QueuedMessage | undefined {
+  try {
+    if (stored.startsWith(UNSEALED)) {
+      return messageFromText(stored.slice(UNSEALED.length));
+    }
+    if (!stored.startsWith(SEALED)) return undefined;
+    const opened = openSetting(
+      stored.slice(SEALED.length),
+      secrets,
+      SEAL_OWNER,
+      sealPath(id)
+    );
+    return opened.readable ? messageFromText(opened.plaintext) : undefined;
+  } catch {
+    // Text that opened but does not parse is damaged, as a bad seal is.
+    return undefined;
+  }
+}
+
+// ============================================================
+// Storing
+// ============================================================
+
+/** What `storeQueuedEmail` stores. */
+export interface QueuedEmailInput {
+  /** Who queued it, the scope its key is claimed in. */
+  scope: string;
+  message: QueuedMessage;
+  /** The person `to` is, as the send records them, when it names one. */
+  person: PrincipalRef | null;
+  /** The install's secrets, current first. */
+  secrets: readonly string[];
+  /** How the database takes the deleted-people lock. */
+  lockServer: RowLockServer;
+  dialect: string;
+  now: Date;
+}
+
+/** A stored queued email: its job, unless it was cancelled as it was stored. */
+export type StoredQueuedEmail =
+  | { id: string; state: "waiting"; jobId: string }
+  | { id: string; state: "cancelled" };
+
+/**
+ * Store a queued email and the job that attempts it, in `tx`. Nothing is
+ * attempted here; the caller starts the job once `tx` has committed.
+ *
+ * One naming a person reads whether they were deleted under the
+ * deleted-people lock, shared, which a deletion takes exclusive: either this
+ * commits first and the deletion then cancels the email, or the deletion
+ * commits first and the email is stored cancelled, with no job, no message
+ * and the person named by their digest.
+ */
+export async function storeQueuedEmail(
+  tx: TransactionContext,
+  input: QueuedEmailInput
+): Promise<StoredQueuedEmail> {
+  const id = randomUUID();
+  const now = input.now.getTime();
+  const db = tx.getDrizzle<QueueDb>();
+  const table = emailQueueTableFor(input.dialect);
+  const erasedAs = input.person
+    ? await deletedDigestOf(tx, input, input.person)
+    : undefined;
+  // The template it is sent from, in clear for the Activity list: a slug
+  // names a kind of message, never a person. A name longer than any stored
+  // template's can name none, and is recorded as no template on every
+  // dialect rather than refused by the narrower columns of two; so is one
+  // that is not slug-shaped.
+  const templateSlug =
+    input.message.kind === "template" &&
+    input.message.slug.length <= TEMPLATE_SLUG_LENGTH &&
+    TEMPLATE_SLUG_SHAPE.test(input.message.slug)
+      ? input.message.slug
+      : null;
+  if (input.person && erasedAs !== undefined) {
+    await db.insert(table).values({
+      id,
+      scope: input.scope,
+      state: "cancelled",
+      jobId: null,
+      message: null,
+      principalKind: input.person.kind,
+      principalId: erasedAs,
+      failure: null,
+      templateSlug,
+      ...shapeOf(input.message),
+      createdAt: now,
+      updatedAt: now,
+      settledAt: now,
+    });
+    return { id, state: "cancelled" };
+  }
+  // Sealed before anything is written, so a message that cannot be stored
+  // (variables that refer to themselves) refuses the queue with nothing left.
+  const message = sealQueuedMessage(input.message, id, input.secrets);
+  const { id: jobId } = await enqueueInTransaction(tx, {
+    slug: QUEUED_EMAIL_JOB,
+    input: { queuedId: id },
+    runAt: null,
+    runAsUserId: null,
+    now: input.now,
+  });
+  await db.insert(table).values({
+    id,
+    scope: input.scope,
+    state: "waiting",
+    jobId,
+    message,
+    principalKind: input.person?.kind ?? null,
+    principalId: input.person?.id ?? null,
+    failure: null,
+    templateSlug,
+    ...shapeOf(input.message),
+    createdAt: now,
+    updatedAt: now,
+    settledAt: null,
+  });
+  await insertRecipientDigests(db, input.dialect, id, input.message);
+  return { id, state: "waiting", jobId };
+}
+
+/**
+ * What a queued email is, in clear for the Activity: a message or a template,
+ * and the kinds of recipient it goes to, `to` first, never an address.
+ */
+function shapeOf(message: QueuedMessage): {
+  messageKind: QueuedMessage["kind"];
+  recipientKinds: string;
+} {
+  return {
+    messageKind: message.kind,
+    recipientKinds: kindsText(
+      queuedRecipients(message).map(entry => entry.kind)
+    ),
+  };
+}
+
+/**
+ * Note on a queued email what its latest attempt went through: the provider
+ * the send resolved, and the kinds of recipient the message finally went to
+ * once the filters had their say, which the queue-time record can't know.
+ * Best effort: the attempt's own outcome is what matters.
+ */
+async function noteAttempt(
+  adapter: DrizzleAdapter,
+  queuedId: string,
+  attempt: {
+    provider: SentProvider | undefined;
+    failed: boolean;
+    finals: readonly FinalRecipient[];
+  }
+): Promise<void> {
+  const { provider, failed, finals } = attempt;
+  // The recipients it went to: one a plugin left out was never sent.
+  const reached = finals.filter(entry => entry.outcome !== "skipped");
+  const values = {
+    ...(provider
+      ? {
+          providerType: provider.type,
+          providerId: provider.id,
+          providerOrigin: provider.origin,
+        }
+      : failed
+        ? // Failed before any provider was asked: no provider is shown for
+          // it, rather than an earlier attempt's. A repeat answered from its
+          // key, which sends nothing, keeps the provider that sent it.
+          { providerType: null, providerId: null, providerOrigin: null }
+        : {}),
+    ...(finals.length > 0
+      ? { recipientKinds: kindsText(reached.map(entry => entry.kind)) }
+      : {}),
+  };
+  if (Object.keys(values).length === 0) return;
+  const queue = emailQueueTableFor(adapter.getCapabilities().dialect);
+  await adapter
+    .getDrizzle<QueueDb>()
+    .update(queue)
+    .set(values)
+    .where(eq(queue.id, queuedId));
+}
+
+/** The Drizzle surface reading an email's latest delivery needs. */
+interface LatestDeliveryDb {
+  select(fields: Record<string, unknown>): {
+    from(table: unknown): {
+      where(condition: unknown): {
+        orderBy(...columns: unknown[]): {
+          limit(count: number): PromiseLike<unknown[]>;
+        };
+      };
+    };
+  };
+}
+
+/**
+ * The provider queued email `queuedId`'s latest delivery went through, as its
+ * delivery record keeps it; undefined when it has none, or none recorded one.
+ */
+async function sentProviderOf(
+  adapter: DrizzleAdapter,
+  queuedId: string
+): Promise<SentProvider | undefined> {
+  const deliveries = deliveriesTableFor(adapter.getCapabilities().dialect);
+  const [latest] = (await adapter
+    .getDrizzle<LatestDeliveryDb>()
+    .select({
+      type: deliveries.providerType,
+      id: deliveries.providerId,
+      origin: deliveries.providerOrigin,
+    })
+    .from(deliveries)
+    .where(eq(deliveries.queuedId, queuedId))
+    .orderBy(desc(deliveries.createdAt), desc(deliveries.id))
+    .limit(1)) as Array<{
+    type: string | null;
+    id: string | null;
+    origin: string | null;
+  }>;
+  if (!latest?.type || !latest.origin) return undefined;
+  return {
+    type: latest.type,
+    id: latest.id,
+    origin: latest.origin as SentProvider["origin"],
+  };
+}
+
+/** Recipient kinds as the queue keeps them: `to` first, each once. */
+function kindsText(kinds: readonly string[]): string {
+  const present = new Set(kinds);
+  return (["to", "cc", "bcc"] as const)
+    .filter(kind => present.has(kind))
+    .join(",");
+}
+
+/**
+ * Every address a queued email goes to, with its kind, `to` first, as the
+ * caller gave them. A template's own copies are fixed addresses of the
+ * site's, not the recipient's, and are not among them.
+ */
+function queuedRecipients(
+  message: QueuedMessage
+): Array<{ kind: "to" | "cc" | "bcc"; address: string }> {
+  const { to, cc, bcc } =
+    message.kind === "message"
+      ? message.send
+      : { to: message.to, ...message.options };
+  const templateCopies =
+    message.kind === "template" ? message.templateCopies : undefined;
+  const of = (kind: "to" | "cc" | "bcc", list: readonly unknown[]) =>
+    list
+      .filter((address): address is string => typeof address === "string")
+      .map(address => ({ kind, address }));
+  return [
+    ...of("to", toAddressList(to)),
+    ...of("cc", [...(cc ?? []), ...(templateCopies?.cc ?? [])]),
+    ...of("bcc", [...(bcc ?? []), ...(templateCopies?.bcc ?? [])]),
+  ];
+}
+
+/**
+ * Write a queued email's recipients by keyed digest, once each, as the
+ * delivery records keep them, under the current secret: what erasing an
+ * address finds the email by. An address that is both `to` and a copy is
+ * kept as `to`.
+ */
+async function insertRecipientDigests(
+  db: QueueDb,
+  dialect: string,
+  id: string,
+  message: QueuedMessage
+): Promise<void> {
+  const byDigest = new Map<string, "to" | "cc" | "bcc">();
+  for (const { kind, address } of queuedRecipients(message)) {
+    const digest = recipientDigest(address);
+    if (!byDigest.has(digest)) byDigest.set(digest, kind);
+  }
+  if (byDigest.size === 0) return;
+  await db.insert(emailQueueRecipientsTableFor(dialect)).values(
+    [...byDigest].map(([recipientHash, recipientKind]) => ({
+      queuedId: id,
+      recipientHash,
+      recipientKind,
+    }))
+  );
+}
+
+/**
+ * The person's digest when they were reported deleted, read under the
+ * deleted-people lock, shared, held until `tx` ends; undefined otherwise.
+ */
+async function deletedDigestOf(
+  tx: TransactionContext,
+  input: QueuedEmailInput,
+  person: PrincipalRef
+): Promise<string | undefined> {
+  const digests = await readPrincipalDigests(
+    tx.getDrizzle<PrincipalDigestDb>(),
+    input.lockServer,
+    principalDigestTablesOf(getDialectTables(input.dialect)),
+    "shared",
+    input.secrets
+  );
+  return (await digests.isDeleted(person)) ? digests.digest(person) : undefined;
+}
+
+/** A queued email's state, or undefined when there is no such email. */
+export async function queuedEmailState(
+  adapter: DrizzleAdapter,
+  id: string
+): Promise<QueuedEmailState | undefined> {
+  const table = emailQueueTableFor(adapter.getCapabilities().dialect);
+  const [row] = (await adapter
+    .getDrizzle<QueueDb>()
+    .select({ state: table.state })
+    .from(table)
+    .where(eq(table.id, id))
+    .limit(1)) as Array<{ state: QueuedEmailState }>;
+  return row?.state;
+}
+
+// ============================================================
+// Attempting
+// ============================================================
+
+/** The states an attempt may start from. `sending` is an attempt that died. */
+const ATTEMPTABLE: QueuedEmailState[] = ["waiting", "sending"];
+
+/** The send service an attempt sends through. */
+export type QueuedEmailSender = Pick<
+  EmailService,
+  "send" | "sendWithTemplate" | "withTemplateCopies"
+> &
+  Partial<
+    Pick<
+      EmailService,
+      "withRecipientReport" | "withQueuedAttempt" | "withProviderReport"
+    >
+  >;
+
+/** What an attempt needs. */
+export interface QueuedAttemptDeps {
+  adapter: DrizzleAdapter;
+  /** The send service as `scope` sends through it. */
+  sender: (scope: string) => QueuedEmailSender;
+  /** The install's secrets, current first. */
+  secrets: readonly string[];
+}
+
+/** The job's input: the queued email's id, and nothing of its message. */
+export type QueuedEmailJobInput = { queuedId: string };
+
+/**
+ * The key a queued email is sent with when its caller gave none: the same on
+ * every attempt, and unlike any other queued email's.
+ */
+export function queuedEmailKey(id: string): string {
+  return `queued-email:${id}`;
+}
+
+/** Failures an attempt's template caused (`thrownAttemptFailure`). */
+const TEMPLATE_FAILURES = new WeakSet<EmailFailure>();
+
+/**
+ * The failure an attempt that threw is recorded with.
+ *
+ * Thrown before any provider answered: the send refused its own input, the
+ * template could not be rendered, or something it needed was not there. One
+ * the error itself marks not retryable is not; otherwise its status decides,
+ * as a provider's HTTP status does (`httpFailure`): a refusal (4xx) fails the
+ * email, and a fault (5xx) is retried. Anything that is not a `NextlyError`
+ * is retried. The reason is the error's public message, with any address
+ * removed.
+ */
+export function thrownAttemptFailure(error: unknown): EmailFailure {
+  const failure = classifiedThrow(error);
+  // Kept beside the failure, never in it: `storedFailure` records it on the
+  // email's row for "Fix template", and the failure a plugin is told of
+  // stays as it was.
+  if (isTemplateCaused(error)) TEMPLATE_FAILURES.add(failure);
+  return failure;
+}
+
+/** The failure a thrown attempt is recorded with, before its cause is kept. */
+function classifiedThrow(error: unknown): EmailFailure {
+  if (!(error instanceof NextlyError)) {
+    return {
+      retryable: true,
+      reason: "The attempt failed before a provider was asked.",
+    };
+  }
+  const retryable =
+    error.logContext?.retryable === false
+      ? false
+      : httpFailure(error.statusCode).retryable;
+  return {
+    retryable,
+    status: error.statusCode,
+    reason: storableError(error.publicMessage),
+  };
+}
+
+/** The key every attempt at `message` is sent with. */
+function attemptKey(message: QueuedMessage, id: string): string {
+  const given =
+    message.kind === "template"
+      ? message.options.idempotencyKey
+      : message.send.idempotencyKey;
+  return given ?? queuedEmailKey(id);
+}
+
+/** The key the caller queued `message` with, when it gave one. */
+function callerKey(message: QueuedMessage): string | undefined {
+  return message.kind === "template"
+    ? message.options.idempotencyKey
+    : message.send.idempotencyKey;
+}
+
+/**
+ * Send the message once. Undefined when it was sent, else why it was not.
+ * Every final recipient, with what became of it, goes to `report`.
+ */
+async function sendOnce(
+  sender: QueuedEmailSender,
+  message: QueuedMessage,
+  id: string,
+  report: (recipients: FinalRecipient[]) => void,
+  onProvider: (provider: SentProvider) => void,
+  onRepeat: () => void = () => undefined
+): Promise<EmailFailure | undefined> {
+  // Each delivery it records names this email, so its attempts read as one
+  // timeline; the provider it goes through is heard from the send itself.
+  const attempting = sender.withQueuedAttempt?.(id) ?? sender;
+  const providing = attempting.withProviderReport?.(onProvider) ?? attempting;
+  const reporting = providing.withRecipientReport?.(report) ?? providing;
+  try {
+    const outcome =
+      message.kind === "template"
+        ? // With the copies it was queued with, which are what its erasure
+          // finds; one sealed before they were kept sends as the template has
+          // them now.
+          await (
+            message.templateCopies
+              ? reporting.withTemplateCopies(message.templateCopies)
+              : reporting
+          ).sendWithTemplate(message.slug, message.to, message.variables, {
+            ...message.options,
+            idempotencyKey: attemptKey(message, id),
+          })
+        : await reporting.send({
+            ...message.send,
+            idempotencyKey: attemptKey(message, id),
+          });
+    // Answered from its key's claim: sent before, nothing sent now.
+    if (outcome.success && outcome.repeat) onRepeat();
+    return outcome.success
+      ? undefined
+      : (outcome.failure ?? notAcceptedFailure());
+  } catch (error) {
+    return thrownAttemptFailure(error);
+  }
+}
+
+/**
+ * A failure as the queue's row records it, with no address, and whether
+ * the template caused it.
+ */
+function storedFailure(failure: EmailFailure): string {
+  return JSON.stringify({
+    retryable: failure.retryable,
+    ...(failure.status !== undefined ? { status: failure.status } : {}),
+    reason: storableError(failure.reason),
+    ...(TEMPLATE_FAILURES.has(failure) ? { template: true } : {}),
+  });
+}
+
+/** A queued email as an attempt reads it after a change. */
+interface HeldRow {
+  state: QueuedEmailState;
+  message: string | null;
+}
+
+/** One change an attempt makes to a queued email's row. */
+interface RowChange {
+  /** The values written, fenced on the row being attemptable. */
+  values: Record<string, unknown>;
+  /** The state the write leaves, which it must read back to have happened. */
+  to: QueuedEmailState;
+  /**
+   * What the plugin that queued it is told, from the row as the write left
+   * it; nothing when it returns undefined.
+   */
+  describe?: (held: HeldRow) => QueuedEmailChange | undefined;
+}
+
+/**
+ * Make `change` to the queued email `row`, in a transaction of its own, and
+ * tell the plugin that queued it in that transaction: a handler that throws
+ * undoes the change, and the attempt that made it is tried again. Answers
+ * the row as the write left it, or undefined when it is gone.
+ */
+async function changeRow(
+  adapter: DrizzleAdapter,
+  row: { id: string; scope: string },
+  change: RowChange,
+  at: Date
+): Promise<HeldRow | undefined> {
+  const table = emailQueueTableFor(adapter.getCapabilities().dialect);
+  return runAdapterTransaction<HeldRow | undefined, TransactionContext>(
+    run => adapter.transaction(ctx => run(ctx)),
+    async tx => {
+      const db = tx.getDrizzle<QueueDb>();
+      await db
+        .update(table)
+        .set({ ...change.values, updatedAt: at.getTime() })
+        .where(and(eq(table.id, row.id), inArray(table.state, ATTEMPTABLE)));
+      const [held] = (await db
+        .select({ state: table.state, message: table.message })
+        .from(table)
+        .where(eq(table.id, row.id))
+        .limit(1)) as HeldRow[];
+      if (held?.state !== change.to) return held;
+      const told = changesObserved(row.scope)
+        ? change.describe?.(held)
+        : undefined;
+      if (told) await notifyQueuedEmailChange(tx, row.scope, told);
+      return held;
+    }
+  );
+}
+
+/** What every change of one attempt says about it. */
+interface AttemptFacts {
+  queuedId: string;
+  attempt: number;
+  at: Date;
+  idempotencyKey?: string;
+}
+
+/** A change of the attempt `facts` describe, as its plugin is told it. */
+function changeOf(
+  facts: AttemptFacts,
+  rest: Omit<QueuedEmailChange, keyof AttemptFacts>
+): QueuedEmailChange {
+  return {
+    queuedId: facts.queuedId,
+    ...(facts.idempotencyKey !== undefined
+      ? { idempotencyKey: facts.idempotencyKey }
+      : {}),
+    attempt: facts.attempt,
+    at: facts.at,
+    ...rest,
+  };
+}
+
+/**
+ * Settle a queued email `state`, telling its plugin. A sent email's message
+ * is cleared as it settles: nothing sends it again, and it is not held a
+ * moment longer than that. A failed one keeps its message until the row is
+ * pruned (`pruneQueuedEmails`).
+ */
+async function settleRow(
+  adapter: DrizzleAdapter,
+  row: { id: string; scope: string },
+  facts: AttemptFacts,
+  settled: Omit<QueuedEmailChange, keyof AttemptFacts> & {
+    state: "sent" | "failed" | "cancelled";
+  }
+): Promise<void> {
+  const { state, failure } = settled;
+  await changeRow(
+    adapter,
+    row,
+    {
+      values: {
+        state,
+        ...(failure ? { failure: storedFailure(failure) } : {}),
+        ...(state === "sent" ? { message: null } : {}),
+        settledAt: facts.at.getTime(),
+      },
+      to: state,
+      describe: () => changeOf(facts, settled),
+    },
+    facts.at
+  );
+  if (state === "failed" && failure) logQueuedEmailFailed(row.id, failure);
+}
+
+/**
+ * Start an attempt: the email is `sending` from here, and its plugin is told.
+ * Answers the message to send, or undefined when there is none to send.
+ *
+ * Read in the same transaction as the write: an erasure that committed since
+ * the first read cancelled the email, and the fenced write then changed
+ * nothing. Once it reads `sending`, an erasure leaves the state alone and
+ * clears the message, and this attempt is the one already with the provider.
+ */
+async function startAttempt(
+  deps: QueuedAttemptDeps,
+  row: { id: string; scope: string },
+  facts: AttemptFacts
+): Promise<QueuedMessage | undefined> {
+  let opened: QueuedMessage | undefined;
+  const held = await changeRow(
+    deps.adapter,
+    row,
+    {
+      values: { state: "sending" },
+      to: "sending",
+      describe: current => {
+        if (current.message === null) return undefined;
+        opened = openQueuedMessage(current.message, row.id, deps.secrets);
+        const key = opened ? callerKey(opened) : undefined;
+        facts.idempotencyKey = key;
+        return changeOf(facts, { state: "sending" });
+      },
+    },
+    facts.at
+  );
+  if (held?.state !== "sending") return undefined;
+  // Cleared by a cancel or an erasure before this attempt took it: nothing
+  // is sent. A cancel reported itself as it was made.
+  if (held.message === null) {
+    await settleRow(deps.adapter, row, facts, {
+      state: "cancelled",
+      cancel: { by: "request" },
+    });
+    return undefined;
+  }
+  opened ??= openQueuedMessage(held.message, row.id, deps.secrets);
+  if (!opened) {
+    await settleRow(deps.adapter, row, facts, {
+      state: "failed",
+      failure: {
+        retryable: false,
+        reason: "The queued message could not be read.",
+      },
+    });
+    return undefined;
+  }
+  facts.idempotencyKey = callerKey(opened);
+  return opened;
+}
+
+/**
+ * Leave a queued email to be tried again after a retryable failure, telling
+ * its plugin. One whose message a cancel cleared while this attempt was with
+ * the provider is cancelled instead, with no attempt to follow.
+ */
+/** Whether a cancel cleared the email's message while its attempt ran. */
+async function messageCleared(
+  adapter: DrizzleAdapter,
+  id: string
+): Promise<boolean> {
+  const db = adapter.getDrizzle<QueueDb>();
+  const table = emailQueueTableFor(adapter.getCapabilities().dialect);
+  const [held] = (await db
+    .select({ message: table.message })
+    .from(table)
+    .where(eq(table.id, id))
+    .limit(1)) as Array<{ message: string | null }>;
+  return held !== undefined && held.message === null;
+}
+
+async function awaitRetry(
+  adapter: DrizzleAdapter,
+  row: { id: string; scope: string },
+  facts: AttemptFacts,
+  failed: { failure: EmailFailure; recipients?: QueuedEmailRecipient[] }
+): Promise<boolean> {
+  const held = await changeRow(
+    adapter,
+    row,
+    {
+      values: { state: "waiting", failure: storedFailure(failed.failure) },
+      to: "waiting",
+      describe: current =>
+        current.message === null
+          ? undefined
+          : changeOf(facts, { state: "retrying", ...failed }),
+    },
+    facts.at
+  );
+  if (held?.message !== null) return true;
+  await settleRow(adapter, row, facts, {
+    state: "cancelled",
+    ...failed,
+    cancel: { by: "request" },
+  });
+  return false;
+}
+
+/**
+ * Make one attempt at a queued email: the `email:send` job's handler.
+ *
+ * Does nothing for an email that is settled or gone, so a job run twice
+ * attempts once. Throws only to have the job queue retry a retryable
+ * failure; every other outcome is recorded on the email's row. Each change
+ * of the row is made in a transaction of its own, in which the plugin that
+ * queued the email is told of it (`queued-send-changes`).
+ */
+export async function attemptQueuedEmail(
+  deps: QueuedAttemptDeps,
+  input: QueuedEmailJobInput,
+  context: Pick<JobContext, "attempt" | "now">
+): Promise<void> {
+  const db = deps.adapter.getDrizzle<QueueDb>();
+  const table = emailQueueTableFor(deps.adapter.getCapabilities().dialect);
+  const [row] = (await db
+    .select({ id: table.id, scope: table.scope, state: table.state })
+    .from(table)
+    .where(eq(table.id, input.queuedId))
+    .limit(1)) as Array<{ id: string; scope: string; state: QueuedEmailState }>;
+  if (!row || !ATTEMPTABLE.includes(row.state)) return;
+
+  const facts: AttemptFacts = {
+    queuedId: row.id,
+    attempt: context.attempt,
+    at: context.now,
+  };
+  const message = await startAttempt(deps, row, facts);
+  if (!message) return;
+
+  let finals: FinalRecipient[] = [];
+  let provider: SentProvider | undefined;
+  let repeated = false;
+  const failure = await sendOnce(
+    deps.sender(row.scope),
+    message,
+    row.id,
+    reported => {
+      finals = reported;
+    },
+    heard => {
+      provider = heard;
+    },
+    () => {
+      repeated = true;
+    }
+  );
+  // A repeat answered from its key's claim sends nothing and hears of no
+  // provider; only a repeat, never an attempt that contacted nobody. The provider that sent it is on the deliveries recorded with
+  // that claim, in its transaction, so it is read from them: an attempt that
+  // stopped after the claim settled and before this note still leaves the
+  // email with the provider that sent it.
+  if (!failure && !provider && repeated) {
+    provider = await sentProviderOf(deps.adapter, row.id).catch(
+      () => undefined
+    );
+  }
+  await noteAttempt(deps.adapter, row.id, {
+    provider,
+    failed: failure !== undefined,
+    finals,
+  }).catch(() => undefined);
+  // Digested before the change's transaction opens: the plugin's digest key
+  // is read on a connection of its own the first time.
+  const recipients = changesObserved(row.scope)
+    ? await changeRecipients(row.scope, finals)
+    : undefined;
+  const told = recipients ? { recipients } : {};
+  if (!failure) {
+    await settleRow(deps.adapter, row, facts, { state: "sent", ...told });
+    return;
+  }
+  if (!failure.retryable || context.attempt >= QUEUED_EMAIL_MAX_ATTEMPTS) {
+    // A cancel that reached this attempt while it was with the provider
+    // cleared its message: the email ends cancelled, as a retryable failure
+    // of it does in `awaitRetry`, not failed.
+    await settleRow(
+      deps.adapter,
+      row,
+      facts,
+      (await messageCleared(deps.adapter, row.id))
+        ? { state: "cancelled", failure, ...told, cancel: { by: "request" } }
+        : { state: "failed", failure, ...told }
+    );
+    return;
+  }
+  if (!(await awaitRetry(deps.adapter, row, facts, { failure, ...told }))) {
+    return;
+  }
+  // To the job queue, which records this as the attempt's error and backs off.
+  throw new NextlyError({
+    code: "EXTERNAL_SERVICE_ERROR",
+    publicMessage: `The queued email was not sent and will be tried again: ${storableError(failure.reason)}`,
+    logContext: { queuedId: row.id, attempt: context.attempt },
+  });
+}
+
+/**
+ * The `email:send` job: one attempt at a queued email per run, retried by
+ * the job queue up to `QUEUED_EMAIL_MAX_ATTEMPTS`. Its dependencies are
+ * resolved per run, so the job can be registered before the send service
+ * exists.
+ */
+export function createQueuedEmailJob(
+  deps: () => QueuedAttemptDeps
+): JobDefinition<QueuedEmailJobInput> {
+  return defineJob<QueuedEmailJobInput>({
+    slug: QUEUED_EMAIL_JOB,
+    retry: { maxAttempts: QUEUED_EMAIL_MAX_ATTEMPTS },
+    handler: async (input, context) => {
+      // A row's input is whatever was stored; one without an id names no
+      // email, and there is nothing to attempt.
+      if (typeof input?.queuedId !== "string") return;
+      const resolved = deps();
+      try {
+        await attemptQueuedEmail(resolved, input, context);
+      } catch (error) {
+        // The last attempt threw before it could record an outcome (the send
+        // service, or the queue's own row, could not be reached), and the
+        // job queue will not try again. The email is settled failed too, so
+        // it does not wait for an attempt that never comes, and its message
+        // is pruned with it. Best effort: the job records the error either way.
+        if (context.attempt >= QUEUED_EMAIL_MAX_ATTEMPTS) {
+          await failExhausted(
+            resolved.adapter,
+            input.queuedId,
+            error,
+            context
+          ).catch(() => undefined);
+        }
+        throw error;
+      }
+    },
+  });
+}
+
+/**
+ * Settle a queued email failed when its last attempt threw, unless it has
+ * settled already, telling its plugin. Should its plugin's handler fail even
+ * then, the email is settled failed without telling it, logged: an email
+ * no attempt follows must not be left waiting for one.
+ */
+async function failExhausted(
+  adapter: DrizzleAdapter,
+  id: string,
+  error: unknown,
+  context: Pick<JobContext, "attempt" | "now">
+): Promise<void> {
+  const table = emailQueueTableFor(adapter.getCapabilities().dialect);
+  const failure = thrownAttemptFailure(error);
+  const [row] = (await adapter
+    .getDrizzle<QueueDb>()
+    .select({ id: table.id, scope: table.scope })
+    .from(table)
+    .where(eq(table.id, id))
+    .limit(1)) as Array<{ id: string; scope: string }>;
+  if (!row) return;
+  const facts = { queuedId: id, attempt: context.attempt, at: context.now };
+  try {
+    await settleRow(adapter, row, facts, { state: "failed", failure });
+    return;
+  } catch (notified) {
+    getNextlyLogger().error({
+      kind: "queued-email-change-not-told",
+      message:
+        "A queued email failed for good, and the plugin that queued it could not be told.",
+      queuedId: id,
+      scope: row.scope,
+      error: notified instanceof Error ? notified.message : String(notified),
+    });
+  }
+  await adapter
+    .getDrizzle<QueueDb>()
+    .update(table)
+    .set({
+      state: "failed",
+      failure: storedFailure(failure),
+      settledAt: context.now.getTime(),
+      updatedAt: context.now.getTime(),
+    })
+    .where(and(eq(table.id, id), inArray(table.state, ATTEMPTABLE)));
+  logQueuedEmailFailed(id, failure);
+}
+
+/**
+ * Say that a queued email failed for good, and why: its sender learns only
+ * its id and state, so the reason reaches the operator here. The reason is
+ * the stored one, with no address in it.
+ */
+function logQueuedEmailFailed(queuedId: string, failure: EmailFailure): void {
+  getNextlyLogger().error({
+    kind: "queued-email-failed",
+    message: `A queued email failed and will not be sent: ${storableError(failure.reason)}`,
+    queuedId,
+    retryable: failure.retryable,
+    ...(failure.status !== undefined ? { status: failure.status } : {}),
+  });
+}
+
+/**
+ * The `email:queue-prune` sweep: a jobs trigger keeps one queued, so settled
+ * queued emails are removed on every jobs run (`pruneQueuedEmails`).
+ */
+export function createQueuedEmailPruneJob(
+  adapter: () => DrizzleAdapter
+): JobDefinition {
+  return defineJob({
+    slug: QUEUED_EMAIL_PRUNE_JOB,
+    sweep: true,
+    handler: async (_input, context) => {
+      await pruneQueuedEmails(adapter(), context.now);
+    },
+  });
+}
+
+// ============================================================
+// Re-sealing at rotation
+// ============================================================
+
+/** Held messages read per statement when re-sealing. */
+const RESEAL_BATCH = 200;
+
+/** The Drizzle surface re-sealing reads held messages through, in id order. */
+interface ResealDb {
+  select(fields: Record<string, unknown>): {
+    from(table: unknown): {
+      where(condition: unknown): {
+        orderBy(column: unknown): {
+          limit(rows: number): PromiseLike<unknown[]>;
+        };
+      };
+    };
+  };
+  update(table: unknown): {
+    set(values: unknown): { where(condition: unknown): PromiseLike<unknown> };
+  };
+}
+
+/**
+ * A held message as it should be stored now, or undefined when it already
+ * is: one sealed under a retired secret, or stored unsealed while the install
+ * now has a secret, is sealed again under the current one. Undefined too for
+ * one no configured secret opens, which re-sealing cannot help.
+ */
+function resealedForm(
+  stored: string,
+  id: string,
+  secrets: readonly string[]
+): { stored: string; text: string } | undefined {
+  const [current] = secrets;
+  if (current === undefined) return undefined;
+  const sealed = (text: string) => ({
+    stored: `${SEALED}${sealSetting(text, current, SEAL_OWNER, sealPath(id))}`,
+    text,
+  });
+  if (stored.startsWith(UNSEALED)) return sealed(stored.slice(UNSEALED.length));
+  if (!stored.startsWith(SEALED)) return undefined;
+  const opened = openSetting(
+    stored.slice(SEALED.length),
+    secrets,
+    SEAL_OWNER,
+    sealPath(id)
+  );
+  if (!opened.readable || !opened.stale) return undefined;
+  return sealed(opened.plaintext);
+}
+
+/**
+ * Seal every held message again under the current secret, the first of
+ * `secrets`, where a retired one sealed it, so a message stays deliverable
+ * across any number of rotations: each rotation's first boot moves every
+ * held message to the new secret while the previous one can still open it.
+ *
+ * Each write is fenced on the message as read, so one an attempt or an
+ * erasure changed meanwhile is left as that left it.
+ *
+ * @returns How many were sealed again, and how many no configured secret
+ *   opens
+ */
+export async function resealQueuedMessages(
+  adapter: DrizzleAdapter,
+  secrets: readonly string[]
+): Promise<{ resealed: number; unreadable: number }> {
+  const result = { resealed: 0, unreadable: 0 };
+  if (secrets.length === 0) return result;
+  const db = adapter.getDrizzle<ResealDb>();
+  const table = emailQueueTableFor(adapter.getCapabilities().dialect);
+  let after = "";
+  for (;;) {
+    const rows = (await db
+      .select({ id: table.id, message: table.message })
+      .from(table)
+      .where(and(isNotNull(table.message), gt(table.id, after)))
+      .orderBy(table.id)
+      .limit(RESEAL_BATCH)) as Array<{ id: string; message: string }>;
+    if (rows.length === 0) return result;
+    for (const row of rows) {
+      const outcome = await resealRow(adapter, row, secrets);
+      if (outcome !== "unchanged") result[outcome] += 1;
+    }
+    after = rows[rows.length - 1].id;
+  }
+}
+
+/**
+ * What re-sealing does to one held message: seals it again when a retired
+ * secret sealed it, or reports it unreadable when no configured secret opens
+ * it or it opens but does not parse. Parsed before anything is written, so a
+ * damaged message is counted and the scan goes on to the rest, which would
+ * otherwise stay sealed under the retired secret.
+ */
+async function resealRow(
+  adapter: DrizzleAdapter,
+  row: { id: string; message: string },
+  secrets: readonly string[]
+): Promise<"resealed" | "unreadable" | "unchanged"> {
+  const next = resealedForm(row.message, row.id, secrets);
+  if (next === undefined) {
+    return openQueuedMessage(row.message, row.id, secrets) === undefined
+      ? "unreadable"
+      : "unchanged";
+  }
+  const parsed = parsedMessage(next.text);
+  if (parsed === undefined) return "unreadable";
+  return (await resealOne(adapter, row, next, parsed))
+    ? "resealed"
+    : "unchanged";
+}
+
+/**
+ * Seal one held message again, and key its recipients' digests again with
+ * it, in one transaction: digests made under a retired secret would no
+ * longer find the email once that secret is dropped, though its message
+ * still opens. Fenced on the message as read, so one an attempt or an
+ * erasure changed meanwhile is left as that left it, and its digests with
+ * it. The digests are made as `storeQueuedEmail` makes them, under the
+ * install's current secret, which is the first of the secrets it seals with.
+ *
+ * @returns Whether it was sealed again
+ */
+async function resealOne(
+  adapter: DrizzleAdapter,
+  row: { id: string; message: string },
+  next: { stored: string; text: string },
+  message: QueuedMessage
+): Promise<boolean> {
+  const dialect = adapter.getCapabilities().dialect;
+  const table = emailQueueTableFor(dialect);
+  return runAdapterTransaction<boolean, TransactionContext>(
+    run => adapter.transaction(ctx => run(ctx)),
+    async ctx => {
+      const db = ctx.getDrizzle<QueueDb>();
+      await db
+        .update(table)
+        .set({ message: next.stored })
+        .where(and(eq(table.id, row.id), eq(table.message, row.message)));
+      const [now] = (await db
+        .select({ message: table.message })
+        .from(table)
+        .where(eq(table.id, row.id))
+        .limit(1)) as Array<{ message: string | null }>;
+      if (now?.message !== next.stored) return false;
+      const recipients = emailQueueRecipientsTableFor(dialect);
+      await db.delete(recipients).where(eq(recipients.queuedId, row.id));
+      await insertRecipientDigests(db, dialect, row.id, message);
+      return true;
+    }
+  );
+}
+
+/**
+ * {@link resealQueuedMessages} at boot, before plugins start. Never throws:
+ * a message that cannot be re-sealed is still opened by the previous secret
+ * until the next rotation, and the app starts either way. Says so when some
+ * held message no configured secret opens, naming what to configure, and
+ * nothing of the messages.
+ */
+/**
+ * Retire the pending job of every cancelled queued email. A cancel retires
+ * its job as it is made (`queued-erasure`); one made before it did leaves a
+ * job a jobs run would only skip, and the overdue count would read it as
+ * waiting. Run at boot, beside the re-seal.
+ */
+export async function retireJobsOfCancelled(
+  adapter: DrizzleAdapter
+): Promise<void> {
+  const dialect = adapter.getCapabilities().dialect;
+  const tables = loadedDialect(dialect).tables;
+  const queue = tables.emailQueue;
+  const jobs = tables.nextlyJobs;
+  const db = adapter.getDrizzle<RetireDb>();
+  for (;;) {
+    const rows = (await db
+      .select({ jobId: queue.jobId })
+      .from(queue)
+      .innerJoin(jobs, eq(jobs.id, queue.jobId))
+      .where(and(eq(queue.state, "cancelled"), eq(jobs.state, "pending")))
+      .limit(RETIRE_BATCH)) as Array<{ jobId: string }>;
+    if (rows.length === 0) return;
+    await db
+      .update(jobs)
+      .set({
+        state: "done",
+        nextAttemptAt: null,
+        lastError: "The queued email was cancelled.",
+        lockedBy: null,
+        lockedUntil: null,
+        dedupeKey: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          inArray(
+            jobs.id,
+            rows.map(row => row.jobId)
+          ),
+          eq(jobs.state, "pending")
+        )
+      );
+    if (rows.length < RETIRE_BATCH) return;
+  }
+}
+
+/** Jobs retired per statement at boot. */
+const RETIRE_BATCH = 500;
+
+/** The Drizzle surface the boot retirement needs. */
+interface RetireDb {
+  select(fields: Record<string, unknown>): {
+    from(table: unknown): {
+      innerJoin(
+        table: unknown,
+        on: unknown
+      ): {
+        where(condition: unknown): {
+          limit(count: number): PromiseLike<unknown[]>;
+        };
+      };
+    };
+  };
+  update(table: unknown): {
+    set(values: unknown): { where(condition: unknown): PromiseLike<unknown> };
+  };
+}
+
+export async function resealQueuedMessagesAtBoot(
+  adapter: DrizzleAdapter,
+  secrets: readonly string[]
+): Promise<void> {
+  await retireJobsOfCancelled(adapter).catch(error =>
+    getNextlyLogger().error({
+      kind: "queued-email-job-retirement-failed",
+      message: error instanceof Error ? error.message : String(error),
+    })
+  );
+  try {
+    const { unreadable } = await resealQueuedMessages(adapter, secrets);
+    if (unreadable > 0) {
+      getNextlyLogger().warn({
+        kind: "queued-email-unreadable",
+        message: `${unreadable} queued email${unreadable === 1 ? "" : "s"} cannot be read with the configured secrets and will not be sent. Configure the secret they were sealed under in NEXTLY_SECRET_PREVIOUS.`,
+      });
+    }
+  } catch (error) {
+    getNextlyLogger().error({
+      kind: "queued-email-reseal-failed",
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}

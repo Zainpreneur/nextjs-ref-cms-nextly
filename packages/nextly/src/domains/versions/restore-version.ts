@@ -1,0 +1,1003 @@
+/**
+ * Putting a document back to an earlier version.
+ *
+ * A restore is an ordinary write. It loads snapshot vN, decides what of it may
+ * be resubmitted, and sends that through the same update path a human edit
+ * uses, so validation, hooks, component and many-to-many writes, events and the
+ * outbox all behave identically. The write records `sourceVersionNo`, which is
+ * the only thing distinguishing it afterwards.
+ *
+ * History is never rewritten: restoring produces a new version rather than
+ * removing the ones after it, so a restore made in error is undone by restoring
+ * again.
+ *
+ * @module domains/versions/restore-version
+ */
+
+import type { AuthenticatedScope } from "../../auth/authenticated-scope";
+import type { RequestActor } from "../../auth/request-actor";
+import type { FieldConfig } from "../../collections/fields/types";
+import { getService, type ServiceMap } from "../../di";
+import { NextlyError } from "../../errors";
+import { NEXTLY_ERROR_STATUS } from "../../errors/error-codes";
+import type { ServiceErrorEnvelope } from "../../errors/from-service-envelope";
+import { errorFromServiceEnvelope } from "../../errors/from-service-envelope";
+import { originalErrorOf } from "../../errors/original-error";
+import { rethrowIfRuleCouldNotRun } from "../../errors/rule-could-not-run";
+import type { VersionScopeKind } from "../../schemas/versions/types";
+import {
+  applyFieldReadAccess,
+  applyFieldWriteAccess,
+  callerAccessGrants,
+} from "../../shared/lib/field-level-registry";
+import { refuseHistoryWriteIfRemovedFromCode } from "../dynamic-collections/services/removed-from-code-writes";
+import { extractFieldGroupReferences } from "../field-groups/storage/field-group-field-type";
+import { appLocalization } from "../i18n/configured-locales";
+import { storesPerLanguage } from "../i18n/per-language-storage";
+import { configuredLocale } from "../i18n/resolve-locale";
+import type { UserContext } from "../singles/types";
+
+import { applyComponentReadAccess } from "./component-read-access";
+import {
+  DOCUMENT_OVERWRITE_KEY,
+  DOCUMENT_VERSION_KEY,
+} from "./document-revision";
+import {
+  buildRestorePayload,
+  payloadTouchesComponents,
+  restoreLocaleIsUnknown,
+  schemaStoresPerLocaleContent,
+  type ComponentSchemaInfo,
+  type ComponentSchemas,
+} from "./restore-snapshot";
+
+export interface RestoreVersionArgs {
+  scopeKind: VersionScopeKind;
+  slug: string;
+  entryId: string;
+  versionNo: number;
+  /**
+   * The person the restore is made as, judged by every read and write rule.
+   * Absent for trusted server code (the Direct API and a plugin acting as
+   * itself), which no rule judges, as its own writes are not judged.
+   */
+  user?: UserContext;
+  /**
+   * Who performed the write, recorded on the outbox event. Forwarded so an
+   * API-key restore is attributed to the key rather than to its owner, which
+   * would make it indistinguishable from that person editing by hand.
+   */
+  actor?: RequestActor;
+  /**
+   * The caller's authenticated scope. A restore replays a snapshot through the
+   * update path, so when the snapshot sets `status: "published"` it hits the
+   * publish transition gate — which for a scoped API key must judge the key's
+   * OWN `publish-<slug>` grant, not the owner's RBAC.
+   */
+  authenticatedScope?: AuthenticatedScope;
+  /**
+   * The HTTP request behind the restore, when one produced it.
+   *
+   * A restore replays a snapshot through the ordinary update, so its hooks run
+   * exactly as an edit's do. Without this a restore an editor clicked would
+   * reach them looking like server-side work, and a rule that treats those two
+   * differently would apply the wrong one.
+   */
+  request?: Request;
+  /**
+   * What the caller hands the update's hooks as `ctx.context`, as an ordinary
+   * write hands it: a plugin's own data, so a hook that reads it decides a
+   * restore as it decides the plugin's other writes.
+   */
+  context?: Record<string, unknown>;
+  /**
+   * The version the restore was made from (`_rev`) and the overwrite choice
+   * (`_overwrite`), as a save's data carries them. A restore puts an old
+   * version's content over the document as it is now, so it is judged as the
+   * update it makes is: made from an out-of-date view, it would undo a save
+   * the restorer never saw. Only those two keys are read.
+   */
+  version?: Readonly<Record<string, unknown>>;
+  /**
+   * The fields to restore, by top-level name; every field the version holds
+   * when absent. A name the version does not hold restores nothing.
+   */
+  fields?: readonly string[];
+}
+
+export type RestoreVersionResult = {
+  /** The version that was restored from. */
+  restoredFrom: number;
+  /**
+   * The document's version after the restore, as the next read gives it, so a
+   * save can follow without reading first.
+   *
+   * @experimental
+   */
+  _rev?: string;
+  /**
+   * Snapshot keys the current schema no longer has. Surfaced so a caller can
+   * tell the editor what could not come back, rather than reporting a restore
+   * that silently left parts behind.
+   */
+  droppedFields: string[];
+};
+
+/** Current field configs and whether the entity stores values per locale. */
+interface EntityDescription {
+  fields: FieldConfig[];
+  localized: boolean;
+  hasStatus: boolean;
+  /** Whether versions are still being captured for this entity. */
+  versioningEnabled: boolean;
+  /**
+   * Whether it keeps a working draft beside what is published, which is what a
+   * restore writes: without one, versions are history only.
+   */
+  draftsEnabled: boolean;
+  /**
+   * Plugin collections get no synthesized `title`/`slug` columns — the update
+   * path makes the same distinction before touching a slug.
+   */
+  isPlugin: boolean;
+}
+
+async function describeEntity(
+  scopeKind: VersionScopeKind,
+  slug: string
+): Promise<EntityDescription> {
+  // Read from the registry rather than the metadata service: the latter
+  // injects synthetic `title`/`slug` field definitions for the entry form, so
+  // its field list would report columns a plugin collection's table does not
+  // actually have.
+  const record =
+    scopeKind === "single"
+      ? await getService("singleRegistryService").getSingleBySlug(slug)
+      : ((await getService("collectionRegistryService").getCollectionBySlug(
+          slug
+        )) as unknown);
+
+  const shape = record as {
+    fields?: unknown[];
+    localized?: boolean;
+    status?: boolean;
+    versions?: {
+      enabled?: boolean;
+      drafts?: { enabled?: boolean } | null;
+    } | null;
+    admin?: { isPlugin?: boolean } | null;
+  } | null;
+
+  return {
+    fields: (shape?.fields ?? []) as FieldConfig[],
+    localized: Boolean(shape?.localized),
+    hasStatus: Boolean(shape?.status),
+    versioningEnabled: Boolean(shape?.versions?.enabled),
+    // The same test the update path makes before it holds a write as a draft.
+    draftsEnabled:
+      Boolean(shape?.status) && shape?.versions?.drafts?.enabled === true,
+    isPlugin: shape?.admin?.isPlugin === true,
+  };
+}
+
+/**
+ * One component's schema as the registry records it, read through `lookup`.
+ * A slug with no record is answered as unresolved; a lookup that throws
+ * propagates.
+ */
+async function readComponentSchema(
+  lookup: ServiceMap["fieldGroupRegistryService"]["getComponentBySlug"],
+  slug: string
+): Promise<ComponentSchemaInfo> {
+  try {
+    const record = await lookup(slug);
+    // The component's OWN localization switch: its values live in its own
+    // tables, so an unlocalized component inside a localized document
+    // stores one copy of each value. A slug with no record behind it is
+    // marked unresolved rather than empty — a component that declares no
+    // fields is legitimate and must stay restorable.
+    return {
+      fields: record?.fields ?? [],
+      // Kept per language when the component is translated, or for every component under
+      // `experimental.perLanguageStorage`.
+      localized: storesPerLanguage(record ?? { localized: false }),
+      resolved: record !== null && record !== undefined,
+    };
+  } catch (cause) {
+    // A missing component returns null above; a throw here is a lookup
+    // failure (registry or database), not a confirmed absence. Recording
+    // it as unresolved would let a transient error masquerade as a
+    // deleted component, and a caller that drops or publishes an unknown
+    // subtree would then silently discard or expose data. Propagate so
+    // the request fails and can be retried; a typed error is preserved.
+    throw cause instanceof NextlyError
+      ? cause
+      : NextlyError.internal({
+          cause: cause instanceof Error ? cause : undefined,
+          logContext: { component: slug },
+        });
+  }
+}
+
+/**
+ * Child fields for every component the schema references, keyed by slug.
+ *
+ * A component field names its schema rather than carrying it, so the payload
+ * filter cannot see inside one without this. A component the registry reports
+ * as absent (no record) is marked unresolved, which makes the filter treat that
+ * subtree as unknown and drop it — the safe direction, since resubmitting a
+ * subtree it cannot inspect could overwrite a nested credential. A lookup that
+ * throws is the different case: it is not proof the component is gone, so the
+ * error propagates rather than being recorded as an absence.
+ *
+ * A caller that holds some definitions itself, such as a configuration not yet
+ * synced to the registry, passes them as `known`: they are used in place of the
+ * registry's, nested references included. With `readRegistry: false` a slug
+ * `known` lacks is left out rather than read.
+ */
+export async function resolveComponentSchemas(
+  fields: FieldConfig[],
+  /**
+   * The transaction-bound executor, for a caller resolving these while its
+   * transaction holds a connection: the reads then run on it, rather than on a
+   * second pooled connection that cannot see its writes and can stall behind it.
+   */
+  executor?: unknown,
+  options: {
+    known?: ReadonlyMap<string, ComponentSchemaInfo>;
+    readRegistry?: boolean;
+  } = {}
+): Promise<ComponentSchemas> {
+  const slugs = new Set<string>();
+
+  const collect = (list: FieldConfig[]): void => {
+    for (const field of list) {
+      // Through the shared extractor: a restore whose schema walk misses a
+      // migrated definition's slugs leaves those subtrees opaque, and an
+      // opaque subtree can be neither credential-filtered nor pruned.
+      const { single, many } = extractFieldGroupReferences(field);
+      if (single !== undefined) slugs.add(single);
+      if (many !== undefined) {
+        for (const slug of many) slugs.add(slug);
+      }
+      const nested = (field as { fields?: unknown }).fields;
+      if (Array.isArray(nested)) collect(nested as FieldConfig[]);
+    }
+  };
+  collect(fields);
+
+  const resolved: ComponentSchemas = new Map();
+  if (slugs.size === 0) return resolved;
+
+  // Read only when a slug needs it, so a caller holding every definition
+  // never reaches the registry.
+  let registry: ServiceMap["fieldGroupRegistryService"] | undefined;
+  const lookup = (slug: string) => {
+    registry ??= getService("fieldGroupRegistryService");
+    return registry.getComponentBySlug(slug, executor);
+  };
+  const leftOut = new Set<string>();
+
+  // A component may embed another, so resolving only the entity's own layer
+  // would leave the deeper ones opaque — and an opaque subtree is one the
+  // filter can neither inspect for credentials nor prune. Resolve until no
+  // new slug is discovered; the `resolved` map doubles as the visited set, so
+  // a cycle terminates.
+  let pending = [...slugs];
+  while (pending.length > 0) {
+    const batch = pending.filter(
+      slug => !resolved.has(slug) && !leftOut.has(slug)
+    );
+    if (batch.length === 0) break;
+
+    await Promise.all(
+      batch.map(async slug => {
+        const schema =
+          options.known?.get(slug) ??
+          (options.readRegistry === false
+            ? undefined
+            : await readComponentSchema(lookup, slug));
+        if (schema === undefined) leftOut.add(slug);
+        else resolved.set(slug, schema);
+      })
+    );
+
+    const discovered = new Set<string>();
+    for (const slug of batch) {
+      const collected = new Set<string>();
+      const gather = (list: FieldConfig[]): void => {
+        for (const field of list) {
+          const { single, many } = extractFieldGroupReferences(field);
+          if (single !== undefined) collected.add(single);
+          if (many !== undefined) {
+            for (const s of many) collected.add(s);
+          }
+          const nested = (field as { fields?: unknown }).fields;
+          if (Array.isArray(nested)) gather(nested as FieldConfig[]);
+        }
+      };
+      gather(resolved.get(slug)?.fields ?? []);
+      for (const s of collected) if (!resolved.has(s)) discovered.add(s);
+    }
+
+    pending = [...discovered];
+  }
+
+  return resolved;
+}
+
+/**
+ * The version's locale, when the app still configures it.
+ *
+ * Locales come and go from configuration. A version captured under one that has
+ * since been removed names a language nothing can be written to, so it is
+ * treated the same as a version that never recorded one.
+ */
+function usableLocale(versionLocale: string | null): string | null {
+  if (versionLocale === null) return null;
+  // The site's languages as they are now, so a site whose languages are stored
+  // rather than declared in its configuration validates against that list too.
+  const localization = appLocalization();
+  // Without languages there is no locale to validate against, and nothing
+  // reads one either.
+  if (!localization) return null;
+  // An older spelling of a configured language is read as the code its rows are stored under.
+  return configuredLocale(localization, versionLocale) ?? null;
+}
+
+/**
+ * Remove from `payload` every key an access probe changed, reporting each.
+ *
+ * The read and write rules are evaluated separately but answered the same way:
+ * a key the probe dropped, or a container it altered, is one this caller may
+ * not carry. Holding a changed container back whole is deliberate — submitting
+ * it half-stripped would overwrite the live value with a partial one, which is
+ * worse than not restoring the field.
+ *
+ * Shared so the two probes cannot drift apart, which is the failure this file
+ * has already seen more than once.
+ */
+function dropFieldsTheProbeRejected(
+  payload: Record<string, unknown>,
+  probe: Record<string, unknown>,
+  droppedFields: string[]
+): void {
+  for (const key of Object.keys(payload)) {
+    if (!(key in probe) || !deepEquals(payload[key], probe[key])) {
+      delete payload[key];
+      droppedFields.push(key);
+    }
+  }
+}
+
+/**
+ * Drop from `payload` every field the restorer may not read, and report it.
+ *
+ * Every read rule runs, the entity's own and each component's on the
+ * instances the version holds, judging a scoped API key on its own grants.
+ * Rules that cannot be evaluated decide nothing, so the restore is refused
+ * rather than applied with values the caller may never have been able to read.
+ */
+async function dropFieldsTheReaderMayNotRead(
+  args: RestoreVersionArgs & { user: UserContext },
+  payload: Record<string, unknown>,
+  fields: FieldConfig[],
+  componentSchemas: ComponentSchemas,
+  droppedFields: string[]
+): Promise<void> {
+  // `args.entryId` is the id as stored: the versions routes refuse a restore
+  // whose id is not exactly the live row's (`assertVersionDocumentReadable`).
+  const readProbe: Record<string, unknown> = {
+    ...structuredClone(payload),
+    id: args.entryId,
+  };
+  const readCaller = {
+    user: args.user,
+    authenticatedScope: args.authenticatedScope,
+    grants: callerAccessGrants(args.user, args.authenticatedScope),
+  };
+  try {
+    await applyFieldReadAccess({
+      kind: args.scopeKind === "single" ? "single" : "collection",
+      slug: args.slug,
+      entry: readProbe,
+      user: args.user,
+      authenticatedScope: args.authenticatedScope,
+      grants: readCaller.grants,
+      overrideAccess: false,
+    });
+    await applyComponentReadAccess(
+      readProbe,
+      fields,
+      new Map(
+        [...componentSchemas].map(([slug, schema]) => [slug, schema.fields])
+      ),
+      readCaller
+    );
+  } catch (error) {
+    // A rule that could not run never answered: the request ends with that,
+    // not with a refusal.
+    rethrowIfRuleCouldNotRun(error);
+    throw NextlyError.forbidden({
+      ...(error instanceof Error ? { cause: error } : {}),
+      logContext: {
+        reason: "restore-read-rules-unevaluated",
+        scopeKind: args.scopeKind,
+        scopeSlug: args.slug,
+        entryId: args.entryId,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
+  }
+  dropFieldsTheProbeRejected(payload, readProbe, droppedFields);
+}
+
+/**
+ * Structural equality for payload values.
+ *
+ * Used to tell whether field-level rules changed a container while probing.
+ * Snapshot values are JSON, so key order is the only ambiguity and comparing
+ * sorted keys settles it.
+ */
+function deepEquals(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (
+    typeof a !== "object" ||
+    typeof b !== "object" ||
+    a === null ||
+    b === null
+  )
+    return false;
+
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length)
+      return false;
+    return a.every((item, i) => deepEquals(item, b[i]));
+  }
+
+  const aKeys = Object.keys(a).sort();
+  const bKeys = Object.keys(b).sort();
+  if (aKeys.length !== bKeys.length) return false;
+  if (!aKeys.every((key, i) => key === bKeys[i])) return false;
+
+  return aKeys.every(key =>
+    deepEquals(
+      (a as Record<string, unknown>)[key],
+      (b as Record<string, unknown>)[key]
+    )
+  );
+}
+
+/**
+ * Restore `versionNo` into the document's working draft.
+ *
+ * The chosen fields (every field the version holds, unless `fields` names
+ * some) are written as an edit held as a draft, so they reach the drafts of
+ * the parts the version holds (its language's and the shared one) and nothing
+ * published moves: status is never restored, so a restore never publishes or
+ * unpublishes. A collection or Single without drafts keeps versions as history
+ * only, and has no working draft to write, so its restore is refused.
+ *
+ * The caller is expected to have already established that this user may read
+ * the document's history and may update the document; this performs the write
+ * with access still enforced, so a mistake upstream cannot escalate.
+ */
+export async function restoreVersion(
+  args: RestoreVersionArgs
+): Promise<RestoreVersionResult> {
+  // Refused first when the collection or Single is removed from code, before
+  // the version is read or replayed.
+  await refuseHistoryWriteIfRemovedFromCode({
+    scopeKind: args.scopeKind,
+    scopeSlug: args.slug,
+  });
+  if (!Number.isInteger(args.versionNo) || args.versionNo < 1) {
+    throw NextlyError.validation({
+      errors: [
+        {
+          path: "versionNo",
+          code: "INVALID_VALUE",
+          message: "Version number must be a positive integer.",
+        },
+      ],
+    });
+  }
+
+  const {
+    fields,
+    localized,
+    hasStatus,
+    versioningEnabled,
+    draftsEnabled,
+    isPlugin,
+  } = await describeEntity(args.scopeKind, args.slug);
+
+  // Refused before the version is read: without drafts the only place to put
+  // the version back is the live document, which would publish it.
+  if (!draftsEnabled) {
+    throw new NextlyError({
+      code: "BUSINESS_RULE_VIOLATION",
+      publicMessage:
+        "This content keeps no drafts, so a version can only be restored by editing it back.",
+      logContext: {
+        reason: "restore-needs-drafts",
+        scopeKind: args.scopeKind,
+        scopeSlug: args.slug,
+        entryId: args.entryId,
+      },
+    });
+  }
+
+  const versions = getService("versionsService");
+  const version = await versions.get(
+    {
+      scopeKind: args.scopeKind,
+      scopeSlug: args.slug,
+      entryId: args.entryId,
+    },
+    args.versionNo
+  );
+
+  // The write goes through the ordinary update, which captures a version only
+  // while versioning is on. With it off, a restore would overwrite live content
+  // without preserving the state it replaced and without recording that it
+  // happened — turning a recoverable action into a destructive one.
+  if (!versioningEnabled) {
+    throw NextlyError.validation({
+      errors: [
+        {
+          path: "versionNo",
+          code: "VERSIONING_DISABLED",
+          message:
+            "Versioning is turned off for this content, so a restore could not be recorded.",
+        },
+      ],
+      logContext: {
+        reason: "restore-versioning-disabled",
+        scopeKind: args.scopeKind,
+        scopeSlug: args.slug,
+        entryId: args.entryId,
+      },
+    });
+  }
+
+  // A localized snapshot holds one locale's values, and a version that records
+  // none cannot say whose. Rather than refuse the whole restore, the per-locale
+  // part is left alone and the shared fields are applied — a version produced by
+  // a shared-field-only edit then restores exactly what it captured. Whatever is
+  // held back is reported; a snapshot with nothing shared left falls through to
+  // the empty-payload refusal below.
+  // A locale the app no longer configures cannot be written: both update paths
+  // reject an unknown one, so carrying it would fail the whole restore instead
+  // of applying the shared fields it could still bring back.
+  const storedLocale = usableLocale(version.locale);
+
+  const componentSchemas = await resolveComponentSchemas(fields);
+
+  // Per-locale content is not only the document's own. An unlocalized document
+  // embedding a localized component still holds values that belong to one
+  // language, and writing them with no locale resolves the default one — so a
+  // German component snapshot would land on top of the default language.
+  // Where its values are stored, which decides whose language a snapshot holds: per language
+  // when it is translated, or always under per-language storage. `localized` stays the
+  // product's flag, for how the restored document publishes.
+  const storedPerLanguage = storesPerLanguage({ localized });
+  const perLocaleContent = schemaStoresPerLocaleContent(
+    storedPerLanguage,
+    fields,
+    componentSchemas
+  );
+  const localeUnknown = restoreLocaleIsUnknown(perLocaleContent, storedLocale);
+  const declared = new Set(fields.map(f => f.name));
+
+  const { payload, droppedFields } = buildRestorePayload(
+    version.snapshot,
+    fields,
+    {
+      hasStatus,
+      // Synthesized for ordinary entities, but a plugin collection has these
+      // columns only when it declares them as fields — the same distinction the
+      // update path makes before it touches a slug.
+      hasSlug: isPlugin ? declared.has("slug") : true,
+      hasTitle: isPlugin ? declared.has("title") : true,
+      componentSchemas,
+      documentLocalized: localized,
+      localeUnknown,
+    }
+  );
+
+  // Field-level READ rules decide what of the snapshot this caller was ever
+  // allowed to see. A field hidden from them must not be written back from a
+  // version they could not have read — the history endpoints redact the same
+  // snapshot before returning it, and restoring is the one path that would
+  // otherwise apply it unredacted.
+  //
+  // Probed on a deep copy for the same reason as the write rules below: these
+  // strip nested keys in place.
+  //
+  // The probe carries the document's id, which the payload deliberately does
+  // not: `id` is immutable and was stripped before this point. A field rule
+  // keyed on the document would otherwise evaluate with
+  // no id and hide fields the same caller can read in version history, making
+  // restore stricter than the endpoint the snapshot came from.
+  // Trusted server code reads every field, as its own reads do.
+  if (args.user) {
+    await dropFieldsTheReaderMayNotRead(
+      { ...args, user: args.user },
+      payload,
+      fields,
+      componentSchemas,
+      droppedFields
+    );
+  }
+
+  // Status is never restored: the restore is an edit held as a draft, and
+  // carrying a version's status would publish or retract with it.
+  delete payload.status;
+  // Nor is it reported as left behind when a read rule withheld it.
+  if (droppedFields.includes("status")) {
+    droppedFields.splice(droppedFields.indexOf("status"), 1);
+  }
+  // The fields chosen, narrowed only now: the read rules above judged each
+  // field against the whole version, as a version read does, since a rule
+  // may consult values the restore does not bring back. What is reported as
+  // left behind is narrowed to the chosen fields too.
+  keepOnlyChosen(payload, args.fields);
+  narrowToChosen(droppedFields, args.fields);
+
+  // Field-level write rules strip denied keys inside the update path, silently
+  // and after it has already reported success. Evaluating the same rules here
+  // — against a copy, so nothing is mutated — turns that into something the
+  // caller can be told about instead of a restore that reports success for
+  // content it never applied.
+  //
+  // The copy is deep. These rules strip nested keys by mutating the container
+  // in place, so a shallow copy would share every group and repeater with the
+  // real payload: the probe would edit the very thing it is meant to leave
+  // alone, and the comparison below — which walks keys, not identity — would
+  // see the two agreeing and report nothing.
+  // Trusted server code writes every field, so it has no rules to probe.
+  if (args.user) {
+    await dropFieldsTheWriterMayNotWrite(
+      { ...args, user: args.user },
+      payload,
+      droppedFields
+    );
+  }
+
+  if (Object.keys(payload).length === 0) {
+    throw NextlyError.validation({
+      errors: [
+        {
+          path: "versionNo",
+          code: "NOTHING_TO_RESTORE",
+          message:
+            "No part of this version can be applied to the document as it is now.",
+        },
+      ],
+      logContext: {
+        reason: "restore-empty-payload",
+        droppedFields,
+        localeUnknown,
+        versionNo: args.versionNo,
+      },
+    });
+  }
+
+  // The locale to write at. A document that stores its own translations needs
+  // one; so does a payload carrying component values, because components keep
+  // per-locale rows of their own even when their parent is not localized —
+  // without it the save path resolves the default language and a translation
+  // restores over the wrong one. A document since un-localized whose payload
+  // reaches no component needs none, and passing a stale one would be rejected.
+  const writeLocale =
+    storedLocale !== null &&
+    (storedPerLanguage || payloadTouchesComponents(payload, fields))
+      ? storedLocale
+      : null;
+
+  // Judged by the version the restore was made from, read out of the
+  // update's data as a save's is. Added after the payload is known to hold
+  // something to restore, so a version alone never reads as content.
+  const judgedPayload = { ...payload, ...versionKeysOf(args.version) };
+  // Every field the restore writes came from this version: recorded per field
+  // on the version the write captures, as a save after a restore records it.
+  const restoredFrom = Object.fromEntries(
+    Object.keys(payload).map(field => [field, args.versionNo])
+  );
+
+  let written: { data?: unknown };
+  if (args.scopeKind === "single") {
+    const singles = getService("singleEntryService");
+    const result = await singles.update(args.slug, judgedPayload, {
+      // Judged as the restorer, or trusted where server code restores.
+      ...(args.user ? { user: args.user } : {}),
+      overrideAccess: !args.user,
+      // Not route-authorized: the route judged the restore in every language,
+      // and it writes the version's, so the update asks the rules again in
+      // that language.
+      // Forward the actor so an API-key restore is attributed to the key, not
+      // its owner — mirrors the collection branch below.
+      ...(args.actor ? { actor: args.actor } : {}),
+      // The request and hook context, so the update's hooks see the restore
+      // as they see any edit made with them.
+      ...(args.request ? { request: args.request } : {}),
+      ...(args.context ? { context: args.context } : {}),
+      // A snapshot that restores `status: "published"` must satisfy the key's
+      // own publish grant, not the owner's RBAC.
+      ...(args.authenticatedScope
+        ? { authenticatedScope: args.authenticatedScope }
+        : {}),
+      ...(writeLocale ? { locale: writeLocale } : {}),
+      sourceVersionNo: args.versionNo,
+      restoredFrom,
+      // Always held as a draft: where the update would write the published
+      // row instead, it refuses.
+      requireHeldDraft: true,
+    });
+    assertWriteSucceeded(result, args);
+    written = result;
+  } else {
+    const collections = getService("collectionsHandler");
+    const result = await collections.updateEntry(
+      {
+        collectionName: args.slug,
+        entryId: args.entryId,
+        // Judged as the restorer, or trusted where server code restores.
+        ...(args.user ? { user: args.user } : {}),
+        // Not route-authorized: the route judged the restore in every
+        // language, and it writes the version's, so the update asks the rule
+        // again in that language, its filter included.
+        overrideAccess: !args.user,
+        request: args.request,
+        ...(args.context ? { context: args.context } : {}),
+        // A snapshot that restores `status: "published"` must satisfy the key's
+        // own publish grant, not the owner's RBAC.
+        ...(args.authenticatedScope
+          ? { authenticatedScope: args.authenticatedScope }
+          : {}),
+        // See the note above the Single branch.
+        ...(writeLocale ? { locale: writeLocale } : {}),
+        ...(args.actor ? { actor: args.actor } : {}),
+        sourceVersionNo: args.versionNo,
+        restoredFrom,
+        // Always held as a draft: where the update would write the published
+        // row instead, it refuses.
+        requireHeldDraft: true,
+      },
+      judgedPayload
+    );
+    assertWriteSucceeded(result, args);
+    written = result;
+  }
+
+  return {
+    restoredFrom: args.versionNo,
+    droppedFields,
+    ...versionWritten(written),
+  };
+}
+
+/**
+ * Drop from `payload` every field the restorer may not write, and report it.
+ *
+ * Field-level write rules strip denied keys inside the update path, silently
+ * and after it has already reported success. Evaluating the same rules here,
+ * against a copy so nothing is mutated, turns that into something the caller
+ * can be told about instead of a restore that reports success for content it
+ * never applied.
+ *
+ * The copy is deep. These rules strip nested keys by mutating the container in
+ * place, so a shallow copy would share every group and repeater with the real
+ * payload: the probe would edit the very thing it is meant to leave alone, and
+ * the comparison, which walks keys rather than identity, would see the two
+ * agreeing and report nothing.
+ */
+async function dropFieldsTheWriterMayNotWrite(
+  args: RestoreVersionArgs & { user: UserContext },
+  payload: Record<string, unknown>,
+  droppedFields: string[]
+): Promise<void> {
+  const accessProbe: Record<string, unknown> = structuredClone(payload);
+  try {
+    await applyFieldWriteAccess({
+      kind: args.scopeKind === "single" ? "single" : "collection",
+      slug: args.slug,
+      data: accessProbe,
+      operation: "update",
+      user: args.user,
+      // A key is judged on its own grants, as the update that follows judges
+      // it: asked of its owner, a field the key may not write would be
+      // reported as restored while the update keeps the stored value.
+      authenticatedScope: args.authenticatedScope,
+      overrideAccess: false,
+      // The id as stored, as the read probe is told.
+      id: args.entryId,
+    });
+    dropFieldsTheProbeRejected(payload, accessProbe, droppedFields);
+  } catch (error) {
+    // A rule that could not run never answered: the request ends with that,
+    // not with the restore going ahead as though it had allowed every field.
+    rethrowIfRuleCouldNotRun(error);
+    // A failure here must not block a restore the update path would allow; the
+    // update evaluates the same rules again and remains the authority.
+  }
+}
+
+/**
+ * Keeps the payload's top-level fields `chosen` names, where it names any: a
+ * restore of some fields writes those alone, and the update holds the rest of
+ * the draft as it was.
+ */
+function keepOnlyChosen(
+  payload: Record<string, unknown>,
+  chosen: readonly string[] | undefined
+): void {
+  if (chosen === undefined) return;
+  const keep = new Set(chosen);
+  for (const key of Object.keys(payload)) {
+    if (!keep.has(key)) delete payload[key];
+  }
+}
+
+/** Narrow a list of field names to the chosen ones, in place; all, when none were chosen. */
+function narrowToChosen(
+  names: string[],
+  chosen: readonly string[] | undefined
+): void {
+  if (chosen === undefined) return;
+  const keep = new Set(chosen);
+  const kept = names.filter(name => keep.has(name));
+  names.splice(0, names.length, ...kept);
+}
+
+/**
+ * The version keys of a restore's request, and nothing else: the restore's
+ * content is the version's, never the request's.
+ */
+function versionKeysOf(
+  version: Readonly<Record<string, unknown>> | undefined
+): Record<string, unknown> {
+  const keys: Record<string, unknown> = {};
+  for (const key of [DOCUMENT_VERSION_KEY, DOCUMENT_OVERWRITE_KEY]) {
+    if (version?.[key] !== undefined) keys[key] = version[key];
+  }
+  return keys;
+}
+
+/** The version the restore's update answered with, where it gave one. */
+function versionWritten(result: { data?: unknown }): { _rev?: string } {
+  const rev = (result.data as { _rev?: unknown } | null | undefined)?._rev;
+  return typeof rev === "string" ? { _rev: rev } : {};
+}
+
+/**
+ * The update services report failure in their result rather than throwing, so a
+ * failed restore must not return as though it succeeded.
+ */
+function assertWriteSucceeded(
+  result: {
+    success?: boolean;
+    statusCode?: number;
+    code?: string;
+    message?: string;
+    messageKey?: string;
+    publicData?: unknown;
+    errors?: unknown;
+  },
+  args: RestoreVersionArgs
+): void {
+  // Fail closed: a result that does not explicitly report success is treated
+  // as failure, so a path that omits the field cannot report a restore that
+  // never happened.
+  if (result.success === true) return;
+
+  const status = result.statusCode ?? 500;
+
+  // The failure the update was built from, chained onto whichever branch below
+  // answers. Only the code-keyed branch went through the converter, so every
+  // other outcome of a failed restore -- a denial, a conflict, a rejected
+  // snapshot, a server fault -- reached the caller naming nothing.
+  const original = originalErrorOf(result);
+
+  // A refusal is the update's own answer, as an update refused there is
+  // answered: in words where the caller may read the entry, and as a missing
+  // entry where it may not. One that names no code is answered as missing.
+  if (
+    (status === NEXTLY_ERROR_STATUS.FORBIDDEN ||
+      status === NEXTLY_ERROR_STATUS.NOT_FOUND) &&
+    result.code
+  ) {
+    throw errorFromServiceEnvelope(result as ServiceErrorEnvelope, {
+      reason: "restore-write-denied",
+      scopeKind: args.scopeKind,
+      scopeSlug: args.slug,
+      entryId: args.entryId,
+    });
+  }
+  if (
+    status === NEXTLY_ERROR_STATUS.FORBIDDEN ||
+    status === NEXTLY_ERROR_STATUS.NOT_FOUND
+  ) {
+    throw NextlyError.notFound({
+      cause: original,
+      logContext: {
+        reason: "restore-write-denied",
+        statusCode: status,
+        scopeKind: args.scopeKind,
+        scopeSlug: args.slug,
+        entryId: args.entryId,
+      },
+    });
+  }
+
+  // A typed failure answers as itself. The 4xx branch below treats everything
+  // as a snapshot that failed today's validation rules, which is right for a
+  // stale select option and wrong for a rate limit -- that reached the client
+  // as a 400 with no retry interval.
+  if (result.code) {
+    throw errorFromServiceEnvelope(result as ServiceErrorEnvelope, {
+      reason: "restore-write-failed",
+      scopeKind: args.scopeKind,
+      scopeSlug: args.slug,
+      entryId: args.entryId,
+    });
+  }
+
+  // A conflict stays a conflict. Wrapping it in a validation error would answer
+  // 400/VALIDATION_ERROR, and a REST client reads the outer status — so a
+  // restore whose slug now collides would stop matching the contract the same
+  // collision reports through an ordinary update.
+  if (status === 409) {
+    throw NextlyError.conflict({
+      cause: original,
+      logContext: {
+        reason: "restore-write-conflict",
+        message: result.message,
+        scopeKind: args.scopeKind,
+        scopeSlug: args.slug,
+        entryId: args.entryId,
+      },
+    });
+  }
+
+  // A snapshot can fail today's rules for ordinary reasons — a select option
+  // since removed, a validator tightened since. Those are answers the editor can
+  // act on, so the update's own message is preserved rather than flattened into
+  // a server fault.
+  if (status >= 400 && status < 500) {
+    throw NextlyError.validation({
+      errors: Array.isArray(result.errors)
+        ? (result.errors as { path: string; code: string; message: string }[])
+        : [
+            {
+              path: "versionNo",
+              code: "RESTORE_REJECTED",
+              message:
+                result.message ??
+                "This version could not be applied to the document as it is now.",
+            },
+          ],
+      cause: original,
+      logContext: {
+        reason: "restore-write-rejected",
+        statusCode: status,
+        scopeKind: args.scopeKind,
+        scopeSlug: args.slug,
+        entryId: args.entryId,
+      },
+    });
+  }
+
+  throw NextlyError.internal({
+    cause: original,
+    logContext: {
+      reason: "restore-write-failed",
+      statusCode: status,
+      message: result.message,
+      scopeKind: args.scopeKind,
+      scopeSlug: args.slug,
+      entryId: args.entryId,
+    },
+  });
+}

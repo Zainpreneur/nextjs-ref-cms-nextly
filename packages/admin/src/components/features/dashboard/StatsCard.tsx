@@ -1,0 +1,163 @@
+/**
+ * StatsCard Component
+ *
+ * Displays a statistic card with optional trend indicator and icon.
+ * Supports default (large) and compact (small) variants.
+ * Used on the dashboard to show metrics like total entries, media, etc.
+ *
+ * @module components/features/dashboard/StatsCard
+ */
+
+import { Card, CardContent } from "@nextlyhq/ui";
+import React from "react";
+
+import { cardNumber } from "@admin/components/features/widgets/frame/format";
+import { TrendingUp, TrendingDown } from "@admin/components/icons";
+import { Sparkline } from "@admin/components/shared/charts/Sparkline";
+import { Link } from "@admin/components/ui/link";
+import { cn } from "@admin/lib/utils";
+import type { StatsCardProps } from "@admin/types/dashboard/stats";
+
+export const StatsCard: React.ForwardRefExoticComponent<
+  StatsCardProps & React.RefAttributes<HTMLDivElement>
+> = React.forwardRef<HTMLDivElement, StatsCardProps>(
+  (
+    {
+      title,
+      value,
+      change,
+      trend,
+      icon,
+      variant = "default",
+      href,
+      sparklineData,
+      footer,
+      className,
+    },
+    ref
+  ) => {
+    const isCompact = variant === "compact";
+
+    const card = (
+      <Card
+        ref={ref}
+        variant={href ? "interactive" : "default"}
+        className={cn(
+          "group relative overflow-hidden transition-all duration-300",
+          "border-border bg-card",
+          href &&
+            "hover-subtle-row hover:border-border active:scale-[0.985] active:translate-y-0.5",
+          className
+        )}
+      >
+        <CardContent className={isCompact ? "p-5" : "p-8"}>
+          {isCompact ? (
+            // Muted foreground at rest so these stat labels meet contrast; they
+            // brighten to the foreground ink on hover, not to the action token.
+            <div className="flex items-start justify-between gap-4 relative z-10">
+              <div className="space-y-1">
+                <p className="text-2xl font-bold tracking-[-0.03em] text-muted-foreground leading-none group-hover:text-foreground transition-colors">
+                  {typeof value === "number" ? cardNumber(value).text : value}
+                </p>
+                <span className="block text-xs font-semibold tracking-tight text-muted-foreground truncate group-hover:text-foreground transition-colors pt-1">
+                  {title}
+                </span>
+              </div>
+              {icon && (
+                <div className="text-muted-foreground shrink-0 group-hover:text-foreground transition-colors pt-1">
+                  {icon}
+                </div>
+              )}
+            </div>
+          ) : (
+            // Muted foreground at rest so these stat labels meet contrast; they
+            // brighten to the foreground ink on hover, not to the action token.
+            <div className="space-y-6 relative z-10">
+              <div className="flex items-start justify-between">
+                <div className="space-y-2">
+                  <p className="text-fluid-4xl font-bold tracking-[-0.05em] text-muted-foreground leading-[0.9] transition-all duration-500 group-hover:text-foreground group-hover:translate-x-0.5">
+                    {typeof value === "number" ? cardNumber(value).text : value}
+                  </p>
+                  <div className="flex items-center gap-2.5 pt-2">
+                    <span className="text-xs font-bold uppercase tracking-[0.2em] text-muted-foreground group-hover:text-foreground transition-colors">
+                      {title}
+                    </span>
+                  </div>
+                </div>
+
+                {icon && (
+                  <div className="text-muted-foreground shrink-0 group-hover:text-foreground transition-all duration-500 pt-1">
+                    {icon}
+                  </div>
+                )}
+              </div>
+
+              {(footer || change !== undefined) && (
+                <div className="flex items-center justify-between pt-5  border-t border-border">
+                  <div className="flex items-center gap-2">
+                    {change !== undefined && (
+                      // A quiet chip, as every status is drawn: the card's surface, ordinary
+                      // text, and the arrow alone in the trend's text colour.
+                      <div
+                        data-trend={trend === "up" ? "up" : "down"}
+                        className="flex items-center gap-1 rounded-md border border-border bg-card px-2 py-0.5 text-xs font-medium tabular-nums text-foreground"
+                      >
+                        {trend === "up" ? (
+                          <TrendingUp
+                            aria-hidden="true"
+                            data-testid="trend-mark"
+                            className="h-3 w-3 text-success-text"
+                          />
+                        ) : (
+                          <TrendingDown
+                            aria-hidden="true"
+                            data-testid="trend-mark"
+                            className="h-3 w-3 text-danger-text"
+                          />
+                        )}
+                        <span>
+                          {change > 0 ? "+" : ""}
+                          {change}%
+                        </span>
+                      </div>
+                    )}
+                    {footer && (
+                      <span className="text-xs font-semibold text-muted-foreground truncate opacity-60 group-hover:opacity-100 transition-opacity">
+                        {footer}
+                      </span>
+                    )}
+                  </div>
+
+                  {sparklineData && (
+                    <div className="group-hover:scale-110 transition-transform duration-700">
+                      <Sparkline
+                        data={sparklineData}
+                        width={80}
+                        height={30}
+                        className="text-primary/20 group-hover-unified transition-colors duration-700"
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    );
+
+    if (href) {
+      return (
+        <Link href={href} className="block">
+          {card}
+        </Link>
+      );
+    }
+
+    return card;
+  }
+);
+
+StatsCard.displayName = "StatsCard";
+
+StatsCard.displayName = "StatsCard";

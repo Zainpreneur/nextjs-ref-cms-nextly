@@ -1,0 +1,64 @@
+/**
+ * Put a version's chosen fields into the editor, and say so with an Undo.
+ *
+ * One answer for "Restore…" in the history and "Restore this field" on a
+ * changed field: only fields that may be restored go in, as unsaved edits,
+ * and the toast names how many and the version's date, with Undo.
+ *
+ * @module components/features/versions/restore-into-editor
+ */
+
+import { toast } from "@admin/components/ui";
+import { formatDateTime } from "@admin/lib/dates/format";
+
+import { announce } from "./announce";
+import type { EditorRestoreSurface } from "./document-history-context";
+import type { RestoreRow } from "./restore-plan";
+import { formFieldsOf } from "./snapshot-to-form-values";
+
+export function restoreIntoEditor(args: {
+  editor: EditorRestoreSurface;
+  rows: readonly RestoreRow[];
+  /** The fields chosen; a disabled one is never restored. */
+  names: readonly string[];
+  versionNo: number;
+  /** When the version was saved, for the toast; its number when unknown. */
+  savedAt?: string | null;
+}): void {
+  const chosen = new Set(args.names);
+  const values = Object.fromEntries(
+    args.rows
+      .filter(row => chosen.has(row.name) && !row.disabled)
+      .map(row => [row.name, row.value])
+  );
+  const count = Object.keys(values).length;
+  if (count === 0) return;
+  // Each field's type, read from the fields the restore list was judged over,
+  // so the restore asks "is it still the restored value?" as that list asked
+  // "does it differ?".
+  const types = new Map(
+    formFieldsOf(args.editor.fields).map(field => [field.name, field.type])
+  );
+  const applied = args.editor.restore.apply(values, args.versionNo, name =>
+    types.get(name)
+  );
+  const when = args.savedAt
+    ? formatDateTime(args.savedAt)
+    : `version ${args.versionNo}`;
+  // On a translated document, the language the fields went into, as the
+  // restore's list named it before.
+  const into = args.editor.language ? ` into ${args.editor.language}` : "";
+  const fields = count === 1 ? "1 field" : `${count} fields`;
+  const message = `${fields} restored${into} from ${when}`;
+  toast.success(message, {
+    action: {
+      label: "Undo",
+      onClick: () => {
+        applied.undo();
+        announce(`Restore undone: ${fields} put back as they were`);
+      },
+    },
+  });
+  // Said aloud as well as shown: a toast alone may never reach a screen reader.
+  announce(message);
+}

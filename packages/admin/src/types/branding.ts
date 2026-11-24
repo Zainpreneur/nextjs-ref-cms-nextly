@@ -1,0 +1,466 @@
+import type {
+  DeliveredAdminContribution,
+  OverridableDocumentAction,
+  PluginDocumentActionOverride,
+  AdminContributionsMeta,
+  PluginListFilterDeclaration,
+  PublishedContentSource,
+} from "nextly/config";
+import type { PluginFieldTypeMeta } from "nextly/field-catalog";
+// The widget as the workspace payload serves it, a type only.
+import type { PublishedWidget } from "nextly/widget-result";
+
+/** What a declared action does: open a plugin component, or call its route. */
+export type DeclaredActionMeta = Extract<
+  DeliveredAdminContribution,
+  { kind: "rowAction" }
+>["action"];
+
+/**
+ * A plugin's person's-menu item as delivered: a label, an icon, and a link or
+ * an action, with the id its action's route is called with.
+ */
+export type PluginUserMenuItemMeta = {
+  id: string;
+  label: string;
+  icon: string;
+} & (
+  | { to: string; action?: undefined }
+  | { action: DeclaredActionMeta; to?: undefined }
+);
+
+export interface ResolvedBrandingColors {
+  primary?: string;
+  primaryForeground?: string;
+  accent?: string;
+  accentForeground?: string;
+}
+
+/**
+ * Where a plugin's admin surfaces appear in the sidebar, as delivered via
+ * `/admin-meta`. Mirrors the server's `PluginNavSection`.
+ */
+export type PluginNavSectionMeta =
+  | "dashboard"
+  | "collections"
+  | "singles"
+  | "media"
+  | "plugins"
+  | "settings"
+  | "standalone";
+
+/**
+ * A plugin sidebar menu item, delivered via `/admin-meta`. Mirrors the
+ * server `PluginMenuItem` contract; one level of `children`.
+ */
+export interface PluginMenuItemMeta {
+  label: string;
+  to: string;
+  icon?: string;
+  order?: number;
+  requiredPermission?: string;
+  /**
+   * Which sidebar section lists this item, as declared by the plugin. Absent
+   * defers to the plugin's own `placement` rather than meaning "Plugins".
+   */
+  section?: PluginNavSectionMeta;
+  /**
+   * The id of one of the plugin's `panel.groups`, the heading the item is
+   * listed under in its own standalone panel. The server sends only one the
+   * plugin declares.
+   */
+  group?: string;
+  /** A quiet number beside the label, shown at 0 too. */
+  count?: PluginItemCountMeta;
+  /** A pill beside the label, shown only while its number is above 0. */
+  badge?: PluginItemCountMeta;
+  children?: PluginMenuItemMeta[];
+}
+
+/**
+ * What a panel item's number counts, as the server checked it: one of the
+ * plugin's own collections, by the slug the host registered it under, or one
+ * of its own attention items, by id.
+ */
+export type PluginItemCountMeta =
+  | { collection: string; where?: Record<string, unknown> }
+  | { attention: string };
+
+/** A heading of a standalone plugin's own panel. */
+export interface PluginPanelGroupMeta {
+  id: string;
+  label: string;
+}
+
+/** A plugin custom admin page, delivered via `/admin-meta`. */
+export interface PluginPageMeta {
+  path: string;
+  component: string;
+  requiredPermission?: string;
+  /**
+   * Which sidebar section is selected while this page is open, as declared by
+   * the plugin. Absent defers to the plugin's own `placement`.
+   */
+  section?: PluginNavSectionMeta;
+}
+
+/**
+ * A widget the registry publishes, as `/admin-meta/workspace` serializes it.
+ *
+ * Every widget reaches the registry as a `defineWidget` declaration, whose
+ * card the server answers from the declaration's `load`. What the admin
+ * receives is the declaration's published description: its title, archetype,
+ * size, settings and the rest, and never a query of its own.
+ *
+ * It is core's `PublishedWidget`, the wire type `nextly/widget-result` derives
+ * from the function the registry publishes every widget through, rather than a
+ * shape restated here: the contract then has one declaration, and a field the
+ * server stops publishing leaves this type with it.
+ */
+export type RegisteredWidgetMeta = PublishedWidget;
+
+/**
+ * A plugin's public client configuration, served before a session exists.
+ *
+ * Separate from `plugins` because the two answer different questions:
+ * this says a plugin DECLARED a public config, while `plugins` says which
+ * plugins the project has installed. Merging them would let a plugin with
+ * a public config read as installed before the gated request answers.
+ */
+export interface PluginClientConfigMeta {
+  name: string;
+  clientConfig?: Record<string, unknown>;
+}
+
+/** Plugin metadata returned by the `/admin-meta` API. */
+export interface PluginMetadata {
+  name: string;
+  /**
+   * The plugin's own configuration for its admin components, as declared in
+   * `contributes.admin.clientConfig` and serialized through `/api/admin-meta`.
+   *
+   * Public: `/api/admin-meta` needs no authentication, so this reaches
+   * anonymous callers and never holds secrets. Read it with
+   * `usePluginClientConfig` rather than searching this array by hand.
+   */
+  clientConfig?: Record<string, unknown>;
+  /**
+   * The plugin's admin strings, by interface language and key, declared in
+   * `contributes.translations`. On the signed-in metadata only.
+   */
+  translations?: Readonly<Record<string, Readonly<Record<string, string>>>>;
+  version?: string;
+  description?: string;
+  /** Author shown in the plugins list; mirrors package.json by convention. */
+  author?: string;
+  /** Homepage URL linked from the plugin detail page. */
+  homepage?: string;
+  /** Source repository URL linked from the plugin detail page. */
+  repository?: string;
+  /** Documentation URL when distinct from the homepage. */
+  docsUrl?: string;
+  /** SPDX license identifier shown on the plugin detail page. */
+  license?: string;
+  /** Category the plugins list filters by (controlled vocabulary). */
+  category?: string;
+  /** Free-form descriptive tags shown on the plugin detail page. */
+  tags?: string[];
+  /** Whether the plugin's behavior is active. Absent on older servers. */
+  enabled?: boolean;
+  /** Required plugin dependencies → version range, for the detail page. */
+  dependsOn?: Record<string, string>;
+  /** @deprecated Use `placement` instead. */
+  group?: string;
+  /** Immutable sidebar placement from plugin config. */
+  placement?: string;
+  order?: number;
+  /** Position anchor for standalone plugins (which built-in section to appear after). */
+  after?: string;
+  /**
+   * Where a standalone plugin's rail item goes, as an admin address the
+   * server has already resolved and checked against what the plugin owns.
+   * Absent when the plugin names none; the rail then opens the first
+   * collection or menu item its panel lists (`standalonePluginLanding`).
+   */
+  landing?: string;
+  collections: string[];
+  /** Slugs of contributed singles, for the detail page's contributions view. */
+  singles?: string[];
+  /** Slugs of contributed field groups, for the detail page's contributions view. */
+  fieldGroups?: string[];
+  /** Declared HTTP routes as method + path (enabled plugins only). */
+  /**
+   * Declared HTTP routes. `fullPath` is the namespace the dispatcher mounts
+   * them at, serialized by the server rather than rebuilt here: it is derived
+   * from the RAW package name, which is not the admin slug this UI addresses
+   * plugins by. Prefix it with the host's mount point (`/api` by convention)
+   * to get the URL.
+   */
+  routes?: Array<{ method: string; path: string; fullPath: string }>;
+  /**
+   * The routes a DISABLED plugin declares but does not currently serve.
+   * Mirrors the server's `PluginAdminMeta.whenEnabled`.
+   *
+   * Routes only: a disabled plugin's permissions are seeded like any other's,
+   * so they are not pending on being enabled. Never present alongside
+   * `routes` — render one or the other.
+   */
+  whenEnabled?: { routes?: PluginMetadata["routes"] };
+  /** Sidebar appearance customization from plugin config. */
+  appearance?: {
+    /** A lucide icon name. The common case; always theme-aware. */
+    icon?: string;
+    /**
+     * A URL to an image the plugin ships, for a plugin that wants its own
+     * branding rather than a generic glyph. Takes precedence over `icon` when
+     * both are present. Resolve through `resolvePluginIcon` rather than
+     * reading either field directly.
+     */
+    iconAsset?: string;
+    label?: string;
+    badge?: string;
+    badgeVariant?: "default" | "secondary" | "destructive" | "outline";
+  };
+  /** Declarative sidebar menu items contributed via `contributes.admin.menu`. */
+  menu?: PluginMenuItemMeta[];
+  /**
+   * The headings of the plugin's own standalone panel, in the order declared
+   * (`contributes.admin.panel`); absent when it declares none.
+   */
+  panel?: { groups: PluginPanelGroupMeta[] };
+  /** Custom admin pages contributed via `contributes.admin.pages`. */
+  pages?: PluginPageMeta[];
+  /**
+   * Plugin settings UI contributed via `contributes.admin.settings`, with the
+   * permission a change to those settings needs: the one the server's gate
+   * asks for, which the settings page asks for too.
+   */
+  settings?: { component: string; permission?: string };
+  /**
+   * Admin header-slot component contributed via `contributes.admin.headerSlot`,
+   * mirrored for a slot at the bar's right end only.
+   */
+  headerSlot?: string;
+  /**
+   * Header customization contributed via `contributes.admin.header`. `place`
+   * is absent for the bar's right end; `slot` is drawn at the bar or the
+   * rail's foot, `item` in the person's menu.
+   */
+  header?: {
+    slot?: string;
+    place?: "rail-foot" | "menu";
+    item?: PluginUserMenuItemMeta;
+    hideDefaults?: boolean;
+    hide?: Array<"github" | "discord" | "docs" | "notifications">;
+  };
+  /**
+   * Component rendered in the schema-builder pages (above the field list),
+   * contributed via `contributes.admin.schemaBuilderSlot`. Receives `{ fields,
+   * setFields, disabled, context }`.
+   */
+  schemaBuilderSlot?: string;
+  /**
+   * Component rendered in the entry/single form header toolbar, contributed via
+   * `contributes.admin.entryFormToolbarSlot`. Receives `{ context,
+   * controllerField }` and reads/writes form state via react-hook-form context.
+   */
+  entryFormToolbarSlot?: string;
+  /**
+   * @experimental Full-screen views of one document, contributed via
+   * `contributes.admin.views[<slug>].documentViews`. Each is on the slug the
+   * admin routes it under (the plugin's rename map already applied) and is
+   * served at `/admin/collections/<slug>/<id>/<path>` or, for a Single,
+   * `/admin/singles/<slug>/<path>`. Present only for enabled plugins.
+   */
+  documentViews?: Array<
+    {
+      path: string;
+      component: string;
+      label?: string;
+      /**
+       * The words of the way into the view a list row's menu and the
+       * document bar offer, as in "Open in builder". Present when declared.
+       */
+      openLabel?: string;
+      /**
+       * The component "+ New" opens over the list of a collection whose
+       * entries open in this view. Present when declared.
+       */
+      createDialog?: string;
+    } & (
+      | { slug: string }
+      /**
+       * Offered on every collection and Single with a TOP-LEVEL field of this
+       * type, via `contributes.admin.documentViews`; the document decides.
+       */
+      | {
+          fieldType: string;
+          /**
+           * Present when the view asks to open first on a collection whose
+           * main field is of this type, unless the collection says otherwise.
+           */
+          opensFirst?: "mainField";
+        }
+    )
+  >;
+  /**
+   * @experimental Overrides of a collection's built-in document actions,
+   * contributed via `contributes.admin.views[<slug>].documentActions`: on the
+   * slug the admin routes (rename map applied), `"hidden"` or the component
+   * the action opens instead. Present only for enabled plugins.
+   */
+  documentActions?: Array<{
+    slug: string;
+    action: OverridableDocumentAction;
+    override: PluginDocumentActionOverride;
+  }>;
+  /**
+   * @experimental Sections added to a collection's document panel, after
+   * Details, contributed via `contributes.admin.views[<slug>].panelSections`.
+   * Present only for enabled plugins.
+   */
+  panelSections?: Array<{ slug: string; title: string; component: string }>;
+  /**
+   * @experimental The collections whose document screens start with the
+   * rail's panel folded away, contributed via
+   * `contributes.admin.views[<slug>].foldedPanel`, on the slug the admin
+   * routes. Present only for enabled plugins.
+   */
+  foldedPanels?: string[];
+  /**
+   * @experimental The filters this plugin offers in the entry list's toolbar,
+   * via `contributes.admin.filters`, as they passed the boot check. Present
+   * only for enabled plugins.
+   */
+  listFilters?: PluginListFilterDeclaration[];
+  /**
+   * Custom field types — `type` → admin editor component path. `layout:
+   * "takeover"` marks a type whose visible field collapses the entry-form body
+   * to just that field + its condition controller (see takeoverLayout). The
+   * picker presentation (label/description/icon/category) and the `surfaces`
+   * the type opted into let each surface offer only the types meant for it
+   * (see pluginFieldTypeCatalogEntries).
+   */
+  fieldTypes?: PluginFieldTypeMeta[];
+}
+
+export interface AdminBranding {
+  /**
+   * Highest-priority logo override (e.g. DB-configured custom logo).
+   */
+  logoUrl?: string;
+
+  /**
+   * Optional theme-specific logo URLs (used when `logoUrl` is not set).
+   */
+  logoUrlLight?: string;
+  logoUrlDark?: string;
+
+  logoText?: string;
+  favicon?: string;
+  colors?: ResolvedBrandingColors;
+  /**
+   * Whether the server offers the schema builder: never in production, and
+   * elsewhere unless `admin.branding.showBuilder` is false.
+   */
+  showBuilder?: boolean;
+
+  /**
+   * Whether the RUNNING server says the dev-reload stream exists, from the
+   * session-gated half alone.
+   *
+   * The client cannot answer this for itself: its `NODE_ENV` was folded into
+   * the published dist at package build time, which says where the library
+   * was built, never where the host is running. Only an explicit `true` may
+   * open the dev-reload stream — `undefined` means the workspace answer has
+   * not arrived yet, not that the server is in development.
+   */
+  devReload?: boolean;
+
+  /**
+   * The collections and Singles a workflow holds that this reader may read,
+   * by slug, from the session-gated half alone. Absent means the server did
+   * not say (the answer has not arrived, or it comes from a server that does
+   * not send it), never that nothing is held.
+   */
+  workflowEntities?: string[];
+
+  /**
+   * INSTALLED plugin metadata, for sidebar rendering and plugin settings pages.
+   *
+   * Comes from the session-gated half alone, so its absence means the list has
+   * not arrived rather than that the project has no plugins. Read
+   * `useBrandingStatus()` before concluding anything from a plugin missing here.
+   */
+  plugins?: PluginMetadata[];
+
+  /**
+   * Each admin place's contributions, by kind, in order, as this reader may
+   * see them: the signed-in half's every place but the login page's, the
+   * public half's the login page's alone.
+   */
+  contributions?: AdminContributionsMeta;
+
+  /**
+   * The fields a plugin's extension switch keeps off each type's pages, by
+   * `collection:<slug>` or `single:<slug>`: added by the plugin there and
+   * switched off now. Drawn nowhere; their stored values stay.
+   */
+  withheldFields?: Record<string, string[]>;
+
+  /**
+   * Public client configuration, readable before a session exists.
+   *
+   * Deliberately NOT merged into `plugins`: a plugin declaring a public config
+   * is not a plugin the project has installed, and a reader that found it in
+   * that list would have skipped the checks saying the installed list is still
+   * unavailable. Only `usePluginClientConfig` reads this.
+   */
+  pluginClientConfigs?: PluginClientConfigMeta[];
+
+  /**
+   * The widgets the registry publishes for this reader: core's, each plugin's
+   * `contributes.dashboard.widgets` and the site config's.
+   *
+   * Comes from the session-gated half alone, so its absence means the registry
+   * has not arrived rather than that there is nothing.
+   */
+  widgets?: RegisteredWidgetMeta[];
+
+  /**
+   * An opaque token for the audience `widgets` were filtered for, from the
+   * session-gated half alone. The dashboard layout read
+   * reports the same token as `audience`, and a difference means this payload
+   * was built for a different reader state than the layout being drawn.
+   */
+  widgetAudience?: string;
+
+  /**
+   * The collections a card's content settings (Collection, Filter, Sort,
+   * Group by) may offer this reader, each with the fields they may offer:
+   * only fields no read rule can refuse and no read hook transforms. Decided
+   * on the server for this reader, from the same answer as `widgets`.
+   */
+  widgetSources?: PublishedContentSource[];
+
+  /** Custom sidebar groups created by the user for organizing collections/singles. */
+  customGroups?: Array<{ slug: string; name: string; icon?: string }>;
+
+  /** Content localization config (present only when the app enables i18n). */
+  locales?: {
+    defaultLocale: string;
+    fallback: boolean;
+    locales: Array<{
+      code: string;
+      label: string;
+      rtl: boolean;
+      fallbackLocale: string[];
+    }>;
+  };
+
+  /**
+   * Plugin placement overrides mapping plugin slugs to sidebar group names.
+   * @deprecated Placement is now author-defined via `PluginMetadata.placement`.
+   */
+  pluginPlacements?: Record<string, string>;
+}

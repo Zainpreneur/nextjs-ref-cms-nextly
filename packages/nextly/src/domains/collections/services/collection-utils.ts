@@ -1,0 +1,569 @@
+/**
+ * Collection utility functions — Pure helpers for collection entry operations.
+ *
+ * Extracted from CollectionEntryService (6,490-line god file).
+ * All functions are pure (no service dependencies) and can be used
+ * by any split service.
+ */
+
+import type { FieldDefinition } from "@nextly/schemas/dynamic-collections";
+
+import { isReservedPath } from "../../../runtime/routing/reserved-paths";
+import { addressableFields } from "../../../shared/addressable-fields";
+import { storageTypeToken } from "../../../shared/lib/plugin-storage";
+import { isFieldLocalized } from "../../i18n/classify-fields";
+import { EVERY_TRANSLATION } from "../../i18n/locale-selector";
+import { decodeEachLanguage } from "../../i18n/read-in-language";
+
+/**
+ * Field types that are always stored as JSON in the database.
+ */
+export const ALWAYS_JSON_TYPES = new Set([
+  "richText",
+  "repeater",
+  "group",
+  "json",
+  "chips", // Chips fields store string[] as JSON
+  "blocks", // A blocks field stores one page document as JSON
+]);
+
+/**
+ * Field types that are searchable by default.
+ * These types contain text content that can be searched with LIKE/ILIKE.
+ */
+export const SEARCHABLE_FIELD_TYPES = [
+  "text",
+  "textarea",
+  "email",
+  "richText",
+] as const;
+
+/**
+ * Convert a snake_case name back to camelCase.
+ * Used for mapping database column names back to field names in API responses.
+ */
+export function toCamelCase(name: string): string {
+  return name.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase());
+}
+
+/**
+ * Checks if a field requires JSON serialization/deserialization.
+ * Also checks hasMany for select/text/number/upload/relationship
+ * fields which are stored as jsonb when they hold arrays.
+ *
+ * Bug 7 (post-Phase-4 testing-pass): `relationship` fields with
+ * `hasMany: true` were missing from this check. The schema generator
+ * creates a JSON-style text column for them (single-column array of
+ * IDs, Payload pattern), but the mutation service's JSON-serialization
+ * step skipped them — leaving raw JS arrays to reach Drizzle's bind
+ * site, which crashed better-sqlite3 with "Too few parameter values
+ * were provided." Adding `relationship` to the hasMany conditional
+ * mirrors the schema generator's behavior: when hasMany, the column
+ * holds a JSON-stringified array of IDs.
+ */
+export function isJsonFieldType(
+  fieldType: string,
+  field?: { hasMany?: boolean; relationTo?: unknown }
+): boolean {
+  // A plugin type is classified by what it stores: its own token names none of
+  // the built-in branches, so a json-backed field would be written as a live
+  // object into the JSON column its descriptor created. None of the storage
+  // primitives is `select`, `relationship` or `upload`, so the branches below
+  // keep reading the declared type.
+  if (ALWAYS_JSON_TYPES.has(storageTypeToken({ type: fieldType }) ?? fieldType))
+    return true;
+
+  if (
+    (fieldType === "select" ||
+      fieldType === "text" ||
+      fieldType === "number") &&
+    field?.hasMany
+  ) {
+    return true;
+  }
+
+  // A relationship is JSON-backed when it holds many values OR when it is
+  // polymorphic, because a polymorphic target is stored as `{relationTo,
+  // value}` rather than a plain id — the same rule `upload` below already
+  // applies. Testing only `hasMany` left a single polymorphic relationship
+  // written to its JSON column as a live object.
+  if (fieldType === "relationship") {
+    return !!(field?.hasMany || Array.isArray(field?.relationTo));
+  }
+
+  if (fieldType === "upload") {
+    return !!(field?.hasMany || Array.isArray(field?.relationTo));
+  }
+
+  return false;
+}
+
+/**
+ * Checks if a field is a relationship field.
+ */
+export function isRelationshipField(fieldType: string): boolean {
+  return fieldType === "relationship";
+}
+
+/**
+ * Normalizes relationship field values to extract only IDs.
+ *
+ * The frontend may send full objects with display properties like:
+ * - { id: "uuid", title: "test", name: "foo" }
+ * - { relationTo: "collection", value: "uuid", title: "test" }
+ *
+ * This function normalizes them to:
+ * - Non-polymorphic: just the ID string
+ * - Polymorphic: { relationTo: string, value: string }
+ */
+export function normalizeRelationshipValue(
+  value: unknown,
+  isPolymorphic: boolean
+): unknown {
+  if (value == null) {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map(item => normalizeRelationshipItem(item, isPolymorphic));
+  }
+
+  return normalizeRelationshipItem(value, isPolymorphic);
+}
+
+/**
+ * The id a multi-target reference points at, whichever form it arrives in.
+ *
+ * A read at depth serves the populated row under `value`, so a document saved
+ * back unchanged hands that row here; storing it as-is would put a whole
+ * object in the column. An unpopulated reference already carries the id.
+ */
+function referenceTargetId(value: unknown): unknown {
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    const { id } = value as Record<string, unknown>;
+    if (typeof id === "string") return id;
+  }
+  return value;
+}
+
+/**
+ * Normalizes a single relationship item.
+ */
+export function normalizeRelationshipItem(
+  item: unknown,
+  isPolymorphic: boolean
+): unknown {
+  if (item == null) {
+    return item;
+  }
+
+  if (typeof item === "string") {
+    return item;
+  }
+
+  if (typeof item === "object") {
+    const obj = item as Record<string, unknown>;
+
+    if (isPolymorphic && "relationTo" in obj && "value" in obj) {
+      return {
+        relationTo: obj.relationTo,
+        value: referenceTargetId(obj.value),
+      };
+    }
+
+    if ("id" in obj && typeof obj.id === "string") {
+      return obj.id;
+    }
+
+    // Fallback for polymorphic with relationTo/value
+    if ("relationTo" in obj && "value" in obj) {
+      return {
+        relationTo: obj.relationTo,
+        value: referenceTargetId(obj.value),
+      };
+    }
+  }
+
+  // Empty objects or unrecognizable values should be treated as null
+  if (typeof item === "object" && Object.keys(item).length === 0) {
+    return null;
+  }
+
+  return item;
+}
+
+/**
+ * Recursively normalizes relationship data inside repeater/group field values.
+ * Strips full relationship objects down to just IDs before saving to the database.
+ */
+export function normalizeNestedRelationships(
+  data: Record<string, unknown>,
+  fields: FieldDefinition[]
+): Record<string, unknown> {
+  const normalized = { ...data };
+
+  for (const field of fields) {
+    const fieldName = field.name;
+    if (
+      !fieldName ||
+      normalized[fieldName] === undefined ||
+      normalized[fieldName] === null
+    )
+      continue;
+
+    if (field.type === "repeater" || field.type === "group") {
+      const nestedFields = ((field as Record<string, unknown>).fields ||
+        []) as FieldDefinition[];
+      if (nestedFields.length === 0) continue;
+
+      const value = normalized[fieldName];
+      if (field.type === "repeater" && Array.isArray(value)) {
+        normalized[fieldName] = value.map((row: unknown) => {
+          if (row && typeof row === "object" && !Array.isArray(row)) {
+            return normalizeNestedRelationships(
+              row as Record<string, unknown>,
+              nestedFields
+            );
+          }
+          return row;
+        });
+      } else if (
+        field.type === "group" &&
+        value &&
+        typeof value === "object" &&
+        !Array.isArray(value)
+      ) {
+        normalized[fieldName] = normalizeNestedRelationships(
+          value as Record<string, unknown>,
+          nestedFields
+        );
+      }
+    } else if (isRelationshipField(field.type)) {
+      const isPolymorphic = Array.isArray(
+        (field as Record<string, unknown>).relationTo
+      );
+      normalized[fieldName] = normalizeRelationshipValue(
+        normalized[fieldName],
+        isPolymorphic
+      );
+    }
+  }
+
+  return normalized;
+}
+
+/**
+ * Get the table name for a collection (convention: dc_collectionName).
+ * Converts hyphens to underscores for database compatibility.
+ */
+export function getTableName(collectionName: string): string {
+  return `dc_${collectionName.replace(/-/g, "_")}`;
+}
+
+/**
+ * A collection record's field definitions: those of its schema definition when
+ * it carries one, else its own `fields`, else none.
+ */
+export function collectionFields(collection: unknown): FieldDefinition[] {
+  const record =
+    typeof collection === "object" && collection !== null
+      ? (collection as Record<string, unknown>)
+      : {};
+  const schemaDefinition = record.schemaDefinition as
+    | Record<string, unknown>
+    | undefined;
+  return (
+    (schemaDefinition?.fields as FieldDefinition[] | undefined) ||
+    (record.fields as FieldDefinition[] | undefined) ||
+    []
+  );
+}
+
+/**
+ * The physical table a collection's rows live in: the `tableName` its registry
+ * record carries, which honours a configured `dbName`, else the `dc_<slug>`
+ * convention.
+ *
+ * The one answer every read, write and response boundary uses. Anything keyed
+ * by table — contributed hidden columns, a component's `_parent_table` — was
+ * recorded under the physical name, so a caller that rebuilds the name from
+ * the slug with `getTableName` misses it for every collection with a custom
+ * `dbName`: silently, because an unknown table simply matches nothing.
+ */
+export function collectionTableName(collection: unknown, slug: string): string {
+  const stored =
+    typeof collection === "object" && collection !== null
+      ? (collection as { tableName?: unknown }).tableName
+      : undefined;
+  return typeof stored === "string" && stored.length > 0
+    ? stored
+    : getTableName(slug);
+}
+
+/**
+ * Generate a URL-friendly slug from a string.
+ * Converts to lowercase, replaces spaces and special characters with hyphens,
+ * and removes consecutive hyphens.
+ */
+export function generateSlug(value: string): string {
+  return value
+    .toString()
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/[^\w-]+/g, "")
+    .replace(/--+/g, "-")
+    .replace(/^-+/, "")
+    .replace(/-+$/, "");
+}
+
+/** The longest slug path a collection with `db.slugPaths` stores. */
+const SLUG_PATH_MAX = 255;
+
+/**
+ * A slug that may hold several `/`-separated segments, as a collection with
+ * `db.slugPaths` stores it, or why it cannot be one.
+ *
+ * Without a `/` the value is normalised exactly as {@link generateSlug}
+ * does, an empty result included (the caller then derives one from the
+ * title, as before). With a `/`, each segment is normalised as a one-segment
+ * slug is, and the path is refused, never rewritten, where rewriting would
+ * put the entry at an address nobody asked for: an empty segment, or a `.` or
+ * `..` segment (which a browser resolves away), or a segment with nothing
+ * left once normalised. One leading and one trailing `/` are dropped first,
+ * since `/docs/install` is how an address is written. Either way, an address
+ * the content route can never serve (a reserved path such as `admin`) or a
+ * column cannot hold (more than 255 characters) is refused too.
+ */
+export function normalizeSlugPath(
+  value: string
+): { readonly slug: string } | { readonly problem: string } {
+  const raw = value.toString().trim();
+  const read = raw.includes("/")
+    ? slugSegments(raw)
+    : { slug: generateSlug(raw) };
+  if ("problem" in read || read.slug === "") return read;
+  const { slug } = read;
+  if (isReservedPath(`/${slug}`)) {
+    return {
+      problem: `The address "/${slug}" is reserved for the site itself (its admin, API or framework files). Choose another.`,
+    };
+  }
+  if (slug.length > SLUG_PATH_MAX) {
+    return {
+      problem: `The address is ${String(slug.length)} characters long. Keep it to ${String(SLUG_PATH_MAX)}.`,
+    };
+  }
+  return { slug };
+}
+
+/** A path of several segments, each normalised, or why it is no path. */
+function slugSegments(
+  raw: string
+): { readonly slug: string } | { readonly problem: string } {
+  const trimmed = raw.replace(/^\//, "").replace(/\/$/, "");
+  const segments: string[] = [];
+  for (const part of trimmed.split("/")) {
+    const segment = part.trim();
+    if (segment === "") {
+      return {
+        problem: `The address "${raw}" has an empty part between two slashes. Remove the extra "/".`,
+      };
+    }
+    if (segment === "." || segment === "..") {
+      return {
+        problem: `The address "${raw}" has a "${segment}" part, which a browser removes from an address. Use a name instead.`,
+      };
+    }
+    const normalised = generateSlug(segment);
+    if (normalised === "") {
+      return {
+        problem: `The address part "${segment}" has no letters or numbers to keep. Use letters, numbers or hyphens.`,
+      };
+    }
+    segments.push(normalised);
+  }
+  return { slug: segments.join("/") };
+}
+
+/**
+ * Normalize upload field values by extracting IDs from populated media objects.
+ *
+ * When editing an entry without changing an upload field, the form sends the full
+ * populated object from the API (with properties like id, filename, url, etc.).
+ * This helper extracts just the ID for database storage.
+ */
+export function normalizeUploadFields(
+  data: Record<string, unknown>,
+  fields: FieldDefinition[]
+): void {
+  fields.forEach(field => {
+    if (field.type === "upload") {
+      if (data[field.name] != null) {
+        const uploadField = field as { hasMany?: boolean };
+        if (uploadField.hasMany && Array.isArray(data[field.name])) {
+          data[field.name] = (data[field.name] as unknown[]).map(
+            (item: unknown) => {
+              if (typeof item === "string") return item;
+              if (typeof item === "object" && item !== null && "id" in item) {
+                return (item as Record<string, unknown>).id;
+              }
+              return item;
+            }
+          );
+        } else {
+          const value = data[field.name];
+          if (typeof value === "object" && value !== null && "id" in value) {
+            data[field.name] = (value as Record<string, unknown>).id;
+          }
+        }
+      }
+    }
+  });
+}
+
+/**
+ * Get searchable fields for a collection.
+ *
+ * Returns explicitly configured searchable fields if defined,
+ * otherwise returns system identifiers plus text-like fields.
+ */
+export function getSearchableFields(
+  collection: Record<string, unknown>
+): string[] {
+  const searchConfig =
+    (collection.search as Record<string, unknown>) ||
+    ((collection.schemaDefinition as Record<string, unknown> | undefined)
+      ?.search as Record<string, unknown> | undefined);
+  const searchableFields = searchConfig?.searchableFields as
+    | string[]
+    | undefined;
+  if (searchableFields?.length) {
+    return searchableFields;
+  }
+
+  const schemaDef = collection.schemaDefinition as
+    | Record<string, unknown>
+    | undefined;
+  const fields: FieldDefinition[] = (schemaDef?.fields ||
+    collection.fields ||
+    []) as FieldDefinition[];
+
+  const defaultSearchableFields = ["slug", "title"];
+
+  const autoDetectedTextFields = fields
+    .filter((field: FieldDefinition) => {
+      if (!field?.name || typeof field.name !== "string") return false;
+
+      // Honor explicit per-field searchable flags when present.
+      if ((field as Record<string, unknown>).searchable === true) return true;
+
+      return (SEARCHABLE_FIELD_TYPES as readonly string[]).includes(field.type);
+    })
+    .map((field: FieldDefinition) => field.name);
+
+  return Array.from(
+    new Set([...defaultSearchableFields, ...autoDetectedTextFields])
+  );
+}
+
+/**
+ * Get minimum search query length for a collection.
+ */
+export function getMinSearchLength(
+  collection: Record<string, unknown>
+): number {
+  const searchConfig =
+    (collection.search as Record<string, unknown>) ||
+    ((collection.schemaDefinition as Record<string, unknown> | undefined)
+      ?.search as Record<string, unknown> | undefined);
+  return (searchConfig?.minSearchLength as number) ?? 2;
+}
+
+/** A stored JSON text as its value; a string that is not JSON is the value. */
+function parseStoredJson(stored: string): unknown {
+  try {
+    return JSON.parse(stored);
+  } catch {
+    return stored;
+  }
+}
+
+/**
+ * Turn storage-encoded JSON columns back into the values the field was
+ * configured with.
+ *
+ * SQLite has no JSON type, so richtext, blocks, array, group and json fields
+ * come back as strings. Every consumer after this point -- hooks, field-level
+ * access, the caller -- is documented against the configured value, so the
+ * decode belongs before the first of them.
+ *
+ * The `locale=all` shape is a language-keyed map, but only a LOCALIZED field
+ * is ever read that way, and localization is a CLASSIFICATION rather than a
+ * flag: text-like types (including `richText`) localize by default in a
+ * localized collection without ever materializing `localized: true`. Reading
+ * the raw flag would leave those maps encoded. The master switch is passed as
+ * enabled because a shared field still classifies as not localized, so a
+ * collection that never opted in has no maps to mistake. A shared JSON field is a plain object on a driver that
+ * parses JSON, so treating every object as a locale map would parse its own
+ * string properties and hand back values the row never held.
+ *
+ * Runs exactly once per read. A second pass cannot tell an already-decoded
+ * string from storage encoding, so a field holding the string `"123"` would
+ * decode to the number `123` on the second visit; `"true"` and `"null"` fail
+ * the same way.
+ */
+export function decodeJsonFieldValues(
+  entries: Record<string, unknown>[],
+  fields: {
+    name: string;
+    type: string;
+    hasMany?: boolean;
+    relationTo?: unknown;
+    localized?: boolean;
+  }[],
+  locale?: string
+): void {
+  // The fields whose columns the row holds, those inside a group with no name among them
+  // (`fieldsStoredOnRow`). One reached through such a group is on the main row whatever it says
+  // of translation, as the declared list classifies it, so it is never read as a language map.
+  const topLevel = new Set(fields);
+  const stored = (addressableFields(fields) as unknown as typeof fields).map(
+    field => (topLevel.has(field) ? field : { ...field, localized: false })
+  );
+  for (const entry of entries) {
+    for (const field of stored) {
+      if (!isJsonFieldType(field.type, field)) continue;
+      // Every language's values beside the row, read as stored, decode as
+      // the row's own value does.
+      decodeEachLanguage(entry, field.name, parseStoredJson);
+      const value = entry[field.name];
+      if (typeof value === "string") {
+        try {
+          entry[field.name] = JSON.parse(value);
+        } catch {
+          // Not JSON after all; the stored string is the value.
+        }
+      } else if (
+        locale === EVERY_TRANSLATION &&
+        isFieldLocalized(field, true) &&
+        value !== null &&
+        typeof value === "object"
+      ) {
+        // `locale=all` yields a language-keyed map of raw companion values, so
+        // each locale's string is decoded to match the shape a single-locale
+        // read returns.
+        const keyed = value as Record<string, unknown>;
+        for (const code of Object.keys(keyed)) {
+          if (typeof keyed[code] === "string") {
+            try {
+              keyed[code] = JSON.parse(keyed[code]);
+            } catch {
+              // Not JSON after all; the stored string is the value.
+            }
+          }
+        }
+      }
+    }
+  }
+}

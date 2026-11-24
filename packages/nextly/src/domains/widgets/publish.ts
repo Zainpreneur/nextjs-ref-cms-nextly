@@ -1,0 +1,116 @@
+/**
+ * The registered widgets as the admin may receive them.
+ *
+ * The registry is the single place that knows which widgets exist in a running
+ * app, and this is the projection that carries it to the browser.
+ *
+ * Per widget rather than per payload, and that is the whole reason this is a
+ * function rather than a `listWidgets()` call at the call site. The registry's
+ * own gate is `structuredClone`, which carries a `BigInt` happily where
+ * `JSON.stringify` throws. One such widget
+ * would take the whole authenticated workspace payload down for every admin.
+ * Skipping the offender and logging it costs that one widget its card and
+ * leaves the dashboard standing.
+ *
+ * @module domains/widgets/publish
+ */
+
+import { getNextlyLogger } from "../../observability/logger";
+import { jsonOnly, unserializableKeys } from "../../plugins/json-round-trip";
+
+import type { WidgetDefinition } from "./definition";
+import type { PublishedContentSource } from "./published-content-source";
+import { listWidgets } from "./registry";
+import { withSiteOverride } from "./site-rules";
+import { getSource, type WidgetSource } from "./sources";
+
+/**
+ * Every registered widget that survives the trip to the browser unchanged, in
+ * registration order.
+ *
+ * Returns the DECODED value rather than the stored object, so what is checked is
+ * exactly what ships: a getter that answered once for the check cannot answer
+ * differently for the serialization.
+ */
+export function publishableWidgets(): WidgetDefinition[] {
+  const publishable: WidgetDefinition[] = [];
+
+  for (const definition of listWidgets()) {
+    const serializable = jsonOnly(definition);
+    if (serializable === undefined) {
+      getNextlyLogger().error({
+        kind: "widget-not-serializable",
+        widget: definition.id,
+        keys: unserializableKeys(definition),
+      });
+      continue;
+    }
+    // As the site's `overrides` change it, on what ships.
+    publishable.push(
+      withSiteOverride(serializable as unknown as WidgetDefinition)
+    );
+  }
+
+  return publishable;
+}
+
+// The collection a card's content settings may name has a module of its own, holding the type
+// alone, so the knobs that read it reach nothing of this one.
+export type { PublishedContentSource } from "./published-content-source";
+
+/**
+ * The collections, and their fields, a card's content settings may offer this
+ * reader.
+ *
+ * 🔴 Derived from the audience's readable collections, never decided again
+ * here: `readableEntities`, the gate the list routes use, asked once per
+ * request in `widgetAudience` of every collection with a content source. A
+ * card's settings may then name exactly the collections a card set to one is
+ * shown for.
+ *
+ * Only fields the source does not mark `offered: false`: a field a read rule
+ * could refuse, or a read hook transforms, is never offered as a choice. A
+ * field offered to filter and sort that the read will not group by carries
+ * `groupable: false`, so a Group by setting leaves it out.
+ */
+export function publishableContentSources(
+  readableCollections: Iterable<string>
+): PublishedContentSource[] {
+  const published: PublishedContentSource[] = [];
+  for (const slug of readableCollections) {
+    const source = getSource(`collection:${slug}`);
+    if (source !== undefined) published.push(publishedSourceOf(slug, source));
+  }
+  return published;
+}
+
+/** One collection's source as a reader's content settings see it. */
+function publishedSourceOf(
+  slug: string,
+  source: WidgetSource
+): PublishedContentSource {
+  const offered = source.fields.filter(field => field.offered !== false);
+  // Published only where the reader is offered the field itself: a title a
+  // read rule could refuse is no row label to ask for.
+  const titleField = offered.some(field => field.name === source.titleField)
+    ? source.titleField
+    : undefined;
+  return {
+    collection: slug,
+    label: source.label,
+    lifecycle: source.lifecycleStatus === true,
+    ...(titleField === undefined ? {} : { titleField }),
+    fields: offered.map(
+      ({ name, label, type, choices, groupable, presentable }) => ({
+        name,
+        type,
+        ...(label === undefined ? {} : { label }),
+        ...(choices === undefined ? {} : { choices }),
+        // Carried so a Group by setting offers only keys the read accepts.
+        ...(groupable === undefined ? {} : { groupable }),
+        // Carried so a Fields setting offers only fields a row can print.
+        ...(presentable === undefined ? {} : { presentable }),
+      })
+    ),
+  };
+}

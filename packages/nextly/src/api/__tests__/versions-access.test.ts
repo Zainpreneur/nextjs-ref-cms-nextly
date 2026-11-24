@@ -1,0 +1,400 @@
+/**
+ * Version-history access gate.
+ *
+ * The gate decides whether a caller may see a document's history, so its side
+ * effects and failure modes matter as much as its verdict. The init/DI/auth
+ * boundary is mocked so the gate itself is what is under test — an
+ * unauthenticated request would be rejected before reaching it.
+ */
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const getEntrySpy = vi.fn();
+const singleGetSpy = vi.fn();
+const selectOneSpy = vi.fn();
+const getSingleBySlugSpy = vi.fn();
+const requireRouteCollectionAccessSpy = vi.fn();
+
+vi.mock("../../init", () => ({
+  getCachedNextly: vi.fn().mockResolvedValue({}),
+}));
+
+vi.mock("../../di", () => ({
+  getService: vi.fn((name: string) => {
+    switch (name) {
+      case "collectionsHandler":
+        return { getEntry: getEntrySpy };
+      case "singleEntryService":
+        return { get: singleGetSpy };
+      case "singleRegistryService":
+        return { getSingleBySlug: getSingleBySlugSpy };
+      case "adapter":
+        // `select` answers the "last looked at" read with no markers.
+        return {
+          selectOne: selectOneSpy,
+          select: vi.fn().mockResolvedValue([]),
+        };
+      case "collectionService":
+        return { getCollection: vi.fn().mockResolvedValue({ fields: [] }) };
+      case "versionsService":
+        return { list: vi.fn().mockResolvedValue([]), get: vi.fn() };
+      // No registered entity is localized, so history asks no language.
+      case "collectionRegistryService":
+        return { getCollectionBySlugForRead: vi.fn().mockResolvedValue(null) };
+      default:
+        return {};
+    }
+  }),
+}));
+
+vi.mock("../route-auth", () => ({
+  requireRouteCollectionAccess: (...args: unknown[]) =>
+    requireRouteCollectionAccessSpy(...args),
+}));
+
+vi.mock("../../services/lib/permissions", () => ({
+  resolveRoleSlugs: vi.fn().mockResolvedValue(["editor"]),
+}));
+
+import {
+  assertVersionDocumentReadable,
+  requireRouteVersionReadAccess,
+} from "../versions-access";
+import { GET as listVersions } from "../versions";
+
+/** A read that succeeds and reports loading the entry it was asked for. */
+function readsTheAskedForEntry(): void {
+  getEntrySpy.mockImplementation(({ entryId }: { entryId: string }) =>
+    Promise.resolve({
+      success: true,
+      statusCode: 200,
+      data: { id: entryId },
+      resolvedEntryId: entryId,
+    })
+  );
+}
+
+describe("requireRouteVersionReadAccess", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    requireRouteCollectionAccessSpy.mockResolvedValue({
+      userId: "user-1",
+      userName: "Ed",
+      userEmail: "ed@example.com",
+      permissions: [],
+      roles: ["editor"],
+      authMethod: "session",
+    });
+  });
+
+  it("reads a collection entry with status:all so drafts still have history", async () => {
+    readsTheAskedForEntry();
+
+    await requireRouteVersionReadAccess(
+      new Request("http://localhost/x"),
+      "collection",
+      "posts",
+      "entry-1"
+    );
+
+    // A history names one document: the gate is asked about that document,
+    // so a caller who may not read it is answered as if it were missing.
+    expect(requireRouteCollectionAccessSpy).toHaveBeenCalledWith(
+      expect.any(Request),
+      "read",
+      "posts",
+      expect.objectContaining({ namesOne: true })
+    );
+
+    // Without status:"all" a draft reads as absent and history 404s — exactly
+    // when an author needs it. Nothing is attested by the route, so the
+    // collection's own read rule is asked in the language the read names.
+    expect(getEntrySpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        collectionName: "posts",
+        entryId: "entry-1",
+        status: "all",
+        routeAuthorized: false,
+        overrideAccess: false,
+      })
+    );
+  });
+
+  it("judges an API-key version read on the key's own scope", async () => {
+    // A version-history read runs the live-document read gate. For an API-key
+    // request it must carry the key's OWN scope, so a super-admin-owned key
+    // scoped for read does not skip the document's own read gate before its
+    // history is exposed.
+    requireRouteCollectionAccessSpy.mockResolvedValue({
+      userId: "key-owner",
+      permissions: ["read-posts"],
+      roles: ["editor"],
+      authMethod: "api-key",
+    });
+    readsTheAskedForEntry();
+
+    await requireRouteVersionReadAccess(
+      new Request("http://localhost/x"),
+      "collection",
+      "posts",
+      "entry-1"
+    );
+
+    expect(getEntrySpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        // `objectContaining` on the scope too: it also carries the key's roles
+        // and, where authentication resolved them, the permission rows both
+        // spellings derive from. Pinning the whole object would fail whenever
+        // the scope gains a field, which is a change to the scope rather than
+        // to what this test is about.
+        authenticatedScope: expect.objectContaining({
+          actorType: "apiKey",
+          permissions: ["read-posts"],
+        }),
+      })
+    );
+  });
+
+  it("carries no scope for a session version read", async () => {
+    // A session caller has no stamped scope, so the read gate falls back to the
+    // owner/session RBAC path (undefined scope), not an empty api-key scope.
+    readsTheAskedForEntry();
+
+    await requireRouteVersionReadAccess(
+      new Request("http://localhost/x"),
+      "collection",
+      "posts",
+      "entry-1"
+    );
+
+    expect(getEntrySpy).toHaveBeenCalledWith(
+      expect.objectContaining({ authenticatedScope: undefined })
+    );
+  });
+
+  it("surfaces a server-side read failure instead of reporting not-found", async () => {
+    // A throwing afterRead hook or a component load error yields success:false
+    // with a 5xx. Collapsing that into 404 would disguise an outage as missing
+    // content.
+    getEntrySpy.mockResolvedValue({ success: false, statusCode: 500 });
+
+    await expect(
+      requireRouteVersionReadAccess(
+        new Request("http://localhost/x"),
+        "collection",
+        "posts",
+        "entry-1"
+      )
+    ).rejects.toMatchObject({ code: "INTERNAL_ERROR" });
+  });
+
+  it("treats a denial as not-found so existence is not disclosed", async () => {
+    getEntrySpy.mockResolvedValue({ success: false, statusCode: 403 });
+
+    await expect(
+      requireRouteVersionReadAccess(
+        new Request("http://localhost/x"),
+        "collection",
+        "posts",
+        "entry-1"
+      )
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("never materializes a Single while checking access", async () => {
+    // SingleEntryService.get auto-creates a missing Single (and captures v1 for
+    // a versioned one). A version request is a read, so the gate must check the
+    // backing row directly and stop before that write can happen.
+    getSingleBySlugSpy.mockResolvedValue({ tableName: "single_settings" });
+    selectOneSpy.mockResolvedValue(null);
+
+    await expect(
+      requireRouteVersionReadAccess(
+        new Request("http://localhost/x"),
+        "single",
+        "settings",
+        "single-1"
+      )
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    expect(singleGetSpy).not.toHaveBeenCalled();
+  });
+
+  it("refuses history for a Single recreated under a different id", async () => {
+    // Version rows outlive the document they came from, so a stale entryId
+    // must not expose the previous document's snapshots.
+    getSingleBySlugSpy.mockResolvedValue({ tableName: "single_settings" });
+    selectOneSpy.mockResolvedValue({ id: "current-id" });
+
+    await expect(
+      requireRouteVersionReadAccess(
+        new Request("http://localhost/x"),
+        "single",
+        "settings",
+        "stale-id"
+      )
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    expect(singleGetSpy).not.toHaveBeenCalled();
+  });
+
+  it("allows a Single whose live id matches the requested history", async () => {
+    getSingleBySlugSpy.mockResolvedValue({ tableName: "single_settings" });
+    selectOneSpy.mockResolvedValue({ id: "single-1" });
+    singleGetSpy.mockResolvedValue({ success: true, statusCode: 200 });
+
+    const { user } = await requireRouteVersionReadAccess(
+      new Request("http://localhost/x"),
+      "single",
+      "settings",
+      "single-1"
+    );
+
+    expect(user.id).toBe("user-1");
+    expect(singleGetSpy).toHaveBeenCalledWith(
+      "settings",
+      expect.objectContaining({ routeAuthorized: false, status: "all" })
+    );
+  });
+});
+
+describe("version list pagination meta", () => {
+  const listSpy = vi.fn();
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    requireRouteCollectionAccessSpy.mockResolvedValue({
+      userId: "user-1",
+      permissions: [],
+      roles: ["editor"],
+      authMethod: "session",
+    });
+    readsTheAskedForEntry();
+    const di = await import("../../di");
+    vi.mocked(di.getService).mockImplementation(((name: string) =>
+      name === "versionsService"
+        ? { list: listSpy, get: vi.fn() }
+        : name === "collectionsHandler"
+          ? { getEntry: getEntrySpy }
+          : name === "adapter"
+            ? // The caller has no "last looked at" markers.
+              { select: vi.fn().mockResolvedValue([]) }
+            : name === "collectionRegistryService"
+              ? // Not localized, so the listing asks no language.
+                { getCollectionBySlugForRead: vi.fn().mockResolvedValue(null) }
+              : {}) as typeof di.getService);
+  });
+
+  function ctx() {
+    return {
+      params: Promise.resolve({ kind: "collection", slug: "posts", id: "e1" }),
+    };
+  }
+
+  function rows(n: number) {
+    return Array.from({ length: n }, (_, i) => ({ versionNo: n - i }));
+  }
+
+  it("reports hasNext=false when the history exactly fills one page", async () => {
+    // The off-by-one that matters: 2 rows with limit=2 previously claimed a
+    // next page, sending the client to an empty one. The route asks for
+    // limit+1 and only a returned extra row proves more exist.
+    listSpy.mockResolvedValue(rows(2));
+
+    const res = await listVersions(
+      new Request("http://localhost/api/versions/collection/posts/e1?limit=2"),
+      ctx()
+    );
+    const body: {
+      items: unknown[];
+      meta: { hasNext: boolean; limit: number };
+    } = await res.json();
+
+    expect(listSpy).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ limit: 3 })
+    );
+    expect(body.items).toHaveLength(2);
+    expect(body.meta.hasNext).toBe(false);
+    expect(body.meta.limit).toBe(2);
+  });
+
+  it("reports hasNext=true and trims the probe row when more exist", async () => {
+    listSpy.mockResolvedValue(rows(3));
+
+    const res = await listVersions(
+      new Request("http://localhost/api/versions/collection/posts/e1?limit=2"),
+      ctx()
+    );
+    const body: {
+      items: unknown[];
+      meta: { hasNext: boolean };
+    } = await res.json();
+
+    // The extra row is a probe, never part of the page.
+    expect(body.items).toHaveLength(2);
+    expect(body.meta.hasNext).toBe(true);
+  });
+});
+
+describe("assertVersionDocumentReadable", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("resolves when the caller may read the live document", async () => {
+    readsTheAskedForEntry();
+
+    await expect(
+      assertVersionDocumentReadable("collection", "posts", "e1", {
+        id: "user-1",
+      })
+      // No registered entity is localized: a history in no language.
+    ).resolves.toEqual(new Set());
+
+    // Same document rules as the standalone route: drafts visible, and the
+    // read rule asked again rather than taken as answered upstream, since an
+    // upstream allow judged one language at most.
+    expect(getEntrySpy).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "all", routeAuthorized: false })
+    );
+  });
+
+  it("rejects with not-found when the document is not readable", async () => {
+    getEntrySpy.mockResolvedValue({ success: false, statusCode: 403 });
+
+    await expect(
+      assertVersionDocumentReadable("collection", "posts", "e1", {
+        id: "user-1",
+      })
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("rejects with not-found when the read returned another document", async () => {
+    // A hook can rewrite the id a read resolves; a read of another document
+    // says nothing about this one.
+    // The output still names the document asked about: only the read's own
+    // report of the row it loaded is trusted.
+    getEntrySpy.mockResolvedValue({
+      success: true,
+      statusCode: 200,
+      data: { id: "e1" },
+      resolvedEntryId: "e2",
+    });
+
+    await expect(
+      assertVersionDocumentReadable("collection", "posts", "e1", {
+        id: "user-1",
+      })
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("does not authenticate — the dispatcher already did", async () => {
+    readsTheAskedForEntry();
+
+    await assertVersionDocumentReadable("collection", "posts", "e1", {
+      id: "user-1",
+    });
+
+    expect(requireRouteCollectionAccessSpy).not.toHaveBeenCalled();
+  });
+});

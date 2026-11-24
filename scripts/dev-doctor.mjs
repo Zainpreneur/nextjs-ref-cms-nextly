@@ -1,0 +1,192 @@
+// Doctor: pre-flight checks for the playground dev experience.
+// Each check returns { ok: true } or { ok: false, reason, fix }.
+// Intentionally JS (.mjs) — kept dependency-free so it can run before
+// any TypeScript or Next.js machinery loads.
+
+import { realpathSync } from "node:fs";
+import * as fs from "node:fs/promises";
+import * as net from "node:net";
+import * as path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+/**
+ * This file's directory, with symlinks resolved. ONE definition, because the
+ * guard import and the diagnostic paths below must agree about where this
+ * script lives.
+ *
+ * Taken from `realpathSync` rather than from `import.meta.url` directly: under
+ * `--preserve-symlinks-main` that URL is the SYMLINK. Two different things go
+ * wrong from it, and the second is the worse one:
+ *
+ * - the guard is looked for beside the link and the command dies with
+ *   `ERR_MODULE_NOT_FOUND` before printing anything;
+ * - `nextlyRoot` lands beside the link, so every check reads the wrong tree
+ *   and a healthy checkout is reported as missing its workspace links, its
+ *   env file and its build artifacts. That one is a FALSE NEGATIVE — the
+ *   command still prints a well-formed report, so nothing about the output
+ *   says the paths were wrong.
+ */
+const HERE = path.dirname(realpathSync(fileURLToPath(import.meta.url)));
+
+const { isCliEntry } = await import(
+  pathToFileURL(path.join(HERE, "cli-entry.mjs")).href
+);
+
+// Workspace integrity check. The two scopes get hoisted differently:
+//   - @nextlyhq/* — consumed by the root package.json (the lint plugin,
+//     the prettier config) and by other packages, so they appear at <root>/node_modules.
+//   - @nextlyhq/* — consumed by the playground app and internally between
+//     packages, but never directly by the root, so the actual symlinks
+//     live in <root>/apps/playground/node_modules. This is the layer
+//     that broke during the @nextly→@nextlyhq rebrand.
+// Checking both locations catches the failure modes that actually occur.
+const REQUIRED_LOCATIONS = [
+  { scope: "@nextlyhq", relativePath: "node_modules" },
+  { scope: "@nextlyhq", relativePath: "apps/playground/node_modules" },
+];
+
+export async function checkWorkspaceLinks(nextlyRoot) {
+  const missing = [];
+  for (const { scope, relativePath } of REQUIRED_LOCATIONS) {
+    const scopeDir = path.join(nextlyRoot, relativePath, scope);
+    try {
+      const entries = await fs.readdir(scopeDir);
+      if (entries.length === 0) missing.push(`${relativePath}/${scope}`);
+    } catch {
+      missing.push(`${relativePath}/${scope}`);
+    }
+  }
+  if (missing.length === 0) return { ok: true };
+
+  return {
+    ok: false,
+    reason: `workspace symlinks missing for: ${missing.join(", ")}`,
+    fix: [
+      "Try in order:",
+      "  1. pnpm install --force",
+      "  2. rm -rf node_modules packages/*/node_modules apps/*/node_modules && pnpm install",
+      "  3. yalc remove --all (if you've used yalc recently in this directory)",
+    ].join("\n"),
+  };
+}
+
+export async function checkEnvFile(envPath) {
+  try {
+    await fs.access(envPath);
+    return { ok: true };
+  } catch {
+    // .env missing. Try auto-creating from .env.example. The example is
+    // a checked-in template with safe defaults (SQLite, dev secrets), so
+    // copying it during a fresh-clone boot is the right default. If even
+    // the example is missing, surface a real failure.
+    const exampleSibling = envPath.replace(/\.env$/, ".env.example");
+    try {
+      await fs.access(exampleSibling);
+      await fs.copyFile(exampleSibling, envPath);
+      return { ok: true, autoCreated: true, copiedFrom: exampleSibling };
+    } catch {
+      return {
+        ok: false,
+        reason: `.env missing at ${envPath} and .env.example missing as well`,
+        fix: `create ${envPath} manually with DB_DIALECT, DATABASE_URL, NEXTLY_SECRET, NEXT_PUBLIC_APP_URL`,
+      };
+    }
+  }
+}
+
+// Detects whether workspace packages have been built. The seed sub-process
+// imports compiled dist outputs (e.g. @nextlyhq/adapter-drizzle's
+// version-check.cjs), so a fresh clone with no `pnpm build` will crash the
+// seed step. Using packages/nextly/dist as the sentinel because it is the
+// last package built in the turbo graph -- if it exists, the whole
+// dependency chain compiled.
+/**
+ * Whether the workspace has EVER been built.
+ *
+ * One sentinel, and the claim is narrowed to what one sentinel can support.
+ * This detects a workspace nobody has built; it cannot detect a `dist` that is
+ * STALE, PARTIAL, or missing in a package other than the sentinel's — and the
+ * failures that actually happen are those. `packages/builder/dist` going absent
+ * leaves this reporting ok while the admin renders blank, because the page
+ * builder's stylesheet `@import`s a file from it.
+ *
+ * `dev:app` therefore does not gate its build on this any more; it builds every
+ * time and lets turbo's hashing answer the currency question, which a directory
+ * listing cannot. This stays for `dev:doctor`, where a human is asking what is
+ * wrong and "nothing has been built" is worth saying plainly.
+ */
+export async function checkBuildArtifacts(nextlyRoot) {
+  const sentinel = path.join(nextlyRoot, "packages", "nextly", "dist");
+  try {
+    const entries = await fs.readdir(sentinel);
+    if (entries.length === 0) {
+      return {
+        ok: false,
+        reason: "packages/nextly/dist is empty (workspace not built yet)",
+        fix: "pnpm turbo build --filter='./packages/*'",
+      };
+    }
+    return { ok: true };
+  } catch {
+    return {
+      ok: false,
+      reason: "packages/nextly/dist missing (workspace not built yet)",
+      fix: "pnpm turbo build --filter='./packages/*'",
+    };
+  }
+}
+
+// NOTE: this is a TOCTOU check by design — between the time we close
+// the test listener and `next dev` calls bind, another process could
+// grab the port. The point is to catch the obvious case ("port already
+// busy when we start") with a clear message; the truly racy edge falls
+// through to next dev's own EADDRINUSE error.
+export async function checkPort(port) {
+  return new Promise(resolve => {
+    const server = net.createServer();
+    server.once("error", () => {
+      resolve({
+        ok: false,
+        reason: `port ${port} is in use`,
+        fix: `PORT=${port + 1} pnpm dev:app`,
+      });
+    });
+    server.once("listening", () => {
+      server.close(() => resolve({ ok: true }));
+    });
+    server.listen(port);
+  });
+}
+
+// Run all standard checks and return a composite result. Used by both the
+// wrapper script and the standalone `pnpm dev:doctor` entry.
+export async function runAllChecks({ nextlyRoot, envPath, port }) {
+  const results = {
+    workspaceLinks: await checkWorkspaceLinks(nextlyRoot),
+    envFile: await checkEnvFile(envPath),
+    buildArtifacts: await checkBuildArtifacts(nextlyRoot),
+    port: await checkPort(port),
+  };
+  const ok = Object.values(results).every(r => r.ok);
+  return { ok, results };
+}
+
+// CLI entry: when invoked directly (pnpm dev:doctor), print a report.
+if (isCliEntry(import.meta.url)) {
+  // `HERE`, so the report describes the checkout this file actually lives in
+  // rather than wherever it was invoked from.
+  const nextlyRoot = path.resolve(HERE, "..");
+  const envPath = path.join(nextlyRoot, "apps", "playground", ".env");
+  const port = Number(process.env.PORT) || 3000;
+
+  const { ok, results } = await runAllChecks({ nextlyRoot, envPath, port });
+  for (const [name, r] of Object.entries(results)) {
+    if (r.ok) {
+      console.log(`[nextly] ✓ ${name}`);
+    } else {
+      console.error(`[nextly] ✗ ${name}: ${r.reason}`);
+      console.error(`         ${r.fix.replace(/\n/g, "\n         ")}`);
+    }
+  }
+  process.exit(ok ? 0 : 1);
+}

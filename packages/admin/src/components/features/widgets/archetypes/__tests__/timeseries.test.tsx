@@ -1,0 +1,168 @@
+/**
+ * What a `timeseries` card shows, and which instant each point is called.
+ *
+ * The labelling is the part with a real defect in it. The server buckets in
+ * UTC, so a point IS a UTC calendar day; rendering that instant in another zone
+ * renames the bucket, and the axis would then disagree with both the table
+ * beside it and the server that produced it.
+ */
+import { render, screen, within } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
+
+import { setGlobalDateTimeConfig } from "@admin/lib/dates/format";
+import type {
+  DashboardWidget,
+  WidgetResult,
+} from "@admin/types/dashboard/widgets";
+
+import { sizeChartsInTests } from "../../charts/__tests__/chart-env";
+import { pointLabel, timeseriesBody } from "../timeseries";
+import { CardEmpty } from "../../frame/states";
+import { gridBounds } from "../../__tests__/grid-bounds";
+
+// A declared card, answered on the server by its card id.
+const widget = (): DashboardWidget =>
+  ({
+    id: "acme/over-time",
+    title: "Entries over time",
+    archetype: "timeseries",
+    size: gridBounds(6),
+  }) as DashboardWidget;
+
+const series = (
+  points: { start: string; count: number }[],
+  interval = "day"
+): WidgetResult =>
+  ({ op: "timeseries", points, interval }) as unknown as WidgetResult;
+
+function draw(result: WidgetResult, definition = widget()) {
+  const outcome = timeseriesBody(result, definition);
+  if (!outcome.ok) throw new Error(`expected a body, got: ${outcome.message}`);
+  render(
+    <>{outcome.empty ? <CardEmpty {...outcome.empty} /> : outcome.node}</>
+  );
+}
+
+afterEach(() => {
+  setGlobalDateTimeConfig({});
+});
+
+sizeChartsInTests();
+
+describe("the timeseries archetype", () => {
+  it("refuses a payload that is not a timeline", () => {
+    const outcome = timeseriesBody(
+      { op: "groupBy", buckets: [{ value: "a", count: 1 }] },
+      widget()
+    );
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.message).toContain("groupBy");
+  });
+
+  it("labels a bucket by its UTC date whatever zone the install is set to", () => {
+    // The defect this exists for: a UTC day begins at midnight, which is 19:00
+    // the PREVIOUS day at UTC-5. Formatted in the install's zone, March 4th's
+    // rows would be labelled "Mar 3" while the server and the table call them
+    // the 4th.
+    setGlobalDateTimeConfig({ timezone: "America/New_York", locale: "en-US" });
+    draw(series([{ start: "2026-03-04T00:00:00.000Z", count: 3 }]));
+
+    const table = screen.getByRole("table");
+    expect(within(table).getByText(/Mar 4/)).toBeInTheDocument();
+    expect(within(table).queryByText(/Mar 3/)).not.toBeInTheDocument();
+  });
+
+  it("still honours the install's locale for how that date is written", () => {
+    // The zone is pinned; the FORMAT is not. Pinning both would make these
+    // cards the only dates in the admin that ignore the configured preference.
+    setGlobalDateTimeConfig({ timezone: "UTC", locale: "de-DE" });
+    draw(series([{ start: "2026-03-04T00:00:00.000Z", count: 3 }]));
+
+    const table = screen.getByRole("table");
+    // German abbreviates March as "Mär"; the assertion is that the locale
+    // reached the formatter at all, not the exact spelling.
+    expect(within(table).queryByText(/Mar 4/)).not.toBeInTheDocument();
+  });
+
+  it("carries a text alternative naming the total, the latest and the highest", () => {
+    draw(
+      series([
+        { start: "2026-03-04T00:00:00.000Z", count: 2 },
+        { start: "2026-03-05T00:00:00.000Z", count: 9 },
+      ])
+    );
+    const graphic = screen.getByRole("group", { name: /Use the arrow keys/ });
+    expect(graphic).toHaveAccessibleName(/Entries over time/);
+    expect(graphic).toHaveAccessibleDescription(/11 in total/);
+    expect(graphic).toHaveAccessibleDescription(/Latest 9 on .*; highest 9 on/);
+  });
+
+  it("keeps an empty interval as a zero row rather than dropping it", () => {
+    // Zero means NO ROWS, never unknown -- the whole window was read. A missing
+    // row would let a reader infer the interval was not measured.
+    draw(
+      series([
+        { start: "2026-03-04T00:00:00.000Z", count: 0 },
+        { start: "2026-03-05T00:00:00.000Z", count: 4 },
+      ])
+    );
+    const table = screen.getByRole("table");
+    expect(within(table).getAllByRole("row")).toHaveLength(3); // header + 2
+    expect(within(table).getByText("0")).toBeInTheDocument();
+  });
+
+  it("marks a single interval instead of drawing an invisible line", async () => {
+    // One point is a legal window and produces no line segment, so without a
+    // marker the card renders an empty box that reads as a failure.
+    const { container } = render(
+      <>
+        {(() => {
+          const outcome = timeseriesBody(
+            series([{ start: "2026-03-04T00:00:00.000Z", count: 5 }]),
+            widget()
+          );
+          if (!outcome.ok) throw new Error(outcome.message);
+          return outcome.node;
+        })()}
+      </>
+    );
+    const drawing = await screen.findByTestId("chart-drawing");
+    expect(container.contains(drawing)).toBe(true);
+    expect(drawing.querySelector(".recharts-reference-dot-dot")).not.toBeNull();
+  });
+
+  it("says the window is empty rather than drawing nothing at all", () => {
+    draw(series([]));
+    // The frame's one empty state, worded for a chart over time.
+    expect(screen.getByTestId("card-empty")).toHaveTextContent(
+      /Nothing to plot yet/
+    );
+  });
+});
+
+describe("an interval in words", () => {
+  afterEach(() =>
+    setGlobalDateTimeConfig({ timezone: "UTC", locale: "en-US" })
+  );
+
+  it("is a day as the chart writes it, with no year", () => {
+    setGlobalDateTimeConfig({ timezone: "UTC", locale: "en-US" });
+    expect(pointLabel("2026-10-27T00:00:00.000Z", "day")).toBe("Oct 27");
+  });
+
+  it("is a week by the day it starts", () => {
+    setGlobalDateTimeConfig({ timezone: "UTC", locale: "en-US" });
+    expect(pointLabel("2026-10-19T00:00:00.000Z", "week")).toBe(
+      "Week of Oct 19"
+    );
+  });
+
+  it("is a month with its year", () => {
+    setGlobalDateTimeConfig({ timezone: "UTC", locale: "en-US" });
+    expect(pointLabel("2026-10-01T00:00:00.000Z", "month")).toBe("Oct 2026");
+  });
+
+  it("is the instant as stored where it cannot be read as a date", () => {
+    expect(pointLabel("not a date", "day")).toBe("not a date");
+  });
+});

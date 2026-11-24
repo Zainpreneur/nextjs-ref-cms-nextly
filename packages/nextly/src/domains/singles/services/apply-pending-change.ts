@@ -1,0 +1,211 @@
+/**
+ * Turning a Single's pending change into the values a write persists.
+ *
+ * Two callers need this and must not answer differently: publishing one
+ * language folds its pending change into that write, and publishing every
+ * language applies each of them. A second copy of the mapping is how the two
+ * would drift, and the drift would be quiet — a translated value routed to the
+ * main table fails loudly with `no such column`, but one routed to the wrong
+ * locale's companion row simply publishes the wrong translation.
+ *
+ * @module domains/singles/services/apply-pending-change
+ */
+
+import type { SupportedDialect } from "@nextlyhq/adapter-drizzle/types";
+import { and, eq, type Column } from "drizzle-orm";
+
+import type { RequestActor } from "../../../auth/request-actor";
+import type { FieldConfig } from "../../../collections/fields/types";
+import { keysToSnakeCase } from "../../../lib/case-conversion";
+import { stripImmutableSystemFields } from "../../../lib/immutable-system-fields";
+import type { CompanionSchema } from "../../i18n/runtime/companion-io";
+import {
+  splitLocalizedWrite,
+  upsertCompanionRow,
+} from "../../i18n/runtime/companion-io";
+import { draftComponentValues } from "../../versions/draft-components";
+import {
+  type ComponentFieldResolver,
+  stripSingleComponentTags,
+} from "../../versions/tag-component-types";
+
+import { serializeJsonFields } from "./single-utils";
+
+/** The column-shaped halves a pending change persists to. */
+export interface PendingChangeParts {
+  /** Values belonging on the Single's own row. */
+  main: Record<string, unknown>;
+  /** Values belonging on the write locale's companion row. */
+  companion: Record<string, unknown>;
+  /**
+   * The draft's component values, keyed by field name. They are stored in the
+   * component tables, not on either row, so the publish writes them with the
+   * component save.
+   */
+  components: Record<string, unknown>;
+}
+
+/**
+ * Split a stored pending change into main-row and companion-row values.
+ *
+ * The snapshot is in read shape (field names, camelCased timestamps), so it is
+ * mapped to columns before the split — and the split runs LAST, because it is
+ * what moves translated values out of the document. Anything merged in
+ * afterwards would land on the main row, which has no column for it.
+ *
+ * `overrides` are the caller's own values, applied on top: a publish that also
+ * sets a field is saying something about that field now, and outranks what the
+ * pending change said earlier.
+ */
+export function splitPendingChange(
+  snapshot: unknown,
+  /** The Single's main table, which the returned `main` values are written to. */
+  tableName: string,
+  /**
+   * The Single's declared fields. A pending change is stored in read shape, so
+   * it can carry a virtual field an afterRead hook computed; it has no column
+   * on the main row and is dropped with the rest of what the row cannot take.
+   */
+  fields: Parameters<typeof stripImmutableSystemFields>[3],
+  companion: CompanionSchema | null,
+  overrides?: Record<string, unknown>,
+  /**
+   * A component's fields by its slug, so the type tags on components nested
+   * in other components come off too, at every depth the draft recorded them.
+   */
+  componentFields?: ComponentFieldResolver
+): PendingChangeParts {
+  const draft = (snapshot ?? {}) as Record<string, unknown>;
+  // The draft records each fixed component with its type; neither the rows
+  // nor a component write's validators see that tag on an ordinary write, so
+  // it comes off both halves here. A dynamic zone's row type is its public
+  // discriminator and is kept.
+  const untagged = (values: Record<string, unknown>) =>
+    stripSingleComponentTags(values, fields as FieldConfig[], componentFields);
+  const components = untagged(
+    draftComponentValues(draft, fields as FieldConfig[])
+  );
+  // The component values leave the row-shaped halves: neither row has a
+  // column for them. Own keys only, so a field named like an Object.prototype
+  // member stays with the row.
+  //
+  // A component nested in a group or repeater stays with the row, inside its
+  // container's value, and is recorded in the draft with its type. The row
+  // stores the container as one JSON value, so the record comes off here, as a
+  // restore takes it off, or it would be stored and served by every read.
+  const rowValues = untagged(
+    Object.fromEntries(
+      Object.entries(draft).filter(
+        ([key]) => !Object.prototype.hasOwnProperty.call(components, key)
+      )
+    )
+  );
+  // A draft holds JSON-backed fields parsed, as reads do; the row stores them
+  // encoded, as an ordinary write encodes them. Encoding is idempotent, so a
+  // draft written before drafts held the read shape passes through unchanged.
+  const encoded = serializeJsonFields(rowValues, fields as FieldConfig[]);
+  const payload = stripImmutableSystemFields(
+    {
+      ...(keysToSnakeCase(encoded) as Record<string, unknown>),
+      ...(overrides ?? {}),
+    },
+    "single",
+    tableName,
+    fields
+  );
+  if (!companion) return { main: payload, companion: {}, components };
+  const { main, companion: companionValues } = splitLocalizedWrite(
+    payload,
+    companion.localizedFields
+  );
+  return { main, companion: companionValues, components };
+}
+
+/** The transaction surface a companion write needs. */
+export interface CompanionWriteTx {
+  execute<T = unknown>(sql: string, params?: unknown[]): Promise<T[]>;
+}
+
+/**
+ * Write one language's values to its companion row, on the caller's
+ * transaction.
+ *
+ * The adapter shim is built here rather than at each call site: it binds the
+ * write to the transaction's own connection, and a site that forgot it would
+ * take a second pooled connection the transaction is holding and stall.
+ */
+export async function writeCompanionValues(args: {
+  tx: CompanionWriteTx;
+  dialect: SupportedDialect;
+  companionTableName: string;
+  entryId: string;
+  locale: string;
+  values: Record<string, unknown>;
+  /** The per-locale lifecycle to stamp, when this write sets one. */
+  status?: string;
+  /**
+   * Who made the save: the language row's version counter moves and its last
+   * changer is recorded, in the upsert itself.
+   */
+  savedBy: RequestActor;
+  /** Set when the save already took the row's next version (`claimCompanionRevision`). */
+  revisionClaimed?: boolean;
+}): Promise<void> {
+  const txWriteAdapter = {
+    dialect: args.dialect,
+    executeQuery: <T = unknown>(sql: string, params?: unknown[]) =>
+      args.tx.execute<T>(sql, params),
+  };
+  await upsertCompanionRow(
+    txWriteAdapter,
+    args.companionTableName,
+    args.entryId,
+    args.locale,
+    args.values,
+    args.status,
+    { savedBy: args.savedBy, revisionClaimed: args.revisionClaimed }
+  );
+}
+
+/**
+ * One language's stored companion values, keyed by FIELD name.
+ *
+ * The live main row is not the whole live document for a localized Single: a
+ * translatable field's value is on its language's companion row. Compared
+ * against the main row alone, every translation reads as absent, so an
+ * untouched one looks like an edit and a publish that changes nothing the
+ * caller is denied is refused.
+ *
+ * Read on the caller's transaction, which already holds the row it is about.
+ */
+export async function readCompanionValuesInTx(
+  tx: { getDrizzle: <T>() => T },
+  companion: {
+    table: unknown;
+    localizedFields: ReadonlyArray<{ name: string; column: string }>;
+  },
+  parentId: string,
+  locale: string
+): Promise<Record<string, unknown>> {
+  const table = companion.table as Record<string, Column>;
+  const drizzle = tx.getDrizzle<{
+    select: () => {
+      from: (t: unknown) => {
+        where: (c: unknown) => Promise<Record<string, unknown>[]>;
+      };
+    };
+  }>();
+  const rows = await drizzle
+    .select()
+    .from(companion.table)
+    .where(and(eq(table._parent, parentId), eq(table._locale, locale)));
+  const row = rows[0];
+  if (!row) return {};
+  const out: Record<string, unknown> = {};
+  for (const field of companion.localizedFields) {
+    if (Object.prototype.hasOwnProperty.call(row, field.column)) {
+      out[field.name] = row[field.column];
+    }
+  }
+  return out;
+}

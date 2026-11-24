@@ -1,0 +1,1833 @@
+/**
+ * Preview-link minting and revocation.
+ *
+ * What matters here is which gate each endpoint asks for and what it does with
+ * the answer, because a preview link is a bearer credential: anyone holding one
+ * reads the draft it names, with no session of their own.
+ */
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { NextlyError } from "../errors/nextly-error";
+
+vi.mock("./route-auth", () => ({
+  requireRouteCollectionAccess: vi.fn(),
+  requireRouteAnyPermission: vi.fn(),
+}));
+
+const {
+  getEntry,
+  canUpdateEntry,
+  getSettings,
+  previewDeclaration,
+  singleDeclaration,
+  findSingle,
+  singleReadable,
+  singleEditable,
+} = vi.hoisted(() => ({
+  getEntry: vi.fn(),
+  canUpdateEntry: vi.fn(),
+  getSettings: vi.fn(),
+  previewDeclaration: vi.fn(),
+  singleDeclaration: vi.fn(),
+  findSingle: vi.fn(),
+  singleReadable: vi.fn(),
+  singleEditable: vi.fn(),
+}));
+
+/** The application's `preview` config for the test in hand. */
+let previewConfig: { route?: string } | undefined;
+
+/**
+ * Which singles the config reports as localized, for the test in hand.
+ *
+ * A set rather than a flag because the endpoint asks per slug, and a single
+ * boolean would answer for a single it was never asked about.
+ */
+const localizedSingles = new Set<string>();
+
+/**
+ * Which singles carry a Draft / Published lifecycle, for the test in hand.
+ *
+ * A single without one has no pending version to preview, so minting is refused
+ * — which every other Single test would otherwise trip over.
+ */
+const statusSingles = new Set<string>();
+
+/**
+ * Each Single's fields where a test names them; otherwise one translatable text field, so a
+ * Single the setting keeps per language has a value to keep.
+ */
+const singleFields = new Map<string, { name: string; type: string }[]>();
+
+vi.mock("../init", () => ({
+  // Carries findSingle, because the Single mint path reads the document through
+  // the Direct API rather than the collections handler.
+  getCachedNextly: () => Promise.resolve({ findSingle }),
+}));
+
+vi.mock("../services/lib/permissions", () => ({
+  resolveRoleSlugs: vi.fn().mockResolvedValue(["editor"]),
+}));
+
+vi.mock("./preview-url", () => ({
+  previewDeclarationFor: (...args: unknown[]) => previewDeclaration(...args),
+  singlePreviewDeclarationFor: (...args: unknown[]) =>
+    singleDeclaration(...args),
+  // Delegates to the same `findSingle` double the mint used to reach directly,
+  // so what these tests drive is unchanged: the read moved behind a shared
+  // loader, and the loader is the one the preview ROUTE reads through too.
+  loadSingleForPreview: async (slug: string, locale: string | undefined) =>
+    (await findSingle({
+      slug,
+      ...(locale === undefined ? {} : { locale }),
+    })) ?? null,
+}));
+
+// The gate itself is exercised where it lives; what these cover is that the
+// mint ASKS it, and that a refusal stops short of signing anything.
+vi.mock("../domains/singles/services/single-document-access", () => ({
+  singleDocumentReadable: (...args: unknown[]) => singleReadable(...args),
+  singleDocumentEditable: (...args: unknown[]) => singleEditable(...args),
+}));
+
+vi.mock("../di", () => ({
+  container: { get: vi.fn(), has: vi.fn().mockReturnValue(false) },
+  getService: vi.fn(() => ({
+    getEntry,
+    canUpdateEntry,
+    // The registry fallback the localized probe reaches when the authored
+    // config has nothing to say about this slug.
+    getSingleBySlug: (slug: string) =>
+      Promise.resolve({
+        localized: localizedSingles.has(slug),
+        status: statusSingles.has(slug),
+        fields: singleFields.get(slug) ?? [{ name: "heading", type: "text" }],
+      }),
+  })),
+}));
+
+/*
+ * The audit writer is mocked so the RECORD is observable. Left real it would
+ * reach the adapter double, fail inside its own never-throws contract, and log
+ * — so every assertion below would pass against a route that recorded nothing.
+ */
+const auditWrite = vi.hoisted(() => vi.fn());
+vi.mock("../domains/audit/audit-log-writer", () => ({
+  buildAuditLogWriter: () => ({ write: auditWrite }),
+}));
+
+/*
+ * The recorded-links store, mocked so what the endpoints ASK of it is
+ * observable. What it does with a real row is covered by the integration suite
+ * on every dialect.
+ */
+const records = vi.hoisted(() => ({
+  recordPreviewLink: vi.fn(),
+  documentRevocationMark: vi.fn(),
+  revokeDocumentLinks: vi.fn(),
+  revokeAllRecordedLinks: vi.fn(),
+}));
+vi.mock("../auth/preview/preview-link-records", async importOriginal => ({
+  ...(await importOriginal<
+    typeof import("../auth/preview/preview-link-records")
+  >()),
+  recordPreviewLink: records.recordPreviewLink,
+  documentRevocationMark: records.documentRevocationMark,
+  revokeDocumentLinks: records.revokeDocumentLinks,
+  revokeAllRecordedLinks: records.revokeAllRecordedLinks,
+}));
+
+vi.mock("../lib/env", () => ({
+  env: { NEXTLY_SECRET: "a-test-secret-value" },
+}));
+
+import { verifyPreviewToken } from "../auth/preview/preview-token";
+import { container } from "../di";
+import { EVERY_TRANSLATION } from "../domains/i18n/locale-selector";
+import {
+  _resetPerLanguageStorage,
+  setPerLanguageStorage,
+} from "../domains/i18n/per-language-storage";
+
+import {
+  requireRouteCollectionAccess,
+  requireRouteAnyPermission,
+} from "./route-auth";
+
+import { mintPreviewLink, revokePreviewLinks } from "./preview-links";
+
+/** The value the mocked `env` supplies, named once so both sides agree. */
+const SECRET = "a-test-secret-value";
+
+const getGeneration = vi.fn();
+const revokeAll = vi.fn();
+
+function post(
+  body: unknown,
+  path = "http://x/api/nextly/preview-links"
+): Request {
+  return new Request(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+async function json(response: Response): Promise<Record<string, unknown>> {
+  return (await response.json()) as Record<string, unknown>;
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  // Nothing is localized unless a test says so, which keeps the unscoped grant
+  // correct for the singles that genuinely have one document.
+  localizedSingles.clear();
+  statusSingles.clear();
+  singleFields.clear();
+  // The default: the caller can see the entry they named AND may edit it, so
+  // the draft the token hands out is one they could already open. Tests about
+  // the entry gate override whichever half they are about.
+  getEntry.mockResolvedValue({
+    success: true,
+    statusCode: 200,
+    // A slug, because the default declaration below is `/{slug}` and minting
+    // now resolves the ENTRY rather than trusting that a declaration exists. An
+    // entry with no slug is genuinely not previewable, which is what the
+    // refusal tests assert by removing it again.
+    data: { id: "7", slug: "seven" },
+  });
+  canUpdateEntry.mockResolvedValue(true);
+  (requireRouteCollectionAccess as ReturnType<typeof vi.fn>).mockResolvedValue({
+    userId: "u1",
+    permissions: [],
+    roles: [],
+    authMethod: "session",
+    // A stored `custom` read rule may decide on a claim this framework knows
+    // nothing about, so the probe has to carry them or it answers a different
+    // question than the caller's own read would.
+    claims: { tenant: "acme", tier: "restricted" },
+  });
+  (requireRouteAnyPermission as ReturnType<typeof vi.fn>).mockResolvedValue({
+    userId: "admin-1",
+    permissions: [],
+    roles: [],
+    authMethod: "session",
+  });
+  getGeneration.mockResolvedValue(0);
+  revokeAll.mockResolvedValue(1);
+  records.recordPreviewLink.mockResolvedValue(undefined);
+  records.documentRevocationMark.mockResolvedValue("mark-1");
+  records.revokeDocumentLinks.mockResolvedValue(2);
+  records.revokeAllRecordedLinks.mockResolvedValue(undefined);
+  getSettings.mockResolvedValue({ siteUrl: "https://site.example" });
+  previewDeclaration.mockResolvedValue({ urlTemplate: "/{slug}" });
+  previewConfig = undefined;
+  // Key-aware, because assembling the link needs BOTH the settings service and
+  // the application config, and a mock answering the same object for every key
+  // cannot tell them apart.
+  (container.get as ReturnType<typeof vi.fn>).mockImplementation(
+    (key: string) => {
+      if (key === "config") return { preview: previewConfig };
+      return {
+        getPreviewTokenGeneration: getGeneration,
+        revokeAllPreviewTokens: revokeAll,
+        getSettings,
+      };
+    }
+  );
+});
+
+/** The mutation envelope's payload, narrowed once rather than at every use. */
+function item(body: { item?: unknown }): Record<string, unknown> {
+  return body.item as Record<string, unknown>;
+}
+
+/** Mint once for the default entry and hand back the envelope's payload. */
+async function mintedData(): Promise<Record<string, unknown>> {
+  return item(
+    await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    )
+  );
+}
+
+describe("mintPreviewLink for a Single", () => {
+  beforeEach(() => {
+    singleDeclaration.mockResolvedValue({ url: () => "/" });
+    findSingle.mockResolvedValue({ id: "homepage" });
+    singleReadable.mockResolvedValue(true);
+    singleEditable.mockResolvedValue(true);
+    statusSingles.add("homepage");
+  });
+
+  /**
+   * The route gate answers a COARSE question — may this caller update this slug
+   * — while the real update path additionally requires the document to exist and
+   * to be reachable in the language asked for. A link minted on the permission
+   * alone is a bearer credential for a draft that path refuses to show them.
+   */
+  describe("the Single's own document gate", () => {
+    it("refuses when the caller cannot see the document", async () => {
+      singleReadable.mockResolvedValue(false);
+
+      const response = await mintPreviewLink(post({ single: "homepage" }));
+
+      expect(response.status).toBe(403);
+    });
+
+    // Reading proves nothing about this. Where a Single allows broad reads and
+    // restricts updates, a caller reads the published document and would
+    // otherwise be handed the author's unpublished edits.
+    it("refuses when the caller cannot edit the document", async () => {
+      singleEditable.mockResolvedValue(false);
+
+      const response = await mintPreviewLink(post({ single: "homepage" }));
+
+      expect(response.status).toBe(403);
+    });
+
+    // The property that matters: a refusal must stop short of SIGNING. A token
+    // that exists is a working credential whatever the response says.
+    it("signs nothing when it refuses", async () => {
+      singleEditable.mockResolvedValue(false);
+
+      const body = await json(
+        await mintPreviewLink(post({ single: "homepage" }))
+      );
+
+      expect(JSON.stringify(body)).not.toContain("eyJ");
+    });
+
+    // Asked BEFORE the trusted read that builds the redirect, so a refused
+    // caller never reaches a document they may not see.
+    it("asks before loading the document", async () => {
+      singleReadable.mockResolvedValue(false);
+
+      await mintPreviewLink(post({ single: "homepage" }));
+
+      expect(findSingle).not.toHaveBeenCalled();
+    });
+
+    /**
+     * `routeAuthorized` tells the checker that the coarse RBAC gate for THIS
+     * operation already ran, so it is skipped as redundant. The mint route gated
+     * `update` and nothing else — so claiming it for the READ probe would skip a
+     * permission check that never happened, and a caller holding `update` with
+     * no read grant would be handed a bearer token for the draft.
+     */
+    it("does not claim a read gate the mint route never ran", async () => {
+      await mintPreviewLink(post({ single: "homepage" }));
+
+      expect(singleReadable).toHaveBeenCalledWith(
+        "homepage",
+        expect.objectContaining({ routeAuthorized: false })
+      );
+    });
+
+    // The other half, and the reason this is a per-call-site decision rather
+    // than one polarity for both: the update gate DID run, so re-running it
+    // would reject a scoped API key by resolving its creator's roles instead.
+    it("does claim the update gate it did run", async () => {
+      await mintPreviewLink(post({ single: "homepage" }));
+
+      expect(singleEditable).toHaveBeenCalledWith(
+        "homepage",
+        expect.objectContaining({ routeAuthorized: true })
+      );
+    });
+
+    // The token names one translation; the probe must judge that one. A rule
+    // told the language may allow one and refuse another, and a localized
+    // Single is a different document in each language, with a lifecycle of its
+    // own, so authorizing the default while signing another authorizes nothing
+    // about what the bearer receives.
+    it("authorizes the translation the token will name", async () => {
+      await mintPreviewLink(post({ single: "homepage", locale: "fr" }));
+
+      expect(singleReadable).toHaveBeenCalledWith(
+        "homepage",
+        expect.objectContaining({ locale: "fr" })
+      );
+      expect(singleEditable).toHaveBeenCalledWith(
+        "homepage",
+        expect.objectContaining({ locale: "fr" })
+      );
+    });
+  });
+
+  /**
+   * A Single with no Draft / Published lifecycle has no pending version, so a
+   * link would hand its recipient the CURRENT private document through a route
+   * that reads it trusted. The admin already withholds the control; this is the
+   * same rule for a caller reaching the endpoint directly.
+   */
+  describe("a single with no draft lifecycle", () => {
+    it("refuses to mint at all", async () => {
+      statusSingles.delete("homepage");
+
+      const response = await mintPreviewLink(post({ single: "homepage" }));
+
+      expect(response.status).toBe(409);
+    });
+
+    it("signs nothing when it refuses", async () => {
+      statusSingles.delete("homepage");
+
+      const body = await json(
+        await mintPreviewLink(post({ single: "homepage" }))
+      );
+
+      expect(JSON.stringify(body)).not.toContain("eyJ");
+    });
+
+    // Refused before the trusted read that builds the redirect, so nothing
+    // loads a document the caller is not going to be given.
+    it("refuses before loading the document", async () => {
+      statusSingles.delete("homepage");
+
+      await mintPreviewLink(post({ single: "homepage" }));
+
+      expect(findSingle).not.toHaveBeenCalled();
+    });
+  });
+
+  // The registry and the authored config can disagree — a metadata sync that
+  // fails deliberately keeps the previous registry row — and the read path
+  // consumes the registry. Believing the config alone reports a localized
+  // Single as unlocalized and signs an all-locales token.
+  describe("when the authored config and the registry disagree", () => {
+    it("treats a Single the registry calls localized as localized", async () => {
+      localizedSingles.add("homepage");
+      previewConfig = undefined;
+
+      const response = await mintPreviewLink(post({ single: "homepage" }));
+
+      expect(response.status).toBe(400);
+    });
+  });
+
+  /**
+   * An absent locale claim covers EVERY translation. On a localized Single that
+   * is a grant over drafts nobody authorized, so the endpoint refuses rather
+   * than widening the probe to match — honouring the request would hand out the
+   * very grant the refusal exists to withhold.
+   */
+  describe("a localized single with no locale named", () => {
+    // Under `experimental.perLanguageStorage` an untranslated Single keeps its values per
+    // language too, so a token with no locale would cover each of them.
+    it("refuses an untranslated Single the site keeps per language under the setting", async () => {
+      statusSingles.add("homepage");
+      setPerLanguageStorage(true);
+      try {
+        const response = await mintPreviewLink(post({ single: "homepage" }));
+        expect(response.status).toBe(400);
+        expect(JSON.stringify(await json(response))).toContain(
+          "needs a locale"
+        );
+      } finally {
+        _resetPerLanguageStorage();
+      }
+    });
+
+    // The setting keeps TRANSLATABLE values per language: an untranslated Single whose every field
+    // is shared is the same in every language, so a token with no locale covers nothing more.
+    it("mints for an untranslated Single with no translatable field, under the setting", async () => {
+      statusSingles.add("homepage");
+      singleFields.set("homepage", [{ name: "views", type: "number" }]);
+      setPerLanguageStorage(true);
+      try {
+        const response = await mintPreviewLink(post({ single: "homepage" }));
+        expect(response.status).toBeLessThan(300);
+      } finally {
+        _resetPerLanguageStorage();
+      }
+    });
+
+    it("refuses rather than minting a token covering every translation", async () => {
+      localizedSingles.add("homepage");
+
+      const response = await mintPreviewLink(post({ single: "homepage" }));
+
+      expect(response.status).toBe(400);
+    });
+
+    it("signs nothing when it refuses", async () => {
+      localizedSingles.add("homepage");
+
+      const body = await json(
+        await mintPreviewLink(post({ single: "homepage" }))
+      );
+
+      expect(JSON.stringify(body)).not.toContain("eyJ");
+    });
+
+    it("mints once a translation is named", async () => {
+      localizedSingles.add("homepage");
+
+      const response = await mintPreviewLink(
+        post({ single: "homepage", locale: "fr" })
+      );
+
+      expect(response.status).toBe(200);
+    });
+
+    // The negative control. An unlocalized Single has exactly one document, so
+    // an absent claim is the CORRECT grant there — a rule that always demanded
+    // a locale would refuse every link for every non-localized Single.
+    it("still mints unscoped for a single that is not localized", async () => {
+      const response = await mintPreviewLink(post({ single: "homepage" }));
+
+      expect(response.status).toBe(200);
+    });
+  });
+
+  it("mints a link scoped to the Single", async () => {
+    const response = await mintPreviewLink(post({ single: "homepage" }));
+
+    expect(response.status).toBe(200);
+  });
+
+  it("signs a token that names the Single rather than a collection entry", async () => {
+    const body = await json(
+      await mintPreviewLink(post({ single: "homepage" }))
+    );
+    const verified = await verifyPreviewToken(
+      String(item(body).token),
+      SECRET,
+      { generation: 0 }
+    );
+
+    expect(verified.valid && verified.scope).toEqual({
+      kind: "single",
+      single: "homepage",
+    });
+  });
+
+  // The same gate a Single's document update asks for, keyed on its slug — so a
+  // caller who cannot edit the Single cannot mint a credential to read its
+  // draft.
+  it("authorizes update on the Single, not on some collection", async () => {
+    await mintPreviewLink(post({ single: "homepage" }));
+
+    expect(requireRouteCollectionAccess).toHaveBeenCalledWith(
+      expect.anything(),
+      "update",
+      "homepage"
+    );
+  });
+
+  it("refuses a Single that declares no preview url", async () => {
+    singleDeclaration.mockResolvedValue(undefined);
+
+    const response = await mintPreviewLink(post({ single: "homepage" }));
+
+    expect(response.status).toBe(409);
+  });
+
+  it("refuses a Single whose declaration cannot address it yet", async () => {
+    singleDeclaration.mockResolvedValue({ url: () => null });
+
+    const response = await mintPreviewLink(post({ single: "homepage" }));
+
+    expect(response.status).toBe(409);
+  });
+
+  /*
+   * A Single's read reports failure by THROWING, not by returning null.
+   * `findSingle` raises a typed error for every unsuccessful service result, so
+   * a loader that only checked for null let the throw travel past it and the
+   * endpoint answered with the raw error instead of a refusal. A fixture that
+   * resolves null cannot reproduce that, which is why these reject instead.
+   */
+  it("refuses, rather than erroring, when the Single's read throws not-found", async () => {
+    findSingle.mockRejectedValue(
+      new NextlyError({
+        code: "NOT_FOUND",
+        statusCode: 404,
+        publicMessage: "No such single",
+      })
+    );
+
+    const response = await mintPreviewLink(post({ single: "homepage" }));
+    const message = String(
+      ((await json(response)).error as { message?: string } | undefined)
+        ?.message ?? ""
+    );
+
+    expect(response.status).toBe(409);
+    expect(message).toMatch(/deleted|removed/i);
+  });
+
+  it("says a FAILED Single read could not be read, not that it was deleted", async () => {
+    findSingle.mockRejectedValue(
+      new NextlyError({
+        code: "INTERNAL_ERROR",
+        statusCode: 500,
+        publicMessage: "Database unavailable",
+      })
+    );
+
+    const response = await mintPreviewLink(post({ single: "homepage" }));
+    const message = String(
+      ((await json(response)).error as { message?: string } | undefined)
+        ?.message ?? ""
+    );
+
+    expect(response.status).toBe(409);
+    expect(message).toMatch(/could not be read just now|try again/i);
+    expect(message).not.toMatch(/deleted/i);
+  });
+
+  // Naming both is not a narrower request, it is two different documents — and
+  // silently honouring one would mint a credential for a document the caller
+  // may not have meant.
+  it("refuses a request that names both a Single and a collection entry", async () => {
+    const response = await mintPreviewLink(
+      post({ single: "homepage", collection: "pages", entryId: "7" })
+    );
+
+    expect(response.status).toBe(400);
+  });
+
+  it("refuses a request that names neither", async () => {
+    const response = await mintPreviewLink(post({}));
+
+    expect(response.status).toBe(400);
+  });
+});
+
+describe("mintPreviewLink: a collection with nowhere to send a reviewer", () => {
+  // The button that mints this is shown whether or not a collection declares a
+  // preview URL, and that is deliberate — a draft is shareable either way. What
+  // is NOT acceptable is answering success and handing over a link that cannot
+  // land: the reviewer then sees a 404 they cannot tell from an expired link,
+  // and the editor has no idea anything is wrong.
+  it("refuses instead of minting a link that cannot land", async () => {
+    previewDeclaration.mockResolvedValue(undefined);
+
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "7" })
+    );
+
+    expect(response.status).toBe(409);
+  });
+
+  it("names the cause and who can fix it", async () => {
+    previewDeclaration.mockResolvedValue(undefined);
+
+    const body = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+
+    // The editor reading this cannot fix it themselves, so the message has to
+    // say what is missing AND that a developer is the one who adds it.
+    const message = String(
+      (body.error as { message?: string } | undefined)?.message ?? ""
+    );
+    expect(message).toMatch(/preview url/i);
+    expect(message).toMatch(/developer/i);
+  });
+
+  it("mints no token at all when it refuses", async () => {
+    previewDeclaration.mockResolvedValue(undefined);
+
+    const body = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+
+    // A bearer credential must not be issued for a refused request, even one
+    // refused for a configuration reason rather than an authorization one.
+    expect(body.item).toBeUndefined();
+  });
+
+  // A declaration is necessary and NOT sufficient. `preview.url` returning null
+  // for a document it cannot address yet, or a `urlTemplate` placeholder naming
+  // an empty field, both mean "not previewable yet" — and both used to mint
+  // successfully and 404 at the redirect, which is the failure this refusal
+  // exists to remove, reappearing one level down.
+  it("refuses an entry the declaration cannot address yet", async () => {
+    previewDeclaration.mockResolvedValue({ url: () => null });
+
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "7" })
+    );
+
+    expect(response.status).toBe(409);
+  });
+
+  it("refuses when a template placeholder has no value on this entry", async () => {
+    previewDeclaration.mockResolvedValue({ urlTemplate: "/{slug}" });
+    getEntry.mockResolvedValue({
+      success: true,
+      statusCode: 200,
+      data: { id: "7" },
+    });
+
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "7" })
+    );
+
+    expect(response.status).toBe(409);
+  });
+
+  // The two refusals must not read alike: one is a developer's job and the other
+  // is the editor's own, and an editor told to "ask a developer" about their
+  // empty slug field is being sent to the wrong person.
+  it("distinguishes an unaddressable entry from an unconfigured collection", async () => {
+    previewDeclaration.mockResolvedValue({ url: () => null });
+    const entryBody = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+
+    previewDeclaration.mockResolvedValue(undefined);
+    const collectionBody = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+
+    const message = (b: { error?: unknown }): string =>
+      String((b.error as { message?: string } | undefined)?.message ?? "");
+
+    expect(message(entryBody)).not.toBe(message(collectionBody));
+    expect(message(entryBody)).toMatch(/this entry/i);
+    expect(message(collectionBody)).toMatch(/developer/i);
+  });
+
+  it("names the ENTRY when a declaration throws, not the collection that declares it", async () => {
+    /*
+     * The message points at a value the reader should go and look at, and that
+     * value lives on the DOCUMENT. Naming the collection sends them to the
+     * wrong screen — there is no field there to check.
+     *
+     * The refusal's other noun, used for a message about CONFIGURATION, is
+     * correctly the collection. This is why the two are derived separately
+     * rather than sharing one word.
+     */
+    previewDeclaration.mockResolvedValue({
+      url: () => {
+        throw new Error("author bug");
+      },
+    });
+
+    const body = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+    const text = String(
+      (body.error as { message?: string } | undefined)?.message ?? ""
+    );
+
+    expect(text).toMatch(/this entry/i);
+    expect(text).not.toMatch(/this collection/i);
+
+    /*
+     * And it does not hand the whole thing to a developer. A caught error
+     * cannot tell a broken declaration from a field this document never filled
+     * in, so a message that blames the declaration alone is wrong exactly when
+     * the reader is the one person who could fix it.
+     */
+    expect(text).toMatch(/this entry's fields/i);
+    expect(text).toMatch(/developer/i);
+  });
+
+  it("mints normally once the collection declares one", async () => {
+    previewDeclaration.mockResolvedValue({ url: () => "/somewhere" });
+
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "7" })
+    );
+
+    expect(response.status).toBe(200);
+  });
+
+  /*
+   * The three refusals an editor cannot act on, asserted THROUGH the endpoint.
+   *
+   * The resolver's own suite stops at the cause value, which says nothing about
+   * what anyone reads: the mapping from cause to message could be swapped back
+   * to the slug advice and every resolver test would stay green, while the
+   * user-facing behaviour this change exists for would be gone. So each case
+   * asserts the remedy it names AND that it does not name the slug.
+   */
+  const slugAdvice = /slug/i;
+
+  /** The message an endpoint refusal put in front of the editor. */
+  const messageOf = (b: { error?: unknown }): string =>
+    String((b.error as { message?: string } | undefined)?.message ?? "");
+
+  async function refusalMessage(): Promise<string> {
+    return messageOf(
+      await json(
+        await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+      )
+    );
+  }
+
+  it("says the document could not be read, rather than blaming the slug", async () => {
+    // The entry vanished between the authorization read and the resolver's own.
+    getEntry.mockResolvedValue({ success: true, statusCode: 200, data: null });
+
+    const message = await refusalMessage();
+
+    expect(message).toMatch(/could not be read|deleted/i);
+    expect(message).not.toMatch(slugAdvice);
+  });
+
+  /**
+   * A read that succeeds for AUTHORIZATION and then fails for the resolver.
+   *
+   * Both of the cases below are only reachable through this window, and
+   * discovering that was worth the fixture: the mint authorizes by reading the
+   * entry, so a read failing on the FIRST call is refused as a permission
+   * problem and never reaches the resolver at all. What the resolver can see is
+   * the race — the entry readable when the caller was authorized and not
+   * readable a moment later — which is exactly the situation being diagnosed.
+   */
+  function readableThenFailing(second: Record<string, unknown>): void {
+    getEntry.mockReset();
+    getEntry.mockResolvedValueOnce({
+      success: true,
+      statusCode: 200,
+      data: { id: "7", slug: "seven" },
+    });
+    getEntry.mockResolvedValue(second);
+  }
+
+  it("does not call a FAILED read a deletion", async () => {
+    /*
+     * A transient database error, a rate limit or a throwing read hook all
+     * arrive as `success: false` with a non-404 status. None of them shows the
+     * entry is absent, so "it may have been deleted" is a claim the read never
+     * established — and it is the most alarming possible wrong answer to give
+     * an editor about their own work.
+     */
+    readableThenFailing({ success: false, statusCode: 500 });
+
+    const message = await refusalMessage();
+
+    expect(message).toMatch(/could not be read just now|try again/i);
+    expect(message).not.toMatch(/deleted/i);
+    expect(message).not.toMatch(slugAdvice);
+    // The ENTRY, not the collection. What failed is the trusted read of one
+    // document; the collection and its declaration were both read fine a
+    // moment earlier, so naming the collection points at the wrong scope.
+    expect(message).toMatch(/this entry/i);
+    expect(message).not.toMatch(/this collection/i);
+  });
+
+  it("still calls a 404 a deletion, so the pair discriminates", async () => {
+    // The control for the case above: a read that DID establish absence keeps
+    // the permanent diagnosis, so the split is on the failure KIND rather than
+    // this endpoint having stopped saying "deleted" at all.
+    readableThenFailing({ success: false, statusCode: 404 });
+
+    const message = await refusalMessage();
+
+    expect(message).toMatch(/deleted/i);
+    expect(message).not.toMatch(/try again/i);
+  });
+
+  it("says the preview URL names another site, rather than blaming the slug", async () => {
+    // No field on this entry can move the declaration to another origin, so
+    // sending the editor to fill one in is advice they cannot act on.
+    previewDeclaration.mockResolvedValue({
+      url: () => "https://elsewhere.test/about",
+    });
+
+    const message = await refusalMessage();
+
+    expect(message).toMatch(/different site/i);
+    expect(message).not.toMatch(slugAdvice);
+  });
+
+  it("says the preview URL does not resolve, rather than blaming the slug", async () => {
+    getSettings.mockResolvedValue({ siteUrl: "not a url" });
+    previewDeclaration.mockResolvedValue({
+      url: () => "https://site.example/about",
+    });
+
+    const message = await refusalMessage();
+
+    expect(message).toMatch(/could not be turned into an address/i);
+    expect(message).not.toMatch(slugAdvice);
+  });
+
+  it("gives all six refusals six different messages", async () => {
+    /*
+     * Stronger than each matching its own pattern: two causes could both match
+     * their phrases while sharing a message, and the whole point is that an
+     * editor can tell which of the six happened. The set having six members is
+     * the property; six individual assertions do not state it.
+     */
+    previewDeclaration.mockResolvedValue(undefined);
+    const notConfigured = await refusalMessage();
+
+    previewDeclaration.mockResolvedValue({ url: () => null });
+    const unavailable = await refusalMessage();
+
+    previewDeclaration.mockResolvedValue({ urlTemplate: "/{slug}" });
+    getEntry.mockResolvedValue({ success: true, statusCode: 200, data: null });
+    const documentGone = await refusalMessage();
+
+    readableThenFailing({ success: false, statusCode: 500 });
+    const documentUnreadable = await refusalMessage();
+
+    getEntry.mockResolvedValue({
+      success: true,
+      statusCode: 200,
+      data: { id: "7", slug: "seven" },
+    });
+    previewDeclaration.mockResolvedValue({
+      url: () => "https://elsewhere.test/about",
+    });
+    const foreignOrigin = await refusalMessage();
+
+    getSettings.mockResolvedValue({ siteUrl: "not a url" });
+    previewDeclaration.mockResolvedValue({
+      url: () => "https://site.example/about",
+    });
+    const unresolvable = await refusalMessage();
+
+    const all = [
+      notConfigured,
+      unavailable,
+      documentGone,
+      documentUnreadable,
+      foreignOrigin,
+      unresolvable,
+    ];
+    // Non-empty first, so six identical empty strings cannot satisfy the size
+    // check by collapsing to one — and so a refusal that stopped carrying a
+    // message at all fails here rather than passing quietly.
+    expect(all.every(m => m.length > 0)).toBe(true);
+    expect(new Set(all).size).toBe(6);
+  });
+});
+
+describe("mintPreviewLink: the link it hands back", () => {
+  it("returns an absolute url built from the site url and the default mount", async () => {
+    const body = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+
+    expect(item(body).url).toMatch(
+      /^https:\/\/site\.example\/api\/preview\?token=/
+    );
+  });
+
+  it("honours a configured preview.route", async () => {
+    previewConfig = { route: "/next/preview" };
+
+    const body = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+
+    expect(item(body).url).toMatch(
+      /^https:\/\/site\.example\/next\/preview\?token=/
+    );
+  });
+
+  // A site URL may legitimately carry a path, a query or a fragment — the
+  // settings schema accepts all three — and concatenating the route onto the end
+  // puts it inside whichever component came last, producing a link that never
+  // reaches the route and carries no token.
+  it("keeps a site url's own query instead of appending the route inside it", async () => {
+    getSettings.mockResolvedValue({
+      siteUrl: "https://site.example/base?tenant=a",
+    });
+
+    const url = new URL(String((await mintedData()).url));
+
+    expect(url.pathname).toBe("/base/api/preview");
+    expect(url.searchParams.get("tenant")).toBe("a");
+    expect(url.searchParams.get("token")).toBeTruthy();
+  });
+
+  it("mounts the route under a site url served from a sub-path", async () => {
+    getSettings.mockResolvedValue({ siteUrl: "https://site.example/site" });
+
+    expect(new URL(String((await mintedData()).url)).pathname).toBe(
+      "/site/api/preview"
+    );
+  });
+
+  it("returns a null url for a site url that cannot be parsed", async () => {
+    getSettings.mockResolvedValue({ siteUrl: "not a url" });
+
+    expect(await mintedData()).toMatchObject({ url: null });
+  });
+
+  it("does not double the separator when the site url carries a trailing slash", async () => {
+    getSettings.mockResolvedValue({ siteUrl: "https://site.example/" });
+
+    const body = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+
+    expect(item(body).url).not.toContain("//api/preview");
+  });
+
+  it("carries the token in the url it returns", async () => {
+    const body = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+
+    expect(item(body).url).toContain(
+      `token=${encodeURIComponent(item(body).token as string)}`
+    );
+  });
+
+  it("still returns the token and expiry", async () => {
+    const body = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+
+    expect(typeof item(body).token).toBe("string");
+    expect(typeof item(body).expiresAt).toBe("string");
+  });
+
+  // The admin cannot recover from this: the `editor` and `author` presets
+  // cannot read settings at all, so a RELATIVE url would be resolved against
+  // the admin's own origin — confidently wrong, and the exact guess the
+  // four-state preview resolver exists elsewhere to prevent.
+  it("returns a null url when no site url is configured", async () => {
+    getSettings.mockResolvedValue({ siteUrl: null });
+
+    const body = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+
+    expect(item(body).url).toBeNull();
+    // The token is still minted: the link is usable by anyone who can build the
+    // URL, and refusing here would break preview on a site that never set one.
+    expect(typeof item(body).token).toBe("string");
+  });
+});
+
+describe("mintPreviewLink", () => {
+  it("refuses an entry the caller cannot read, even inside a collection it may edit", async () => {
+    // The collection gate answers a coarser question than the token asks. A
+    // caller bounded by a row-level rule to their own documents passes it, so
+    // without a check on the ENTRY they could mint a working credential for
+    // someone else's draft — a read they cannot perform themselves.
+    getEntry.mockResolvedValue({ success: false, statusCode: 403 });
+
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "someone-elses-draft" })
+    );
+
+    expect(response.status).toBe(403);
+    // No token is minted for a refused entry.
+    const body = await json(response);
+    expect(body.item).toBeUndefined();
+  });
+
+  it("answers a missing entry the same way as a hidden one", async () => {
+    // 403 for both, deliberately. Answering 404 for an id that matches nothing
+    // would let an unauthorized caller enumerate which entry ids exist by
+    // reading the status code.
+    getEntry.mockResolvedValue({ success: false, statusCode: 404 });
+
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "no-such-entry" })
+    );
+
+    expect(response.status).toBe(403);
+  });
+
+  it("lets a genuine failure keep its own status instead of reading as a denial", async () => {
+    // 429, deliberately NOT 500. A test using 500 as both the input and the
+    // expected output cannot tell "the status was preserved" from "every
+    // failure is flattened to 500" — it passes under both, which is how the
+    // flattening survived the first version of this test.
+    getEntry.mockResolvedValue({
+      success: false,
+      statusCode: 429,
+      code: "RATE_LIMITED",
+      message: "Too many requests",
+    });
+
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "7" })
+    );
+
+    // Not 403 (an unreadable row) and not 500 (a flattened one): the caller
+    // needs the retry semantics the service actually reported.
+    expect(response.status).toBe(429);
+  });
+
+  it("judges the entry as the CALLER and keeps a never-published one visible", async () => {
+    await mintPreviewLink(post({ collection: "pages", entryId: "7" }));
+
+    expect(getEntry).toHaveBeenCalledWith(
+      expect.objectContaining({
+        collectionName: "pages",
+        entryId: "7",
+        // Enforced, not a trusted read: an `overrideAccess: true` probe would
+        // answer a different question than the bearer's read will face.
+        overrideAccess: false,
+        // Without this a status-enabled collection filters to published only,
+        // so an entry that has never been published reports as missing — which
+        // is exactly the entry an editor wants to share for review.
+        status: "all",
+        // The whole identity, not an id: `roles` drives role-based rules and
+        // the claims drive `custom` ones. A probe missing either decides a
+        // different question than the read it stands in for — an
+        // absence-tolerant rule would admit a caller it was written to refuse.
+        user: expect.objectContaining({
+          id: "u1",
+          roles: ["editor"],
+          role: "editor",
+          tenant: "acme",
+          tier: "restricted",
+        }),
+      })
+    );
+  });
+
+  it("refuses a readable entry the caller may NOT edit", async () => {
+    // The defect this gate exists for. Where a collection allows broad reads but
+    // restricts updates per row, the caller passes both the collection gate and
+    // the read — and the token they would receive is consumed with `draft: true`
+    // and `overrideAccess: true`, exposing another author's unpublished edits.
+    //
+    // 🔴 Enabling `draft` on the read instead would NOT catch this: the overlay
+    // falls back to the published row for a caller who cannot edit rather than
+    // denying, so the read succeeds either way and the mint proceeds.
+    canUpdateEntry.mockResolvedValue(false);
+
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "someone-elses-draft" })
+    );
+
+    expect(response.status).toBe(403);
+    const body = await json(response);
+    expect(body.item).toBeUndefined();
+  });
+
+  it("asks the edit question about the id the token will sign", async () => {
+    // Two earlier tests here pinned a derived subject — the id read back from
+    // the returned document, and a refusal when that id was absent. Both were
+    // removed deliberately, not lost: `read.data` is presentation data and
+    // `afterRead` may remove `id` OR rewrite it to another row's, so no value in
+    // it identifies what was fetched. Deriving the subject from it authorized a
+    // row the bearer would not receive.
+    //
+    // The token signs the requested id, so that is what is asserted editable.
+    // The remaining gap — a `beforeOperation` hook resolving that id differently
+    // in the bearer's context, where `user` is undefined — is not closeable at
+    // this boundary and is tracked as a known limitation.
+    getEntry.mockResolvedValue({
+      success: true,
+      statusCode: 200,
+      data: { id: "reshaped-by-afterRead" },
+    });
+
+    await mintPreviewLink(post({ collection: "pages", entryId: "7" }));
+
+    expect(canUpdateEntry).toHaveBeenCalledWith(
+      expect.objectContaining({
+        collectionName: "pages",
+        // The requested id, NOT the one the returned document carries.
+        entryId: "7",
+        // The route already ran the coarse `update` gate for this collection and
+        // this flag skips only that; the document gate still runs against the
+        // loaded row.
+        routeAuthorized: true,
+      })
+    );
+  });
+
+  it("refuses to mint from an API key at all", async () => {
+    // A preview link records WHOSE permissions the draft is rendered through,
+    // and a key names no person. It is authorized on the grants stamped on the
+    // key — deliberately, so a narrow key cannot mint on the strength of its
+    // owner's account — but the only identity it could record is that owner,
+    // whose access is exactly what the key was scoped away from. The link would
+    // render under permissions the request never had.
+    //
+    // This REPLACES a case asserting that both gates carried the key's own
+    // scope. That property is now unreachable rather than untested: the request
+    // is refused before either gate runs, which is strictly stronger than
+    // judging it correctly.
+    (
+      requireRouteCollectionAccess as ReturnType<typeof vi.fn>
+    ).mockResolvedValue({
+      userId: "owner-who-can-read",
+      permissions: ["update-pages"],
+      roles: [],
+      authMethod: "api-key",
+      apiKeyId: "key-1",
+      claims: {},
+    });
+
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "7" })
+    );
+
+    // 403 exactly, not merely >= 400: an unrecognised failure renders as 500,
+    // and a range assertion cannot tell a refusal from a crash.
+    expect(response.status).toBe(403);
+    expect(await response.clone().json()).toMatchObject({
+      error: { message: "Only a signed-in person can manage preview links." },
+    });
+    // Refused BEFORE the authorization probe, so a rejected request performs no
+    // reads on the caller's behalf — and before any token exists, since a token
+    // that was signed and then discarded is still a token.
+    expect(getEntry).not.toHaveBeenCalled();
+    expect(canUpdateEntry).not.toHaveBeenCalled();
+    expect(getGeneration).not.toHaveBeenCalled();
+  });
+
+  it("sends no scope for a session caller, so it resolves grants the normal way", async () => {
+    // Not merely absent: an empty scope would read as an API key holding nothing
+    // and deny a legitimate session caller everything.
+    await mintPreviewLink(post({ collection: "pages", entryId: "7" }));
+
+    expect(getEntry.mock.calls[0][0].authenticatedScope).toBeUndefined();
+    expect(canUpdateEntry.mock.calls[0][0].authenticatedScope).toBeUndefined();
+  });
+
+  it("asks the route gate in the language the link names, and in every language for one naming none", async () => {
+    await mintPreviewLink(post({ single: "homepage", locale: "fr" }));
+    expect(requireRouteCollectionAccess).toHaveBeenLastCalledWith(
+      expect.anything(),
+      "update",
+      "homepage",
+      { method: "sharePreviewLink", params: { locale: "fr" } }
+    );
+
+    await mintPreviewLink(post({ single: "homepage" }));
+    expect(
+      (requireRouteCollectionAccess as ReturnType<typeof vi.fn>).mock.lastCall
+    ).toHaveLength(3);
+  });
+
+  it("gates on update for the collection that was named", async () => {
+    // Per collection, not a blanket permission: otherwise a caller who may
+    // edit posts could mint a link into a collection they cannot read.
+    await mintPreviewLink(post({ collection: "pages", entryId: "7" }));
+
+    expect(requireRouteCollectionAccess).toHaveBeenCalledWith(
+      expect.anything(),
+      "update",
+      "pages"
+    );
+  });
+
+  it("does not mint when the gate refuses", async () => {
+    // The error the real gate throws, not a stand-in. `throwAuthError` raises
+    // `NextlyError.forbidden`, which the handler renders as 403; a bare `Error`
+    // is an unrecognised failure and renders as 500. Both are >= 400, so a
+    // range assertion over a stand-in passes whether the refusal is reported
+    // as a refusal or as a crash.
+    (
+      requireRouteCollectionAccess as ReturnType<typeof vi.fn>
+    ).mockRejectedValueOnce(NextlyError.forbidden());
+
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "7" })
+    );
+
+    expect(response.status).toBe(403);
+    // The gate has to run BEFORE the token exists, not merely before it is
+    // returned: a token that was signed and then discarded is still a token.
+    expect(getGeneration).not.toHaveBeenCalled();
+  });
+
+  it("signs the site's current generation into the token", async () => {
+    // Asserting that the getter RAN would pass for a handler that read 4 and
+    // signed 0, which is the regression that matters: a link minted under a
+    // stale generation is already revoked, and looks to the editor like preview
+    // is simply broken. So the token is verified rather than inspected.
+    getGeneration.mockResolvedValue(4);
+
+    const body = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+    const item = body.item as { token: string };
+
+    const atCurrent = await verifyPreviewToken(item.token, SECRET, {
+      generation: 4,
+    });
+    expect(atCurrent.valid).toBe(true);
+
+    // And the same token is refused once the generation moves, which is what
+    // makes revocation reach links already in circulation.
+    const afterRevoke = await verifyPreviewToken(item.token, SECRET, {
+      generation: 5,
+    });
+    expect(afterRevoke.valid).toBe(false);
+  });
+
+  it("reads the site address it links to from the row, never a kept copy", async () => {
+    // The settings row is followed elsewhere, and a copy may be up to the
+    // read interval old. Where a link sends its holder is part of what the
+    // link grants, so an address saved through another instance a moment ago
+    // has to apply to a link minted now.
+    await mintPreviewLink(post({ collection: "pages", entryId: "7" }));
+
+    expect(getSettings).toHaveBeenCalled();
+    for (const call of getSettings.mock.calls) {
+      expect(call).toEqual([{ fresh: true }]);
+    }
+  });
+
+  it("scopes the token to the entry that was asked for", async () => {
+    const body = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+    const item = body.item as { token: string };
+
+    const verified = await verifyPreviewToken(item.token, SECRET, {
+      generation: 0,
+    });
+    expect(verified.valid && verified.scope).toEqual({
+      collection: "pages",
+      entryId: "7",
+    });
+  });
+
+  it("answers with the canonical envelope and nothing else", async () => {
+    const body = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+
+    // The canonical mutation envelope, so a direct-API caller reads `.item`.
+    expect(Object.keys(body).sort()).toEqual(["item", "message"]);
+    const item = body.item as Record<string, unknown>;
+    // `id` names the recorded link for the list and revoke-one; the token
+    // itself is shown only here.
+    expect(Object.keys(item).sort()).toEqual([
+      "embeddable",
+      "expiresAt",
+      "id",
+      "token",
+      "url",
+      "viewports",
+    ]);
+    // The token is a credential, not an address: it carries no host of its own,
+    // and the `url` beside it is what puts one in front.
+    expect(String(item.token)).not.toContain("http");
+    /*
+     * Asserted as a VALUE, not merely as a present key. This fixture mints from
+     * `http://x` for a site on `https://site.example` — a different host and a
+     * different scheme — so the honest answer is false, and a field that
+     * arrived `undefined` would satisfy a key-set assertion while telling the
+     * pane nothing.
+     */
+    expect(item.embeddable).toBe(false);
+    /*
+     * Asserted as a VALUE for the same reason `embeddable` is. This fixture
+     * declares no viewports, and the honest answer is an EMPTY list rather than
+     * an absent key — a caller reading `undefined` has to guess whether the
+     * collection declared none or the server forgot to answer.
+     */
+    expect(item.viewports).toEqual([]);
+  });
+
+  it("offers the viewports a collection DECLARES", async () => {
+    previewDeclaration.mockResolvedValue({
+      url: () => "/p",
+      breakpoints: [
+        { label: "Phone", width: 390 },
+        { label: "Desktop", width: 1280 },
+      ],
+    });
+
+    const body = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+
+    expect((body.item as Record<string, unknown>).viewports).toEqual([
+      { label: "Phone", width: 390 },
+      { label: "Desktop", width: 1280 },
+    ]);
+  });
+
+  it("EVALUATES a function declaration, so stored breakpoints stay current", async () => {
+    /*
+     * The property that lets a plugin supply a site's own breakpoints without
+     * the admin depending on it: the function runs here, on the server, and only
+     * its result crosses to the browser.
+     */
+    previewDeclaration.mockResolvedValue({
+      url: () => "/p",
+      breakpoints: () => [{ label: "Wide", width: 1440 }],
+    });
+
+    const body = await json(
+      await mintPreviewLink(post({ collection: "pages", entryId: "7" }))
+    );
+
+    expect((body.item as Record<string, unknown>).viewports).toEqual([
+      { label: "Wide", width: 1440 },
+    ]);
+  });
+
+  it("says the session reaches a frame when the site shares the admin's host", async () => {
+    getSettings.mockResolvedValue({ siteUrl: "https://site.example" });
+
+    const body = await json(
+      await mintPreviewLink(
+        post(
+          { collection: "pages", entryId: "7" },
+          "https://site.example/api/nextly/preview-links"
+        )
+      )
+    );
+
+    expect((body.item as Record<string, unknown>).embeddable).toBe(true);
+  });
+
+  it("ignores the PORT, which same-site does too", async () => {
+    /*
+     * The case this answer exists to unlock, and the one the admin's own origin
+     * comparison refused: a contributor running the admin on :3000 against a
+     * site on :3100 is same-site, so the cookie reaches the frame and the pane
+     * can show it. Cookies are not port-scoped and neither is same-site.
+     */
+    getSettings.mockResolvedValue({ siteUrl: "http://localhost:3100" });
+
+    const body = await json(
+      await mintPreviewLink(
+        post(
+          { collection: "pages", entryId: "7" },
+          "http://localhost:3000/api/nextly/preview-links"
+        )
+      )
+    );
+
+    expect((body.item as Record<string, unknown>).embeddable).toBe(true);
+  });
+
+  it("takes the admin origin from the REQUEST, not from a header a caller sends", async () => {
+    /*
+     * The mint route is served by the admin, so its own URL names the admin's
+     * origin. A caller asserting a matching Origin must not be able to talk the
+     * server into calling a cross-site frame embeddable — it decides only
+     * whether a pane or a tab is offered, but an answer that moves with a
+     * caller-supplied header is not an answer.
+     */
+    getSettings.mockResolvedValue({ siteUrl: "https://site.example" });
+
+    const request = new Request("http://x/api/nextly/preview-links", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Origin: "https://site.example",
+        Referer: "https://site.example/admin",
+      },
+      body: JSON.stringify({ collection: "pages", entryId: "7" }),
+    });
+
+    const body = await json(await mintPreviewLink(request));
+
+    expect((body.item as Record<string, unknown>).embeddable).toBe(false);
+  });
+
+  it("refuses a ttl beyond the maximum rather than shortening it", async () => {
+    // Silently clamping would leave an editor believing a link lasts longer
+    // than it does, which is the failure they cannot see until it bites.
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "7", ttlSeconds: 60 * 60 * 24 * 30 })
+    );
+
+    expect(response.status).toBe(400);
+  });
+
+  it("refuses a request naming no entry", async () => {
+    const response = await mintPreviewLink(post({ collection: "pages" }));
+    expect(response.status).toBe(400);
+    expect(requireRouteCollectionAccess).not.toHaveBeenCalled();
+  });
+
+  it("refuses a body that is not json", async () => {
+    const response = await mintPreviewLink(
+      new Request("http://x/api/nextly/preview-links", {
+        method: "POST",
+        body: "not json",
+      })
+    );
+    expect(response.status).toBe(400);
+  });
+});
+
+describe("revokePreviewLinks", () => {
+  it("gates on updating settings, not on a collection", async () => {
+    // The generation is site-wide, so one editor revoking would otherwise end
+    // every other editor's outstanding links.
+    await revokePreviewLinks(
+      post({}, "http://x/api/nextly/preview-links/revoke")
+    );
+
+    expect(requireRouteAnyPermission).toHaveBeenCalledWith(expect.anything(), [
+      { action: "update", resource: "settings" },
+    ]);
+    expect(requireRouteCollectionAccess).not.toHaveBeenCalled();
+  });
+
+  it("does not revoke when the gate refuses", async () => {
+    (
+      requireRouteAnyPermission as ReturnType<typeof vi.fn>
+    ).mockRejectedValueOnce(NextlyError.forbidden());
+
+    const response = await revokePreviewLinks(
+      post({}, "http://x/api/nextly/preview-links/revoke")
+    );
+
+    expect(response.status).toBe(403);
+    expect(revokeAll).not.toHaveBeenCalled();
+  });
+
+  it("treats an absent body as the site-wide revoke, as it always has", async () => {
+    await revokePreviewLinks(
+      new Request("http://x/api/nextly/preview-links/revoke", {
+        method: "POST",
+      })
+    );
+    expect(revokeAll).toHaveBeenCalledTimes(1);
+    expect(records.revokeDocumentLinks).not.toHaveBeenCalled();
+  });
+
+  it("refuses a body that names no document it can read, rather than revoking the site", async () => {
+    const response = await revokePreviewLinks(
+      post({ colection: "pages" }, "http://x/api/nextly/preview-links/revoke")
+    );
+    expect(response.status).toBe(400);
+    expect(revokeAll).not.toHaveBeenCalled();
+    expect(records.revokeDocumentLinks).not.toHaveBeenCalled();
+    expect(requireRouteAnyPermission).not.toHaveBeenCalled();
+  });
+
+  it("judges revoking a document's links in every language, whatever language the request names", async () => {
+    // Revoking acts on every link to the entry, whatever language each is
+    // to, so a caller allowed English alone must not end the French ones.
+    await revokePreviewLinks(
+      post(
+        { collection: "pages", entryId: "7", locale: "en" },
+        "http://x/api/nextly/preview-links/revoke"
+      )
+    );
+    expect(
+      (requireRouteCollectionAccess as ReturnType<typeof vi.fn>).mock.lastCall
+    ).toEqual([expect.anything(), "update", "pages"]);
+    expect(getEntry).toHaveBeenLastCalledWith(
+      expect.objectContaining({ entryId: "7", locale: EVERY_TRANSLATION })
+    );
+  });
+
+  it("revokes one document's links behind the sharer's rule, not a settings grant", async () => {
+    const response = await revokePreviewLinks(
+      post(
+        { collection: "pages", entryId: "7" },
+        "http://x/api/nextly/preview-links/revoke"
+      )
+    );
+    expect(response.status).toBe(200);
+    expect(requireRouteCollectionAccess).toHaveBeenCalledWith(
+      expect.anything(),
+      "update",
+      "pages"
+    );
+    expect(requireRouteAnyPermission).not.toHaveBeenCalled();
+    expect(revokeAll).not.toHaveBeenCalled();
+    expect(records.revokeDocumentLinks).toHaveBeenCalledWith(
+      { kind: "entry", collection: "pages", entryId: "7" },
+      "u1",
+      expect.any(Date)
+    );
+  });
+
+  it("refuses a key one document's revoke-all, and revokes nothing", async () => {
+    (
+      requireRouteCollectionAccess as ReturnType<typeof vi.fn>
+    ).mockResolvedValueOnce({
+      userId: "u1",
+      permissions: [],
+      roles: [],
+      authMethod: "api-key",
+      apiKeyId: "key-1",
+    });
+    const response = await revokePreviewLinks(
+      post(
+        { collection: "pages", entryId: "7" },
+        "http://x/api/nextly/preview-links/revoke"
+      )
+    );
+    expect(response.status).toBe(403);
+    expect(records.revokeDocumentLinks).not.toHaveBeenCalled();
+  });
+
+  it("returns the generation it moved to", async () => {
+    revokeAll.mockResolvedValue(9);
+
+    const body = await json(
+      await revokePreviewLinks(
+        post({}, "http://x/api/nextly/preview-links/revoke")
+      )
+    );
+
+    expect((body.item as { generation?: unknown }).generation).toBe(9);
+  });
+});
+
+/*
+ * Minting hands out a bearer credential that reads a draft as the minter, and
+ * until now it left no record at all. These cover WHAT is recorded rather than
+ * that something is: a row naming the wrong document, or carrying the token
+ * itself, is worse than no row — the first misdirects an investigation and the
+ * second hands its reader the access the trail exists to describe.
+ */
+describe("the audit trail a preview link leaves", () => {
+  // The Single path needs its own document doubles, exactly as the Single mint
+  // suite above sets them up. The entry path's defaults come from the top-level
+  // `beforeEach` and need nothing here.
+  beforeEach(() => {
+    singleDeclaration.mockResolvedValue({ url: () => "/" });
+    findSingle.mockResolvedValue({ id: "homepage" });
+    singleReadable.mockResolvedValue(true);
+    singleEditable.mockResolvedValue(true);
+    statusSingles.add("homepage");
+  });
+
+  /** The single event the run recorded, narrowed once. */
+  function recorded(): Record<string, unknown> {
+    expect(auditWrite, "nothing was recorded").toHaveBeenCalledTimes(1);
+    return auditWrite.mock.calls[0]?.[0] as Record<string, unknown>;
+  }
+
+  function meta(): Record<string, unknown> {
+    return recorded().metadata as Record<string, unknown>;
+  }
+
+  it("records the entry mint against the person who minted it", async () => {
+    await mintPreviewLink(post({ collection: "pages", entryId: "7" }));
+
+    expect(recorded()).toMatchObject({
+      kind: "preview-link-minted",
+      // The minter, not merely "someone": the token renders the draft through
+      // THEIR field-level permissions, so the actor is what makes the row
+      // answer "whose access was handed out".
+      actorUserId: "u1",
+    });
+    expect(meta()).toMatchObject({
+      scope: "collection",
+      collection: "pages",
+      entryId: "7",
+    });
+  });
+
+  // The same recording, reached by the OTHER mint path. Both funnel through one
+  // helper, and this is what would go red if a later change gave either path its
+  // own response and left the record behind.
+  it("records a Single mint through the same choke point", async () => {
+    await mintPreviewLink(post({ single: "homepage" }));
+
+    expect(recorded()).toMatchObject({ kind: "preview-link-minted" });
+    expect(meta()).toMatchObject({ scope: "single", single: "homepage" });
+  });
+
+  it("records the language a scoped link was minted for", async () => {
+    localizedSingles.add("homepage");
+
+    await mintPreviewLink(post({ single: "homepage", locale: "fr" }));
+
+    expect(meta()).toMatchObject({ locale: "fr" });
+  });
+
+  /*
+   * The security property, asserted as an ABSENCE with a control beside it.
+   * `toMatchObject` above would pass on a row that also carried the token, so
+   * this is the assertion that separates them — and the metadata is checked to
+   * be non-empty first, because an empty object contains no token either and
+   * would satisfy the absence perfectly.
+   */
+  it("never writes the credential itself into the trail", async () => {
+    await mintPreviewLink(post({ collection: "pages", entryId: "7" }));
+
+    const serialised = JSON.stringify(recorded());
+    // The control: the row genuinely describes this mint, so the absence below
+    // is a true absence rather than an empty row.
+    expect(serialised).toContain("pages");
+    expect(serialised).not.toContain("eyJ");
+    expect(Object.keys(meta())).not.toContain("token");
+  });
+
+  it("records who revoked, and the generation the revocation moved to", async () => {
+    await revokePreviewLinks(
+      post({}, "http://x/api/nextly/preview-links/revoke")
+    );
+
+    expect(recorded()).toMatchObject({
+      kind: "preview-links-revoked",
+      actorUserId: "admin-1",
+    });
+    // What relates the two kinds of row: every mint below this generation is
+    // one this revocation killed.
+    expect(meta()).toMatchObject({ generation: 1 });
+  });
+
+  it("records a site-wide revoke even when marking the rows then fails", async () => {
+    // The generation has already ended every link by then, so the revocation
+    // happened and the trail must say who did it.
+    records.revokeAllRecordedLinks.mockRejectedValueOnce(
+      new Error("connection reset")
+    );
+
+    const response = await revokePreviewLinks(
+      post({}, "http://x/api/nextly/preview-links/revoke")
+    );
+
+    expect(response.status).toBe(500);
+    expect(recorded()).toMatchObject({
+      kind: "preview-links-revoked",
+      actorUserId: "admin-1",
+    });
+  });
+
+  /*
+   * A refused mint produces no credential, so it must produce no row. Recorded
+   * before the refusal, the trail would claim access was handed out that never
+   * was — and an investigator reading it would be chasing a link nobody holds.
+   */
+  /*
+   * `userId` on an api-key request is the key's OWNER. A row carrying only that
+   * would state that a person personally revoked every link on the site when a
+   * delegated key did — backwards in exactly the case this trail exists for,
+   * where the key is what is under suspicion.
+   */
+  it("names the KEY when an api key revokes, not just its owner", async () => {
+    (requireRouteAnyPermission as ReturnType<typeof vi.fn>).mockResolvedValue({
+      userId: "owner-1",
+      permissions: [],
+      roles: [],
+      authMethod: "api-key",
+      apiKeyId: "key-9",
+    });
+
+    await revokePreviewLinks(
+      post({}, "http://x/api/nextly/preview-links/revoke")
+    );
+
+    expect(meta()).toMatchObject({ authMethod: "api-key", apiKeyId: "key-9" });
+  });
+
+  // The control for the case above: a session revocation must NOT invent a key
+  // id, so a reader can tell "no key was involved" from "a key id was lost".
+  it("carries no key id when a session revokes", async () => {
+    await revokePreviewLinks(
+      post({}, "http://x/api/nextly/preview-links/revoke")
+    );
+
+    expect(meta()).toMatchObject({ authMethod: "session" });
+    expect(Object.keys(meta())).not.toContain("apiKeyId");
+  });
+
+  /*
+   * Signing is not the moment a credential exists for anyone: the settings read
+   * and the link assembly come after it, and a failure in either returns an
+   * error while the token never leaves the process. A row written before them
+   * would durably assert that access was handed out on a request that handed
+   * out nothing.
+   */
+  it("records nothing when the response cannot be assembled after signing", async () => {
+    /*
+     * The application config is the ONLY read that happens strictly after the
+     * token is signed — the settings read cannot serve here, because the
+     * redirect resolver reads settings too, so failing it aborts the request
+     * before anything is signed and the assertion passes without ever reaching
+     * the ordering it claims to test.
+     */
+    (container.get as ReturnType<typeof vi.fn>).mockImplementation(
+      (key: string) => {
+        if (key === "config") throw new Error("config unavailable");
+        return {
+          getPreviewTokenGeneration: getGeneration,
+          revokeAllPreviewTokens: revokeAll,
+          getSettings,
+        };
+      }
+    );
+
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "7" })
+    );
+
+    expect(response.status).not.toBe(200);
+    expect(auditWrite).not.toHaveBeenCalled();
+  });
+
+  it("records nothing when the mint is refused", async () => {
+    previewDeclaration.mockResolvedValue(undefined);
+
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "7" })
+    );
+
+    expect(response.status).not.toBe(200);
+    expect(auditWrite).not.toHaveBeenCalled();
+  });
+});
+
+describe("mintPreviewLink records the link it hands out", () => {
+  it("records the token's own id and end, before answering", async () => {
+    const data = await mintedData();
+    const token = String(data.token);
+    const verified = await verifyPreviewToken(token, SECRET, {
+      generation: 0,
+    });
+    expect(verified.valid).toBe(true);
+    if (!verified.valid) return;
+    // A recorded token, naming the row the store was asked to write.
+    expect(verified.linkId).toBe(data.id);
+    expect(records.recordPreviewLink).toHaveBeenCalledTimes(1);
+    expect(records.recordPreviewLink).toHaveBeenCalledWith({
+      id: data.id,
+      scope: { collection: "pages", entryId: "7" },
+      createdBy: "u1",
+      createdAt: verified.issuedAt,
+      expiresAt: verified.expiresAt,
+      generation: 0,
+      // The document's mark as it stood before signing, so a revoke-all that
+      // replaces it afterwards can stop the link.
+      revocationMark: "mark-1",
+    });
+    expect(records.documentRevocationMark).toHaveBeenCalledWith({
+      kind: "entry",
+      collection: "pages",
+      entryId: "7",
+    });
+  });
+
+  it("hands out no token when the link cannot be recorded", async () => {
+    records.recordPreviewLink.mockRejectedValueOnce(
+      NextlyError.serviceUnavailable({
+        publicMessage: "Run `nextly migrate`.",
+        logMessage: "missing table",
+      })
+    );
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "7" })
+    );
+    const text = await response.text();
+    expect(response.status).toBe(503);
+    expect(text).not.toContain("token");
+    // Nothing recorded as minted either: no credential exists.
+    expect(auditWrite).not.toHaveBeenCalled();
+  });
+});
+
+describe("mintPreviewLink records nothing it cannot hand out", () => {
+  it("reads everything the answer needs before it records the link", async () => {
+    // A read that fails after the row is written leaves a live row whose
+    // token nobody received. Every fallible input is read first, so a failure
+    // stops the mint with nothing kept.
+    const response = await mintPreviewLink(
+      post({ collection: "pages", entryId: "7" })
+    );
+    expect(response.status).toBe(200);
+    const recordedAt = records.recordPreviewLink.mock.invocationCallOrder[0]!;
+    for (const readAt of getSettings.mock.invocationCallOrder) {
+      expect(readAt).toBeLessThan(recordedAt);
+    }
+  });
+});

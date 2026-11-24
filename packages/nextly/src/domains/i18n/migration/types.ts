@@ -1,0 +1,181 @@
+import type { SupportedDialect } from "@nextlyhq/adapter-drizzle/types";
+
+import type { I18nTransitionKind } from "./transition-state";
+
+/**
+ * Whose values an archive row holds: the entity's slug and its kind. A field group's slug may equal
+ * a collection's or a Single's, so the slug alone cannot say which entity a row belongs to, and a
+ * restore or a deletion keyed by it alone reaches another entity's values.
+ */
+export interface ArchiveOwner {
+  slug: string;
+  kind: I18nTransitionKind;
+}
+
+/**
+ * Every storage kind a localized column may declare.
+ *
+ * Stated once, as a value, because both a type and a runtime check need it: the generator writes
+ * one of these into a migration file's header and the parser that reads that file back has to
+ * accept exactly the same set. Kept as two independent lists, the parser rejected a kind the
+ * generator had just written and aborted the run — so the list is the value, and the type is
+ * derived from it.
+ */
+export const LOCALIZED_COLUMN_KINDS = [
+  "text",
+  "longText",
+  "shortText",
+  "boolean",
+  "integer",
+  "double",
+  "decimal",
+  "timestamp",
+  "json",
+  "fkSingle",
+] as const;
+
+/** Logical storage kind — drives the per-dialect DDL type. */
+export type LocalizedColumnKind = (typeof LOCALIZED_COLUMN_KINDS)[number];
+
+/**
+ * A single localized column, described independently of the field system.
+ * M3 will derive these from field descriptors; M1 accepts them directly so the
+ * migration generator is self-contained and testable.
+ */
+export interface LocalizedColumnSpec {
+  /** snake_case column name; identical on the main and companion tables. */
+  name: string;
+  kind: LocalizedColumnKind;
+  /** optional length for text/varchar-like columns. */
+  length?: number;
+  /** precision/scale for the `decimal` kind (DECIMAL/NUMERIC); ignored otherwise. */
+  precision?: number;
+  scale?: number;
+  /**
+   * What the column the values come from carries into this one as translation is turned on or
+   * off (`carriedDefinition`); absent, the column is the field's own (`ddlType`).
+   */
+  carried?: CarriedDefinition;
+  /**
+   * The column the main table's snapshot records for this field, where a migration file turning
+   * translation off puts the values back on the main table: its type and default, so the main table the file leaves is the one that snapshot describes, which the
+   * migration runner checks it against. Absent, the column is put back from `carried` or wider
+   * (`restoreTargetType`), as a reconcile with no snapshot to follow puts it back.
+   */
+  restoredAs?: CarriedDefinition;
+}
+
+/** A receiving column's type and default, taken from the column its values come from. */
+export interface CarriedDefinition {
+  /** The source's type, where it holds every value the field's own type holds and more. */
+  type?: string;
+  /** The source's default, as DDL. */
+  default?: string;
+}
+
+/**
+ * Just enough of a {@link CompanionMigrationSpec} to move values between a main table and its
+ * companion in one named locale.
+ *
+ * The correlated copies in either direction need the two table names, the dialect's quoting and
+ * the locale, and take the columns to copy as an argument. Naming that subset lets a caller that
+ * only wants a copy pass what it actually knows, instead of inventing a column list and a
+ * parent-id DDL type that nothing reads.
+ */
+export type CompanionCopyRef = Pick<
+  CompanionMigrationSpec,
+  "dialect" | "mainTable" | "companionTable" | "defaultLocale"
+> & {
+  /**
+   * What decides which language's row an entry's shared value is taken from, when its readers
+   * are to keep seeing what they saw (`restoredValue`). Absent, the default language's row is
+   * taken, else the first by language code.
+   */
+  liveness?: CopyLiveness;
+};
+
+/**
+ * Which of an entry's translation rows its readers see, and the site's order of languages, as a
+ * copy ranks them: the default language where it is live, else the first live language in the
+ * site's order, else the default language's row, else the first in the site's order.
+ */
+export interface CopyLiveness {
+  /** The site's languages in its own order (the configuration's, or Settings'). */
+  languageOrder: readonly string[];
+  /** The publish states a reader sees (`publicStateNames`). */
+  publicStates: readonly string[];
+  /**
+   * Whether each language has a publish state of its own (the companion's `_status`). Without
+   * one, every language of an entry is as live as the entry, so none is preferred for it.
+   */
+  companionHasStatus: boolean;
+}
+
+/**
+ * Everything the generator needs to emit an enable/disable localization migration for
+ * one collection. Table names, default locale, and the columns to move are all explicit.
+ */
+export interface CompanionMigrationSpec {
+  dialect: SupportedDialect;
+  /** See {@link CompanionCopyRef.liveness}. */
+  liveness?: CopyLiveness;
+  /** collection slug (for archive rows + file header). */
+  collection: string;
+  /**
+   * Which kind of entity `collection` names, recorded with its archive rows. A spec that only
+   * describes the companion (a query table, a seed) has no rows to record and may leave it out;
+   * one whose statements archive is refused without it (`archiveOwnerOf`).
+   */
+  kind?: I18nTransitionKind;
+  /** physical main table, e.g. "dc_pages". */
+  mainTable: string;
+  /** physical companion table, e.g. "dc_pages_locales". */
+  companionTable: string;
+  /** the default locale code seeded from existing rows, e.g. "en". */
+  defaultLocale: string;
+  /** DDL type of the main table's `id` column, so the companion FK type matches. */
+  parentIdType: string;
+  /** columns being localized (moved main -> companion). */
+  columns: LocalizedColumnSpec[];
+  /**
+   * Names of `columns` that physically exist on the main table right now, so the ENABLE seed
+   * (`SELECT ... FROM main`) and the main-table DROP only touch real columns. A field added
+   * and localized in the same save is in `columns` (it needs a companion column) but not here
+   * (there is nothing on main to seed from or drop). Undefined means "all of `columns`" — the
+   * file-migration path, where every localized column pre-exists on main.
+   */
+  columnsOnMain?: string[];
+  /**
+   * Whether the collection has Draft/Published enabled (i18n M6). When true, the companion gets a
+   * per-locale `_status` column (`'draft' | 'published'`, default `'draft'`) so each language
+   * publishes independently. On an ENABLE seed, existing rows carry the main row's `status`.
+   */
+  status?: boolean;
+  /**
+   * The translated fields a `unique` file's UP indexes, each with its companion column. Recorded
+   * so `nextly migrate` can refuse the file, before any statement, where a language already holds
+   * a value twice or the server cannot build the index. Present only on a `unique` file.
+   */
+  unique?: { field: string; column: string }[];
+  /**
+   * The translated fields a `retypes` file gives a new column type, each with its companion
+   * column, whose new type `columns` records. Recorded so `nextly migrate` knows the change it is
+   * judging carries its translations column, and judges each language's value before it runs.
+   * Present only on a `retypes` file.
+   */
+  retyped?: { field: string; column: string }[];
+  /**
+   * The settings fields leaving translation take on once their default language's values are on
+   * the main table: the Required ones, and those a one-column unique index covers, each with its
+   * companion column. Recorded so `nextly migrate` can refuse the move, before its first file runs,
+   * where those values cannot take them. Present only on an `archive` or `shared` file whose fields
+   * carry one.
+   */
+  settings?: LeavingSettingsSpec;
+}
+
+/** The settings a move out of translation applies after its copy, as `CompanionMigrationSpec` records them. */
+export interface LeavingSettingsSpec {
+  required: { field: string; column: string }[];
+  unique: { field: string; column: string }[];
+}

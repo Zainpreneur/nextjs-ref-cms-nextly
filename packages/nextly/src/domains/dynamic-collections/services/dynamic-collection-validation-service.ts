@@ -1,0 +1,412 @@
+import safeRegex from "safe-regex2";
+import { z } from "zod";
+
+import type { FieldDefinition } from "@nextly/schemas/dynamic-collections";
+
+/**
+ * Cap admin-supplied regex pattern length. Long patterns are both
+ * useless (almost no real-world validation needs 200+ chars) and a
+ * vector for hiding catastrophic-backtracking constructs that defeat
+ * static analyzers.
+ */
+
+import { NextlyError } from "../../../errors/nextly-error";
+import { reservedSystemFieldNames } from "../../../lib/system-columns";
+import { addressSchema, isAddressSpelling } from "../../../shared/address-rule";
+import {
+  BUILDER_RESERVED_COLLECTION_NAMES,
+  BUILDER_SQL_KEYWORDS,
+} from "../../../shared/sql-reserved";
+import { consoleLogger } from "../../../shared/types";
+import {
+  toSnakeCase,
+  usesJunctionTable,
+} from "../../schema/services/field-column-descriptor";
+import { relationshipTargetSlug } from "../../schema/services/relationship-key-target";
+import {
+  fieldNameProblem,
+  type FieldNameProblemKind,
+  MAX_FIELD_COLUMN_LENGTH,
+  MAX_FIELD_NAME_LENGTH,
+} from "../field-name-rule";
+
+const MAX_REGEX_PATTERN_LENGTH = 200;
+
+/**
+ * Characters that would break the surrounding
+ * `CHECK (col ~ '…')` constraint expression when embedded as raw text
+ * after the existing single-quote escaping. The R3 update notes that
+ * `replace(/'/g, "''")` alone is not sufficient — a regex containing
+ * a stray `;`, backslash, or newline can corrupt the DDL even without
+ * SQL injection. We allowlist by reject-listing the smallest set that
+ * shouldn't appear in any reasonable validation pattern.
+ */
+const REGEX_DDL_FORBIDDEN_CHARS = /[;\\\n\r\0]/;
+
+/**
+ * The Schema Builder's SQL keywords and reserved collection names, kept with
+ * the other reserved lists in `shared/sql-reserved` so the one address rule
+ * can read them without importing this service; re-exported under their
+ * earlier names for this module's importers.
+ */
+export const SQL_KEYWORDS = BUILDER_SQL_KEYWORDS;
+export const RESERVED_COLLECTION_NAMES = BUILDER_RESERVED_COLLECTION_NAMES;
+
+/** Reserved field names (added automatically). */
+/**
+ * Field names the Schema Builder refuses, in both spellings.
+ *
+ * A projection of the columns declared reserved on this surface. Config validation accepts a
+ * camelCase field name and snake-cases it, so the two spellings reach the same column and
+ * reserving one alone reserves nothing — a field named `createdAt` lands in the same CREATE TABLE
+ * as the injected `created_at`, which the database refuses.
+ */
+export const RESERVED_FIELD_NAMES: readonly string[] =
+  reservedSystemFieldNames("builder");
+
+/**
+ * A Builder-created collection's name, judged by the one address rule every
+ * road shares (`shared/address-rule`), so the Builder refuses exactly what
+ * configuration, the schema endpoints and the migrate commands refuse.
+ */
+export const collectionNameSchema = addressSchema("collection");
+
+/**
+ * How this road words each rule the shared field-name rule reports. The rule decides; the wording
+ * stays the one this road has always answered with.
+ */
+const FIELD_NAME_MESSAGES: Record<FieldNameProblemKind, string> = {
+  spelling:
+    "Field name must start with a lowercase letter and contain only letters, numbers, and underscores",
+  "column-too-long": `Field name's column would be longer than ${MAX_FIELD_COLUMN_LENGTH} characters`,
+  "name-too-long": `Field name must be ${MAX_FIELD_NAME_LENGTH} characters or less`,
+  reserved: "Field name is reserved",
+  lifecycle: "Field name is reserved",
+};
+
+// A field keeps the name it is given, camelCase included, as on every other
+// road; its column is `toSnakeCase(name)`. So each rule that protects a column
+// is checked against that column, not only against the name as written.
+//
+// The spelling, the column's length and the system columns' names are the
+// shared field-name rule's (`field-name-rule`), asked for a collection's top
+// level with the camelCase this road accepts. The length cap, the wider
+// reserved list and the SQL keywords are this road's own: the Builder's field
+// save takes those names, so they are not part of the shared rule.
+export const fieldNameSchema = z
+  .string()
+  .min(1, "Field name cannot be empty")
+  .max(50, "Field name must be 50 characters or less")
+  .superRefine((name, ctx) => {
+    const problem = fieldNameProblem(name, {
+      surface: "collection",
+      nested: false,
+      spelling: "declared",
+    });
+    if (problem !== null) {
+      ctx.addIssue({
+        code: "custom",
+        message: FIELD_NAME_MESSAGES[problem.kind],
+      });
+    }
+  })
+  .refine(
+    (name: string) =>
+      !RESERVED_FIELD_NAMES.includes(name) &&
+      !RESERVED_FIELD_NAMES.includes(toSnakeCase(name)),
+    { message: "Field name is reserved" }
+  )
+  .refine(
+    (name: string) => !SQL_KEYWORDS.includes(name.toLowerCase() as never),
+    {
+      message: "Field name is a reserved SQL keyword",
+    }
+  );
+
+// Why: the new modal-driven create flow (Builder redesign PR 2) creates a
+// collection with empty user fields and lets the user add fields on the
+// next page. The server already auto-injects system columns (id, title,
+// slug, plus createdAt/updatedAt/status when those toggles are on), so a
+// "fieldless" collection has 4-7 real DB columns. The legacy "at least
+// one user field" rule was a UI assumption baked into the API; relaxing
+// to min(0) lets create-then-add-fields work without breaking
+// update flows (removing all user fields is also valid — the system
+// columns remain).
+export const fieldsArraySchema = z
+  .array(z.any())
+  .min(0)
+  .max(100, "Collection cannot have more than 100 fields");
+
+/**
+ * Whether a relationship names the collection it links to, as the schema can
+ * keep it.
+ *
+ * - A many-to-many keeps its links in a junction table, which is made only for
+ *   a target named in `options.target`, so it must name its target there: a
+ *   `relationTo` target alone would leave it nowhere to keep them.
+ * - A `relationTo` that is neither a string nor a list names none.
+ * - Otherwise `relationTo` first, one collection or several, each spelled as
+ *   an address is (`isAddressSpelling`).
+ * - Else the earlier Builder's `options.target`, read as every other reader of
+ *   a stored relationship reads it (`relationshipTargetSlug`).
+ */
+function namesItsTarget(
+  field: FieldDefinition,
+  relationType: unknown
+): boolean {
+  const { relationTo } = field;
+  // Any other value in relationTo names no collection, and the readers that
+  // take relationTo before options.target would take it as one: refused, not
+  // passed over for options.target.
+  if (
+    relationTo !== undefined &&
+    typeof relationTo !== "string" &&
+    !Array.isArray(relationTo)
+  ) {
+    return false;
+  }
+  if (relationType === "manyToMany") {
+    const target = field.options?.target;
+    return typeof target === "string" && target !== "";
+  }
+  if (Array.isArray(relationTo)) {
+    return relationTo.length > 0 && relationTo.every(isAddressSpelling);
+  }
+  if (typeof relationTo === "string" && relationTo !== "") {
+    return isAddressSpelling(relationTo);
+  }
+  return relationshipTargetSlug(field) !== null;
+}
+
+export class DynamicCollectionValidationService {
+  /**
+   * @throws Error if the name is invalid
+   */
+  validateCollectionName(name: string): void {
+    const result = collectionNameSchema.safeParse(name);
+    if (!result.success) {
+      const errorMessage =
+        result.error.issues[0]?.message || "Invalid collection name";
+      throw new Error(errorMessage);
+    }
+  }
+
+  /**
+   * Whether two of the fields clash is the sibling rule's question, asked with
+   * the stored list beside them (`assertNoNewSiblingClashes`), so a pair the
+   * collection already holds is not refused here on an unrelated save.
+   *
+   * @throws Error if any field name is invalid
+   */
+  validateFieldNames(fields: FieldDefinition[]): void {
+    const countResult = fieldsArraySchema.safeParse(fields);
+    if (!countResult.success) {
+      const errorMessage =
+        countResult.error.issues[0]?.message || "Invalid fields array";
+      throw new Error(errorMessage);
+    }
+
+    for (const field of fields) {
+      const result = fieldNameSchema.safeParse(field.name);
+      if (!result.success) {
+        const errorMessage =
+          result.error.issues[0]?.message ||
+          `Invalid field name "${field.name}"`;
+        throw new Error(errorMessage);
+      }
+
+      if (field.type === "relationship") {
+        this.validateRelationshipField(field);
+      }
+    }
+  }
+
+  /**
+   * Two many-to-many fields may not store their links in one junction table.
+   * A link row carries the two collections' ids and nothing that says which
+   * field made it, so the fields would read each other's links, and removing
+   * either field would take the other's table with it. Asked of the name each
+   * field RESOLVES to — its `junctionTable`, or the generated name — through
+   * the caller's resolver, which must be the one the DDL is written with: an
+   * author may name a table exactly what another field's generated name is.
+   *
+   * @throws NextlyError (validation, `JUNCTION_TABLE_SHARED`) naming both fields and the table
+   */
+  validateJunctionOwnership(
+    fields: FieldDefinition[],
+    junctionTableFor: (field: FieldDefinition) => string
+  ): void {
+    const owners = new Map<string, string>();
+    for (const field of fields.filter(usesJunctionTable)) {
+      const table = junctionTableFor(field);
+      const owner = owners.get(table);
+      if (owner !== undefined) {
+        throw NextlyError.validation({
+          errors: [
+            {
+              path: "fields",
+              code: "JUNCTION_TABLE_SHARED",
+              message:
+                `Fields "${owner}" and "${field.name}" both store their links in ` +
+                `junction table "${table}". Each many-to-many field needs a ` +
+                `junction table of its own.`,
+            },
+          ],
+          logContext: { fields: [owner, field.name], junctionTable: table },
+        });
+      }
+      owners.set(table, field.name);
+    }
+  }
+
+  /**
+   * A relationship must name the collection it links to, read as every other
+   * reader of a stored relationship reads it (`relationshipTargetSlug`): the
+   * editor's `relationTo`, one collection or several, else the earlier
+   * Builder's `options.target`. That earlier shape names its cardinality
+   * beside its target in `options.relationType` and must still give it; the
+   * editor's shape gives its cardinality by `hasMany` and Unique, and is
+   * many-to-one when it states none, as its column is created. A cardinality
+   * given either way must be one the schema knows, and the options given
+   * beside it are judged as before.
+   *
+   * @throws Error if the relationship configuration is invalid
+   */
+  validateRelationshipField(field: FieldDefinition): void {
+    this.validateRelationshipTarget(field);
+    if (!field.options) return;
+    this.validateReferentialActions(field, field.options);
+    this.validateCardinalityRules(field, field.options);
+  }
+
+  /** The collection it links to, and the cardinality the earlier shape must give. */
+  private validateRelationshipTarget(field: FieldDefinition): void {
+    const relationType = field.options?.relationType;
+    const hasTarget = namesItsTarget(field, relationType);
+    if (!hasTarget) {
+      throw new Error(
+        `Relationship field "${field.name}" must specify a target collection`
+      );
+    }
+
+    // The earlier shape: its target in options, and no `relationTo` beside it.
+    const earlierShape = field.relationTo === undefined;
+    if (earlierShape && !relationType) {
+      throw new Error(
+        `Relationship field "${field.name}" must specify a relationType (oneToOne, oneToMany, manyToOne, or manyToMany)`
+      );
+    }
+
+    const validTypes = ["oneToOne", "oneToMany", "manyToOne", "manyToMany"];
+    if (relationType !== undefined && !validTypes.includes(relationType)) {
+      throw new Error(
+        `Invalid relationType "${relationType}" for field "${field.name}". Must be one of: ${validTypes.join(", ")}`
+      );
+    }
+  }
+
+  /** What a delete or an update of the linked row does, where one is given. */
+  private validateReferentialActions(
+    field: FieldDefinition,
+    options: NonNullable<FieldDefinition["options"]>
+  ): void {
+    // Sent as a request sends it, a value may be any type: one that is not a
+    // string is refused as an unknown action, never read as one.
+    const actionOf = (value: unknown) =>
+      typeof value === "string" ? value.toLowerCase() : undefined;
+    if (options.onDelete !== undefined) {
+      const validActions = ["cascade", "set null", "restrict", "no action"];
+      const action = actionOf(options.onDelete);
+      if (action === undefined || !validActions.includes(action)) {
+        throw new Error(
+          `Invalid onDelete action "${options.onDelete}" for field "${field.name}". Must be one of: ${validActions.join(", ")}`
+        );
+      }
+    }
+
+    if (options.onUpdate !== undefined) {
+      const validActions = ["cascade", "set null", "restrict", "no action"];
+      const action = actionOf(options.onUpdate);
+      if (action === undefined || !validActions.includes(action)) {
+        throw new Error(
+          `Invalid onUpdate action "${options.onUpdate}" for field "${field.name}". Must be one of: ${validActions.join(", ")}`
+        );
+      }
+    }
+  }
+
+  /** What a stated cardinality asks of the field's own marks. */
+  private validateCardinalityRules(
+    field: FieldDefinition,
+    options: NonNullable<FieldDefinition["options"]>
+  ): void {
+    if (
+      options.relationType === "oneToOne" &&
+      !field.unique &&
+      !field.required
+    ) {
+      consoleLogger.warn(
+        `One-to-one relationship "${field.name}" should typically be unique. Consider setting unique: true.`
+      );
+    }
+
+    // manyToMany relationships use a junction table and cannot be required.
+    if (options.relationType === "manyToMany" && field.required) {
+      throw new Error(
+        `Many-to-many relationship "${field.name}" cannot be marked as required. Use validation in your application logic instead.`
+      );
+    }
+  }
+
+  /**
+   * The previous check only blocked `(?{` and `(?>` —
+   * neither of which is even valid JS regex syntax, so the function
+   * accepted catastrophic patterns like `(a+)+b` that DoS the database
+   * regex engine on subsequent writes.
+   *
+   * The new gate has three layers:
+   *
+   *   1. **Length cap** (≤200 chars). Real validation patterns are
+   *      short; long patterns are usually obfuscated.
+   *   2. **JS parse**. If `new RegExp(pattern)` throws, it's malformed
+   *      regardless of the runtime that will execute it.
+   *   3. **`safe-regex2`** static analysis. Detects nested-quantifier
+   *      and alternation explosion patterns (the standard ReDoS shapes).
+   *
+   * In this codebase the runtime engine is the database (Postgres `~`
+   * or MySQL `REGEXP`), not Node — JS-side runtime matching of admin-
+   * supplied patterns does not exist here. So we don't pull in the
+   * native re2 binding; the static `safe-regex2` check + length cap is
+   * the load-bearing defense for what actually ships to the DB.
+   *
+   * @throws Error if the regex is invalid, too long, or unsafe
+   */
+  validateRegexPattern(fieldName: string, pattern: string): void {
+    if (pattern.length > MAX_REGEX_PATTERN_LENGTH) {
+      throw new Error(
+        `Regex pattern for field "${fieldName}" exceeds the ${MAX_REGEX_PATTERN_LENGTH}-character cap (got ${pattern.length}).`
+      );
+    }
+
+    try {
+      new RegExp(pattern);
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      throw new Error(
+        `Invalid regex pattern for field "${fieldName}": ${message}`
+      );
+    }
+
+    if (!safeRegex(pattern)) {
+      throw new Error(
+        `Regex pattern for field "${fieldName}" is unsafe (catastrophic backtracking detected).`
+      );
+    }
+
+    if (REGEX_DDL_FORBIDDEN_CHARS.test(pattern)) {
+      throw new Error(
+        `Regex pattern for field "${fieldName}" contains characters that are not allowed in CHECK constraint expressions (no semicolons, backslashes, newlines, or null bytes).`
+      );
+    }
+  }
+}

@@ -1,0 +1,802 @@
+---
+title: Email
+description: Configure email providers (Resend, SMTP, SendLayer), send programmatically via the Direct API, and test locally with Mailpit.
+---
+
+Nextly's email system supports three providers -- Resend, SMTP, and SendLayer -- with database-managed templates, variable interpolation, and a shared header/footer layout. Email is used for password resets, email verification, welcome messages, and any custom notifications you send via the Direct API.
+
+For local development, Nextly ships a **Mailpit** profile in `docker-compose.yml` so you can test email flows without sending anything over the internet -- see [Local email testing with Mailpit](#local-email-testing-with-mailpit) below.
+
+## The Email hub
+
+Everything about email lives in one place in the admin: **Email**, under **Settings**, at `/admin/settings/email`. Links to its earlier address, `/admin/email`, redirect there. Its tabs run across the top:
+
+- **Messages** lists every email the site sends, grouped by who owns it (Nextly, each plugin, then the site), with what sends each one and its state: default, customised, update available, off, or kept as before. Search by name or what sends it, filter by owner and state, and start a new email from **New email**.
+- **Design** lists the layouts emails are sent in, and the partials they share.
+- **Sending** shows how email goes out: the default sender, every provider with whether it is on and which is the default, a provider set in `nextly.config.ts` (read-only), and a warning when the default is the Log provider on a site that is not in development.
+
+Each tab shows to anyone allowed to read what it shows: `read-email-templates` or `manage-email-templates` for Messages and Design, `read-email-providers` or `manage-email-providers` for Sending. A change needs the permission the server checks for it, so someone who may only read sees the lists without the actions they would be refused.
+
+The email pages that used to live under Settings (`/admin/settings/email-templates` and `/admin/settings/email-providers`, with their create and edit pages) redirect to their place in the hub, so bookmarks and links keep working.
+
+### Adding a provider
+
+**Settings -> Email -> Sending -> Add provider** guides a new provider through three steps:
+
+1. **Choose** the provider type. Log is marked as for development: it writes each email to the server log and delivers nothing.
+2. **Connect** it with only that type's settings. Where the provider can be asked without sending (an SMTP server's sign-in, a Resend key), Nextly checks the settings with it before saving and says plainly what failed. SendLayer can't be checked without sending, so the test in the next step is its check. A provider whose transport package isn't installed yet (SMTP without `nodemailer`) is saved without a check, and the form shows the command to install it.
+3. **Send a test**, a real email to your own address. A provider's test always goes to the address of the person who sends it, so it can't be pointed at anyone else.
+
+A new provider is saved **off**, and never as the default. An accepted test doesn't turn it on by itself: at the last step you choose **Turn on**, and separately **Make it the default**, and both apply when you press **Done**. Turning it on is an edit, so it needs permission to edit providers: someone who may only add providers can send the test and leave the provider off for someone who can. An accepted test is reported as accepted by the provider, not as delivered: check the inbox. A test through Log is reported as logged, not sent.
+
+When a check or a test fails, the hub says what to check:
+
+| What went wrong                  | What to check                                                                                                                                                                             |
+| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The sign-in was refused          | The API key, or the username and password. Google Workspace and Microsoft 365 need an app password; a Microsoft 365 mailbox also needs SMTP sending allowed, which tenants often disable. |
+| The sender isn't allowed         | That the From address uses a domain verified with the provider.                                                                                                                           |
+| The recipient was refused        | Your own address, on your account, and whether the provider is blocking it.                                                                                                               |
+| The provider is rate limiting    | Wait a minute, then send again.                                                                                                                                                           |
+| The provider couldn't be reached | The host and port, and that the server can reach the internet.                                                                                                                            |
+| Anything else                    | The reason is in the server log.                                                                                                                                                          |
+
+Fix the settings and send again without starting over. **Send a test** is also on every provider's row and page. Saving changed sign-in settings on a provider's page checks them first too; **Save anyway** keeps them if you know better.
+
+Only a provider that is on can be made the default. A default your site already has is left as it is.
+
+Where a provider reports the status of your sending domain (Resend does), the provider's page shows it, verified, pending or failed, with the DNS records it expects, each copyable. Nextly never changes DNS itself.
+
+### Linking to an email from a plugin
+
+A plugin's own screens link to an email in the hub rather than editing it themselves. An email opens for editing at:
+
+```text
+/admin/settings/email/messages/edit/<template id>
+```
+
+The form builder does this from a form's **Notifications** tab, opening the chosen email in a new tab so the form's unsaved changes are kept. The link shows only to someone allowed to edit templates.
+
+## Provider configuration
+
+Configure your email provider in `nextly.config.ts` as a code-first fallback. Database-managed providers (added in the admin at **Settings -> Email -> Sending**, see [Adding a provider](#adding-a-provider)) take priority over code-defined config when one is on and set as the default; the full order is under [Provider resolution order](#provider-resolution-order).
+
+> **Note:** `email.providerConfig` is **required** when the `email` block is set. If you only want database-managed providers, you can omit the `email` block entirely.
+
+### Resend
+
+```typescript
+// nextly.config.ts
+import { defineConfig } from "nextly/config";
+
+export default defineConfig({
+  email: {
+    providerConfig: {
+      provider: "resend",
+      apiKey: process.env.RESEND_API_KEY!,
+    },
+    from: "My App <noreply@example.com>",
+  },
+});
+```
+
+### SMTP
+
+```typescript
+// nextly.config.ts
+export default defineConfig({
+  email: {
+    providerConfig: {
+      provider: "smtp",
+      host: process.env.SMTP_HOST!,
+      port: Number(process.env.SMTP_PORT) || 587,
+      secure: false,
+      auth: {
+        user: process.env.SMTP_USER!,
+        pass: process.env.SMTP_PASS!,
+      },
+    },
+    from: process.env.SMTP_FROM || "noreply@example.com",
+  },
+});
+```
+
+### SendLayer
+
+```typescript
+// nextly.config.ts
+export default defineConfig({
+  email: {
+    providerConfig: {
+      provider: "sendlayer",
+      apiKey: process.env.SENDLAYER_API_KEY!,
+    },
+    from: "My App <noreply@example.com>",
+  },
+});
+```
+
+### Conditional provider selection
+
+The playground app shows a useful pattern -- prefer Resend when its API key is set, fall back to SMTP otherwise:
+
+```typescript
+// nextly.config.ts
+export default defineConfig({
+  email: process.env.RESEND_API_KEY
+    ? {
+        providerConfig: {
+          provider: "resend" as const,
+          apiKey: process.env.RESEND_API_KEY,
+        },
+        from: process.env.SMTP_FROM || "onboarding@resend.dev",
+      }
+    : {
+        providerConfig: {
+          provider: "smtp" as const,
+          host: process.env.SMTP_HOST!,
+          port: Number(process.env.SMTP_PORT) || 587,
+          secure: false,
+          auth: {
+            user: process.env.SMTP_USER!,
+            pass: process.env.SMTP_PASS!,
+          },
+        },
+        from: process.env.SMTP_FROM || "noreply@example.com",
+      },
+});
+```
+
+## Email config options
+
+| Option              | Type     | Default                   | Description                        |
+| ------------------- | -------- | ------------------------- | ---------------------------------- |
+| `providerConfig`    | object   | required                  | Provider-specific configuration.   |
+| `from`              | `string` | required                  | Default sender address.            |
+| `baseUrl`           | `string` | `NEXT_PUBLIC_APP_URL` env | Base URL for links in emails.      |
+| `resetPasswordPath` | `string` | `'/admin/reset-password'` | Path for password-reset links.     |
+| `verifyEmailPath`   | `string` | `'/admin/verify-email'`   | Path for email-verification links. |
+
+## Provider resolution order
+
+When sending an email, Nextly resolves the provider in this order:
+
+1. **Specific provider ID** -- if the call passes a `providerId`.
+2. **Database default provider** -- the provider marked as default on the admin's **Settings -> Email -> Sending** tab, when it is on.
+3. **Code-first config** -- the `providerConfig` from `defineConfig()`.
+4. **The log transport** -- if none of the above resolve, the message is written to the server log instead of being sent, so a fresh install's password-reset flow still works. A `providerId` that doesn't resolve is still an error.
+
+This lets you wire a code-first provider for development and configure a production provider through the admin UI without changing code.
+
+The log transport writes the full message, body included, only when `NODE_ENV` is `development` or `test`, so you can follow a reset link locally. Anywhere else, an unset `NODE_ENV` included, it masks every address and leaves the body out, because the body carries live reset and verification tokens.
+
+## Email addresses in logs
+
+Outside development and test (an unset `NODE_ENV` included), Nextly masks every email address it writes to the logs down to its first character and its domain: `john@example.com` becomes `j***@example.com`. That covers the log transport, a failed send whose provider error quotes the recipient, and every line written through Nextly's structured logger (including a logger you install with `setNextlyLogger`), and every line its services write, to the `logger` you pass Nextly or to its fallback console logger. To find a message in production logs, search by the domain and first character. Nextly writes to the console only through these loggers, apart from its command-line output, which is written for the person at the terminal. Logs your own code writes outside Nextly's loggers are yours to handle.
+
+## Built-in email templates
+
+Nextly automatically creates three email templates on first startup:
+
+| Template           | Slug                 | Purpose                         |
+| ------------------ | -------------------- | ------------------------------- |
+| Welcome            | `welcome`            | Sent after user registration.   |
+| Password Reset     | `password-reset`     | Contains the reset link.        |
+| Email Verification | `email-verification` | Contains the verification link. |
+
+Templates are stored in the database and edited through the admin UI (**Settings -> Email -> Messages**) using a Lexical-based rich-text editor. They support `{{variable}}` placeholder syntax with HTML escaping.
+
+The editor's **Send test** sends the saved template, with its sample data, to the signed-in user's own address and nowhere else. It needs the `update-email-templates` permission.
+
+### Template variables
+
+Templates receive context-appropriate variables.
+
+**Password Reset:**
+
+- `{{resetLink}}` -- full password reset URL.
+- `{{userName}}` -- user's name or email.
+- `{{userEmail}}` -- user's email.
+- `{{appName}}` -- application name.
+- `{{expiresIn}}` -- token expiry duration.
+- `{{year}}` -- current year.
+
+**Email Verification:**
+
+- `{{verifyLink}}` -- full verification URL.
+- `{{userName}}`, `{{userEmail}}`, `{{appName}}`, `{{expiresIn}}`, `{{year}}`.
+
+**Welcome:**
+
+- `{{userName}}`, `{{userEmail}}`, `{{appName}}`, `{{year}}`.
+
+### Shared header / footer layout
+
+Templates can opt into a shared layout via the `useLayout` flag (enabled by default). The layout uses reserved slugs `_email-header` and `_email-footer`. The final email is composed as:
+
+```
+header HTML + template body + footer HTML
+```
+
+Layout templates also support `{{variable}}` interpolation, so common variables like `{{year}}` and `{{appName}}` work in headers and footers.
+
+## Templates written in blocks
+
+A template is either **coded**, written in HTML as described above (in Liquid, or on the older `{{variable}}` engine for a template kept on it), or **written**: a short list of content blocks, with variables placed as chips. A written template always renders as Liquid. A written template is drawn in its layout and your brand settings, and its HTML and plain text are written from its blocks each time it renders, so a preview, a test send and a real send of the same saved template, with the same layout, brand settings and data, are the same email.
+
+Every template you already have stays coded, unchanged, and nothing turns a template you wrote or edited in code into blocks. A plugin's template the site hasn't changed follows the plugin's own version, written or coded, as its other updates do.
+
+Written templates are `@experimental`: `format`, `blocks` and the shapes below may still change. The admin has no editor for them yet, so create and change them through the Direct API or the REST routes.
+
+### Blocks
+
+| Block     | What it holds                                                                                               |
+| --------- | ----------------------------------------------------------------------------------------------------------- |
+| `heading` | Text and variables.                                                                                         |
+| `text`    | Text and variables, each run optionally bold, italic or a link.                                             |
+| `button`  | A label and a link. It keeps a fallback for Outlook on Windows.                                             |
+| `image`   | An image address, or a variable holding one, its alt text, and an optional width from 16 to 600 px.         |
+| `divider` | A line across the email.                                                                                    |
+| `spacer`  | Empty space, 4 to 96 px high (24 when left out).                                                            |
+| `list`    | Blocks repeated for each item of a list variable. A list can't hold another list; it holds up to 50 blocks. |
+
+A template holds up to 200 blocks at its top level, a list counting as one; a list holds up to 50 blocks of its own. A link is `{ "url": "https://…" }` or `{ "chip": { "variable": "orderUrl" } }`. Links take complete `https`, `http` and `mailto` addresses, and images `https` and `http` ones. An invalid address written in the blocks is refused when saved, and an invalid one a variable supplies at send time is left out. Links in text stay readable in a dark inbox.
+
+### Variables and fallbacks
+
+A variable is a chip: `{ "type": "chip", "variable": "name", "fallback": "there" }`. Its fallback is used when the value is absent, `null` or an empty string, and never for `false` or `0`.
+
+Chips sit only in the blocks. Each is made safe for where it sits:
+
+- In headings, text and button labels, the value is escaped as text.
+- In a link, the value must be a complete `https`, `http` or `mailto` address, and in an image address a complete `https` or `http` one. It is escaped as an attribute, and any other value is left out.
+- In the plain-text body written from the blocks, it is plain text, without markup.
+
+The subject, preview text, From name and Reply-To are text fields beside the blocks, written with Liquid (`{{ name }}`) as in a coded template. A variable in them is made safe as well:
+
+- In the subject and From name, it is plain text with line breaks removed.
+- In the preview text, it is escaped as text, as the inbox's preview line is HTML.
+- A Reply-To that uses a variable must render as one email address. When it renders empty, the email has no Reply-To; anything else fails the send.
+
+### Showing a block only sometimes
+
+Any block can carry `show: { "variable": "paid", "when": … }`:
+
+- `"present"` shows it when the variable has a value: present, and not `null`, an empty string or an empty list. `0` and `false` count as values.
+- `"yes"` shows it when the variable is `true`.
+- `"no"` shows it when the variable is `false`.
+
+### Lists
+
+A list repeats its blocks for each item of a list variable. Inside it, `item` is the current item, so a chip reads one of its fields with `item.name`:
+
+```json
+{
+  "type": "list",
+  "variable": "lines",
+  "blocks": [
+    { "type": "text", "text": [{ "type": "chip", "variable": "item.name" }] }
+  ]
+}
+```
+
+### Creating a written template
+
+```typescript
+await nextly.emailTemplates.create({
+  data: {
+    name: "Order paid",
+    slug: "order-paid",
+    subject: "Thanks for your order",
+    // Written from the blocks, so left empty.
+    htmlContent: "",
+    format: "written",
+    blocks: {
+      version: 1,
+      blocks: [
+        {
+          type: "heading",
+          text: [
+            { type: "text", text: "Hello " },
+            { type: "chip", variable: "name", fallback: "there" },
+          ],
+        },
+        {
+          type: "text",
+          text: [{ type: "text", text: "Paid in full." }],
+          show: { variable: "paid", when: "yes" },
+        },
+        {
+          type: "button",
+          label: [{ type: "text", text: "View order" }],
+          link: { chip: { variable: "orderUrl" } },
+        },
+      ],
+    },
+  },
+});
+```
+
+The REST route, `POST /admin/api/email-templates`, takes the contents of `data` as its JSON body, without the `data` wrapper.
+
+### Converting to code
+
+To take a written template further than blocks allow, convert it to code:
+
+```typescript
+await nextly.emailTemplates.update({ id, data: { format: "code" } });
+```
+
+or `PATCH /admin/api/email-templates/{id}` with `{ "format": "code" }`.
+
+Conversion is one-way. The template becomes HTML with Liquid that keeps every chip, condition and list as Liquid, so each later send still uses its own recipient's data, and it sends the same email as before. When the template is a site's override of a plugin's written template, its base copy is converted too, and the plugin's later updates are reviewed line by line, as for any coded override.
+
+### In a plugin
+
+A plugin ships a written template by giving `blocks` instead of `htmlContent` in `contributes.emailTemplates`:
+
+```typescript
+contributes: {
+  emailTemplates: [
+    {
+      slug: "orders-paid",
+      name: "Order paid",
+      subject: "Thanks for your payment",
+      blocks: {
+        version: 1,
+        blocks: [{ type: "heading", text: [{ type: "text", text: "Paid" }] }],
+      },
+    },
+  ],
+},
+```
+
+A written entry gives no `htmlContent` or `plainTextContent`, since both are written from its blocks. It also gives no `engine: "legacy"`, since it always renders as Liquid. The app refuses to start, naming the plugin and the template, for an entry with:
+
+- both HTML and blocks, or neither;
+- blocks that don't pass the rules above;
+- HTML that isn't text.
+
+The site's copy follows the plugin's version until the site changes it. A site's override of a written template stays written. When the plugin later updates it, the update is reviewed **block by block**:
+
+- Each block the plugin changed, added or removed is one change. A block it moved is one change for both places.
+- Each change offers **Keep yours** or **Use theirs**.
+- Undo puts the site's blocks back.
+
+The changes describe the blocks in plain words, such as `Heading: Thanks`, `Button: View order → [orderUrl]` and `For each item in lines:`.
+
+## Code-first template overrides
+
+You can override the built-in email templates in `defineConfig()` without touching the database:
+
+```typescript
+// nextly.config.ts
+import { defineConfig } from "nextly/config";
+
+export default defineConfig({
+  email: {
+    providerConfig: {
+      provider: "resend",
+      apiKey: process.env.RESEND_API_KEY!,
+    },
+    from: "noreply@example.com",
+    templates: {
+      passwordReset: data => ({
+        subject: "Reset your password",
+        html: `
+          <p>Hi ${data.user.name ?? data.user.email},</p>
+          <p>Click <a href="${data.url}">here</a> to reset your password.</p>
+          <p>This link expires in 1 hour.</p>
+        `,
+      }),
+      welcome: data => ({
+        subject: `Welcome to our app!`,
+        html: `<p>Hi ${data.user.name}, thanks for signing up!</p>`,
+      }),
+      emailVerification: data => ({
+        subject: "Verify your email",
+        html: `<p>Click <a href="${data.url}">here</a> to verify your email.</p>`,
+      }),
+    },
+  },
+});
+```
+
+Resolution order for templates: **database template** (if active) > **code-first override** > **error**.
+
+## Sending emails programmatically
+
+The Direct API exposes `nextly.email.send()` and `nextly.email.sendWithTemplate()`.
+
+There is no REST route for sending email. To send from a browser or another
+service, add a route of your own that checks who may send, and to whom, and then
+calls `nextly.email.send()` or `nextly.email.sendWithTemplate()`.
+
+### Using a template
+
+```typescript
+import { nextly } from "@/nextly";
+
+await nextly.email.sendWithTemplate({
+  template: "password-reset",
+  to: "user@example.com",
+  variables: {
+    resetLink: "https://example.com/admin/reset-password?token=abc123",
+    userName: "Jane",
+    appName: "My App",
+  },
+});
+```
+
+### Sending raw
+
+```typescript
+await nextly.email.send({
+  to: "user@example.com",
+  subject: "Your order has shipped",
+  html: "<p>Your order #1234 is on its way!</p>",
+});
+```
+
+Both calls return `{ success: boolean; messageId?: string }`, and on a failed send
+also `failure` and `error` (see [When a send fails](#when-a-send-fails)).
+
+### Sending to several people
+
+`to` takes one address or a list, on the Direct API and a plugin's
+`ctx.services.email`. Every address receives the email:
+
+```typescript
+await nextly.email.sendWithTemplate({
+  template: "order-alert",
+  to: ["orders@example.com", "owner@example.com"],
+  replyTo: "support@example.com",
+});
+```
+
+- Through SMTP, Resend or SendLayer, the list goes out as one message, with every
+  `to` address on it. Each provider takes a limited number of `to` addresses in one
+  message: 100 for SMTP (the number RFC 5321 requires every server to accept), 50
+  for Resend and 10 for SendLayer. A longer list is refused before anything is
+  sent, with an error naming the limit; no recipient is dropped. Whatever the
+  provider, one send has at most 100 `to` addresses.
+- Through a provider that takes one `to` per message, which is any provider plugin
+  that does not declare otherwise (see [Writing a provider](#writing-a-provider)),
+  each address gets a message of its own. `cc` and `bcc` go with the first message
+  only, so a copied address receives the email once, and an address that is also
+  a `to` gets only its own message. Every message is sent before any
+  `email.afterSend` action runs. The send succeeds only when every message did.
+- Every recipient, copied ones included, has a record in the delivery log.
+- A send with no `to` address, or one that is not an email address, is refused
+  before anything is sent. So is a send that names a `person` and has more than one
+  `to` address: a person is one recipient, so copy anyone else with `cc` or `bcc`.
+
+The `to` list is `@experimental` until the send contract is complete.
+
+### From and Reply-To
+
+`from` and `replyTo` set the message's sender and Reply-To on every way of sending.
+The send's own value wins, then the template's, then the provider's default
+sender. `replyTo` is `@experimental`.
+
+### When a send fails
+
+A provider's refusal is returned, not thrown: `success` is `false`, and `failure`
+says what happened, on the Direct API and `ctx.services.email` alike:
+
+- `failure.retryable`: whether sending again later can succeed. A refusal of the
+  message itself (an HTTP 4xx other than 408 and 429, or an SMTP 5xx reply) is
+  not retryable; a timeout, a rate limit, a server error (408, 429, 5xx, or an
+  SMTP 4xx reply) or a provider that could not be reached is. A failure the
+  provider did not classify counts as retryable, so a retry never drops an email
+  that could still be delivered.
+- `failure.status`: the provider's HTTP status or SMTP reply code, when it gave one.
+- `failure.reason`: a short sentence of Nextly's own, saying which kind of
+  failure it was, with no configuration, credential or address in it. A
+  provider's own explanation goes to the server log, not to the caller. The
+  Direct API also puts the sentence in `error`.
+
+When the provider took the message but refused some recipients, `refused` lists
+each by its line (`to`, `cc` or `bcc`) and its position on that line, with
+`retryable` and `status`, never the address. The send is successful only when
+every `to` recipient was accepted. The delivery log records each refusal with
+whether a retry can help.
+
+A send refused before anything is sent, such as one with an address that is not
+an email address, or a Reply-To holding a line break, is thrown as a validation
+error: nothing was sent, and the same send would be refused again.
+
+`failure` and `refused` are `@experimental`.
+
+### Sending an email once
+
+Give a send an `idempotencyKey` and it goes out once, however often it is
+repeated: on the Direct API's `send` and `sendWithTemplate`, and the same two on
+`ctx.services.email`. A key is text of up to 256 characters that names the
+email, such as an order's confirmation.
+
+- Nextly claims the key before contacting the provider. A repeat of a send that
+  succeeded returns the first send's result with `repeat: true`, and sends
+  nothing.
+- A repeat while the first send is still going returns `success: false` with a
+  retryable `failure`, saying a send with the key is in progress. Retry it, and
+  it returns the result once there is one.
+- A repeat after the first send failed sends again.
+- The same key with a different message is refused with a conflict error. The
+  message is everything that reaches the provider:
+  every recipient, `from`, `replyTo`, the rendered subject and bodies, the
+  attachments and the person. A template edited between two sends with one key
+  is a different message.
+- Keys belong to their caller. The site's own code (the Direct API) has one
+  set; each plugin has its own; Nextly's own sends have theirs. The same key
+  from two of them names two different emails.
+- A provider that takes a key (Resend) is also handed one derived from yours, so
+  the provider itself sends the message once for 24 hours.
+
+Nextly keeps a keyed digest of the key, never the key itself, and no address. A
+successful send's key is remembered for as long as the delivery log keeps the
+send's records (90 days by default, following the retention setting). With a
+retention of zero nothing is kept, and a key protects only within the
+provider's own window. The digests are kept under the install's stored digest
+key, so a key keeps working across a rotation of `NEXTLY_SECRET`. Erasing a
+person clears the key's digest from every record of the sends they were on, and
+from those sends' claims.
+
+A send whose recipients fared differently is reported recipient by recipient.
+When some were accepted and the send still did not succeed (a split send whose
+second message failed, or an SMTP server that took one address and refused
+another), the result has `partlyDelivered: true` and `recipients`, each
+recipient's `outcome` (`accepted`, `refused` or `unknown`) by its line and
+position, never by address. A retry with the same key sends only to the
+recipients not yet accepted, whichever provider carries it, and its result
+counts the earlier ones as accepted. A partly delivered send's claim is kept as
+long as a successful one's. A send whose recipients all fared alike has the
+result it always had, with neither field.
+
+A failure with `unknown: true` means delivery cannot be known: the request may
+have reached the provider, but no definite answer came back (a connection lost
+mid-request, a timeout after sending, or the call deadline below). It is
+retryable; through a provider that takes a key, a retry is deduplicated there. A
+keyed send that ends unknown keeps its claim held to the lease limit below,
+however soon the answer was lost, so a repeat with the key in that time is told
+the send is in progress rather than sending it again. A provider that could not
+be reached at all sent nothing, and has no such mark.
+
+Every provider call has a deadline of 2 minutes. A call that has not answered by
+then is reported as `"The email provider did not answer in time."`, unknown and
+retryable, and its adapter is told to stop through the call's `signal`. A keyed
+send's claim stays held while the call is still unsettled, its lease renewed,
+for up to 10 minutes (the lease limit, five times the deadline): a repeat in
+that time is told the send is in progress, and if the call answers, the claim
+records what it answered. Past the lease limit the outcome is recorded as
+unknown and a later send may take the claim over. Through a provider that takes
+a key, the provider still sends the email once. Through one without keys, the
+email can then be delivered twice: stopping the call only stops Nextly waiting,
+and a request that reached the provider may still be delivered.
+
+If the process stops while sending, the key is held for 15 minutes from the
+claim's last renewal, after which a later send with it may send again. Through a
+provider without keys (SMTP, SendLayer) that can repeat the email once: a keyed
+send is delivered at least once, never lost.
+
+A keyed send's delivery records and its outcome are written together, in one
+transaction: a process that stops between the provider's answer and that
+commit leaves neither, and the retry that takes the claim over writes both.
+
+The key protects for as long as the delivery log keeps the send's records. A
+caller whose retries can outlast that keeps its own record of what it sent, or
+accepts a repeat after that horizon.
+
+A keyed send cannot run inside an open database transaction: send before
+opening it or after it has finished.
+
+`idempotencyKey`, `repeat`, `partlyDelivered`, `recipients` and
+`failure.unknown` are `@experimental`.
+
+### Changing a send before it goes out
+
+An `email.beforeSend` filter receives the whole envelope: `to`, `recipients`,
+`from`, `replyTo`, `subject`, `html`, `text`, `cc` and `bcc`. `to` is a single
+string when the send has one recipient, as it always was, and a list when it has
+several. `recipients` lists every address, `to`, `cc` and `bcc`, each with its
+line (`{ address, kind }`). Change recipients through `to`, `cc` and `bcc`:
+`recipients` is rebuilt from them after every filter, so the next filter reads the
+recipients as they now stand, and a change made only to `recipients` is replaced.
+What the filter returns is what is sent, and it is checked again first: a filter
+that leaves no valid `to`, adds more `to` addresses than the provider takes, or
+changes the recipient of a send that names a person, has the send refused.
+
+An `email.afterSend` action runs once for each message handed to the provider, with
+the message's `to`, its `recipients` (blind copies included), the outcome and the
+message id. An action that forwards its argument elsewhere sends every address of
+the message with it, blind copies too, so forward only what you need.
+
+`recipients`, `replyTo`, and `to` as a list are `@experimental`.
+
+### Email to a person a plugin signs in
+
+A plugin emailing one of its own [signed-in people](/docs/plugins/signed-in-people#email-a-person)
+passes `person` to `ctx.services.email.send` or `sendWithTemplate`. The delivery
+record then names the person, so the plugin's report that they were deleted erases
+it, and leaves alone the records of anyone else at the same address.
+
+### Email to a staff user
+
+A send can name a staff user the same way, as `{ kind: "staff", id }`, on
+`nextly.email.send`, `nextly.email.sendWithTemplate` and a plugin's
+`ctx.services.email`. The delivery record then names that user by kind and id
+beside the address it went to. A send naming a staff user who does not exist is
+refused before anything is sent. `person` is `@experimental`.
+
+```typescript
+await nextly.email.sendWithTemplate({
+  to: user.email,
+  template: "account-notice",
+  person: { kind: "staff", id: user.id },
+});
+```
+
+Core's own emails to a staff user name them this way: the welcome email, the
+password reset and the email verification.
+
+### When a staff user is deleted
+
+Deleting a staff user erases their email delivery records:
+
+- **Every record that names them,** whatever address it went to, including
+  an address they used before an address change. The record keeps its row,
+  so the install's send counts stay right, but loses its address digest, and
+  names the user by a keyed digest in place of their id.
+- **Records that name nobody,** sent to the address the user holds when
+  deleted. These are records written before sends named their person, so an
+  earlier address's unnamed records are pruned only by the delivery log's
+  retention.
+- **Records written after the deletion,** for a send that was in flight, a
+  retry or a provider's later report, are written already erased. Nextly keeps
+  a keyed digest of each deleted staff user, never their id or an address, for
+  this.
+
+A record that names someone else is never touched, even when that person holds,
+or once held, the same address.
+
+An email the provider had already accepted before the deletion may still be
+delivered: erasing its record cannot recall the message.
+
+### Auth flow auto-sends
+
+The `AuthService` handles email sending for auth flows automatically when an email service is configured:
+
+- `generatePasswordResetToken(email)` -- generates a token and sends the reset email.
+- `generateEmailVerificationToken(email)` -- generates a token and sends the verification email.
+- `sendWelcomeEmail(to, user)` -- sends the welcome template.
+
+If no email service is configured, tokens are returned in the API response as a development-only fallback (with a console warning). In production, configure a real provider so password resets and email verification work.
+
+## Local email testing with Mailpit
+
+For local development, the Nextly repo's `docker-compose.yml` ships a `with-mailpit` profile that runs [Mailpit](https://github.com/axllent/mailpit) -- an SMTP server and web UI for catching outgoing email locally.
+
+### Start Mailpit
+
+```bash
+docker compose --profile with-mailpit up -d mailpit
+```
+
+This starts the `axllent/mailpit:latest` container with:
+
+- **SMTP** on host port `1025`.
+- **Web UI** on host port `8025`.
+- No authentication (Mailpit is dev-only).
+
+### Configure Nextly to use it
+
+Point your SMTP env vars at the local Mailpit instance. Empty `SMTP_USER` / `SMTP_PASS` is fine -- Mailpit accepts any credentials.
+
+```bash
+# .env.local
+SMTP_HOST=localhost
+SMTP_PORT=1025
+SMTP_USER=
+SMTP_PASS=
+SMTP_FROM=dev@nextly.local
+```
+
+Then either let `getStorageFromEnv()`-style auto-detection pick up SMTP, or wire it explicitly in `nextly.config.ts`:
+
+```typescript
+// nextly.config.ts
+import { defineConfig } from "nextly/config";
+
+export default defineConfig({
+  email: {
+    providerConfig: {
+      provider: "smtp",
+      host: process.env.SMTP_HOST!,
+      port: Number(process.env.SMTP_PORT) || 1025,
+      secure: false,
+      auth: {
+        user: process.env.SMTP_USER || "",
+        pass: process.env.SMTP_PASS || "",
+      },
+    },
+    from: process.env.SMTP_FROM || "dev@nextly.local",
+  },
+});
+```
+
+### Inspect captured email
+
+Open `http://localhost:8025` in your browser. Every email Nextly sends locally lands in the Mailpit inbox -- password resets, verification links, welcome emails, and anything you fire via `nextly.email.send()`. The web UI lets you preview HTML, view raw source, and inspect headers.
+
+The container is dev-only and gated behind a Compose profile, so it does **not** auto-start with `docker compose up`.
+
+## Environment variables
+
+| Variable            | Provider  | Description                                  |
+| ------------------- | --------- | -------------------------------------------- |
+| `RESEND_API_KEY`    | Resend    | API key from the Resend dashboard.           |
+| `SENDLAYER_API_KEY` | SendLayer | API key (Bearer token).                      |
+| `SMTP_HOST`         | SMTP      | Server hostname.                             |
+| `SMTP_PORT`         | SMTP      | Server port (587 for TLS, 1025 for Mailpit). |
+| `SMTP_USER`         | SMTP      | Authentication username (empty for Mailpit). |
+| `SMTP_PASS`         | SMTP      | Authentication password (empty for Mailpit). |
+| `SMTP_FROM`         | Any       | Default sender address.                      |
+
+## Writing a provider
+
+A plugin adds a provider through `contributes.emailProviders`, with
+`defineEmailProvider`. Its `createAdapter` returns an adapter whose `send` receives
+one message: `to`, `from`, `subject`, `html`, and optionally `text`, `replyTo`,
+`cc`, `bcc` and `attachments`.
+
+An adapter receives one `to` address per message unless it declares more. When
+its provider addresses one message to several people, declare how many `to`
+addresses it takes:
+
+```typescript
+createAdapter: config => ({
+  maxToPerMessage: 50,
+  async send(options) {
+    // `toList` is present only when the message has more than one `to`.
+    const to = options.toList ?? [options.to];
+    // ...send `to`, `options.cc` and `options.bcc` to the provider...
+  },
+}),
+```
+
+- Nextly refuses a send with more `to` addresses than `maxToPerMessage` before
+  calling the adapter, so the adapter never has to drop or split recipients.
+- A message to one person reaches the adapter exactly as it always has, with `to`
+  alone, so an adapter written before `maxToPerMessage` keeps working unchanged:
+  Nextly sends it one message per `to` address.
+
+A provider that refuses a send throws. To say whether a retry can help, throw an
+error carrying `emailFailure: { retryable, status, reason }`; the built-in
+adapters classify their failures this way. The caller is told `retryable` and
+`status` with a sentence of Nextly's own for that kind of failure; the error's
+own message, with the provider's declared credentials taken out, goes to the
+server log. A failure with no `emailFailure` is treated as retryable. When a
+provider takes a message but refuses some recipients, return `rejected` with
+their bare addresses, and optionally `refusals` with
+`{ address, retryable, status }` for each.
+
+A provider that sends a message once per key can declare `acceptsIdempotencyKey:
+true`. For a send that carried a key, its adapter then receives
+`idempotencyKey`, a key derived from the caller's, the same on every retry of
+that message. Nextly claims the caller's key itself either way.
+
+Every call is handed a `signal`, an `AbortSignal` that fires at the call
+deadline (2 minutes). An adapter should stop sending when it fires: pass it to
+`fetch`, or close its connection. When a request may have reached the provider
+but its answer was lost, throw an error carrying
+`emailFailure: { retryable: true, unknown: true, reason }`; a provider that could
+not be reached at all is not unknown.
+
+`maxToPerMessage`, `toList`, `emailFailure`, `refusals`, `acceptsIdempotencyKey`,
+`idempotencyKey`, `signal` and `emailFailure.unknown` are `@experimental`.
+
+## Next steps
+
+- [Authentication](/docs/guides/authentication) -- understand how the auth flows trigger emails.
+- [Deployment](/docs/guides/deployment) -- production email-provider setup.
+- [Environment variables](/docs/configuration/environment) -- full env-var reference.
+- [Configuration reference](/docs/configuration/nextly-config) -- full `defineConfig()` email options.

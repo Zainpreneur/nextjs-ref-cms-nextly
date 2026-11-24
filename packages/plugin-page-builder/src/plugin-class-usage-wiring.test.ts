@@ -1,0 +1,366 @@
+/**
+ * Whether installing the plugin actually installs class-usage maintenance.
+ *
+ * Every other test in this area exercises the maintenance modules directly, so
+ * all of them pass with the registration call deleted from `init` — measured:
+ * removing it compiles and leaves the whole suite green. A host would then
+ * install the plugin, get the index TABLE and nothing that writes to it, and
+ * every class on the site would read as unused with no error anywhere.
+ *
+ * This is the one assertion that fails when the wiring is absent.
+ *
+ * @module plugin-class-usage-wiring.test
+ */
+import { describe, expect, it, vi } from "vitest";
+
+import { UNDETERMINED_CLASS_ID } from "./class-usage-reconcile";
+import { pageBuilder } from "./plugin";
+import { UNDETERMINED_TOKEN_ID } from "./token-usage";
+
+/**
+ * The plugin's own database, as far as a save's maintenance reaches it: no
+ * stored rows, and every insert recorded with the table it went to.
+ */
+function fakeDatabase() {
+  const inserted: { table: string; values: Record<string, unknown> }[] = [];
+  const rows = {
+    where: () => rows,
+    orderBy: () => rows,
+    limit: () => rows,
+    offset: () => rows,
+    all: async () => [],
+    first: async () => null,
+  };
+  const db = {
+    // Column stubs: conditions are built, never run.
+    table: () => new Proxy({}, { get: () => ({}) }),
+    select: () => rows,
+    insert: async (
+      table: { name: string },
+      values: Record<string, unknown>
+    ) => {
+      inserted.push({ table: table.name, values });
+    },
+    delete: () => ({ where: async () => 0 }),
+  };
+  return { db, inserted };
+}
+
+/** The parts of a plugin context `init` reaches for, and nothing more. */
+function initContext(renameMap: Record<string, string> = {}) {
+  const database = fakeDatabase();
+  const registered: string[] = [];
+  const handlers: ((c: Record<string, unknown>) => unknown)[] = [];
+  const byKey = new Map<string, ((c: Record<string, unknown>) => unknown)[]>();
+  const ctx = {
+    // What `.rename()` resolves to. Identity when nothing was renamed, which is
+    // the shape core builds for every plugin.
+    self: {
+      collections: {
+        nx_pb_class_usage: renameMap.nx_pb_class_usage ?? "nx_pb_class_usage",
+      },
+      singles: {},
+      name: "@nextlyhq/plugin-page-builder",
+    },
+    hooks: {
+      on: (
+        type: string,
+        collection: string,
+        handler: (c: Record<string, unknown>) => unknown
+      ) => {
+        registered.push(`${type}:${collection}`);
+        handlers.push(handler);
+        // Keyed by what it was registered FOR. Selecting by position couples
+        // every test to registration ORDER, so a hook added anywhere in `init`
+        // silently hands them a different handler than the one they name — and
+        // the failure reads as the maintenance being broken.
+        const key = `${type}:${collection}`;
+        byKey.set(key, [...(byKey.get(key) ?? []), handler]);
+      },
+      off: vi.fn(),
+      onBeforeOperation: vi.fn(),
+      offBeforeOperation: vi.fn(),
+      onInTransaction: vi.fn(),
+      offInTransaction: vi.fn(),
+      onCollectionDelete: vi.fn(),
+    },
+    services: {
+      collections: { getCollection: vi.fn(async () => ({})) },
+      plugins: {},
+    },
+    config: {},
+    logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
+    db: database.db,
+    dialect: "sqlite",
+  };
+  /**
+   * The class-usage handler for one phase, selected by what it was registered
+   * FOR rather than by its position among every registration.
+   *
+   * More than one thing listens on `afterCreate:*` — the readiness notice does
+   * too — so this takes the FIRST for the key, which is the maintenance. That
+   * is the same handler the tests always ran; what changed is that a hook
+   * added elsewhere in `init` no longer shifts it, and the failure no longer
+   * reads as the maintenance being broken.
+   *
+   * Running every handler for the key was tried and is worse here: the other
+   * listener reaches `getCollection`, which is exactly the call one of these
+   * tests asserts is NOT made.
+   */
+  const maintenanceFor = (type: string, collection: string) => {
+    const found = byKey.get(`${type}:${collection}`) ?? [];
+    if (found.length === 0) {
+      throw new Error(`nothing is registered for ${type}:${collection}`);
+    }
+    return found[0];
+  };
+
+  return {
+    ctx,
+    registered,
+    handlers,
+    maintenanceFor,
+    inserted: database.inserted,
+  };
+}
+
+describe("installing the page-builder plugin", () => {
+  it("registers class-usage maintenance on the after-phases", () => {
+    const { ctx, registered } = initContext();
+
+    // The plugin's own init, run the way a host runs it.
+    (pageBuilder().init as (c: unknown) => void)(ctx);
+
+    expect(registered).toContain("afterCreate:*");
+    expect(registered).toContain("afterUpdate:*");
+  });
+
+  it("contributes the index table it maintains", () => {
+    // The pair matters: a table with no maintenance silently records nothing,
+    // and maintenance with no table fails every write it is called for. A host
+    // installing the plugin is asking for both.
+    const tables = (pageBuilder().contributes?.schema?.tables ?? []).map(
+      table => table.name
+    );
+
+    expect(tables).toEqual(
+      expect.arrayContaining(["class_usage", "component_usage", "token_usage"])
+    );
+  });
+});
+
+describe("the warning for a blocks field the Page Builder cannot open", () => {
+  it("is said through the plugin's logger when it is installed", () => {
+    // A repeater whose rows declare their own `id` gives its rows no saved
+    // id, so a blocks field in one is the case still warned about.
+    const { ctx } = initContext();
+    Object.assign(ctx.config, {
+      collections: [
+        {
+          slug: "wiring-pages",
+          fields: [
+            {
+              name: "rows",
+              type: "repeater",
+              fields: [
+                { name: "id", type: "text" },
+                { name: "layout", type: "blocks" },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    (pageBuilder().init as (c: unknown) => void)(ctx);
+
+    expect(ctx.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('"rows.layout" on collection "wiring-pages"')
+    );
+  });
+
+  it("adds no setup transformer, which would make every request boot the app", () => {
+    // A plugin with `setup` makes the route boot decision boot for any cold
+    // request it cannot rule out, anonymous scans included, because only
+    // running the transformer could say which routes it adds.
+    expect(pageBuilder().setup).toBeUndefined();
+  });
+});
+
+describe("what one save derives, and writes to each index", () => {
+  /** A document with two nodes, each applying one class. */
+  const twoNodes = {
+    formatVersion: 1,
+    kind: "page",
+    nodes: [
+      { id: "a", type: "core/text", version: 1, props: {}, classes: ["one"] },
+      { id: "b", type: "core/text", version: 1, props: {}, classes: ["two"] },
+    ],
+  };
+
+  /** Drive one save through the plugin's own wiring and collect index writes. */
+  async function savedUnder(
+    options: Parameters<typeof pageBuilder>[0],
+    document: unknown = twoNodes
+  ) {
+    // `maintenanceFor` rather than a positional handler: the phase and
+    // collection are what identify a handler, and selecting by position made
+    // adding any registration silently point this at a different one.
+    const { ctx, maintenanceFor, inserted } = initContext();
+    ctx.services.collections.getCollection = (async () => ({
+      fields: [{ type: "blocks", name: "content" }],
+    })) as never;
+
+    (pageBuilder(options).init as (c: unknown) => void)(ctx);
+
+    await maintenanceFor(
+      "afterCreate",
+      "*"
+    )({
+      collection: "pages",
+      data: { id: "p1" },
+      req: {
+        nextly: {
+          // Both read shapes, so this test does not depend on which one the
+          // reader currently uses: the document read moves from `findByID` to
+          // `find` with a lifecycle filter in a parallel change, and this
+          // assertion is about LIMITS either way.
+          findByID: async () => ({ id: "p1", content: document }),
+          find: async (a: { collection: string }) =>
+            a.collection === "pages"
+              ? {
+                  items: [{ id: "p1", content: document }],
+                  meta: { hasNext: false },
+                }
+              : { items: [], meta: { hasNext: false } },
+        },
+      },
+    });
+    // Scoped to each index's own table. One save maintains both indexes from
+    // one read, so an unscoped collector also catches the component index's
+    // row, whose `classId` is `undefined`, which would read as this wiring
+    // having produced a second, malformed class row.
+    const created = inserted
+      .filter(entry => entry.table === "class_usage")
+      .map(entry => entry.values.classId);
+    const componentRows = inserted
+      .filter(entry => entry.table === "component_usage")
+      .map(entry => ({
+        kind: entry.values.kind,
+        componentId: entry.values.componentId,
+      }));
+    const tokenRows = inserted
+      .filter(entry => entry.table === "token_usage")
+      .map(entry => entry.values.tokenId);
+    return { created, componentRows, tokenRows };
+  }
+
+  it("uses the limits the HOST configured, not the engine defaults", async () => {
+    // A host that lowers `maxNodes` is telling the renderer to draw fewer
+    // nodes. Deriving the index under the defaults would record classes on
+    // nodes the page never draws; deriving under RAISED limits is the
+    // dangerous direction and the same defect mirrored — a class the page does
+    // render would be missing, and read as unused.
+    //
+    // Observed through the undetermined marker, which is what a document that
+    // could not be read whole contributes.
+    const { created } = await savedUnder({
+      limits: { maxDepth: 1, maxNodes: 1, maxBytes: 100_000 },
+    });
+
+    expect(created).toEqual([UNDETERMINED_CLASS_ID]);
+  });
+
+  it("records the real classes when the host configures nothing", async () => {
+    // The control: without it, a wiring that always produced the marker would
+    // satisfy the case above.
+    const { created } = await savedUnder({});
+
+    expect(created).toEqual(["one", "two"]);
+  });
+
+  describe("the variable index, maintained from the same read", () => {
+    const withVariable = {
+      formatVersion: 1,
+      kind: "page",
+      nodes: [
+        {
+          id: "a",
+          type: "core/text",
+          version: 1,
+          props: {},
+          styles: { base: { base: { color: { $token: "color.brand" } } } },
+        },
+        { id: "b", type: "core/text", version: 1, props: {} },
+      ],
+    };
+
+    it("writes a row for a variable the saved page uses", async () => {
+      const { tokenRows } = await savedUnder({}, withVariable);
+
+      expect(tokenRows).toEqual(["color.brand"]);
+    });
+
+    it("writes NO variable row for a page that uses none", async () => {
+      const { tokenRows } = await savedUnder({});
+
+      expect(tokenRows).toEqual([]);
+    });
+
+    it("marks a page it could not read whole, under the host's limits", async () => {
+      const { tokenRows } = await savedUnder(
+        { limits: { maxDepth: 1, maxNodes: 1, maxBytes: 100_000 } },
+        withVariable
+      );
+
+      expect(tokenRows).toEqual([UNDETERMINED_TOKEN_ID]);
+    });
+  });
+
+  describe("the component index, maintained from the same read", () => {
+    const withInstance = {
+      formatVersion: 1,
+      kind: "page",
+      nodes: [
+        { id: "a", type: "core/text", version: 1, props: {}, classes: ["one"] },
+        {
+          id: "i1",
+          type: "nextly/component-instance",
+          version: 1,
+          props: { componentId: "header" },
+        },
+      ],
+    };
+
+    it("writes a row for a component the saved page embeds", async () => {
+      // The feature's own evidence. The class assertions above pass whether or
+      // not a second index exists, so without this the wiring could maintain
+      // nothing and every other test in the file would stay green.
+      const { componentRows } = await savedUnder({}, withInstance);
+
+      expect(componentRows).toEqual([
+        { kind: "reference", componentId: "header" },
+      ]);
+    });
+
+    it("writes NO component row for a page that embeds none", async () => {
+      // The control. Without it, a wiring that wrote a row unconditionally —
+      // recording a reference no document holds — would satisfy the case above.
+      const { componentRows } = await savedUnder({});
+
+      expect(componentRows).toEqual([]);
+    });
+
+    it("marks a page it could not read whole, rather than calling it empty", async () => {
+      // A cap of one node stops the walk before the instance. The row that
+      // records THAT is what stops "could not read" being stored as "references
+      // nothing" — the answer that would let the component be deleted.
+      const { componentRows } = await savedUnder(
+        { limits: { maxDepth: 1, maxNodes: 1, maxBytes: 100_000 } },
+        withInstance
+      );
+
+      expect(componentRows).toEqual([{ kind: "unreadable", componentId: "" }]);
+    });
+  });
+});

@@ -1,0 +1,308 @@
+/**
+ * The four version methods must be reachable through the dispatchers the
+ * catch-all handler uses, since that is the only API surface the admin calls.
+ */
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const listSpy = vi.fn();
+const getSpy = vi.fn();
+const resolveSingleIdSpy = vi.fn();
+
+vi.mock("../versions-methods", async () => {
+  const actual = await vi.importActual<typeof import("../versions-methods")>(
+    "../versions-methods"
+  );
+  return {
+    ...actual,
+    // The dispatchers answer a history page through this one helper; what
+    // they owe it is the document and the request's params.
+    respondVersionPage: (...a: unknown[]) => listSpy(...a),
+    getVersionForDocument: (...a: unknown[]) => getSpy(...a),
+  };
+});
+
+vi.mock("../../../api/versions-access", () => ({
+  assertVersionDocumentReadable: vi.fn(),
+  redactSnapshotForUser: vi.fn(),
+  resolveSingleDocumentId: (...a: unknown[]) => resolveSingleIdSpy(...a),
+}));
+
+import {
+  currentRequestCaller,
+  type RequestCaller,
+} from "../../../auth/caller-scope";
+import {
+  COLLECTION_ENTRY_METHODS,
+  SINGLE_DOCUMENT_METHODS,
+} from "../../../routeHandler";
+import { asCaller, sessionCaller } from "../../__tests__/request-caller";
+import { COLLECTION_VERSION_METHODS } from "../collection-dispatcher";
+import { SINGLE_VERSION_METHODS } from "../single-dispatcher";
+import { parseRestRoute } from "../../../route-handler/route-parser";
+
+describe("version methods are registered", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listSpy.mockResolvedValue({ items: [], meta: { total: 0 } });
+    getSpy.mockResolvedValue({ versionNo: 1 });
+  });
+
+  it("exposes every collection version method", () => {
+    // Pinned as a set so a method cannot be added to the map without also
+    // being registered for authorization, which decides whether it is
+    // permitted as a read or as a write.
+    expect(Object.keys(COLLECTION_VERSION_METHODS).sort()).toEqual([
+      "autosaveEntry",
+      "discardWorkingDraft",
+      "getEntryAutosave",
+      "getEntryVersion",
+      "getEntryVersionDiff",
+      // The entry's content events, read through the same document gate.
+      "listEntryEvents",
+      "listEntryVersions",
+      "markEntryVersionSeen",
+      "restoreEntryVersion",
+      "setEntryVersionLabel",
+      // Brings one language's pending change up to date with the live
+      // shared values.
+      "takeLiveSharedValues",
+    ]);
+  });
+
+  it("exposes every single version method", () => {
+    expect(Object.keys(SINGLE_VERSION_METHODS).sort()).toEqual([
+      "autosaveSingle",
+      // The Single equivalent of the entry list's `discardWorkingDraft`.
+      "discardSingleWorkingDraft",
+      "getSingleAutosave",
+      "getSingleVersion",
+      "getSingleVersionDiff",
+      "listSingleEvents",
+      "listSingleVersions",
+      "markSingleVersionSeen",
+      "restoreSingleVersion",
+      "setSingleVersionLabel",
+      "takeLiveSingleSharedValues",
+    ]);
+  });
+
+  it("authorizes every registered version method against its document", () => {
+    // Read OUT of the dispatcher's own maps rather than restated, so a version
+    // method cannot be registered without also being authorized.
+    //
+    // The consequence of an omission is not a refusal, which is why this is
+    // asserted rather than left to review: a method absent from these sets
+    // skips the per-slug branch in `resolveAuthorization` and falls through to
+    // the definition branch, which demands `manage-settings`. That denies the
+    // editors who hold `update-{slug}` AND admits a caller who holds settings
+    // but no access to the document, so one omission fails open and closed at
+    // once. Nothing in the type system joins the two, so this is the join.
+    const collectionMethods = Object.keys(COLLECTION_VERSION_METHODS);
+    const singleMethods = Object.keys(SINGLE_VERSION_METHODS);
+
+    // A map that went missing would satisfy every assertion below by having
+    // nothing to check, so the population is asserted before the verdict.
+    expect(collectionMethods.length).toBeGreaterThan(0);
+    expect(singleMethods.length).toBeGreaterThan(0);
+
+    for (const method of collectionMethods) {
+      expect(COLLECTION_ENTRY_METHODS).toContain(method);
+    }
+    for (const method of singleMethods) {
+      expect(SINGLE_DOCUMENT_METHODS).toContain(method);
+    }
+  });
+
+  it("passes the collection slug, entry id and caller through", async () => {
+    // The caller is read inside the helper from the request context it runs
+    // in; captured at the call, so a handler that left that context would hand
+    // the helper no one.
+    let seen: RequestCaller | undefined;
+    listSpy.mockImplementation(() => {
+      seen = currentRequestCaller();
+      return Promise.resolve({ items: [], meta: { total: 0 } });
+    });
+    const caller = sessionCaller({ userId: "user-1", roles: ["editor"] });
+
+    await asCaller(caller, () =>
+      COLLECTION_VERSION_METHODS.listEntryVersions.execute(
+        {} as never,
+        { collectionName: "posts", entryId: "e1", limit: "10" },
+        undefined
+      )
+    );
+
+    expect(listSpy).toHaveBeenCalledWith(
+      { scopeKind: "collection", slug: "posts", entryId: "e1" },
+      expect.objectContaining({ limit: "10" })
+    );
+    expect(seen).toBe(caller);
+  });
+
+  it("resolves a Single's entry id from the live row, not from params", async () => {
+    // The Single URL carries no entry id, and trusting a client-supplied one
+    // would defeat the check that stops a recreated Single exposing its
+    // predecessor's snapshots.
+    resolveSingleIdSpy.mockResolvedValue("live-id");
+
+    await SINGLE_VERSION_METHODS.listSingleVersions.execute(
+      {} as never,
+      {
+        slug: "settings",
+        entryId: "attacker-supplied",
+      },
+      undefined
+    );
+
+    expect(resolveSingleIdSpy).toHaveBeenCalledWith("settings");
+    expect(listSpy).toHaveBeenCalledWith(
+      { scopeKind: "single", slug: "settings", entryId: "live-id" },
+      expect.anything()
+    );
+  });
+
+  it("returns not-found for a Single that has never been materialized", async () => {
+    resolveSingleIdSpy.mockResolvedValue(null);
+
+    await expect(
+      SINGLE_VERSION_METHODS.listSingleVersions.execute(
+        {} as never,
+        { slug: "settings" },
+        undefined
+      )
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+    expect(listSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("version methods reach the router", () => {
+  // The sets above pin what the dispatcher exposes. This pins the other half:
+  // a method the router cannot resolve is unreachable however well registered,
+  // and one resolved with the wrong operation is authorized as the wrong thing.
+  it.each([
+    {
+      method: "listEntryVersions",
+      path: ["collections", "posts", "entries", "e1", "versions"],
+      verb: "GET",
+    },
+    {
+      method: "getEntryVersion",
+      path: ["collections", "posts", "entries", "e1", "versions", "2"],
+      verb: "GET",
+    },
+    {
+      method: "restoreEntryVersion",
+      path: [
+        "collections",
+        "posts",
+        "entries",
+        "e1",
+        "versions",
+        "2",
+        "restore",
+      ],
+      verb: "POST",
+    },
+    {
+      method: "setEntryVersionLabel",
+      path: ["collections", "posts", "entries", "e1", "versions", "2"],
+      verb: "PATCH",
+    },
+    {
+      method: "discardWorkingDraft",
+      path: [
+        "collections",
+        "posts",
+        "entries",
+        "e1",
+        "versions",
+        "working-draft",
+      ],
+      verb: "DELETE",
+    },
+    {
+      method: "listSingleVersions",
+      path: ["singles", "settings", "versions"],
+      verb: "GET",
+    },
+    {
+      method: "getSingleVersion",
+      path: ["singles", "settings", "versions", "2"],
+      verb: "GET",
+    },
+    {
+      method: "restoreSingleVersion",
+      path: ["singles", "settings", "versions", "2", "restore"],
+      verb: "POST",
+    },
+    {
+      method: "takeLiveSharedValues",
+      path: [
+        "collections",
+        "posts",
+        "entries",
+        "e1",
+        "versions",
+        "working-draft",
+        "take-live",
+      ],
+      verb: "POST",
+    },
+    {
+      method: "takeLiveSingleSharedValues",
+      path: ["singles", "settings", "versions", "working-draft", "take-live"],
+      verb: "POST",
+    },
+    {
+      method: "setSingleVersionLabel",
+      path: ["singles", "settings", "versions", "2"],
+      verb: "PATCH",
+    },
+  ])("$method is reachable at $verb $path", ({ method, path, verb }) => {
+    expect(parseRestRoute(path, verb).method).toBe(method);
+  });
+
+  it("routes the writes as writes and the reads as reads", () => {
+    const operationFor = (path: string[], verb: string) =>
+      parseRestRoute(path, verb).operation;
+
+    expect(
+      operationFor(
+        ["collections", "posts", "entries", "e1", "versions", "2"],
+        "PATCH"
+      )
+    ).toBe("update");
+    expect(
+      operationFor(["singles", "settings", "versions", "2"], "PATCH")
+    ).toBe("update");
+    // Taking the live values rewrites the pending change: a write.
+    expect(
+      operationFor(
+        [
+          "collections",
+          "posts",
+          "entries",
+          "e1",
+          "versions",
+          "working-draft",
+          "take-live",
+        ],
+        "POST"
+      )
+    ).toBe("update");
+    expect(
+      operationFor(
+        ["singles", "settings", "versions", "working-draft", "take-live"],
+        "POST"
+      )
+    ).toBe("update");
+    // A read of the same version must not be promoted to a write.
+    expect(
+      operationFor(
+        ["collections", "posts", "entries", "e1", "versions", "2"],
+        "GET"
+      )
+    ).not.toBe("update");
+  });
+});

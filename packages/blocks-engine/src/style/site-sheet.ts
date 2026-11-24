@@ -1,0 +1,522 @@
+// The stylesheet a whole site shares, compiled once.
+//
+// A page's own sheet carries what only that page knows: its settings and each node's own values.
+// Everything above that — the design tokens, the self-hosted fonts, the named classes, the block
+// types' defaults — is the same bytes on every page of the site. Inlining it per page repeats it
+// on every request; compiling it once gives one cacheable artifact addressed by its content.
+//
+// The tiers here are emitted by `compilePageCss`, not by a second emitter written beside it. That
+// is the load-bearing choice. The site sheet and a page's sheet have to agree exactly about what
+// a class or a block default looks like — one specificity, one order, one set of bytes — and two
+// emitters agree only until someone edits one of them. Feeding the page compiler a document that
+// uses every type and styles nothing keeps the guarantee structural rather than remembered.
+//
+// @module style/site-sheet
+
+import type {
+  BlockDocument,
+  BlockPart,
+  BreakpointSet,
+  NodeStyles,
+} from "../document";
+import type { ValidationIssue } from "../validation";
+
+import { compilePageCss } from "./compile-page";
+import {
+  COLUMN_FLOW_PROPERTY,
+  CONTAIN_INSET_PROPERTY,
+  FILLS_ROW_PROPERTY,
+  OUT_OF_FLOW_PROPERTY,
+  SIZED_FLAG_PROPERTIES,
+  SIZED_ITEM_PROPERTY,
+} from "./contain-inset";
+import { CONTENT_WIDTH_PROPERTY } from "./content-width";
+import type { MayFetchUrl } from "./css-value";
+import { compileStyleValues, tokenCustomProperty } from "./declarations";
+import type { NamedClass } from "./named-class";
+import { CONTENT_WIDTH_CLASS, hashId, PAGE_ROOT_CLASS } from "./node-class";
+import type { FontFaceDef, SiteToken, SiteTokenSet } from "./site-tokens";
+import {
+  emitFontFaces,
+  emitTokenBlocks,
+  resolveTokenPrefix,
+  tokenIdentity,
+} from "./site-tokens";
+
+/** Everything the shared sheet is built from. All of it is site configuration, not document content. */
+export interface SiteSheetInput {
+  /** The site's design tokens, emitted as custom properties. */
+  tokens?: SiteTokenSet;
+  /** Self-hosted font faces. Remote sources are refused by `validateFontFace`, not here. */
+  fonts?: readonly FontFaceDef[];
+  /** The named-class library, emitted in library order. */
+  classes?: readonly NamedClass[];
+  /** Each block type's default look, keyed by type. */
+  blockBases?: Readonly<Record<string, NodeStyles>>;
+  /** The site's breakpoints, which decide the at-rules every tier is emitted under. */
+  breakpoints: BreakpointSet;
+  /** The custom-property prefix tokens are written under. */
+  tokenPrefix?: string;
+  /**
+   * Which hosts this site will fetch from.
+   *
+   * The class and block-default tiers are emitted VERBATIM into every page of
+   * the site, and a declaration is a fetching surface: one stored
+   * `background-image: url(...)` is a request every visitor of every page
+   * makes. A page's own sheet is compiled with this policy already; without it
+   * here, the two sheets judged the same value differently, and the site sheet
+   * is emitted FIRST — a page sheet that merely omits a declaration cannot
+   * retract one.
+   *
+   * Left undefined, no host question is asked and the compile behaves as it
+   * did before this existed. That is unasked rather than allowed: an empty
+   * allowlist would be the opposite answer.
+   *
+   * No `fetchPolicyId` counterpart, unlike the page compile. That stamp exists
+   * so a reader can tell whether a STORED sheet was compiled under other
+   * rules; this artifact is compiled per render and addressed by the hash of
+   * its own bytes, so a policy that changes what is emitted changes the hash
+   * and cannot be mistaken for the old sheet.
+   */
+  mayFetchUrl?: MayFetchUrl;
+  /**
+   * Emit viewport breakpoints as container queries against this container, for
+   * a surface previewing the page in a resizable box.
+   *
+   * Carried so this tier answers the breakpoint question the same way the page
+   * tier does. See {@link BreakpointContextOptions.previewContainer}.
+   */
+  previewContainer?: string;
+  /**
+   * Emit each interaction state so a previewing surface can force one.
+   *
+   * Carried through for the same reason `previewContainer` is: a named class
+   * and a block-type default are compiled HERE, not with the page, so an editor
+   * that asked the page compile for forceable states and not this one gets a
+   * selected block whose hover appearance comes from a class showing nothing at
+   * all. The tiers split across two sheets; the option must not.
+   */
+  previewStates?: boolean;
+}
+
+/** The shared sheet and the name it is addressed by. */
+export interface SiteSheetArtifact {
+  css: string;
+  /**
+   * A stable name for these exact bytes.
+   *
+   * Same input, same hash, on every machine and every run: it is computed from the emitted CSS
+   * rather than from the inputs, so a change that does not alter a single byte of output does not
+   * invalidate a cache, and one that does cannot fail to.
+   *
+   * Not a cryptographic digest, and not used as one. A collision would serve a stale sheet, which
+   * is a caching fault rather than a safety one, and 53 bits is far past what a site's lifetime
+   * of revisions can reach.
+   */
+  contentHash: string;
+  /** What was left out of the sheet, and why. */
+  warnings: ValidationIssue[];
+}
+
+/**
+ * The selector site tokens are declared on.
+ *
+ * `:root` rather than the page root, because tokens are read by everything on the document —
+ * including admin surfaces and any markup outside a compiled page — and a custom property is
+ * inherited from wherever it is declared. Scoping them to the page root would leave a token
+ * unreadable to anything the compiler did not write.
+ */
+const TOKEN_SELECTOR = ":root";
+
+/**
+ * The token the content-width rule reads.
+ *
+ * Its KIND is no longer checked here. Asking whether a value is a `max-width`
+ * is the compiler's question, and a token-kind check answered a narrower
+ * version of it — a `dimension` may carry a bare identifier the property
+ * refuses.
+ */
+const CONTENT_WIDTH_TOKEN = "content.width";
+
+/** The token that sets the least space beside a contained container's content. */
+const GUTTER_TOKEN = "space.gutter";
+
+/**
+ * Values that are legal for `max-width` and bound nothing.
+ *
+ * `none` says so outright; the CSS-wide keywords resolve to it or to whatever a
+ * cascade decides, which a site stylesheet cannot promise on behalf of a page.
+ */
+const UNBOUNDED_WIDTHS = new Set([
+  "none",
+  // `max-width` is not an inherited property, so `inherit` takes the parent's
+  // computed value — which is `none` unless something up the tree happened to
+  // set one. A site stylesheet cannot promise that, and the failure is the same
+  // as the others here.
+  "inherit",
+  "initial",
+  "unset",
+  "revert",
+  "revert-layer",
+  "auto",
+]);
+
+/**
+ * A document that uses every block type and styles nothing itself.
+ *
+ * `compilePageCss` emits a type's default only for a type present in the document, which is right
+ * for a page and wrong for a site sheet: the sheet is shared, so it carries every default the
+ * caller supplied. One styleless node per type says exactly that, and contributes no rules of its
+ * own — a node with no `styles` and no `visibility` emits nothing.
+ */
+function documentUsingEveryType(
+  blockBases: Readonly<Record<string, NodeStyles>>
+): BlockDocument {
+  return {
+    formatVersion: 1,
+    kind: "page",
+    nodes: Object.keys(blockBases)
+      .sort()
+      .map((type, index) => ({
+        id: `site-sheet-${index}`,
+        type,
+        version: 1,
+        props: {},
+      })),
+  } as unknown as BlockDocument;
+}
+
+/**
+ * The rule behind the content-width class.
+ *
+ * **The box is never narrowed; its content is padded in.** A contained
+ * container stays one element drawn full width, its background included, and
+ * its inline padding brings its content in to the content width:
+ * `max(<gutter>, (100% - <content width>) / 2)` at each side. One element,
+ * because flow, flex and grid all lay out the container's own children, and an
+ * author's selectors and the canvas's marks address that element.
+ *
+ * The inset travels in `--nx-contain-inset`, which this rule sets on a
+ * contained element and to `0px` on every other element of the page. The
+ * engine writes every inline padding as at least that inset
+ * (`withContainInset` in `contain-inset`), so the value an author or a block
+ * default sets replaces the gutter and can widen the inset, but never undoes
+ * the containment. The property is registered as not inherited, and the reset
+ * says the same for a browser that ignores the registration, so a block inside
+ * a contained one is never inset by it. Logical padding, so the inset follows
+ * the writing direction.
+ *
+ * **No fallback width, deliberately.** A site whose token set omits
+ * `content.width` gets no rule at all, which is the same posture the rest of
+ * this compiler takes: what the merged style does not define is omitted rather
+ * than invented. A literal here would hand a site that deliberately removed the
+ * token a width from a place it cannot see.
+ *
+ * **Withheld whole when the width bounds nothing.** An inset computed from a
+ * width that is not one is invalid at computed-value time, and the registered
+ * property then falls to `0px`: harmless, but a rule that contains nothing.
+ * So the rule is written only when the width is usable, and a site without one
+ * gets none of it.
+ *
+ * Wrapped in `:where()` so it weighs nothing. It is a default that must lose to
+ * anything an author states, and zero specificity is what makes that true
+ * without depending on source order.
+ */
+/**
+ * Whether one emitted token can actually bound the content width.
+ *
+ * ONE predicate rather than a list of conditions, and that is the point. The
+ * rule it guards has been reached from five directions — the token absent, the
+ * token refused by the emitter, the right identity with the wrong kind, the
+ * right kind with a value that is not one, and now a value that is a legal
+ * `max-width` yet bounds nothing. Each was patched as its own condition, and a
+ * fifth said the shape was wrong rather than the list incomplete: every one of
+ * them is the same question, which is whether `max-width` will end up with a
+ * usable maximum.
+ *
+ * Asked once, it also covers cases nobody has hit yet. `none` is valid CSS and
+ * removes the bound; `initial`, `unset` and `revert` resolve to `none` or to
+ * whatever a cascade decides, which is not something a site stylesheet can
+ * promise. None of them gives the containment a width to inset the content
+ * to — the case this gate exists to withhold the rule for.
+ */
+function boundsTheContent(token: SiteToken): boolean {
+  if (tokenIdentity(token) !== CONTENT_WIDTH_TOKEN) return false;
+  const values = Object.values(token.values ?? {});
+  if (values.length === 0) return false;
+  return values.every(value => typeof value === "string" && boundsWidth(value));
+}
+
+/**
+ * Whether one value would give `max-width` a usable maximum.
+ *
+ * Two questions with two authorities, rather than one weaker check standing in
+ * for both.
+ *
+ * **Is it a `max-width` at all?** Asked of the COMPILER, by compiling the
+ * declaration and seeing whether one came out. A parallel check here would be a
+ * second statement of the property's grammar, and a narrower one — a token
+ * declared `dimension` may carry a bare identifier like `wide`, which the
+ * token-kind check passes because it cannot know what a dimension may say,
+ * while `max-width` rejects it outright.
+ *
+ * **Does it bound anything?** Asked here, because that is not a grammar
+ * question. `none` is a perfectly valid `max-width` and removes the maximum;
+ * the CSS-wide keywords resolve to it or to whatever a cascade decides, which a
+ * site stylesheet cannot promise on behalf of a page. None of them is a width
+ * the content can be inset to.
+ */
+/** The intrinsic sizing keywords and functions, which no arithmetic takes. */
+const INTRINSIC_SIZE =
+  /(?:^|[^a-z-])(?:min-content|max-content|fit-content|stretch|-webkit-fill-available|-moz-available)(?![a-z-])/;
+
+function boundsWidth(value: string): boolean {
+  const normalised = value.trim().toLowerCase();
+  if (UNBOUNDED_WIDTHS.has(normalised)) return false;
+  // A value that resolves in the browser cannot be judged here at all.
+  // `var(--x, none)` compiles — it is valid CSS — and computes to `none` when
+  // the referenced property is absent, which is the unbounded case arriving
+  // through a door no static check can watch. Refused rather than guessed at,
+  // for the same reason an undefined token is: what the merged style does not
+  // establish is omitted rather than assumed.
+  if (normalised.includes("var(")) return false;
+  // An intrinsic size is a legal `max-width`, but not a length: the inset
+  // subtracts the content width from the box's, and `min-content` or
+  // `fit-content(60rem)` cannot be subtracted, so the inset would be invalid
+  // and the containment silently nothing. Withheld instead, like any width
+  // that bounds nothing here.
+  if (INTRINSIC_SIZE.test(normalised)) return false;
+  const { declarations } = compileStyleValues({ maxWidth: value }, "/maxWidth");
+  return declarations.length > 0;
+}
+
+function emitContentWidth(
+  declaredTokens: readonly SiteToken[],
+  prefix: string | undefined
+): string {
+  // The decision lives here rather than at the call site so the caller pushes
+  // unconditionally: whether this rule applies is a fact about what the token
+  // emitter wrote, and every branch spent asking about it up there is one the
+  // sheet compiler carries for a question it does not own.
+  //
+  // Matched on IDENTITY rather than on the display name, because those are
+  // different fields and the custom property is built from the first. A site
+  // that renames this token keeps the identity and therefore keeps
+  // `--site-content-width`, so a name check would withdraw containment from
+  // every opted-in section while the property it reads was still declared.
+  //
+  // The KIND is part of the question, not decoration. A token carrying this
+  // identity with a colour kind is emitted happily — the emitter's job is to
+  // declare what it was given — and an inset computed from `#ff0000` is
+  // invalid at computed-value time: a rule that contains nothing, arrived at
+  // from a third direction.
+  const declared = declaredTokens.some(boundsTheContent);
+  if (!declared) return "";
+
+  // Resolved through the same function the token emitter uses, not read raw. A
+  // prefix that fails validation is REPLACED with the default there rather than
+  // rejected, so a reference built from the raw value would name a property
+  // nothing declared — silently, because an unresolved custom property
+  // invalidates its declaration instead of reporting.
+  const resolvedPrefix = resolveTokenPrefix(prefix).prefix;
+  const property = tokenCustomProperty(CONTENT_WIDTH_TOKEN, resolvedPrefix);
+  // The least space at each side when nothing sets the padding. Read with a
+  // `0px` fallback: a site that removed the token has no gutter, and an
+  // undeclared custom property would otherwise invalidate the whole padding.
+  const gutter = tokenCustomProperty(GUTTER_TOKEN, resolvedPrefix);
+  const inset = CONTAIN_INSET_PROPERTY;
+  // Anchored to the page root, like every other default this engine emits.
+  // `override-contract.md` states the invariant plainly — "nothing the builder
+  // emits can match outside the page root" — and an unanchored `:where()`
+  // matches anywhere in the document, so a host element or a second rendered
+  // page wearing this class would be constrained by a sheet that is not its
+  // own. One class in the anchor keeps the whole selector at 0-1-0, which is
+  // the weight the contract gives an element or block-type default.
+  const sizedWidth = SIZED_FLAG_PROPERTIES.width;
+  const sizedMax = SIZED_FLAG_PROPERTIES["max-width"];
+  const sizedItem = SIZED_ITEM_PROPERTY;
+  const outOfFlow = OUT_OF_FLOW_PROPERTY;
+  const columnFlow = COLUMN_FLOW_PROPERTY;
+  const fillsRow = FILLS_ROW_PROPERTY;
+  // The width a container states for itself, which the rule reads first.
+  const ownWidth = CONTENT_WIDTH_PROPERTY;
+  return [
+    `@property ${inset}{syntax:"<length-percentage>";inherits:false;initial-value:0px}`,
+    // The flags the page compile sets beside a block's own width and
+    // maximum width: 1 while either sizes the block, 0 otherwise.
+    `@property ${sizedWidth}{syntax:"<number>";inherits:false;initial-value:0}`,
+    `@property ${sizedMax}{syntax:"<number>";inherits:false;initial-value:0}`,
+    // And the flag a parent's flex layout sets on its children.
+    `@property ${sizedItem}{syntax:"<number>";inherits:false;initial-value:0}`,
+    // And the one a block's own position sets: out of the flow, it is no
+    // flex item whatever its parent's layout.
+    `@property ${outOfFlow}{syntax:"<number>";inherits:false;initial-value:0}`,
+    // And the one a parent's flex column sets: its items fill its width.
+    `@property ${columnFlow}{syntax:"<number>";inherits:false;initial-value:0}`,
+    // And the one a block's own `min-width: 100%` sets: it fills the row.
+    `@property ${fillsRow}{syntax:"<number>";inherits:false;initial-value:0}`,
+    // The content width too, set to the site's on every element: a
+    // container's own width is written in its own rule (`content-width`), and
+    // a custom property inherits, so without this a contained block inside a
+    // container with a width of its own would box to that width.
+    `.${PAGE_ROOT_CLASS} :where(*){${inset}:0px;${sizedWidth}:0;${sizedMax}:0;${sizedItem}:0;${outOfFlow}:0;${columnFlow}:0;${fillsRow}:0;${ownWidth}:var(${property})}`,
+    // After the reset and at its weight, so a contained element takes this.
+    // `100%` resolves where the property is used, in the element's own
+    // padding, so it is the width of the box the container is laid out in.
+    // A block an author sized, or a flex item, is narrower than that box, so
+    // its inset is multiplied away; `margin-inline: auto` is 0 on a block that
+    // fills its box and centres a sized one, and an author's own margin
+    // outweighs it.
+    `.${PAGE_ROOT_CLASS} :where(.${CONTENT_WIDTH_CLASS}){${inset}:max(0px, (100% - var(${ownWidth}, var(${property}))) / 2 * (1 - max(var(${sizedWidth}), var(${sizedMax}), var(${sizedItem}) * (1 - var(${outOfFlow})) * (1 - var(${columnFlow})) * (1 - var(${fillsRow})))));padding-inline:max(var(${gutter}, 0px), var(${inset}));margin-inline:auto}`,
+  ].join("\n");
+}
+
+/**
+ * The tiers that do not read `breakpoints`: font faces, tokens, content width.
+ *
+ * Separated because these three are compilable when the site's breakpoints are unknown and the
+ * block-default tier below them is not. `emitTokenBlocks` declares its custom properties under
+ * `:root` and the only at-rule it can reach for is `(prefers-color-scheme:dark)`, which is a
+ * colour-scheme query rather than a width one — so no answer about breakpoints changes a byte of
+ * what this emits. A caller holding only a compiled artifact can therefore still be handed the
+ * declarations that artifact's `var()` references resolve against, which is the whole reason this
+ * boundary is drawn here rather than left inside {@link compileSiteSheet}.
+ */
+function compileBreakpointIndependentTiers(
+  input: Omit<SiteSheetInput, "breakpoints">
+): {
+  blocks: string[];
+  warnings: ValidationIssue[];
+  // Carried out rather than re-derived by the caller: this file resolves the prefix once
+  // precisely so the half that DECLARES `--site-*` and the half that REFERENCES it cannot
+  // disagree, and a second `input.tokenPrefix ?? input.tokens?.prefix` beside it would be the
+  // drift that guard exists to prevent.
+  tokenPrefix: string | undefined;
+} {
+  const warnings: ValidationIssue[] = [];
+  const blocks: string[] = [];
+
+  const fonts = emitFontFaces(input.fonts ?? []);
+  warnings.push(...fonts.issues);
+  if (fonts.css !== "") blocks.push(fonts.css);
+
+  // ONE prefix, used to declare the custom properties and to reference them.
+  //
+  // The two halves read it from different places — `emitTokenBlocks` from the token set, the
+  // style compiler from its context — and a site that set one and not the other declared
+  // `--site-color-primary` while its pages asked for `var(--brand-color-primary)`. Nothing
+  // errors: the reference resolves to nothing and the value silently does not apply. Deriving it
+  // once here is what makes that impossible rather than merely unlikely.
+  const tokenPrefix = input.tokenPrefix ?? input.tokens?.prefix;
+
+  // What the token emitter actually WROTE, carried forward rather than
+  // re-derived. `emitTokenBlocks` refuses a token on five separate conditions
+  // and reports the survivors for exactly this reason: a second statement of
+  // those conditions agrees today and drifts the first time one changes.
+  let declaredTokens: readonly SiteToken[] = [];
+
+  if (input.tokens !== undefined) {
+    const tokens = emitTokenBlocks(
+      {
+        ...input.tokens,
+        ...(tokenPrefix === undefined ? {} : { prefix: tokenPrefix }),
+      },
+      TOKEN_SELECTOR
+    );
+    warnings.push(...tokens.issues);
+    if (tokens.css !== "") blocks.push(tokens.css);
+    declaredTokens = tokens.emitted;
+  }
+
+  // After the tokens that declare the property it reads, and before the block
+  // defaults, which is where a structural rule belongs in this cascade: it must
+  // lose to a block's own default and to everything after it.
+  //
+  // Pushed unconditionally; the rule withholds ITSELF when the width token it
+  // reads is undeclared. The engine's default set carries `content.width`, but
+  // those defaults are layered a tier above this function, so a caller
+  // compiling a set that omits it arrives here with the property undeclared,
+  // and a rule reading a width nothing declares contains nothing.
+  blocks.push(emitContentWidth(declaredTokens, tokenPrefix));
+
+  return { blocks, warnings, tokenPrefix };
+}
+
+/**
+ * Compile the token declarations a stored artifact's `var()` references resolve against.
+ *
+ * For a consumer that compiles a page once, stores the CSS and hands it back: that artifact still
+ * carries every `var(--site-*)` it was compiled with, and a custom property nothing declares makes
+ * its declaration invalid at computed-value time, so the property falls to its INITIAL value
+ * rather than to the site's. The two initial values differ in kind — `background-color` is
+ * `transparent`, `border-color` is `currentColor` — so the omission does not merely mute a block,
+ * it repaints it in the text colour.
+ *
+ * The block-default and named-class tiers are deliberately absent: both are emitted under the
+ * at-rules the site's breakpoints imply, and a caller on this path has stated none.
+ */
+export function compileSiteTokenSheet(
+  input: Omit<SiteSheetInput, "breakpoints">
+): SiteSheetArtifact {
+  const { blocks, warnings } = compileBreakpointIndependentTiers(input);
+  const css = blocks.filter(block => block !== "").join("\n");
+  return { css, contentHash: hashId(css), warnings };
+}
+
+/**
+ * Compile the stylesheet every page of a site shares.
+ *
+ * Order is the cascade, so it is fixed: font faces, then tokens, then the block-type defaults,
+ * then the named classes. A page's own sheet is appended after this one, which is what lets a
+ * node's own value beat a class and a class beat a block default.
+ */
+export function compileSiteSheet(
+  input: SiteSheetInput,
+  /**
+   * The parts of the block types the page draws, keyed by type, as the page's
+   * own sheet reads them. Read only for the root properties a part takes from
+   * a wrapping root, so the classes written here route them as the page sheet
+   * does; no part's defaults are written here. Required, and apart from the
+   * site's inputs, because a sheet compiled without them still succeeds and
+   * styles a wrapped image's box where its picture was meant: `{}` says the
+   * page draws no such part.
+   *
+   * @experimental
+   */
+  parts: Readonly<Record<string, Readonly<Record<string, BlockPart>>>>
+): SiteSheetArtifact {
+  const { blocks, warnings, tokenPrefix } =
+    compileBreakpointIndependentTiers(input);
+
+  const blockBases = input.blockBases ?? {};
+  const tiers = compilePageCss(documentUsingEveryType(blockBases), {
+    breakpoints: input.breakpoints,
+    blockBases,
+    namedClasses: input.classes ?? [],
+    // A class here styles a node's root as the page's own sheet does, so it
+    // routes what a part takes from a wrapping root the same way. The parts'
+    // own defaults stay in the page sheet: this document draws none of them.
+    blockParts: parts,
+    ...(tokenPrefix === undefined ? {} : { tokenPrefix }),
+    ...(input.mayFetchUrl === undefined
+      ? {}
+      : { mayFetchUrl: input.mayFetchUrl }),
+    // The SAME breakpoint emission the page tier uses. Compiled without it, the
+    // shared classes and block defaults answer the published question while the
+    // node-local declarations beside them answer the preview one — so a
+    // container-axis rule from this sheet can match a real authored container
+    // while the node's own rule at that breakpoint is aimed at a name nothing
+    // carries. One document, two answers to one breakpoint.
+    ...(input.previewContainer === undefined
+      ? {}
+      : { previewContainer: input.previewContainer }),
+    ...(input.previewStates === true ? { previewStates: true } : {}),
+  });
+  warnings.push(...tiers.warnings);
+  if (tiers.css !== "") blocks.push(tiers.css);
+
+  // Empty entries are dropped here rather than guarded at each push, so a
+  // section that decides it has nothing to say can simply say nothing.
+  const css = blocks.filter(block => block !== "").join("\n");
+  return { css, contentHash: hashId(css), warnings };
+}

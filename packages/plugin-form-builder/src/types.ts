@@ -1,0 +1,1427 @@
+/**
+ * Form Builder Plugin Types
+ *
+ * Defines configuration options and types for the form builder plugin.
+ *
+ * @packageDocumentation
+ */
+
+import type { CollectionConfig, FieldDefinition, RequestContext } from "nextly";
+import type { ComponentType } from "react";
+
+import type { RedirectRelationships } from "./utils/redirect-target";
+
+// ============================================================
+// Supporting Types
+// ============================================================
+
+/**
+ * Configuration for customizing field block behavior.
+ */
+export interface FieldBlockConfig {
+  /** Default label for this field type */
+  label?: string;
+  /** Default validation settings */
+  validation?: Record<string, unknown>;
+  /** Custom component to use for this field type */
+  component?: ComponentType<unknown>;
+}
+
+/**
+ * Email configuration for notifications.
+ */
+export interface EmailConfig {
+  to: string | string[];
+  from?: string;
+  subject: string;
+  html?: string;
+  text?: string;
+  replyTo?: string;
+  cc?: string | string[];
+  bcc?: string | string[];
+}
+
+/**
+ * @experimental A resolved outgoing form notification (template-based) as built
+ * by the submission handler, before it is sent. This is the value transformed by
+ * the `form-builder.beforeEmail` D63 filter seam.
+ */
+export interface FormEmailNotification {
+  /**
+   * Resolved recipient address, or the addresses of a team notification
+   * that has several. A notification with one recipient keeps a string.
+   */
+  to: string | string[];
+  /** Email template slug to render. */
+  templateSlug: string;
+  /** Template variables (submitted data + form metadata). */
+  variables: Record<string, unknown>;
+  /** Email provider id; undefined = system default. */
+  providerId?: string;
+  /**
+   * Resolved sender address (rule's senderEmail, else the plugin's
+   * defaultFrom); undefined = template/provider default.
+   */
+  from?: string;
+  /** Resolved Reply-To address, if the rule configured one. */
+  replyTo?: string;
+  /** CC addresses, if any. */
+  cc?: string[];
+  /** BCC addresses, if any. */
+  bcc?: string[];
+  /** Source notification id; undefined for filter-injected emails. */
+  notificationId?: string;
+  /**
+   * The files that go with this email, by media id: the notification's own
+   * choice of file fields. Absent on a filter-injected email, which takes the
+   * files of the fields marked to attach to notification emails.
+   */
+  attachments?: Array<{ mediaId: string }>;
+}
+
+/** @experimental Context passed to the `form-builder.beforeEmail` filter seam. */
+export interface BeforeEmailFilterContext {
+  form: Record<string, unknown>;
+  submission: Record<string, unknown>;
+}
+
+/**
+ * A single email notification rule stored on a form.
+ * Matches the shape saved by the form builder admin UI. This is the ONE
+ * notification rule type — the admin context re-exports it rather than
+ * keeping a parallel copy.
+ */
+export interface FormNotification {
+  /** Unique ID for this notification */
+  id: string;
+  /** Display name for this notification rule */
+  name: string;
+  /** Whether this notification is active */
+  enabled: boolean;
+  /** ID of the email provider to use; undefined = system default */
+  providerId?: string;
+  /**
+   * Sender email override. Resolution order at send time:
+   * this value, else the plugin's `notifications.defaultFrom` option, else
+   * the template/provider default.
+   */
+  senderEmail?: string;
+  /**
+   * Which preset the notification started from: one to the team, or a
+   * confirmation to the person who submitted. Absent on rules saved before
+   * presets, which read by their recipient.
+   */
+  kind?: "team" | "visitor";
+  /** How the recipient address is determined */
+  recipientType: "static" | "field";
+  /**
+   * Recipient: static email address or a {{fieldName}} reference. A team
+   * notification with several addresses keeps them in `recipients`; this
+   * then holds the first, for readers that know only one.
+   */
+  to: string;
+  /**
+   * A team notification's addresses. Absent on rules saved before several
+   * were allowed, whose single `to` reads as a list of one.
+   */
+  recipients?: string[];
+  /** CC email addresses */
+  cc: string[];
+  /** BCC email addresses */
+  bcc: string[];
+  /**
+   * Reply-To address: a `{{fieldName}}` reference to one of the form's
+   * email fields (resolved against the submission) or a literal address.
+   */
+  replyTo?: string;
+  /**
+   * Optional send condition evaluated against the submitted data. When set
+   * and unmet, the rule is skipped for that submission. A single condition
+   * covers the common case; the JSON storage leaves room to grow into a
+   * multi-condition tree without a migration.
+   */
+  condition?: ConditionalLogicCondition;
+  /**
+   * Several send conditions: all must hold, or any one. Takes the place of
+   * `condition`, which reads as a list of one under `all` when this is absent.
+   */
+  conditions?: {
+    match: "all" | "any";
+    list: ConditionalLogicCondition[];
+  };
+  /**
+   * The names of the form's file fields whose files go with this email.
+   * Absent on rules saved before it, which attach exactly the file fields
+   * marked to attach to notification emails.
+   */
+  attachFields?: string[];
+  /** Slug of the email template to use */
+  templateSlug?: string;
+}
+
+/**
+ * @deprecated Use {@link FormNotification}. Alias kept so existing imports
+ * keep compiling during the alpha; will be removed before a stable release.
+ */
+export type FormNotificationItem = FormNotification;
+
+/**
+ * Form document structure (stored in database).
+ */
+export interface FormDocument {
+  id: string;
+  slug: string;
+  name: string;
+  fields: AnyFormField[];
+  settings: FormSettings;
+  notifications: FormNotification[];
+  status: "draft" | "published" | "closed";
+  /**
+   * What a closed form tells a visitor who reaches it.
+   *
+   * Optional because the field is only written once an author has a reason to
+   * give, and a row created before it existed has none. A closed form with
+   * nothing here falls back to the generic refusal, which is also what a draft
+   * gets — a draft has never been public, so there is no author intent to
+   * relay.
+   */
+  closedMessage?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/**
+ * Submission document structure (stored in database).
+ */
+export interface SubmissionDocument {
+  id: string;
+  form: string | FormDocument;
+  data: Record<string, unknown>;
+  /**
+   * Where the submission sits in review.
+   *
+   * `spam` is one of them, not a separate flag: the stored field offers it, the
+   * admin has a Spam tab and filters the other views with `not_equals: "spam"`,
+   * the notification hook skips it, and marking something "Not spam" moves it
+   * back to `new`. `spamReason` records WHICH check flagged it.
+   */
+  status: "new" | "read" | "archived" | "spam";
+  ipAddress?: string;
+  userAgent?: string;
+  /** Which spam check flagged this, when one did. */
+  spamReason?: string | null;
+  /**
+   * What it was asked, as the write seam stored it (`utils/asked-fields`):
+   * its fields' labels and option labels at the time. Absent on a
+   * submission stored before submissions kept it.
+   */
+  asked?: unknown;
+  submittedAt: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// ============================================================
+// Plugin Configuration
+// ============================================================
+
+/**
+ * Configuration options for the form builder plugin.
+ */
+/**
+ * Which field types the builder offers, and how each one is customised.
+ *
+ * Declared ONCE and viewed twice: the options surface takes
+ * `Partial<FormFieldToggles>` and the resolved config takes it whole, because
+ * "resolved" means exactly "every toggle now has a value". Written out twice
+ * the two lists agree until someone adds a field type to one of them.
+ */
+export interface FormFieldToggles {
+  text: boolean | Partial<FieldBlockConfig>;
+  email: boolean | Partial<FieldBlockConfig>;
+  number: boolean | Partial<FieldBlockConfig>;
+  phone: boolean | Partial<FieldBlockConfig>;
+  url: boolean | Partial<FieldBlockConfig>;
+  textarea: boolean | Partial<FieldBlockConfig>;
+  select: boolean | Partial<FieldBlockConfig>;
+  checkbox: boolean | Partial<FieldBlockConfig>;
+  radio: boolean | Partial<FieldBlockConfig>;
+  file: boolean | Partial<FieldBlockConfig>;
+  date: boolean | Partial<FieldBlockConfig>;
+  time: boolean | Partial<FieldBlockConfig>;
+  hidden: boolean | Partial<FieldBlockConfig>;
+  consent: boolean | Partial<FieldBlockConfig>;
+}
+
+/** What a host may override on a collection this plugin contributes. */
+export type CollectionOverrides = Partial<CollectionConfig> & {
+  slug?: string;
+  labels?: { singular?: string; plural?: string };
+  /** Fields can be an array or a function receiving defaultFields */
+  fields?:
+    | FieldDefinition[]
+    | ((args: { defaultFields: FieldDefinition[] }) => FieldDefinition[]);
+};
+
+/** The same, once the plugin's defaults have filled in what a host omitted. */
+export type ResolvedCollectionOverrides = {
+  slug: string;
+  labels: { singular: string; plural: string };
+} & Partial<CollectionConfig>;
+
+export interface FormBuilderPluginOptions {
+  /**
+   * Override the default Forms collection configuration.
+   *
+   * Allows customizing the slug, labels, fields, access control, and other
+   * collection options.
+   *
+   * The `fields` option can be:
+   * - An array of fields (merged with defaults)
+   * - A function receiving `{ defaultFields }` for full control
+   *
+   * @example
+   * ```typescript
+   * // Option 1: Array (fields merged with defaults)
+   * formOverrides: {
+   *   slug: 'my-forms',
+   *   labels: { singular: 'My Form', plural: 'My Forms' },
+   *   access: {
+   *     read: () => true,
+   *     // Narrow the permission, never replace it: the role screen still
+   *     // decides who holds `create-my-forms`.
+   *     create: ({ permissions }) =>
+   *       permissions.includes('create-my-forms') && process.env.CONTENT_FREEZE !== 'on',
+   *   },
+   *   fields: [
+   *     text({ name: 'internalNotes', label: 'Internal Notes' }),
+   *   ],
+   * }
+   *
+   * // Option 2: Function (full control over fields)
+   * formOverrides: {
+   *   slug: 'contact-forms',
+   *   access: {
+   *     read: ({ permissions }) => permissions.includes('read-contact-forms'),
+   *     update: () => false,
+   *   },
+   *   fields: ({ defaultFields }) => {
+   *     return [
+   *       ...defaultFields,
+   *       { name: 'custom', type: 'text' },
+   *     ];
+   *   },
+   * }
+   * ```
+   */
+  formOverrides?: CollectionOverrides;
+
+  /**
+   * Override the default Form Submissions collection configuration.
+   *
+   * Allows customizing the slug, labels, fields, access control, and other
+   * collection options.
+   *
+   * The `fields` option can be:
+   * - An array of fields (merged with defaults)
+   * - A function receiving `{ defaultFields }` for full control
+   *
+   * @example
+   * ```typescript
+   * // Option 1: Array (fields merged with defaults)
+   * formSubmissionOverrides: {
+   *   slug: 'my-submissions',
+   *   labels: { singular: 'Response', plural: 'Responses' },
+   *   access: {
+   *     read: ({ permissions }) => permissions.includes('read-my-submissions'),
+   *   },
+   *   fields: [
+   *     select({
+   *       name: 'priority',
+   *       label: 'Priority',
+   *       options: [
+   *         { label: 'Low', value: 'low' },
+   *         { label: 'High', value: 'high' },
+   *       ],
+   *     }),
+   *   ],
+   * }
+   *
+   * // Option 2: Function (full control over fields)
+   * formSubmissionOverrides: {
+   *   fields: ({ defaultFields }) => {
+   *     // Add field after 'form' field
+   *     const formIndex = defaultFields.findIndex(f => f.name === 'form');
+   *     return [
+   *       ...defaultFields.slice(0, formIndex + 1),
+   *       { name: 'source', type: 'text' },
+   *       ...defaultFields.slice(formIndex + 1),
+   *     ];
+   *   },
+   * }
+   * ```
+   */
+  formSubmissionOverrides?: CollectionOverrides;
+
+  /**
+   * Configure which field types are available in the form builder.
+   *
+   * Set to `false` to disable a field type, or provide partial configuration
+   * to customize default behavior.
+   *
+   * @example
+   * ```typescript
+   * fields: {
+   *   // Disable payment field
+   *   payment: false,
+   *
+   *   // Customize text field defaults
+   *   text: {
+   *     maxLength: 500,
+   *   },
+   *
+   *   // Disable file uploads
+   *   file: false,
+   * }
+   * ```
+   */
+  fields?: Partial<FormFieldToggles>;
+
+  /**
+   * Collections whose documents a form may redirect to after submission, and
+   * how each one's documents become URLs.
+   *
+   * The mapping is configuration because it cannot be derived: a site's URL
+   * structure belongs to the site. `{field}` placeholders are filled from the
+   * document; a function covers a path this package cannot express.
+   *
+   * The array shorthand names the collections and takes `/{slug}` for all of
+   * them, which is the routing the page builder ships.
+   *
+   * @example
+   * ```typescript
+   * redirectRelationships: ['pages']
+   *
+   * redirectRelationships: {
+   *   pages: '/{slug}',
+   *   posts: '/blog/{slug}',
+   *   docs: page => `/docs/${String(page.section)}/${String(page.slug)}`,
+   * }
+   * ```
+   */
+  redirectRelationships?: string[] | RedirectRelationships;
+
+  /**
+   * Hook called before sending email notifications.
+   *
+   * Runs as the `form-builder.beforeEmail` D63 filter: the resolved outgoing
+   * notifications (template + recipient + variables) are threaded through this
+   * callback before they are sent. Allows modifying, adding, or filtering the
+   * outgoing notifications. Return the modified array.
+   *
+   * @example
+   * ```typescript
+   * beforeEmail: async ({ emails, form, submission }) => {
+   *   // Add BCC to all outgoing notifications
+   *   return emails.map((e) => ({ ...e, bcc: ['archive@example.com'] }));
+   * }
+   * ```
+   */
+  beforeEmail?: (args: {
+    emails: FormEmailNotification[];
+    form: FormDocument;
+    submission: SubmissionDocument;
+  }) => Promise<FormEmailNotification[]> | FormEmailNotification[];
+
+  /**
+   * Email notification settings.
+   */
+  notifications?: {
+    /**
+     * Default "from" email address.
+     */
+    defaultFrom?: string;
+
+    /**
+     * Default "to" email address for all form submissions.
+     *
+     * If specified, this email will receive all form submissions
+     * regardless of form-specific notification settings.
+     * @example
+     * ```typescript
+     * notifications: {
+     *   defaultToEmail: 'submissions@example.com',
+     * }
+     * ```
+     */
+    defaultToEmail?: string;
+
+    /**
+     * Enable/disable email notifications globally.
+     * @default true
+     */
+    enabled?: boolean;
+  };
+
+  /**
+   * Spam protection configuration.
+   */
+  /**
+   * One response per person.
+   */
+  oneResponse?: {
+    /**
+     * How many earlier submissions a form may have for a change of its
+     * one-response setting to give them their keys inside the save itself,
+     * so the save answers with the form as it then stands. A form with more
+     * is brought up to date by the plugin's background sweep instead, and
+     * until it is, each new submission is compared with the earlier answers.
+     * Lower it to keep saves short on a slow database.
+     * @default 200
+     */
+    keysInSave?: number;
+  };
+
+  spamProtection?: {
+    /**
+     * Enable honeypot field for spam detection.
+     * @default true
+     */
+    honeypot?: boolean;
+
+    /**
+     * Google reCAPTCHA v3: a score for each visitor, in the background.
+     * `enabled` makes it the site default for forms whose bot check is "Site
+     * default". The token is verified on the server with `secretKey`; the
+     * visitor's form renders the widget with `siteKey`.
+     * @default { enabled: false }
+     */
+    recaptcha?: {
+      enabled: boolean;
+      siteKey?: string;
+      secretKey?: string;
+      /** Below this score (0.0 to 1.0) a visitor is a bot. @default 0.5 */
+      scoreThreshold?: number;
+    };
+
+    /**
+     * Cloudflare Turnstile: a check in the background that rarely shows a
+     * puzzle. `enabled` makes it the site default when reCAPTCHA's is not.
+     * @default { enabled: false }
+     */
+    turnstile?: {
+      enabled: boolean;
+      siteKey?: string;
+      secretKey?: string;
+    };
+
+    /**
+     * Rate limiting configuration.
+     */
+    rateLimit?: {
+      /**
+       * Maximum submissions per window.
+       * @default 10
+       */
+      maxSubmissions?: number;
+
+      /**
+       * Time window in milliseconds.
+       * @default 60000 (1 minute)
+       */
+      windowMs?: number;
+    };
+  };
+
+  /**
+   * File upload settings.
+   */
+  uploads?: {
+    /**
+     * Maximum file size in bytes.
+     * @default 10485760 (10MB)
+     */
+    maxFileSize?: number;
+
+    /**
+     * Allowed file types (MIME types).
+     * @default ['image/*', 'application/pdf', 'text/*']
+     */
+    allowedMimeTypes?: string[];
+
+    /**
+     * Collection to store uploaded files.
+     * @default 'media'
+     */
+    uploadCollection?: string;
+  };
+
+  /**
+   * Enable/disable features.
+   */
+  features?: {
+    /**
+     * Enable visual form builder UI.
+     * @default true
+     */
+    builder?: boolean;
+
+    /**
+     * Enable conditional logic.
+     * @default true
+     */
+    conditionalLogic?: boolean;
+
+    /**
+     * Enable file uploads.
+     * @default true
+     */
+    fileUploads?: boolean;
+  };
+}
+
+// ============================================================
+// Form Configuration Types
+// ============================================================
+
+/**
+ * Form configuration interface.
+ * Similar to CollectionConfig but tailored for forms.
+ */
+export interface FormConfig {
+  /**
+   * Unique identifier for the form.
+   */
+  slug: string;
+
+  /**
+   * Display labels for the form.
+   */
+  labels?: {
+    singular?: string;
+    plural?: string;
+  };
+
+  /**
+   * Form fields definition.
+   */
+  fields: AnyFormField[];
+
+  /**
+   * Form settings and behavior.
+   */
+  settings?: FormSettings;
+
+  /**
+   * Email notification configuration.
+   */
+  notifications?: FormNotifications;
+
+  /**
+   * Access control for form submission and viewing.
+   */
+  access?: FormAccess;
+
+  /**
+   * Lifecycle hooks for form submissions.
+   */
+  hooks?: FormHooks;
+
+  /**
+   * Custom metadata.
+   */
+  custom?: Record<string, unknown>;
+}
+
+// ============================================================
+// Form Field Types (Discriminated Union)
+// ============================================================
+
+/**
+ * Form field type (discriminated union).
+ * Uses the `type` property as the discriminant.
+ */
+export type FormField =
+  | TextFormField
+  | EmailFormField
+  | NumberFormField
+  | PhoneFormField
+  | UrlFormField
+  | TextareaFormField
+  | SelectFormField
+  | CheckboxFormField
+  | RadioFormField
+  | FileFormField
+  | DateFormField
+  | TimeFormField
+  | HiddenFormField
+  | ConsentFormField;
+
+/**
+ * A form field of a built-in type OR a plugin-contributed type. Stored form
+ * data and the builder work with this; `isKnownFormField` narrows it back to
+ * the closed `FormField` union so `switch (field.type)` keeps discriminating
+ * the built-ins (a `CustomFormField` in the union itself would collapse that).
+ */
+export type AnyFormField = FormField | CustomFormField;
+
+/**
+ * All available built-in form field type identifiers.
+ */
+export type FormFieldType =
+  | "text"
+  | "email"
+  | "number"
+  | "phone"
+  | "url"
+  | "textarea"
+  | "select"
+  | "checkbox"
+  | "radio"
+  | "file"
+  | "date"
+  | "time"
+  | "hidden"
+  | "consent";
+
+/**
+ * A form field's type on the wire: a built-in or a plugin-contributed type id
+ * that opted into the forms surface. The `(string & {})` arm admits the plugin
+ * id while keeping built-in autocomplete. Built-in `case` narrowing still works
+ * because every field-type switch keeps a `default` for the custom arm.
+ */
+export type FormFieldTypeId = FormFieldType | (string & {});
+
+/** Every built-in form field type, as a value list (the single source shared
+ * by the field-type guard and the config validator). */
+export const BUILT_IN_FORM_FIELD_TYPES: readonly FormFieldType[] = [
+  "text",
+  "email",
+  "number",
+  "phone",
+  "url",
+  "textarea",
+  "select",
+  "checkbox",
+  "radio",
+  "file",
+  "date",
+  "time",
+  "hidden",
+  "consent",
+];
+
+const BUILT_IN_FORM_FIELD_TYPES_SET = new Set<string>(
+  BUILT_IN_FORM_FIELD_TYPES
+);
+
+/**
+ * Narrow an `AnyFormField` to the closed built-in `FormField` union. Returns
+ * `false` for a plugin-contributed field, so callers handle it generically
+ * before switching on the built-in discriminant.
+ */
+export function isKnownFormField(field: AnyFormField): field is FormField {
+  return BUILT_IN_FORM_FIELD_TYPES_SET.has(field.type);
+}
+
+/**
+ * Base form field properties.
+ * All form field types extend this interface.
+ */
+export interface BaseFormField {
+  /** Field type identifier (discriminant) */
+  type: FormFieldType;
+
+  /** Field name (used as key in submission data) */
+  name: string;
+
+  /** Display label */
+  label: string;
+
+  /** Placeholder text */
+  placeholder?: string;
+
+  /** Help text shown below field */
+  helpText?: string;
+
+  /** Default value */
+  defaultValue?: unknown;
+
+  /** Whether field is required */
+  required?: boolean;
+
+  /** Validation rules */
+  validation?: ValidationRules;
+
+  /** Conditional logic configuration */
+  conditionalLogic?: ConditionalLogic;
+
+  /** Admin UI configuration */
+  admin?: {
+    /** CSS classes */
+    className?: string;
+
+    /** Field width */
+    width?: "25%" | "33%" | "50%" | "66%" | "75%" | "100%";
+  };
+}
+
+/**
+ * A plugin-contributed form field type (outside the built-in union). Carries
+ * only the base properties — the plugin owns its editor component and value
+ * semantics — and its `type` is the plugin's registered field-type id. Kept a
+ * distinct union member so built-in `case` narrowing is unaffected while a
+ * plugin field still type-checks as a `FormField`.
+ */
+export interface CustomFormField extends Omit<BaseFormField, "type"> {
+  type: string & {};
+}
+
+/**
+ * Text input field.
+ */
+export interface TextFormField extends Omit<BaseFormField, "type"> {
+  type: "text";
+  defaultValue?: string;
+  validation?: ValidationRules & {
+    minLength?: number;
+    maxLength?: number;
+    pattern?: string;
+  };
+}
+
+/**
+ * Email input field.
+ */
+export interface EmailFormField extends Omit<BaseFormField, "type"> {
+  type: "email";
+  defaultValue?: string;
+  validation?: ValidationRules & {
+    pattern?: string;
+  };
+}
+
+/**
+ * Number input field.
+ */
+export interface NumberFormField extends Omit<BaseFormField, "type"> {
+  type: "number";
+  defaultValue?: number;
+  validation?: ValidationRules & {
+    min?: number;
+    max?: number;
+    step?: number;
+  };
+}
+
+/**
+ * Phone input field.
+ */
+export interface PhoneFormField extends Omit<BaseFormField, "type"> {
+  type: "phone";
+  defaultValue?: string;
+  validation?: ValidationRules & {
+    pattern?: string;
+  };
+}
+
+/**
+ * URL input field.
+ */
+export interface UrlFormField extends Omit<BaseFormField, "type"> {
+  type: "url";
+  defaultValue?: string;
+  validation?: ValidationRules & {
+    pattern?: string;
+  };
+}
+
+/**
+ * Textarea field.
+ */
+export interface TextareaFormField extends Omit<BaseFormField, "type"> {
+  type: "textarea";
+  defaultValue?: string;
+  rows?: number;
+  validation?: ValidationRules & {
+    minLength?: number;
+    maxLength?: number;
+  };
+}
+
+/**
+ * Select dropdown field.
+ */
+export interface SelectFormField extends Omit<BaseFormField, "type"> {
+  type: "select";
+  options: Array<{ label: string; value: string }>;
+  defaultValue?: string | string[];
+  allowMultiple?: boolean;
+}
+
+/**
+ * Single checkbox field.
+ */
+export interface CheckboxFormField extends Omit<BaseFormField, "type"> {
+  type: "checkbox";
+  defaultValue?: boolean;
+}
+
+/**
+ * Radio group field.
+ */
+export interface RadioFormField extends Omit<BaseFormField, "type"> {
+  type: "radio";
+  options: Array<{ label: string; value: string }>;
+  defaultValue?: string;
+}
+
+/**
+ * File upload field.
+ */
+export interface FileFormField extends Omit<BaseFormField, "type"> {
+  type: "file";
+  accept?: string; // MIME types
+  multiple?: boolean;
+  maxFileSize?: number; // bytes
+  /**
+   * When true, files uploaded through this field are attached to all
+   * notification emails for this form. Default false.
+   */
+  attachToEmail?: boolean;
+}
+
+/**
+ * Date picker field.
+ */
+export interface DateFormField extends Omit<BaseFormField, "type"> {
+  type: "date";
+  defaultValue?: string; // ISO date string
+  min?: string; // ISO date
+  max?: string; // ISO date
+}
+
+/**
+ * Time picker field.
+ */
+export interface TimeFormField extends Omit<BaseFormField, "type"> {
+  type: "time";
+  defaultValue?: string; // HH:mm format
+}
+
+/**
+ * Hidden field.
+ */
+export interface HiddenFormField extends Omit<BaseFormField, "type"> {
+  type: "hidden";
+  defaultValue?: string;
+}
+
+/**
+ * A box the visitor ticks to agree to a text, such as a privacy policy. It is
+ * always required, and its answer keeps the text the visitor was shown, so a
+ * later change to the text does not change what an earlier visitor agreed to.
+ */
+export interface ConsentFormField extends Omit<BaseFormField, "type"> {
+  type: "consent";
+  /** What the visitor agrees to, shown beside the box and stored with it. */
+  agreementText: string;
+}
+
+/**
+ * A consent field's stored answer: whether the visitor agreed, and the text
+ * the form showed them. Made by the server from the form, never taken from
+ * the visitor, and never changed by an edit of the submission.
+ */
+export interface ConsentAnswer {
+  agreed: boolean;
+  text: string;
+}
+
+// ============================================================
+// Validation Types
+// ============================================================
+
+/**
+ * Validation rules for form fields.
+ */
+/**
+ * Turn a union of object types into their intersection.
+ *
+ * The standard conditional-type idiom: distributing the union into contravariant
+ * positions makes the compiler infer the intersection that satisfies all of them.
+ */
+type UnionToIntersection<U> = (
+  U extends unknown ? (k: U) => void : never
+) extends (k: infer I) => void
+  ? I
+  : never;
+
+/**
+ * Every validation key any form field type may carry, each optional.
+ *
+ * For surfaces that read validation ACROSS field types rather than inside one —
+ * a shared rules editor cannot narrow to `TextFormField` without becoming the
+ * per-type branching it exists to remove.
+ *
+ * DERIVED from the field union rather than restated. A field type that declares
+ * a new rule becomes readable here with nobody remembering to add it, and a rule
+ * removed there stops compiling here. A hand-kept list would agree on the day it
+ * was written and drift after, silently, because both would look correct.
+ */
+export type AnyFieldValidation = Partial<
+  UnionToIntersection<NonNullable<FormField["validation"]>>
+>;
+
+export interface ValidationRules {
+  /** Custom error message */
+  errorMessage?: string;
+
+  /** Custom validation function */
+  validate?: (
+    value: unknown,
+    formData: Record<string, unknown>
+  ) => boolean | string | Promise<boolean | string>;
+}
+
+// ============================================================
+// Conditional Logic Types
+// ============================================================
+
+/**
+ * Conditional logic configuration.
+ */
+export interface ConditionalLogic {
+  /** Whether conditional logic is enabled */
+  enabled: boolean;
+
+  /** Action to perform when conditions are met */
+  action: "show" | "hide";
+
+  /** Logical operator for multiple conditions */
+  operator: "AND" | "OR";
+
+  /** Conditions to evaluate */
+  conditions: ConditionalLogicCondition[];
+}
+
+/**
+ * A single conditional logic condition.
+ */
+export interface ConditionalLogicCondition {
+  /** Field name to check */
+  field: string;
+
+  /** Comparison operator */
+  comparison:
+    | "equals"
+    | "notEquals"
+    | "contains"
+    | "isEmpty"
+    | "isNotEmpty"
+    | "greaterThan"
+    | "lessThan";
+
+  /** Value to compare against (not used for isEmpty/isNotEmpty) */
+  value?: unknown;
+}
+
+// ============================================================
+// Form Settings Types
+// ============================================================
+
+/** How a form tells one person's response from another's. */
+export type OneResponseMode = "off" | "email" | "browser" | "ip";
+
+/** Which bot check a form asks for. */
+export type BotCheckMode = "default" | "off" | "recaptcha" | "turnstile";
+
+/**
+ * Form settings and behavior.
+ */
+export interface FormSettings {
+  /** Submit button text */
+  submitButtonText?: string;
+
+  /**
+   * Confirmation type after successful submission.
+   * - "message": Display a success message
+   * - "redirect": Redirect to a URL
+   * - "relationship": Redirect to a linked document (requires
+   *   `redirectRelationships` in the plugin options)
+   *
+   * @default "message"
+   */
+  confirmationType?: "message" | "redirect" | "relationship";
+
+  /**
+   * Linked document for relationship-based redirects (the collection's
+   * `redirectPage` relationship value). Preserved verbatim — resolution
+   * happens where the relationship is rendered.
+   */
+  redirectPage?: unknown;
+
+  /** Success message (supports HTML) - used when confirmationType is "message" */
+  successMessage?: string;
+
+  /** Redirect URL after successful submission - used when confirmationType is "redirect" */
+  redirectUrl?: string;
+
+  /**
+   * Relationship to redirect document - used when confirmationType is "redirect"
+   * and redirectRelationships are configured in plugin options.
+   */
+  redirectRelation?: {
+    relationTo: string;
+    value: string; // Document ID
+  };
+
+  /**
+   * Allow multiple submissions from same IP (default true).
+   * @deprecated Read as `oneResponse` (true is `"off"`, false is `"ip"`);
+   * no longer written.
+   */
+  allowMultipleSubmissions?: boolean;
+
+  /**
+   * One response per person, and how a person is told apart: `"off"` allows
+   * several; `"email"` by the answer to `oneResponseField`, `"browser"` by a
+   * token the browser keeps, `"ip"` by network address.
+   *
+   * @default "off"
+   */
+  oneResponse?: OneResponseMode;
+
+  /** The email field `oneResponse: "email"` reads, by name. */
+  oneResponseField?: string;
+
+  /**
+   * Which run of one-response checks the form is on: a whole number from 0,
+   * moved on when the mode changes so earlier responses count afresh.
+   *
+   * @default 0
+   */
+  oneResponseVersion?: number;
+
+  /**
+   * The one-response version whose earlier submissions all carry their keys.
+   * Behind `oneResponseVersion` while the plugin is still making them, after
+   * a change of mode or Email field; unset reads as up to date. Written by
+   * the plugin only.
+   */
+  oneResponseKeyedVersion?: number;
+
+  /**
+   * The bot check: `"default"` follows the plugin's option, `"off"` none, or
+   * a named provider.
+   *
+   * @default "default"
+   */
+  botCheck?: BotCheckMode;
+
+  /** When the form stops taking submissions, as an ISO date and time. */
+  closesAt?: string;
+
+  /** How many submissions the form takes before it closes; none for no limit. */
+  submissionLimit?: number;
+
+  /**
+   * Whether a submission keeps the visitor's IP address and browser.
+   *
+   * @default true
+   */
+  storeIpAndBrowser?: boolean;
+
+  /** How many days submissions are kept; none to keep them. */
+  keepDays?: number;
+
+  /** A note about the form, for people in the admin only. */
+  internalNote?: string;
+
+  /**
+   * Per-form honeypot override. Unset inherits the plugin's
+   * `spamProtection.honeypot`; the form wins where set.
+   */
+  honeypotEnabled?: boolean;
+
+  /**
+   * Per-form reCAPTCHA override. Unset inherits the plugin's
+   * `spamProtection.recaptcha.enabled`; the form wins where set.
+   * @deprecated Read as `botCheck` (unset is `"default"`, true
+   * `"recaptcha"`, false `"off"`); no longer written.
+   */
+  captchaEnabled?: boolean;
+
+  /** reCAPTCHA site key (client-facing) when captcha is enabled per-form */
+  captchaSiteKey?: string;
+}
+
+// ============================================================
+// Notification Types
+// ============================================================
+
+/**
+ * Email notification configuration for a form.
+ */
+export interface FormNotifications {
+  /** Enable email notifications */
+  enabled: boolean;
+
+  /** Recipient email addresses */
+  recipients: Array<{
+    email: string;
+    name?: string;
+  }>;
+
+  /** Email subject line */
+  subject?: string;
+
+  /** Use submitter's email as reply-to */
+  replyTo?: boolean;
+
+  /** Custom email template */
+  template?: string; // HTML template
+}
+
+// ============================================================
+// Access Control Types
+// ============================================================
+
+/**
+ * Form access control.
+ */
+export interface FormAccess {
+  /** Who can submit the form */
+  submit?: (context: { req: RequestContext }) => boolean | Promise<boolean>;
+
+  /** Who can view submissions */
+  read?: (context: { req: RequestContext }) => boolean | Promise<boolean>;
+}
+
+// ============================================================
+// Hook Types
+// ============================================================
+
+/**
+ * Form lifecycle hooks.
+ */
+export interface FormHooks {
+  /** Before submission validation */
+  beforeValidate?: Array<(context: FormHookContext) => void | Promise<void>>;
+
+  /** Before submission is saved */
+  beforeSubmit?: Array<(context: FormHookContext) => void | Promise<void>>;
+
+  /** After submission is saved */
+  afterSubmit?: Array<(context: FormHookContext) => void | Promise<void>>;
+}
+
+/**
+ * Hook context for form hooks.
+ */
+export interface FormHookContext {
+  /** Form configuration */
+  form: FormConfig;
+
+  /** Submission data */
+  data: Record<string, unknown>;
+
+  /** Request context */
+  req: RequestContext;
+
+  /** Submission metadata */
+  metadata?: {
+    ipAddress?: string;
+    userAgent?: string;
+  };
+}
+
+// ============================================================
+// Submission Types
+// ============================================================
+
+/**
+ * Form submission data structure.
+ */
+export interface FormSubmission {
+  /** Submission ID */
+  id: string;
+
+  /** Form slug */
+  formSlug: string;
+
+  /** Submission data (JSON) */
+  data: Record<string, unknown>;
+
+  /**
+   * Submission status.
+   *
+   * `spam` is one of them, not a separate flag: the stored field offers it, the
+   * admin has a Spam tab and filters its other views with `not_equals: "spam"`,
+   * and marking something "Not spam" moves it back to `new`.
+   */
+  status: "new" | "read" | "archived" | "spam";
+
+  /** Which spam check flagged this, when one did. */
+  spamReason?: string | null;
+
+  /** Internal notes (admin only) */
+  notes?: string;
+
+  /** Metadata */
+  ipAddress?: string;
+  userAgent?: string;
+  submittedAt: Date;
+
+  /** Created/updated timestamps */
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// ============================================================
+// Resolved Configuration Types (Internal)
+// ============================================================
+
+/**
+ * Resolved form builder configuration after applying defaults.
+ * Used internally by the plugin.
+ */
+export interface ResolvedFormBuilderConfig {
+  formOverrides: ResolvedCollectionOverrides;
+
+  formSubmissionOverrides: ResolvedCollectionOverrides;
+
+  fields: FormFieldToggles;
+
+  /**
+   * The collection-to-URL map, with the array shorthand already expanded.
+   *
+   * ONE shape, so nothing downstream branches on which spelling was written.
+   * The list of redirect collections is `Object.keys` of this rather than a
+   * second field beside it, which would agree with it today and drift later.
+   */
+  redirectRelationships: RedirectRelationships;
+
+  /**
+   * Whether each redirect target collection is localized, keyed by slug.
+   *
+   * Resolved at `init` from the collection's own declaration rather than
+   * asked for in options, because the collection already declares it and a
+   * second declaration drifts: the configuration's for a collection code
+   * declares, the registry row's for one made in the Schema Builder.
+   *
+   * It decides whether a target's main-row `status` answers for the document:
+   * a localized collection publishes on a locale companion, so the row reads
+   * `draft` while a translation is public. A slug missing here is a collection
+   * whose metadata could not be read — undefined, not false, because reading
+   * an unknown as "not localized" is what marks a reachable translation as a
+   * draft.
+   */
+  redirectTargetLocalization: Record<string, boolean>;
+
+  beforeEmail?: FormBuilderPluginOptions["beforeEmail"];
+
+  notifications: {
+    defaultFrom?: string;
+    defaultToEmail?: string;
+    enabled: boolean;
+  };
+
+  /** `FormBuilderPluginOptions["oneResponse"]`, every option filled. */
+  oneResponse: Required<NonNullable<FormBuilderPluginOptions["oneResponse"]>>;
+
+  spamProtection: {
+    honeypot: boolean;
+    recaptcha?: {
+      enabled: boolean;
+      siteKey?: string;
+      secretKey?: string;
+      scoreThreshold?: number;
+    };
+    turnstile?: {
+      enabled: boolean;
+      siteKey?: string;
+      secretKey?: string;
+    };
+    rateLimit?: {
+      maxSubmissions: number;
+      windowMs: number;
+    };
+  };
+
+  uploads: {
+    maxFileSize: number;
+    allowedMimeTypes: string[];
+    uploadCollection: string;
+  };
+
+  features: {
+    builder: boolean;
+    conditionalLogic: boolean;
+    fileUploads: boolean;
+  };
+}
+
+// ============================================================
+// Type Guards
+// ============================================================
+
+/**
+ * Check if a value is a FormField.
+ */
+export function isFormField(value: unknown): value is FormField {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "type" in value &&
+    "name" in value &&
+    "label" in value
+  );
+}
+
+/**
+ * Check if a FormField is a specific type.
+ */
+export function isFormFieldType<T extends FormField>(
+  field: FormField,
+  type: T["type"]
+): field is T {
+  return field.type === type;
+}
+
+/**
+ * Type guard for text field.
+ */
+export function isTextFormField(field: FormField): field is TextFormField {
+  return field.type === "text";
+}
+
+/**
+ * Type guard for email field.
+ */
+export function isEmailFormField(field: FormField): field is EmailFormField {
+  return field.type === "email";
+}
+
+/**
+ * Type guard for select field.
+ */
+export function isSelectFormField(field: FormField): field is SelectFormField {
+  return field.type === "select";
+}
+
+/**
+ * Type guard for checkbox field.
+ */
+export function isCheckboxFormField(
+  field: FormField
+): field is CheckboxFormField {
+  return field.type === "checkbox";
+}
+
+/**
+ * Type guard for file field.
+ */
+export function isFileFormField(field: FormField): field is FileFormField {
+  return field.type === "file";
+}

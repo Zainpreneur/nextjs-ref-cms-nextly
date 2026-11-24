@@ -1,0 +1,698 @@
+/**
+ * Vercel Blob Storage Adapter
+ *
+ * Stores files on Vercel Blob Storage, a globally distributed object storage
+ * service powered by Cloudflare R2. Optimized for Vercel deployments with
+ * built-in CDN distribution.
+ *
+ * Features:
+ * - Globally distributed CDN-backed storage
+ * - Automatic file management with unique filenames
+ * - Token-based authentication
+ * - Client-side upload support (via handleUpload API)
+ * - Serverless-friendly (no filesystem access required)
+ *
+ * @example Basic usage
+ * ```typescript
+ * const adapter = new VercelBlobStorageAdapter({
+ *   token: process.env.BLOB_READ_WRITE_TOKEN,
+ *   collections: { media: true }
+ * });
+ *
+ * const result = await adapter.upload(buffer, {
+ *   filename: 'photo.jpg',
+ *   mimeType: 'image/jpeg'
+ * });
+ * // result.url: "https://abc123.public.blob.vercel-storage.com/photo-xyz.jpg"
+ * ```
+ */
+
+import { put, del, head, list, BlobNotFoundError } from "@vercel/blob";
+import { NextlyError } from "nextly/errors";
+import type {
+  IStorageAdapter,
+  UploadOptions,
+  UploadResult,
+  StorageAdapterInfo,
+  ClientUploadData,
+  FileMetadata,
+  BulkDeleteResult,
+  StorageReadOptions,
+  StoredFileEntry,
+} from "nextly/storage";
+import {
+  fetchStoredBytes,
+  DEFAULT_READ_TIMEOUT_MS,
+} from "nextly/storage/fetch-stored-bytes";
+
+import type {
+  VercelBlobStorageConfig,
+  ResolvedVercelBlobConfig,
+} from "./types";
+
+/**
+ * The host this store's blobs are served from, `<store id>.<access>.blob.vercel-storage.com`,
+ * from the store id a read-write token carries (`vercel_blob_rw_<store id>_<secret>`).
+ * Hosts are lowercase, as the store's own blob URLs are. `undefined` for a
+ * token naming no store.
+ */
+function blobStoreHost(token: string, access: string): string | undefined {
+  const [prefix, kind, mode, storeId] = token.split("_");
+  if (prefix !== "vercel" || kind !== "blob" || !mode || !storeId) {
+    return undefined;
+  }
+  if (!/^[a-z0-9]+$/i.test(storeId)) return undefined;
+  return `${storeId.toLowerCase()}.${access}.blob.vercel-storage.com`;
+}
+
+// ============================================================
+// Vercel Blob Storage Adapter
+// ============================================================
+
+/**
+ * Vercel Blob Storage Adapter
+ *
+ * Implements the IStorageAdapter interface for Vercel Blob Storage.
+ * Provides file upload, deletion, existence checks, and metadata retrieval.
+ */
+export class VercelBlobStorageAdapter implements IStorageAdapter {
+  private resolvedConfig: ResolvedVercelBlobConfig;
+
+  /**
+   * Create a new Vercel Blob storage adapter.
+   *
+   * The token is deliberately NOT checked here. This constructor runs while
+   * the host's config file is evaluated, so a throw would stop every command
+   * — including the schema-only ones that never touch storage. The check
+   * moves to the first storage operation ({@link ensureToken}), which refuses
+   * with the same message a missing token has always produced.
+   *
+   * @param config - Vercel Blob storage configuration
+   */
+  constructor(private config: VercelBlobStorageConfig) {
+    // Resolve config with defaults. The token is stored unresolved when the
+    // config omits it and picked up from the environment at first use.
+    this.resolvedConfig = {
+      token: config.token || "",
+      addRandomSuffix: config.addRandomSuffix ?? true,
+      cacheControlMaxAge: config.cacheControlMaxAge ?? 31536000,
+      access: config.access ?? "public",
+      storeId: config.storeId,
+      allowOverwrite: config.allowOverwrite ?? false,
+      multipartThreshold: config.multipartThreshold ?? 5 * 1024 * 1024, // 5MB
+    };
+  }
+
+  /**
+   * Resolve the storage token, refusing at the first use that needs it.
+   *
+   * A token already resolved — from the config at construction, or from the
+   * environment on an earlier call — is returned as is. An unresolved one is
+   * read from the config and then the environment, and a refusal here is the
+   * same one the constructor used to throw: the operator is told which
+   * variable to set, at the moment the credential was actually needed.
+   *
+   * @throws Error if token is not provided
+   */
+  private ensureToken(): string {
+    if (this.resolvedConfig.token) return this.resolvedConfig.token;
+
+    const token = this.config.token || process.env.BLOB_READ_WRITE_TOKEN || "";
+    if (!token) {
+      throw new Error(
+        "@nextly/storage-vercel-blob: token is required.\n\n" +
+          "Either set the BLOB_READ_WRITE_TOKEN environment variable or pass token in config.\n" +
+          "Get your token from: Vercel Dashboard > Storage > Blob > Tokens"
+      );
+    }
+
+    this.resolvedConfig.token = token;
+    return token;
+  }
+
+  // ============================================================
+  // Core IStorageAdapter Methods
+  // ============================================================
+
+  /**
+   * Upload file to Vercel Blob.
+   *
+   * Files are stored with globally distributed CDN backing.
+   * By default, a random suffix is added to prevent filename collisions.
+   *
+   * @param buffer - File content as Buffer
+   * @param options - Upload options (filename, mimeType, folder, collection)
+   * @returns Upload result with URL and storage path
+   */
+  async upload(buffer: Buffer, options: UploadOptions): Promise<UploadResult> {
+    const mimeType = (options.contentType || options.mimeType || "")
+      .toLowerCase()
+      .trim();
+    const filename = (options.filename || "").toLowerCase();
+    const ext = filename.includes(".")
+      ? filename.slice(filename.lastIndexOf(".") + 1)
+      : "";
+    const isHtml =
+      mimeType === "text/html" ||
+      mimeType === "application/xhtml+xml" ||
+      ext === "html" ||
+      ext === "htm" ||
+      ext === "xhtml";
+    // HTML stays unconditionally rejected. The `downloadUrl` trick that
+    // makes SVG safe (see below) doesn't help HTML — a downloaded HTML
+    // file is still a usable XSS vector when opened from disk, and
+    // Vercel Blob has no equivalent of `Content-Security-Policy` to
+    // defang it.
+    if (isHtml) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path: "file",
+            code: "UNSUPPORTED_FOR_BACKEND",
+            message:
+              "HTML files cannot be hosted on Vercel Blob. Use the S3 or R2 adapter, or upload as another format.",
+          },
+        ],
+        logContext: {
+          adapter: "vercel-blob",
+          claimedMimeType: options.mimeType,
+          reason: "vercel-blob-rejects-html",
+          filename: options.filename,
+        },
+      });
+    }
+
+    const isSvg =
+      mimeType === "image/svg+xml" || ext === "svg" || ext === "svgz";
+
+    const pathname = this.buildPathname(options.filename, options.folder);
+
+    const result = await put(pathname, buffer, {
+      access: this.resolvedConfig.access,
+      token: this.ensureToken(),
+      contentType: options.contentType || options.mimeType,
+      addRandomSuffix: this.resolvedConfig.addRandomSuffix,
+      cacheControlMaxAge: this.resolvedConfig.cacheControlMaxAge,
+    });
+
+    // SVGs are served via Vercel Blob's `downloadUrl` (the same URL with
+    // `?download=1` appended) so direct top-level navigation forces an
+    // attachment download instead of rendering. `<img src>` ignores the
+    // `Content-Disposition` header, so legitimate inline rendering still
+    // works. The `@vercel/blob` SDK has no `contentDisposition` input
+    // option on `put()`, so this query-param-driven approach is the
+    // supported mechanism. Caller is responsible for sanitizing SVG
+    // contents upstream (handled by `upload-validation`).
+    const url =
+      isSvg && options.contentDisposition === "attachment"
+        ? result.downloadUrl
+        : result.url;
+
+    return {
+      url,
+      path: result.url,
+    };
+  }
+
+  /**
+   * Write bytes at exactly the blob `filePath` names, beside one already in
+   * the store.
+   *
+   * A stored path here is the blob's full URL, so `filePath` is one too: a
+   * stored blob's URL with a suffix core derived from it, for a file made from
+   * that blob, such as a resized copy of an image. Written under that URL's
+   * pathname with no random suffix, so the blob's URL is the key it was asked
+   * for and the next read finds it; overwriting is allowed, since two requests
+   * may make the same copy at once and write the same bytes.
+   *
+   * A key on any host but this store's is refused before anything is
+   * written, so core keeps no copy of it and serves the original. Writes go
+   * to the token's store whatever host the key names, so a key on another
+   * store's host, as an item moved from another store has, would otherwise
+   * be written where its next read never looks.
+   *
+   * @experimental
+   */
+  async uploadAt(
+    filePath: string,
+    buffer: Buffer,
+    options: { mimeType: string }
+  ): Promise<UploadResult> {
+    const token = this.ensureToken();
+    const located = URL.canParse(filePath) ? new URL(filePath) : undefined;
+    const storeHost = blobStoreHost(token, this.resolvedConfig.access);
+    if (
+      located === undefined ||
+      located.protocol !== "https:" ||
+      storeHost === undefined ||
+      located.hostname !== storeHost
+    ) {
+      throw NextlyError.internal({
+        logContext: {
+          adapter: "vercel-blob",
+          reason: "upload-at-key-not-in-this-store",
+        },
+      });
+    }
+    const result = await put(
+      decodeURIComponent(located.pathname.replace(/^\/+/, "")),
+      buffer,
+      {
+        access: this.resolvedConfig.access,
+        token,
+        contentType: options.mimeType,
+        addRandomSuffix: false,
+        allowOverwrite: true,
+        cacheControlMaxAge: this.resolvedConfig.cacheControlMaxAge,
+      }
+    );
+    return { url: result.url, path: result.url };
+  }
+
+  /**
+   * Delete file from Vercel Blob.
+   *
+   * @param filePath - Full blob URL to delete
+   */
+  async delete(filePath: string): Promise<void> {
+    await del(filePath, {
+      token: this.ensureToken(),
+    });
+  }
+
+  /**
+   * Delete multiple files from Vercel Blob in chunked batches.
+   *
+   * Processes deletions in chunks of 10 concurrent calls using Promise.allSettled,
+   * collecting successes and failures without short-circuiting.
+   *
+   * @param filePaths - Array of full blob URLs to delete
+   * @returns BulkDeleteResult with successful and failed arrays
+   */
+  async bulkDelete(filePaths: string[]): Promise<BulkDeleteResult> {
+    const successful: string[] = [];
+    const failed: Array<{ filePath: string; error: string }> = [];
+    const chunkSize = 10;
+
+    for (let i = 0; i < filePaths.length; i += chunkSize) {
+      const chunk = filePaths.slice(i, i + chunkSize);
+      const results = await Promise.allSettled(
+        chunk.map(fp => del(fp, { token: this.ensureToken() }))
+      );
+
+      results.forEach((result, idx) => {
+        const fp = chunk[idx];
+        if (result.status === "fulfilled") {
+          successful.push(fp);
+        } else {
+          failed.push({
+            filePath: fp,
+            error:
+              result.reason instanceof Error
+                ? result.reason.message
+                : String(result.reason),
+          });
+        }
+      });
+    }
+
+    return { successful, failed };
+  }
+
+  /**
+   * Check if file exists in Vercel Blob.
+   *
+   * Uses the head() function which is efficient for existence checks.
+   *
+   * @param filePath - Full blob URL to check
+   * @returns true if file exists, false otherwise
+   */
+  async exists(filePath: string): Promise<boolean> {
+    // Resolved BEFORE the not-found catch, which answers "the blob is not
+    // there" for lookup failures: a missing credential is a configuration
+    // error, and the refusal must escape rather than be reported as that
+    // answer.
+    const token = this.ensureToken();
+    try {
+      await head(filePath, {
+        token,
+      });
+      return true;
+    } catch {
+      // Vercel Blob throws an error if the blob doesn't exist
+      return false;
+    }
+  }
+
+  /**
+   * Read a stored blob back as bytes, or `null` when it is not there.
+   *
+   * A NETWORK round trip, unlike the local adapter's disk read, because the
+   * bytes live on Vercel's CDN and there is no other way to reach them. That
+   * cost is the reason a caller serving these from its own origin has to cache:
+   * the privacy rule that forces same-origin serving does not also make the
+   * fetch free, and an uncached proxy pays it on every request.
+   *
+   * The URL is taken from `head` rather than assembled from `filePath`,
+   * because a blob's address is issued by the service — it carries a random
+   * suffix this adapter never chose — so deriving one here would be guessing at
+   * a string another system owns.
+   *
+   * `null` for a missing blob rather than a throw, matching {@link exists}.
+   *
+   * @param filePath - Blob path/key
+   * @returns The blob's bytes, or `null` when it does not exist
+   */
+  async read(
+    filePath: string,
+    options?: StorageReadOptions
+  ): Promise<Buffer | null> {
+    /*
+     * ONE deadline for both phases, started before the lookup.
+     *
+     * `head` can stall exactly as the fetch can, and it runs first — so a
+     * deadline that begins only at the fetch leaves the lookup unbounded and
+     * the read can outlive what the caller was promised. Created here and
+     * handed to both.
+     *
+     * ALWAYS, not only when the caller named a timeout. `safeFetch` applies a
+     * default deadline of its own, so a caller stating none was still bounded
+     * for the fetch and unbounded for the lookup — which is the commonest call,
+     * the email path among them, since it supplies only a byte cap. The default
+     * comes from the same constant `safeFetch` uses rather than being restated.
+     */
+    const deadline = AbortSignal.timeout(
+      options?.timeoutMs ?? DEFAULT_READ_TIMEOUT_MS
+    );
+
+    let target: string;
+    try {
+      const meta = await head(filePath, {
+        token: this.ensureToken(),
+        abortSignal: deadline,
+      });
+      target = meta.downloadUrl ?? meta.url;
+    } catch (error: unknown) {
+      /*
+       * ONLY the not-found class becomes `null`. `head` also rejects for an
+       * expired token, a suspended or missing store, an aborted request and a
+       * plain network failure, and every one of those says nothing about
+       * whether the blob exists. Catching them all reports an outage as a
+       * deletion, which a caller may act on by writing a replacement over a
+       * file that is still there.
+       *
+       * Identified by the CLASS the SDK exports rather than by matching the
+       * message, because the message is prose this package does not own.
+       */
+      if (error instanceof BlobNotFoundError) return null;
+      throw error;
+    }
+
+    /*
+     * OUTSIDE the catch above, deliberately, and through the shared helper so
+     * that separation is stated once rather than in each adapter. A failed
+     * fetch of a blob whose metadata just resolved is a transport failure
+     * rather than an absence, and folding it into `null` would report a
+     * network outage as a deleted file.
+     */
+    return await fetchStoredBytes(
+      target,
+      filePath,
+      "Vercel Blob",
+      options,
+      deadline
+    );
+  }
+
+  /**
+   * Get public URL for Vercel Blob file.
+   *
+   * Vercel Blob paths ARE the public URLs - they're already full HTTPS URLs
+   * with CDN distribution.
+   *
+   * @param filePath - Full blob URL
+   * @returns The same URL (Vercel Blob paths are already public URLs)
+   */
+  /**
+   * Every blob in the store, by its URL (which is its stored path here), with
+   * when it was uploaded, a page at a time.
+   */
+  async *list(): AsyncIterable<StoredFileEntry> {
+    let cursor: string | undefined;
+    do {
+      const page = await this.listBlobs(undefined, { cursor });
+      for (const blob of page.blobs) {
+        yield { path: blob.url, lastModified: blob.uploadedAt };
+      }
+      cursor = page.hasMore ? page.cursor : undefined;
+    } while (cursor);
+  }
+
+  getPublicUrl(filePath: string): string {
+    // Vercel Blob paths are already full URLs
+    return filePath;
+  }
+
+  /**
+   * Get storage type identifier.
+   */
+  getType(): "vercel-blob" {
+    return "vercel-blob";
+  }
+
+  // ============================================================
+  // Optional IStorageAdapter Methods
+  // ============================================================
+
+  /**
+   * Get adapter info including capabilities.
+   *
+   * @returns Adapter info with type, name, and capability flags
+   */
+  getInfo(): StorageAdapterInfo {
+    return {
+      type: "vercel-blob",
+      name: "VercelBlobStorageAdapter",
+      supportsSignedUrls: false, // Vercel Blob URLs are public by default
+      // No: Vercel Blob has no pre-signed upload Nextly can bind to a checked
+      // type and size, so `clientUploads` is refused for it rather than signing
+      // nothing. Its large files go through the standard upload.
+      supportsClientUploads: false,
+    };
+  }
+
+  /**
+   * Get file metadata from Vercel Blob.
+   *
+   * Retrieves file information including size, content type, and upload date.
+   *
+   * @param filePath - Full blob URL
+   * @returns File metadata or null if file not found
+   */
+  async getMetadata(filePath: string): Promise<FileMetadata | null> {
+    // Resolved BEFORE the not-found catch, for the same reason as
+    // {@link exists}: `null` here means "no such blob", never "no
+    // credential".
+    const token = this.ensureToken();
+    try {
+      const result = await head(filePath, {
+        token,
+      });
+
+      // Extract filename from pathname
+      const filename = result.pathname.split("/").pop() || result.pathname;
+
+      return {
+        id: filePath,
+        filename,
+        originalFilename: filename,
+        mimeType: result.contentType,
+        size: result.size,
+        url: result.url,
+        createdAt: result.uploadedAt.toISOString(),
+      };
+    } catch {
+      // File not found
+      return null;
+    }
+  }
+
+  /**
+   * Generate pre-signed URL for client-side uploads.
+   *
+   * Vercel Blob uses a different pattern for client uploads - they require
+   * the handleUpload API which handles token generation server-side.
+   *
+   * This method is not implemented because Vercel Blob's client upload flow
+   * requires server-side route handlers with handleUpload().
+   *
+   * @see https://vercel.com/docs/storage/vercel-blob/client-upload
+   * @throws Error always - client uploads require handleUpload API
+   */
+  getPresignedUploadUrl(
+    _key: string,
+    _mimeType: string,
+    _expiresIn?: number
+  ): Promise<ClientUploadData> {
+    return Promise.reject(
+      new Error(
+        "@nextly/storage-vercel-blob: Client uploads require the handleUpload API.\n\n" +
+          "Vercel Blob uses a different pattern for client-side uploads that involves:\n" +
+          "1. A server-side route handler with handleUpload()\n" +
+          "2. The @vercel/blob/client upload() function\n\n" +
+          "See: https://vercel.com/docs/storage/vercel-blob/client-upload\n\n" +
+          "For server-side uploads, use the standard upload() method instead."
+      )
+    );
+  }
+
+  // ============================================================
+  // Additional Methods
+  // ============================================================
+
+  /**
+   * List blobs with optional prefix filter.
+   *
+   * Useful for browsing or batch operations on stored files.
+   *
+   * @param prefix - Optional prefix to filter results
+   * @param options - List options (limit, cursor)
+   * @returns List of blob metadata
+   */
+  async listBlobs(
+    prefix?: string,
+    options?: { limit?: number; cursor?: string }
+  ): Promise<{
+    blobs: Array<{
+      url: string;
+      pathname: string;
+      size: number;
+      uploadedAt: Date;
+    }>;
+    hasMore: boolean;
+    cursor?: string;
+  }> {
+    const result = await list({
+      token: this.ensureToken(),
+      prefix,
+      limit: options?.limit,
+      cursor: options?.cursor,
+    });
+
+    return {
+      blobs: result.blobs.map(blob => ({
+        url: blob.url,
+        pathname: blob.pathname,
+        size: blob.size,
+        uploadedAt: blob.uploadedAt,
+      })),
+      hasMore: result.hasMore,
+      cursor: result.cursor,
+    };
+  }
+
+  // ============================================================
+  // Helper Methods
+  // ============================================================
+
+  /**
+   * Build pathname for Vercel Blob upload.
+   *
+   * Creates pathname in format: {folder}/{filename}
+   * If no folder is provided, uses the filename directly.
+   *
+   * @param filename - Original filename (will be sanitized)
+   * @param folder - Optional folder/prefix for organizing uploads
+   * @returns Generated pathname
+   * @throws Error if folder fails sanitization
+   */
+  private buildPathname(filename: string, folder?: string): string {
+    const sanitized = this.sanitizeFilename(filename);
+    if (!folder) return sanitized;
+    return `${this.sanitizeFolder(folder)}/${sanitized}`;
+  }
+
+  /**
+   * Sanitize filename to prevent path traversal issues.
+   *
+   * @param filename - Original filename
+   * @returns Sanitized filename
+   */
+  private sanitizeFilename(filename: string): string {
+    const basename = filename.split(/[/\\]/).pop() || filename;
+    return basename.replace(/[^a-zA-Z0-9._-]/g, "-");
+  }
+
+  /**
+   * Reject folder values that would let a caller
+   * escape the configured prefix via path traversal or weird
+   * separators. Vercel Blob is flat-keyed so `/` is just part of the
+   * pathname, but an attacker who controls `folder` could still:
+   *
+   *   - Use `..` to chain a relative-traversal-style key.
+   *   - Use `\` (Windows separator) to confuse downstream tooling.
+   *   - Use control chars / null bytes to truncate the key.
+   *   - Use a leading `/` to look like an absolute path.
+   *
+   * Internal `/` segments stay allowed because callers legitimately
+   * use nested folders (`docs/2026/...`); a leading `/`, empty
+   * segments (`docs//x`), or `..` segments are rejected.
+   *
+   * @throws Error with a stable message so the storage facade can
+   *   surface a 400 instead of a 500.
+   */
+  private sanitizeFolder(folder: string): string {
+    const trimmed = folder.replace(/\/+$/, ""); // tolerate one trailing `/`
+    if (!trimmed) {
+      throw new Error("Folder must be a non-empty string.");
+    }
+    // eslint-disable-next-line no-control-regex -- the whole point is to reject control chars
+    if (/[\\\0\x01-\x1f\x7f]/.test(trimmed)) {
+      throw new Error(
+        "Folder contains forbidden characters (backslash, control chars, or null bytes)."
+      );
+    }
+    if (trimmed.startsWith("/")) {
+      throw new Error("Folder must not start with `/`.");
+    }
+    const segments = trimmed.split("/");
+    for (const segment of segments) {
+      if (segment === "") {
+        throw new Error("Folder must not contain empty segments (`//`).");
+      }
+      if (segment === "..") {
+        throw new Error("Folder must not contain `..` segments.");
+      }
+    }
+    return trimmed;
+  }
+
+  // ============================================================
+  // Public Accessors
+  // ============================================================
+
+  /**
+   * Get the configured token (masked for logging). Never resolves or
+   * refuses: an adapter whose credentials have not arrived yet masks to
+   * `****`, since this answers for logs, not for storage.
+   */
+  getTokenMasked(): string {
+    const token = this.resolvedConfig.token;
+    if (token.length <= 8) return "****";
+    return `${token.slice(0, 4)}...${token.slice(-4)}`;
+  }
+
+  /**
+   * Check if random suffix is enabled.
+   */
+  hasRandomSuffix(): boolean {
+    return this.resolvedConfig.addRandomSuffix;
+  }
+
+  /**
+   * Get configured cache control max age.
+   */
+  getCacheControlMaxAge(): number {
+    return this.resolvedConfig.cacheControlMaxAge;
+  }
+}

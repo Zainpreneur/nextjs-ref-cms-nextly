@@ -1,0 +1,669 @@
+/**
+ * loadDynamicTables boot-pass regression test.
+ *
+ * Pins the contract that:
+ *  - Empty `fields: []` rows still call `register` (so freshly-created UI
+ *    Singles whose user-field array is still empty get their physical
+ *    table re-registered after a server restart).
+ *  - The `status` column drives the `hasStatus` argument passed to the
+ *    register callback (sqlite returns 0/1, postgres returns booleans).
+ *  - The `localized` column drives the `localized` argument (i18n M3b-2).
+ *  - The Components SELECT never asks for a `status` / `localized` column.
+ *  - Adapter errors (table doesn't exist on a fresh DB) don't throw.
+ */
+import { describe, it, expect, vi } from "vitest";
+
+import { MIGRATION_TARGET } from "../../domains/field-groups/migration/manifest";
+import {
+  forgetFieldGroupStorageNames,
+  resolveFieldGroupRegistryName,
+} from "../../domains/field-groups/storage/resolve-storage-names";
+import {
+  _resetPerLanguageStorage,
+  setPerLanguageStorage,
+} from "../../domains/i18n/per-language-storage";
+import { STORAGE_FORMAT } from "../../schemas/storage-format";
+import { loadDynamicTables } from "../load-dynamic-tables";
+
+function makeAdapter(rows: unknown[], opts: { throwOnSelect?: boolean } = {}) {
+  const calls: string[] = [];
+  const adapter = {
+    executeQuery: vi.fn(async (sql: string) => {
+      calls.push(sql);
+      if (opts.throwOnSelect) {
+        throw new Error("no such table: dynamic_singles");
+      }
+      return rows;
+    }),
+  } as unknown as Parameters<typeof loadDynamicTables>[0];
+  return { adapter, calls };
+}
+
+describe("loadDynamicTables — empty-fields rows still register", () => {
+  it("calls register for a row with fields: [] (UI Single without user fields yet)", async () => {
+    const { adapter } = makeAdapter([
+      { table_name: "single_banner", fields: "[]", slug: "banner", status: 0 },
+    ]);
+    const register = vi.fn(async () => {});
+
+    await loadDynamicTables(adapter, "dynamic_singles", register);
+
+    expect(register).toHaveBeenCalledTimes(1);
+    expect(register).toHaveBeenCalledWith(
+      "single_banner",
+      [],
+      false,
+      false,
+      undefined,
+      "banner"
+    );
+  });
+
+  it("skips rows where the JSON parses to a non-array", async () => {
+    // Defensive: garbage `fields` values shouldn't crash the boot pass,
+    // they just shouldn't register either.
+    const { adapter } = makeAdapter([
+      { table_name: "single_x", fields: '"not-an-array"', slug: "x" },
+      {
+        table_name: "single_ok",
+        fields: "[]",
+        slug: "ok",
+        status: 0,
+      },
+    ]);
+    const register = vi.fn(async () => {});
+
+    await loadDynamicTables(adapter, "dynamic_singles", register);
+
+    // Only the array-shaped row registers.
+    expect(register).toHaveBeenCalledTimes(1);
+    expect(register).toHaveBeenCalledWith(
+      "single_ok",
+      [],
+      false,
+      false,
+      undefined,
+      "ok"
+    );
+  });
+
+  it("forwards hasStatus=true when status=1 (sqlite)", async () => {
+    const { adapter } = makeAdapter([
+      { table_name: "single_a", fields: "[]", slug: "a", status: 1 },
+    ]);
+    const register = vi.fn(async () => {});
+
+    await loadDynamicTables(adapter, "dynamic_singles", register);
+
+    expect(register).toHaveBeenCalledWith(
+      "single_a",
+      [],
+      true,
+      false,
+      undefined,
+      "a"
+    );
+  });
+
+  it("forwards hasStatus=true when status=true (postgres)", async () => {
+    const { adapter } = makeAdapter([
+      { table_name: "dc_a", fields: "[]", slug: "a", status: true },
+    ]);
+    const register = vi.fn(async () => {});
+
+    await loadDynamicTables(adapter, "dynamic_collections", register);
+
+    expect(register).toHaveBeenCalledWith(
+      "dc_a",
+      [],
+      true,
+      false,
+      undefined,
+      "a"
+    );
+  });
+
+  it("forwards hasStatus=false for legacy rows without a status field", async () => {
+    const { adapter } = makeAdapter([
+      // status column existed but was never set (legacy row).
+      { table_name: "dc_a", fields: "[]", slug: "a" },
+    ]);
+    const register = vi.fn(async () => {});
+
+    await loadDynamicTables(adapter, "dynamic_collections", register);
+
+    expect(register).toHaveBeenCalledWith(
+      "dc_a",
+      [],
+      false,
+      false,
+      undefined,
+      "a"
+    );
+  });
+
+  it("forwards localized=true when localized=1 (sqlite)", async () => {
+    const { adapter } = makeAdapter([
+      { table_name: "dc_pages", fields: "[]", slug: "pages", localized: 1 },
+    ]);
+    const register = vi.fn(async () => {});
+
+    await loadDynamicTables(adapter, "dynamic_collections", register);
+
+    expect(register).toHaveBeenCalledWith(
+      "dc_pages",
+      [],
+      false,
+      true,
+      undefined,
+      "pages"
+    );
+  });
+
+  it("forwards localized=true when localized=true (postgres)", async () => {
+    const { adapter } = makeAdapter([
+      {
+        table_name: "dc_pages",
+        fields: "[]",
+        slug: "pages",
+        status: true,
+        localized: true,
+      },
+    ]);
+    const register = vi.fn(async () => {});
+
+    await loadDynamicTables(adapter, "dynamic_collections", register);
+
+    expect(register).toHaveBeenCalledWith(
+      "dc_pages",
+      [],
+      true,
+      true,
+      undefined,
+      "pages"
+    );
+  });
+
+  it("forwards localized=false for legacy rows without a localized field", async () => {
+    const { adapter } = makeAdapter([
+      { table_name: "dc_a", fields: "[]", slug: "a", status: 0 },
+    ]);
+    const register = vi.fn(async () => {});
+
+    await loadDynamicTables(adapter, "dynamic_collections", register);
+
+    expect(register).toHaveBeenCalledWith(
+      "dc_a",
+      [],
+      false,
+      false,
+      undefined,
+      "a"
+    );
+  });
+});
+
+describe("loadDynamicTables — SELECT shape", () => {
+  it("excludes status but includes localized in the SELECT for dynamic_components", async () => {
+    const { adapter, calls } = makeAdapter([]);
+    await loadDynamicTables(adapter, "dynamic_components", vi.fn());
+    // Components have no Draft/Published status column, but they do carry the
+    // i18n `localized` flag, so it must be part of the select.
+    expect(calls[0]).toBe(
+      "SELECT table_name, fields, slug, localized, source, locked FROM dynamic_components"
+    );
+  });
+
+  it("includes status in the SELECT for dynamic_collections / dynamic_singles", async () => {
+    const { adapter, calls } = makeAdapter([]);
+    await loadDynamicTables(adapter, "dynamic_singles", vi.fn());
+    expect(calls[0]).toBe(
+      "SELECT table_name, fields, slug, status, localized, source, locked FROM dynamic_singles"
+    );
+
+    const second = makeAdapter([]);
+    await loadDynamicTables(second.adapter, "dynamic_collections", vi.fn());
+    expect(second.calls[0]).toBe(
+      "SELECT table_name, fields, slug, status, localized, source, locked FROM dynamic_collections"
+    );
+  });
+});
+
+describe("loadDynamicTables — fault tolerance", () => {
+  it("does not throw if the source table doesn't exist (fresh DB)", async () => {
+    // Still resolves rather than throwing -- a fresh database has no registry
+    // table and that is the right answer for the caller this was written for.
+    // What it resolves WITH is the neighbouring test's subject; asserting
+    // `undefined` here only ever pinned the absence of a return value.
+    const { adapter } = makeAdapter([], { throwOnSelect: true });
+    const register = vi.fn(async () => {});
+
+    await expect(
+      loadDynamicTables(adapter, "dynamic_singles", register)
+    ).resolves.not.toThrow();
+    expect(register).not.toHaveBeenCalled();
+  });
+
+  /*
+   * 🔴 The swallow above is right for a FRESH database and wrong for a caller
+   * that has just migrated: there the table certainly exists, so a failed read
+   * means that caller's registry is stale and it must not report a reload as
+   * done. Resolving silently gives both callers the same answer to different
+   * questions, so the failure is now offered to whoever asked for it.
+   *
+   * Driven through the REAL loader. The boot reload's own tests mock this
+   * module, so they can only show that it reacts to `onReadError` -- nothing
+   * there says this function ever calls it.
+   */
+  it("reports the failed read rather than only swallowing it", async () => {
+    const { adapter } = makeAdapter([], { throwOnSelect: true });
+    const register = vi.fn(async () => {});
+
+    const result = await loadDynamicTables(
+      adapter,
+      "dynamic_singles",
+      register
+    );
+
+    expect(result.registered).toBe(0);
+    expect(result.failures.map(f => f.scope)).toEqual(["read"]);
+    expect(register).not.toHaveBeenCalled();
+  });
+
+  /*
+   * 🔴 A ROW failure has to be reportable too, and a lower count is not it: one
+   * unregisterable collection is indistinguishable from a database holding one
+   * fewer, so a caller reading the count alone calls its reload complete while
+   * that entity stays unaddressable.
+   */
+  it("reports a row whose register callback throws, naming it", async () => {
+    const { adapter } = makeAdapter([
+      { table_name: "single_bad", fields: "[]", slug: "bad", status: 0 },
+      { table_name: "single_ok", fields: "[]", slug: "ok", status: 0 },
+    ]);
+    const register = vi.fn(async (tableName: string) => {
+      if (tableName === "single_bad") throw new Error("synthetic");
+    });
+
+    const result = await loadDynamicTables(
+      adapter,
+      "dynamic_singles",
+      register
+    );
+
+    // The other row still registered: one bad row costs only itself.
+    expect(result.registered).toBe(1);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]?.scope).toBe("row");
+    expect(result.failures[0]?.tableName).toBe("single_bad");
+  });
+
+  it("reports a row whose stored fields are not an array", async () => {
+    // The other way a row goes unregistered, and it used to be a bare
+    // `continue` -- so it never even reached the per-row catch.
+    const { adapter } = makeAdapter([
+      {
+        table_name: "single_corrupt",
+        fields: '"not-an-array"',
+        slug: "c",
+        status: 0,
+      },
+    ]);
+
+    const result = await loadDynamicTables(
+      adapter,
+      "dynamic_singles",
+      vi.fn(async () => {})
+    );
+
+    expect(result.registered).toBe(0);
+    expect(result.failures[0]?.tableName).toBe("single_corrupt");
+  });
+
+  it("reports nothing when every row registered", async () => {
+    // The control for all three: an outcome that always carried a failure
+    // would satisfy them while telling every healthy boot its registry is
+    // stale.
+    const { adapter } = makeAdapter([
+      { table_name: "single_ok", fields: "[]", slug: "ok", status: 0 },
+    ]);
+
+    const result = await loadDynamicTables(
+      adapter,
+      "dynamic_singles",
+      vi.fn(async () => {})
+    );
+
+    expect(result.registered).toBe(1);
+    expect(result.failures).toEqual([]);
+  });
+
+  it("isolates failures per row — a thrown register continues with the next row", async () => {
+    const { adapter } = makeAdapter([
+      { table_name: "single_bad", fields: "[]", slug: "bad", status: 0 },
+      { table_name: "single_ok", fields: "[]", slug: "ok", status: 0 },
+    ]);
+    const register = vi.fn(async (tableName: string) => {
+      if (tableName === "single_bad") throw new Error("synthetic");
+    });
+
+    await loadDynamicTables(adapter, "dynamic_singles", register);
+
+    // Both attempts happen; only the second succeeds, but the first
+    // failure is swallowed and doesn't block the rest.
+    expect(register).toHaveBeenCalledTimes(2);
+  });
+
+  // An existing DB that predates the i18n `localized` column must not lose all
+  // its dynamic tables. The select falls back to one without `localized` rather
+  // than letting the missing column throw into the outer catch.
+  it("falls back to a select without `localized` on a pre-i18n DB", async () => {
+    const calls: string[] = [];
+    const adapter = {
+      executeQuery: vi.fn(async (sql: string) => {
+        calls.push(sql);
+        // A pre-i18n database has neither the ownership columns nor `localized`, so both of
+        // the first two rungs fail and the third is the one that answers.
+        if (/,\s*source,\s*locked\s+FROM/.test(sql)) {
+          throw new Error('column "source" does not exist');
+        }
+        if (/,\s*localized\s+FROM/.test(sql)) {
+          throw new Error('column "localized" does not exist');
+        }
+        return [
+          { table_name: "dc_pages", fields: "[]", slug: "pages", status: 1 },
+        ];
+      }),
+    } as unknown as Parameters<typeof loadDynamicTables>[0];
+    const register = vi.fn(async () => {});
+
+    await loadDynamicTables(adapter, "dynamic_collections", register);
+
+    // First (full) select threw; the fallback (no `localized`) succeeded and the
+    // row still registered — with localized defaulting to false.
+    expect(calls[0]).toContain("source");
+    expect(calls[1]).toContain("localized");
+    expect(calls[2]).toBe(
+      "SELECT table_name, fields, slug, status FROM dynamic_collections"
+    );
+    // Ownership is `undefined` rather than false: the registry could not say, which is not the
+    // same as saying the Builder does not own it.
+    expect(register).toHaveBeenCalledWith(
+      "dc_pages",
+      [],
+      true,
+      false,
+      undefined,
+      "pages"
+    );
+  });
+});
+
+/**
+ * 🔴 The boot pass has to address the registry that is actually there.
+ *
+ * `loadDynamicTables` treats a failed read as the fresh-database case — correct
+ * for a database that has no registry yet, and silent for one whose registry
+ * has been renamed. Addressing the legacy name on a migrated database therefore
+ * registers NOTHING and raises nothing, leaving every field-group table
+ * unaddressable until someone notices reads coming back empty.
+ */
+describe("loadDynamicTables — the field-group registry is resolved, not assumed", () => {
+  function catalogAdapter(tables: string[], rows: unknown[]) {
+    const selected: string[] = [];
+    return {
+      selected,
+      adapter: {
+        dialect: "sqlite" as const,
+        listTables: vi.fn(async () => tables),
+        getDrizzle: <T>(): T => ({}) as T,
+        executeQuery: vi.fn(async (sql: string) => {
+          selected.push(sql);
+          // Only the table this database actually has answers; anything else
+          // fails the way a real driver fails, which is what the boot pass
+          // swallows.
+          const target = tables.find(table => sql.includes(table));
+          if (target === undefined) throw new Error("no such table");
+          return rows;
+        }),
+      },
+    };
+  }
+
+  const componentRow = {
+    table_name: "fg_hero",
+    fields: JSON.stringify([{ name: "heading", type: "text" }]),
+    slug: "hero",
+    localized: 0,
+  };
+
+  it("registers components from the migrated registry after a rename", async () => {
+    forgetFieldGroupStorageNames();
+    const { adapter, selected } = catalogAdapter(
+      [MIGRATION_TARGET.registryTable],
+      [componentRow]
+    );
+    const register = vi.fn(async () => {});
+
+    await loadDynamicTables(
+      adapter as unknown as Parameters<typeof loadDynamicTables>[0],
+      await resolveFieldGroupRegistryName(adapter),
+      register
+    );
+
+    expect(register).toHaveBeenCalledTimes(1);
+    expect(register).toHaveBeenCalledWith(
+      "fg_hero",
+      [{ name: "heading", type: "text" }],
+      false,
+      false,
+      undefined,
+      "hero"
+    );
+    expect(selected.join("\n")).toContain(MIGRATION_TARGET.registryTable);
+  });
+
+  // The migrated registry has no `status` column either, so a branch that only
+  // recognises the legacy spelling would select one that is not there.
+  it("never selects a status column from the migrated registry", async () => {
+    forgetFieldGroupStorageNames();
+    const { adapter, selected } = catalogAdapter(
+      [MIGRATION_TARGET.registryTable],
+      [componentRow]
+    );
+
+    await loadDynamicTables(
+      adapter as unknown as Parameters<typeof loadDynamicTables>[0],
+      await resolveFieldGroupRegistryName(adapter),
+      async () => {}
+    );
+
+    expect(selected.join("\n")).not.toContain("status");
+  });
+
+  it("still addresses the legacy registry on a database that has not migrated", async () => {
+    forgetFieldGroupStorageNames();
+    const { adapter, selected } = catalogAdapter(
+      [STORAGE_FORMAT.registryTable],
+      [{ ...componentRow, table_name: "comp_hero" }]
+    );
+    const register = vi.fn(async () => {});
+
+    await loadDynamicTables(
+      adapter as unknown as Parameters<typeof loadDynamicTables>[0],
+      await resolveFieldGroupRegistryName(adapter),
+      register
+    );
+
+    expect(register).toHaveBeenCalledTimes(1);
+    expect(selected.join("\n")).toContain(STORAGE_FORMAT.registryTable);
+  });
+});
+
+/**
+ * These registries hold code-first and plugin rows beside Builder ones.
+ *
+ * A caller that goes on to emit DDL has to describe a column the way its creator built it, and the
+ * two creators size an unstated text field differently. Assumed rather than read, every code-first
+ * and plugin-owned table was described as the Builder's — so a companion created during an upgrade
+ * or a recovery got Builder widths for a table the pipeline had made.
+ */
+describe("loadDynamicTables — ownership comes from the row", () => {
+  const ownershipFor = async (
+    row: Record<string, unknown>
+  ): Promise<boolean | undefined> => {
+    const { adapter } = makeAdapter([
+      { table_name: "dc_pages", fields: "[]", slug: "pages", ...row },
+    ]);
+    // Typed to the callback's real signature so the ownership argument is reachable by index
+    // rather than asserted through a cast.
+    const register = vi.fn(
+      async (
+        _tableName: string,
+        _fields: unknown[],
+        _hasStatus: boolean,
+        _localized: boolean,
+        _builderOwned: boolean | undefined
+      ) => {}
+    );
+    await loadDynamicTables(adapter, "dynamic_collections", register);
+    return register.mock.calls[0]?.[4];
+  };
+
+  it("reports the Schema Builder as the owner of an unlocked UI row", async () => {
+    expect(await ownershipFor({ source: "ui", locked: false })).toBe(true);
+  });
+
+  it.each([
+    ["a locked row", { source: "ui", locked: true }],
+    ["a code-first row", { source: "code", locked: false }],
+    ["a plugin-owned row", { source: "plugin:acme-seo", locked: false }],
+  ])("does not report the Builder as the owner of %s", async (_label, row) => {
+    expect(await ownershipFor(row)).toBe(false);
+  });
+
+  // Distinct from `false` on purpose: a registry too old to carry these columns has said nothing
+  // about ownership, and the caller reads that as the pipeline's rather than as a Builder denial.
+  it("reports nothing when the registry carries no ownership columns", async () => {
+    expect(await ownershipFor({})).toBeUndefined();
+  });
+});
+
+/**
+ * A row removed from code (a code row whose slug the configuration no longer
+ * declares) is registered only while every table it owns exists. Registering a
+ * localized entity creates its missing translation table, so registering one
+ * whose tables a migration dropped would bring part of it back. A Builder row
+ * and a declared code row register whatever their tables, as before.
+ */
+describe("loadDynamicTables — an entity removed from code", () => {
+  const registeredTables = async (
+    rows: Array<Record<string, unknown>>,
+    existing: string[],
+    options?: Parameters<typeof loadDynamicTables>[3]
+  ): Promise<string[]> => {
+    const { adapter } = makeAdapter(rows);
+    Object.assign(adapter, {
+      tableExists: vi.fn(async (name: string) => existing.includes(name)),
+      getCapabilities: () => ({ dialect: "sqlite" as const }),
+    });
+    const register = vi.fn(async (tableName: string) => {
+      void tableName;
+    });
+    await loadDynamicTables(adapter, "dynamic_collections", register, options);
+    return register.mock.calls.map(([tableName]) => tableName);
+  };
+  const rows = [
+    {
+      table_name: "dc_posts",
+      fields: JSON.stringify([{ name: "headline", type: "text" }]),
+      slug: "posts",
+      localized: 1,
+      source: "code",
+    },
+    { table_name: "dc_tags", fields: "[]", slug: "tags", source: "code" },
+    { table_name: "dc_drafts", fields: "[]", slug: "drafts", source: "ui" },
+  ];
+  const declared = { declaredSlugs: new Set(["tags"]) };
+
+  it("is not registered once its main table is gone", async () => {
+    expect(await registeredTables(rows, [], declared)).toEqual([
+      "dc_tags",
+      "dc_drafts",
+    ]);
+  });
+
+  it("is not registered while its translation table is gone", async () => {
+    expect(await registeredTables(rows, ["dc_posts"], declared)).toEqual([
+      "dc_tags",
+      "dc_drafts",
+    ]);
+  });
+
+  it("is registered while every table it owns stands", async () => {
+    expect(
+      await registeredTables(rows, ["dc_posts", "dc_posts_locales"], declared)
+    ).toEqual(["dc_posts", "dc_tags", "dc_drafts"]);
+  });
+
+  // A localized entity whose every field is shared has no translatable column,
+  // so nothing creates a translation table for it and none is required.
+  it("is registered with no translation table when it has nothing to translate", async () => {
+    const shared = [
+      {
+        table_name: "dc_notes",
+        fields: JSON.stringify([
+          { name: "title", type: "text", localized: false },
+        ]),
+        slug: "notes",
+        localized: 1,
+        source: "code",
+      },
+    ];
+    expect(await registeredTables(shared, ["dc_notes"], declared)).toEqual([
+      "dc_notes",
+    ]);
+  });
+
+  it("registers every row when the caller declares nothing", async () => {
+    expect(await registeredTables(rows, [])).toEqual([
+      "dc_posts",
+      "dc_tags",
+      "dc_drafts",
+    ]);
+  });
+});
+
+// A collection removed from code is registered only while every table it owns stands. Under
+// `experimental.perLanguageStorage` an untranslated one owns a per-language table too, so one whose
+// per-language table is gone is left unregistered, as a translated one's would be.
+describe("loadDynamicTables — a code-removed entity under per-language storage", () => {
+  it("leaves an untranslated entity unregistered once its per-language table is gone", async () => {
+    setPerLanguageStorage(true);
+    try {
+      const { adapter } = makeAdapter([
+        {
+          table_name: "dc_gone",
+          fields: JSON.stringify([{ name: "title", type: "text" }]),
+          slug: "gone",
+          localized: 0,
+          source: "code",
+          locked: 1,
+        },
+      ]);
+      Object.assign(adapter, {
+        tableExists: vi.fn(async (name: string) => name === "dc_gone"),
+        getCapabilities: () => ({ dialect: "sqlite" }),
+      });
+      const register = vi.fn(async () => undefined);
+
+      await loadDynamicTables(adapter, "dynamic_collections", register, {
+        declaredSlugs: new Set(["kept"]),
+      });
+
+      expect(register).not.toHaveBeenCalled();
+    } finally {
+      _resetPerLanguageStorage();
+    }
+  });
+});

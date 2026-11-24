@@ -1,0 +1,535 @@
+/**
+ * Rate Limiting Middleware
+ *
+ * Provides configurable rate limiting for API endpoints to protect
+ * against abuse and ensure fair resource usage.
+ *
+ * Features:
+ * - Pluggable store interface (in-memory default, Redis-compatible)
+ * - Separate read/write limits
+ * - Per-collection overrides
+ * - Budgets by who is asking: a session, an API key, an address
+ * - Standard rate limit headers
+ *
+ * @module middleware/rate-limit
+ * @since 1.0.0
+ *
+ * @example
+ * ```typescript
+ * // Enable rate limiting in nextly.config.ts
+ * export default defineConfig({
+ *   rateLimit: {
+ *     enabled: true,
+ *     readLimit: 100,   // 100 GET requests per minute
+ *     writeLimit: 30,   // 30 POST/PATCH/DELETE per minute
+ *   },
+ * });
+ * ```
+ */
+
+import { container } from "../di/container";
+
+// ============================================================================
+// Types & Interfaces
+// ============================================================================
+
+/**
+ * Result from a rate limit check.
+ */
+export interface RateLimitResult {
+  /** Whether the request is allowed */
+  allowed: boolean;
+  /** Maximum requests allowed in the window */
+  limit: number;
+  /** Remaining requests in current window */
+  remaining: number;
+  /** Unix timestamp (ms) when the window resets */
+  resetTime: number;
+}
+
+/**
+ * Pluggable store interface for rate limit state.
+ *
+ * Implement this interface to use Redis, Memcached, or other
+ * distributed stores for rate limiting in production.
+ *
+ * @example
+ * ```typescript
+ * import Redis from 'ioredis';
+ *
+ * class RedisRateLimitStore implements RateLimitStore {
+ *   private redis: Redis;
+ *
+ *   constructor(redis: Redis) {
+ *     this.redis = redis;
+ *   }
+ *
+ *   async increment(key: string, windowMs: number): Promise<RateLimitRecord> {
+ *     const now = Date.now();
+ *     const resetTime = now + windowMs;
+ *     const count = await this.redis.incr(key);
+ *     if (count === 1) {
+ *       await this.redis.pexpire(key, windowMs);
+ *     }
+ *     return { count, resetTime };
+ *   }
+ *
+ *   async reset(key: string): Promise<void> {
+ *     await this.redis.del(key);
+ *   }
+ * }
+ * ```
+ */
+export interface RateLimitStore {
+  /**
+   * Increment the request count for a key.
+   *
+   * @param key - Unique identifier (e.g., IP address or user ID)
+   * @param windowMs - Time window in milliseconds
+   * @returns Record with current count and reset time
+   */
+  increment(key: string, windowMs: number): Promise<RateLimitRecord>;
+
+  /**
+   * Reset the request count for a key.
+   *
+   * @param key - Unique identifier to reset
+   */
+  reset(key: string): Promise<void>;
+
+  /**
+   * Record an attempt ONLY if it stays within `limit`, atomically.
+   *
+   * One operation, because two are not safe. A caller that increments and then
+   * takes the increment back on refusal has an await between the two, and in
+   * that gap another request can start a NEW window — the old rollback then
+   * erases the new window's count and admits attempts nobody budgeted for. The
+   * damage is worst at a window boundary, which is exactly where a limiter is
+   * most load-bearing.
+   *
+   * Optional because not every store can be atomic. A caller that needs the
+   * guarantee checks for it and degrades deliberately when it is absent; see
+   * `RateLimiter.check`, which then counts refused attempts rather than
+   * risking the erasure — stricter, never looser.
+   *
+   * `allowed` is the store's decision, not a hint: only the store knows whether
+   * the entry was recorded. On a refusal, `count` excludes the refused attempt,
+   * and a `limit` of 0 records nothing — `RateLimiter.peek` reads a key's count
+   * that way.
+   */
+  consume?(
+    key: string,
+    limit: number,
+    windowMs: number
+  ): Promise<RateLimitRecord & { allowed: boolean }>;
+}
+
+/**
+ * Whether `value` keeps the {@link RateLimitStore} contract, as far as its
+ * shape shows: an app's store of this contract keeps serving core's own
+ * limits when `rateLimit.store` also accepts the newer limit store contract.
+ */
+export function isRateLimitStore(value: unknown): value is RateLimitStore {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.increment === "function" &&
+    typeof candidate.reset === "function"
+  );
+}
+
+/**
+ * Record returned by store increment operation.
+ */
+export interface RateLimitRecord {
+  /** Current request count in the window */
+  count: number;
+  /** Unix timestamp (ms) when the window resets */
+  resetTime: number;
+}
+
+/**
+ * Configuration for rate limiting.
+ */
+export interface RateLimitConfig {
+  /**
+   * Enable rate limiting.
+   * @default true
+   */
+  enabled: boolean;
+
+  /**
+   * Maximum requests per window for read operations (GET).
+   * @default 100
+   */
+  readLimit?: number;
+
+  /**
+   * Maximum requests per window for write operations (POST, PATCH, PUT, DELETE).
+   * @default 30
+   */
+  writeLimit?: number;
+
+  /**
+   * Time window in milliseconds.
+   * @default 60000 (1 minute)
+   */
+  windowMs?: number;
+
+  /**
+   * Custom store for rate limit state.
+   * Defaults to in-memory store if not provided.
+   *
+   * @example
+   * ```typescript
+   * import { RedisRateLimitStore } from '@nextly/ratelimit-redis';
+   *
+   * rateLimit: {
+   *   enabled: true,
+   *   store: new RedisRateLimitStore(redisClient),
+   * }
+   * ```
+   */
+  store?: RateLimitStore;
+
+  /**
+   * Function to generate a unique key for rate limiting.
+   * Defaults to the trusted client IP address (see `trustProxy` /
+   * `trustedProxyIps`). Requests with no resolvable IP spend the
+   * `unresolvedCeiling` instead. A key this function returns is always taken
+   * as a resolved source.
+   *
+   * @param request - The incoming request
+   * @returns A unique identifier string
+   */
+  keyGenerator?: (request: Request) => string;
+
+  /**
+   * When true, the default keyGenerator parses
+   * `X-Forwarded-For` (filtered through `trustedProxyIps`). When false
+   * (default), proxy headers are ignored — direct-internet deployments
+   * fall back to a single `unknown` bucket. Wired from
+   * `nextly.config.ts → security.trustProxy`.
+   *
+   * @default false
+   */
+  trustProxy?: boolean;
+
+  /**
+   * CIDR list of proxy IPs (from TRUSTED_PROXY_IPS).
+   * Used by the default keyGenerator to walk the X-Forwarded-For chain
+   * rightmost-first, returning the first non-proxy hop.
+   */
+  trustedProxyIps?: readonly string[];
+
+  /**
+   * Function to skip rate limiting for certain requests.
+   * Returns true to skip rate limiting.
+   *
+   * No request is skipped by default, the admin API included: a signed-in
+   * session spends a budget of its own (`sessions`), so the admin's parallel
+   * page loads never share the per-address budget an anonymous caller spends.
+   *
+   * @param request - The incoming request
+   * @returns True to skip rate limiting
+   *
+   * @example
+   * ```typescript
+   * // Skip internal service calls
+   * skip: (req) =>
+   *   req.headers.get("x-internal-key") === process.env.INTERNAL_KEY
+   * ```
+   */
+  skip?: (request: Request) => boolean | Promise<boolean>;
+
+  /**
+   * The budget a signed-in session spends per window, counted per user
+   * whatever address the session comes from. A session that does not verify,
+   * a revoked one included, spends the budget of a request that carries none.
+   *
+   * @default five times `readLimit` and `writeLimit`
+   */
+  sessions?: { readLimit?: number; writeLimit?: number };
+
+  /**
+   * The ceiling shared, per window, by every request that carries no session
+   * and no API key and comes from no address the server can resolve (see
+   * `trustProxy`). Spending it refuses only such requests, never a session or
+   * a key, and never a request to an auth route, which its own limits judge.
+   *
+   * @default ten times `readLimit` and `writeLimit`
+   */
+  unresolvedCeiling?: { readLimit?: number; writeLimit?: number };
+
+  /**
+   * Per-collection rate limit overrides.
+   *
+   * @example
+   * ```typescript
+   * collections: {
+   *   'media': { readLimit: 50, writeLimit: 10 },  // Stricter for media
+   *   'logs': { readLimit: 200 },                   // More lenient for logs
+   * }
+   * ```
+   */
+  collections?: Record<
+    string,
+    {
+      readLimit?: number;
+      writeLimit?: number;
+    }
+  >;
+
+  /**
+   * Custom handler for rate limit exceeded responses.
+   * If not provided, returns a standard 429 response.
+   *
+   * @param request - The rate-limited request
+   * @param result - The rate limit check result
+   * @returns A custom Response
+   */
+  handler?: (request: Request, result: RateLimitResult) => Response;
+}
+
+// ============================================================================
+// In-Memory Store Implementation
+// ============================================================================
+
+/**
+ * In-memory rate limit store.
+ *
+ * Suitable for development and single-instance deployments.
+ * For production with multiple instances, use a Redis-backed store.
+ *
+ * @internal
+ */
+export class InMemoryRateLimitStore implements RateLimitStore {
+  private hits: Map<string, { count: number; resetTime: number }> = new Map();
+  private cleanupInterval: ReturnType<typeof setInterval> | null = null;
+
+  constructor() {
+    // Periodically clean up expired entries (every 60 seconds)
+    this.cleanupInterval = setInterval(() => {
+      this.cleanup();
+    }, 60000);
+
+    // Ensure cleanup interval doesn't prevent process exit
+    if (this.cleanupInterval.unref) {
+      this.cleanupInterval.unref();
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async increment(key: string, windowMs: number): Promise<RateLimitRecord> {
+    const now = Date.now();
+    const record = this.hits.get(key);
+
+    // If no record or window expired, start a new window
+    if (!record || now > record.resetTime) {
+      const newRecord = { count: 1, resetTime: now + windowMs };
+      this.hits.set(key, newRecord);
+      return newRecord;
+    }
+
+    // Increment existing record
+    record.count++;
+    return record;
+  }
+
+  /**
+   * Record an attempt only while the key's window holds fewer than `limit`.
+   *
+   * Kept so the REST limiter can ask a key's count before work it bounds,
+   * with a `limit` of 0, which records nothing and starts no window.
+   */
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async consume(
+    key: string,
+    limit: number,
+    windowMs: number
+  ): Promise<RateLimitRecord & { allowed: boolean }> {
+    const now = Date.now();
+    const held = this.hits.get(key);
+    const live = held && now <= held.resetTime ? held : undefined;
+    const count = live?.count ?? 0;
+    const resetTime = live?.resetTime ?? now + windowMs;
+    if (count >= limit) return { count, resetTime, allowed: false };
+    const record = { count: count + 1, resetTime };
+    this.hits.set(key, record);
+    return { ...record, allowed: true };
+  }
+
+  // eslint-disable-next-line @typescript-eslint/require-await
+  async reset(key: string): Promise<void> {
+    this.hits.delete(key);
+  }
+
+  /**
+   * Clean up expired records to prevent memory leaks.
+   */
+  private cleanup(): void {
+    const now = Date.now();
+    for (const [key, record] of this.hits.entries()) {
+      if (now > record.resetTime) {
+        this.hits.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Destroy the store and stop cleanup interval.
+   * Call this when shutting down the application.
+   */
+  destroy(): void {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+    this.hits.clear();
+  }
+
+  /**
+   * Get the current size of the store (for testing/monitoring).
+   */
+  get size(): number {
+    return this.hits.size;
+  }
+}
+
+// ============================================================================
+// Rate Limiter Factory
+// ============================================================================
+
+/**
+ * Default configuration values: the one source of them. The sanitized config
+ * (`DEFAULT_RATE_LIMIT_CONFIG`) is this object, so an app configured through
+ * `defineConfig` and a limiter built without values count the same budgets.
+ * A signed-in session spends a budget of its own, a multiple of these, so the
+ * admin's parallel page loads are not sized against them.
+ *
+ * Exported because the plugin-route limiter answers to the same defaults:
+ * a general-limited plugin route with no configured limits is limited by
+ * THESE numbers or by nothing — a second copy of them would drift the day
+ * one side is tuned and the other is not, silently giving plugin routes a
+ * different allowance than the REST surface beside them.
+ */
+export const RATE_LIMIT_DEFAULTS = {
+  readLimit: 100,
+  writeLimit: 30,
+  windowMs: 60000, // 1 minute
+} as const;
+
+/**
+ * Determine if the request is a read (GET) or write (POST/PATCH/PUT/DELETE) operation.
+ *
+ * Exported because the read/write split of the configured budgets has one
+ * owner: any second list of which methods spend from which allowance drifts
+ * the day a method joins one side here and not there.
+ */
+export function isReadOperation(method: string): boolean {
+  return method === "GET" || method === "HEAD" || method === "OPTIONS";
+}
+
+/**
+ * A `skip` function that exempts every `/admin/api/*` request.
+ *
+ * It was the default, and no longer is: the REST limit now counts a signed-in
+ * session against a budget of its own, so the admin needs no exemption. Kept,
+ * unchanged, for an app that passes it as `rateLimit.skip`.
+ *
+ * @deprecated The default limit already gives the admin its own budget. A
+ * later release removes this export.
+ */
+export function defaultSkipAdminApi(request: Request): boolean {
+  const { pathname } = new URL(request.url);
+  return pathname.startsWith("/admin/api/");
+}
+
+/**
+ * Create rate limit headers for successful requests.
+ *
+ * Call this after checking rate limits to add headers to the response.
+ *
+ * @param result - The rate limit check result
+ * @returns Headers object to merge with response
+ *
+ * @example
+ * ```typescript
+ * const response = new Response(JSON.stringify(data), {
+ *   headers: {
+ *     'Content-Type': 'application/json',
+ *     ...createRateLimitHeaders(rateLimitResult),
+ *   },
+ * });
+ * ```
+ */
+export function createRateLimitHeaders(
+  result: RateLimitResult
+): Record<string, string> {
+  return {
+    "X-RateLimit-Limit": String(result.limit),
+    "X-RateLimit-Remaining": String(result.remaining),
+    "X-RateLimit-Reset": String(result.resetTime),
+  };
+}
+
+// ============================================================================
+// Singleton Store (for shared state across requests)
+// ============================================================================
+
+let _defaultStore: InMemoryRateLimitStore | null = null;
+
+/**
+ * Get the default in-memory rate limit store.
+ *
+ * Returns a singleton instance to ensure rate limit state is shared
+ * across all requests within the same process.
+ *
+ * @internal
+ */
+export function getDefaultStore(): InMemoryRateLimitStore {
+  if (!_defaultStore) {
+    _defaultStore = new InMemoryRateLimitStore();
+  }
+  return _defaultStore;
+}
+
+/**
+ * The rate-limit store this deployment is using.
+ *
+ * @public
+ *
+ * One store, three consumers: the REST limiter, the auth limiter, and any
+ * plugin that limits something of its own. A consumer that reaches for its own
+ * store instead counts in isolation, and on a deployment that spans processes
+ * the effective limit becomes `configured x instances` -- a number the operator
+ * never chose and cannot see. Configure `rateLimit.store` once, in
+ * `nextly.config.ts`, and every limiter shares the window.
+ *
+ * Falls back to the in-memory default when nothing is configured, which is
+ * correct for a single process and wrong for several. That is the same default
+ * the REST and auth limiters take, so the three agree about what they are
+ * counting whether or not a store is configured.
+ */
+export function resolveRateLimitStore(): RateLimitStore {
+  try {
+    const config = container.has("config")
+      ? container.get<{ rateLimit?: { store?: RateLimitStore } }>("config")
+      : undefined;
+    return config?.rateLimit?.store ?? getDefaultStore();
+  } catch {
+    return getDefaultStore();
+  }
+}
+
+/**
+ * Reset the default store (for testing purposes).
+ *
+ * @internal
+ */
+export function resetDefaultStore(): void {
+  if (_defaultStore) {
+    _defaultStore.destroy();
+    _defaultStore = null;
+  }
+}

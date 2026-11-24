@@ -1,0 +1,1561 @@
+/**
+ * Dev Command — Build / Sync Operations
+ *
+ * Config-driven registry sync operations extracted from `dev.ts`. This
+ * module owns the "build" phase: syncing collections/singles/components
+ * from the config into the registry, syncing user fields, and seeding
+ * permissions and user data.
+ *
+ * @module cli/commands/dev-build
+ */
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+
+import { configTheCodeOwnsIn } from "../../di/load-dynamic-tables";
+import { PermissionSeedService } from "../../domains/auth/services/permission-seed-service";
+import { CollectionRegistryService } from "../../domains/collections/services/collection-registry-service";
+import { dashboardPinsPresent } from "../../domains/dashboard/dashboard-pins";
+import { teardownEntityComponentData } from "../../domains/field-groups/services/teardown-entity-field-group-data";
+import { resolveFieldGroupRegistryName } from "../../domains/field-groups/storage/resolve-storage-names";
+import {
+  type RecordedEntities,
+  recordedBeforeOf,
+} from "../../domains/i18n/migration/recorded-before";
+import { teardownEntityI18n } from "../../domains/i18n/migration/teardown-entity-i18n";
+import {
+  bindTransitionRecorder,
+  resolveTransitionStore,
+  transitionDefaultLocale,
+} from "../../domains/i18n/migration/transition-recorder";
+import {
+  beginI18nTransition,
+  settleI18nTransition,
+} from "../../domains/i18n/migration/transition-state";
+import {
+  publishesPerLanguage,
+  storesPerLanguage,
+} from "../../domains/i18n/per-language-storage";
+import {
+  busyTableBounds,
+  type BusyTableBounds,
+} from "../../domains/schema/busy-table/bounds";
+import { runStatementsInTries } from "../../domains/schema/busy-table/run-on-session";
+import type { Deletion } from "../../domains/schema/migrate/data-loss-consent";
+import { refuseFieldGroupSwitches } from "../../domains/schema/pipeline/companion-shape-switches";
+import { registryRows } from "../../domains/schema/pipeline/recorded-fields";
+import { withSchemaChangeExcluded } from "../../domains/schema/services/schema-change-exclusion";
+import {
+  deleteEntityRegistryRow,
+  mediaUsageTablePresent,
+} from "../../domains/versions/entity-teardown";
+// Resolve the versioning config so `db:sync` persists it (parity with boot/HMR).
+import { resolveVersionsConfig } from "../../domains/versions/resolve-config";
+import {
+  describeError,
+  immediateMessage,
+  NextlyError,
+} from "../../errors/index";
+import { STORAGE_FORMAT } from "../../schemas/storage-format";
+import { CollectionSyncService } from "../../services/collections/collection-sync-service";
+import type { CollectionSyncResultWithValidation } from "../../services/collections/collection-sync-service";
+import {
+  FieldGroupRegistryService,
+  type CodeFirstComponentConfig,
+  type SyncComponentResult,
+} from "../../services/field-groups/field-group-registry-service";
+import type { Logger as ServiceLogger } from "../../services/shared/types";
+import {
+  SingleRegistryService,
+  type CodeFirstSingleConfig,
+  type SyncSingleResult,
+} from "../../services/singles/single-registry-service";
+import { UserExtSchemaService } from "../../services/users/user-ext-schema-service";
+import { UserFieldDefinitionService } from "../../services/users/user-field-definition-service";
+import type { CommandContext } from "../program";
+import type { CLIDatabaseAdapter } from "../utils/adapter";
+import type { LoadConfigResult } from "../utils/config-loader";
+import {
+  judgeDataLossWithGrace,
+  readDataLossConsent,
+} from "../utils/data-loss-consent";
+import { formatCount } from "../utils/logger";
+
+import type { ResolvedDevOptions } from "./db-sync";
+import {
+  displayComponentsSyncResults,
+  displaySinglesSyncResults,
+  displaySyncResults,
+} from "./dev-display";
+import {
+  performAutoSync,
+  performComponentsAutoSync,
+  performSinglesAutoSync,
+  performSinglesReconcile,
+} from "./dev-server";
+
+// ============================================================================
+// Orphan Record Type
+// ============================================================================
+
+/** Orphan record returned by detection functions. */
+interface OrphanRecord {
+  slug: string;
+  tableName: string;
+}
+
+// ============================================================================
+// Schema statements and a busy table
+// ============================================================================
+
+/** How a sync's own schema statements wait for a busy table, and how a report names them. */
+interface SyncStatementsRun {
+  /** What runs them, as a report names it: "the removal of orphaned singles". */
+  change: string;
+  bounds: BusyTableBounds;
+  logger: CommandContext["logger"];
+  /** What this pass applied before these statements, as a report names it. */
+  appliedBefore: readonly string[];
+  /** What a report calls the statement at `index`, never its text; by default its position. */
+  name?: (index: number) => string;
+}
+
+/**
+ * Runs a sync's own schema statements (the `user_ext` table's, the drop of an orphan's table) in
+ * order and returns what a report calls each one that ran. Each waits for a table another session
+ * is using in its own tries on one connection (`runStatementsInTries`), bounded by
+ * `NEXTLY_LOCK_TIMEOUT` / `NEXTLY_LOCK_TIMEOUT_TOTAL` (which `db:sync`'s `--lock-timeout` flags
+ * set), each try's notice through the logger's warning; one that stays busy throws
+ * `NEXTLY_TABLE_BUSY`, naming the statements before it, which stay. The command's adapter is typed
+ * as the CLI's narrower one, so an adapter offering no session runs each statement once, as before.
+ */
+async function runSyncStatements(
+  adapter: DrizzleAdapter,
+  statements: readonly string[],
+  run: SyncStatementsRun
+): Promise<readonly string[]> {
+  const nameOf =
+    run.name ??
+    ((index: number) =>
+      `statement ${String(index + 1)} of ${String(statements.length)}`);
+  const sessionCapable = [
+    "withSession",
+    "executeQuery",
+    "queryStatement",
+  ].every(method => typeof Reflect.get(adapter, method) === "function");
+  if (!sessionCapable) {
+    for (const statement of statements) {
+      await adapter.executeQuery(statement);
+    }
+    return statements.map((_, index) => `${run.change}: ${nameOf(index)}`);
+  }
+  return runStatementsInTries(adapter, statements, {
+    change: run.change,
+    bounds: run.bounds,
+    notify: line => run.logger.warn(line),
+    appliedBefore: run.appliedBefore,
+    name: nameOf,
+  });
+}
+
+// ============================================================================
+// Extension schema
+// ============================================================================
+
+/**
+ * Compile the config's extension schema — plugin tables with their indexes,
+ * and the columns and indexes plugins and the app contribute to entity
+ * tables — and make it the one the push pipeline plans from, as boot and a
+ * config reload do.
+ *
+ * Run before the syncs. Without it the CLI process holds no extension
+ * schema, so a push neither created plugin tables nor contributed columns,
+ * and planned a drop of a contributed column it found in the database. A
+ * config that declares none clears it, so a removed plugin's tables leave
+ * the desired set.
+ */
+export async function publishExtensionSchema(
+  configResult: LoadConfigResult,
+  adapter: CLIDatabaseAdapter,
+  context: CommandContext
+): Promise<void> {
+  const { compileAndPublishExtensionSchema } = await import(
+    "../../domains/schema/extension/publish"
+  );
+  const capabilities = (adapter as unknown as DrizzleAdapter).getCapabilities();
+  // Each field group under its stored table, so a contribution to a group attaches to the table
+  // it is in: `fg_<slug>` on a site whose field-group storage was migrated.
+  const fieldGroups = await storedFieldGroupsOf(adapter, configResult.config);
+  await compileAndPublishExtensionSchema({
+    ...(fieldGroups === undefined
+      ? {}
+      : {
+          fieldGroupTables: fieldGroups.tables,
+          fieldGroupTypeColumns: fieldGroups.typeColumns,
+        }),
+    dialect: capabilities.dialect,
+    plugins: configResult.config.plugins ?? [],
+    config: configResult.config,
+    // The connected server's limits: a push that declares a check or
+    // expression index the server cannot hold is refused before applying.
+    server: capabilities,
+    logger: {
+      warn: m => context.logger.warn(m),
+      debug: m => context.logger.debug(m),
+    },
+  });
+}
+
+// ============================================================================
+// Collection Sync
+// ============================================================================
+
+/**
+ * Sync collections to database and generate files
+ */
+export async function syncCollections(
+  configResult: LoadConfigResult,
+  adapter: CLIDatabaseAdapter,
+  options: ResolvedDevOptions,
+  context: CommandContext
+): Promise<void> {
+  const { logger } = context;
+  const { config } = configResult;
+
+  logger.newline();
+  logger.info("Syncing collections...");
+
+  // Create sync service with adapter cast to DrizzleAdapter
+  // The CLIDatabaseAdapter is compatible with DrizzleAdapter interface
+  const serviceLogger: ServiceLogger = {
+    info: (msg: string) => logger.debug(msg),
+    warn: (msg: string) => logger.warn(msg),
+    error: (msg: string) => logger.error(msg),
+    debug: (msg: string) => logger.debug(msg),
+  };
+
+  const syncService = new CollectionSyncService(
+    adapter as unknown as DrizzleAdapter,
+    serviceLogger
+  );
+
+  // Determine what to generate (opt-in: only generate when explicitly
+  // requested). Drizzle `.ts` schema generation was removed (orphan output);
+  // the `--schemas` flag now only drives Zod validation schema generation.
+  const generateTypes = options.types === true;
+  const generateZodSchemas = options.schemas === true;
+
+  // What each collection's registry row records before the sync below replaces it, for the apply
+  // that follows: on SQLite a relationship switched between one related entry and many is told by
+  // nothing else.
+  const recordedCollections = await registryRows(
+    () =>
+      new CollectionRegistryService(
+        adapter as unknown as DrizzleAdapter,
+        serviceLogger
+      ).getAllCollections(),
+    {
+      kind: "collections",
+      tableExists: name =>
+        (adapter as unknown as DrizzleAdapter).tableExists(name),
+    }
+  );
+
+  let result: CollectionSyncResultWithValidation;
+  try {
+    result = await syncService.syncWithValidation(config, {
+      generateZodSchemas,
+      generateTypes,
+      dialect: adapter.getCapabilities().dialect,
+      cwd: options.cwd ?? process.cwd(),
+      onRemoved: options.removeOrphaned ? "delete" : "warn",
+    });
+  } catch (error) {
+    // Name the phase that failed, then rethrow. The detail is deliberately
+    // left to the top-level handler: printing it here too would render the
+    // same description twice for a single failure.
+    logger.error("Sync failed while registering collections.");
+    throw error;
+  }
+
+  // Display sync results
+  displaySyncResults(result, options, context);
+
+  // Step 5: Auto-sync schema to database (development mode only)
+  const autoSyncEnabled = options.autoSync !== false;
+  if (autoSyncEnabled) {
+    await performAutoSync(
+      config,
+      adapter,
+      result,
+      options,
+      context,
+      recordedCollections
+    );
+  }
+
+  // Seeding moved out of syncCollections to the orchestrator (runDbSync).
+  // When collections AND singles exist, running the user seed here caused
+  // the seed to execute before singles' physical tables were created by
+  // syncSingles (which runs AFTER syncCollections). Any seed that calls
+  // nextly.updateSingle("...") then failed with
+  //   DatabaseError: no such table: single_<slug>
+  // even though the singles were registered in dynamic_singles. The fix is
+  // to seed AFTER every sync step has run — runDbSync now owns that call.
+}
+
+// ============================================================================
+// Singles Sync
+// ============================================================================
+
+/**
+ * Sync singles to database registry
+ *
+ * This syncs code-first Singles from the config to the dynamic_singles
+ * registry table. Unlike collections, Singles don't generate individual
+ * schema files - they use the registry for metadata and auto-create
+ * their data tables on first access.
+ */
+export async function syncSingles(
+  configResult: LoadConfigResult,
+  adapter: CLIDatabaseAdapter,
+  options: ResolvedDevOptions,
+  context: CommandContext
+): Promise<void> {
+  const { logger } = context;
+  const { config } = configResult;
+
+  logger.newline();
+  logger.info("Syncing singles...");
+
+  // Create service logger
+  const serviceLogger: ServiceLogger = {
+    info: (msg: string) => logger.debug(msg),
+    warn: (msg: string) => logger.warn(msg),
+    error: (msg: string) => logger.error(msg),
+    debug: (msg: string) => logger.debug(msg),
+  };
+
+  const singleRegistry = new SingleRegistryService(
+    adapter as unknown as DrizzleAdapter,
+    serviceLogger
+  );
+
+  // Transform SingleConfig[] to CodeFirstSingleConfig[]
+  const codeFirstConfigs: CodeFirstSingleConfig[] = config.singles.map(
+    single => ({
+      slug: single.slug,
+      label: single.label?.singular ?? toTitleCase(single.slug),
+      fields: single.fields,
+      description: single.description,
+      tableName: single.dbName,
+      admin: single.admin,
+      // Persist Draft/Published, i18n, and resolved versioning through db:sync
+      // (parity with the boot/HMR registry sync).
+      status: single.status === true,
+      localized: single.localized === true,
+      versions: resolveVersionsConfig(single.versions, single.status),
+      // Forward the cache-revalidation config through db:sync too, so a
+      // code-first single's disable/tags reach dynamic_singles.revalidate.
+      revalidate: single.revalidate,
+      configPath: `singles/${single.slug}.ts`,
+    })
+  );
+
+  let result: SyncSingleResult;
+  try {
+    result = await singleRegistry.syncCodeFirstSingles(codeFirstConfigs);
+  } catch (error) {
+    logger.error("Singles sync failed while registering singles.");
+    throw error;
+  }
+
+  // Detect orphaned singles (in DB with source='code' but not in config)
+  const removedSingles = await detectRemovedSingles(
+    codeFirstConfigs,
+    singleRegistry
+  );
+
+  if (removedSingles.length > 0) {
+    if (options.removeOrphaned) {
+      await handleRemovedSingles(
+        removedSingles,
+        adapter as unknown as DrizzleAdapter,
+        logger
+      );
+    } else {
+      logger.newline();
+      logger.warn(`${removedSingles.length} orphaned single(s) in database:`);
+      for (const { slug } of removedSingles) {
+        logger.item(slug, 1);
+      }
+      logger.info(
+        "These exist in the database but not in your config. Run with --remove-orphaned to delete."
+      );
+    }
+  }
+
+  // Display sync results
+  displaySinglesSyncResults(result, options, context);
+
+  // Auto-sync: Create data tables for created/updated Singles and set status to 'applied'
+  const autoSyncEnabled = options.autoSync !== false;
+  if (
+    autoSyncEnabled &&
+    (result.created.length > 0 || result.updated.length > 0)
+  ) {
+    await performSinglesAutoSync(
+      config,
+      adapter,
+      singleRegistry,
+      result,
+      options,
+      context
+    );
+  }
+
+  // Reconcile: even when no singles changed in this sync (and thus auto-sync
+  // didn't run), ensure every registered single has its physical table. This
+  // covers the "registry row exists but table missing" case that can happen
+  // after a DB reset, a dropped table, or a UI-created single whose DDL
+  // aborted. Runs unconditionally after sync so reality always matches
+  // registry by the time `pnpm dev` finishes startup.
+  if (autoSyncEnabled) {
+    await performSinglesReconcile(config, adapter, singleRegistry, context);
+  }
+}
+
+// ============================================================================
+// Components Sync
+// ============================================================================
+
+/**
+ * Sync components to database registry
+ *
+ * This syncs code-first Components from the config to the dynamic_components
+ * registry table. Components are reusable field group templates that can be
+ * embedded in Collections and Singles via the `component` field type.
+ */
+export async function syncComponents(
+  configResult: LoadConfigResult,
+  adapter: CLIDatabaseAdapter,
+  options: ResolvedDevOptions,
+  context: CommandContext
+): Promise<void> {
+  const { logger } = context;
+  const { config } = configResult;
+
+  logger.newline();
+  logger.info("Syncing components...");
+
+  // Create service logger
+  const serviceLogger: ServiceLogger = {
+    info: (msg: string) => logger.debug(msg),
+    warn: (msg: string) => logger.warn(msg),
+    error: (msg: string) => logger.error(msg),
+    debug: (msg: string) => logger.debug(msg),
+  };
+
+  const componentRegistry = new FieldGroupRegistryService(
+    adapter as unknown as DrizzleAdapter,
+    serviceLogger
+  );
+
+  // Transform FieldGroupConfig[] to CodeFirstComponentConfig[]
+  const codeFirstConfigs: CodeFirstComponentConfig[] = config.fieldGroups.map(
+    component => ({
+      slug: component.slug,
+      label: component.label?.singular ?? toTitleCase(component.slug),
+      fields: component.fields,
+      description: component.description,
+      admin: component.admin,
+      // Persist i18n through db:sync, as the singles mapping above already does.
+      // Runtime field-group writes gate on the stored flag, so leaving it unset
+      // made `db:sync` record a localized field group as non-localized:
+      // translatable values kept being treated as shared main-table fields, and a
+      // save in a non-default locale overwrote the default one.
+      localized: component.localized === true,
+      configPath: `${STORAGE_FORMAT.configPathDir}/${component.slug}.ts`,
+    })
+  );
+
+  // A relation an existing field group switches between storage shapes is refused before the
+  // registry records the new shape: this sync never converts an existing field group's columns.
+  refuseFieldGroupSwitches(
+    await registryRows(() => componentRegistry.getAllComponents(), {
+      kind: "components",
+      tableExists: name =>
+        (adapter as unknown as DrizzleAdapter).tableExists(name),
+    }),
+    config.fieldGroups
+  );
+
+  let result: SyncComponentResult;
+  try {
+    result = await componentRegistry.syncCodeFirstComponents(codeFirstConfigs);
+  } catch (error) {
+    logger.error("Field group sync failed while registering field groups.");
+    throw error;
+  }
+
+  // Detect orphaned components (in DB with source='code' but not in config)
+  const removedComponents = await detectRemovedComponents(
+    codeFirstConfigs,
+    componentRegistry
+  );
+
+  if (removedComponents.length > 0) {
+    if (options.removeOrphaned) {
+      await handleRemovedComponents(
+        removedComponents,
+        adapter as unknown as DrizzleAdapter,
+        logger
+      );
+    } else {
+      logger.newline();
+      logger.warn(
+        `${removedComponents.length} orphaned component(s) in database:`
+      );
+      for (const { slug } of removedComponents) {
+        logger.item(slug, 1);
+      }
+      logger.info(
+        "These exist in the database but not in your config. Run with --remove-orphaned to delete."
+      );
+    }
+  }
+
+  // Display sync results
+  displayComponentsSyncResults(result, options, context);
+
+  // Auto-sync: Create data tables for created/updated Components and set status to 'applied'
+  const autoSyncEnabled = options.autoSync !== false;
+  if (
+    autoSyncEnabled &&
+    (result.created.length > 0 || result.updated.length > 0)
+  ) {
+    await performComponentsAutoSync(
+      config,
+      adapter,
+      componentRegistry,
+      result,
+      options,
+      context
+    );
+  }
+}
+
+// ============================================================================
+// User Field Sync
+// ============================================================================
+
+/**
+ * Sync user custom fields and ensure user_ext table exists.
+ *
+ * Always runs (even without code-defined fields) because UI-defined
+ * fields may exist in the database. Steps:
+ * 1. Sync code fields from config → user_field_definitions table
+ * 2. Load merged fields (code + UI) into schema service
+ * 3. If merged fields exist, generate and execute CREATE TABLE IF NOT EXISTS
+ * 4. Verify user_ext table exists
+ */
+export async function syncUserFields(
+  configResult: LoadConfigResult,
+  adapter: CLIDatabaseAdapter,
+  options: ResolvedDevOptions,
+  context: CommandContext
+): Promise<void> {
+  const { logger } = context;
+  const { config } = configResult;
+
+  logger.newline();
+  logger.info("Syncing user fields...");
+
+  // Create service logger
+  const serviceLogger: ServiceLogger = {
+    info: (msg: string) => logger.debug(msg),
+    warn: (msg: string) => logger.warn(msg),
+    error: (msg: string) => logger.error(msg),
+    debug: (msg: string) => logger.debug(msg),
+  };
+
+  const drizzleAdapter = adapter as unknown as DrizzleAdapter;
+  const dialect = drizzleAdapter.getCapabilities().dialect;
+
+  // 1. Instantiate services
+  const fieldDefService = new UserFieldDefinitionService(
+    drizzleAdapter,
+    serviceLogger
+  );
+  const schemaService = new UserExtSchemaService(dialect, fieldDefService);
+
+  // 2. Sync code fields from config → user_field_definitions table
+  const codeFields = config.users?.fields || [];
+  try {
+    await fieldDefService.syncCodeFields(
+      codeFields as unknown as { name: string; [key: string]: unknown }[]
+    );
+  } catch {
+    // user_field_definitions table might not exist yet (migrations not run)
+    logger.debug("Skipping user field sync (table may not exist yet)");
+    return;
+  }
+
+  // 3. Load merged fields (code + UI)
+  try {
+    await schemaService.loadMergedFields();
+  } catch {
+    logger.debug("Skipping user field sync (could not load merged fields)");
+    return;
+  }
+
+  const mergedFields = schemaService.getMergedFieldConfigs();
+
+  if (mergedFields.length === 0) {
+    logger.success("No user custom fields defined (code or UI)");
+    return;
+  }
+
+  const codeCount = codeFields.length;
+  const uiCount = mergedFields.length - codeCount;
+  const parts: string[] = [];
+  if (codeCount > 0) parts.push(`${codeCount} code`);
+  if (uiCount > 0) parts.push(`${uiCount} UI`);
+  const breakdown = parts.length > 0 ? ` (${parts.join(", ")})` : "";
+  logger.success(
+    `Found ${formatCount(mergedFields.length, "user field")}${breakdown}`
+  );
+
+  // 4. Auto-sync: generate and execute migration SQL for user_ext table
+  const autoSyncEnabled = options.autoSync !== false;
+  if (!autoSyncEnabled) {
+    logger.debug("Auto-sync disabled, skipping user_ext table sync");
+    return;
+  }
+
+  logger.info("Auto-syncing user_ext table...");
+
+  const migrationSQL = schemaService.generateMigrationSQL(mergedFields);
+
+  // Execute the migration SQL (same pattern as singles/components)
+  const statements = migrationSQL
+    .split("--> statement-breakpoint")
+    .map((s: string) => s.trim())
+    .filter((s: string) => s.length > 0)
+    .map((statement: string) =>
+      statement
+        .split("\n")
+        .filter((line: string) => !line.trim().startsWith("--"))
+        .join("\n")
+        .trim()
+    )
+    .filter((statement: string) => statement.length > 0);
+
+  // Read before anything runs, so a bound outside its range is refused with nothing changed.
+  const bounds = busyTableBounds({ env: process.env });
+  try {
+    // The statements in order, each waiting for a busy table in tries (`runSyncStatements`).
+    await runSyncStatements(drizzleAdapter, statements, {
+      change: "the user_ext table's sync",
+      bounds,
+      logger,
+      appliedBefore: [],
+    });
+
+    // Verify table actually exists
+    const tableExists = await drizzleAdapter.tableExists("user_ext");
+    if (tableExists) {
+      logger.success("Synced user_ext table");
+    } else {
+      logger.warn("user_ext table creation SQL executed but table not found");
+    }
+  } catch (error) {
+    // A table that stayed busy past its tries stops the sync, rather than being reported as a
+    // warning the run then passes over.
+    if (NextlyError.isCode(error, "NEXTLY_TABLE_BUSY")) throw error;
+    // Table already exists is expected with CREATE TABLE IF NOT EXISTS.
+    // Match the immediate message only, so a wrapped failure carrying those
+    // words deeper in its cause chain is still reported rather than skipped.
+    const immediate = immediateMessage(error);
+    if (
+      immediate.includes("already exists") ||
+      immediate.includes("duplicate")
+    ) {
+      const tableExists = await drizzleAdapter.tableExists("user_ext");
+      if (tableExists) {
+        logger.success("user_ext table already exists");
+      }
+    } else {
+      logger.warn(`user_ext sync error: ${describeError(error)}`);
+    }
+  }
+}
+
+// ============================================================================
+// Permission Seeding
+// ============================================================================
+
+/**
+ * Seed permissions for all collections, singles, and system resources.
+ *
+ * This ensures that CRUD permissions exist for every collection (4 each:
+ * create/read/update/delete) and every single (2 each: read/update), plus
+ * all system resource permissions. Newly created permissions are auto-assigned
+ * to the super_admin role.
+ *
+ * All operations are idempotent — existing permissions are skipped.
+ * Runs on every `nextly db:sync` run and watch-mode re-sync.
+ */
+export async function performPermissionSeeding(
+  adapter: CLIDatabaseAdapter,
+  options: ResolvedDevOptions,
+  context: CommandContext
+): Promise<void> {
+  const { logger } = context;
+
+  logger.newline();
+  logger.info("Syncing permissions...");
+
+  try {
+    const drizzleAdapter = adapter as unknown as DrizzleAdapter;
+
+    // Adapt the CLI logger to the ServiceLogger interface expected by the
+    // PermissionSeedService. Routing info/debug to the CLI's debug channel
+    // keeps the seeding output concise during dev startup.
+    const serviceLogger: ServiceLogger = {
+      info: (msg: string) => logger.debug(msg),
+      warn: (msg: string) => logger.warn(msg),
+      error: (msg: string) => logger.error(msg),
+      debug: (msg: string) => logger.debug(msg),
+    };
+
+    const permissionSeedService = new PermissionSeedService(
+      drizzleAdapter,
+      serviceLogger
+    );
+
+    // Seed system permissions (users, roles, permissions, media, settings, email-*)
+    const systemResult = await permissionSeedService.seedSystemPermissions();
+
+    // Seed collection permissions (4 CRUD each)
+    const collectionResult =
+      await permissionSeedService.seedAllCollectionPermissions();
+
+    // Seed single permissions (read/update each)
+    const singleResult = await permissionSeedService.seedAllSinglePermissions();
+
+    // Auto-assign newly created permissions to super_admin role
+    const allNewIds = [
+      ...systemResult.newPermissionIds,
+      ...collectionResult.newPermissionIds,
+      ...singleResult.newPermissionIds,
+    ];
+
+    if (allNewIds.length > 0) {
+      await permissionSeedService.assignNewPermissionsToSuperAdmin(allNewIds);
+    }
+
+    // Log summary
+    const totalCreated =
+      systemResult.created + collectionResult.created + singleResult.created;
+    const totalTotal =
+      systemResult.total + collectionResult.total + singleResult.total;
+
+    if (totalCreated > 0) {
+      const parts: string[] = [];
+      if (systemResult.created > 0) {
+        parts.push(`${systemResult.created} system`);
+      }
+      if (collectionResult.created > 0) {
+        parts.push(`${collectionResult.created} collection`);
+      }
+      if (singleResult.created > 0) {
+        parts.push(`${singleResult.created} single`);
+      }
+
+      logger.success(
+        `Permissions: ${parts.join(" + ")} permission(s) created (${totalTotal} total)`
+      );
+
+      if (allNewIds.length > 0) {
+        logger.debug(
+          `Assigned ${allNewIds.length} new permission(s) to super-admin`
+        );
+      }
+    } else {
+      logger.success(`Permissions: all synced (${totalTotal} total)`);
+    }
+
+    // When remove-orphaned mode is enabled, also clean up stale permissions
+    // that no longer map to any existing code-first resource.
+    if (options.removeOrphaned) {
+      const cleanupResult =
+        await permissionSeedService.cleanupOrphanedPermissions();
+
+      if (cleanupResult.created > 0) {
+        logger.success(
+          `Permissions cleanup: removed ${cleanupResult.created} orphaned permission(s)`
+        );
+      } else {
+        logger.debug("Permissions cleanup: no orphaned permissions found");
+      }
+    }
+  } catch (error) {
+    // Handle fresh DB scenarios gracefully (tables may not exist yet). The
+    // immediate message decides: a real seeding failure that merely wraps a
+    // "does not exist" cause must still be reported, not skipped silently.
+    const immediate = immediateMessage(error);
+    if (
+      immediate.includes("no such table") ||
+      immediate.includes("does not exist") ||
+      immediate.includes("relation") ||
+      immediate.includes("doesn't exist")
+    ) {
+      logger.debug("Skipping permission seeding (tables may not exist yet)");
+    } else {
+      logger.warn(`Permission seeding failed: ${describeError(error)}`);
+    }
+  }
+}
+
+// CLI. Demo content seeding is now Payload-style: an auth-gated POST route
+// in the user's project at `src/app/admin/api/seed/route.ts` invokes the
+// seed function (under `src/endpoints/seed/`) on user action from the
+// admin UI. Eliminates the boot-/CLI-time esbuild + dynamic-import dance
+// and the silent-failure mode it introduced.
+
+// ============================================================================
+// Utilities
+// ============================================================================
+
+/**
+ * Convert slug to title case for display
+ * @example 'site-settings' -> 'Site Settings'
+ */
+function toTitleCase(str: string): string {
+  return str.replace(/[-_]/g, " ").replace(/\b\w/g, char => char.toUpperCase());
+}
+
+// ============================================================================
+// Orphan Detection & Removal Helpers
+// ============================================================================
+
+/**
+ * The data-loss consent for `--remove-orphaned`, taken once for the whole run
+ * before the first deletion of any kind.
+ *
+ * Every orphan the run deletes is collected first: each collection, Single
+ * and field group no longer in the config (its table, its translations table
+ * when there is one, and with them its registry entry and the rows stored for
+ * it in shared tables), and the permissions the cleanup retires, theirs
+ * included. They are judged together, so the person asked sees all of it, and
+ * a no or a refusal ends the run with nothing deleted. A run that cannot ask
+ * and was given no consent deletes as before, after a notice that the next
+ * release needs the consent. Nothing orphaned, nothing is asked.
+ *
+ * The deletions themselves stay where they are (the syncs and the permission
+ * seeding), which find the same orphans again under the same schema lock this
+ * runs under.
+ */
+export async function judgeOrphanRemoval(
+  configResult: LoadConfigResult,
+  adapter: CLIDatabaseAdapter,
+  options: ResolvedDevOptions,
+  context: CommandContext
+): Promise<void> {
+  if (!options.removeOrphaned) return;
+  const { logger } = context;
+  // Before anything is read, so a malformed list stops the run at once.
+  const consent = readDataLossConsent({
+    flag: options.acceptDataLoss,
+    warn: message => logger.warn(message),
+  });
+  const deletions = await collectOrphanDeletions(configResult, adapter, logger);
+  await judgeDataLossWithGrace({
+    command: "db:sync --remove-orphaned",
+    deletions,
+    consent,
+    print: line => logger.info(line),
+    warn: message => logger.warn(message),
+  });
+}
+
+/** What `--remove-orphaned` deletes, as the consent judges it. */
+export async function collectOrphanDeletions(
+  configResult: LoadConfigResult,
+  adapter: CLIDatabaseAdapter,
+  logger: CommandContext["logger"]
+): Promise<Deletion[]> {
+  const { config } = configResult;
+  const drizzleAdapter = adapter as unknown as DrizzleAdapter;
+  // Detection only: the services log nothing a person needs here.
+  const quiet: ServiceLogger = {
+    info: (msg: string) => logger.debug(msg),
+    warn: (msg: string) => logger.debug(msg),
+    error: (msg: string) => logger.debug(msg),
+    debug: (msg: string) => logger.debug(msg),
+  };
+
+  // The same detections the syncs delete from.
+  const collections = await new CollectionSyncService(
+    drizzleAdapter,
+    quiet
+  ).detectRemovedCollections(config.collections);
+  const singles = await detectRemovedSingles(
+    config.singles,
+    new SingleRegistryService(drizzleAdapter, quiet)
+  );
+  const fieldGroups = await detectRemovedComponents(
+    config.fieldGroups,
+    new FieldGroupRegistryService(drizzleAdapter, quiet)
+  );
+
+  const deletions: Deletion[] = [];
+  const entities = [
+    {
+      kind: "collection",
+      orphans: collections,
+      shared: "autosaves, version pins, ",
+    },
+    { kind: "single", orphans: singles, shared: "autosaves, version pins, " },
+    { kind: "field group", orphans: fieldGroups, shared: "" },
+  ];
+  for (const { kind, orphans, shared } of entities) {
+    for (const { slug, tableName } of orphans) {
+      // What goes with the table from tables every entity shares: named with
+      // it, so naming the table covers it without naming a shared table.
+      deletions.push({
+        kind: "table",
+        table: tableName,
+        alongside: `${kind} "${slug}": its registry entry, ${shared}field group instances and archived translations`,
+      });
+      // The translations table is dropped with it, listed as its own table
+      // as `prune` lists it.
+      if (await drizzleAdapter.tableExists(`${tableName}_locales`)) {
+        deletions.push({ kind: "table", table: `${tableName}_locales` });
+      }
+    }
+  }
+
+  // Permissions are retired with their grants. Unreadable, they are listed
+  // anyway: the cleanup may still delete some, and consent is taken for
+  // what may be deleted.
+  let permissionsGo = true;
+  try {
+    const orphanedPermissions = await new PermissionSeedService(
+      drizzleAdapter,
+      quiet
+    ).findOrphanedPermissions({
+      collections: collections.map(c => c.slug),
+      singles: singles.map(s => s.slug),
+      fieldGroups: fieldGroups.map(f => f.slug),
+    });
+    permissionsGo = orphanedPermissions.length > 0;
+  } catch (error) {
+    logger.debug(
+      `Orphaned permissions could not be read, so they are listed: ${describeError(error)}`
+    );
+  }
+  if (permissionsGo) {
+    deletions.push(
+      { kind: "rows", table: "permissions" },
+      { kind: "rows", table: "role_permissions" }
+    );
+  }
+  return deletions;
+}
+
+/**
+ * Detect singles that exist in the database with source='code' but are
+ * no longer defined in the config.
+ */
+async function detectRemovedSingles(
+  codeSingles: ReadonlyArray<{ slug: string }>,
+  registry: SingleRegistryService
+): Promise<OrphanRecord[]> {
+  const dbSingles = await registry.getAllSingles({ source: "code" });
+  const codeSlugs = new Set(codeSingles.map(s => s.slug));
+  return dbSingles
+    .filter(s => !codeSlugs.has(s.slug))
+    .map(s => ({ slug: s.slug, tableName: s.tableName }));
+}
+
+/**
+ * Delete orphaned singles: drop the data table, then remove the registry entry.
+ * Uses raw delete to avoid re-fetch issues with getSingle/updateSingle.
+ */
+async function handleRemovedSingles(
+  removed: OrphanRecord[],
+  adapter: DrizzleAdapter,
+  logger: CommandContext["logger"]
+): Promise<void> {
+  const dialect = adapter.getCapabilities().dialect;
+  const q = dialect === "mysql" ? "`" : '"';
+  // Read before anything is deleted, so a bound outside its range is refused with nothing changed.
+  const bounds = busyTableBounds({ env: process.env });
+  const change = "the removal of orphaned singles";
+  // What a busy-table report names as done before the drop that stopped.
+  const applied: string[] = [];
+
+  for (const { slug, tableName } of removed) {
+    try {
+      // Dependent data first: embedded component instances have no FK back to this table
+      // so the drop cascades nothing onto them, and the `_locales` companion holds an FK
+      // to `<main>.id` which blocks the drop outright on MySQL. Running before the registry
+      // delete keeps the single detectable as an orphan if any of this fails.
+      await teardownEntityComponentData({ adapter, parentTable: tableName });
+      await teardownEntityI18n({ adapter, slug, tableName, kind: "single" });
+
+      // Drop the data table, waiting for it in tries where another session is using it. Before
+      // the registry delete: a drop that stops leaves the entry, so the next sync still finds
+      // the orphan and drops it then.
+      const sql =
+        dialect === "postgresql"
+          ? `DROP TABLE IF EXISTS ${q}${tableName}${q} CASCADE`
+          : `DROP TABLE IF EXISTS ${q}${tableName}${q}`;
+      applied.push(
+        ...(await runSyncStatements(adapter, [sql], {
+          change,
+          bounds,
+          logger,
+          appliedBefore: applied,
+          name: () => `the drop of table ${JSON.stringify(tableName)}`,
+        }))
+      );
+
+      // Delete the registry entry directly, then the Single's autosaves and
+      // version pins, in one transaction and in that order, as the
+      // registry's own delete does: see `deleteEntityRegistryRow`.
+      // Asked before the transaction opens: see `DashboardTables`.
+      const tables = {
+        dashboardPinsPresent: await dashboardPinsPresent(adapter),
+        mediaUsagePresent: await mediaUsageTablePresent(adapter),
+      };
+      await adapter.transaction(tx =>
+        deleteEntityRegistryRow(tx, "single", slug, tables, dialect)
+      );
+      applied.push(
+        `${change}: the registry entry of single ${JSON.stringify(slug)}`
+      );
+
+      logger.success(`Deleted orphaned single: ${slug} (table: ${tableName})`);
+    } catch (error) {
+      // A table that stayed busy past its tries stops the sync, rather than being logged as one
+      // more failed deletion the run then passes over.
+      if (NextlyError.isCode(error, "NEXTLY_TABLE_BUSY")) throw error;
+      logger.error(
+        `Failed to delete single "${slug}": ${describeError(error)}`
+      );
+    }
+  }
+}
+
+/**
+ * Detect components that exist in the database with source='code' but are
+ * no longer defined in the config.
+ */
+async function detectRemovedComponents(
+  codeComponents: ReadonlyArray<{ slug: string }>,
+  registry: FieldGroupRegistryService
+): Promise<OrphanRecord[]> {
+  const dbComponents = await registry.getAllComponents({ source: "code" });
+  const codeSlugs = new Set(codeComponents.map(c => c.slug));
+  return dbComponents
+    .filter(c => !codeSlugs.has(c.slug))
+    .map(c => ({ slug: c.slug, tableName: c.tableName }));
+}
+
+/**
+ * Delete orphaned components: drop the data table, then remove the registry entry.
+ * Uses raw delete to avoid re-fetch issues with getComponent/updateComponent.
+ */
+/**
+ * Exported for its own test.
+ *
+ * The guard below is an ORDERING property — the exclusion is taken before the first drop — and the
+ * only way to observe an ordering is to invoke the thing that does it. Reaching this through
+ * `syncComponents` would mean standing up a config, a registry and a scan whose failure modes are
+ * unrelated to what is being asserted, so the test would be answering a broader question than the
+ * one it claims.
+ */
+export async function handleRemovedComponents(
+  removed: OrphanRecord[],
+  adapter: DrizzleAdapter,
+  logger: CommandContext["logger"]
+): Promise<void> {
+  // 🔴 The whole pass, not each component, and not nothing.
+  //
+  // This path does its own schema work rather than calling a service, so the exclusion belongs at
+  // the one depth where the table drop and the registry delete meet — the same reasoning that put
+  // it on the field group apply handler.
+  //
+  // It spans the LOOP because `removed` carries table names read before any of this ran. A storage
+  // migration renaming `comp_<slug>` to `fg_<slug>` between two iterations would leave the later
+  // drops addressing names that no longer exist — silently, since they are `DROP TABLE IF EXISTS` —
+  // and the field group would survive as an orphaned table nothing scans for again.
+  //
+  // `issuesDdl: true` because this genuinely drops tables: a first-ever migration must not be able
+  // to create the lock, claim it, and start renaming while this pass is already deleting.
+  //
+  // The boundary this does NOT close: `removed` was computed by a scan that ran before the lock was
+  // taken, so a migration completing between that scan and this call remains possible. Holding from
+  // the scan means moving the exclusion up into the caller, which is convergence work rather than
+  // this guard.
+  await withSchemaChangeExcluded(
+    { adapter, logger, label: "delete orphaned field groups", issuesDdl: true },
+    () => deleteOrphanedComponents(removed, adapter, logger)
+  );
+}
+
+/** The teardown itself, split out so the exclusion above reads as one decision. */
+async function deleteOrphanedComponents(
+  removed: OrphanRecord[],
+  adapter: DrizzleAdapter,
+  logger: CommandContext["logger"]
+): Promise<void> {
+  const dialect = adapter.getCapabilities().dialect;
+  const q = dialect === "mysql" ? "`" : '"';
+  // Read before anything is deleted, so a bound outside its range is refused with nothing changed.
+  const bounds = busyTableBounds({ env: process.env });
+  const change = "the removal of orphaned field groups";
+  // What a busy-table report names as done before the drop that stopped.
+  const applied: string[] = [];
+
+  for (const { slug, tableName } of removed) {
+    try {
+      // A component can host other components, whose instances point at THIS table and
+      // would be stranded by the drop. The `_locales` companion also holds an FK to
+      // `<main>.id`, blocking the drop on MySQL. Both go before the registry delete so a
+      // failure leaves the component detectable as an orphan.
+      await teardownEntityComponentData({ adapter, parentTable: tableName });
+      await teardownEntityI18n({
+        adapter,
+        slug,
+        tableName,
+        kind: "fieldGroup",
+      });
+
+      // Drop the data table, waiting for it in tries where another session is using it. Before
+      // the registry delete: a drop that stops leaves the entry, so the next sync still finds
+      // the orphan and drops it then.
+      const sql =
+        dialect === "postgresql"
+          ? `DROP TABLE IF EXISTS ${q}${tableName}${q} CASCADE`
+          : `DROP TABLE IF EXISTS ${q}${tableName}${q}`;
+      applied.push(
+        ...(await runSyncStatements(adapter, [sql], {
+          change,
+          bounds,
+          logger,
+          appliedBefore: applied,
+          name: () => `the drop of table ${JSON.stringify(tableName)}`,
+        }))
+      );
+
+      // Delete registry entry directly
+      // Resolved: this delete runs AFTER the nested instances and localized
+      // data are torn down, so addressing a registry that is not there fails
+      // once the dependent content is already gone.
+      await adapter.delete(await resolveFieldGroupRegistryName(adapter), {
+        and: [{ column: "slug", op: "=", value: slug }],
+      });
+      applied.push(
+        `${change}: the registry entry of field group ${JSON.stringify(slug)}`
+      );
+
+      logger.success(
+        `Deleted orphaned component: ${slug} (table: ${tableName})`
+      );
+    } catch (error) {
+      // A table that stayed busy past its tries stops the sync, rather than being logged as one
+      // more failed deletion the run then passes over.
+      if (NextlyError.isCode(error, "NEXTLY_TABLE_BUSY")) throw error;
+      logger.error(
+        `Failed to delete component "${slug}": ${describeError(error)}`
+      );
+    }
+  }
+}
+
+/**
+ * Create the companion `_locales` table for every localized collection, single
+ * and component in the config.
+ *
+ * The push pipeline deliberately does not manage companion tables (see
+ * `managed-tables.isCompanionTable`), and `ensureCompanionTable` — the intended
+ * db:sync/dev-boot counterpart to migration-owned creation — was only ever called
+ * at boot. Because `db:sync` runs in its own CLI process, it flipped the
+ * registry's `localized` flag and left creation to whenever the app next started;
+ * a server already running then rendered the whole localization UI over a table
+ * that did not exist.
+ *
+ * MUST be called after `syncCollections`, `syncSingles` AND `syncComponents`:
+ * the companion carries a foreign key to its main table, so running it earlier
+ * fails for whichever entity types have not been pushed yet. Idempotent —
+ * `ensureCompanionTable` returns early when the table is already there — so
+ * running it on every sync costs one probe per localized entity.
+ */
+/**
+ * Each configured field group's stored table, read from the registry, or undefined where the
+ * configuration declares none or the registry cannot be read, in which case names are derived as
+ * before (`field-group-stored-tables`).
+ */
+async function storedFieldGroupTableOf(
+  adapter: unknown,
+  config: { fieldGroups?: readonly unknown[] }
+): Promise<((slug: string) => string) | undefined> {
+  const storage = await storedFieldGroupsOf(adapter, config);
+  return storage === undefined ? undefined : slug => storage.tables.get(slug)!;
+}
+
+/** Where each declared field group is stored, as the extension compile takes it. */
+async function storedFieldGroupsOf(
+  adapter: unknown,
+  config: { fieldGroups?: readonly unknown[] }
+) {
+  const { declaredFieldGroupStorage } = await import(
+    "../../domains/field-groups/services/field-group-stored-tables"
+  );
+  return declaredFieldGroupStorage(
+    adapter as Parameters<typeof declaredFieldGroupStorage>[0],
+    config.fieldGroups
+  );
+}
+
+export async function ensureLocalizedCompanions(
+  config: LoadConfigResult["config"],
+  adapter: CLIDatabaseAdapter,
+  context: CommandContext,
+  /**
+   * Which side of the schema push this pass runs on.
+   *
+   * `beforeApply` copies an entity's existing content into its companion while the main table
+   * still carries the translatable columns. Enabling localization removes those columns from the
+   * desired schema, so the push wants to drop them; running only afterwards means the copy either
+   * never happens or happens after the values are gone. Restricted to entities whose main table
+   * already exists, since only those can hold content and a companion's foreign key needs a main
+   * table the push has not yet created for anything newer.
+   */
+  phase: "beforeApply" | "afterApply" = "afterApply",
+  options: {
+    /**
+     * Run even in production.
+     *
+     * Only `nextly migrate` passes this. The production guard below exists to stop UNATTENDED
+     * schema changes — a running deployment must not alter its own schema because a config file
+     * changed — and `migrate` is attended by definition, which is why it is also the remedy the
+     * refusal message names in production.
+     */
+    supervised?: boolean;
+    /**
+     * Treat an entity with NO transition record as owing a copy of its content.
+     *
+     * Separate from `supervised`, because being attended does not make the inference sound. An
+     * entity with no record is either an install that transitioned before transitions were
+     * recorded or one localized since birth, and nothing on disk tells them apart — so this is
+     * only ever set by an operator asking for it explicitly (`nextly migrate
+     * --repair-localization`), which is how the one missing fact, the language, gets supplied.
+     */
+    repairUntracked?: boolean;
+    /**
+     * Every entity as the registry recorded it before this run's first sync or migration
+     * (`readRecordedEntities`). With it, a field the run newly translates over a translations
+     * column already there is judged before that column is taken as the field's; without it,
+     * nothing is judged.
+     */
+    recordedBefore?: RecordedEntities;
+  } = {}
+): Promise<void> {
+  const { logger } = context;
+  // Same policy `performAutoSync` applies: production never gets unattended schema
+  // changes, and this issues DDL and can copy rows. Enforced here rather than at
+  // each call site so no caller can reintroduce the hole. In production the
+  // companion is `nextly migrate`'s job, and the write guard keeps a non-default
+  // write from destroying content until it runs.
+  if (process.env.NODE_ENV === "production" && !options.supervised) return;
+  const dialect = adapter.getCapabilities().dialect;
+  const {
+    ensureCompanionTable,
+    reconcileCompanionColumns,
+    versionScopeForEntityKind,
+    mainTableExists,
+    resolveCompanionSeedDebt,
+    survivingCompanionRefusal,
+  } = await import("../../domains/i18n/runtime/companion-io");
+  // Where transitions are recorded. Resolved whether or not the app configures a default locale:
+  // an app that has just removed its `localization` block still has companions to unwind, and
+  // asking for a locale first would hide exactly those entities.
+  const transitionStore = await resolveTransitionStore(
+    adapter as unknown as DrizzleAdapter,
+    logger
+  );
+  // The same store, plus the locale a newly created companion gets recorded with. Undefined when
+  // the app configures no default locale, in which case no entity can be localized and nothing
+  // reaches the create below.
+  const transitions = bindTransitionRecorder(
+    transitionStore,
+    await transitionDefaultLocale(adapter as unknown as DrizzleAdapter, config)
+  );
+  // Each kind's entities and how its table is named, as the boot reads them too. A field group's
+  // table is the one its registry row names: on a site whose field-group storage was migrated that
+  // is `fg_<slug>`, which no slug rule derives, and a derived name would provision a translation
+  // table beside a main table that is not there.
+  // The entities are the configuration's as code still owns it (`configTheCodeOwnsIn`): a
+  // collection a demote handed to the Schema Builder keeps the translations table the Builder's
+  // collection has, so its code entry's `localized` setting provisions or restores nothing.
+  const [{ localizableConfigEntities }, fieldGroupTable, owned] =
+    await Promise.all([
+      import("../../domains/i18n/runtime/localizable-config-entities"),
+      storedFieldGroupTableOf(adapter, config),
+      configTheCodeOwnsIn(adapter as unknown as DrizzleAdapter, config),
+    ]);
+  const groups = localizableConfigEntities(owned, fieldGroupTable);
+
+  const failures: string[] = [];
+  for (const [kind, group, resolveTableName] of groups) {
+    for (const entity of group) {
+      if (!entity.slug) continue;
+      // Restored only when its translatable values no longer belong in a companion (`storesPerLanguage`).
+      if (!storesPerLanguage(entity)) {
+        // Turning localization off is a transition too, and until now only the Schema Builder
+        // performed it: this pass skipped everything not currently localized, so a companion
+        // created from configuration was simply abandoned. Reads fall back to the main table and
+        // return what it held before the entity was localized, because every write since went to
+        // the companion. Restoring runs after the push, which is what puts the columns back.
+        if (phase === "afterApply") {
+          const { restoreDisabledCompanion } = await import(
+            "../../domains/i18n/runtime/restore-companion"
+          );
+          await restoreDisabledCompanion(
+            adapter as unknown as DrizzleAdapter,
+            {
+              kind,
+              slug: entity.slug,
+              tableName: resolveTableName(entity),
+              fields: entity.fields ?? [],
+              dialect,
+              defaultLocale: transitions?.defaultLocale,
+              store: transitionStore,
+            },
+            error => {
+              logger.error(
+                `Could not restore "${entity.slug}" from its translations table after ` +
+                  `localization was turned off. Its content is still in ` +
+                  `${resolveTableName(entity)}_locales: ` +
+                  `${error instanceof Error ? error.message : String(error)}`
+              );
+              failures.push(entity.slug!);
+            }
+          );
+        }
+        continue;
+      }
+      const tableName = resolveTableName(entity);
+      // What both companion calls below say about this entity, said once.
+      //
+      // They ask different things of it -- one creates the table, the other brings an existing
+      // one into step -- but the entity they are describing is the same entity, from the same
+      // config, in the same iteration. Spelling that description twice let the two drift on a
+      // field that belongs to neither call in particular: `status` reaching one and not the other
+      // is a companion built with a `_status` column that the reconcile then does not know about.
+      const companionEntityArgs = {
+        // The dev build syncs what nextly.config.ts declares.
+        builtBy: "codeFirst" as const,
+        slug: entity.slug,
+        tableName,
+        fields: entity.fields ?? [],
+        dialect,
+        // A per-language `_status` only where the entity publishes each language on its own.
+        status: publishesPerLanguage(entity),
+      };
+
+      // How both companion calls report a failure, differing only in what they were doing and
+      // what it costs the user.
+      //
+      // Written once because the SHAPE is the contract, not the wording: each failure has to name
+      // the entity, name the physical table, say which writes stop working, and register the slug
+      // so the command exits non-zero. A second copy keeps all four in step only for as long as
+      // nobody edits one -- and the one most likely to be edited is the message, which is the part
+      // that carries the remedy.
+      const reportCompanionFailure =
+        (attempted: string, consequence: string) =>
+        (error: unknown): void => {
+          logger.error(
+            `Could not ${attempted} the translations table for "${entity.slug}" (${tableName}_locales). ` +
+              `${consequence}: ` +
+              `${error instanceof Error ? error.message : String(error)}`
+          );
+          failures.push(entity.slug!);
+        };
+      if (
+        phase === "beforeApply" &&
+        !(await mainTableExists(
+          adapter as unknown as DrizzleAdapter,
+          tableName
+        ))
+      ) {
+        // Nothing to preserve, and no main table to reference yet. The pass after the push
+        // creates this entity's companion once its table exists.
+        continue;
+      }
+      // Before copying anything into a translations table that survived turning translation
+      // off: a column there that can no longer hold its field stops the run, before the push.
+      if (phase === "beforeApply") {
+        const refused = await survivingCompanionRefusal(
+          adapter as unknown as DrizzleAdapter,
+          {
+            ...companionEntityArgs,
+            recordedBefore: recordedBeforeOf(
+              options.recordedBefore,
+              kind,
+              entity.slug
+            ),
+          }
+        );
+        if (refused) {
+          reportCompanionFailure(
+            "prepare",
+            "Nothing was copied into it and the schema was not changed"
+          )(refused);
+          continue;
+        }
+      }
+      // `ensureCompanionTable` resolves even on failure (a first boot may not have
+      // the main table yet), so the reporter — not a try/catch — is what surfaces
+      // a real problem.
+      // `CLIDatabaseAdapter` under-declares the runtime object, which is a real
+      // DrizzleAdapter — the same conversion this file already uses for the sync
+      // service above. `ensureCompanionTable` needs `executeQuery`, which the
+      // declared CLI interface omits.
+      await ensureCompanionTable(
+        adapter as unknown as DrizzleAdapter,
+        {
+          ...companionEntityArgs,
+          // Turns creation into a transition: content already on the main table is
+          // copied in as this locale's rows, instead of being left behind an empty
+          // companion that reads null.
+          sourceLocale: transitions?.defaultLocale,
+          // Written before the DDL rather than after a successful return: MySQL commits DDL
+          // implicitly, so a crash in between would leave a companion the next run treats as
+          // pre-existing and never records. It is also what makes a failed copy recoverable.
+          recordTransition: transitions
+            ? () =>
+                beginI18nTransition(transitions, {
+                  kind,
+                  slug: entity.slug!,
+                  sourceLocale: transitions.defaultLocale,
+                })
+            : undefined,
+          // Lets an existing companion be finished rather than skipped. `enabling` means an
+          // earlier run created the table and did not complete the copy; `restored` means the
+          // companion outlived a disable, so its default-locale rows describe a main table that
+          // has been authoritative ever since and must be overwritten rather than trusted.
+          seedIncomplete: transitions
+            ? () =>
+                resolveCompanionSeedDebt(transitions, kind, entity.slug!, {
+                  defaultLocale: transitions.defaultLocale,
+                  // Only under supervision. A from-birth localized entity is untracked too and
+                  // owes nothing, so an unattended pass must not read absence as a debt.
+                  repairUntracked: options.repairUntracked === true,
+                })
+            : undefined,
+          settleTransition: transitions
+            ? token =>
+                settleI18nTransition(transitions, {
+                  kind,
+                  slug: entity.slug!,
+                  // The claim this settles, handed back by whichever of the two callbacks above
+                  // made it. A settlement that did not name one would close whatever claim it
+                  // found, including one taken over while this copy ran.
+                  token,
+                })
+            : undefined,
+        },
+        reportCompanionFailure(
+          "prepare",
+          "Writes in a non-default locale will be refused until it exists"
+        )
+      );
+      // Skipped before the push, which is what creates the columns a reconcile looks for.
+      if (phase === "beforeApply") continue;
+      // Creating the companion is not enough on its own. `ensureCompanionTable` returns
+      // immediately once the table is there, so marking a FURTHER field localized on an
+      // entity that is already localized leaves the companion a column short — while the
+      // main-table sync above has already added that column to `comp_*` / `dc_*`. The write
+      // then splits the value into a companion column that does not exist. Additive only,
+      // Additive only. The reload path reconciles too — it is dev-only, behind its own
+      // production return — so the two stay in step.
+      const columnsInStep = await reconcileCompanionColumns(
+        adapter as unknown as DrizzleAdapter,
+        {
+          ...companionEntityArgs,
+          // Decides whether `_updated_at` can be seeded from version history for this
+          // entity kind; a kind with no history correctly seeds nothing.
+          versionScope: versionScopeForEntityKind(kind),
+          recordedBefore: recordedBeforeOf(
+            options.recordedBefore,
+            kind,
+            entity.slug
+          ),
+        },
+        reportCompanionFailure(
+          "update",
+          "Newly translatable fields will fail to save until it matches"
+        ),
+        // A column left as it is that cannot hold its field is reported, never counted as a
+        // failure: the run did not change it, and an install nobody touched must not start failing.
+        message =>
+          logger.warn(
+            `The translations table for "${entity.slug}" (${tableName}_locales): ${message}`
+          )
+      );
+      // Its per-language unique indexes, once its columns are in step. A field whose rule cannot
+      // hold is reported, which fails the command, and left without its index. Not after a column
+      // failure: a refused column is not the field's, and on MySQL an index built over it would
+      // stay in place though the run fails.
+      if (!columnsInStep) continue;
+      const { reconcileCompanionUniqueIndexes } = await import(
+        "../../domains/i18n/runtime/companion-unique-reconcile"
+      );
+      await reconcileCompanionUniqueIndexes(
+        adapter as unknown as DrizzleAdapter,
+        companionEntityArgs,
+        reportCompanionFailure(
+          "index",
+          "Unique translated fields are not enforced in each language until it is"
+        )
+      );
+    }
+  }
+  // Fail the command. Exiting 0 here would tell deployment automation the schema is
+  // in step while the registry advertises localization the database cannot store, so
+  // every translation write is refused — unlike a failure from the main auto-sync
+  // pipeline, which does stop the run. Boot and the HMR reload stay best-effort by
+  // passing no reporter: they must not refuse to start over a companion.
+  if (failures.length > 0) {
+    throw NextlyError.conflict({
+      reason: "state",
+      message: `Localization could not be brought into step for: ${failures.join(", ")}. Until it succeeds, translations for these entities are either unwritable or unreadable.`,
+      logContext: {
+        reason: "localization-not-provisioned",
+        cause: "companion-provisioning-failed",
+        entities: failures,
+      },
+    });
+  }
+  // Each translated date column an earlier release made with a time zone, of every entity the
+  // registry holds, Builder-made ones included, once nothing above was refused. The development
+  // sync converts it, no earlier instance writing beside it. `nextly migrate` (`supervised`) runs
+  // while instances of the earlier release may still write, which would store a date in a
+  // non-default language shifted into a converted column, so it only names each, and `nextly
+  // upgrade`, which converts them once the release serves every instance.
+  if (phase === "afterApply") {
+    const { convertZonedDateCompanions } = await import(
+      "../../domains/i18n/runtime/zoned-date-companions"
+    );
+    await convertZonedDateCompanions(adapter as unknown as DrizzleAdapter, {
+      convert: options.supervised !== true,
+      onNotice: message => logger.info(message),
+      onWarning: message => logger.warn(message),
+    });
+  }
+}

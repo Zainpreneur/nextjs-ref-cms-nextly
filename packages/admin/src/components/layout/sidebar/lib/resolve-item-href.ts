@@ -1,0 +1,57 @@
+import { ROUTES } from "@admin/constants/routes";
+import { pluginSlug } from "@admin/lib/plugins/plugin-slug";
+import type { PluginMetadata } from "@admin/types/branding";
+
+import type { MainMenuItem } from "../sidebar-types";
+
+import { CONTENT_RAIL_ID } from "./content-rail";
+import {
+  type StandaloneLandingReader,
+  standalonePluginLanding,
+} from "./standalone-plugin-landing";
+
+// Where a primary sidebar icon points.
+//
+// Content lands on the Content overview, and collections and singles on its
+// one-table pages. Plugins follows the same convention and lands on the installed list, which renders an empty table
+// when nothing is installed. Standalone plugins have no section page, so they
+// go where `standalonePluginLanding` decides: the landing the plugin names, or
+// the first collection or menu item its panel lists for the reader.
+//
+// A pure function of the item and the caller's capabilities: every destination
+// here is decided by those two, and nothing about the answer depends on the
+// sidebar being mounted.
+export function resolveItemHref(
+  item: MainMenuItem,
+  visibleStandalonePlugins: PluginMetadata[],
+  // What a standalone plugin's landing is decided from: the collections, the
+  // reader's capabilities and permissions its panel is drawn with.
+  standaloneReader: StandaloneLandingReader,
+  // The first settings subpage the user can actually open. The default settings
+  // href (/admin/settings) is guarded by `manage-settings`, so a user whose only
+  // settings access is API Keys or Webhooks would be redirected away; the caller
+  // resolves this to a reachable subpage for them.
+  settingsHref?: string,
+  // Whether this user can open /admin/plugins, which is `manage-settings`
+  // guarded in pages/registry.ts. The plugins ICON is shown more widely than
+  // that: a user who can read a plugin-owned collection sees it in order to
+  // reach that collection through the sub-sidebar. Navigating them to the
+  // guarded page would bounce them to the dashboard and remove their only route
+  // to content they are allowed to see, so for them the icon stays a
+  // sub-sidebar opener.
+  canOpenPluginsPage = false
+): string {
+  // The Content overview. On a phone the item still opens its panel rather
+  // than navigating (`railEntryNavigates`), and the panel's title leads here.
+  if (item.id === CONTENT_RAIL_ID) return ROUTES.CONTENT;
+  if (item.id === "collections") return ROUTES.COLLECTIONS;
+  if (item.id === "singles") return ROUTES.SINGLES;
+  if (item.id === "plugins") return canOpenPluginsPage ? ROUTES.PLUGINS : "#";
+  if (item.id === "settings" && settingsHref) return settingsHref;
+  if (item.id.startsWith("standalone-")) {
+    const slug = item.id.replace("standalone-", "");
+    const sp = visibleStandalonePlugins.find(p => pluginSlug(p.name) === slug);
+    return sp ? standalonePluginLanding(sp, standaloneReader) : "#";
+  }
+  return item.href;
+}

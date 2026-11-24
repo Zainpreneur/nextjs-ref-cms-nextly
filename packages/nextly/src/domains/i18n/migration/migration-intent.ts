@@ -1,0 +1,493 @@
+import { NextlyError } from "../../../errors/nextly-error";
+
+import type { I18nTransitionKind } from "./transition-state";
+import { LOCALIZED_COLUMN_KINDS, type CompanionMigrationSpec } from "./types";
+
+/**
+ * Header field carrying a companion migration's declared intent.
+ *
+ * Written before the `-- UP` marker, so `parseSqlSections` never routes it into the executable
+ * statements. Kept on ONE line because the header is parsed line by line.
+ */
+export const LOCALIZATION_INTENT_HEADER = "-- Localization:";
+
+/**
+ * Payload version, so a later shape change can be recognised rather than guessed at.
+ *
+ * A reader that meets a HIGHER version refuses the file. Falling back to verbatim would be the
+ * worst of both: the statements were chosen for a database in a state this reader can no longer
+ * establish, and running them anyway is precisely what recording the intent exists to prevent.
+ * Absence of the field is different, and does mean verbatim — that is what every file written
+ * before this existed looks like.
+ */
+export const LOCALIZATION_INTENT_VERSION = 8;
+
+/**
+ * Every payload version this build has a parser for.
+ *
+ * A set rather than a ceiling: the question is whether this build can INTERPRET the payload, and a
+ * version it has never defined is uninterpretable whether it is above the current one or below it.
+ * When version 2 arrives and 1 is still readable, both belong here; when 1 stops being readable, it
+ * comes out and its files start refusing instead of being silently misread.
+ */
+const SUPPORTED_INTENT_VERSIONS: ReadonlySet<number> = new Set([
+  1, 2, 3, 4, 5, 6, 7, 8,
+]);
+
+/**
+ * What a companion migration file declares it is FOR, as opposed to the statements it happens to
+ * contain.
+ *
+ * The statements describe one route to the goal — the route that is right for a database which
+ * has had nothing done to it yet. Whether that route is the right one here depends on what the
+ * target database has already had done, which only the target database can say. Recording the
+ * goal separately is what lets the apply path ask.
+ *
+ * 🔴 Read from the FILE, never from the current config. A migration replayed out of history has
+ * to describe the schema as of the migration, and today's config describes today's. Resolving an
+ * old migration against a config that has since gained or dropped fields would have it do work no
+ * one ever asked for.
+ */
+/**
+ * What a companion migration file does.
+ *
+ * - `enable` relocates existing values into the companion; `create-only` makes a companion for a
+ *   collection that never held them on main; `disable` brings them home and drops the companion.
+ * - `archive` and `shared` are the two halves of fields that stop being translated while the
+ *   entity stays translated (`plan-field-leaves-migration.ts`): `archive` writes their other
+ *   languages to the archive before the main migration, and `shared` copies the default language
+ *   onto main and drops their companion columns after it.
+ * - `joins` is the opposite move, for shared fields that become translated while the entity stays
+ *   translated (`field-joins-translation.ts`): before the main migration drops their main columns,
+ *   it adds their companion columns and gives each entry's default-language row the shared value.
+ * - `unique` adds or drops the companion's per-language unique indexes, for translated fields that
+ *   become or stop being unique (`plan-translated-unique-migration.ts`). Its drops run before the
+ *   main migration, so no column they key on goes first, and its creates after every other file.
+ * - `adds` adds the companion columns of translated fields added to an entity that is already
+ *   translated (`field-added-to-translation.ts`), and its DOWN drops them.
+ * - `retypes` gives the companion columns of fields translated before and after a change the type
+ *   their new field type makes (`plan-companion-type-change.ts`). It runs before the main
+ *   migration, so the change is judged, in every language, before either runs.
+ */
+export const LOCALIZATION_MIGRATION_KINDS = [
+  "enable",
+  "create-only",
+  "disable",
+  "archive",
+  "shared",
+  "joins",
+  "unique",
+  "adds",
+  "retypes",
+] as const;
+
+export type LocalizationMigrationKind =
+  (typeof LOCALIZATION_MIGRATION_KINDS)[number];
+
+/** The kinds versions 5 to 7 declare: every kind before `retypes`. */
+const KINDS_BEFORE_RETYPES: readonly LocalizationMigrationKind[] =
+  LOCALIZATION_MIGRATION_KINDS.filter(kind => kind !== "retypes");
+
+/**
+ * The kinds each payload version can declare. Version 8 added `retypes`; 7 added no kind but the
+ * spec's `liveness`, 6 its `settings` (`SETTINGS_INTENT_VERSION`); 5 `adds`, 4 `unique`, 3
+ * `joins`, version 2 `archive` and `shared`; version 1 has only the whole-entity transitions.
+ */
+const KINDS_BY_VERSION: ReadonlyMap<
+  number,
+  readonly LocalizationMigrationKind[]
+> = new Map<number, readonly LocalizationMigrationKind[]>([
+  [1, ["enable", "create-only", "disable"]],
+  [2, ["enable", "create-only", "disable", "archive", "shared"]],
+  [3, ["enable", "create-only", "disable", "archive", "shared", "joins"]],
+  [
+    4,
+    [
+      "enable",
+      "create-only",
+      "disable",
+      "archive",
+      "shared",
+      "joins",
+      "unique",
+    ],
+  ],
+  [5, KINDS_BEFORE_RETYPES],
+  [6, KINDS_BEFORE_RETYPES],
+  [7, KINDS_BEFORE_RETYPES],
+  [8, LOCALIZATION_MIGRATION_KINDS],
+]);
+
+/**
+ * The first version whose spec may record `settings`. A build before it ignores keys it does not
+ * know, so it would run such a file without the check the settings are recorded for; at this
+ * version it refuses the file instead, as one it does not support.
+ */
+const SETTINGS_INTENT_VERSION = 6;
+
+/**
+ * The first version whose spec may record `liveness`, the ranking that chooses the value an entry
+ * keeps. A build before it would apply such a file judging the Required and Unique settings on
+ * other rows than the copy keeps, so it refuses the file instead.
+ */
+const LIVENESS_INTENT_VERSION = 7;
+
+/**
+ * The version a file of this kind is written with: the lowest that can declare it. A file of a
+ * version-1 kind stays readable by a build that knows only version 1, and a file of a newer kind
+ * is refused by such a build as a version it does not support, which says to upgrade, rather
+ * than as a corrupt version-1 file. A spec recording `settings` needs `SETTINGS_INTENT_VERSION`,
+ * so only the files that carry them leave older builds behind.
+ */
+export function intentVersionFor(
+  kind: LocalizationMigrationKind,
+  spec?: Pick<CompanionMigrationSpec, "settings" | "liveness">
+): number {
+  if (spec?.liveness !== undefined) return LIVENESS_INTENT_VERSION;
+  if (spec?.settings !== undefined) return SETTINGS_INTENT_VERSION;
+  for (const [version, kinds] of KINDS_BY_VERSION) {
+    if (kinds.includes(kind)) return version;
+  }
+  return LOCALIZATION_INTENT_VERSION;
+}
+
+export interface LocalizationMigrationIntent {
+  version: number;
+  kind: LocalizationMigrationKind;
+  /**
+   * Which kind of entity this is, which the transition record is keyed by along with the slug.
+   * A collection, a single and a field group may share one slug and only one of them may have
+   * transitioned, so a slug alone cannot find the right record.
+   */
+  entity: I18nTransitionKind;
+  spec: CompanionMigrationSpec;
+}
+
+/**
+ * Render the intent as the single header line.
+ *
+ * Keys are written in a fixed order rather than handed to `JSON.stringify` as-is, because the
+ * file's checksum covers this line: two runs that produced the same intent with keys in a
+ * different order would look like two different migrations.
+ */
+export function formatLocalizationIntent(
+  intent: Omit<LocalizationMigrationIntent, "version">
+): string {
+  const s = intent.spec;
+  const ordered = {
+    version: intentVersionFor(intent.kind, intent.spec),
+    kind: intent.kind,
+    entity: intent.entity,
+    spec: {
+      dialect: s.dialect,
+      collection: s.collection,
+      mainTable: s.mainTable,
+      companionTable: s.companionTable,
+      defaultLocale: s.defaultLocale,
+      parentIdType: s.parentIdType,
+      columns: s.columns.map(c => ({
+        name: c.name,
+        kind: c.kind,
+        ...(c.length === undefined ? {} : { length: c.length }),
+        ...(c.precision === undefined ? {} : { precision: c.precision }),
+        ...(c.scale === undefined ? {} : { scale: c.scale }),
+      })),
+      ...(s.columnsOnMain === undefined
+        ? {}
+        : { columnsOnMain: s.columnsOnMain }),
+      ...(s.status === undefined ? {} : { status: s.status }),
+      ...(s.unique === undefined
+        ? {}
+        : {
+            unique: s.unique.map(u => ({ field: u.field, column: u.column })),
+          }),
+      ...(s.retyped === undefined
+        ? {}
+        : {
+            retyped: s.retyped.map(r => ({ field: r.field, column: r.column })),
+          }),
+      ...(s.settings === undefined
+        ? {}
+        : {
+            settings: {
+              required: s.settings.required.map(r => ({
+                field: r.field,
+                column: r.column,
+              })),
+              unique: s.settings.unique.map(u => ({
+                field: u.field,
+                column: u.column,
+              })),
+            },
+          }),
+      ...(s.liveness === undefined
+        ? {}
+        : {
+            liveness: {
+              languageOrder: [...s.liveness.languageOrder],
+              publicStates: [...s.liveness.publicStates],
+              companionHasStatus: s.liveness.companionHasStatus,
+            },
+          }),
+    },
+  };
+  // `JSON.stringify` escapes newlines, so the result is always one line whatever the identifiers
+  // contain.
+  return `${LOCALIZATION_INTENT_HEADER} ${JSON.stringify(ordered)}`;
+}
+
+/**
+ * True for the line that ends the header and begins the executable SQL.
+ *
+ * Mirrors the spellings `parseSqlSections` accepts. A test pins the two in agreement, because if
+ * they drift this scan walks into statements again.
+ */
+export function isUpSectionMarker(line: string): boolean {
+  const t = line.trim();
+  return t === "-- UP" || t.startsWith("-- UP ") || t.startsWith("-- UP:");
+}
+
+/**
+ * The leading comment block, which is the only region a header field may occupy.
+ *
+ * Bounded two ways, because either can come first. A `-- UP` marker ends it — but a file may have
+ * none at all, which `parseSqlSections` explicitly supports, and in that case the boundary is the
+ * first line that is not a comment or blank. Without the second bound, a raw migration's comment
+ * beginning with this prefix is read as intent, and prose behind the prefix would then abort the
+ * whole run rather than merely being ignored.
+ */
+function headerLines(content: string): string[] {
+  const out: string[] = [];
+  for (const line of content.split("\n")) {
+    if (isUpSectionMarker(line)) break;
+    const t = line.trim();
+    // Statements end the preamble; blank lines and comments do not.
+    if (t !== "" && !t.startsWith("--")) break;
+    out.push(line);
+  }
+  return out;
+}
+
+/** Reasons this module refuses a header, named so callers can tell them from a parse failure. */
+const INTENT_REFUSAL_REASONS = new Set([
+  "localization_intent_unparsable",
+  "localization_intent_malformed",
+  "localization_intent_version_unsupported",
+]);
+
+/**
+ * Whether an error is this module refusing a declared intent.
+ *
+ * Migration discovery catches parse errors per file and drops the file with a warning, which is
+ * survivable for a file it cannot read at all. It is NOT survivable here: dropping a file whose
+ * intent is unreadable lets the run apply everything after it and report success, while the
+ * transition the file describes never happened. Callers use this to rethrow instead.
+ */
+export function isLocalizationIntentRefusal(error: unknown): boolean {
+  if (!NextlyError.is(error)) return false;
+  const reason = error.logContext?.reason;
+  return typeof reason === "string" && INTENT_REFUSAL_REASONS.has(reason);
+}
+
+/** Dialects a spec may name. Drives DDL, so an unknown one cannot be carried forward. */
+const DIALECTS = new Set(["postgresql", "mysql", "sqlite"]);
+
+/**
+ * Storage kinds a localized column may declare.
+ *
+ * Built from the declaration the spec's own type is derived from, so the set this parser accepts
+ * and the set the generator can write are the same set. A hand-kept copy drifted the moment a kind
+ * was added: the generator wrote it, this refused it, and the run aborted on a file it had just
+ * produced itself.
+ */
+const COLUMN_KINDS: ReadonlySet<string> = new Set<string>(
+  LOCALIZED_COLUMN_KINDS
+);
+
+/**
+ * A column dimension: absent, or a whole number in range.
+ *
+ * Checked as an integer rather than merely as a number because these reach DDL as
+ * `VARCHAR(n)` / `DECIMAL(p,s)`. A string, a fraction or a negative would be rendered into the
+ * statement as written, so a header that says `"precision": "20"` has to be refused here rather
+ * than interpolated later. `scale` may legitimately be zero; a length or precision may not.
+ */
+function isDimension(value: unknown, allowZero: boolean): boolean {
+  if (value === undefined) return true;
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    (allowZero ? value >= 0 : value > 0)
+  );
+}
+
+function isColumnShape(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const c = value as Record<string, unknown>;
+  return (
+    typeof c.name === "string" &&
+    COLUMN_KINDS.has(c.kind as string) &&
+    isDimension(c.length, false) &&
+    isDimension(c.precision, false) &&
+    isDimension(c.scale, true)
+  );
+}
+
+/**
+ * Shape guard for the parsed payload — the file is user-editable text, not a trusted channel.
+ *
+ * Checks EVERY field the spec declares as required, not just enough of them to look right. A
+ * partial guard is worse than none here: it hands back a value typed as a complete
+ * `CompanionMigrationSpec`, so the apply path that reads `dialect` to pick its DDL, or walks
+ * `columns` to build statements, would be trusting a guarantee nothing established.
+ */
+function isIntentShape(value: unknown): value is LocalizationMigrationIntent {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  if (typeof v.version !== "number") return false;
+  if (
+    !(KINDS_BY_VERSION.get(v.version) ?? []).includes(
+      v.kind as LocalizationMigrationKind
+    )
+  )
+    return false;
+  if (
+    v.entity !== "collection" &&
+    v.entity !== "single" &&
+    v.entity !== "fieldGroup"
+  )
+    return false;
+  const spec = v.spec;
+  if (typeof spec !== "object" || spec === null) return false;
+  const s = spec as Record<string, unknown>;
+  if (
+    typeof s.mainTable !== "string" ||
+    typeof s.companionTable !== "string" ||
+    typeof s.defaultLocale !== "string" ||
+    typeof s.collection !== "string" ||
+    typeof s.parentIdType !== "string" ||
+    !DIALECTS.has(s.dialect as string)
+  )
+    return false;
+  if (!Array.isArray(s.columns) || !s.columns.every(isColumnShape))
+    return false;
+  // Optionals: absent is fine, present and wrong is not.
+  if (
+    s.columnsOnMain !== undefined &&
+    (!Array.isArray(s.columnsOnMain) ||
+      !s.columnsOnMain.every(n => typeof n === "string"))
+  )
+    return false;
+  if (s.status !== undefined && typeof s.status !== "boolean") return false;
+  if (s.unique !== undefined && !isFieldColumnList(s.unique)) return false;
+  // The retyped fields arrived with their kind: a header of another kind carrying them was not
+  // written by a generator.
+  if (
+    s.retyped !== undefined &&
+    !(v.kind === "retypes" && isFieldColumnList(s.retyped))
+  )
+    return false;
+  // The ranking arrived with its version, as the settings did.
+  if (
+    s.liveness !== undefined &&
+    !(v.version >= LIVENESS_INTENT_VERSION && isLivenessShape(s.liveness))
+  )
+    return false;
+  // Settings arrived with their version: an older header carrying them was not written by a
+  // generator, and a hand-added key is not one to trust.
+  return (
+    s.settings === undefined ||
+    (v.version >= SETTINGS_INTENT_VERSION && isSettingsShape(s.settings))
+  );
+}
+
+/** The ranking a file records: the site's language order, the public states, the status flag. */
+function isLivenessShape(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const l = value as Record<string, unknown>;
+  const strings = (list: unknown) =>
+    Array.isArray(list) && list.every(item => typeof item === "string");
+  return (
+    strings(l.languageOrder) &&
+    strings(l.publicStates) &&
+    typeof l.companionHasStatus === "boolean"
+  );
+}
+
+/** A list of `{ field, column }` names, as `unique` and each `settings` list record them. */
+function isFieldColumnList(value: unknown): boolean {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      u =>
+        typeof u === "object" &&
+        u !== null &&
+        typeof (u as Record<string, unknown>).field === "string" &&
+        typeof (u as Record<string, unknown>).column === "string"
+    )
+  );
+}
+
+function isSettingsShape(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return isFieldColumnList(v.required) && isFieldColumnList(v.unique);
+}
+
+/**
+ * Read the declared intent out of a migration file's text.
+ *
+ * Returns null when the file declares none, which covers both an ordinary migration and a
+ * companion file written before this field existed. Those apply verbatim, exactly as they always
+ * have.
+ *
+ * @throws NextlyError when the field is present but unreadable. A header that was meant to steer
+ * the apply and cannot be understood must not be silently downgraded to "no intent" — that would
+ * quietly run the very statements the intent existed to reconsider.
+ */
+export function parseLocalizationIntent(
+  content: string,
+  filename: string
+): LocalizationMigrationIntent | null {
+  const line = headerLines(content).find(l =>
+    l.trim().startsWith(LOCALIZATION_INTENT_HEADER)
+  );
+  if (line === undefined) return null;
+
+  const payload = line.trim().slice(LOCALIZATION_INTENT_HEADER.length).trim();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch (cause) {
+    throw NextlyError.internal({
+      cause: cause instanceof Error ? cause : undefined,
+      logContext: { reason: "localization_intent_unparsable", filename },
+    });
+  }
+  // Version is settled BEFORE shape, because a newer writer is entitled to a shape this build has
+  // never seen. Checking today's shape first would report tomorrow's payload as corrupt and send
+  // the operator looking for damage that is not there, when the actual remedy is to upgrade.
+  const version =
+    typeof parsed === "object" && parsed !== null
+      ? (parsed as Record<string, unknown>).version
+      : undefined;
+  // Membership, not a comparison. A `>` gate lets 0, a negative and a fraction through as
+  // "not newer", and this build has a parser for exactly one version — so anything it cannot name
+  // is something it cannot interpret, whichever side of the current number it falls on.
+  if (typeof version === "number" && !SUPPORTED_INTENT_VERSIONS.has(version)) {
+    throw NextlyError.internal({
+      logContext: {
+        reason: "localization_intent_version_unsupported",
+        filename,
+        found: version,
+        supported: [...SUPPORTED_INTENT_VERSIONS],
+      },
+    });
+  }
+  if (!isIntentShape(parsed)) {
+    throw NextlyError.internal({
+      logContext: { reason: "localization_intent_malformed", filename },
+    });
+  }
+  return parsed;
+}

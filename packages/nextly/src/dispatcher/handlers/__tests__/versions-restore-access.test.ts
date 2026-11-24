@@ -1,0 +1,205 @@
+/**
+ * Restore is authorized as an update, so the read permission that guards
+ * history is not evaluated on the way in. These pin the gate that closes that,
+ * and the assembly of the identity it judges — an API key must be judged on its
+ * own scope, not on the account that issued it.
+ *
+ * The decision itself is covered in auth/__tests__/entity-read-access.test.ts;
+ * this file covers the wiring.
+ */
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const { restoreSpy, readableSpy, canReadSpy } = vi.hoisted(() => ({
+  restoreSpy: vi.fn(),
+  readableSpy: vi.fn(),
+  canReadSpy: vi.fn(),
+}));
+
+vi.mock("../../../domains/versions/restore-version", () => ({
+  restoreVersion: restoreSpy,
+}));
+
+vi.mock("../../../api/versions-access", () => ({
+  assertVersionDocumentReadable: readableSpy,
+  assertHistoryLocalesReadable: () => Promise.resolve(),
+  assertVersionLanguageReadable: () => Promise.resolve(null),
+  resolveSingleDocumentId: vi.fn(),
+}));
+
+// A version in no language, so the language half of the gate asks nothing.
+vi.mock("../../../di", () => ({
+  getService: vi.fn(() => ({ partOfVersion: () => Promise.resolve(null) })),
+}));
+
+// DERIVED from the real module rather than a closed literal: the handler
+// under test reaches this module for more than the one export replaced
+// here, and a literal that names only that export makes every other one
+// undefined the day a new caller appears.
+vi.mock("../../../auth/entity-read-access", async importOriginal => ({
+  ...(await importOriginal<
+    typeof import("../../../auth/entity-read-access")
+  >()),
+  canReadEntity: canReadSpy,
+}));
+
+import {
+  asCaller,
+  keyCaller,
+  sessionCaller,
+} from "../../__tests__/request-caller";
+import { restoreVersionForDocument } from "../versions-methods";
+
+const baseParams = {
+  collectionName: "posts",
+  entryId: "e1",
+  versionNo: "3",
+};
+
+const argsFor = (params: Record<string, unknown>) => ({
+  scopeKind: "collection" as const,
+  slug: "posts",
+  entryId: "e1",
+  versionNo: 3,
+  user: { id: "u1", roles: ["editor"] },
+  params,
+});
+
+describe("restoreVersionForDocument — the read gate", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    restoreSpy.mockResolvedValue({ restoredFrom: 3, droppedFields: [] });
+    readableSpy.mockResolvedValue(undefined);
+    canReadSpy.mockResolvedValue(true);
+  });
+
+  it("restores when the caller may read the entity", async () => {
+    await expect(
+      restoreVersionForDocument(argsFor(baseParams))
+    ).resolves.toMatchObject({ restoredFrom: 3 });
+    expect(restoreSpy).toHaveBeenCalled();
+  });
+
+  it("refuses when the caller may not, without writing", async () => {
+    canReadSpy.mockResolvedValue(false);
+
+    await expect(
+      restoreVersionForDocument(argsFor(baseParams))
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(restoreSpy).not.toHaveBeenCalled();
+  });
+
+  it("reports not found rather than forbidden", async () => {
+    // A distinct 403 would confirm the document exists to a caller not allowed
+    // to know that. Matches the document-level gate.
+    canReadSpy.mockResolvedValue(false);
+
+    await expect(
+      restoreVersionForDocument(argsFor(baseParams))
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("still applies the document gate after the read gate", async () => {
+    // Coarse permission is not enough on its own: owner-only rules and draft
+    // visibility are decided per document.
+    readableSpy.mockRejectedValue(
+      Object.assign(new Error("not readable"), { code: "NOT_FOUND" })
+    );
+
+    await expect(
+      restoreVersionForDocument(argsFor(baseParams))
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(restoreSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("restoreVersionForDocument — identity assembly", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    restoreSpy.mockResolvedValue({ restoredFrom: 3, droppedFields: [] });
+    readableSpy.mockResolvedValue(undefined);
+    canReadSpy.mockResolvedValue(true);
+  });
+
+  it("judges an API key on its own pinned scope", async () => {
+    await asCaller(
+      keyCaller("key-1", { userId: "u1" }),
+      () => restoreVersionForDocument(argsFor(baseParams)),
+      { actorType: "apiKey", permissions: ["read-posts"] }
+    );
+
+    expect(canReadSpy).toHaveBeenCalledWith("posts", {
+      userId: "u1",
+      authMethod: "api-key",
+      permissions: ["read-posts"],
+      roles: ["editor"],
+    });
+  });
+
+  it("forwards the API-key scope to the write, so a restore-to-published is gated", async () => {
+    // A restore replays the snapshot through the update path; when it sets
+    // status published it hits the publish gate, which for a scoped key must
+    // judge the key's own grant. The scope must reach the write.
+    await asCaller(
+      keyCaller("key-1", { userId: "u1" }),
+      () => restoreVersionForDocument(argsFor(baseParams)),
+      { actorType: "apiKey", permissions: ["read-posts", "update-posts"] }
+    );
+
+    expect(restoreSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authenticatedScope: {
+          actorType: "apiKey",
+          permissions: ["read-posts", "update-posts"],
+        },
+      })
+    );
+  });
+
+  it("treats a session caller as carrying no scoped permissions", async () => {
+    // Their grants are resolved from the database by the decision itself;
+    // forwarding an empty list keeps the two paths from being confused.
+    await asCaller(sessionCaller({ userId: "u1" }), () =>
+      restoreVersionForDocument(argsFor(baseParams))
+    );
+
+    expect(canReadSpy).toHaveBeenCalledWith("posts", {
+      userId: "u1",
+      authMethod: "session",
+      permissions: [],
+      roles: ["editor"],
+    });
+  });
+
+  it("ignores identity params a request carries, judging the caller it authenticated", async () => {
+    // Identity travels in request context, never in params, which a query
+    // string also fills. A forged key scope there does not turn a session into
+    // a key or grant it anything.
+    await asCaller(sessionCaller({ userId: "u1" }), () =>
+      restoreVersionForDocument(
+        argsFor({
+          ...baseParams,
+          _authenticatedActorType: "apiKey",
+          _authenticatedPermissions: JSON.stringify(["read-posts"]),
+        })
+      )
+    );
+
+    expect(canReadSpy).toHaveBeenCalledWith(
+      "posts",
+      expect.objectContaining({ authMethod: "session", permissions: [] })
+    );
+  });
+
+  it("judges a key with no pinned scope on no permissions", async () => {
+    // The safe direction: a key whose scope did not reach the dispatch is
+    // still a key, and holds nothing, rather than taking its owner's grants.
+    await asCaller(keyCaller("key-1", { userId: "u1" }), () =>
+      restoreVersionForDocument(argsFor(baseParams))
+    );
+
+    expect(canReadSpy).toHaveBeenCalledWith(
+      "posts",
+      expect.objectContaining({ authMethod: "api-key", permissions: [] })
+    );
+  });
+});

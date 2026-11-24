@@ -1,0 +1,130 @@
+import type { SupportedDialect } from "@nextlyhq/adapter-drizzle/types";
+
+import {
+  DEFAULT_DECIMAL_PRECISION,
+  DEFAULT_DECIMAL_SCALE,
+} from "../../schema/services/field-column-descriptor";
+
+import type { LocalizedColumnSpec } from "./types";
+
+/**
+ * Logical kind -> canonical DDL keyword, per dialect.
+ *
+ * We intentionally do NOT reuse `field-column-descriptor`'s `renderDialectType`: it is
+ * unexported and emits introspection tokens (int4/float8/bool), not DDL keywords. This
+ * mirrors `getSchemaEventsDdl`'s hand-written canonical DDL instead.
+ */
+export function ddlType(
+  col: LocalizedColumnSpec,
+  dialect: SupportedDialect
+): string {
+  const len = col.length ?? 255;
+  switch (col.kind) {
+    case "text":
+      return dialect === "mysql" ? `VARCHAR(${len})` : "TEXT";
+    case "longText":
+      // TEXT, not LONGTEXT, because a companion column mirrors one on the main table and the main
+      // table's creator emits ordinary TEXT for every field that lands on this kind. The canonical
+      // descriptor renders it the same way. LONGTEXT here described a column as a type nothing
+      // creates, and `longtext` and `text` do not normalise to each other, so the diff reported a
+      // type change on an untouched column for as long as it stood.
+      //
+      // Widening back is safe on an existing companion: this path only ADDs and DROPs columns, so
+      // a column already created as LONGTEXT is never rewritten to the narrower type.
+      return "TEXT";
+    case "shortText":
+      // Bounded on both dialects that have a bounded string; SQLite has only one.
+      return dialect === "sqlite" ? "TEXT" : `VARCHAR(${len})`;
+    case "boolean":
+      return dialect === "postgresql"
+        ? "BOOLEAN"
+        : dialect === "mysql"
+          ? "TINYINT(1)"
+          : "INTEGER";
+    case "integer":
+      return dialect === "mysql" ? "INT" : "INTEGER";
+    case "double":
+      return dialect === "postgresql"
+        ? "DOUBLE PRECISION"
+        : dialect === "mysql"
+          ? "DOUBLE"
+          : "REAL";
+    case "decimal": {
+      // Exact numeric so a localized decimal keeps its precision in the
+      // companion table; PG/SQLite render NUMERIC, MySQL DECIMAL — matching the
+      // main-table column emitted by field-column-descriptor.
+      const precision = col.precision ?? DEFAULT_DECIMAL_PRECISION;
+      const scale = col.scale ?? DEFAULT_DECIMAL_SCALE;
+      return dialect === "mysql"
+        ? `DECIMAL(${precision}, ${scale})`
+        : `NUMERIC(${precision}, ${scale})`;
+    }
+    case "timestamp":
+      // A date field's column, as the main table keeps it: on PostgreSQL a plain `timestamp`
+      // holding the UTC wall clock Nextly writes. With a time zone, every value moved or written
+      // here was read in the session's zone, so its instant was off by that zone's offset.
+      return dialect === "postgresql"
+        ? "TIMESTAMP"
+        : dialect === "mysql"
+          ? "DATETIME(3)"
+          : "INTEGER";
+    case "json":
+      return dialect === "postgresql"
+        ? "JSONB"
+        : dialect === "mysql"
+          ? "JSON"
+          : "TEXT";
+    case "fkSingle":
+      return dialect === "mysql" ? "VARCHAR(36)" : "TEXT";
+    default: {
+      const _exhaustive: never = col.kind;
+      throw new Error(`Unknown column kind: ${String(_exhaustive)}`);
+    }
+  }
+}
+
+/** Quote an identifier for the dialect (backticks on MySQL, double quotes elsewhere). */
+export function q(id: string, dialect: SupportedDialect): string {
+  return dialect === "mysql" ? `\`${id}\`` : `"${id}"`;
+}
+
+/**
+ * Escape a value for use inside a single-quoted SQL string literal (doubles embedded quotes).
+ * Defense-in-depth (L9): the values interpolated into generated migration SQL — locale codes,
+ * collection slugs, column names — are already validated upstream, but they are written to an
+ * executable `.sql` file, so escaping removes any residual injection surface.
+ */
+export function lit(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/** Cast a column expression to text for archival, per dialect. */
+/**
+ * An expression to compare byte for byte. MySQL compares text under each column's collation, and
+ * two tables created at different times can carry different ones, which it refuses to compare at
+ * all; as binary the comparison is exact and the collations do not meet. Elsewhere the expression
+ * is returned unchanged.
+ */
+export function exactText(expr: string, dialect: SupportedDialect): string {
+  return dialect === "mysql" ? `CAST(${expr} AS BINARY)` : expr;
+}
+
+/**
+ * Whether two expressions differ, treating two NULLs as equal and a NULL and a value as different.
+ * Each dialect spells null-safe comparison its own way.
+ */
+export function nullSafeDiffers(
+  left: string,
+  right: string,
+  dialect: SupportedDialect
+): string {
+  if (dialect === "mysql") return `NOT (${left} <=> ${right})`;
+  if (dialect === "sqlite") return `(${left}) IS NOT (${right})`;
+  return `(${left}) IS DISTINCT FROM (${right})`;
+}
+
+export function castText(colExpr: string, dialect: SupportedDialect): string {
+  return dialect === "mysql"
+    ? `CAST(${colExpr} AS CHAR)`
+    : `CAST(${colExpr} AS TEXT)`;
+}

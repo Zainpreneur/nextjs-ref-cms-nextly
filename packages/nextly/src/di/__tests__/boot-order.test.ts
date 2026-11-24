@@ -1,0 +1,377 @@
+/**
+ * Pending migrations run before any plugin initialises.
+ *
+ * This is an ORDERING property, so it is asserted by watching the sequence
+ * rather than by reading the code: a comment saying "before" is exactly what
+ * was there while the opposite was true.
+ *
+ * `record-settings-activity.ts` documented the hazard for core columns — an
+ * upgraded database whose `activity_log` had not migrated, and a plugin `init`
+ * inserting into a column that did not exist yet. With plugin-owned tables it
+ * stops being a hazard and becomes fatal: `init` and `onReady` would query
+ * tables no migration has created.
+ */
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+import { parseSource } from "@nextlyhq/module-specifiers/parse-source";
+import { describe, expect, it } from "vitest";
+
+// Read with node rather than through a `?raw` import: that is a bundler
+// feature with no type, and `check-types` compiles this file with plain tsc.
+const registerFile = fileURLToPath(new URL("../register.ts", import.meta.url));
+const registerText = readFileSync(registerFile, "utf8");
+const registerAst = parseSource(registerText, registerFile);
+
+/**
+ * `register.ts` between two offsets as code alone: every comment inside the
+ * range is blanked to spaces, so a call that only survives in a comment — a
+ * line commented out, or a sentence naming the call — is not found as code,
+ * and every offset still points at the same place.
+ */
+function codeBetween(start: number, end: number): string {
+  let code = registerText.slice(start, end);
+  for (const comment of registerAst.comments) {
+    if (comment.start < start || comment.end > end) continue;
+    code =
+      code.slice(0, comment.start - start) +
+      " ".repeat(comment.end - comment.start) +
+      code.slice(comment.end - start);
+  }
+  return code;
+}
+
+/** `register.ts` as code alone. */
+const registerSource = codeBetween(0, registerText.length);
+
+/**
+ * Every top-level function in `register.ts`, exported or not, by name.
+ *
+ * Taken from the parsed declarations rather than sliced between two matches in
+ * the text, so each ends where its function ends: never inside the next
+ * function's JSDoc, and never past a boundary a text search did not expect.
+ */
+const topLevelFunctions = new Map(
+  registerAst.program.body.flatMap(statement => {
+    const declaration =
+      statement.type === "ExportNamedDeclaration"
+        ? statement.declaration
+        : statement;
+    return declaration?.type === "FunctionDeclaration" && declaration.id
+      ? [[declaration.id.name, declaration] as const]
+      : [];
+  })
+);
+
+/** The code of one top-level function in `register.ts`. */
+function bodyOf(name: string): string {
+  const declaration = topLevelFunctions.get(name);
+  expect(declaration, `function ${name} in register.ts`).toBeDefined();
+  return declaration ? codeBetween(declaration.start, declaration.end) : "";
+}
+
+/**
+ * The reading itself, checked against the real file: each assertion below
+ * reads `register.ts` through the helpers above, so a helper that found the
+ * wrong text would make them pass or fail on the wrong code.
+ */
+describe("how register.ts is read", () => {
+  it("finds an exported function as well as an unexported one", () => {
+    expect(bodyOf("registerServices")).toMatch(
+      /^async function registerServices\(/
+    );
+    expect(bodyOf("registerServicesOnce")).toMatch(
+      /^async function registerServicesOnce\(/
+    );
+  });
+
+  it("ends each function where it ends, before the next one", () => {
+    const names = [...topLevelFunctions.keys()];
+    expect(names.length).toBeGreaterThan(10);
+    for (const name of names) {
+      const body = bodyOf(name);
+      for (const other of names) {
+        if (other === name) continue;
+        expect(body, `${name} reaching into ${other}`).not.toMatch(
+          new RegExp(`\\bfunction ${other}\\b`)
+        );
+      }
+    }
+  });
+
+  it("leaves comments out of the code", () => {
+    const comments = registerAst.comments.filter(
+      comment => comment.end - comment.start > 20
+    );
+    expect(comments.length).toBeGreaterThan(0);
+    for (const comment of comments) {
+      expect(registerSource).not.toContain(
+        registerText.slice(comment.start, comment.end)
+      );
+    }
+  });
+});
+
+describe("the boot sequence in registerServices", () => {
+  /**
+   * Read from the source rather than by booting a container.
+   *
+   * Booting one here would need a database, an adapter and a plugin set, and
+   * would assert the same single fact through far more machinery. The risk of
+   * a source read — that it matches a comment rather than the code — is
+   * answered by anchoring on the CALL, not on the layer banner.
+   */
+  //
+  // `registerServicesOnce` runs one named function per boot phase, so the
+  // order is read from its calls, and each phase function is checked to make
+  // the call the ordering is about.
+  const boot = bodyOf("registerServicesOnce");
+  const pluginCall = boot.indexOf("await initializePlugins(");
+  /**
+   * What has to stand before a plugin's `init` runs: its migrations applied,
+   * the applied schema version checked against what it declares, and the
+   * tables it declares created.
+   */
+  const beforePlugins = [
+    "await assertBootPluginInstallStates(",
+    "await runBootMigrations(",
+    "await assertBootPluginSchemaVersions(",
+    "await prepareExtensionTablesForInit(",
+  ];
+
+  /**
+   * A plugin that is not installed, or whose uninstall stopped part way, is
+   * refused before boot migrations: after them, a refused plugin's modules,
+   * or a half-uninstalled one's rolled-back modules, would already be
+   * applied again.
+   */
+  it("judges install state before the boot migrations, through the gate", () => {
+    const gate = boot.indexOf("await assertBootPluginInstallStates(");
+    expect(gate).toBeGreaterThan(-1);
+    expect(gate).toBeLessThan(boot.indexOf("await runBootMigrations("));
+    expect(bodyOf("assertBootPluginInstallStates")).toContain(
+      "await assertBootPluginsInstalled("
+    );
+  });
+
+  /**
+   * The gate reads only the ledger and the configuration, so it can run before
+   * any step that writes to the database or the registry. Checked after one of
+   * those, a refused plugin's Builder fields, code-first tables and registry
+   * rows would already have been written.
+   */
+  it("judges install state before any step that writes the schema or the registry", () => {
+    const gate = boot.indexOf("await assertBootPluginInstallStates(");
+    for (const step of [
+      "await reconcileBuilderTargets(",
+      "await syncCodeFirstEntities(",
+      "await runBootMigrations(",
+    ]) {
+      expect(boot.indexOf(step), step).toBeGreaterThan(-1);
+      expect(gate, step).toBeLessThan(boot.indexOf(step));
+    }
+  });
+
+  /**
+   * A lifecycle command's boot exists to run one plugin's hook. A resumed
+   * uninstall is leaving a schema version the plugin declares, and a
+   * development boot must not recreate extension tables the uninstall removed,
+   * so neither check is made in that boot.
+   */
+  it.each(["assertBootPluginSchemaVersions", "prepareExtensionTablesForInit"])(
+    "%s makes no check in a lifecycle command boot",
+    name => {
+      expect(bodyOf(name)).toContain("isLifecycleCommandBoot()");
+    }
+  );
+
+  /**
+   * A stored page, the admin's included, is served only once the tag expiry
+   * ledger is published. Where the app runs no migrations at start, nothing
+   * before the registry is read can expire a tag, so the ledger is published
+   * before the start's schema reads, each a round trip the page would wait
+   * for; where it runs them, after them, which record their own expiries.
+   */
+  it("publishes the tag expiry ledger before the schema reads, or after the migrations at start", () => {
+    const early = boot.indexOf(
+      'publishLedgerIfAt("before the schema reads", ledgerAt, adapter);'
+    );
+    const late = boot.indexOf(
+      'publishLedgerIfAt("after migrations at start", ledgerAt, adapter);'
+    );
+    const decided = boot.indexOf(
+      "const ledgerAt = ledgerPublicationOf(structure, config);"
+    );
+    for (const at of [decided, early, late]) expect(at).toBeGreaterThan(-1);
+    expect(decided).toBeLessThan(early);
+    expect(early).toBeLessThan(boot.indexOf("await prepareBootSchema("));
+    expect(early).toBeLessThan(
+      boot.indexOf("await assertBootPluginInstallStates(")
+    );
+    expect(late).toBeGreaterThan(boot.indexOf("await runBootMigrations("));
+    // Published nowhere else in the start, and only where the decision says.
+    expect(boot).not.toContain("installTagExpiryLedger(");
+    expect(bodyOf("publishLedgerIfAt")).toContain(
+      "if (at === publication) installTagExpiryLedger(adapter);"
+    );
+    // After the migrations wherever the app opts into them, before otherwise.
+    expect(bodyOf("ledgerPublicationOf")).toContain(
+      'structure.migratesAtStart || config.db?.runMigrationsOnBoot === true\n    ? "after migrations at start"\n    : "before the schema reads"'
+    );
+  });
+
+  it("runs the boot migrations inside the migration phase", () => {
+    expect(bodyOf("runBootMigrations")).toContain(
+      "await runProdMigrationsIfEnabled("
+    );
+  });
+
+  it("calls each, so the comparisons below have something to compare", () => {
+    // The population check: two -1s would satisfy "before" perfectly.
+    expect(pluginCall).toBeGreaterThan(-1);
+    for (const call of beforePlugins) {
+      expect(boot.indexOf(call), call).toBeGreaterThan(-1);
+    }
+  });
+
+  it.each(beforePlugins)("runs %s before plugins initialise", call => {
+    expect(boot.indexOf(call)).toBeLessThan(pluginCall);
+  });
+
+  /**
+   * Extension tables' foreign keys to code-first tables are added by the apply
+   * that creates those tables, by boot migrations, and in development by the
+   * extension-table reconcile. Checked before any of them, the check would
+   * refuse keys moments from being added; checked after plugins initialise,
+   * something would already have used tables missing their keys. The boot's
+   * executed path is observed by the integration suite
+   * (`fresh-install-foreign-keys.integration.test.ts`); this pins the order.
+   */
+  it("checks foreign keys to code-first tables after every step that adds them, before plugins", () => {
+    const check = boot.indexOf("await checkForeignKeysToCodeFirstTables(");
+    expect(check).toBeGreaterThan(-1);
+    for (const step of [
+      "await syncCodeFirstEntities(",
+      "await runBootMigrations(",
+      "await prepareExtensionTablesForInit(",
+    ]) {
+      expect(boot.indexOf(step), step).toBeGreaterThan(-1);
+      expect(boot.indexOf(step), step).toBeLessThan(check);
+    }
+    expect(check).toBeLessThan(pluginCall);
+    expect(bodyOf("syncCodeFirstEntities")).toContain(
+      "await createMissingCodeFirstTables("
+    );
+    expect(bodyOf("checkForeignKeysToCodeFirstTables")).toContain(
+      "await assertForeignKeysToCodeFirstTables("
+    );
+  });
+
+  /**
+   * Relations are asked of the registry once every table that registers
+   * during the boot is in it — Builder-made ones and extension tables on its
+   * first load, the code-first ones by their sync, what boot migrations
+   * created by their reload — and before a plugin's `init` can query through
+   * them.
+   */
+  it("asks whether every relation resolves once the tables are registered, before plugins", () => {
+    const check = boot.indexOf("assertBootRelationsResolve(");
+    expect(check).toBeGreaterThan(-1);
+    for (const step of [
+      "await initializeSchemaRegistry(",
+      "await syncCodeFirstEntities(",
+      "await runBootMigrations(",
+      "await prepareExtensionTablesForInit(",
+    ]) {
+      expect(boot.indexOf(step), step).toBeGreaterThan(-1);
+      expect(boot.indexOf(step), step).toBeLessThan(check);
+    }
+    expect(check).toBeLessThan(pluginCall);
+    expect(bodyOf("assertBootRelationsResolve")).toContain(
+      "checkRelationsBeforePlugins("
+    );
+  });
+
+  /**
+   * First-run setup runs inside `initializeSchemaRegistry` and decides what to
+   * create by introspecting the ACTIVE PostgreSQL schema. Published after it,
+   * a boot into a new schema introspected `public` instead — and when `public`
+   * already held another installation, found its core tables there and
+   * created nothing in the schema the adapter writes to.
+   */
+  const schemaPublication = registerSource.indexOf("setActivePostgresSchema(");
+  const schemaPhase = registerSource.indexOf("await prepareBootSchema(");
+  const schemaRegistryInit = registerSource.indexOf(
+    "await initializeSchemaRegistry("
+  );
+
+  it("publishes the PostgreSQL schema inside the schema phase", () => {
+    expect(bodyOf("prepareBootSchema")).toContain("publishBootPostgresSchema(");
+    expect(bodyOf("publishBootPostgresSchema")).toContain(
+      "setActivePostgresSchema("
+    );
+  });
+
+  it("publishes the PostgreSQL schema before the extension schema compiles", () => {
+    // Everything after the publication reads the PostgreSQL schema as its one
+    // answer, so it is published as soon as the dialect is known, before the
+    // extension schema compiles and is published beside it.
+    const phase = bodyOf("prepareBootSchema");
+    const publication = phase.indexOf("publishBootPostgresSchema(");
+    const compilation = phase.indexOf("compileAndPublishExtensionSchema(");
+    expect(publication).toBeGreaterThan(-1);
+    expect(compilation).toBeGreaterThan(-1);
+    expect(publication).toBeLessThan(compilation);
+  });
+
+  it("publishes the PostgreSQL schema exactly once", () => {
+    // Once, so a later second publication cannot quietly replace the value
+    // first-run already acted on — and present at all, so the ordering below
+    // is not satisfied by a -1.
+    expect(schemaPublication).toBeGreaterThan(-1);
+    expect(
+      registerSource.indexOf("setActivePostgresSchema(", schemaPublication + 1)
+    ).toBe(-1);
+    expect(schemaRegistryInit).toBeGreaterThan(-1);
+  });
+
+  it("publishes the PostgreSQL schema before first-run setup can run", () => {
+    expect(schemaPhase).toBeGreaterThan(-1);
+    expect(schemaPhase).toBeLessThan(schemaRegistryInit);
+  });
+});
+
+describe("the settings permission check in the Builder reconcile", () => {
+  it("refuses an unowned settings permission before any Builder row or table is written", () => {
+    // A boot that refuses the configuration must not have changed the
+    // installation first: the check is asked as soon as the Builder's entities
+    // are loaded, ahead of the materialization that writes registry rows and
+    // runs DDL.
+    const phase = bodyOf("reconcileBuilderTargets");
+    const loaded = phase.indexOf("loadBuilderEntities(");
+    const checked = phase.indexOf("assertSettingsPermissionsOwned(");
+    const written = phase.indexOf("materializeBuilderChanges(");
+    expect(loaded).toBeGreaterThan(-1);
+    expect(checked).toBeGreaterThan(-1);
+    expect(written).toBeGreaterThan(-1);
+    expect(loaded).toBeLessThan(checked);
+    expect(checked).toBeLessThan(written);
+  });
+});
+
+describe("the settings permission check before the adapter connects", () => {
+  it("refuses an unowned settings permission before first-run setup can write schema", () => {
+    // A misspelt or foreign permission is known from the config alone, so it
+    // stops the boot in the pre-connection validation, before
+    // `initializeSchemaRegistry` runs first-run setup on a fresh database.
+    expect(bodyOf("validateBootContributions")).toContain(
+      "assertSettingsPermissionsOwned("
+    );
+    const phase = bodyOf("registerServicesOnce");
+    const validated = phase.indexOf("validateBootContributions(");
+    const schemaSetup = phase.indexOf("initializeSchemaRegistry(");
+    expect(validated).toBeGreaterThan(-1);
+    expect(schemaSetup).toBeGreaterThan(-1);
+    expect(validated).toBeLessThan(schemaSetup);
+  });
+});

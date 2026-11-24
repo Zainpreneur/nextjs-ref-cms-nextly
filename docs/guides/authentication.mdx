@@ -1,0 +1,590 @@
+---
+title: Authentication
+description: Custom email + password authentication with JWT sessions, API keys, RBAC, and the super-admin bootstrap flow.
+---
+
+Nextly ships a complete custom authentication system. It is **not** built on NextAuth, Auth.js, or any OAuth library. The runtime owns:
+
+- Email + password sign-up and login (bcrypt hashing, password-strength validation, email verification).
+- Stateless JWT access tokens (jose, HS256) plus opaque refresh tokens stored hashed in the database.
+- API key authentication (`Authorization: Bearer nx_live_...`) with read-only / full-access / role-based scopes.
+- Role-Based Access Control (RBAC) with code-defined and database-managed permissions.
+- A first-administrator flow: the setup form at `/admin/setup`, behind a one-time setup token in production, or the `nextly users:create-admin` command.
+
+There is no OAuth provider integration in the runtime. Authentication is local to your database.
+
+## Limits
+
+- **Email and password, built in.** Nextly has no built-in sign-in through another provider and no built-in second factor. A plugin can add either through the `@experimental` [auth extensibility](/docs/plugins/auth) surface; no official plugin adds one.
+- **For the people who use the admin.** This is sign-in for your team: the session cookies are scoped to `/admin`. Accounts for your site's visitors are not built in; a plugin can define its own kind of signed-in person, an `@experimental` feature (see [Signed-in people of your own kind](/docs/plugins/signed-in-people)).
+- **Fixed settings.** Token lifetimes, the lockout and the login stall time are the defaults listed under [Auth configuration](#auth-configuration), not settings you can change.
+
+## How sessions work
+
+Sessions use a two-token architecture:
+
+- **Access token** -- JWT signed with HS256 (jose), 15-minute TTL. Its signature is verified, and its account is checked to still be allowed to use it, read from the database at most once every five seconds per active account (see [When an account may hold a session](#when-an-account-may-hold-a-session)). Sent as the HTTP-only `nextly_session` cookie.
+- **Refresh token** -- opaque random string, 7-day TTL, SHA-256 hashed in the database for revocation support. Sent as the HTTP-only `nextly_refresh` cookie, scoped to `/admin/api/auth` so that both refresh and sign-out receive it.
+
+When the access token expires, the admin UI silently refreshes it using the refresh token. Users only see a re-login prompt once the refresh token itself expires (7 days of inactivity by default). Every refresh consumes the old refresh token and issues a new one. A token whose row is gone is refused and logged as `refresh-token-not-found` (see [Refresh-token rotation](#refresh-token-rotation)).
+
+Cookies are scoped to `/admin/*` so Nextly auth never collides with frontend application cookies.
+
+### Reading the session in code
+
+Reading a session checks its account in the database, so Nextly must be
+initialised in the process first. Nextly's own routes start it themselves. In
+your own route, call `await getNextly({ config })` before `getSession` or
+`requireAuth`, or initialise Nextly at startup in `instrumentation.ts` with
+`createRegister(config)`. A session read in a process where Nextly has not
+been initialised fails with an internal error, and the server log names this
+fix, rather than answering without the check.
+
+```typescript
+// app/api/my-route/route.ts
+import { getNextly } from "nextly";
+import { getSession } from "nextly/auth";
+
+import config from "../../../nextly.config";
+
+export async function GET(req: Request) {
+  await getNextly({ config });
+  const result = await getSession(req, process.env.NEXTLY_SECRET ?? "");
+
+  if (!result.authenticated) {
+    return Response.json({ error: "Not authenticated" }, { status: 401 });
+  }
+
+  // result.user is the SessionUser
+  return Response.json({
+    userId: result.user.id,
+    email: result.user.email,
+    roleIds: result.user.roleIds,
+  });
+}
+```
+
+The `SessionUser` shape:
+
+| Field     | Type       | Description                           |
+| --------- | ---------- | ------------------------------------- |
+| `id`      | `string`   | User's unique ID                      |
+| `email`   | `string`   | User's email address                  |
+| `name`    | `string`   | Display name                          |
+| `image`   | `string?`  | Profile image URL                     |
+| `roleIds` | `string[]` | Array of role IDs from the JWT claims |
+
+Custom user fields defined via `defineConfig({ users: { fields } })` are also surfaced on the session user object.
+
+### Requiring authentication
+
+```typescript
+import { getNextly } from "nextly";
+import { requireAuth } from "nextly/auth";
+
+import config from "../../../nextly.config";
+
+export async function GET(req: Request) {
+  await getNextly({ config });
+  // Throws AuthenticationError if no valid session.
+  const user = await requireAuth(req, process.env.NEXTLY_SECRET ?? "");
+  return Response.json({ email: user.email });
+}
+```
+
+## When an account may hold a session
+
+Every path that ends in a session asks the same question first, whether it is a
+password login, a second factor being answered, a forced password change, a
+token refresh, or a plugin finishing an external sign-in. An account is refused
+when it is deactivated, when its address is unverified and verification is
+required, or when it is locked by failed password attempts.
+
+Each refusal answers identically, so the response cannot be used to tell a
+locked account from one that does not exist. Which of the three it was is
+recorded only for the operator: in the server log, and as `metadata.reason` on
+the `login-failed` audit row, which names no account.
+
+The exception is an unverified address when the password was correct: the
+login answers `EMAIL_NOT_VERIFIED`, so the login page can offer to resend the
+verification link. Only someone who already holds the password sees it; a wrong
+password on the same account answers like any other refusal, and a locked
+account, or one an administrator deactivated, answers generically even to the
+right password. Asking for the link again does nothing for an address that is
+already verified.
+
+The lockout is the exception to "every path": it applies to password attempts
+only. A refresh is not a password attempt, and neither is an external sign-in —
+otherwise anyone who knew an address could lock its owner out of their provider
+by typing five wrong passwords.
+
+Deactivating an account, or an administrator setting its password, ends the
+sessions it already holds within ten seconds. Every access token issued to it
+before the change is refused wherever a session is read: `getSession` and
+`requireAuth`, `GET /auth/session`, a plugin's `ctx.auth.currentUser`, and the
+admin API. That includes a token from the Direct API's `nextly.login()`,
+which is otherwise valid for 24 hours, and one whose login the change
+landed in the middle of. The account's refresh tokens are
+deleted in the same change, so its next refresh is refused with
+`REFRESH_FAILED`. That answer clears no cookies: a missing refresh row is
+answered the same way as one another tab has just rotated, whose fresh
+cookies must survive. A client treats `REFRESH_FAILED` as signed out and
+sends the person to sign in again, as the admin does. Reactivating the
+account restores none of these sessions; its owner signs in again.
+
+The same applies when people change or reset their own password: their other
+sessions end with the old password.
+
+Each token carries a number the account's row also holds, and the change
+raises it, so the check compares the two rather than times. A server reads the
+row at most once every five seconds per active account, so every instance,
+the one that made the change included, refuses within the ten seconds; the
+instance that made the change usually refuses at once. A token for an account
+that is not active, or no longer exists, reads the row on each request.
+If the database cannot be read, or takes longer than five seconds to answer,
+`getSession`, `requireAuth` and `ctx.auth.currentUser` throw, and the request
+fails rather than being answered as signed in or signed out. The check runs
+wherever a session is read through them; `verifyAccessToken` alone checks
+only the token's signature. An installation upgrading to this release adds the
+column with `nextly migrate`, as for any new core column.
+
+A deactivation also outlasts the account's own links. While an administrator
+has an account switched off, following its verification link verifies the
+address without activating the account, no new verification link is sent, and
+an invite link or a password-reset link is refused. Activating the account
+again lifts all of these.
+
+## Reset and verification links belong to one account
+
+A password-reset or email-verification link is issued for the account that
+holds the address it is sent to, and records that account. It works only for
+that account, and only while the account still holds that address:
+
+- Changing an account's address revokes every reset and verification link it
+  holds. A link sent to the old address stays dead even if the account later
+  moves back to it.
+- Deleting an account removes its links, whatever address they went to.
+- Someone who is later given an address keeps their own account: a link sent
+  to an earlier holder of the address never resets or verifies theirs.
+
+Issuing, following, changing an address and deleting an account are ordered
+against each other, so a link issued or followed while the account is moving
+or being deleted either completes first and is then revoked, or is refused.
+
+An installation upgrading to this release adds the column with
+`nextly migrate`, as for any new core column. The same run removes every
+password reset link already sent, so anyone part-way through a reset requests
+a new link: a reset link may have been given any lifetime, and its stored
+times cannot show reliably when it was sent. It ties each email verification
+link already sent to the account it was issued for, so it keeps working, when
+that account was created and last changed before the link was sent. A
+verification link whose account was created or changed afterwards, or in the
+same second, may have been sent to someone else, so it is removed, and its
+owner requests a new one. Expired links, and links to an address no account
+holds, are removed too. Until that run, a link from before the upgrade is
+refused.
+
+These guarantees hold once every server runs this release. During a rolling
+deploy, a server still on the previous release keeps the previous behaviour:
+it neither revokes a link when an address changes nor checks the account when
+a link is followed. Drain the old servers before relying on them.
+
+## What a token is for
+
+Session tokens and the pending tokens of a second-factor exchange carry a
+`typ` header naming their purpose, and each is verified for one purpose only,
+so a pending token cannot be presented as a session, whatever else it carries.
+Preview tokens are kept apart by their own derived key and audience.
+
+A session token with no `typ` header no longer verifies. This is the release
+the header's introduction named in advance, and it stops accepting a token
+that carries no purpose wherever a session is read. A Direct API token minted
+before the header existed stops working: mint a new one with `nextly.login()`.
+Browser sessions are unaffected, because access tokens rotate every fifteen
+minutes, so none older than the change survives.
+
+## Signing in with an external provider
+
+A plugin that has authenticated someone elsewhere finishes the login through
+core rather than assembling a session itself, using `ctx.auth.completeLogin`.
+It applies the same account-state rules, hooks and audit trail as a password
+login, so a plugin cannot grant a session core would have refused. The app
+must also list the plugin in `auth.loginPlugins`: an enabled plugin that
+declares the login capability, or a hook that decides who is signed in,
+without being listed refuses to start, naming the plugin and the line to add.
+
+A sign-in interrupted by a second factor resumes on the login page without a
+token ever appearing in a URL: the pending token travels in an HttpOnly cookie
+and the page asks the server which challenge is outstanding.
+
+See [plugin authentication](/docs/plugins/auth) for the full flow.
+
+## The first administrator
+
+> **Needs the release after 0.0.2-alpha.68.** Before it, setup has no token and closes once the first account exists, and registration is open: create the first administrator before the site is reachable, or keep it behind your host's access protection until you have.
+
+The first administrator is the account that holds the built-in `Super Admin` role. Nextly creates it in one of two ways: the setup form at `/admin/setup`, or the `nextly users:create-admin` command. Either way the account gets the role, the core permission rows are seeded, and setup then closes.
+
+Setup stays open until someone holds `Super Admin`, directly or through a role that inherits it, not until the first account exists. An install that already has accounts but no `Super Admin` holder therefore still offers setup: give one of its accounts the role before you upgrade to this behaviour. Once someone holds it, `POST /admin/api/auth/setup` returns `403 SETUP_COMPLETE`.
+
+Only an account the app provisions itself can become the first administrator: the setup form, the command, or your own server code. An account someone created through [registration](#registration) never does, and gets no role. Setup also refuses an email address that already belongs to an account, so it never takes one over.
+
+### In development
+
+The first time someone visits `/admin`, the panel redirects them to `/admin/setup` (driven by `GET /admin/api/auth/setup-status`). Under `next dev` the form asks only for a name, an email and a password, creates the account and signs the new administrator in, in a single CSRF-protected request.
+
+### In production: the setup token
+
+While `NODE_ENV` is `production` and nobody holds `Super Admin`, `/admin/setup` also asks for a **setup token**, and `setup-status` reports `requiresSetupToken: true`. Without it, anyone who reached the site first could make themselves its administrator. The token comes from one of two places:
+
+- **Generated.** At the first production start with no administrator, Nextly generates a token and prints it once to the server's output, on a line that starts with `[nextly] SETUP TOKEN`, beside the setup address: `https://<VERCEL_PROJECT_PRODUCTION_URL>/admin/setup` on Vercel, otherwise `/admin/setup` on the site. Search the deployment's logs for that prefix. A generated token is valid for 24 hours and for one setup; a start after it expires prints a new one. Only a digest of it is stored.
+- **Set by you.** `NEXTLY_SETUP_TOKEN` in the environment is the token, and nothing is generated. It must be at least 43 characters long with at least 16 distinct characters; a weaker value keeps setup closed, and the server's start-up output says so on a `[nextly] SETUP TOKEN` line. Setting it discards any generated token for good.
+
+`nextly setup-token --generate` prints a value suitable for `NEXTLY_SETUP_TOKEN` and changes nothing.
+
+Lost a generated token? Run `nextly setup-token` with the install's own environment, so it reaches the production database. It replaces the token and prints the new one, and the old one stops working. It refuses while `NEXTLY_SETUP_TOKEN` is set, since that variable is the token and is changed where it is set.
+
+A valid token completes setup whatever the auth rate limit holds. A missing, wrong or expired one gets one answer, "A valid setup token is required. Find it in the server's output, or set NEXTLY_SETUP_TOKEN.", and counts against the [auth rate limit](#auth-rate-limit), which answers `429` once it is spent. One setup runs at a time: of simultaneous attempts, exactly one creates the administrator, and the others are told setup is complete and create no account. The token is spent when the administrator is created, so afterwards no token opens setup again. `nextly setup-token` refuses once an administrator exists; `nextly setup-token --generate` reads no database and always prints a value.
+
+### From the command line
+
+`nextly users:create-admin` creates the first administrator directly in the database, with no browser and no setup token:
+
+```bash
+NEXTLY_ADMIN_PASSWORD='<your password>' \
+  pnpm nextly users:create-admin --email admin@example.com --name "Site Admin"
+```
+
+- It uses the database the environment names (`DATABASE_URL`, and `DB_DIALECT` when set), as the other `nextly` commands do, so run it with the production environment to set up a production install.
+- The password comes from `NEXTLY_ADMIN_PASSWORD`, or, at a terminal, from a prompt that does not echo and asks twice. It is never taken from an argument. It must pass the same strength rules as the setup form: 8 to 128 characters, with a lowercase letter, an uppercase letter, a number and a symbol. The command lists the rules it fails.
+- A missing `--email` or `--name` is prompted for at a terminal; with no terminal, the command refuses and names the flag.
+- It refuses, creating nothing and exiting with code 1, when an administrator already exists, when another setup is in progress at that moment, when an account already uses that email (matched as sign-in matches it), or when the password is weak, the two prompts differ, the email is invalid or no password source is available.
+- It spends any generated setup token, as the setup form does, so a pending one stops working.
+- On success it prints "Created the first administrator. Sign in as \<email\>." and exits with code 0.
+
+### Notes
+
+- Passwords are validated for strength (length, character classes) before hashing -- see `validatePasswordStrength` for the exact rules.
+- `Super Admin` is a system role that bypasses every permission check. Hand it out sparingly.
+- Only a super-admin can give someone super-admin authority. That covers assigning `Super Admin` or a role that inherits it, creating or updating a user with one, and making a role inherit one, by adding inheritance or through `childRoleIds`. Anyone else gets `403 FORBIDDEN`, including an API key made by a super-admin. Server code with no request caller, such as the Direct API, is unaffected.
+- Making a role super-admin, by having it inherit `Super Admin`, also makes super-admin every role that inherits that role, and everyone who holds one of them.
+- Only a super-admin can take super-admin authority away, by any role change or by removing the account: replacing a user's roles, unassigning a role, removing a role's inheritance, replacing its `childRoleIds`, deleting the role, or deleting or deactivating a super-admin's account. Anyone else gets `403 FORBIDDEN`, including an API key made by a super-admin, even when another super-admin would remain. Server code with no request caller, such as the Direct API, is unaffected.
+- The last active super-admin can't be removed. Deleting them, deactivating them, or taking the role from them is refused with `409 CONFLICT` ("Make another user super-admin first"), whether the request comes from the admin, the REST API or the Direct API. A caller who isn't a super-admin is refused with `403 FORBIDDEN` first, by the rule above, since they may not take super-admin from anyone. A plugin may not make these writes to any super-admin account, so it gets `403 FORBIDDEN` instead. Every active super-admin counts, whether they hold `Super Admin` itself or a role that inherits it, as long as that assignment has no expiry. One that expires ends without a request to refuse, so it doesn't count, and neither does a deactivated account. A change to a role is refused the same way when it would leave no super-admin: removing the inheritance the last one depends on, replacing the role's `childRoleIds`, or deleting the role (`409 CONFLICT`, "This change would leave no active super-admin. Make another user super-admin first."). To remove the last one, first make another user super-admin. Two such changes sent at once can't remove both of the last two.
+- For programmatic / test seeding, `seedSuperAdmin(adapter, { email, password, name? })` exists, but the recommended path is the setup wizard. It ships **no** default credentials -- `email` and `password` are required, and it throws a `VALIDATION_ERROR` if either is missing, so a known-weak default admin can never be created by accident. Pass throwaway values in tests and real, secret values anywhere else.
+
+## Roles
+
+Roles are managed in the admin UI at **Settings -> Roles** (`/admin/security/roles`) or programmatically via `RoleService`. Each role has a `name`, `slug`, `level`, and optional `description`.
+
+The seeded `Super Admin` role bypasses every check. Other roles you create are gated by their assigned permissions.
+
+### Checking access in code
+
+Ask whether the user may do something, rather than which roles they hold: a user whose custom role holds the permission is then allowed too. `nextly.access.check` asks the same access decision every route uses, collection and Single rules included.
+
+For a read, `true` means the user may read some entries. Where the collection's `read` rule answers a filter, the user may read only the entries the filter matches, and a read through Nextly in the user's context applies it. So read with that context (`overrideAccess: false` and the user) rather than as a trusted call, which returns every entry. A write whose rule answers a filter is answered `false`.
+
+The example below authenticates a signed-in session, so a request carrying only an API key is answered `401` before any check. `nextly.access.check` judges the user named by `userId`: it doesn't know about an API key's own scope, which can be narrower than the user who made the key.
+
+```typescript
+import { getNextly } from "nextly";
+import { getSession, isSuperAdmin } from "nextly/auth";
+
+import config from "../../../nextly.config";
+
+export async function GET(req: Request) {
+  const nextly = await getNextly({ config });
+  const result = await getSession(req, process.env.NEXTLY_SECRET ?? "");
+  if (!result.authenticated) {
+    return Response.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const userId = result.user.id;
+
+  if (
+    await nextly.access.check({
+      userId,
+      resource: "posts",
+      operation: "update",
+    })
+  ) {
+    // the user may update posts
+  }
+
+  if (await isSuperAdmin(userId)) {
+    // the user holds super-admin authority
+  }
+}
+```
+
+`nextly/auth` has no role checks. A session carries role ids, not role names, so ask the question you mean: a permission through `nextly.access.check`, or super-admin authority through `isSuperAdmin`.
+
+## Permissions
+
+Permissions follow the slug format `<action>-<resource>` -- e.g. `read-users`, `create-roles`, `update-api-keys`, `update-settings`. The four standard actions are `create`, `read`, `update`, `delete`; a few resources have a `manage` permission of their own, such as `manage-background-jobs`.
+
+> **Upgrading:** `manage-media`, `manage-settings`, `manage-email-providers` and `manage-email-templates` are retired. Run `nextly migrate` after updating (`nextly db:sync` in development): it gives each role holding one the plain `read-`, `create-`, `update-` and `delete-` permissions on that resource. Until it has run, a role holding only the retired permission is refused there.
+
+Permissions for the core resources (`users`, `roles`, `permissions`) are seeded the first time the database is set up. Permissions for collections and singles you define in `nextly.config.ts` are wired up by the collection / single registration path -- you don't need to add them to a seeder.
+
+For the full RBAC reference (role hierarchy, the seeded permission inventory, sidebar gating), see the [Admin overview](/docs/admin#permissions).
+
+## Code-defined access control
+
+You can attach access rules directly to collections and singles via `defineCollection({ access })`. Rules can be a boolean or a function that receives the request context. A declared rule only narrows the role's permission: a signed-in user or an API key needs the permission first, and the rule lets them through only by returning `true`. Super Admin always bypasses everything. Don't decide by a role's name: a custom role, or an API key, that holds the permission would be refused.
+
+```typescript
+// src/collections/posts.ts
+import { defineCollection } from "nextly/config";
+
+export default defineCollection({
+  slug: "posts",
+  access: {
+    // Boolean: visitors can read, and signed-in callers holding read-posts
+    read: true,
+
+    // Function: on top of the role's update-posts, not during a content freeze
+    update: () => process.env.CONTENT_FREEZE !== "on",
+
+    // Create and delete declare no rule: the role's permission decides
+  },
+  fields: [
+    // ...
+  ],
+});
+```
+
+## API key authentication
+
+Nextly supports API keys via the `Authorization: Bearer nx_live_...` header (no `X-API-Key` header). Keys are created and managed in the admin UI at **Settings -> API Keys**.
+
+### Token types
+
+| Type          | Permissions                                                            |
+| ------------- | ---------------------------------------------------------------------- |
+| `read-only`   | Only the `read-*` slugs from the creator's roles.                      |
+| `full-access` | All permissions of the creator's roles.                                |
+| `role-based`  | Permissions of an explicitly chosen role (independent of the creator). |
+
+A key created by a Super Admin copies the whole permission catalogue rather than the role's rows, because the Super Admin's power is a bypass and the role only holds the permissions that existed when the install was set up: a `read-only` key of theirs can read every collection, including one added later, and still cannot write. A role that inherits Super Admin counts, the same way it counts everywhere else.
+
+Keys can be time-bound (set an expiry date) and revoked at any time. The full key value is shown to the operator **once** at creation; the database only stores the SHA-256 hash.
+
+A key acts with its creator's authority, so it is refused while its creator is deactivated and works again once they are reactivated. The instance that deactivates the account refuses its keys at once, and every other instance within ten seconds, the same bound as the account's sessions. A key is a credential of its own: an administrator setting the creator's password ends their sessions but not their keys.
+
+### How verification works
+
+When a request includes a `Bearer` token, the auth middleware:
+
+1. Hashes the key with SHA-256 and looks it up in the `api_keys` table.
+2. Rejects expired or revoked keys, and keys whose creator is deactivated.
+3. Enforces per-key rate limiting (default: 1,000 requests/hour, configurable via `apiKeys.rateLimit` in `defineConfig()`).
+4. Resolves the effective permission set based on the token type and creator's roles.
+5. Attaches an `AuthContext` with `authMethod: "api-key"` to the request.
+
+```typescript
+// Client-side usage
+const response = await fetch(
+  "https://example.com/admin/api/collections/posts/entries",
+  {
+    headers: {
+      Authorization: "Bearer nx_live_<random>...",
+    },
+  }
+);
+```
+
+## Security features
+
+### Brute-force protection
+
+Failed logins are tracked per-user. After 5 consecutive failures, the account is locked for 15 minutes. Counters reset on successful login.
+
+### Login stall time
+
+Every login response is held for at least 500ms regardless of whether the account exists. This prevents email enumeration via response timing.
+
+### Auth rate limit
+
+A separate rate limit guards `/auth/login`, `/auth/register`, `/auth/forgot-password`, `/auth/verify-email/resend`, `/auth/verify-email`, `/auth/reset-password`, `/auth/accept-invite`, `/auth/challenge/resolve` and `/auth/set-initial-password`. It stops credential stuffing before per-user lockout kicks in. The budget is 30 requests an hour by default, set with `security.authRateLimit`; `requestsPerHour: 0` turns it off. What it counts against depends on whether Nextly can read the client's address.
+
+**When the client address can be read**, every request from that address counts against one budget, across all of these routes. An address can be read only when `security.trustProxy` is `true` and the request came through a proxy that reports the client (see [Deployment](/docs/guides/deployment#client-addresses-and-the-auth-rate-limit)).
+
+**When it cannot**, which is every request while `security.trustProxy` is unset (the default), each request counts against the account it names instead:
+
+| Request                                                                                           | Counts against                                                                                                                               |
+| ------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Sign-in, registration, password-reset request, verification resend                                | The email address in the body, compared the way sign-in compares it (case and surrounding spaces ignored), whether or not an account has it. |
+| Password reset, email verification, invite acceptance, second-factor answer, initial-password set | The account the request's token belongs to.                                                                                                  |
+| A body that names no address, or a token that belongs to no account                               | One shared account-less budget.                                                                                                              |
+
+Sign-in is keyed on the `email` its body carries, which is what the built-in password strategy reads. A [custom strategy](/docs/plugins/auth#naming-the-account-to-the-sign-in-rate-limit) that signs people in from something else, such as a username or an OAuth code, names what it reads with `limitKey`, and its sign-ins are then keyed on that, in a budget of their own per name; rotating the `email` buys nothing. A strategy without `limitKey` leaves the limiter unable to tell which strategy will handle a sign-in, so sign-ins are keyed on the `email` they carry, one that carries none counts against the account-less budget below (30 an hour by default), and the server names that strategy at startup. Behind a proxy, `security.trustProxy` keeps every strategy's sign-in per client instead.
+
+Each account, and the account-less budget, gets the configured budget (30 an hour by default). All of these requests together are also held to a ceiling of 100 times that budget (3,000 an hour by default), so inventing addresses buys no extra attempts. A request whose address can be read never counts against the ceiling.
+
+These counts are kept per server process unless the app gives `rateLimit.store` a store object of its own that every instance shares, such as one backed by Redis ([`rateLimit`](/docs/configuration/nextly-config#ratelimit)). The built-in `"database"` [limit store](/docs/configuration/limit-store) does not count sign-in limits yet. On Vercel, or any deployment with more than one instance, each instance otherwise counts on its own, so every budget and the ceiling are multiplied by the number of instances. Configure a shared store object wherever the limits must hold as written.
+
+What happens when each is spent. Each refused request is answered with `429` and a `Retry-After` header saying when to try again. With Nextly's own counts, that is when the oldest counted request leaves the window (an hour by default). A store object of your own keeps its own window and reports when it resets. One without `consume` also counts the requests it refuses, so, depending on how it keeps its window, a client that keeps retrying can keep its budget spent.
+
+- **An account's budget:** requests naming that account are refused. Other accounts are unaffected until the ceiling is met.
+- **The account-less budget:** requests that name no account, or carry a token that matches none, are refused. Requests that name an account are unaffected.
+- **The ceiling:** every request whose address cannot be read is refused, whatever it names. Requests whose address can be read are unaffected.
+
+A request its own budget refuses can still count toward the ceiling, so the ceiling can be met by requests that are themselves refused:
+
+- On the token routes (password reset, email verification, invite acceptance, second-factor answer, initial-password set), a request that carries a token spends a ceiling place before the token is looked up, because that lookup is the work the ceiling bounds. It has spent it whether the token turns out to belong to an account or to none.
+- With a shared store object, two requests for the same account that arrive together can both pass the check for its last place, and the one then refused has spent a ceiling place.
+- With a store object that has no `consume`, every refused request counts toward the ceiling.
+
+Two limits remain while addresses cannot be read. Someone who knows an address can spend that one account's budget and hold its sign-in shut for the window. Someone sending requests at the ceiling's rate can hold every unreadable-address sign-in shut for as long as they keep it up. Making client addresses readable removes both.
+
+Nextly says when it is counting this way. Starting on Vercel with `security.trustProxy` unset logs a warning naming the setting. The first auth request that arrives with proxy headers (`x-forwarded-for`, `cf-connecting-ip` or `x-real-ip`) but still yields no address logs one warning per process, naming `security.trustProxy` and `TRUSTED_PROXY_IPS`.
+
+### CSRF protection
+
+All state-changing auth endpoints (login, logout, register, setup, password operations) use double-submit CSRF tokens plus Origin/Referer validation. Add additional allowed origins via the `NEXTLY_ALLOWED_ORIGINS` env var (comma-separated). A self-hosted server (`next start` or standalone) takes its own origin from the address it listens on, not from your public URL, so list the origin browsers use whenever it differs from that address — behind a proxy, by IP or hostname, or in a container — or sign-in and plugin-route writes are refused with `CSRF_FAILED`.
+
+### Refresh-token rotation
+
+Every successful refresh consumes the old refresh token and issues a new one. A token that matches no row answers 401 `REFRESH_FAILED` without clearing the cookies, and logs a `refresh-token-not-found` warning (without the token). Watch that warning for replays of a consumed token, but not every one is theft: it also fires for a second tab a round trip behind a rotation another tab made, for a session that was revoked, and for a cookie holding a value that was never issued. The cookies are left alone because nothing is revoked there, and clearing them would sign out the tab that just rotated.
+
+Two refreshes presenting the same token get one rotation. The one that loses the race answers 401 `REFRESH_SUPERSEDED` and leaves the cookies alone. The admin retries with the cookies it now holds; any other client should retry once with its current cookies.
+
+A refresh from another network or browser than the one its token was issued to still rotates. With `security.trustProxy` on, each refresh token records the client address and User-Agent it was issued to, and a refresh from another IP family, another IPv4 /24 or IPv6 /48, or another User-Agent logs a `refresh-client-changed` warning naming what changed (never the addresses). It is not refused, because one browser reaches a site from several addresses in ordinary use: a carrier-grade NAT or a connection with several uplinks picks a public address per connection, and a dual-stack browser connects over IPv4 or IPv6. Watch that warning beside `refresh-token-not-found` for a session used from somewhere unexpected.
+
+### Session revocation on password change and deactivation
+
+Every password write ends the account's sessions: an administrator setting it (`updateUser` or `PATCH /admin/api/users/:id/password`), the user changing their own, a reset, accepting an invite, and setting an initial password. Deactivating an account does the same. Each deletes all of the account's refresh tokens in the same transaction as the write, forcing re-login on every device.
+
+## Password management
+
+Passwords are hashed with bcryptjs (12 salt rounds) unless your app brings its own hasher ([below](#your-own-password-hasher)). The `AuthService` and password handlers cover the full lifecycle:
+
+- `registerUser()` -- creates a new user with strength-validated password.
+- `verifyCredentials()` -- validates email + password for login.
+- `changePassword()` -- updates the password after verifying the current one; revokes all sessions.
+- `generatePasswordResetToken()` -- issues a single-use SHA-256-hashed token (24-hour expiry) and sends the reset email.
+- `resetPasswordWithToken()` -- consumes the token and updates the password.
+- `generateEmailVerificationToken()` / `verifyEmail()` -- email verification flow.
+
+Raw tokens are returned to the user once (in the email link); only the hashes are stored.
+
+### Your own password hasher
+
+To store passwords with another scheme, for example argon2 for accounts brought over from another system, set `auth.passwordHasher` in your config. It is then the one scheme for every account password: creating an account, an administrator setting one, a person changing theirs, a reset link, an invite, the first password, and every sign-in.
+
+```ts
+// nextly.config.ts
+import { hash, verify } from "@node-rs/argon2";
+import { defineConfig } from "nextly/config";
+
+export default defineConfig({
+  auth: {
+    passwordHasher: {
+      name: "argon2id",
+      hash: password => hash(password),
+      verify: (password, stored) => verify(stored, password),
+      // What the hasher reads whole: argon2 reads the whole password.
+      reach: "unbounded",
+      // Recognise your own hashes, so a stored value that is neither yours nor
+      // core's bcrypt is never compared.
+      isHash: stored => stored.startsWith("$argon2"),
+    },
+  },
+});
+```
+
+Set it in the config rather than passing `passwordHasher` to `getNextly`: Nextly starts once per process, and a request to the route handler can start it before your code calls `getNextly`. Every way it starts reads the config, and so does `nextly users:create-admin`, which hashes the administrator it creates with your hasher. Two different hashers, one in each place, are refused at startup.
+
+- `reach` (or `validate`) is required: it tells the password rules how much of a password your hasher reads, so a longer one is refused rather than cut short. The admin's password forms check the same limit before they submit, or none where your hasher reads a password whole.
+- `isHash` is optional. Without it, any stored value that is not core's bcrypt goes to your `verify`. If your hasher writes bcrypt itself (a peppered bcrypt, say), declare `isHash` so its values can be told from core's older ones: without it, every bcrypt value counts as yours, and an older one signs in only if your `verify` accepts it.
+- Accounts that already have a bcrypt password keep signing in. The first sign-in that proves the password stores it again with your hasher, provided your hasher reads the whole password and the password is no longer than the 72 bytes bcrypt compares; otherwise it stays bcrypt. Only the hash changes: existing sessions stay signed in, and the time the password was set is kept.
+- Password fields in your collections are content, not sign-in credentials, and keep using core's bcrypt (`verifyPassword` from `nextly/auth` checks them).
+
+## Auth configuration
+
+The `auth` block in `defineConfig()` exposes opt-in flags. The TTLs and brute-force settings listed below as defaults are wired in the runtime today; they are not yet exposed as user-tunable config keys.
+
+```typescript
+// nextly.config.ts
+import { defineConfig } from "nextly/config";
+
+export default defineConfig({
+  auth: {
+    // When false (default), /auth/register returns the same "we've sent a
+    // confirmation link" response whether or not the email exists. Set to
+    // true only if you don't care about email enumeration (e.g. closed
+    // admin tool with controlled signup).
+    revealRegistrationConflict: false,
+  },
+});
+```
+
+### Registration
+
+> **Needs the release after 0.0.2-alpha.68.**
+
+Self-registration is off unless the `auth` block sets `allowRegistration: true`. While it's off, `POST /admin/api/auth/register` answers `403` "Registration is not open.", creating no account and sending no email; an account already awaiting verification can still verify. With it on, a registered account gets no role, and never becomes the [first administrator](#the-first-administrator).
+
+> **Needs the release after 0.0.2-alpha.75.**
+
+The admin follows the same setting. Its sign-in page offers "Sign up" only while registration is on, and `/admin/register` shows its form only then; while it's off, that page says registration is closed and links back to sign-in. Both read the setting from `GET /admin/api/auth/setup-status`, which reports it as `allowRegistration`.
+
+Built-in defaults you can rely on (not configurable yet):
+
+| Setting                    | Default    |
+| -------------------------- | ---------- |
+| Access-token TTL           | 15 minutes |
+| Refresh-token TTL          | 7 days     |
+| Max login attempts         | 5          |
+| Lockout duration           | 15 minutes |
+| Login stall time           | 500ms      |
+| Bcrypt salt rounds         | 12         |
+| Require email verification | true       |
+
+## Environment variables
+
+| Variable                 | Required    | Description                                                                                                                                                                            |
+| ------------------------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NEXTLY_SECRET`          | yes (prod)  | JWT signing secret. **Min 32 characters in production.**                                                                                                                               |
+| `NEXTLY_ALLOWED_ORIGINS` | self-hosted | Comma-separated additional CSRF origins; include the origin browsers use whenever it differs from the address the server listens on.                                                   |
+| `NEXT_PUBLIC_APP_URL`    | yes (prod)  | Public URL of the deployment, used in email links.                                                                                                                                     |
+| `NEXTLY_SETUP_TOKEN`     | no          | The production [setup token](#in-production-the-setup-token), at least 43 characters with at least 16 distinct ones. Unset, Nextly generates one and prints it to the server's output. |
+| `NEXTLY_ADMIN_PASSWORD`  | no          | The password `nextly users:create-admin` gives the [first administrator](#from-the-command-line), read instead of prompting. Set it only for that command.                             |
+
+Generate `NEXTLY_SECRET` with:
+
+```bash
+openssl rand -base64 32
+```
+
+## Auth endpoints
+
+| Method | Path                                   | Description                                                                                                                   |
+| ------ | -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| GET    | `/admin/api/auth/setup-status`         | Is setup still open, does it need a setup token (`requiresSetupToken`), and does the app take sign-ups (`allowRegistration`)? |
+| GET    | `/admin/api/auth/session`              | Get the current session.                                                                                                      |
+| GET    | `/admin/api/auth/csrf`                 | Mint a CSRF token.                                                                                                            |
+| GET    | `/admin/api/auth/pending`              | Which second factor an interrupted sign-in left outstanding. Never returns the token itself.                                  |
+| GET    | `/admin/api/auth/ui`                   | The login page's provider buttons, challenge views and slots.                                                                 |
+| POST   | `/admin/api/auth/setup`                | Create the first super-admin (auto-logs in); in production, with the setup token.                                             |
+| POST   | `/admin/api/auth/login`                | Email + password login.                                                                                                       |
+| POST   | `/admin/api/auth/challenge/resolve`    | Answer a second factor with the pending token.                                                                                |
+| POST   | `/admin/api/auth/set-initial-password` | Replace an administrator-set password at first sign-in.                                                                       |
+| POST   | `/admin/api/auth/logout`               | Revoke the current session.                                                                                                   |
+| POST   | `/admin/api/auth/refresh`              | Rotate access + refresh tokens.                                                                                               |
+| POST   | `/admin/api/auth/register`             | User registration, when `auth.allowRegistration` is on.                                                                       |
+| PATCH  | `/admin/api/auth/change-password`      | Change password (auth required).                                                                                              |
+| POST   | `/admin/api/auth/forgot-password`      | Request a password-reset email.                                                                                               |
+| POST   | `/admin/api/auth/reset-password`       | Reset password with the email token.                                                                                          |
+| POST   | `/admin/api/auth/accept-invite`        | Set a password from an invite link.                                                                                           |
+| POST   | `/admin/api/auth/verify-email`         | Verify email with the email token.                                                                                            |
+| POST   | `/admin/api/auth/verify-email/resend`  | Resend the verification email.                                                                                                |
+
+## Next steps
+
+- [Email](/docs/guides/email) -- configure the provider that sends password-reset and verification emails.
+- [Admin overview](/docs/admin#permissions) -- the seeded permissions, sidebar gating, and per-route checks.
+- [Collections](/docs/configuration/collections) -- attach access rules to your collections.
+- [Configuration reference](/docs/configuration/nextly-config) -- the full `defineConfig()` shape.
+- [REST API](/docs/api-reference/rest-api) -- request / response shapes for the auth endpoints.

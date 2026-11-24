@@ -1,0 +1,516 @@
+import { describe, expect, it, vi } from "vitest";
+
+import {
+  groupMysqlForeignKeys,
+  introspectLiveSnapshot,
+  parseSqliteIndexStatement,
+} from "../introspect-live";
+
+const PG_COLS = {
+  rows: [
+    {
+      table_name: "dc_posts",
+      column_name: "id",
+      udt_name: "int4",
+      is_nullable: "NO",
+      column_default: null,
+      is_primary_key: true,
+    },
+    {
+      table_name: "dc_posts",
+      column_name: "title",
+      udt_name: "text",
+      is_nullable: "YES",
+      column_default: null,
+      is_primary_key: false,
+    },
+    {
+      table_name: "dc_posts",
+      column_name: "status",
+      udt_name: "varchar",
+      is_nullable: "NO",
+      column_default: "'draft'::character varying",
+      is_primary_key: false,
+    },
+  ],
+};
+
+describe("introspectLiveSnapshot - postgresql", () => {
+  it("builds snapshot from columns + indexes (two queries)", async () => {
+    // 1st execute = columns; 2nd execute = index rows.
+    const execute = vi
+      .fn()
+      .mockResolvedValueOnce(PG_COLS)
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            table: "dc_posts",
+            index: "uq_dc_posts_slug",
+            unique: true,
+            column: "slug",
+          },
+        ],
+      });
+    const db = { execute };
+
+    const snapshot = await introspectLiveSnapshot(db, "postgresql", [
+      "dc_posts",
+    ]);
+
+    expect(execute).toHaveBeenCalledTimes(4);
+    expect(snapshot.tables[0].columns).toEqual([
+      {
+        name: "id",
+        type: "int4",
+        nullable: false,
+        default: undefined,
+        primaryKey: true,
+      },
+      { name: "title", type: "text", nullable: true, default: undefined },
+      {
+        name: "status",
+        type: "varchar",
+        nullable: false,
+        default: "'draft'::character varying",
+      },
+    ]);
+    expect(snapshot.tables[0].indexes).toEqual([
+      { name: "uq_dc_posts_slug", columns: ["slug"], unique: true },
+    ]);
+  });
+
+  it("gives every table a defined (possibly empty) indexes array", async () => {
+    const execute = vi
+      .fn()
+      .mockResolvedValueOnce(PG_COLS)
+      .mockResolvedValueOnce({ rows: [] });
+    const db = { execute };
+    const snapshot = await introspectLiveSnapshot(db, "postgresql", [
+      "dc_posts",
+    ]);
+    expect(snapshot.tables[0].indexes).toEqual([]);
+  });
+
+  it("returns empty snapshot when tableNames is empty (no query issued)", async () => {
+    const execute = vi.fn();
+    const db = { execute };
+    const snapshot = await introspectLiveSnapshot(db, "postgresql", []);
+    expect(execute).not.toHaveBeenCalled();
+    expect(snapshot.tables).toEqual([]);
+  });
+});
+
+describe("introspectLiveSnapshot - mysql", () => {
+  // Three queries, in this order: columns, the PRIMARY key's columns, then the
+  // secondary indexes. A mock short by one silently shifts every later result
+  // onto the wrong query, so the count is part of what these tests pin.
+  it("handles mysql2's [rows, fields] tuple + reads indexes", async () => {
+    const execute = vi
+      .fn()
+      .mockResolvedValueOnce([
+        [
+          {
+            TABLE_NAME: "dc_posts",
+            COLUMN_NAME: "id",
+            COLUMN_TYPE: "int(11)",
+            IS_NULLABLE: "NO",
+            COLUMN_DEFAULT: null,
+            DATA_TYPE: "int",
+            EXTRA: "",
+          },
+        ],
+        [],
+      ])
+      .mockResolvedValueOnce([
+        [{ TABLE_NAME: "dc_posts", COLUMN_NAME: "id" }],
+        [],
+      ])
+      .mockResolvedValueOnce([
+        [
+          {
+            TABLE_NAME: "dc_posts",
+            INDEX_NAME: "idx_dc_posts_views",
+            NON_UNIQUE: 1,
+            COLUMN_NAME: "views",
+            SEQ_IN_INDEX: 1,
+          },
+        ],
+        [],
+      ]);
+    const db = { execute };
+
+    const snapshot = await introspectLiveSnapshot(db, "mysql", ["dc_posts"]);
+
+    expect(snapshot.tables[0].columns[0]).toEqual({
+      name: "id",
+      type: "int(11)",
+      nullable: false,
+      default: undefined,
+      primaryKey: true,
+      // MySQL reports the DECLARATION in `COLUMN_TYPE`, so a display width declared on the column
+      // is part of what it says. Recorded as reported rather than judged here: whether a modifier
+      // is meaningful for a given type is the consumer's question, and inventing an absence would
+      // be the same error as inventing a width.
+      typeModifier: "11",
+    });
+    expect(snapshot.tables[0].indexes).toEqual([
+      { name: "idx_dc_posts_views", columns: ["views"], unique: false },
+    ]);
+    expect(execute).toHaveBeenCalledTimes(5);
+  });
+
+  it("keys only the columns the PRIMARY index names", async () => {
+    // `COLUMN_KEY` is not consulted, and this is why: MySQL reports `PRI` for
+    // a NOT NULL UNIQUE index when the table has no primary key at all,
+    // because InnoDB promotes such an index to the clustered key. The fixture
+    // says `PRI` on a column the PRIMARY index does not name, so a reader that
+    // trusted it would key `slug`.
+    const execute = vi
+      .fn()
+      .mockResolvedValueOnce([
+        [
+          {
+            TABLE_NAME: "dc_posts",
+            COLUMN_NAME: "slug",
+            COLUMN_TYPE: "varchar(40)",
+            IS_NULLABLE: "NO",
+            COLUMN_DEFAULT: null,
+            COLUMN_KEY: "PRI",
+            DATA_TYPE: "varchar",
+            EXTRA: "",
+          },
+        ],
+        [],
+      ])
+      // No PRIMARY index on the table.
+      .mockResolvedValueOnce([[], []])
+      .mockResolvedValueOnce([[], []]);
+
+    const snapshot = await introspectLiveSnapshot({ execute }, "mysql", [
+      "dc_posts",
+    ]);
+
+    expect(
+      snapshot.tables[0].columns.filter(c => c.primaryKey === true)
+    ).toEqual([]);
+  });
+
+  it("quotes a literal default and leaves an expression alone", async () => {
+    // MySQL reports a string default without quotes, unlike the other two
+    // dialects, and `EXTRA` is what separates a literal from an expression.
+    const execute = vi
+      .fn()
+      .mockResolvedValueOnce([
+        [
+          {
+            TABLE_NAME: "dc_posts",
+            COLUMN_NAME: "status",
+            COLUMN_TYPE: "varchar(20)",
+            IS_NULLABLE: "NO",
+            COLUMN_DEFAULT: "dra'ft\\x",
+            DATA_TYPE: "varchar",
+            EXTRA: "",
+          },
+          {
+            TABLE_NAME: "dc_posts",
+            COLUMN_NAME: "n",
+            COLUMN_TYPE: "int(11)",
+            IS_NULLABLE: "YES",
+            COLUMN_DEFAULT: "5",
+            DATA_TYPE: "int",
+            EXTRA: "",
+          },
+          {
+            TABLE_NAME: "dc_posts",
+            COLUMN_NAME: "made_at",
+            COLUMN_TYPE: "datetime",
+            IS_NULLABLE: "YES",
+            COLUMN_DEFAULT: "CURRENT_TIMESTAMP",
+            DATA_TYPE: "datetime",
+            EXTRA: "DEFAULT_GENERATED",
+          },
+        ],
+        [],
+      ])
+      .mockResolvedValueOnce([[], []])
+      .mockResolvedValueOnce([[], []]);
+
+    const snapshot = await introspectLiveSnapshot({ execute }, "mysql", [
+      "dc_posts",
+    ]);
+
+    expect(snapshot.tables[0].columns.map(c => c.default)).toEqual([
+      // Backslash escaped first, then the quote doubled.
+      "'dra''ft\\\\x'",
+      "5",
+      "CURRENT_TIMESTAMP",
+    ]);
+  });
+
+  it("restores the parentheses information_schema strips from an expression default", async () => {
+    // MySQL reports a function-call expression default without the enclosing
+    // parentheses it REQUIRES, so the reported text is not valid DDL. Every
+    // row here carries DEFAULT_GENERATED; what separates them is the form the
+    // server reports, not the flag.
+    const columns = [
+      // What a required JSON, repeater, group or chips field emits. The
+      // reported text is the case a rebuild fails on.
+      ["payload", "json", "convert(0x7b7d using utf8mb4)"],
+      ["listing", "json", "json_array()"],
+      ["ident", "varchar", "uuid()"],
+      // Already parenthesised as a whole: anything but a single call is
+      // reported this way and is valid as it stands.
+      ["total", "int", "(1 + 2)"],
+      // The documented exception, bare and with a precision. Wrapping either
+      // would record it as the ordinary expression `now()` instead.
+      ["made_at", "datetime", "CURRENT_TIMESTAMP"],
+      ["seen_at", "datetime", "CURRENT_TIMESTAMP(3)"],
+    ] as const;
+
+    const execute = vi
+      .fn()
+      .mockResolvedValueOnce([
+        columns.map(([name, dataType, columnDefault]) => ({
+          TABLE_NAME: "dc_posts",
+          COLUMN_NAME: name,
+          COLUMN_TYPE: dataType,
+          IS_NULLABLE: "NO",
+          COLUMN_DEFAULT: columnDefault,
+          DATA_TYPE: dataType,
+          EXTRA: "DEFAULT_GENERATED",
+        })),
+        [],
+      ])
+      .mockResolvedValueOnce([[], []])
+      .mockResolvedValueOnce([[], []]);
+
+    const snapshot = await introspectLiveSnapshot({ execute }, "mysql", [
+      "dc_posts",
+    ]);
+
+    expect(snapshot.tables[0].columns.map(c => c.default)).toEqual([
+      "(convert(0x7b7d using utf8mb4))",
+      "(json_array())",
+      "(uuid())",
+      "(1 + 2)",
+      "CURRENT_TIMESTAMP",
+      "CURRENT_TIMESTAMP(3)",
+    ]);
+  });
+
+  it("leaves a DEFAULT_GENERATED expression alone when EXTRA also carries ON UPDATE", async () => {
+    // `EXTRA` reads `DEFAULT_GENERATED on update CURRENT_TIMESTAMP` for an
+    // auto-updating timestamp. The substring match must still recognise the
+    // expression, and the bare keyword must still not be wrapped.
+    const execute = vi
+      .fn()
+      .mockResolvedValueOnce([
+        [
+          {
+            TABLE_NAME: "dc_posts",
+            COLUMN_NAME: "updated_at",
+            COLUMN_TYPE: "timestamp",
+            IS_NULLABLE: "NO",
+            COLUMN_DEFAULT: "CURRENT_TIMESTAMP",
+            DATA_TYPE: "timestamp",
+            EXTRA: "DEFAULT_GENERATED on update CURRENT_TIMESTAMP",
+          },
+        ],
+        [],
+      ])
+      .mockResolvedValueOnce([[], []])
+      .mockResolvedValueOnce([[], []]);
+
+    const snapshot = await introspectLiveSnapshot({ execute }, "mysql", [
+      "dc_posts",
+    ]);
+
+    expect(snapshot.tables[0].columns[0].default).toBe("CURRENT_TIMESTAMP");
+  });
+});
+
+describe("introspectLiveSnapshot - sqlite", () => {
+  it("reads columns + indexes, filtering pk/autoindex", async () => {
+    // Three statements whatever the number of tables: the columns, the index
+    // keys (each with its index's list entry and CREATE INDEX), and each
+    // table's CREATE TABLE beside its foreign keys. Every row names its table.
+    const all = vi
+      .fn()
+      .mockReturnValueOnce([
+        {
+          tbl: "dc_posts",
+          cid: 0,
+          name: "id",
+          type: "INTEGER",
+          notnull: 1,
+          dflt_value: null,
+          pk: 1,
+        },
+        {
+          tbl: "dc_posts",
+          cid: 1,
+          name: "slug",
+          type: "TEXT",
+          notnull: 0,
+          dflt_value: null,
+          pk: 0,
+        },
+      ])
+      // One real unique index, and an autoindex that is filtered out.
+      .mockReturnValueOnce([
+        {
+          tbl: "dc_posts",
+          seq: 0,
+          idx: "uq_dc_posts_slug",
+          unique: 1,
+          origin: "c",
+          partial: 0,
+          seqno: 0,
+          col: "slug",
+          idx_sql: "CREATE UNIQUE INDEX uq_dc_posts_slug ON dc_posts (slug)",
+        },
+        {
+          tbl: "dc_posts",
+          seq: 1,
+          idx: "sqlite_autoindex_dc_posts_1",
+          unique: 1,
+          origin: "u",
+          partial: 0,
+          seqno: 0,
+          col: "slug",
+          idx_sql: null,
+        },
+      ])
+      // No foreign key: the outer join's one row of nulls, with the table's SQL.
+      .mockReturnValueOnce([
+        {
+          tbl: "dc_posts",
+          create_sql:
+            "CREATE TABLE dc_posts (id integer primary key, slug text)",
+          id: null,
+          seq: null,
+          table: null,
+          from: null,
+          to: null,
+          on_delete: null,
+          on_update: null,
+        },
+      ]);
+    const db = { all };
+
+    const snapshot = await introspectLiveSnapshot(db, "sqlite", ["dc_posts"]);
+
+    expect(snapshot.tables[0].columns).toEqual([
+      {
+        name: "id",
+        type: "integer",
+        nullable: false,
+        default: undefined,
+        primaryKey: true,
+      },
+      { name: "slug", type: "text", nullable: true, default: undefined },
+    ]);
+    expect(snapshot.tables[0].indexes).toEqual([
+      { name: "uq_dc_posts_slug", columns: ["slug"], unique: true },
+    ]);
+    expect(snapshot.tables[0].foreignKeys).toEqual([]);
+    expect(all).toHaveBeenCalledTimes(3);
+  });
+
+  it("skips tables with empty PRAGMA result (table not yet created)", async () => {
+    const all = vi.fn().mockReturnValue([]);
+    const db = { all };
+    const snapshot = await introspectLiveSnapshot(db, "sqlite", [
+      "dc_nonexistent",
+    ]);
+    expect(snapshot.tables).toEqual([]);
+  });
+});
+
+describe("groupMysqlForeignKeys", () => {
+  const row = (
+    table: string,
+    constraint: string,
+    column: string,
+    refColumn: string,
+    rules: { DELETE_RULE?: string; UPDATE_RULE?: string } = {}
+  ) => ({
+    TABLE_NAME: table,
+    CONSTRAINT_NAME: constraint,
+    COLUMN_NAME: column,
+    REFERENCED_TABLE_NAME: "dc_users",
+    REFERENCED_COLUMN_NAME: refColumn,
+    DELETE_RULE: rules.DELETE_RULE ?? "NO ACTION",
+    UPDATE_RULE: rules.UPDATE_RULE ?? "NO ACTION",
+  });
+
+  it("collects one key per constraint, its columns in row order", () => {
+    const fks = groupMysqlForeignKeys([
+      row("dc_posts", "fk_a", "org_id", "org", { DELETE_RULE: "CASCADE" }),
+      row("dc_posts", "fk_a", "user_id", "id", { DELETE_RULE: "CASCADE" }),
+      row("dc_posts", "fk_b", "editor_id", "id", { UPDATE_RULE: "SET NULL" }),
+      row("dc_notes", "fk_a", "user_id", "id"),
+    ]);
+    expect(fks.get("dc_posts")).toEqual([
+      {
+        name: "fk_a",
+        columns: ["org_id", "user_id"],
+        referencesTable: "dc_users",
+        referencesColumns: ["org", "id"],
+        onDelete: "cascade",
+        onUpdate: "no action",
+      },
+      {
+        name: "fk_b",
+        columns: ["editor_id"],
+        referencesTable: "dc_users",
+        referencesColumns: ["id"],
+        onDelete: "no action",
+        onUpdate: "set null",
+      },
+    ]);
+    // A constraint name is scoped to its table, so the same name elsewhere is
+    // a different key.
+    expect(fks.get("dc_notes")?.map(fk => fk.columns)).toEqual([["user_id"]]);
+  });
+
+  it("reads an unknown rule as no action", () => {
+    const fks = groupMysqlForeignKeys([
+      row("dc_posts", "fk_a", "user_id", "id", { DELETE_RULE: "WHATEVER" }),
+    ]);
+    expect(fks.get("dc_posts")?.[0]?.onDelete).toBe("no action");
+  });
+});
+
+describe("parseSqliteIndexStatement", () => {
+  it("reads each key and no predicate", () => {
+    expect(
+      parseSqliteIndexStatement(
+        `CREATE INDEX "ix" ON "t" (lower(email), "a,b", status)`
+      )
+    ).toEqual({ keys: ["lower(email)", '"a,b"', "status"] });
+  });
+
+  it("reads the predicate after the key list", () => {
+    expect(
+      parseSqliteIndexStatement(
+        "CREATE UNIQUE INDEX ix ON t (email) WHERE deleted_at IS NULL"
+      )
+    ).toEqual({ keys: ["email"], where: "deleted_at IS NULL" });
+  });
+
+  it("ignores parentheses inside quoted names and literals", () => {
+    expect(
+      parseSqliteIndexStatement(`CREATE INDEX "ix(" ON t (coalesce(a, ')'))`)
+    ).toEqual({ keys: ["coalesce(a, ')')"] });
+  });
+
+  it("is null for text without a closed key list or with other trailing text", () => {
+    expect(parseSqliteIndexStatement(undefined)).toBeNull();
+    expect(parseSqliteIndexStatement("CREATE INDEX ix ON t")).toBeNull();
+    expect(parseSqliteIndexStatement("CREATE INDEX ix ON t (a")).toBeNull();
+    expect(
+      parseSqliteIndexStatement("CREATE INDEX ix ON t (a) junk")
+    ).toBeNull();
+  });
+});

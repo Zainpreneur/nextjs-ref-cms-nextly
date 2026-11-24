@@ -1,0 +1,264 @@
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import type { SupportedDialect } from "@nextlyhq/adapter-drizzle/types";
+import { and, eq, sql, type Column, type SQL } from "drizzle-orm";
+
+import { loadedDialect } from "../../../database/dialect-tables";
+import { NextlyError } from "../../../errors/nextly-error";
+import { BaseService } from "../../../shared/base-service";
+import { affectedRowCount } from "../../../shared/lib/affected-row-count";
+import type { Logger } from "../../../shared/types";
+
+/**
+ * A key's stored value plus whether the key exists.
+ *
+ * `value` is nullable on a present key because the row's value column may be
+ * SQL NULL or may hold the JSON literal `null`; neither is distinguishable
+ * from the other once decoded, but both are distinguishable from absence.
+ */
+export type MetaEntry<T = unknown> =
+  | { present: true; value: T | null }
+  | { present: false };
+
+/**
+ * MetaService — small KV API over the `nextly_meta` table.
+ *
+ * Used for runtime flags that don't belong in collection schemas
+ * (e.g., `seed.completedAt`, `seed.skippedAt`). All values are JSON
+ * round-tripped: callers pass / receive JS values; the service
+ * handles serialisation. Pg/MySQL native JSON columns store the
+ * serialised string verbatim (no double-decoding on read since the
+ * service is the only writer).
+ *
+ * Cross-dialect: looks up the right Drizzle table via `this.dialect`.
+ */
+/**
+ * Whether a `nextly_meta` row's value is `serialised`, the JSON text callers
+ * store: the one comparison every conditional write and guarded statement
+ * against this table makes.
+ *
+ * Every dialect stores that text, but MySQL's column is native JSON and its
+ * driver serialises once more, so the row holds the text as a JSON string.
+ * Compared to the column directly, the expected text went through the same
+ * encoding again and never matched: every compare-and-set failed there, and
+ * every statement guarded on a row changed nothing. Unquoted, MySQL's value is
+ * the text the other dialects compare.
+ */
+export function metaValueEquals(
+  table: { value: Column },
+  serialised: string,
+  dialect: SupportedDialect
+): SQL {
+  return dialect === "mysql"
+    ? sql`JSON_UNQUOTE(${table.value}) = ${serialised}`
+    : eq(table.value, serialised);
+}
+
+export class MetaService extends BaseService {
+  constructor(adapter: DrizzleAdapter, logger: Logger) {
+    super(adapter, logger);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private get table(): any {
+    const d = this.dialect;
+    // The loaded dialect's own table, so only that dialect's file is
+    // imported; `createAdapter` loads it.
+    return loadedDialect(d).tables.nextlyMeta;
+  }
+
+  // Drizzle handle. BaseService already exposes `this.db` via its
+  // protected getter, but we widen it locally for the cross-dialect
+  // table reference (whose type varies per dialect). Cast to any to
+  // avoid a TS conflict with BaseService's typed `db`.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private get drizzle(): any {
+    return this.adapter.getDrizzle();
+  }
+
+  /**
+   * The handle a statement runs on: a transaction's own Drizzle executor where
+   * the caller is inside one, so the statement commits or rolls back with it
+   * and runs on its connection, else the pooled one.
+   */
+  private on(executor?: unknown): MetaService["drizzle"] {
+    return executor ?? this.drizzle;
+  }
+
+  /**
+   * Read a key together with whether a row for it exists at all.
+   *
+   * `get` collapses three different situations onto `null`: no row, a row whose
+   * value column is SQL NULL, and a row holding the JSON literal `null`.
+   * Callers for which "absent" and "present but carrying nothing readable" mean
+   * different things must use this instead, because for them the difference
+   * decides whether it is safe to proceed.
+   *
+   * With `lock`, on a transaction's `executor`, the row is read locked for
+   * update on PostgreSQL and MySQL (SQLite has one writer), so a caller that
+   * decides from the value and then writes it is not overtaken by another
+   * transaction doing the same. A missing row locks nothing.
+   */
+  async getEntry<T = unknown>(
+    key: string,
+    executor?: unknown,
+    options: { lock?: boolean } = {}
+  ): Promise<MetaEntry<T>> {
+    const query = this.on(executor)
+      .select()
+      .from(this.table)
+      .where(eq(this.table.key, key))
+      .limit(1);
+    const rows =
+      options.lock === true && this.dialect !== "sqlite"
+        ? await query.for("update")
+        : await query;
+    if (rows.length === 0) return { present: false };
+    const raw = rows[0].value as string | null;
+    if (raw === null || raw === undefined)
+      return { present: true, value: null };
+    try {
+      return { present: true, value: JSON.parse(raw) as T };
+    } catch {
+      // Stored as a non-JSON string somehow — return as-is
+      return { present: true, value: raw as T };
+    }
+  }
+
+  // Delegates so there is one query and one decoding path; an absent row and a
+  // row carrying no value both read as `null`, as callers of `get` expect.
+  async get<T = unknown>(key: string, executor?: unknown): Promise<T | null> {
+    const entry = await this.getEntry<T>(key, executor);
+    return entry.present ? entry.value : null;
+  }
+
+  /**
+   * Store `value` under `key`, on `executor` where given (a transaction's own
+   * Drizzle handle, so the write commits or rolls back with it), else on the
+   * pooled one.
+   */
+  async set(key: string, value: unknown, executor?: unknown): Promise<void> {
+    const serialised = JSON.stringify(value);
+    const now = new Date();
+    const db = this.on(executor);
+    const existing = await db
+      .select({ key: this.table.key })
+      .from(this.table)
+      .where(eq(this.table.key, key))
+      .limit(1);
+
+    if (existing.length > 0) {
+      await db
+        .update(this.table)
+        .set({ value: serialised, updatedAt: now })
+        .where(eq(this.table.key, key));
+    } else {
+      await db
+        .insert(this.table)
+        .values({ key, value: serialised, updatedAt: now });
+    }
+  }
+
+  /**
+   * Write a key only if no row for it exists yet, leaving any existing row untouched.
+   *
+   * `set` reads the row and then inserts or updates, so two processes writing the same new key both
+   * see nothing and both insert — one gets a primary-key violation, and if they disagree about the
+   * value the survivor is whichever landed last. That is fine for a flag being stamped with the
+   * same value from every caller, and not fine for a key whose value records a decision the losing
+   * caller must abide by.
+   *
+   * Resolved by the database rather than by reading first: the conflict clause makes the check and
+   * the write one statement. PostgreSQL and SQLite express it as `ON CONFLICT DO NOTHING`; MySQL
+   * has no such clause and gets the equivalent no-op update of the key onto itself, so the row is
+   * matched and left as it is. The builder is feature-detected because Drizzle exposes these under
+   * different names per dialect.
+   *
+   * Says nothing about who won, deliberately. A caller that needs to know reads the row afterwards
+   * and decides from its contents, which also covers losing to a caller that wrote the same value.
+   */
+  async insertIfAbsent(
+    key: string,
+    value: unknown,
+    executor?: unknown
+  ): Promise<void> {
+    const insert = this.on(executor)
+      .insert(this.table)
+      .values({ key, value: JSON.stringify(value), updatedAt: new Date() });
+    if (typeof insert.onConflictDoNothing === "function") {
+      await insert.onConflictDoNothing();
+      return;
+    }
+    if (typeof insert.onDuplicateKeyUpdate === "function") {
+      await insert.onDuplicateKeyUpdate({ set: { key } });
+      return;
+    }
+    // No fallback to a plain insert. The builder is feature-detected on an untyped handle, so a
+    // renamed or absent method would otherwise degrade silently into an unconditional write —
+    // which is exactly the behaviour callers use this method to avoid, and they would have no way
+    // to notice. Failing here is recoverable; a claim that quietly stopped claiming is not.
+    throw NextlyError.internal({
+      logContext: {
+        reason: "no conflict clause available for a conditional insert",
+        dialect: this.dialect,
+      },
+    });
+  }
+
+  /**
+   * Replace a key's value only if it still holds `expected`, reporting whether it did.
+   *
+   * The missing half of {@link insertIfAbsent}. That one settles a race to CREATE a key; this one
+   * settles a race to MOVE one, which is a different problem and equally unserved by `set`: two
+   * processes that both read the same value and both write leave whichever landed last, with
+   * neither able to tell that it lost.
+   *
+   * Compares the serialised form rather than the decoded value, so the check is the same string
+   * equality the database can perform in the `WHERE` clause — no read, no window between the
+   * comparison and the write.
+   *
+   * False means the row has moved on: it was deleted, or someone else already claimed it. Callers
+   * re-read and decide, because "someone else won" and "someone else won with the same intent" are
+   * not the same outcome.
+   */
+  async compareAndSet(
+    key: string,
+    expected: unknown,
+    next: unknown,
+    executor?: unknown
+  ): Promise<boolean> {
+    const holdsExpected = metaValueEquals(
+      this.table,
+      JSON.stringify(expected),
+      this.dialect
+    );
+    const result = await this.on(executor)
+      .update(this.table)
+      .set({ value: JSON.stringify(next), updatedAt: new Date() })
+      .where(and(eq(this.table.key, key), holdsExpected));
+    // Each driver reports the affected count somewhere different, and mysql2 nests it inside a
+    // result tuple, so the shared dialect-aware reader owns that knowledge.
+    return affectedRowCount(result, this.dialect) > 0;
+  }
+
+  async delete(key: string): Promise<void> {
+    await this.drizzle.delete(this.table).where(eq(this.table.key, key));
+  }
+
+  async getAll(): Promise<Record<string, unknown>> {
+    const rows = await this.drizzle.select().from(this.table);
+    const out: Record<string, unknown> = {};
+    for (const row of rows) {
+      const raw = row.value as string | null;
+      if (raw === null || raw === undefined) {
+        out[row.key as string] = null;
+        continue;
+      }
+      try {
+        out[row.key as string] = JSON.parse(raw);
+      } catch {
+        out[row.key as string] = raw;
+      }
+    }
+    return out;
+  }
+}

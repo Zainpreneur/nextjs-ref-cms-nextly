@@ -1,0 +1,47 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@3.0.0/schema.json",
+  "changelog": [
+    "../scripts/release/changelog.cjs",
+    {
+      "repo": "nextlyhq/nextly"
+    }
+  ],
+  "commit": false,
+  "fixed": [
+    [
+      "nextly",
+      "create-nextly-app",
+      "@nextlyhq/admin",
+      "@nextlyhq/admin-css",
+      "@nextlyhq/blocks-engine",
+      "@nextlyhq/blocks-react",
+      "@nextlyhq/ui",
+      "@nextlyhq/adapter-drizzle",
+      "@nextlyhq/adapter-postgres",
+      "@nextlyhq/adapter-mysql",
+      "@nextlyhq/adapter-sqlite",
+      "@nextlyhq/storage-s3",
+      "@nextlyhq/storage-uploadthing",
+      "@nextlyhq/storage-vercel-blob",
+      "@nextlyhq/plugin-accounts",
+      "@nextlyhq/plugin-commerce",
+      "@nextlyhq/plugin-form-builder",
+      "@nextlyhq/plugin-mcp",
+      "@nextlyhq/plugin-page-builder",
+      "@nextlyhq/plugin-seo",
+      "@nextlyhq/plugin-sdk",
+      "@nextlyhq/eslint-config",
+      "@nextlyhq/eslint-plugin",
+      "@nextlyhq/prettier-config",
+      "@nextlyhq/telemetry",
+      "@nextlyhq/tsconfig",
+      "@nextlyhq/builder",
+      "@nextlyhq/module-specifiers"
+    ]
+  ],
+  "linked": [],
+  "access": "public",
+  "baseBranch": "dev",
+  "updateInternalDependencies": "patch",
+  "ignore": []
+}

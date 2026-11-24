@@ -1,0 +1,143 @@
+/**
+ * Shared `/auth/setup-status` cache used by both route guards
+ * (`PrivateRoute`, `PublicRoute`) and the logout flow. Centralising the
+ * fetch + cache + reset trio here gives the admin UI a single source of
+ * truth for "has initial setup been completed?" -- if the two guards
+ * disagreed on this answer they could redirect the user in opposite
+ * directions on transient failures.
+ *
+ * Cache lifetime: module-scoped, so it survives client-side navigations
+ * (where module state persists) but is cleared on a full page reload
+ * (where module state is reconstructed). `resetSetupStatusCache()` is
+ * called explicitly from the logout path so the next user starts with a
+ * clean slate.
+ */
+import { publicApi } from "../api/publicApi";
+import { parsePasswordRule, setPasswordRule } from "../password-rule";
+
+/** What setup-status answers, as the admin reads it. */
+export interface SetupStatus {
+  /**
+   * Whether the server answered. False only on the fail-safe path below, where
+   * `isSetup` and `requiresSetupToken` are defaults rather than the server's.
+   */
+  answered: boolean;
+  isSetup: boolean;
+  /** Whether setup needs its setup token: in production, until it is done. */
+  requiresSetupToken: boolean;
+  /**
+   * Whether the app takes sign-ups (`auth.allowRegistration`), which decides
+   * whether the sign-in page offers "Sign up" and the register page its form.
+   * No unless the server says yes, as the server's own default is: an older
+   * server that does not say, and the fail-safe path, both read as no.
+   */
+  allowRegistration: boolean;
+}
+
+/**
+ * The answer every reader shares: one request per page lifecycle, however
+ * many ask and however soon, so the route guards and the setup form can never
+ * read setup-status differently.
+ */
+let setupStatusCache: Promise<SetupStatus> | null = null;
+
+/**
+ * On any failure (5xx, 429, network error, invalid response shape) setup is
+ * fail-safed to "complete". The alternative -- synthesising `false` -- would
+ * drag authenticated users into the setup wizard on a transient hiccup, which
+ * is destructive. Staying on the dashboard or login screen is recoverable on
+ * the next request. The token is fail-safed to "needed": the form then shows
+ * a field the server may ignore, rather than hiding one it requires.
+ */
+async function fetchSetupStatus(): Promise<SetupStatus> {
+  try {
+    const result = await publicApi.get<
+      | {
+          isSetup?: unknown;
+          requiresSetupToken?: unknown;
+          allowRegistration?: unknown;
+          passwordRule?: unknown;
+        }
+      | undefined
+    >("/auth/setup-status");
+    // The password forms check by the server's rule from here on.
+    const rule = parsePasswordRule(result?.passwordRule);
+    if (rule) setPasswordRule(rule);
+    // Require a strict boolean; any other shape (empty body, non-JSON,
+    // schema drift) takes the same fail-safe default as the catch branch
+    // below. Inlined rather than throwing into the catch -- the admin
+    // package doesn't carry a NextlyError dependency, and a bare throw
+    // would just be local control flow with no payload.
+    return {
+      answered: typeof result?.isSetup === "boolean",
+      isSetup: typeof result?.isSetup === "boolean" ? result.isSetup : true,
+      requiresSetupToken: result?.requiresSetupToken !== false,
+      allowRegistration: result?.allowRegistration === true,
+    };
+  } catch {
+    return {
+      answered: false,
+      isSetup: true,
+      requiresSetupToken: true,
+      allowRegistration: false,
+    };
+  }
+}
+
+function readSetupStatus(): Promise<SetupStatus> {
+  if (setupStatusCache) return setupStatusCache;
+  const pending = fetchSetupStatus().then(status => {
+    // A fail-safe default is not an answer to keep: the server may be starting,
+    // and the next reader should ask it again rather than inherit the default
+    // for the rest of the page's life.
+    if (!status.answered && setupStatusCache === pending) {
+      setupStatusCache = null;
+    }
+    return status;
+  });
+  setupStatusCache = pending;
+  return pending;
+}
+
+/**
+ * Setup status as the server gave it, with `answered: false` where it gave
+ * none, for a reader that must not mistake the fail-safe for an answer.
+ */
+export function readSetupState(): Promise<SetupStatus> {
+  return readSetupStatus();
+}
+
+/** Whether initial setup has been completed. */
+export async function checkSetupStatus(): Promise<boolean> {
+  return (await readSetupStatus()).isSetup;
+}
+
+/** Whether the setup form must ask for the setup token. */
+export async function checkSetupTokenRequired(): Promise<boolean> {
+  return (await readSetupStatus()).requiresSetupToken;
+}
+
+/**
+ * Clear the cached setup status. Called from the logout flow so the
+ * next user (potentially a different account, potentially after a DB
+ * reset) sees a fresh answer rather than the previous user's.
+ */
+export function resetSetupStatusCache(): void {
+  setupStatusCache = null;
+  for (const listener of resetListeners) listener();
+}
+
+/** Who is told the answer was dropped, to ask again. */
+const resetListeners = new Set<() => void>();
+
+/**
+ * Calls `listener` whenever the shared answer is dropped (a retry abandoning
+ * a request the server holds, or a sign-out), so a reader still waiting on the
+ * dropped request can ask again. Returns the unsubscribe.
+ */
+export function onSetupStatusReset(listener: () => void): () => void {
+  resetListeners.add(listener);
+  return () => {
+    resetListeners.delete(listener);
+  };
+}

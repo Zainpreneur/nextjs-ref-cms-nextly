@@ -1,0 +1,262 @@
+/**
+ * Shared SQL Reserved Keyword & Slug Constants
+ *
+ * Pure-data module — no imports — so it can be the cycle-breaker between
+ * collections/config/validate-config.ts and shared/base-validator.ts.
+ *
+ * Originally these constants lived in validate-config.ts and base-validator.ts
+ * imported them back, creating a circular dependency. tsup's bundling masked
+ * the issue (its evaluation order happened to initialise the constants before
+ * base-validator's top-level Set construction). Turbopack's strict ESM
+ * evaluation surfaced it as a TDZ ReferenceError when source-mode dev started
+ * walking the source files directly.
+ *
+ * Solution: extract the constants here. Both validate-config and base-validator
+ * import from this leaf module, which has no further imports → no cycle.
+ *
+ * @module shared/sql-reserved
+ */
+
+// ============================================================
+// Reserved Names and Keywords
+// ============================================================
+
+/**
+ * Reserved collection slugs that cannot be used.
+ * These are used by the system or have special meaning.
+ */
+export const RESERVED_SLUGS = [
+  // API routes
+  "api",
+  "graphql",
+  "rest",
+  // Admin routes
+  "admin",
+  "dashboard",
+  // Auth routes
+  "auth",
+  "login",
+  "logout",
+  "register",
+  "signup",
+  "signin",
+  "signout",
+  "forgot-password",
+  "reset-password",
+  "verify",
+  "verify-email",
+  // System routes
+  "static",
+  "public",
+  "assets",
+  "_next",
+  "health",
+  "status",
+  "metrics",
+  // Common system collections
+  "users",
+  "roles",
+  "permissions",
+  // Retired core tables. Still reserved, so a collection cannot take a name
+  // an existing database may still hold a table under.
+  "accounts",
+  "sessions",
+  // Pre-existing route/table reservations. Two of these (`webhooks`, `media`)
+  // are also system resources, but they are reserved here for the independent
+  // reason that a route/table already owns the name. The permission-collision
+  // reservation for the REMAINING system-resource names (settings, api-keys,
+  // email-providers, email-templates) is deliberately NOT added to this list:
+  // it is spread into the component reserved set too, and a component does not
+  // seed a permission under its own slug, so reserving those names for
+  // components would be a false positive. That collision check lives in the
+  // collection and single validators via `isReservedResourceSlug`
+  // (schemas/_zod/rbac.ts), scoped to those two entity kinds.
+  "webhooks",
+  "tokens",
+  "media",
+  "uploads",
+  "files",
+] as const;
+
+/**
+ * SQL reserved keywords that should not be used as identifiers.
+ *
+ * Curated list of the most problematic keywords across PostgreSQL, MySQL,
+ * and SQLite. Using these as table or column names can cause issues even
+ * with quoting.
+ *
+ * @see https://sqlite.org/lang_keywords.html
+ * @see https://www.postgresql.org/docs/current/sql-keywords-appendix.html
+ * @see https://dev.mysql.com/doc/refman/8.0/en/keywords.html
+ */
+export const SQL_RESERVED_KEYWORDS = [
+  // Data manipulation
+  "select",
+  "insert",
+  "update",
+  "delete",
+  "from",
+  "where",
+  "set",
+  "values",
+  // Table operations
+  "create",
+  "drop",
+  "alter",
+  "table",
+  "index",
+  "view",
+  "trigger",
+  "database",
+  // Joins and relations
+  "join",
+  "inner",
+  "outer",
+  "left",
+  "right",
+  "cross",
+  "full",
+  "on",
+  "using",
+  // Clauses
+  "order",
+  "group",
+  "by",
+  "having",
+  "limit",
+  "offset",
+  "distinct",
+  "as",
+  "case",
+  "when",
+  "then",
+  "else",
+  "end",
+  // Logical
+  "and",
+  "or",
+  "not",
+  "in",
+  "is",
+  "null",
+  "like",
+  "between",
+  "exists",
+  // Constraints
+  "primary",
+  "foreign",
+  "key",
+  "references",
+  "unique",
+  "check",
+  "constraint",
+  "default",
+  // Transactions
+  "begin",
+  "commit",
+  "rollback",
+  "transaction",
+  // Aggregates (can cause confusion)
+  "count",
+  "sum",
+  "avg",
+  "min",
+  "max",
+  // Other commonly problematic
+  "all",
+  "any",
+  "union",
+  "except",
+  "intersect",
+  "column",
+  "row",
+  "rows",
+  "for",
+  "to",
+  "into",
+  "with",
+  // High-risk specific keywords
+  "user",
+  "password",
+  "role",
+  "session",
+  "grant",
+  "revoke",
+  "match",
+  "natural",
+] as const;
+
+// ============================================================
+// The Schema Builder's lists
+// ============================================================
+
+/** SQL keywords that should be blocked as field/collection names. */
+export const BUILDER_SQL_KEYWORDS = [
+  "select",
+  "insert",
+  "update",
+  "delete",
+  "drop",
+  "create",
+  "alter",
+  "table",
+  "from",
+  "where",
+  "join",
+  "union",
+  "order",
+  "group",
+  "having",
+  "limit",
+  "offset",
+  "index",
+  "constraint",
+  "primary",
+  "foreign",
+  "key",
+  "references",
+  "on",
+  "null",
+  "not",
+  "and",
+  "or",
+  "in",
+  "like",
+  "between",
+  "exists",
+  "case",
+  "when",
+  "then",
+  "else",
+  "end",
+  "as",
+  "distinct",
+  "all",
+  "any",
+  "some",
+  "into",
+  "values",
+  "set",
+  "cascade",
+] as const;
+
+/**
+ * Reserved names for collections.
+ *
+ * Separate from `RESERVED_SLUGS`, which the code-first validator uses: a
+ * Builder-created collection never passes through that path, so a name has to
+ * be refused here as well to be refused at all.
+ */
+export const BUILDER_RESERVED_COLLECTION_NAMES = [
+  "users",
+  "roles",
+  "permissions",
+  "sessions",
+  "accounts",
+  "dynamic_collections",
+  // Permission identity is action + resource, so a collection named `webhooks`
+  // would share the rows the webhook endpoint routes check: its `read-webhooks`
+  // would expose endpoint configuration and `update-webhooks` the signing
+  // secrets.
+  "webhooks",
+] as const;

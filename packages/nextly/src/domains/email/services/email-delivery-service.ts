@@ -1,0 +1,1128 @@
+/**
+ * The email delivery log's writer and reader.
+ *
+ * Records that a message was attempted and what happened to it: which provider
+ * carried it, which template produced it, whether it was accepted, and a hash
+ * of each recipient. One row per RECIPIENT, so the question "did this person
+ * receive it" has an answer for someone who was copied.
+ *
+ * **This is a log, not a queue.** It is PRUNED — `domains/email/prune.ts` sweeps
+ * it by retention class and age, offered from this service after a send is
+ * recorded, because rows here are created by sends and that is when the table
+ * grows. It is still not DRAINED: nothing retries, and `next_attempt_at` and
+ * `attempts` stay inert. See `schemas/email-deliveries/postgres.ts` for why
+ * that distinction is written into the schema rather than only decided here.
+ *
+ * The two halves cover different populations, and neither is sufficient alone.
+ * The sweep bounds every row by age, whoever it belonged to and whichever
+ * secret hashed it. `erase-recipient.ts` answers a named request on demand, and
+ * only for people a caller can name — many recipients never had an account at
+ * all.
+ *
+ * @module domains/email/services/email-delivery-service
+ */
+
+import { randomUUID } from "crypto";
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import type { TransactionContext } from "@nextlyhq/adapter-drizzle/types";
+import {
+  and,
+  desc,
+  eq,
+  getColumns,
+  gte,
+  inArray,
+  isNull,
+  lt,
+  lte,
+  or,
+  sql,
+  type SQL,
+} from "drizzle-orm";
+
+import { loadedDialect } from "../../../database/dialect-tables";
+import { toDbError } from "../../../database/errors";
+import { getDialectTables } from "../../../database/index";
+import { NextlyError } from "../../../errors";
+import { env } from "../../../lib/env";
+import { maskingServiceLogger } from "../../../observability/mask-emails";
+import type { PrincipalRef } from "../../../plugins/principals/types";
+import type { Logger } from "../../../services/shared";
+import { BaseService } from "../../../shared/base-service";
+import { runAdapterTransaction } from "../../../shared/lib/run-adapter-transaction";
+import { rowLockServer } from "../../audit/audit-log-writer";
+import { runLockedWrite } from "../../audit/person-write";
+import {
+  principalDigestTablesOf,
+  readPrincipalDigests,
+  type PrincipalDigestDb,
+} from "../../audit/principal-digest";
+import { pluginSettingsSecrets } from "../../plugins/settings-service";
+import { warnQuietly } from "../../retention/safe-log";
+import {
+  deliveriesTableFor,
+  type EmailDeliveriesTable,
+} from "../deliveries-table";
+import {
+  EMAIL_RETENTION_CLASS,
+  ERASED_RECIPIENT_HASH,
+  isErasedRecipientHash,
+  recipientDigest,
+  recipientDigests,
+  storableError,
+  DRAFT_TEMPLATE_DIGEST,
+  templateVersionColumns,
+  type DeliveryFailure,
+  type DeliveryFailureKind,
+  type DeliveryTemplateVersion,
+  type EmailDeliveryInput,
+  type EmailDeliveryRecipientKind,
+  type EmailDeliveryStatus,
+} from "../delivery-record";
+import { eraseRecipientDeliveries } from "../erase-recipient";
+import {
+  originCondition,
+  providerExists,
+  providerRead,
+  providersTablePresent,
+  type FilterableOrigin,
+  type ProviderRead,
+} from "../provider-origin";
+import { pruneSendClaims } from "../prune";
+import type { ResolvedEmailRetentionConfig } from "../retention-config";
+import {
+  claimSendKey,
+  ownTransaction,
+  renewSendClaim,
+  sendClaimsTableFor,
+  settleClaimIn,
+  settleSendClaim,
+  type SettleOptions,
+  type ClaimDecision,
+  type HeldClaim,
+  type SendKey,
+} from "../send-claims";
+
+import type { EmailSendOutcome } from "./send-failures";
+
+/** The Drizzle surface a write naming a person needs. */
+type PersonRowsDb = PrincipalDigestDb;
+
+/**
+ * Rows per insert statement.
+ *
+ * Chosen against the tightest dialect rather than the roomiest: SQLite's
+ * default bind-parameter ceiling is the low limit, and each row binds a dozen
+ * columns. Small enough to stay well inside it, large enough that an ordinary
+ * send is still one statement.
+ */
+const INSERT_CHUNK_SIZE = 50;
+
+/**
+ * A thrown value as one log-safe line.
+ *
+ * `String(value)` on a plain object yields `[object Object]`, which reads like
+ * a message and says nothing — so a non-Error rejection is serialised instead.
+ */
+function describeUnknownError(value: unknown): string {
+  if (value instanceof Error) return value.message;
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return Object.prototype.toString.call(value);
+  }
+}
+
+/**
+ * A row as the three dialect tables produce it.
+ *
+ * Declared rather than inferred: the three table definitions are a union, and
+ * Drizzle's select over a union resolves to something the compiler cannot name,
+ * so the callback parameter would be implicitly `any`. Writing the shape once
+ * keeps the mapping below checked against something real.
+ */
+interface EmailDeliveryRow {
+  id: string;
+  providerId: string | null;
+  providerType: string;
+  templateSlug: string | null;
+  recipientHash: string;
+  recipientKind: string;
+  status: string;
+  attemptCount: number;
+  error: string | null;
+  messageId: string | null;
+  principalKind: string | null;
+  queuedId: string | null;
+  templateOwner: string | null;
+  templateOverridden: boolean | number | null;
+  templateDigest: string | null;
+  failureKind: string | null;
+  failureStatus: number | null;
+  providerOrigin: string | null;
+  /** Whether its provider row exists, read with the row. */
+  providerExists: unknown;
+  createdAt: Date;
+}
+
+/** One recorded delivery, as a reader sees it. */
+export interface EmailDeliveryRecord {
+  id: string;
+  providerId: string | null;
+  providerType: string;
+  templateSlug: string | null;
+  /**
+   * The stored digest, or null once this recipient has been erased.
+   *
+   * Null rather than the raw sentinel so a reader never has to know what the
+   * erased state is spelled as. The column is NOT NULL, so there is no "no
+   * value recorded" case for null to be confused with: it means erased and
+   * nothing else.
+   */
+  recipientHash: string | null;
+  recipientKind: EmailDeliveryRecipientKind;
+  status: EmailDeliveryStatus;
+  attemptCount: number;
+  error: string | null;
+  messageId: string | null;
+  /** Whether the send named a plugin-defined person as this recipient. */
+  namedPerson: boolean;
+  /** The queued email this was an attempt of, when it was one. */
+  queuedId: string | null;
+  /**
+   * Which version of its template was sent, `none` for a send without one,
+   * or `not-recorded` for a record written before versions were.
+   */
+  templateVersion: DeliveryTemplateVersion | "not-recorded";
+  /** The provider's structured answer, for a failed recipient. */
+  failure: DeliveryFailure | null;
+  /**
+   * The provider as it reads now: its id only while it exists, its type,
+   * and where it came from (`provider-origin`).
+   */
+  provider: ProviderRead;
+  createdAt: Date;
+}
+
+/**
+ * A stored row as a reader sees it.
+ *
+ * Every read path returns rows through here rather than building the record
+ * inline, so the erased state is translated once. A future single-row getter
+ * that mapped its own columns would hand back the raw sentinel, and it would
+ * look correct beside a listing that does not — so the translation lives where
+ * a new caller gets it by construction instead of by noticing.
+ */
+function toDeliveryRecord(row: EmailDeliveryRow): EmailDeliveryRecord {
+  return {
+    provider: providerRead(
+      row.providerType,
+      row.providerId,
+      row.providerOrigin,
+      row.providerExists
+    ),
+    id: row.id,
+    providerId: row.providerId,
+    providerType: row.providerType,
+    templateSlug: row.templateSlug,
+    // The sentinel is a storage detail: it exists because the column is NOT
+    // NULL, and a reader has no use for the spelling.
+    recipientHash: isErasedRecipientHash(row.recipientHash)
+      ? null
+      : row.recipientHash,
+    recipientKind: row.recipientKind as EmailDeliveryRecipientKind,
+    status: row.status as EmailDeliveryStatus,
+    attemptCount: row.attemptCount,
+    error: row.error,
+    messageId: row.messageId,
+    namedPerson: row.principalKind !== null,
+    queuedId: row.queuedId,
+    templateVersion: templateVersionOf(row),
+    failure: failureOfRow(row),
+    createdAt: row.createdAt,
+  };
+}
+
+/** A row's template version, as its columns record it. */
+function templateVersionOf(
+  row: EmailDeliveryRow
+): DeliveryTemplateVersion | "not-recorded" {
+  if (row.templateOwner === null) return "not-recorded";
+  if (row.templateOwner === "none") return "none";
+  const draft = row.templateDigest === DRAFT_TEMPLATE_DIGEST;
+  return {
+    owner: row.templateOwner,
+    // A boolean on PostgreSQL, 0 or 1 on MySQL and SQLite.
+    overridden: Boolean(Number(row.templateOverridden ?? 0)),
+    digest: draft ? null : row.templateDigest,
+    ...(draft ? { draft: true as const } : {}),
+  };
+}
+
+/** A row's structured failure, when it recorded one. */
+function failureOfRow(row: EmailDeliveryRow): DeliveryFailure | null {
+  if (row.failureKind === null) return null;
+  return {
+    kind: row.failureKind as DeliveryFailureKind,
+    ...(row.failureStatus !== null
+      ? { status: Number(row.failureStatus) }
+      : {}),
+  };
+}
+
+/** How a caller narrows a listing. */
+export interface ListDeliveriesOptions {
+  /** One record, by its id. */
+  id?: string;
+  /**
+   * Only records that stand on their own: a send that was not queued, or
+   * an attempt of a queued email whose row has since been pruned (the queue
+   * keeps a settled email 7 days, the log its records far longer).
+   */
+  standalone?: true;
+  /** Only records whose provider reads as this origin now. */
+  providerOrigin?: FilterableOrigin;
+  /** The attempts of one queued email. */
+  queuedId?: string;
+  /** Hash of the address to look for; callers pass an address, not a hash. */
+  recipient?: string;
+  status?: EmailDeliveryStatus;
+  providerId?: string;
+  /** A provider's registered type, whether or not it is still stored. */
+  providerType?: string;
+  templateSlug?: string;
+  /** Recorded at or after. */
+  from?: Date;
+  /** Recorded at or before. */
+  to?: Date;
+  /**
+   * Only records after this one in the listing's order, newest first: the
+   * last record of the page before, by its time and id.
+   */
+  before?: { createdAt: Date; id: string };
+  limit?: number;
+}
+
+export class EmailDeliveryService extends BaseService {
+  private deliveries: EmailDeliveriesTable;
+
+  /**
+   * Offered after a send is recorded, when retention is configured.
+   *
+   * The trigger is the send rather than a content write, because rows here are
+   * created by sends: that is when the table grows, and an install that never
+   * sends mail has nothing to sweep. `maybeRun` decides whether a pass is
+   * actually due, so this costs an in-process clock check on an ordinary send.
+   */
+  private readonly retention?: { maybeRun(maxBatches?: number): Promise<void> };
+
+  /**
+   * The live retention policy, or undefined when none was configured.
+   *
+   * A function rather than a value, because a runner built at boot outlives
+   * every hot reload: reading it per call is what lets a saved change take
+   * effect without a restart, and it is the same value the sweep runs on.
+   */
+  private readonly retentionPolicy?: () =>
+    | ResolvedEmailRetentionConfig
+    | undefined;
+
+  /**
+   * The install's secrets, current first, that seal the key naming deleted
+   * plugin-defined people. Read per write, as a rotation is read on restart.
+   */
+  private readonly digestSecrets: () => readonly string[];
+
+  constructor(
+    adapter: DrizzleAdapter,
+    logger: Logger,
+    retention?: { maybeRun(maxBatches?: number): Promise<void> },
+    retentionPolicy?: () => ResolvedEmailRetentionConfig | undefined,
+    digestSecrets: () => readonly string[] = () => pluginSettingsSecrets(env)
+  ) {
+    // Masked here whatever logger an app supplied: what this service logs,
+    // a provider error quoting a recipient included, never carries a full
+    // email address outside development and test.
+    super(adapter, maskingServiceLogger(logger));
+    this.deliveries = deliveriesTableFor(this.dialect);
+    this.retention = retention;
+    this.retentionPolicy = retentionPolicy;
+    this.digestSecrets = digestSecrets;
+  }
+
+  /**
+   * Whether this install has asked to keep no delivery history at all.
+   *
+   * A window of zero is not "prune aggressively" — it is an operator saying
+   * they want none of this retained. Writing the row and deleting it later
+   * satisfies neither half of that: the digest is in the table until a pass is
+   * next due, which the gate holds off for a full interval, and the rows
+   * written after the final pass stay indefinitely because nothing offers
+   * another one. Not writing it is the only reading that means what it says.
+   */
+  private keepsNothing(): boolean {
+    // Guarded for the same reason the retention offer below is, and I added
+    // this call without it right beside the one I had just guarded. The
+    // callback is INJECTED and does real work — it resolves the policy from the
+    // config on every send — so a throw here escapes `recordAll`, whose whole
+    // contract is that a provider-accepted send is never reported as failed.
+    //
+    // A failing read means "no zero window", which continues recording. The
+    // other direction would silently stop writing the log the moment a policy
+    // read broke, which is the failure this table exists to make impossible.
+    try {
+      return this.retentionPolicy?.()?.maxAgeMs === 0;
+    } catch (error) {
+      warnQuietly(this.logger, "Email retention policy could not be read", {
+        error,
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Claim a keyed send before any provider is contacted (`send-claims.ts`).
+   *
+   * Throws when the claim cannot be read or written, unlike the recorder: a
+   * send that cannot be claimed cannot promise to go out once, and nothing has
+   * been sent yet.
+   */
+  async claimSend(sendKey: SendKey): Promise<ClaimDecision> {
+    try {
+      return await claimSendKey(this.adapter, sendKey, this.digestSecrets());
+    } catch (error) {
+      if (NextlyError.is(error)) throw error;
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, error));
+    }
+  }
+
+  /**
+   * Record a claimed send's outcome, then sweep claims past their lifetime.
+   *
+   * Never throws, as `record` never does: the send has happened. A claim left
+   * without its outcome is taken over once its lease lapses. A successful
+   * claim lives as long as the delivery log keeps its records, so a site that
+   * keeps none keeps no claim either.
+   */
+  async settleSend(
+    claim: HeldClaim,
+    outcome: EmailSendOutcome,
+    acceptedRecipients: readonly string[] = [],
+    records?: EmailDeliveryInput[],
+    acceptedCalls: readonly string[] = []
+  ): Promise<boolean> {
+    const keep = !this.keepsNothing();
+    let committed = true;
+    try {
+      if (records === undefined) {
+        await settleSendClaim(this.adapter, claim, outcome, {
+          keep,
+          acceptedRecipients,
+          acceptedCalls,
+        });
+      } else {
+        await this.recordAndSettle(claim, outcome, {
+          keep,
+          acceptedRecipients,
+          acceptedCalls,
+          records,
+        });
+      }
+    } catch (error) {
+      // Neither written: the claim stays held until its lease lapses, and a
+      // later send with the key takes it over and completes both.
+      committed = false;
+      warnQuietly(this.logger, "Email send claim could not be recorded", {
+        error,
+      });
+    }
+    if (records !== undefined) await this.offerRetention();
+    try {
+      await pruneSendClaims(this.adapter, this.sentClaimLifetime(), new Date());
+    } catch (error) {
+      warnQuietly(this.logger, "Email send claims could not be swept", {
+        error,
+      });
+    }
+    return committed;
+  }
+
+  /**
+   * A keyed send's delivery records and its claim's outcome, in one
+   * transaction: a process that stops between the provider's answer and the
+   * commit leaves neither, so the retry that takes the claim over writes both.
+   * Recovers from a provider deleted mid-send as `insertChunk` does, by
+   * writing the records again without its reference.
+   */
+  private async recordAndSettle(
+    claim: HeldClaim,
+    outcome: EmailSendOutcome,
+    options: {
+      keep: boolean;
+      acceptedRecipients: readonly string[];
+      acceptedCalls: readonly string[];
+      records: EmailDeliveryInput[];
+    }
+  ): Promise<void> {
+    const commit = (withProvider: boolean) =>
+      ownTransaction(this.adapter)(async db => {
+        if (options.keep) {
+          await this.insertWithin(
+            db as unknown as PersonRowsDb,
+            options.records,
+            withProvider
+          );
+        }
+        await this.settleWithin(db, claim, outcome, {
+          keep: options.keep,
+          acceptedRecipients: options.acceptedRecipients,
+          acceptedCalls: options.acceptedCalls,
+        });
+      });
+    try {
+      await commit(true);
+    } catch (error) {
+      if (toDbError(this.dialect, error).kind !== "fk-violation") throw error;
+      await commit(false);
+      this.reportProviderReferenceDropped(options.records);
+    }
+  }
+
+  /** The claim's part of a keyed send's commit, in the transaction given. */
+  settleWithin(
+    db: unknown,
+    claim: HeldClaim,
+    outcome: EmailSendOutcome,
+    options: SettleOptions
+  ): Promise<void> {
+    return settleClaimIn(db, this.dialect, claim, outcome, options);
+  }
+
+  /**
+   * Insert a send's records in the transaction given, in bounded chunks as
+   * `recordAll` does, clearing the key digest of a send to a person already
+   * reported deleted from every chunk.
+   */
+  private async insertWithin(
+    db: PersonRowsDb,
+    inputs: EmailDeliveryInput[],
+    withProvider: boolean
+  ): Promise<void> {
+    if (inputs.length === 0) return;
+    const now = new Date();
+    const ids = inputs.map(() => randomUUID());
+    const erasedKeys = new Set<string>();
+    for (let start = 0; start < inputs.length; start += INSERT_CHUNK_SIZE) {
+      const end = start + INSERT_CHUNK_SIZE;
+      await this.insertRows(
+        inputs.slice(start, end),
+        ids.slice(start, end),
+        now,
+        withProvider,
+        erasedKeys,
+        db
+      );
+    }
+    if (erasedKeys.size > 0) {
+      await db
+        .update(this.deliveries)
+        .set({ keyDigest: null })
+        .where(inArray(this.deliveries.keyDigest, [...erasedKeys]));
+    }
+  }
+
+  /**
+   * Push a held claim's lease on before the next provider call of a send.
+   * Never throws: a renewal that fails leaves the lease as it was.
+   */
+  async renewSend(claim: HeldClaim): Promise<void> {
+    try {
+      await renewSendClaim(this.adapter, claim);
+    } catch (error) {
+      warnQuietly(this.logger, "Email send claim could not be renewed", {
+        error,
+      });
+    }
+  }
+
+  /** How long a successful claim is kept: the delivery log's window. */
+  private sentClaimLifetime(): number | false {
+    try {
+      return this.retentionPolicy?.()?.maxAgeMs ?? false;
+    } catch {
+      // Unreadable: kept, as the delivery records it describes are.
+      return false;
+    }
+  }
+
+  /**
+   * Record one delivery attempt.
+   *
+   * Never throws. A send that succeeded must not be reported as failed because
+   * the log could not be written, and a send that failed must not have its
+   * failure replaced by a different one. The recording failure goes to the
+   * process log, so a trail that stops being written is visible.
+   *
+   * `next_attempt_at` is not set. Nothing drains this table, and a timestamp
+   * there would tell an operator to expect a retry that no code will perform.
+   */
+  async record(input: EmailDeliveryInput): Promise<void> {
+    await this.recordAll([input]);
+  }
+
+  /**
+   * Record every recipient of one message.
+   *
+   * A message with copied recipients produces one row per address, because the
+   * question the table answers is asked about a PERSON and a person copied on
+   * a message received it.
+   *
+   * Written in bounded chunks: an ordinary send is one statement, and a large
+   * recipient list becomes several rather than one that would exceed a
+   * dialect's bind-parameter limit. Each chunk succeeds or fails on its own,
+   * so a batch can end up partially recorded -- which is the deliberate trade
+   * against losing all of it.
+   *
+   * Never throws, for the reason `record` gives.
+   */
+  async recordAll(inputs: EmailDeliveryInput[]): Promise<void> {
+    if (inputs.length === 0) return;
+
+    // A zero window means keep nothing, so nothing is written. The sweep is
+    // still offered below: rows recorded before the setting changed are
+    // exactly what an operator who has just asked for none of this expects to
+    // go, and skipping the offer would strand them permanently.
+    if (!this.keepsNothing()) {
+      const now = new Date();
+      // Generated ONCE, outside the retry below. The provider-reference retry
+      // rewrites the rows it was given, and reusing the ids is what makes it a
+      // REPLACEMENT of the refused rows rather than a second set of them.
+      const ids = inputs.map(() => randomUUID());
+      // The key digests a chunk found to belong to a person already reported
+      // deleted. Only the chunk carrying the person can tell; every chunk of
+      // the send carries the digest, so it is cleared from all of them below.
+      const erasedKeys = new Set<string>();
+
+      // Written in bounded chunks. One `values()` over an unbounded recipient
+      // list exceeds a dialect's bind-parameter or statement-size limit, and
+      // this method swallows its own failures by design -- so a message with a
+      // large BCC list would be dispatched and then lose EVERY row. Each chunk
+      // fails, retries and reports on its own, so one oversized or unlucky
+      // slice cannot take the rest of the batch with it.
+      for (let start = 0; start < inputs.length; start += INSERT_CHUNK_SIZE) {
+        const end = start + INSERT_CHUNK_SIZE;
+        await this.insertChunk(
+          inputs.slice(start, end),
+          ids.slice(start, end),
+          now,
+          erasedKeys
+        );
+      }
+      await this.clearErasedKeys(erasedKeys);
+    }
+
+    await this.offerRetention();
+  }
+
+  /**
+   * Offer a retention pass, after a send's rows are written.
+   *
+   * Offered after the rows exist, never before: a pass that ran first would
+   * do its work and then be handed the very rows it was meant to bound.
+   */
+  private async offerRetention(): Promise<void> {
+    // Contained here as well as inside the runner, and the duplication is
+    // deliberate. `retention` is INJECTED, so what arrives is whatever the
+    // composition root or a test handed over, and this method cannot verify
+    // that it absorbs its own failures — while the contract it would break is
+    // this method's own: the rows are already written, so a rejection here
+    // reports an accepted send as a failed one and invites the caller to send
+    // it twice.
+    try {
+      await this.retention?.maybeRun(
+        EmailDeliveryService.WRITE_PATH_PRUNE_BATCHES
+      );
+    } catch (error) {
+      warnQuietly(this.logger, "Email retention pass could not be offered", {
+        error,
+      });
+    }
+  }
+
+  /**
+   * Batches this runner may spend when a SEND offered the pass.
+   *
+   * A write path wants a bounded amount of work, not a backlog sweep. This
+   * runner carries every domain's policy, so an uncapped offer spends each
+   * one's full configured budget — dozens of delete batches by default — while
+   * the caller waits, AFTER the provider has already accepted the message.
+   * Long enough to hit a serverless request timeout, and the caller's natural
+   * response to a timeout is to send the mail again.
+   *
+   * Two, matching the other mutation services. Full-budget sweeps belong to
+   * triggers nothing is waiting on.
+   */
+  private static readonly WRITE_PATH_PRUNE_BATCHES = 2;
+
+  /**
+   * One bounded slice of a batch: insert it, and recover the one way that can
+   * be recovered.
+   *
+   * Per chunk rather than per batch, because the provider retry rewrites the
+   * rows it was given. Retrying a whole batch after a later chunk failed would
+   * re-insert the ids an earlier chunk had already committed, and collide on
+   * the primary key.
+   */
+  private async insertChunk(
+    inputs: EmailDeliveryInput[],
+    ids: string[],
+    now: Date,
+    erasedKeys: Set<string>
+  ): Promise<void> {
+    try {
+      await this.insertRows(inputs, ids, now, true, erasedKeys);
+    } catch (error) {
+      // The one recoverable failure: PostgreSQL and SQLite carry a foreign key
+      // to `email_providers`, and an administrator deleting a provider while
+      // its send is in flight leaves `providerId` pointing at a row that is
+      // gone by the time this runs. `ON DELETE SET NULL` only protects rows
+      // that already existed. The message WAS sent, so losing its row to the
+      // provider's absence would make the log's completeness depend on nobody
+      // editing settings during a send.
+      //
+      // ONLY a foreign-key violation. Any other failure -- a deadlock, a
+      // timeout, a lost connection -- has nothing to do with the provider
+      // reference, and retrying without it would clear a reference whose
+      // provider still exists, quietly weakening every row written during a
+      // database hiccup.
+      if (toDbError(this.dialect, error).kind !== "fk-violation") {
+        this.reportInsertFailure(inputs, error);
+        return;
+      }
+
+      try {
+        // `provider_type` beside it keeps every row meaningful without the
+        // join, which is the same reason MySQL carries no key here at all.
+        await this.insertRows(inputs, ids, now, false, erasedKeys);
+        this.reportProviderReferenceDropped(inputs);
+        return;
+      } catch (retryError) {
+        // BOTH errors. The original says the row was refused for its provider
+        // reference; the retry's says what stopped the recovery -- a lost
+        // connection or a timeout is a different problem with a different fix,
+        // and reporting only the foreign-key violation would send an operator
+        // looking for a provider-deletion race that is not what went wrong.
+        this.reportInsertFailure(inputs, error, retryError);
+        return;
+      }
+      this.reportInsertFailure(inputs, error);
+    }
+  }
+
+  /**
+   * Say that a row was kept without its provider reference, and never let
+   * saying so change what happened.
+   *
+   * The row is already inserted by the time this runs. An installed logger
+   * that throws would otherwise be caught by the recovery's own handler and
+   * reported as a retry that failed -- an error naming a row that exists, on a
+   * path whose whole purpose was to keep it. Isolated for the same reason
+   * `reportInsertFailure` is, and the two sit together so neither is the one
+   * that gets forgotten.
+   */
+  private reportProviderReferenceDropped(inputs: EmailDeliveryInput[]): void {
+    try {
+      this.logger.warn(
+        "Recorded an email delivery without its provider reference",
+        {
+          providerType: inputs[0]?.providerType,
+          providerId: inputs[0]?.providerId,
+        }
+      );
+    } catch {
+      // Nowhere left to report to: the reporting mechanism is what failed.
+    }
+  }
+
+  /**
+   * One shape for a lost chunk, so the two report sites cannot diverge.
+   *
+   * The log call is isolated. `recordAll` promises never to throw, and it is
+   * called from a send that has already been dispatched -- so a logger an
+   * install supplied, throwing from `error()`, would otherwise escape a
+   * recorder whose whole contract is that it cannot affect the send, and be
+   * caught as a provider failure by the path above it. A trail that cannot be
+   * written is a trail that cannot be written; it is not a failed message.
+   */
+  private reportInsertFailure(
+    inputs: EmailDeliveryInput[],
+    error: unknown,
+    retryError?: unknown
+  ): void {
+    try {
+      this.logInsertFailure(inputs, error, retryError);
+    } catch {
+      // Nowhere left to report to: the reporting mechanism is what failed.
+    }
+  }
+
+  private logInsertFailure(
+    inputs: EmailDeliveryInput[],
+    error: unknown,
+    retryError?: unknown
+  ): void {
+    this.logger.error("Failed to record an email delivery", {
+      providerType: inputs[0]?.providerType,
+      status: inputs[0]?.status,
+      recipientCount: inputs.length,
+      message: describeUnknownError(error),
+      ...(retryError !== undefined
+        ? { retryMessage: describeUnknownError(retryError) }
+        : {}),
+    });
+  }
+
+  /**
+   * The insert itself, with or without the provider reference.
+   *
+   * Split out so the retry above writes exactly the same rows rather than a
+   * second, subtly different statement — which is how a fallback path comes to
+   * store something the primary one never would. The ids are passed in for the
+   * same reason: the retry must replace the failed rows, not add new ones.
+   */
+  private async insertRows(
+    inputs: EmailDeliveryInput[],
+    ids: string[],
+    now: Date,
+    withProvider: boolean,
+    erasedKeys: Set<string>,
+    within?: PersonRowsDb
+  ): Promise<void> {
+    const rows = this.rowsFor(inputs, ids, now, withProvider);
+    const people = inputs.map(input => input.person ?? null);
+    if (people.every(person => person === null)) {
+      await (within ?? this.db).insert(this.deliveries).values(rows);
+      return;
+    }
+    // Inside a keyed send's commit, which already holds a transaction.
+    if (within) {
+      await this.insertNamingPeople(within, rows, people, erasedKeys);
+      return;
+    }
+    // A row naming a person is decided under the deleted-people lock, in the
+    // transaction that lock needs: the one insert every delivery record goes
+    // through, so a send, and any writer added later, is held to it.
+    await runLockedWrite<PersonRowsDb, void>(
+      this.adapter,
+      this.db,
+      this.dialect,
+      executor => this.insertNamingPeople(executor, rows, people, erasedKeys),
+      { namesPerson: true, needsLock: false },
+      "email delivery record"
+    );
+  }
+
+  /**
+   * Insert rows some of which name a person: each person's row is written as
+   * it is while they exist, and with no address digest, naming them by the
+   * keyed digest, once their plugin has reported them deleted. Read under the
+   * shared lock a deletion report takes exclusively, so a report either
+   * finishes first and is seen, or waits for this insert and erases it.
+   */
+  private async insertNamingPeople(
+    db: PersonRowsDb,
+    rows: Record<string, unknown>[],
+    people: (PrincipalRef | null)[],
+    erasedKeys: Set<string>
+  ): Promise<void> {
+    const digests = await readPrincipalDigests(
+      db,
+      rowLockServer(this.adapter, this.dialect),
+      principalDigestTablesOf(getDialectTables(this.dialect)),
+      "shared",
+      this.digestSecrets()
+    );
+    const decided: Record<string, unknown>[] = [];
+    // The key digests of sends to someone already reported deleted, which
+    // their erasure ran too early to find: cleared here, as it would have,
+    // and from the send's other chunks once they are written.
+    for (const [index, row] of rows.entries()) {
+      const person = people[index];
+      if (!person) {
+        decided.push(row);
+        continue;
+      }
+      const gone = await digests.isDeleted(person);
+      if (gone && typeof row.keyDigest === "string") {
+        erasedKeys.add(row.keyDigest);
+      }
+      decided.push({
+        ...row,
+        principalKind: person.kind,
+        principalId: gone ? digests.digest(person) : person.id,
+        ...(gone ? { recipientHash: ERASED_RECIPIENT_HASH } : {}),
+      });
+    }
+    await db
+      .insert(this.deliveries)
+      .values(
+        decided.map(row =>
+          erasedKeys.has(row.keyDigest as string)
+            ? { ...row, keyDigest: null }
+            : row
+        )
+      );
+    if (erasedKeys.size > 0) {
+      const claims = sendClaimsTableFor(this.dialect);
+      await db
+        .update(claims)
+        .set({ keyDigest: null, messageDigest: null })
+        .where(inArray(claims.keyDigest, [...erasedKeys] as string[]));
+    }
+  }
+
+  /**
+   * Clear the key digests a chunk found erased from every record of the send,
+   * the chunks written after it included. Never throws, as `recordAll` never
+   * does: the send has happened.
+   */
+  private async clearErasedKeys(
+    erasedKeys: ReadonlySet<string>
+  ): Promise<void> {
+    if (erasedKeys.size === 0) return;
+    try {
+      await this.db
+        .update(this.deliveries)
+        .set({ keyDigest: null })
+        .where(inArray(this.deliveries.keyDigest, [...erasedKeys]));
+    } catch (error) {
+      warnQuietly(this.logger, "Erased key digests could not be cleared", {
+        error,
+      });
+    }
+  }
+
+  /** The rows for one chunk, with or without the provider reference. */
+  private rowsFor(
+    inputs: EmailDeliveryInput[],
+    ids: string[],
+    now: Date,
+    withProvider: boolean
+  ): Record<string, unknown>[] {
+    return inputs.map((input, index) => ({
+      id: ids[index],
+      providerId: withProvider ? (input.providerId ?? null) : null,
+      providerType: input.providerType,
+      templateSlug: input.templateSlug ?? null,
+      // The address is hashed here and nowhere retained. Callers hand over
+      // the real one because they are sending to it; this is the boundary
+      // where it stops travelling.
+      //
+      // Through `recipientDigest`, the same function the reader and the
+      // erasure use. A send addressed `Jane <jane@example.com>` must store
+      // what a lookup for `jane@example.com` will compute, or the row is
+      // written in a form nothing can ever find again.
+      recipientHash: recipientDigest(input.to),
+      recipientKind: input.recipientKind ?? "to",
+      status: input.status,
+      attemptCount: 1,
+      retentionClass: EMAIL_RETENTION_CLASS,
+      error: input.error ? storableError(input.error) : null,
+      messageId: input.messageId ?? null,
+      keyDigest: input.keyDigest ?? null,
+      queuedId: input.queuedId ?? null,
+      providerOrigin: input.providerOrigin ?? null,
+      ...templateVersionColumns(input.templateVersion),
+      failureKind: input.failure?.kind ?? null,
+      failureStatus: input.failure?.status ?? null,
+      // One timestamp for the whole message: the rows describe a single
+      // send, and staggering them by microseconds would suggest otherwise.
+      createdAt: now,
+    }));
+  }
+
+  /**
+   * Erase every delivery recorded for an address.
+   *
+   * The reachable entry point for the population `deleteUser` cannot serve:
+   * most recipients never had an account — a password reset to an address that
+   * never registered, a CC, a BCC added by a `beforeSend` filter — and no
+   * account deletion will ever fire for them. Without a caller of its own, the
+   * erasure would cover an arbitrary subset of the people it claims to.
+   *
+   * Runs in a transaction of its own, so the erasure commits whole or not at
+   * all, and the queued emails it cancels are read under the row locks that
+   * transaction holds until it commits. `deleteUser` calls the underlying
+   * function directly with its own, so the erasure commits and rolls back with
+   * the account removal.
+   */
+  async eraseRecipient(address: string): Promise<void> {
+    try {
+      await runAdapterTransaction<void, TransactionContext>(
+        run => this.adapter.transaction(ctx => run(ctx)),
+        ctx =>
+          eraseRecipientDeliveries(
+            ctx.getDrizzle<Parameters<typeof eraseRecipientDeliveries>[0]>(),
+            this.deliveries,
+            address
+          )
+      );
+    } catch (err) {
+      // Converted like every other read and write on this service. A caller
+      // handling an erasure request needs to tell "the table is missing on this
+      // install" from "the connection dropped", and a raw driver exception
+      // carries neither in a form the API layer can map — it becomes a 500
+      // whatever it was. Rethrown rather than swallowed: unlike `record`, a
+      // failed erasure must not be reported as a completed one.
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, err));
+    }
+  }
+
+  /**
+   * The oldest time the log still answers for: records older than the
+   * retention window have been, or are about to be, pruned. Null when the
+   * install keeps every record, or has no retention policy, or it cannot be
+   * read.
+   */
+  keptSince(now: Date = new Date()): Date | null {
+    let maxAge: number | false | undefined;
+    try {
+      maxAge = this.retentionPolicy?.()?.maxAgeMs;
+    } catch {
+      return null;
+    }
+    return typeof maxAge === "number" ? new Date(now.getTime() - maxAge) : null;
+  }
+
+  /** Records with no queued email still kept to read them under. */
+  private standsAlone(): SQL {
+    const queue = loadedDialect(this.dialect).tables.emailQueue;
+    return or(
+      isNull(this.deliveries.queuedId),
+      sql`not exists (select 1 from ${queue} where ${queue.id} = ${this.deliveries.queuedId})`
+    ) as SQL;
+  }
+
+  /**
+   * List recorded deliveries, newest first.
+   *
+   * `recipient` takes an ADDRESS and hashes it here, because a caller holding a
+   * hash is a caller who has been handed one — and the only supported way to
+   * ask about a person is to already know which person you mean.
+   */
+  async list(
+    options: ListDeliveriesOptions = {}
+  ): Promise<EmailDeliveryRecord[]> {
+    let present: boolean;
+    try {
+      present = await providersTablePresent(this.db as never, this.dialect);
+    } catch (error) {
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, error));
+    }
+    const filters = [
+      options.recipient !== undefined
+        ? inArray(
+            this.deliveries.recipientHash,
+            // The MAILBOX, as the writer stored it. A caller asking about
+            // `Jane <jane@example.com>` is asking about `jane@example.com`,
+            // and hashing what they typed answers "no record" for a message
+            // that was sent.
+            //
+            // EVERY generation, matching the erasure exactly. A rotation does
+            // not move the rows already written, so a lookup keyed only on the
+            // current secret stops finding a person's older mail — while a
+            // deletion still removes it. The two would then disagree about
+            // which rows are that person's, which is the one thing this table
+            // cannot afford: an operator answering "what do you hold about me"
+            // from the narrower answer would under-report, and confidently.
+            recipientDigests(options.recipient)
+          )
+        : undefined,
+      options.status !== undefined
+        ? eq(this.deliveries.status, options.status)
+        : undefined,
+      options.providerId !== undefined
+        ? eq(this.deliveries.providerId, options.providerId)
+        : undefined,
+      options.providerType !== undefined
+        ? eq(this.deliveries.providerType, options.providerType)
+        : undefined,
+      // By its exact bytes on MySQL, whose collation ignores case: a type id
+      // is case-sensitive everywhere else. The equality above keeps the
+      // index narrowing the rows.
+      options.providerType !== undefined && this.dialect === "mysql"
+        ? sql`CAST(${this.deliveries.providerType} AS BINARY) = CAST(${options.providerType} AS BINARY)`
+        : undefined,
+      options.id !== undefined ? eq(this.deliveries.id, options.id) : undefined,
+      options.standalone ? this.standsAlone() : undefined,
+      options.providerOrigin !== undefined
+        ? originCondition(
+            this.deliveries,
+            options.providerOrigin,
+            this.dialect,
+            present
+          )
+        : undefined,
+      options.queuedId !== undefined
+        ? eq(this.deliveries.queuedId, options.queuedId)
+        : undefined,
+      options.templateSlug !== undefined
+        ? eq(this.deliveries.templateSlug, options.templateSlug)
+        : undefined,
+      options.from !== undefined
+        ? gte(this.deliveries.createdAt, options.from)
+        : undefined,
+      options.to !== undefined
+        ? lte(this.deliveries.createdAt, options.to)
+        : undefined,
+      // After the cursor in the listing's own order, so a page never repeats
+      // or skips a record that shares its time with the one before.
+      options.before !== undefined
+        ? or(
+            lt(this.deliveries.createdAt, options.before.createdAt),
+            and(
+              eq(this.deliveries.createdAt, options.before.createdAt),
+              lt(this.deliveries.id, options.before.id)
+            )
+          )
+        : undefined,
+    ].filter(filter => filter !== undefined);
+
+    // A lost connection or any other driver failure has to arrive at the
+    // caller as a `NextlyError` like every other read in the service layer:
+    // the raw driver error carries no canonical code and no public message, so
+    // an unguarded await would put a driver's own text in an API response and
+    // lose the database log context the rest of the layer records.
+    let rows: unknown[];
+    try {
+      rows = await this.db
+        .select({
+          ...getColumns(this.deliveries),
+          // Read with the row, as the origin filter tests it.
+          providerExists: providerExists(
+            this.deliveries,
+            this.dialect,
+            present
+          ),
+        })
+        .from(this.deliveries)
+        .where(filters.length > 0 ? and(...filters) : undefined)
+        // `id` breaks the tie, and what that buys is DETERMINISM, not
+        // chronology. Rows written by one send share a timestamp by design, so
+        // without a second key a limited read returns a different subset of
+        // them each time it runs. Two INDEPENDENT sends landing in the same
+        // millisecond are ordered arbitrarily between themselves; recovering
+        // that would need an insertion sequence the table does not keep, and
+        // `created_at` already carries every bit of chronology it is given.
+        .orderBy(desc(this.deliveries.createdAt), desc(this.deliveries.id))
+        // Bounded by default. An unbounded read of a log table is the query
+        // that works in development and takes the database down in production.
+        .limit(options.limit ?? 50);
+    } catch (error) {
+      throw NextlyError.fromDatabaseError(toDbError(this.dialect, error));
+    }
+
+    return (rows as EmailDeliveryRow[]).map(toDeliveryRecord);
+  }
+}

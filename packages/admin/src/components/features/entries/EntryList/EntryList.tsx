@@ -1,0 +1,1181 @@
+"use client";
+
+/**
+ * Entry List Container Component
+ *
+ * Main container component for displaying and managing collection entries.
+ * Handles pagination, sorting, search, and bulk operations state management.
+ *
+ * @module components/entries/EntryList/EntryList
+ * @see https://tanstack.com/query/v5/docs/react/guides/paginated-queries
+ * @since 1.0.0
+ */
+
+import {
+  Alert,
+  AlertDescription,
+  Button,
+  Dialog,
+  DialogContent,
+  DialogTitle,
+  PageHeader,
+} from "@nextlyhq/ui";
+import { isFieldLocalized } from "nextly/config";
+import { useState, useCallback, useId, useMemo, useRef } from "react";
+import type { JSX } from "react";
+
+import { Code, Plus } from "@admin/components/icons";
+import { Breadcrumbs } from "@admin/components/shared";
+import { ListOutline } from "@admin/components/shared/loading-frame/outlines";
+import { PluginSlot } from "@admin/components/shared/plugin-slot";
+import { TargetSlot } from "@admin/components/shared/target-slot";
+import { usePlaceContributions } from "@admin/components/shared/target-slot/usePlaceContributions";
+import { useListColumns } from "@admin/components/ui/table/list-view";
+import { ROUTES, buildRoute } from "@admin/constants/routes";
+import {
+  useBranding,
+  useBrandingStatus,
+} from "@admin/context/providers/BrandingProvider";
+import {
+  useEntries,
+  useBulkDeleteEntries,
+  useBulkUpdateEntries,
+} from "@admin/hooks/queries";
+import { useCollection } from "@admin/hooks/queries/useCollections";
+import { useCan } from "@admin/hooks/useCan";
+import { useDefaultLanguageAsksTranslationStatus } from "@admin/hooks/useCanRequest";
+import { useDashboardUser } from "@admin/hooks/useDashboardUser";
+import { useEntryListShortcuts } from "@admin/hooks/useKeyboardShortcuts";
+import { useLocalization } from "@admin/hooks/useLocalization";
+import { useSearchParams } from "@admin/hooks/useSearchParams";
+import { apiErrorMessage } from "@admin/lib/api/parseApiError";
+import type { ListResponse } from "@admin/lib/api/response-types";
+import { revsFor } from "@admin/lib/document-version";
+import { navigateTo } from "@admin/lib/navigation";
+import {
+  useDocumentAddress,
+  useRowWaysIn,
+} from "@admin/lib/navigation/useDocumentAddress";
+import {
+  hasComponent,
+  type InjectionPointProps,
+} from "@admin/lib/plugins/component-registry";
+import { getSearchParam } from "@admin/lib/search-params";
+import type { Entry } from "@admin/types/collection";
+
+import { BulkDeleteDialog } from "../BulkActions/BulkDeleteDialog";
+import {
+  isRemovedFromCode,
+  removedEntityHasNoTable,
+} from "../removed-from-code-notice";
+import { RemovedFromCodeNotice } from "../RemovedFromCodeNotice";
+
+import {
+  getCollectionLabels,
+  toCollectionForColumns,
+} from "./collection-for-columns";
+import { declaredColumns } from "./declared-columns";
+import { EntryEmptyState } from "./EntryEmptyState";
+import { buildEntryWhereFilter } from "./entryFilters";
+import {
+  EntryTable,
+  type TablePaginationState,
+  type EntryTableRef,
+} from "./EntryTable";
+import {
+  getAvailableColumns,
+  getDefaultVisibleColumns,
+  getEntryTitleField,
+  findTopLevelField,
+  choiceInForce,
+  linkedSortFor,
+  linkedStatusFor,
+  type ChosenForCollection,
+} from "./EntryTableColumns";
+import { LANGUAGE_FILTER } from "./language-list-filters";
+import {
+  chosenPluginFilters,
+  listFiltersFor,
+  pluginFilterParamValues,
+  pluginFilterWheres,
+  writePluginFilterParams,
+} from "./plugin-filters";
+import type { TitleLanguageChoice } from "./TitleLanguageSelect";
+import { useDeclaredBulkActions } from "./useDeclaredBulkActions";
+import { useDeclaredRowActions } from "./useDeclaredRowActions";
+import { useEntryBulkActions } from "./useEntryBulkActions";
+import type { EntryRow, EntryVersions } from "./useEntrySelection";
+import { useLanguageListFilters } from "./useLanguageListFilters";
+import { useListCreateDialog } from "./useListCreateDialog";
+import { useTitlesInLanguage } from "./useTitlesInLanguage";
+import { workflowListFilters } from "./workflow-list-filters";
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/**
+ * Props for the EntryList component.
+ */
+export interface EntryListProps {
+  /** The collection slug/name to display entries for */
+  collectionSlug: string;
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/**
+ * Converts canonical ListResponse meta into the EntryTable's local
+ * pagination shape. Handles the 1-indexed to 0-indexed page conversion
+ * (canonical wire is 1-based per spec §5.1; the table component
+ * uses a 0-based React index internally).
+ */
+function toTablePaginationState(
+  response: ListResponse<Entry> | undefined,
+  limit: number
+): TablePaginationState {
+  if (!response) {
+    return {
+      page: 0,
+      limit,
+      total: 0,
+      totalPages: 0,
+    };
+  }
+
+  return {
+    page: response.meta.page - 1,
+    limit: response.meta.limit,
+    total: response.meta.total,
+    totalPages: response.meta.totalPages,
+    totalCapped: response.meta.totalCapped === true,
+    pageItemCount: response.items.length,
+  };
+}
+
+// ============================================================================
+// Component
+// ============================================================================
+
+/** The list's order until the person or their link chooses one: newest entries first. */
+const DEFAULT_SORT = "-createdAt";
+
+/**
+ * Above this many characters the collection's description under its name is
+ * clamped to two lines. About two lines at the header's width on a desktop
+ * screen; shorter text wraps to at most a few lines on a phone, which the page
+ * can afford.
+ */
+const DESCRIPTION_CLAMP_LENGTH = 160;
+
+/**
+ * The collection's description under its name, held to two lines when it is
+ * long, with a control to read the rest.
+ *
+ * The builder keeps new descriptions short, but one set in code, or saved
+ * before that limit, can be any length, and drawn whole it pushed the list
+ * itself off the screen.
+ *
+ * Whether to clamp is judged by LENGTH rather than by measuring the drawn text,
+ * as the jobs table's error cell does: below the threshold the text is shown
+ * whole and offers no control, so nothing is ever cut without a way to read
+ * it. The clamp is visual only — the whole text stays in the page, so it is
+ * read in full by assistive technology either way.
+ */
+function ListDescription({ text }: { text: string }): JSX.Element {
+  const [expanded, setExpanded] = useState(false);
+  const textId = useId();
+
+  if (text.length <= DESCRIPTION_CLAMP_LENGTH) {
+    return <span className="break-words">{text}</span>;
+  }
+
+  return (
+    <>
+      <span
+        id={textId}
+        className={expanded ? "block break-words" : "line-clamp-2 break-words"}
+      >
+        {text}
+      </span>
+      <button
+        type="button"
+        className="mt-1 text-sm font-medium text-foreground underline underline-offset-2 hover:no-underline"
+        aria-expanded={expanded}
+        aria-controls={textId}
+        onClick={() => setExpanded(current => !current)}
+      >
+        {expanded ? "Show less" : "Show more"}
+      </button>
+    </>
+  );
+}
+
+/**
+ * Entry list container with pagination, sorting, search, and bulk operations.
+ *
+ * Features:
+ * - Fetches and displays entries for a collection
+ * - Server-side pagination, sorting, and search
+ * - Bulk delete operations with confirmation
+ * - Empty state when no entries exist
+ * - Loading states during data fetches
+ * - Navigation to create/edit pages
+ *
+ * @param props - Entry list props
+ * @returns Entry list container component
+ *
+ * @example
+ * ```tsx
+ * // In a page component
+ * function CollectionEntriesPage() {
+ *   const { slug } = useParams<{ slug: string }>();
+ *   return <EntryList collectionSlug={slug!} />;
+ * }
+ * ```
+ */
+export function EntryList({ collectionSlug }: EntryListProps): JSX.Element {
+  // ---------------------------------------------------------------------------
+  // Refs
+  // ---------------------------------------------------------------------------
+
+  const tableRef = useRef<EntryTableRef>(null);
+
+  // ---------------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------------
+
+  // Held here rather than in `usePagination`, and the reason is the index base
+  // rather than preference: this page number goes to the entries API, which is
+  // 1-indexed, while the hook is 0-indexed like every table surface that reads
+  // its value straight into a slice. Moving this onto the hook would mean
+  // converting at every read and every write, and one missed conversion is an
+  // off-by-one page of content with nothing to catch it.
+  const [page, setPage] = useState(1);
+  const [limit, setLimit] = useState(25);
+  // The sort the person chose here; until they choose, the one their link carried, else newest
+  // entries first.
+  const [chosenSort, setChosenSort] = useState<
+    ChosenForCollection | undefined
+  >();
+  const [search, setSearch] = useState("");
+  const [chosenStatus, setChosenStatus] = useState<
+    ChosenForCollection | undefined
+  >();
+  const [createdFrom, setCreatedFrom] = useState("");
+  const [createdTo, setCreatedTo] = useState("");
+  const [updatedFrom, setUpdatedFrom] = useState("");
+  const [updatedTo, setUpdatedTo] = useState("");
+  // The language the title column shows, as the reader chose it on this
+  // collection; until then, the default language the list is read in.
+  const [chosenTitleLanguage, setChosenTitleLanguage] = useState<
+    ChosenForCollection | undefined
+  >();
+
+  // Read where parameter from URL for filtering (e.g., from SubmissionsFilter)
+  const searchParams = useSearchParams();
+  const whereParam = getSearchParam(searchParams, "where");
+
+  // The filters plugins offer this list, and the options the page's URL has
+  // chosen among them (`?pf=<filter>:<value>`), each resolved by name against
+  // what was declared, so a `pf` naming anything else is ignored.
+  const { plugins } = useBranding();
+  // Plugins' declared row actions for this list, and the component one of
+  // them opened, drawn below in a dialog with the row it was run on.
+  const declaredActions = useDeclaredRowActions<EntryRow>(collectionSlug);
+  // Fetch collection metadata: read before the filters, since a workflow's review filters are
+  // offered from it.
+  const { data: collection, isLoading: collectionLoading } =
+    useCollection(collectionSlug);
+  // Whether the collection's content is per language: the list's languages
+  // column, its language filter and its "Titles in" control all start here.
+  const collectionLocalized =
+    (collection as { localized?: boolean } | undefined)?.localized === true;
+  // The language filter, where the list shows each row's languages: offered
+  // from the collection and the reader's access, so a choice waits for both.
+  const languageFilters = useLanguageListFilters(
+    collectionSlug,
+    collectionLocalized
+  );
+  // The plugins' filters, then the review filters of the workflow holding the collection, then
+  // the language filter: one toolbar, one `pf` in the URL and one way into the request for all.
+  const pluginFilters = useMemo(
+    () => [
+      ...listFiltersFor(plugins, collectionSlug),
+      ...workflowListFilters(collection?.workflow),
+      ...languageFilters.filters,
+    ],
+    [plugins, collectionSlug, collection?.workflow, languageFilters.filters]
+  );
+  const chosenPluginFilterOptions = useMemo(
+    () =>
+      chosenPluginFilters(pluginFilters, pluginFilterParamValues(searchParams)),
+    [pluginFilters, searchParams]
+  );
+  // The filters are declared in the signed-in workspace meta, so until it
+  // arrives a `pf` in the URL resolves to nothing. The list waits for it
+  // rather than requesting, and showing, the rows the filter would remove;
+  // if it never arrives, the list says so and is not read at all, since the
+  // list without the filter is not the one the link asks for.
+  const {
+    isPending: pluginFiltersPending,
+    isUnavailable: pluginFiltersUnavailable,
+  } = useBrandingStatus();
+  const choosesPluginFilter = pluginFilterParamValues(searchParams).length > 0;
+  // A review filter is offered from the collection, and the language filter
+  // from the reader's access too, so a choice waits for them as well.
+  const awaitsPluginFilters =
+    (pluginFiltersPending || collectionLoading || languageFilters.pending) &&
+    choosesPluginFilter;
+  const lostPluginFilters =
+    !pluginFiltersPending && pluginFiltersUnavailable && choosesPluginFilter;
+  // A link choosing the language filter whose deciding answer failed: not read, as above, since
+  // the list without the filter is not the one the link asks for.
+  const lostLanguageFilter =
+    languageFilters.unavailable &&
+    pluginFilterParamValues(searchParams).some(value =>
+      value.startsWith(`${LANGUAGE_FILTER}:`)
+    );
+  // The page returns to the first whenever the choice changes, however it
+  // changed: a choice in the toolbar, or the back button restoring an older
+  // one. Kept on the page alone, a narrower choice would ask for a page past
+  // its last.
+  const pluginFilterChoice = JSON.stringify(
+    [...chosenPluginFilterOptions].sort(([a], [b]) => a.localeCompare(b))
+  );
+  const [pagedPluginFilterChoice, setPagedPluginFilterChoice] =
+    useState(pluginFilterChoice);
+  if (pagedPluginFilterChoice !== pluginFilterChoice) {
+    setPagedPluginFilterChoice(pluginFilterChoice);
+    setPage(1);
+  }
+
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [selectedForDelete, setSelectedForDelete] = useState<string[]>([]);
+  const [hasSelection, setHasSelection] = useState(false);
+
+  // ---------------------------------------------------------------------------
+  // Queries
+  // ---------------------------------------------------------------------------
+
+  // Request the per-locale translation-status overview only for localized collections
+  // on a localization-enabled app — drives the list's translation-completeness column.
+  // Asked only of a user the server lets read every language's state: the
+  // overview reads them all, so without that the whole list would be refused
+  // rather than shown without its translation column. The list's read carries
+  // no language, so the server judges it in the default language.
+  const asksTranslationStatus =
+    useDefaultLanguageAsksTranslationStatus(collectionSlug);
+  const wantsTranslationStatus =
+    asksTranslationStatus &&
+    (collection as { localized?: boolean } | undefined)?.localized === true;
+
+  const collectionForColumns = useMemo(
+    () =>
+      toCollectionForColumns(collection, collectionSlug, asksTranslationStatus),
+    [collection, collectionSlug, asksTranslationStatus]
+  );
+
+  // ---------------------------------------------------------------------------
+  // Title language
+  // ---------------------------------------------------------------------------
+
+  // "Titles in" is offered where a title has languages to choose among: a
+  // site with two languages or more, and a title field translated per
+  // language. A title kept once for every language (a built-in title, or a
+  // field marked shared) reads the same in each, and shown "in Spanish" it
+  // would be marked as Spanish text that it is not. Each title in the chosen
+  // language comes from a read of its own in that language, which the server
+  // judges for that language and each row.
+  const {
+    enabled: multilingual,
+    locales = [],
+    defaultLocale = "",
+    fallback: fallsBack = true,
+  } = useLocalization();
+  // Whether the list's own read, in the default language with fallback, may show another
+  // language's title where the default holds none: the default names a language to fall back to.
+  const defaultMayFallBack =
+    fallsBack &&
+    (locales.find(l => l.code === defaultLocale)?.fallbackLocale ?? []).length >
+      0;
+  const titleField = useMemo(
+    () => getEntryTitleField(collectionForColumns),
+    [collectionForColumns]
+  );
+  const titleTranslated = useMemo(() => {
+    const field = titleField
+      ? findTopLevelField(collectionForColumns.fields, titleField)
+      : undefined;
+    // The field itself, as stored: the rule reads its `virtual` mark (at its root, or in its
+    // options) as well as `localized`, and a virtual title is stored in no language.
+    return field !== undefined && isFieldLocalized(field, collectionLocalized);
+  }, [collectionForColumns.fields, titleField, collectionLocalized]);
+  const offersTitleLanguage =
+    multilingual && locales.length > 1 && titleTranslated;
+  const chosenTitleCode = choiceInForce(
+    chosenTitleLanguage,
+    collectionSlug,
+    undefined,
+    defaultLocale
+  );
+  // A language the site no longer configures is not read in: the titles
+  // return to the default language.
+  const titleLanguage =
+    offersTitleLanguage && locales.some(l => l.code === chosenTitleCode)
+      ? chosenTitleCode
+      : defaultLocale;
+  // A sort the link that opened this list carried (`?sort=-updatedAt`, from a dashboard card's
+  // "More exist"), honoured only for a column the sort menu itself can order by. Anything else
+  // is ignored rather than refused: a stale link still opens the list, newest first. Read once
+  // per address and never written back as the person changes it.
+  const sortParam = getSearchParam(searchParams, "sort");
+  const linkedSort = useMemo(
+    () =>
+      linkedSortFor(
+        sortParam,
+        collection
+          ? toCollectionForColumns(
+              collection,
+              collectionSlug,
+              asksTranslationStatus
+            )
+          : undefined
+      ),
+    [sortParam, collection, collectionSlug, asksTranslationStatus]
+  );
+  const sortAsked = choiceInForce(
+    chosenSort,
+    collectionSlug,
+    linkedSort,
+    DEFAULT_SORT
+  );
+  // While titles are shown in a language other than the default, the list is not ordered by its
+  // title: its read orders by the default language's titles, not the ones shown.
+  const sort =
+    titleLanguage !== defaultLocale &&
+    titleField !== undefined &&
+    sortAsked.replace(/^-/, "") === titleField
+      ? DEFAULT_SORT
+      : sortAsked;
+
+  // The lifecycle the link that opened this list carried (`?status=draft`), so a card's "More
+  // exist" lands on the drafts or published entries it showed rather than on every entry. Only
+  // for a collection with the lifecycle; read as the sort is, never written back.
+  const statusParam = getSearchParam(searchParams, "status");
+  const linkedStatus = useMemo(
+    () =>
+      linkedStatusFor(
+        statusParam,
+        collection
+          ? toCollectionForColumns(
+              collection,
+              collectionSlug,
+              asksTranslationStatus
+            )
+          : undefined
+      ),
+    [statusParam, collection, collectionSlug, asksTranslationStatus]
+  );
+  const status = choiceInForce(
+    chosenStatus,
+    collectionSlug,
+    linkedStatus,
+    "all"
+  );
+
+  const whereFilter = useMemo(() => {
+    return buildEntryWhereFilter({
+      whereParam,
+      status,
+      createdFrom,
+      createdTo,
+      updatedFrom,
+      updatedTo,
+      readsTranslationState: asksTranslationStatus,
+      pluginWheres: pluginFilterWheres(
+        pluginFilters,
+        chosenPluginFilterOptions
+      ),
+    });
+  }, [
+    pluginFilters,
+    chosenPluginFilterOptions,
+    whereParam,
+    status,
+    createdFrom,
+    createdTo,
+    updatedFrom,
+    updatedTo,
+    asksTranslationStatus,
+  ]);
+
+  // A collection removed from code whose main table an applied migration
+  // dropped has no entries to read: the read would only fail, after its
+  // retries, with the table's skeleton standing under the notice until then.
+  const tableGone = removedEntityHasNoTable(collection);
+
+  // Fetch entries with pagination and filters
+  const {
+    data: entriesResponse,
+    isLoading: entriesRequestLoading,
+    error: entriesError,
+  } = useEntries({
+    collectionSlug,
+    enabled:
+      !tableGone &&
+      !awaitsPluginFilters &&
+      !lostPluginFilters &&
+      !lostLanguageFilter,
+    params: {
+      page,
+      limit,
+      sort,
+      search: search || undefined,
+      // The REST default is published-only; the management list must see drafts
+      // too, so request `all` as the base. The status dropdown narrows to
+      // draft/published via `where` on top of this.
+      status: "all",
+      where: whereFilter,
+      translationStatus: wantsTranslationStatus || undefined,
+      // Each row's review state, for the Review column and the bulk moves, where a workflow
+      // holds the collection.
+      reviewState: collection?.workflow ? true : undefined,
+      // Counting every row of a very large collection is slow, and the list
+      // only needs to say "1000+" past that.
+      cappedCount: true,
+    },
+  });
+  // A request held for the filters is still loading: a disabled query reports
+  // no loading, which would draw the empty state over a list not yet read.
+  const entriesLoading = entriesRequestLoading || awaitsPluginFilters;
+
+  // ---------------------------------------------------------------------------
+  // Mutations
+  // ---------------------------------------------------------------------------
+
+  // Bulk delete mutation
+  const bulkDelete = useBulkDeleteEntries({
+    collectionSlug,
+    onSuccess: () => {
+      setDeleteDialogOpen(false);
+      setSelectedForDelete([]);
+    },
+  });
+
+  // Bulk publish/unpublish mutation. Single hook, two callers — both flip
+  // the per-row `status` system column. Only meaningful when the
+  // collection has the built-in Draft / Published lifecycle enabled
+  // (`status: true`); the bulk-action bar gates the buttons on that flag,
+  // so a non-status collection won't reach this code path.
+  const bulkUpdate = useBulkUpdateEntries({
+    collectionSlug,
+    onSuccess: () => {
+      tableRef.current?.clearSelection();
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // Column Visibility
+  // ---------------------------------------------------------------------------
+
+  // Get available and default columns from collection config
+  const availableColumns = useMemo(
+    () => getAvailableColumns(collectionForColumns),
+    [collectionForColumns]
+  );
+
+  const defaultVisibleColumns = useMemo(
+    () => getDefaultVisibleColumns(collectionForColumns),
+    [collectionForColumns]
+  );
+
+  /*
+   * The same control every other admin list uses, so "which columns has this
+   * reader hidden" has one answer and one place it is stored. This surface read
+   * the underlying hook directly, which left the entry list with its own
+   * spelling of a question the shared one already answers.
+   */
+  const columnsControl = useListColumns<Record<string, unknown>>({
+    storageKey: collectionSlug,
+    columns: availableColumns.map(name => ({ name, header: name })),
+    defaultVisible: defaultVisibleColumns,
+  });
+
+  // ---------------------------------------------------------------------------
+  // Query Presets
+  // ---------------------------------------------------------------------------
+
+  const labels = useMemo(
+    () => getCollectionLabels(collection, collectionSlug),
+    [collection, collectionSlug]
+  );
+
+  const entries = useMemo(
+    () => entriesResponse?.items ?? [],
+    [entriesResponse?.items]
+  );
+  const pagination = toTablePaginationState(entriesResponse, limit);
+
+  // The titles in the chosen language, for the rows on screen.
+  const entryIds = useMemo(
+    () => entries.map(entry => String(entry.id)),
+    [entries]
+  );
+  const titlesInLanguage = useTitlesInLanguage({
+    collectionSlug,
+    locale: titleLanguage,
+    titleField,
+    ids: entryIds,
+    enabled: offersTitleLanguage && titleLanguage !== defaultLocale,
+  });
+  const handleTitleLanguageChange = useCallback(
+    (code: string) => setChosenTitleLanguage({ collectionSlug, value: code }),
+    [collectionSlug]
+  );
+  const titleLanguageChoice = useMemo(
+    (): TitleLanguageChoice | undefined =>
+      offersTitleLanguage
+        ? {
+            languages: locales,
+            defaultLocale,
+            value: titleLanguage,
+            onChange: handleTitleLanguageChange,
+            titles: titlesInLanguage.titles,
+            failed: titlesInLanguage.failed,
+            defaultMayFallBack,
+          }
+        : undefined,
+    [
+      offersTitleLanguage,
+      locales,
+      defaultLocale,
+      titleLanguage,
+      handleTitleLanguageChange,
+      titlesInLanguage.titles,
+      titlesInLanguage.failed,
+      defaultMayFallBack,
+    ]
+  );
+
+  // What a plugin's block, column or bulk action on this list is told: who is
+  // looking, at which collection. Held while the viewer is not known yet, so
+  // nothing contributed is handed an id that is not theirs.
+  const { user } = useDashboardUser();
+  const userId = user?.id;
+  const placeContext = useMemo(
+    () => (userId ? { userId, collection: collectionSlug } : null),
+    [userId, collectionSlug]
+  );
+  // Plugins' declared columns, scoped to this collection by the place's own
+  // rule, drawn after the collection's own columns.
+  const deliveredColumns = usePlaceContributions("collection.list", "column", {
+    context: placeContext,
+  });
+  const declaredTableColumns = useMemo(
+    () =>
+      placeContext === null
+        ? []
+        : declaredColumns(deliveredColumns, collectionForColumns, placeContext),
+    [deliveredColumns, collectionForColumns, placeContext]
+  );
+  // Plugins' declared bulk actions, run on the selected rows, and the
+  // component one of them opened, drawn in the same dialog a row action's is.
+  const declaredBulk = useDeclaredBulkActions<EntryRow>(
+    collectionSlug,
+    entries
+  );
+  const openedAction = declaredActions.opened ?? declaredBulk.opened;
+  const closeOpenedAction = () => {
+    declaredActions.close();
+    declaredBulk.close();
+  };
+
+  // ---------------------------------------------------------------------------
+  // Handlers
+  // ---------------------------------------------------------------------------
+
+  // Where a row opens, by the one rule every "open this document" link uses,
+  // read from this list's own copy of the collection.
+  const addressOf = useDocumentAddress();
+  const entryHref = useCallback(
+    (entryId: string, locale?: string) =>
+      addressOf(
+        { kind: "collection", slug: collectionSlug, id: entryId },
+        {
+          ...(collection === undefined ? {} : { collection }),
+          // The language rides in the URL because that is where the editor
+          // reads it. Opening a row "in Arabic" from the list is the same act
+          // as being sent a link to the Arabic copy, and both arrive the same
+          // way; the rule opens the form for any language but the default.
+          ...(locale ? { locale } : {}),
+        }
+      ),
+    [addressOf, collectionSlug, collection]
+  );
+  const handleEdit = useCallback(
+    (entryId: string, locale?: string) =>
+      navigateTo(entryHref(entryId, locale)),
+    [entryHref]
+  );
+  // The other ways into a row's entry its menu offers, by the same rule and
+  // the same copy of the collection as the row's own link.
+  const waysInOf = useRowWaysIn();
+  const rowWaysIn = useCallback(
+    (entryId: string) =>
+      waysInOf(
+        { kind: "collection", slug: collectionSlug, id: entryId },
+        collection === undefined ? {} : { collection }
+      ),
+    [waysInOf, collectionSlug, collection]
+  );
+
+  const handleDelete = useCallback((entryId: string) => {
+    setSelectedForDelete([entryId]);
+    setDeleteDialogOpen(true);
+  }, []);
+
+  const handleBulkDelete = useCallback((entryIds: string[]) => {
+    setSelectedForDelete(entryIds);
+    setDeleteDialogOpen(true);
+  }, []);
+
+  // Bulk publish/unpublish: fire the bulk-update mutation directly (no
+  // confirmation modal — the action is reversible by clicking the
+  // opposite button). The hook's onSuccess clears row selection.
+  // Each judged by the version its row had when selected, so a document
+  // changed since is refused alone and named, and the rest go ahead.
+  const handleBulkPublish = useCallback(
+    (entryIds: string[], versions: EntryVersions) => {
+      void bulkUpdate.mutate({
+        ids: entryIds,
+        data: { status: "published" },
+        revs: revsFor(entryIds, versions),
+      });
+    },
+    [bulkUpdate]
+  );
+  const handleBulkUnpublish = useCallback(
+    (entryIds: string[], versions: EntryVersions) => {
+      void bulkUpdate.mutate({
+        ids: entryIds,
+        data: { status: "draft" },
+        revs: revsFor(entryIds, versions),
+      });
+    },
+    [bulkUpdate]
+  );
+
+  const handleConfirmDelete = useCallback(() => {
+    void bulkDelete.mutate(selectedForDelete, undefined);
+  }, [bulkDelete, selectedForDelete]);
+
+  const handlePageChange = useCallback((newPage: number) => {
+    // Convert from 0-indexed (table) to 1-indexed (API)
+    setPage(newPage + 1);
+  }, []);
+
+  const handleLimitChange = useCallback((newLimit: number) => {
+    setLimit(newLimit);
+    setPage(1); // Reset to first page when limit changes
+  }, []);
+
+  const handleSortChange = useCallback(
+    (field: string, order: "asc" | "desc") => {
+      // Sort format: -field for desc, field for asc
+      const sortValue = order === "desc" ? `-${field}` : field;
+      setChosenSort({ collectionSlug, value: sortValue });
+      setPage(1); // Reset to first page on sort change
+    },
+    [collectionSlug]
+  );
+
+  const handleSearchChange = useCallback((newSearch: string) => {
+    setSearch(newSearch);
+    setPage(1); // Reset to first page on search
+  }, []);
+
+  const handleStatusChange = useCallback(
+    (newStatus: string) => {
+      setChosenStatus({ collectionSlug, value: newStatus });
+      setPage(1); // Reset to first page on status change
+    },
+    [collectionSlug]
+  );
+
+  const handlePluginFilterChange = useCallback(
+    (name: string, value: string | null) => {
+      const next = new Map(chosenPluginFilterOptions);
+      if (value === null) next.delete(name);
+      else next.set(name, value);
+      // Kept in the URL, which the list reads back: the choice survives a
+      // reload and a shared link, and the request and the page follow the URL.
+      writePluginFilterParams(pluginFilters, next);
+    },
+    [chosenPluginFilterOptions, pluginFilters]
+  );
+
+  const handleCreatedFromChange = useCallback((value: string) => {
+    setCreatedFrom(value);
+    setPage(1);
+  }, []);
+
+  const handleCreatedToChange = useCallback((value: string) => {
+    setCreatedTo(value);
+    setPage(1);
+  }, []);
+
+  const handleUpdatedFromChange = useCallback((value: string) => {
+    setUpdatedFrom(value);
+    setPage(1);
+  }, []);
+
+  const handleUpdatedToChange = useCallback((value: string) => {
+    setUpdatedTo(value);
+    setPage(1);
+  }, []);
+
+  // One gate for every creation affordance — the header button, the
+  // empty-state CTA, and the keyboard shortcut — so neither a
+  // machine-created collection (disableCreate) nor a caller who may not
+  // create here reaches the create screen through any of them. While the
+  // collection metadata or the caller's access is still loading the answer
+  // is unknown, and unknown counts as disabled: the shortcut must not slip
+  // through the loading window.
+  const canCreate = useCan(`create-${collectionSlug}`);
+  // A collection removed from code refuses every write, a create included.
+  const removedFromCode = isRemovedFromCode(collection);
+  const createDisabled =
+    Boolean(collection?.admin?.disableCreate) || removedFromCode;
+  const createAllowed = Boolean(collection) && !createDisabled && canCreate;
+  // The bulk actions offered here, which the table's checkboxes and bar
+  // follow too, so the Delete shortcut opens nothing they would not.
+  const offeredBulk = useEntryBulkActions(collectionForColumns);
+  // The dialog the view this collection's entries open in declares for
+  // "+ New", opened in place of the create form where there is one.
+  const createDialog = useListCreateDialog({
+    slug: collectionSlug,
+    collection,
+    labels,
+    entryHref,
+  });
+  const handleCreateClick = useCallback(() => {
+    if (!createAllowed || createDialog.open()) return;
+    navigateTo(
+      buildRoute(ROUTES.COLLECTION_ENTRY_CREATE, { slug: collectionSlug })
+    );
+  }, [collectionSlug, createAllowed, createDialog]);
+
+  const handleApiPlaygroundClick = useCallback(() => {
+    navigateTo(
+      buildRoute(ROUTES.COLLECTION_ENTRY_API, { slug: collectionSlug })
+    );
+  }, [collectionSlug]);
+
+  const handleFocusSearch = useCallback(() => {
+    // Focus the search input using data attribute
+    const searchInput = document.querySelector<HTMLInputElement>(
+      "[data-entry-search-input]"
+    );
+    searchInput?.focus();
+  }, []);
+
+  const handleSelectAll = useCallback(() => {
+    tableRef.current?.selectAll();
+  }, []);
+
+  const handleDeleteSelected = useCallback(() => {
+    if (!offeredBulk.delete) return;
+    const selectedIds = tableRef.current?.getSelectedIds() ?? [];
+    if (selectedIds.length > 0) {
+      setSelectedForDelete(selectedIds);
+      setDeleteDialogOpen(true);
+    }
+  }, [offeredBulk.delete]);
+
+  const handleSelectionChange = useCallback((selectedIds: string[]) => {
+    setHasSelection(selectedIds.length > 0);
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // Keyboard Shortcuts
+  // ---------------------------------------------------------------------------
+
+  useEntryListShortcuts({
+    onNew: handleCreateClick,
+    onSearch: handleFocusSearch,
+    onSelectAll: handleSelectAll,
+    onDelete: handleDeleteSelected,
+    hasSelection,
+  });
+
+  // ---------------------------------------------------------------------------
+  // Loading State
+  // ---------------------------------------------------------------------------
+
+  // The list's outline while the collection loads: the same outline the frame
+  // drew for this address, so nothing changes until the list itself arrives.
+  if (collectionLoading) {
+    return <ListOutline framed={false} list={collectionSlug} />;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Custom Components from Plugins
+  // ---------------------------------------------------------------------------
+
+  // Resolve plugin/collection admin component overrides (D23). All resolved +
+  // isolated via PluginSlot.
+  const beforeListTablePath = collection?.admin?.components?.BeforeListTable;
+  const afterListTablePath = collection?.admin?.components?.AfterListTable;
+  // A collection's own List view, where the generated map registered it. One
+  // it did not register draws the default list instead of a blank page: the
+  // map registers every component before the admin draws, so nothing would
+  // bring it later. A collection removed from code is the usual case: its
+  // stored metadata still names the view, and the map no longer lists it.
+  const declaredListViewPath =
+    collection?.admin?.components?.views?.List?.Component;
+  const listViewPath = hasComponent(declaredListViewPath)
+    ? declaredListViewPath
+    : undefined;
+
+  // Props for injection point components
+  const injectionPointProps: InjectionPointProps = {
+    collectionSlug,
+    collection: collection as unknown as Record<string, unknown>,
+  };
+  const injectionProps = injectionPointProps as unknown as Record<
+    string,
+    unknown
+  >;
+
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
+
+  return (
+    <div>
+      {/* Breadcrumbs */}
+      <div className="mb-6 empty:hidden">
+        <Breadcrumbs
+          items={[
+            { label: "Dashboard", href: ROUTES.DASHBOARD, isDashboard: true },
+            { label: labels.plural },
+          ]}
+        />
+      </div>
+      {/* Why nothing here can be changed, and the next step: above the
+          place, not in its `table` part, so a plugin that replaces the list
+          cannot take the warning with it. */}
+      {removedFromCode && (
+        <RemovedFromCodeNotice
+          entity={{
+            kind: "collection",
+            label: labels.plural,
+            slug: collectionSlug,
+          }}
+          state={collection?.removedFromCodeState}
+          className="mb-6"
+        />
+      )}
+      {/* The list's own parts are the place's built-ins, `toolbar` (the
+          header) and `table` (the list itself): plugins' blocks draw around
+          them in the order sent. One gap spaces every part the place lays
+          out, built-in or contributed, so a block never sits against the
+          list; with nothing contributed it is the header's space above the
+          list, as before. */}
+      <div className="flex flex-col gap-8">
+        <TargetSlot
+          place="collection.list"
+          context={placeContext}
+          builtIns={{
+            toolbar: (
+              // The list's header, drawn by the shared page header. The place
+              // gives its parts their spacing, so the header adds none below.
+              <PageHeader
+                className="m-0"
+                title={labels.plural}
+                description={
+                  collection?.description ? (
+                    <ListDescription text={collection.description} />
+                  ) : undefined
+                }
+                actions={
+                  <div className="flex items-center gap-2 w-full sm:w-auto">
+                    <Button
+                      variant="outline"
+                      onClick={handleApiPlaygroundClick}
+                      className="flex-1 sm:flex-initial hover-unified"
+                    >
+                      <Code className="h-4 w-4" />
+                      API
+                    </Button>
+                    {/* Machine-created collections (disableCreate) never offer "New" —
+                        a hand-typed entry there would be fiction, not data — and nor
+                        does a collection the caller may not create in. */}
+                    {createAllowed && (
+                      <Button
+                        onClick={handleCreateClick}
+                        className="flex-1 sm:flex-initial hover-unified"
+                      >
+                        <Plus className="h-4 w-4" />
+                        New {labels.singular}
+                      </Button>
+                    )}
+                  </div>
+                }
+              />
+            ),
+            table: (
+              // One part of the place: what the list draws inside it keeps its
+              // own spacing.
+              <div>
+                {/* BeforeListTable injection point */}
+                {beforeListTablePath && (
+                  <PluginSlot
+                    path={beforeListTablePath}
+                    props={injectionProps}
+                  />
+                )}
+
+                {/* Content — a plugin List override replaces the default table (D23) */}
+                {listViewPath ? (
+                  <PluginSlot path={listViewPath} props={injectionProps} />
+                ) : tableGone ? null : lostPluginFilters ? (
+                  <Alert variant="destructive">
+                    <AlertDescription>
+                      This link chooses a plugin&apos;s filter, and the filters
+                      couldn&apos;t be loaded, so the list isn&apos;t shown.
+                      Reload the page to try again.
+                    </AlertDescription>
+                  </Alert>
+                ) : lostLanguageFilter ? (
+                  <Alert variant="destructive">
+                    <AlertDescription>
+                      This link chooses a language filter, and your access to it
+                      couldn&apos;t be checked, so the list isn&apos;t shown.
+                      Reload the page to try again.
+                    </AlertDescription>
+                  </Alert>
+                ) : entriesError ? (
+                  // A list the server refused says so in its own words where the rows
+                  // would be. Without this a failed read has no rows and is not
+                  // loading, which draws the empty state and calls the collection empty.
+                  <Alert variant="destructive">
+                    <AlertDescription>
+                      {apiErrorMessage(
+                        entriesError,
+                        "The entries couldn't be loaded."
+                      )}
+                    </AlertDescription>
+                  </Alert>
+                ) : entries.length === 0 &&
+                  !entriesLoading &&
+                  !search &&
+                  whereFilter === undefined ? (
+                  // Only an unfiltered list is empty. A filtered one with no rows keeps
+                  // its table, and with it the toolbar that clears the filter.
+                  <EntryEmptyState
+                    collectionName={labels.plural}
+                    singularName={labels.singular}
+                    onCreateClick={
+                      createAllowed ? handleCreateClick : undefined
+                    }
+                  />
+                ) : (
+                  <EntryTable
+                    ref={tableRef}
+                    declaredRowActions={declaredActions.rowActions}
+                    declaredBulkActions={declaredBulk.bulkActions}
+                    declaredColumns={declaredTableColumns}
+                    collection={collectionForColumns}
+                    entries={entries}
+                    pagination={pagination}
+                    isLoading={entriesLoading}
+                    currentSort={sort}
+                    onPageChange={handlePageChange}
+                    onLimitChange={handleLimitChange}
+                    onSortChange={handleSortChange}
+                    onSearchChange={handleSearchChange}
+                    onEdit={handleEdit}
+                    entryHref={entryHref}
+                    rowWaysIn={rowWaysIn}
+                    onDelete={handleDelete}
+                    onBulkDelete={handleBulkDelete}
+                    onBulkPublish={handleBulkPublish}
+                    onBulkUnpublish={handleBulkUnpublish}
+                    isBulkPublishing={bulkUpdate.isPending}
+                    onSelectionChange={handleSelectionChange}
+                    status={status}
+                    onStatusChange={handleStatusChange}
+                    titleLanguage={titleLanguageChoice}
+                    pluginFilters={pluginFilters}
+                    chosenPluginFilters={chosenPluginFilterOptions}
+                    onPluginFilterChange={handlePluginFilterChange}
+                    createdFrom={createdFrom}
+                    createdTo={createdTo}
+                    updatedFrom={updatedFrom}
+                    updatedTo={updatedTo}
+                    onCreatedFromChange={handleCreatedFromChange}
+                    onCreatedToChange={handleCreatedToChange}
+                    onUpdatedFromChange={handleUpdatedFromChange}
+                    onUpdatedToChange={handleUpdatedToChange}
+                    columnsControl={columnsControl}
+                  />
+                )}
+
+                {/* AfterListTable injection point (D23) */}
+                {afterListTablePath && (
+                  <PluginSlot
+                    path={afterListTablePath}
+                    props={injectionProps}
+                  />
+                )}
+              </div>
+            ),
+          }}
+        />
+      </div>
+
+      {/* Bulk Delete Confirmation Dialog */}
+      <BulkDeleteDialog
+        open={deleteDialogOpen}
+        onOpenChange={setDeleteDialogOpen}
+        count={selectedForDelete.length}
+        collectionName={labels.plural}
+        onConfirm={handleConfirmDelete}
+        isLoading={bulkDelete.isPending}
+      />
+
+      {createDialog.dialog}
+
+      {/* A declared action that opens its plugin's component, with its rows */}
+      <Dialog
+        open={openedAction !== null}
+        onOpenChange={open => {
+          if (!open) closeOpenedAction();
+        }}
+      >
+        <DialogContent>
+          <DialogTitle>{openedAction?.label}</DialogTitle>
+          {openedAction ? (
+            <PluginSlot
+              path={openedAction.component}
+              props={{
+                rows: openedAction.rows,
+                onClose: closeOpenedAction,
+              }}
+              fallback={
+                <p className="text-sm text-muted-foreground">
+                  This action&apos;s component isn&apos;t available in this
+                  admin.
+                </p>
+              }
+            />
+          ) : null}
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}

@@ -1,0 +1,147 @@
+import { NextlyError } from "../../../errors/nextly-error";
+import { isReservedLocaleCode } from "../locale-selector";
+
+import { normalizeLocalization } from "./normalize";
+import type { LocalizationConfig } from "./types";
+
+/** A locale code: non-empty, letters/digits/`-`/`_` only (e.g. `en`, `en-US`, `zh_Hant`). */
+const LOCALE_CODE_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Whether a string could be a configured locale code: the pattern, and none of
+ * the spellings read as instructions rather than languages. The one rule for
+ * anything that stores a language code, so nothing keeps a looser copy of it.
+ */
+export function isConfigurableLocaleCode(code: string): boolean {
+  return LOCALE_CODE_PATTERN.test(code) && !isReservedLocaleCode(code);
+}
+
+/**
+ * Validate a `LocalizationConfig`, throwing a descriptive Error on any problem:
+ * non-empty locales, unique codes, `defaultLocale` ∈ codes, and every `fallbackLocale`
+ * reference resolves to a real code. Called from `defineConfig` / `validateNextlyConfig`.
+ */
+export function validateLocalizationConfig(input: LocalizationConfig): void {
+  // Guard the shape BEFORE normalizing so a missing/invalid `locales` yields a descriptive
+  // error rather than a "Cannot read properties of undefined (reading 'map')" TypeError (L19).
+  if (!Array.isArray(input?.locales) || input.locales.length === 0) {
+    throw new Error("localization.locales must contain at least one locale.");
+  }
+
+  const { locales, defaultLocale } = normalizeLocalization(input);
+
+  if (locales.length === 0) {
+    throw new Error("localization.locales must contain at least one locale.");
+  }
+
+  // The companion `_locale` column is VARCHAR(20); a longer code would fail or
+  // truncate on insert (a truncation could even collide with another locale).
+  const MAX_LOCALE_CODE_LENGTH = 20;
+  const codes = new Set<string>();
+  // Case-insensitive view for duplicate detection so `en` / `EN` (and stray
+  // whitespace variants) are caught rather than treated as distinct locales (M10).
+  const seen = new Set<string>();
+  for (const l of locales) {
+    // Reject empty/whitespace/junk codes up front — they otherwise flow into the
+    // companion `_locale` rows and the admin switcher as meaningless entries (M10).
+    if (!LOCALE_CODE_PATTERN.test(l.code)) {
+      throw new Error(
+        `Invalid locale code '${l.code}' in localization.locales — a code must be ` +
+          `non-empty and contain only letters, digits, '-' or '_' (e.g. 'en', 'en-US').`
+      );
+    }
+    // The instructions are reserved. `*` already fails the pattern; `all` and
+    // `none` do not, and a site that configured either as a language could
+    // never use it as one — a read naming `all` answers with every
+    // translation, and a fallback naming `none` disables fallback instead of
+    // choosing that language. Refused at configuration, where the collision
+    // is a sentence rather than a page that silently answers in every
+    // language at once.
+    if (isReservedLocaleCode(l.code)) {
+      throw NextlyError.invalidInput({
+        message:
+          `Locale code '${l.code}' in localization.locales is reserved: the core ` +
+          `reads it as an instruction rather than a language. Choose another code.`,
+        logContext: { reason: "localization-locale-code-is-reserved" },
+      });
+    }
+    // Bound the length to the companion `_locale` VARCHAR(20) so a longer code
+    // can't fail or silently truncate (and then collide) on insert.
+    if (l.code.length > MAX_LOCALE_CODE_LENGTH) {
+      throw new Error(
+        `Locale code '${l.code}' exceeds the ${MAX_LOCALE_CODE_LENGTH}-character limit for companion _locale storage.`
+      );
+    }
+    const lower = l.code.toLowerCase();
+    if (seen.has(lower)) {
+      throw new Error(
+        `Duplicate locale code '${l.code}' in localization.locales ` +
+          `(codes are compared case-insensitively).`
+      );
+    }
+    seen.add(lower);
+    codes.add(l.code);
+  }
+
+  if (!codes.has(defaultLocale)) {
+    throw new Error(
+      `localization.defaultLocale '${defaultLocale}' is not one of the configured locales.`
+    );
+  }
+
+  for (const l of locales) {
+    for (const fb of l.fallbackLocale) {
+      if (!codes.has(fb)) {
+        throw new Error(
+          `Locale '${l.code}' has fallbackLocale '${fb}', which is not a configured locale.`
+        );
+      }
+      // A locale falling back to itself is a config mistake — it does nothing (the resolver's
+      // seen-set breaks the cycle) and signals confusion. Reject it explicitly (L18).
+      if (fb === l.code) {
+        throw new Error(
+          `Locale '${l.code}' lists itself as a fallbackLocale — remove the self-reference.`
+        );
+      }
+    }
+  }
+
+  const loop = fallbackLoop(locales);
+  if (loop) {
+    throw NextlyError.invalidInput({
+      message:
+        `localization fallback lists loop: ${loop.join(" → ")}. ` +
+        `A language may fall back through others, but never back to itself.`,
+      logContext: { reason: "localization-fallback-loop", loop },
+    });
+  }
+}
+
+/**
+ * A cycle through the fallback lists, as the codes it passes ending where it started, or
+ * `undefined` when there is none. Each list names the languages a language falls back to, so
+ * the lists form a graph; a cycle in it is a language that, through others, falls back to itself.
+ * A language several others fall back to is not a cycle.
+ */
+function fallbackLoop(
+  locales: ReadonlyArray<{ code: string; fallbackLocale: readonly string[] }>
+): string[] | undefined {
+  const next = new Map(locales.map(l => [l.code, l.fallbackLocale]));
+  const done = new Set<string>();
+  const visit = (code: string, path: string[]): string[] | undefined => {
+    const at = path.indexOf(code);
+    if (at !== -1) return [...path.slice(at), code];
+    if (done.has(code)) return undefined;
+    for (const fb of next.get(code) ?? []) {
+      const loop = visit(fb, [...path, code]);
+      if (loop) return loop;
+    }
+    done.add(code);
+    return undefined;
+  };
+  for (const { code } of locales) {
+    const loop = visit(code, []);
+    if (loop) return loop;
+  }
+  return undefined;
+}

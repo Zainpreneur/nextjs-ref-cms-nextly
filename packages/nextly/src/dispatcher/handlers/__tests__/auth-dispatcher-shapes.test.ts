@@ -1,0 +1,424 @@
+// Regression tests for auth + rbac dispatcher op-types beyond
+// listRoles. One test per op-type pattern; new methods adopting the
+// same pattern inherit shape correctness from the respondX helpers
+// (covered in api/__tests__/response-shapes.test.ts).
+
+import { describe, expect, it, vi } from "vitest";
+
+import type { ServiceContainer } from "../../../services";
+import {
+  dispatchAuth,
+  dispatchIdentities,
+  dispatchRbac,
+} from "../auth-dispatcher";
+
+describe("dispatchAuth — actions", () => {
+  it("registerUser returns { message, item } body and 201 status", async () => {
+    const fakeUser = { id: "u1", email: "new@example.com" };
+    const container = {
+      auth: { registerUser: vi.fn().mockResolvedValue(fakeUser) },
+    } as unknown as ServiceContainer;
+
+    const result = await dispatchAuth(
+      container,
+      "registerUser",
+      {},
+      { email: "new@example.com", password: "Pass1234!" }
+    );
+
+    const response = result as Response;
+    expect(response.status).toBe(201);
+    const body = await response.json();
+    expect(body).toEqual({ message: "Account created.", item: fakeUser });
+  });
+
+  it("verifyCredentials returns { user } body via respondData", async () => {
+    const fakeUser = { id: "u1", email: "a@example.com" };
+    const container = {
+      auth: { verifyCredentials: vi.fn().mockResolvedValue(fakeUser) },
+    } as unknown as ServiceContainer;
+
+    const result = await dispatchAuth(
+      container,
+      "verifyCredentials",
+      {},
+      { email: "a@example.com", password: "Pass1234!" }
+    );
+
+    const body = await (result as Response).json();
+    expect(body).toEqual({ user: fakeUser });
+    expect(body).not.toHaveProperty("data");
+    expect(body).not.toHaveProperty("message");
+  });
+
+  it("changePassword returns just { message } body", async () => {
+    const container = {
+      auth: { changePassword: vi.fn().mockResolvedValue(undefined) },
+    } as unknown as ServiceContainer;
+
+    const result = await dispatchAuth(
+      container,
+      "changePassword",
+      { userId: "u1" },
+      { currentPassword: "old", newPassword: "new" }
+    );
+
+    const body = await (result as Response).json();
+    expect(body).toEqual({ message: "Password changed." });
+  });
+
+  it("generatePasswordResetToken returns generic message (no leak)", async () => {
+    const container = {
+      auth: {
+        generatePasswordResetToken: vi.fn().mockResolvedValue(undefined),
+      },
+    } as unknown as ServiceContainer;
+
+    const result = await dispatchAuth(
+      container,
+      "generatePasswordResetToken",
+      {},
+      { email: "a@example.com" }
+    );
+
+    const body = (await (result as Response).json()) as { message: string };
+    expect(body.message).toMatch(/^If an account exists/);
+    // Critical: do not echo the email back in the message
+    expect(body.message).not.toContain("a@example.com");
+  });
+});
+
+describe("dispatchRbac — single-doc reads (respondDoc)", () => {
+  it("getRoleById returns bare doc body", async () => {
+    const fakeRole = { id: "r1", name: "Admin", level: 100 };
+    const container = {
+      roles: { getRoleById: vi.fn().mockResolvedValue(fakeRole) },
+      permissions: {},
+    } as unknown as ServiceContainer;
+
+    const result = await dispatchRbac(
+      container,
+      "getRoleById",
+      { roleId: "r1" },
+      undefined
+    );
+
+    const response = result as Response;
+    const body = await response.json();
+    expect(body).toEqual(fakeRole);
+    expect(body).not.toHaveProperty("data");
+    expect(body).not.toHaveProperty("item");
+  });
+});
+
+describe("dispatchRbac — paginated lists (respondList)", () => {
+  it("listPermissions returns { items, meta } body", async () => {
+    const fakePerms = [
+      { id: "p1", action: "read", resource: "users" },
+      { id: "p2", action: "write", resource: "users" },
+    ];
+    const fakeServiceResult = {
+      data: fakePerms,
+      meta: { total: 2, page: 1, limit: 10, totalPages: 1 },
+    };
+    const container = {
+      permissions: {
+        listPermissions: vi.fn().mockResolvedValue(fakeServiceResult),
+      },
+      roles: {},
+    } as unknown as ServiceContainer;
+
+    const result = await dispatchRbac(
+      container,
+      "listPermissions",
+      { page: "1", limit: "10" },
+      undefined
+    );
+
+    const body = await (result as Response).json();
+    expect(body).toEqual({
+      items: fakePerms,
+      meta: {
+        total: 2,
+        page: 1,
+        limit: 10,
+        totalPages: 1,
+        hasNext: false,
+        hasPrev: false,
+      },
+    });
+  });
+
+  // Observed on the service call rather than reconstructed here: the response
+  // body is identical whichever way the option went, so asserting the shape
+  // again would pass on a dispatcher that dropped the parameter entirely.
+  it.each([
+    ["true", true],
+    ["false", false],
+  ])(
+    "forwards includeOrphaned=%s to the service as %s",
+    async (query, expected) => {
+      const listPermissions = vi.fn().mockResolvedValue({
+        data: [],
+        meta: { total: 0, page: 1, limit: 10, totalPages: 0 },
+      });
+      const container = {
+        permissions: { listPermissions },
+        roles: {},
+      } as unknown as ServiceContainer;
+
+      await dispatchRbac(
+        container,
+        "listPermissions",
+        { includeOrphaned: query },
+        undefined
+      );
+
+      expect(listPermissions).toHaveBeenCalledWith(
+        expect.objectContaining({ includeOrphaned: expected })
+      );
+    }
+  );
+
+  // Omission has to reach the service as `undefined` rather than as `false`,
+  // so the service's own default decides. A dispatcher substituting a literal
+  // here would pin the policy in two places.
+  it("leaves includeOrphaned undefined when the query omits it", async () => {
+    const listPermissions = vi.fn().mockResolvedValue({
+      data: [],
+      meta: { total: 0, page: 1, limit: 10, totalPages: 0 },
+    });
+    const container = {
+      permissions: { listPermissions },
+      roles: {},
+    } as unknown as ServiceContainer;
+
+    await dispatchRbac(container, "listPermissions", { page: "1" }, undefined);
+
+    expect(listPermissions).toHaveBeenCalledWith(
+      expect.objectContaining({ includeOrphaned: undefined })
+    );
+  });
+});
+
+describe("dispatchRbac — non-paginated lists (respondData)", () => {
+  it("listRolePermissions returns { permissions: [...] } body", async () => {
+    const fakePerms = [{ id: "p1", action: "read", resource: "users" }];
+    const container = {
+      rolePermissions: {
+        listRolePermissions: vi.fn().mockResolvedValue(fakePerms),
+      },
+      roles: {},
+      permissions: {},
+    } as unknown as ServiceContainer;
+
+    const result = await dispatchRbac(
+      container,
+      "listRolePermissions",
+      { roleId: "r1" },
+      undefined
+    );
+
+    const body = await (result as Response).json();
+    expect(body).toEqual({ permissions: fakePerms });
+  });
+
+  it("listUserRoles returns { roles: [...] } body", async () => {
+    const fakeRoles = [{ id: "r1", name: "Admin" }];
+    const container = {
+      userRoles: { listUserRoles: vi.fn().mockResolvedValue(fakeRoles) },
+      roles: {},
+      permissions: {},
+    } as unknown as ServiceContainer;
+
+    const result = await dispatchRbac(
+      container,
+      "listUserRoles",
+      { userId: "u1" },
+      undefined
+    );
+
+    const body = await (result as Response).json();
+    expect(body).toEqual({ roles: fakeRoles });
+  });
+});
+
+describe("dispatchRbac — mutations (respondMutation)", () => {
+  it("createRole returns { message, item } body and 201 status", async () => {
+    const fakeRole = { id: "r2", name: "Editor", slug: "editor" };
+    const container = {
+      roles: { createRole: vi.fn().mockResolvedValue(fakeRole) },
+      permissions: {},
+    } as unknown as ServiceContainer;
+
+    const result = await dispatchRbac(
+      container,
+      "createRole",
+      {},
+      { name: "Editor", slug: "editor", permissionIds: ["p1"] }
+    );
+
+    const response = result as Response;
+    expect(response.status).toBe(201);
+    const body = await response.json();
+    expect(body).toEqual({ message: "Role created.", item: fakeRole });
+  });
+});
+
+describe("dispatchRbac — actions (respondAction)", () => {
+  it("assignRoleToUser returns { message, userId, roleId } body", async () => {
+    const container = {
+      // The service's own answer for an assignment it made.
+      userRoles: {
+        assignRoleToUser: vi.fn().mockResolvedValue({
+          success: true,
+          statusCode: 201,
+          message: "Role assigned successfully",
+        }),
+      },
+      roles: {},
+      permissions: {},
+    } as unknown as ServiceContainer;
+
+    const result = await dispatchRbac(
+      container,
+      "assignRoleToUser",
+      { userId: "u1", roleId: "r1" },
+      undefined
+    );
+
+    const body = await (result as Response).json();
+    expect(body).toMatchObject({
+      message: "Role assigned to user.",
+      userId: "u1",
+      roleId: "r1",
+    });
+  });
+
+  it("setRolePermissions returns count metadata", async () => {
+    const container = {
+      rolePermissions: {
+        setRolePermissions: vi
+          .fn()
+          .mockResolvedValue([{ id: "p1" }, { id: "p2" }, { id: "p3" }]),
+      },
+      roles: {},
+      permissions: {},
+    } as unknown as ServiceContainer;
+
+    const result = await dispatchRbac(
+      container,
+      "setRolePermissions",
+      { roleId: "r1" },
+      { permissionIds: ["p1", "p2", "p3"] }
+    );
+
+    const body = await (result as Response).json();
+    expect(body).toEqual({
+      message: "Role permissions updated.",
+      roleId: "r1",
+      permissionCount: 3,
+    });
+  });
+
+  it("setRolePermissions counts what the role holds, not what was asked", async () => {
+    // A retired `manage-` permission asked for is stored as the plain four.
+    const stored = ["read", "create", "update", "delete"].map(action => ({
+      id: `${action}-media`,
+      action,
+      resource: "media",
+    }));
+    const container = {
+      rolePermissions: {
+        setRolePermissions: vi.fn().mockResolvedValue(stored),
+      },
+      roles: {},
+      permissions: {},
+    } as unknown as ServiceContainer;
+
+    const result = await dispatchRbac(
+      container,
+      "setRolePermissions",
+      { roleId: "r1" },
+      { permissionIds: ["manage-media-id"] }
+    );
+
+    expect(await (result as Response).json()).toEqual({
+      message: "Role permissions updated.",
+      roleId: "r1",
+      permissionCount: 4,
+    });
+  });
+});
+
+describe("dispatchIdentities — a user's external identities", () => {
+  it("listUserIdentities returns { items, meta }, private to the caller, and reads the named user's", async () => {
+    const identities = [
+      {
+        id: "i1",
+        providerKey: "acme-auth:google",
+        issuer: "",
+        subject: "subject-one",
+        address: null,
+        userId: "u1",
+        createdAt: new Date("2020-01-01T00:00:00Z"),
+      },
+    ];
+    const listExternalIdentities = vi.fn().mockResolvedValue(identities);
+    const container = {
+      identities: { listExternalIdentities },
+    } as unknown as ServiceContainer;
+
+    const result = await dispatchIdentities(
+      container,
+      "listUserIdentities",
+      { userId: "u1" },
+      undefined
+    );
+
+    const response = result as Response;
+    const body = await response.json();
+    // The wire form of the listing: a Response body carries the rows as
+    // JSON wrote them, a Date as its ISO string, so that is the body
+    // asserted — not the in-memory shape the service answered with. One
+    // page holds every identity.
+    expect(body).toEqual({
+      items: [
+        { ...identities[0], createdAt: identities[0].createdAt.toISOString() },
+      ],
+      meta: {
+        total: 1,
+        page: 1,
+        limit: 1,
+        totalPages: 1,
+        hasNext: false,
+        hasPrev: false,
+      },
+    });
+    // Told to one caller, so no shared cache keeps it for the next.
+    expect(response.headers.get("cache-control")).toContain("private");
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    expect(listExternalIdentities).toHaveBeenCalledWith("u1");
+  });
+
+  it("unlinkUserIdentity returns { message, item } and unlinks through the service with both ids", async () => {
+    const unlinkExternalIdentity = vi.fn().mockResolvedValue(undefined);
+    const container = {
+      identities: { unlinkExternalIdentity },
+    } as unknown as ServiceContainer;
+
+    const result = await dispatchIdentities(
+      container,
+      "unlinkUserIdentity",
+      { userId: "u1", identityId: "i1" },
+      undefined
+    );
+
+    const body = await (result as Response).json();
+    expect(body).toEqual({
+      message: "Identity unlinked.",
+      item: { id: "i1" },
+    });
+    expect(unlinkExternalIdentity).toHaveBeenCalledWith("u1", "i1");
+  });
+});

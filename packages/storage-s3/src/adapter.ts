@@ -1,0 +1,1089 @@
+/**
+ * S3 Storage Adapter
+ *
+ * Stores files on AWS S3 or S3-compatible services (Cloudflare R2, MinIO, DigitalOcean Spaces).
+ * Uses AWS SDK v3 with automatic multipart upload for large files (>5MB).
+ *
+ * Features:
+ * - Automatic multipart upload via @aws-sdk/lib-storage
+ * - Pre-signed URL generation for client-side uploads
+ * - Signed URL generation for private file access
+ * - Cloudflare R2 support (S3-compatible API)
+ * - Custom endpoint support (MinIO, DigitalOcean Spaces)
+ * - CDN URL override support
+ * - File metadata retrieval
+ *
+ * @example AWS S3
+ * ```typescript
+ * const adapter = new S3StorageAdapter({
+ *   bucket: 'my-media-bucket',
+ *   region: 'us-east-1',
+ *   accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+ *   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+ *   collections: { media: true }
+ * });
+ * ```
+ *
+ * @example Cloudflare R2
+ * ```typescript
+ * const adapter = new S3StorageAdapter({
+ *   bucket: 'my-media',
+ *   region: 'auto',
+ *   accessKeyId: process.env.R2_ACCESS_KEY_ID!,
+ *   secretAccessKey: process.env.R2_SECRET_ACCESS_KEY!,
+ *   endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+ *   publicUrl: 'https://pub-abc.r2.dev',
+ *   collections: { media: true }
+ * });
+ * ```
+ *
+ * @example MinIO (self-hosted)
+ * ```typescript
+ * const adapter = new S3StorageAdapter({
+ *   bucket: 'my-bucket',
+ *   region: 'us-east-1',
+ *   accessKeyId: process.env.MINIO_ACCESS_KEY!,
+ *   secretAccessKey: process.env.MINIO_SECRET_KEY!,
+ *   endpoint: 'http://localhost:9000',
+ *   forcePathStyle: true,
+ *   collections: { media: true }
+ * });
+ * ```
+ */
+
+import {
+  S3Client,
+  DeleteObjectCommand,
+  DeleteObjectsCommand,
+  ListObjectsV2Command,
+  HeadObjectCommand,
+  GetObjectCommand,
+  PutObjectCommand,
+  type PutObjectCommandInput,
+  type GetObjectCommandOutput,
+} from "@aws-sdk/client-s3";
+import { Upload } from "@aws-sdk/lib-storage";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import type {
+  StorageReadOptions,
+  IStorageAdapter,
+  UploadOptions,
+  UploadResult,
+  StorageAdapterInfo,
+  ClientUploadData,
+  FileMetadata,
+  BulkDeleteResult,
+  StoredFileEntry,
+  StoredObjectHead,
+  StorageStreamOptions,
+  PrivateDownloadUrlOptions,
+  PrivateUploadUrlOptions,
+} from "nextly/storage";
+import { resolveReadBounds } from "nextly/storage/fetch-stored-bytes";
+import { StorageReadTooLargeError } from "nextly/storage/read-errors";
+
+import { generateStorageKey, sanitizeFilename } from "./storage-key";
+import type { S3ObjectACL, S3StorageConfig, ResolvedS3Config } from "./types";
+
+/**
+ * The Cache-Control a private object is stored and answered with: no cache,
+ * shared or the browser's own, may keep a copy, so every later request has to
+ * come back through Nextly's checked route.
+ */
+const PRIVATE_CACHE_CONTROL = "private, no-store";
+
+/** What a signed direct upload writes, besides its key and type. */
+interface PresignedPut {
+  cacheControl: string;
+  acl: S3ObjectACL;
+  expiresIn: number | undefined;
+  contentLength: number | undefined;
+}
+
+// ============================================================
+// S3 Storage Adapter
+// ============================================================
+
+/**
+ * S3 Storage Adapter
+ *
+ * Implements the IStorageAdapter interface for AWS S3 and S3-compatible services.
+ * Provides full support for uploads, downloads, signed URLs, and client-side uploads.
+ */
+/**
+ * The SDK request options carrying the caller's deadline, or none.
+ *
+ * A free function rather than a branch inside `read`, because it is the only
+ * part of that method with nothing to do with telling an absent key apart from
+ * an unreachable bucket — which is the distinction a reader has to hold in
+ * their head there.
+ *
+ * `AbortSignal.timeout` rather than a controller and a `setTimeout`: it needs no
+ * clearing, so it cannot leak a timer when the read resolves first. The signal
+ * covers the BODY as well as the request, because the SDK threads it through
+ * the response stream — and a backend that answers headers promptly and then
+ * stalls mid-transfer is exactly the case a request-only deadline misses.
+ */
+function abortAfter(options?: StorageReadOptions): {
+  abortSignal: AbortSignal;
+} {
+  /*
+   * ALWAYS a signal, defaulted through the shared resolver.
+   * `StorageReadOptions` promises the deadline whether or not a caller names
+   * one, and the URL-backed adapters keep that promise by inheriting
+   * `safeFetch`'s. Returning nothing here left the no-options read — which is
+   * what the media pipeline does — able to hang on a stalled bucket forever.
+   */
+  return {
+    abortSignal: AbortSignal.timeout(resolveReadBounds(options).timeoutMs),
+  };
+}
+
+export class S3StorageAdapter implements IStorageAdapter {
+  private client: S3Client | null = null;
+  private resolvedConfig: ResolvedS3Config;
+  private isR2: boolean;
+
+  /**
+   * Create a new S3 storage adapter.
+   *
+   * The bucket and region are deliberately NOT checked here, and the SDK
+   * client is deliberately not built. This constructor runs while the host's
+   * config file is evaluated, so a throw would stop every command —
+   * including the schema-only ones that never touch storage. Both the checks
+   * and the client construction move to the first storage operation
+   * ({@link ensureClient} and {@link ensureConfigured}), which refuse with
+   * the same messages a missing bucket or region has always produced.
+   *
+   * @param config - S3 storage configuration
+   */
+  constructor(private config: S3StorageConfig) {
+    // Detect if this is Cloudflare R2
+    this.isR2 = config.endpoint?.includes("r2.cloudflarestorage.com") ?? false;
+
+    // Resolve config with defaults
+    this.resolvedConfig = {
+      bucket: config.bucket,
+      region: config.region,
+      endpoint: config.endpoint,
+      forcePathStyle: config.forcePathStyle ?? false,
+      acl: config.acl ?? "private",
+      publicUrl: config.publicUrl,
+      cacheControl: config.cacheControl ?? "public, max-age=31536000",
+      contentDisposition: config.contentDisposition,
+      signedUrlExpiresIn: config.signedUrlExpiresIn ?? 3600,
+    };
+  }
+
+  /**
+   * Validate that bucket and region are present.
+   *
+   * @throws Error if bucket is not provided
+   * @throws Error if region is not provided
+   */
+  private ensureConfigured(): void {
+    if (!this.config.bucket) {
+      throw new Error("@nextly/storage-s3: bucket is required");
+    }
+    if (!this.config.region) {
+      throw new Error("@nextly/storage-s3: region is required");
+    }
+  }
+
+  /**
+   * Validate the stored configuration and build the SDK client, at the
+   * first use that needs them.
+   *
+   * The refusals are the ones the constructor used to throw, in the same
+   * order, so an operator with a genuinely misconfigured deployment sees
+   * the message they have always seen — at the moment the value was
+   * actually needed rather than at config load. The client is built once
+   * and reused.
+   *
+   * @throws Error if bucket is not provided
+   * @throws Error if region is not provided
+   */
+  private ensureClient(): S3Client {
+    if (this.client) return this.client;
+
+    this.ensureConfigured();
+
+    // Build credentials
+    const credentials = this.buildCredentials();
+
+    this.client = new S3Client({
+      region: this.config.region,
+      endpoint: this.config.endpoint,
+      credentials,
+      forcePathStyle: this.resolvedConfig.forcePathStyle,
+      ...this.config.config,
+    });
+    return this.client;
+  }
+
+  /**
+   * Build AWS credentials from config.
+   * Supports explicit credentials or falls back to SDK default chain.
+   */
+  private buildCredentials():
+    | { accessKeyId: string; secretAccessKey: string }
+    | undefined {
+    if (this.config.accessKeyId && this.config.secretAccessKey) {
+      return {
+        accessKeyId: this.config.accessKeyId,
+        secretAccessKey: this.config.secretAccessKey,
+      };
+    }
+
+    // Check if credentials are in the config object
+    if (this.config.config?.credentials) {
+      return undefined; // Let SDK use the provided config.credentials
+    }
+
+    // Fall back to SDK default credential chain (env vars, IAM roles, etc.)
+    return undefined;
+  }
+
+  // ============================================================
+  // Core IStorageAdapter Methods
+  // ============================================================
+
+  /**
+   * Upload file to S3.
+   *
+   * Uses AWS SDK v3's Upload class from @aws-sdk/lib-storage which:
+   * - Automatically handles multipart upload for large files (>5MB)
+   * - Provides progress tracking capability
+   * - Includes retry logic
+   * - Optimizes upload performance
+   *
+   * @param buffer - File content as Buffer
+   * @param options - Upload options (filename, mimeType, folder, collection)
+   * @returns Upload result with URL and storage path
+   */
+  async upload(buffer: Buffer, options: UploadOptions): Promise<UploadResult> {
+    const client = this.ensureClient();
+    // The one key layout, shared with direct browser uploads.
+    const key = generateStorageKey(options.filename, options.folder);
+
+    // Build upload parameters
+    const uploadParams: PutObjectCommandInput = {
+      Bucket: this.resolvedConfig.bucket,
+      Key: key,
+      Body: buffer,
+      ContentType: options.contentType || options.mimeType,
+      CacheControl: this.resolvedConfig.cacheControl,
+    };
+
+    // Add ACL if not R2 (R2 ignores ACL settings)
+    if (!this.isR2) {
+      uploadParams.ACL = this.resolvedConfig.acl;
+    }
+
+    // Add Content-Disposition: per-file override takes priority, then global config
+    const disposition =
+      options.contentDisposition ?? this.resolvedConfig.contentDisposition;
+    if (disposition) {
+      const filename = sanitizeFilename(options.filename);
+      uploadParams.ContentDisposition =
+        disposition === "attachment"
+          ? `attachment; filename="${filename}"`
+          : "inline";
+    }
+
+    // Store original filename in metadata for later retrieval
+    uploadParams.Metadata = {
+      "original-filename": options.filename,
+    };
+
+    // The address is formed BEFORE the write: a bucket with no public URL
+    // (an R2 bucket without one) refuses here, rather than after the object is
+    // stored, which left it in the bucket with nothing pointing at it.
+    const url = this.getPublicUrl(key);
+
+    // Use Upload for automatic multipart handling
+    const upload = new Upload({
+      client,
+      params: uploadParams,
+    });
+
+    await upload.done();
+
+    return { url, path: key };
+  }
+
+  /**
+   * Write bytes at exactly `filePath`, beside a file already in the bucket.
+   *
+   * Core uses it to keep a file made from a stored one, such as a resized
+   * copy of an image, under a key derived from the original's. One request,
+   * since such a file is small, with the same cache setting and access as an
+   * upload, so it is served the way its original is.
+   *
+   * @experimental
+   */
+  async uploadAt(
+    filePath: string,
+    buffer: Buffer,
+    options: { mimeType: string }
+  ): Promise<UploadResult> {
+    const client = this.ensureClient();
+    const params: PutObjectCommandInput = {
+      Bucket: this.resolvedConfig.bucket,
+      Key: filePath,
+      Body: buffer,
+      ContentType: options.mimeType,
+      CacheControl: this.resolvedConfig.cacheControl,
+    };
+    // R2 ignores ACL settings, as for an upload.
+    if (!this.isR2) {
+      params.ACL = this.resolvedConfig.acl;
+    }
+    // Formed before the write, as for an upload, so a refusal stores nothing.
+    const url = this.getPublicUrl(filePath);
+    await client.send(new PutObjectCommand(params));
+    return { url, path: filePath };
+  }
+
+  /**
+   * Store a private file at exactly `key`, the key core made for it.
+   *
+   * Unlike {@link upload}: no public address is formed (so an R2 bucket needs
+   * no `publicUrl`), the original file name goes into neither the key nor the
+   * object's metadata, the object is stored never to be cached, and its ACL is
+   * `private` whatever the adapter's own `acl` says (R2 has no ACLs, and keeps
+   * a bucket private unless public access is turned on for it).
+   *
+   * @experimental
+   */
+  async putPrivate(
+    key: string,
+    buffer: Buffer,
+    options: { mimeType: string }
+  ): Promise<void> {
+    const client = this.ensureClient();
+    const params: PutObjectCommandInput = {
+      Bucket: this.resolvedConfig.bucket,
+      Key: key,
+      Body: buffer,
+      ContentType: options.mimeType,
+      CacheControl: PRIVATE_CACHE_CONTROL,
+    };
+    if (!this.isR2) {
+      params.ACL = "private";
+    }
+    await new Upload({ client, params }).done();
+  }
+
+  /**
+   * A pre-signed URL a browser sends one private file to, at exactly `key`.
+   * Binds the type and exact length as {@link getPresignedUploadUrl} does,
+   * and writes the object private and never cached.
+   *
+   * @experimental
+   */
+  async getPrivateUploadUrl(
+    key: string,
+    mimeType: string,
+    options: PrivateUploadUrlOptions
+  ): Promise<ClientUploadData> {
+    return this.presignPut(key, mimeType, {
+      cacheControl: PRIVATE_CACHE_CONTROL,
+      acl: "private",
+      expiresIn: options.expiresIn,
+      contentLength: options.contentLength,
+    });
+  }
+
+  /**
+   * A link to a private file that lasts `options.expiresIn` seconds (at most
+   * the configured `signedUrlExpiresIn`). The bucket answers it with the
+   * given Content-Disposition and type, and with a Cache-Control that lets no
+   * cache keep it, whatever the object itself was stored with.
+   *
+   * @experimental
+   */
+  async getPrivateDownloadUrl(
+    key: string,
+    options: PrivateDownloadUrlOptions
+  ): Promise<string> {
+    const client = this.ensureClient();
+    const command = new GetObjectCommand({
+      Bucket: this.resolvedConfig.bucket,
+      Key: key,
+      ResponseContentDisposition: options.contentDisposition,
+      ResponseCacheControl: PRIVATE_CACHE_CONTROL,
+      ...(options.contentType !== undefined
+        ? { ResponseContentType: options.contentType }
+        : {}),
+    });
+    return getSignedUrl(client, command, {
+      expiresIn: Math.min(
+        options.expiresIn,
+        this.resolvedConfig.signedUrlExpiresIn
+      ),
+    });
+  }
+
+  /**
+   * Delete file from S3.
+   *
+   * @param filePath - Storage path/key to delete
+   */
+  async delete(filePath: string): Promise<void> {
+    const client = this.ensureClient();
+    const command = new DeleteObjectCommand({
+      Bucket: this.resolvedConfig.bucket,
+      Key: filePath,
+    });
+
+    await client.send(command);
+  }
+
+  /**
+   * Bulk delete files from S3 using a single API call per 1000 keys.
+   *
+   * Uses AWS SDK v3's DeleteObjectsCommand which supports up to 1000 keys per
+   * request. Automatically batches larger arrays and collects per-key results.
+   *
+   * @param filePaths - Storage paths/keys to delete
+   * @returns Object with arrays of successful and failed deletions
+   */
+  async bulkDelete(filePaths: string[]): Promise<BulkDeleteResult> {
+    const client = this.ensureClient();
+    const successful: string[] = [];
+    const failed: Array<{ filePath: string; error: string }> = [];
+    const maxBatchSize = 1000; // AWS limit
+
+    for (let i = 0; i < filePaths.length; i += maxBatchSize) {
+      const batch = filePaths.slice(i, i + maxBatchSize);
+      const command = new DeleteObjectsCommand({
+        Bucket: this.resolvedConfig.bucket,
+        Delete: {
+          Objects: batch.map(key => ({ Key: key })),
+          Quiet: false,
+        },
+      });
+
+      const response = await client.send(command);
+
+      if (response.Errors && response.Errors.length > 0) {
+        for (const err of response.Errors) {
+          if (err.Key) {
+            failed.push({
+              filePath: err.Key,
+              error: err.Message ?? "Unknown S3 delete error",
+            });
+          }
+        }
+      }
+
+      if (response.Deleted) {
+        for (const del of response.Deleted) {
+          if (del.Key) {
+            successful.push(del.Key);
+          }
+        }
+      }
+    }
+
+    return { successful, failed };
+  }
+
+  /**
+   * Check if file exists in S3.
+   *
+   * Uses HeadObject command which is more efficient than GetObject
+   * for existence checks (doesn't download the file).
+   *
+   * @param filePath - Storage path/key to check
+   * @returns true if file exists, false otherwise
+   */
+  async exists(filePath: string): Promise<boolean> {
+    const client = this.ensureClient();
+    try {
+      const command = new HeadObjectCommand({
+        Bucket: this.resolvedConfig.bucket,
+        Key: filePath,
+      });
+
+      await client.send(command);
+      return true;
+    } catch (error: unknown) {
+      // HeadObject returns 404 if object doesn't exist
+      if (this.isNotFoundError(error)) {
+        return false;
+      }
+      // Re-throw other errors (permissions, network, etc.)
+      throw error;
+    }
+  }
+
+  /**
+   * Get public URL for S3 file.
+   *
+   * Priority order:
+   * 1. Custom publicUrl (CDN or custom domain) if configured
+   * 2. Standard S3 URL based on region and bucket
+   *
+   * For R2: Requires publicUrl configuration (R2 has no default public URLs).
+   *
+   * @param filePath - Storage path/key
+   * @returns Public URL to access the file
+   * @throws Error if R2 is used without publicUrl configuration
+   */
+  /**
+   * Every object in the bucket, by key, with when it was last written, a page
+   * of up to 1,000 at a time.
+   */
+  async *list(): AsyncIterable<StoredFileEntry> {
+    const client = this.ensureClient();
+    let token: string | undefined;
+    do {
+      const page = await client.send(
+        new ListObjectsV2Command({
+          Bucket: this.resolvedConfig.bucket,
+          ContinuationToken: token,
+        })
+      );
+      for (const object of page.Contents ?? []) {
+        if (object.Key) {
+          yield { path: object.Key, lastModified: object.LastModified };
+        }
+      }
+      token = page.IsTruncated ? page.NextContinuationToken : undefined;
+    } while (token);
+  }
+
+  getPublicUrl(filePath: string): string {
+    // A URL is derived from the bucket and region, so a missing one is
+    // refused here exactly as an upload or read would refuse. A check-only
+    // helper is used so forming a URL does not needlessly build the full
+    // S3 client.
+    this.ensureConfigured();
+
+    // Use custom CDN/public URL if configured
+    if (this.resolvedConfig.publicUrl) {
+      const baseUrl = this.resolvedConfig.publicUrl.replace(/\/$/, "");
+      return `${baseUrl}/${filePath}`;
+    }
+
+    // R2 requires custom domain or public bucket URL
+    if (this.isR2) {
+      throw new Error(
+        "@nextly/storage-s3: Cloudflare R2 requires publicUrl configuration.\n\n" +
+          "R2 does not have default public URLs like AWS S3. Configure one of:\n" +
+          "1. Public bucket URL: publicUrl: 'https://pub-xxx.r2.dev'\n" +
+          "2. Custom domain: publicUrl: 'https://cdn.example.com'\n\n" +
+          "Set up public access in the Cloudflare R2 dashboard. A collection " +
+          "of private files needs none: its files have no public address."
+      );
+    }
+
+    // Standard S3 URL format
+    // https://bucket.s3.region.amazonaws.com/key
+    return `https://${this.resolvedConfig.bucket}.s3.${this.resolvedConfig.region}.amazonaws.com/${filePath}`;
+  }
+
+  /**
+   * Get storage type identifier.
+   *
+   * Returns "s3" for all S3-compatible services (AWS S3, R2, MinIO, etc.)
+   * as they all use the S3 API.
+   */
+  getType(): "s3" {
+    return "s3";
+  }
+
+  // ============================================================
+  // Optional IStorageAdapter Methods
+  // ============================================================
+
+  /**
+   * Get adapter info including capabilities.
+   *
+   * @returns Adapter info with type, name, and capability flags
+   */
+  getInfo(): StorageAdapterInfo {
+    return {
+      type: "s3",
+      name: "S3StorageAdapter",
+      supportsSignedUrls: true,
+      supportsClientUploads: true,
+      /*
+       * Private files only where nothing public is configured in front of
+       * the bucket. A `publicUrl` (an R2 public bucket URL, a custom domain, a
+       * CDN) serves every key in the bucket, so a private file stored behind
+       * one would have a public address after all. Such a site keeps private
+       * collections in a second `s3Storage` with no `publicUrl`.
+       */
+      supportsPrivateFiles: !this.resolvedConfig.publicUrl,
+    };
+  }
+
+  /**
+   * Get file metadata from S3.
+   *
+   * Retrieves file information including size, content type, and timestamps
+   * using the HeadObject command.
+   *
+   * @param filePath - Storage path/key
+   * @returns File metadata or null if file not found
+   */
+  async getMetadata(filePath: string): Promise<FileMetadata | null> {
+    const client = this.ensureClient();
+    try {
+      const command = new HeadObjectCommand({
+        Bucket: this.resolvedConfig.bucket,
+        Key: filePath,
+      });
+
+      const response = await client.send(command);
+      const filename = filePath.split("/").pop() || filePath;
+
+      return {
+        id: filePath,
+        filename,
+        originalFilename: response.Metadata?.["original-filename"] || filename,
+        mimeType: response.ContentType || "application/octet-stream",
+        size: response.ContentLength || 0,
+        url: this.getPublicUrl(filePath),
+        createdAt:
+          response.LastModified?.toISOString() || new Date().toISOString(),
+      };
+    } catch (error: unknown) {
+      if (this.isNotFoundError(error)) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Read a stored object back as bytes, or `null` when it is not there.
+   *
+   * The contract declares this OPTIONAL and, until now, no adapter supplied
+   * it — so a caller reaching for `adapter.read` got `undefined` and fell
+   * through whatever branch followed. An optional member nothing implements is
+   * a contract that reads as a capability and behaves as an absence.
+   *
+   * BUFFERS rather than streams, because that is the declared return type and
+   * widening it here would make this adapter answer a different question from
+   * its siblings. That bounds what it should be used for: an asset the server
+   * must serve from its own origin — a font file, a small document — rather
+   * than arbitrarily large media, which belongs behind {@link getSignedUrl} or
+   * a public URL. A streaming variant is a separate contract member, not a
+   * quiet change to this one.
+   *
+   * `null` for a missing key rather than a throw, matching
+   * {@link getMetadata}: absence is an ordinary answer about the bucket, while
+   * a credential or network failure is not, so only the first is folded into
+   * the return value.
+   *
+   * @param filePath - Storage path/key
+   * @returns The object's bytes, or `null` when no such key exists
+   */
+  async read(
+    filePath: string,
+    options?: StorageReadOptions
+  ): Promise<Buffer | null> {
+    const client = this.ensureClient();
+    try {
+      const command = new GetObjectCommand({
+        Bucket: this.resolvedConfig.bucket,
+        Key: filePath,
+      });
+
+      /*
+       * The caller's deadline reaches the SDK, or it is advertised and inert.
+       * `StorageReadOptions` promises a bound, and the URL-backed adapters keep
+       * it by handing `timeoutMs` to `safeFetch`; without this the same option
+       * does nothing here, so a stalled bucket holds the read open past a
+       * deadline the caller was told applied — the worst kind of option, one
+       * that validates and then has no effect.
+       *
+       * Aborting covers the BODY as well as the request. `transformToByteArray`
+       * pulls the stream after `send` resolves, and a backend that answers
+       * headers promptly and then stalls mid-transfer is exactly the case a
+       * request-only timeout misses.
+       */
+      const response = await client.send(command, abortAfter(options));
+      /*
+       * An empty body is not a missing object, and the two must not collapse.
+       * `GetObject` on a zero-byte key succeeds with no stream to transform,
+       * so returning `null` here would report a stored empty file as absent —
+       * and a caller deleting "missing" keys would then delete a real one.
+       */
+      if (response.Body === undefined) return Buffer.alloc(0);
+
+      /*
+       * Refused on the LENGTH the store reports, before the body is pulled
+       * down. `transformToByteArray` buffers the whole object, so a caller that
+       * knows its own limit has to be able to stop an oversized read rather
+       * than discover the size after paying for it — which is what an
+       * attachment path does when it checks a size only after buffering.
+       */
+      const cap = resolveReadBounds(options).maxBytes;
+      // Cheap refusal first, where the store told us the size up front.
+      this.refuseOverCap(filePath, response.ContentLength, cap);
+      return await this.readCapped(filePath, response.Body, cap);
+    } catch (error: unknown) {
+      /*
+       * Only an OBJECT-level absence becomes `null`. `isNotFoundError` treats
+       * any 404 as missing, and `NoSuchBucket` is a 404 — so a bucket that was
+       * deleted, renamed or mistyped would report every key in it as absent,
+       * which is the configuration failure this method's contract exists to
+       * tell apart from an ordinary miss. Named explicitly rather than by
+       * status, because the status cannot separate them.
+       */
+      if (error instanceof Error && error.name === "NoSuchBucket") throw error;
+      if (this.isNotFoundError(error)) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * The stored object's size and type, without reading it, or `null` when the
+   * key is not in the bucket. A missing bucket throws rather than reading as a
+   * missing key, as for {@link read}.
+   *
+   * @experimental
+   */
+  async head(filePath: string): Promise<StoredObjectHead | null> {
+    const client = this.ensureClient();
+    try {
+      const response = await client.send(
+        new HeadObjectCommand({
+          Bucket: this.resolvedConfig.bucket,
+          Key: filePath,
+        })
+      );
+      // A size the bucket did not report is not a size of zero: a caller
+      // checks an upload against it, and must not be told it matched.
+      if (response.ContentLength === undefined) {
+        throw new Error(
+          "@nextly/storage-s3: the bucket did not report the object's size"
+        );
+      }
+      return {
+        size: response.ContentLength,
+        ...(response.ContentType !== undefined
+          ? { contentType: response.ContentType }
+          : {}),
+        ...(response.LastModified !== undefined
+          ? { lastModified: response.LastModified }
+          : {}),
+      };
+    } catch (error: unknown) {
+      if (error instanceof Error && error.name === "NoSuchBucket") throw error;
+      if (this.isNotFoundError(error)) return null;
+      throw error;
+    }
+  }
+
+  /**
+   * The stored object as a stream, or `null` when the key is not in the
+   * bucket, for a response that should not buffer a whole file.
+   *
+   * The deadline covers the bucket's answer only, then is cleared: the body
+   * flows as fast as its reader takes it, and a deadline on the whole
+   * transfer would cut off a slow but healthy download.
+   *
+   * @experimental
+   */
+  async readStream(
+    filePath: string,
+    options?: StorageStreamOptions
+  ): Promise<ReadableStream<Uint8Array> | null> {
+    const client = this.ensureClient();
+    const answered = new AbortController();
+    const timer = setTimeout(
+      () => answered.abort(),
+      resolveReadBounds(options).timeoutMs
+    );
+    try {
+      const response = await client.send(
+        new GetObjectCommand({
+          Bucket: this.resolvedConfig.bucket,
+          Key: filePath,
+        }),
+        { abortSignal: answered.signal }
+      );
+      // An empty object is an empty stream, not a missing one.
+      if (response.Body === undefined) {
+        return new ReadableStream<Uint8Array>({
+          start: controller => controller.close(),
+        });
+      }
+      return response.Body.transformToWebStream();
+    } catch (error: unknown) {
+      if (error instanceof Error && error.name === "NoSuchBucket") throw error;
+      if (this.isNotFoundError(error)) return null;
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Generate signed URL for temporary private file access.
+   *
+   * Creates a pre-signed GetObject URL that grants temporary read access
+   * to private files. Useful for serving files from private buckets.
+   *
+   * @param filePath - Storage path/key
+   * @param expiresIn - URL validity duration in seconds (default: 3600)
+   * @returns Pre-signed URL for downloading the file
+   */
+  async getSignedUrl(filePath: string, expiresIn?: number): Promise<string> {
+    const client = this.ensureClient();
+    const command = new GetObjectCommand({
+      Bucket: this.resolvedConfig.bucket,
+      Key: filePath,
+    });
+
+    return getSignedUrl(client, command, {
+      expiresIn: expiresIn ?? this.resolvedConfig.signedUrlExpiresIn,
+    });
+  }
+
+  /**
+   * Generate pre-signed URL for client-side uploads.
+   *
+   * Creates a pre-signed PutObject URL that allows direct uploads from
+   * the browser to S3, bypassing server-side upload limits (e.g., Vercel's 4.5MB).
+   *
+   * The signature covers the `Content-Type` and, given `options.contentLength`,
+   * the `Content-Length`: the bytes never pass Nextly's upload checks, so S3
+   * itself refuses a body of another type or length. The browser sets the
+   * length from the body; it is not a header the client sends.
+   *
+   * It covers the configured `Cache-Control` too, which is returned in
+   * `headers`: S3 stores an object's Cache-Control only from the upload
+   * request's own header, so a browser upload is served with the same caching
+   * as a server one only when the client sends it. The client must send every
+   * header in `headers`, as it is; one left out fails the signature.
+   *
+   * @param key - Storage path/key for the upload
+   * @param mimeType - MIME type of the file being uploaded
+   * @param expiresIn - URL validity in seconds, at most the configured
+   *   `signedUrlExpiresIn` (its default)
+   * @param options - `contentLength`: the exact size the upload may have
+   * @returns Client upload data with URL, method, and headers
+   */
+  async getPresignedUploadUrl(
+    key: string,
+    mimeType: string,
+    expiresIn?: number,
+    options?: { contentLength?: number }
+  ): Promise<ClientUploadData> {
+    return this.presignPut(key, mimeType, {
+      cacheControl: this.resolvedConfig.cacheControl,
+      acl: this.resolvedConfig.acl,
+      expiresIn,
+      contentLength: options?.contentLength,
+    });
+  }
+
+  /**
+   * Sign one direct upload at exactly `key`: the type, the length when given,
+   * and the Cache-Control are signed, so S3 refuses a body that differs. The
+   * one signer for public and private uploads alike, which differ only in the
+   * caching and access they write.
+   */
+  private async presignPut(
+    key: string,
+    mimeType: string,
+    put: PresignedPut
+  ): Promise<ClientUploadData> {
+    const client = this.ensureClient();
+    const longest = this.resolvedConfig.signedUrlExpiresIn;
+    const expiration = Math.min(put.expiresIn ?? longest, longest);
+
+    // Build PutObject command parameters
+    const commandParams: PutObjectCommandInput = {
+      Bucket: this.resolvedConfig.bucket,
+      Key: key,
+      ContentType: mimeType,
+      CacheControl: put.cacheControl,
+      ...(put.contentLength !== undefined
+        ? { ContentLength: put.contentLength }
+        : {}),
+    };
+
+    // Add ACL if not R2
+    if (!this.isR2) {
+      commandParams.ACL = put.acl;
+    }
+
+    const command = new PutObjectCommand(commandParams);
+
+    const uploadUrl = await getSignedUrl(client, command, {
+      expiresIn: expiration,
+      /*
+       * Signed, so S3 refuses an upload whose type or length differs, and
+       * one without the configured caching. The SDK never signs
+       * `cache-control` unless named here, and an unsigned header is not
+       * part of the URL, so without it the browser's request would carry no
+       * Cache-Control and the stored object would have none.
+       */
+      signableHeaders: new Set([
+        "content-type",
+        "content-length",
+        "cache-control",
+      ]),
+    });
+
+    return {
+      uploadUrl,
+      path: key,
+      method: "PUT",
+      // Every signed header the client sends itself; the browser adds the
+      // length and the host.
+      headers: {
+        "Content-Type": mimeType,
+        "Cache-Control": put.cacheControl,
+      },
+      expiresAt: new Date(Date.now() + expiration * 1000),
+    };
+  }
+
+  // ============================================================
+  // Helper Methods
+  // ============================================================
+
+  /**
+   * Check if an error is a "not found" error from S3.
+   *
+   * @param error - Error to check
+   * @returns true if error indicates file not found
+   */
+  /**
+   * The object's bytes, refusing once more than `cap` have actually arrived.
+   *
+   * `ContentLength` is OPTIONAL in the SDK's response type, and this adapter
+   * explicitly supports MinIO, R2 and other compatible services — any of which
+   * may omit it or report it wrongly. A preflight check against metadata is
+   * therefore a courtesy that fails OPEN: trusting it alone leaves the cap
+   * unenforced exactly where an unusual backend is involved, which is where a
+   * caller most needs it.
+   *
+   * Counted while consuming, so an oversized body is abandoned partway rather
+   * than after it has all been buffered — the cap exists to bound memory, and
+   * one applied after `transformToByteArray` has already spent it.
+   *
+   * Falls back to buffering when the body is not async-iterable, which the SDK
+   * types permit. Stated rather than hidden: on that path the cap bounds what a
+   * caller RECEIVES rather than what the process allocates.
+   */
+  private async readCapped(
+    filePath: string,
+    body: NonNullable<GetObjectCommandOutput["Body"]>,
+    cap: number
+  ): Promise<Buffer> {
+    /*
+     * Probed rather than assumed. The SDK types the body as a union whose Node
+     * member is async-iterable and whose browser members are not, and this
+     * package supports compatible services whose transport may differ — so the
+     * capability is read off the value in hand instead of from the type.
+     */
+    const iterable = body as Partial<AsyncIterable<Uint8Array>>;
+    if (typeof iterable[Symbol.asyncIterator] !== "function") {
+      const whole = Buffer.from(await body.transformToByteArray());
+      if (whole.byteLength > cap) {
+        throw new StorageReadTooLargeError(filePath, cap, whole.byteLength);
+      }
+      return whole;
+    }
+
+    const chunks: Buffer[] = [];
+    let received = 0;
+    for await (const chunk of body as AsyncIterable<Uint8Array>) {
+      received += chunk.byteLength;
+      if (received > cap) {
+        throw new StorageReadTooLargeError(filePath, cap, received);
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks);
+  }
+
+  /**
+   * Refuse a read whose object is already known to exceed the caller's cap.
+   *
+   * Its own method rather than three conditions inside `read`, because the
+   * decision has nothing to do with the surrounding error handling and reads
+   * as noise there — and because `read`'s branching is the part a reviewer has
+   * to hold in their head to check the absent-versus-unavailable distinction.
+   *
+   * Both `undefined` cases mean "no opinion" and pass: a caller that named no
+   * cap has none, and a store that reported no length gives nothing to compare.
+   * The second is deliberately permissive — refusing an unmeasured object would
+   * reject valid reads whenever S3 omits the header.
+   */
+  private refuseOverCap(
+    filePath: string,
+    declared: number | undefined,
+    cap: number | undefined
+  ): void {
+    if (cap === undefined || declared === undefined || declared <= cap) return;
+    /*
+     * The SHARED refusal rather than a generic internal error, because callers
+     * act on the difference. The email attachment path answers an over-cap read
+     * with a size error the author can do something about; anything else is
+     * wrapped as an opaque storage failure, so throwing `internal` here would
+     * turn a fixable refusal into one that tells them nothing.
+     */
+    throw new StorageReadTooLargeError(filePath, cap, declared);
+  }
+
+  private isNotFoundError(error: unknown): boolean {
+    if (error && typeof error === "object") {
+      const e = error as {
+        name?: string;
+        $metadata?: { httpStatusCode?: number };
+      };
+      return e.name === "NotFound" || e.$metadata?.httpStatusCode === 404;
+    }
+    return false;
+  }
+
+  // ============================================================
+  // Public Accessors
+  // ============================================================
+
+  /**
+   * Get the S3 client instance.
+   * Useful for advanced operations not covered by the adapter interface.
+   *
+   * Handing out the client is itself a use of the adapter, so a caller
+   * without the configuration a client needs is refused here like any
+   * other operation.
+   */
+  getClient(): S3Client {
+    return this.ensureClient();
+  }
+
+  /**
+   * Get the bucket name.
+   */
+  getBucket(): string {
+    return this.resolvedConfig.bucket;
+  }
+
+  /**
+   * Get the AWS region.
+   */
+  getRegion(): string {
+    return this.resolvedConfig.region;
+  }
+
+  /**
+   * Check if this adapter is configured for Cloudflare R2.
+   */
+  isCloudflareR2(): boolean {
+    return this.isR2;
+  }
+}

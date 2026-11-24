@@ -1,0 +1,188 @@
+/**
+ * RBAC tables — PostgreSQL.
+ *
+ * Tables: roles, permissions, rolePermissions, userRoles, roleInherits.
+ * Moved verbatim from packages/nextly/src/database/schema/postgres.ts as part
+ * of Plan A schemas consolidation. No behavior change.
+ *
+ * Drizzle v2 relations for this feature live centrally in
+ * `../_dialect-bundles/postgres.relations.ts` (defineRelations).
+ * imports (`users`, `apiKeys`). Re-exported at the bottom so namespace
+ * consumers see them.
+ *
+ * The Zod RBAC validators (RoleSchema, PermissionSchema, etc.) live at
+ * schemas/_zod/rbac.ts and are unrelated to this file.
+ *
+ * @module schemas/rbac/postgres
+ * @since v0.0.3-alpha (Plan A — schemas consolidation)
+ */
+
+import {
+  pgTable,
+  text,
+  timestamp,
+  integer,
+  index,
+  uniqueIndex,
+  boolean,
+  varchar,
+} from "drizzle-orm/pg-core";
+
+import { users } from "../users/postgres";
+
+export const roles = pgTable(
+  "roles",
+  {
+    id: text("id").primaryKey(),
+    name: varchar("name", { length: 50 }).notNull(),
+    slug: varchar("slug", { length: 50 }).notNull(),
+    description: varchar("description", { length: 255 }),
+    level: integer("level").notNull().default(0),
+    isSystem: boolean("is_system").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: false })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: false })
+      .defaultNow()
+      .notNull(),
+  },
+  t => [
+    uniqueIndex("roles_name_unique").on(t.name),
+    uniqueIndex("roles_slug_unique").on(t.slug),
+    // Performance indexes for common query patterns
+    index("roles_level_idx").on(t.level), // For hierarchical role queries
+    index("roles_is_system_idx").on(t.isSystem), // For filtering system vs custom roles
+  ]
+);
+
+export const permissions = pgTable(
+  "permissions",
+  {
+    id: text("id").primaryKey(),
+    name: varchar("name", { length: 100 }).notNull(),
+    slug: varchar("slug", { length: 100 }).notNull(),
+    action: varchar("action", { length: 50 }).notNull(),
+    resource: varchar("resource", { length: 50 }).notNull(),
+    description: varchar("description", { length: 255 }),
+    /**
+     * Who declared this permission — a plugin name, or null for the ones the
+     * framework seeds per collection and single.
+     *
+     * Stored rather than guessed. A plugin's custom permission (D36) names a
+     * resource that is not a content type, and without provenance the admin
+     * inferred one from the slug and drew it as a collection that does not
+     * exist. It is also what a future prune would need: a permission can only
+     * be retired safely if it is known who stopped declaring it.
+     */
+    owner: varchar("owner", { length: 191 }),
+    /**
+     * When the declaring package stopped declaring this permission, or null
+     * while it is still declared.
+     *
+     * Absence from config is not an uninstall — there is no uninstall event to
+     * read, and a disabled plugin still declares its permissions — so an
+     * orphan is marked rather than deleted. Grants survive: revoking access
+     * because a declaration moved would be a surprising way to find out. The
+     * mark is what lets the permission drop out of the UI, stop counting
+     * toward a preset, and be retired later on purpose.
+     */
+    orphanedAt: timestamp("orphaned_at", { withTimezone: false }),
+    /**
+     * Heading this permission is filed under within its owner's section of the
+     * matrix. Declared by the owner, which is the only thing that knows which
+     * of its own verbs belong together.
+     */
+    permissionGroup: varchar("permission_group", { length: 191 }),
+    /**
+     * True for a permission that hands out access, destroys data, or reaches
+     * outside the site. The admin warns before granting it.
+     *
+     * Nullable, like `owner` and `orphaned_at`: a not-null column cannot be
+     * added to a table that already has rows without a SQL default, and
+     * drizzle-kit refuses the change rather than guess. Absent reads as false.
+     */
+    danger: boolean("danger"),
+    createdAt: timestamp("created_at", { withTimezone: false })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: false })
+      .defaultNow()
+      .notNull(),
+  },
+  t => [
+    uniqueIndex("permissions_action_resource_unique").on(t.action, t.resource),
+    uniqueIndex("permissions_slug_unique").on(t.slug),
+    index("permissions_resource_idx").on(t.resource),
+    index("permissions_action_idx").on(t.action), // For action-based permission lookups
+  ]
+);
+
+export const rolePermissions = pgTable(
+  "role_permissions",
+  {
+    id: text("id").primaryKey(),
+    roleId: text("role_id")
+      .notNull()
+      .references(() => roles.id, { onDelete: "cascade" }),
+    permissionId: text("permission_id")
+      .notNull()
+      .references(() => permissions.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: false })
+      .defaultNow()
+      .notNull(),
+  },
+  t => [
+    uniqueIndex("role_permissions_role_permission_unique").on(
+      t.roleId,
+      t.permissionId
+    ),
+    index("role_permissions_role_id_idx").on(t.roleId),
+  ]
+);
+
+export const userRoles = pgTable(
+  "user_roles",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    roleId: text("role_id")
+      .notNull()
+      .references(() => roles.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: false })
+      .defaultNow()
+      .notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: false }),
+  },
+  t => [
+    uniqueIndex("user_roles_user_role_unique").on(t.userId, t.roleId),
+    index("user_roles_user_id_idx").on(t.userId),
+    // Finding the accounts that hold a role. The last-super-admin guard makes
+    // that read inside every write it judges, under the role row's lock, so a
+    // scan there would hold the write open.
+    index("user_roles_role_id_idx").on(t.roleId),
+    index("user_roles_expires_at_idx").on(t.expiresAt), // For filtering expired role assignments
+  ]
+);
+
+export const roleInherits = pgTable(
+  "role_inherits",
+  {
+    id: text("id").primaryKey(),
+    parentRoleId: text("parent_role_id")
+      .notNull()
+      .references(() => roles.id, { onDelete: "cascade" }),
+    childRoleId: text("child_role_id")
+      .notNull()
+      .references(() => roles.id, { onDelete: "cascade" }),
+  },
+  t => [
+    uniqueIndex("role_inherits_parent_child_unique").on(
+      t.parentRoleId,
+      t.childRoleId
+    ),
+    index("role_inherits_child_idx").on(t.childRoleId),
+    index("role_inherits_parent_idx").on(t.parentRoleId), // For bidirectional hierarchy queries
+  ]
+);

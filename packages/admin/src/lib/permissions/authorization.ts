@@ -1,0 +1,214 @@
+/**
+ * Admin Authorization Module
+ *
+ * Utility functions for filtering sidebar navigation items and dynamic
+ * content based on the current user's AdminCapabilities.
+ *
+ * Used by:
+ * - SidebarNavigation (static items)
+ * - DynamicCollectionNav (dynamic collection items)
+ * - DynamicSingleNav (dynamic single items)
+ * - DynamicPluginNav (plugin collection items)
+ */
+
+import type { NavigationItem } from "../../constants/navigation";
+import { SYSTEM_RESOURCE_SET } from "../../constants/permissions";
+import type { AdminCapabilities } from "../../types/permissions";
+
+/**
+ * Minimal collection shape for authorization filtering.
+ * Matches the data returned by useCollections().
+ */
+interface FilterableCollection {
+  name: string;
+  slug?: string;
+  id?: string;
+  label?: string;
+  labels?: { singular?: string; plural?: string };
+  migrationStatus?: string;
+  admin?: {
+    hidden?: boolean;
+    isPlugin?: boolean;
+    group?: string;
+    order?: number;
+    sidebarGroup?: string;
+    icon?: string;
+  };
+}
+
+/**
+ * Minimal single shape for authorization filtering.
+ * Matches the data returned by useSingles().
+ */
+interface FilterableSingle {
+  slug: string;
+  label?: string;
+  admin?: {
+    hidden?: boolean;
+    order?: number;
+    sidebarGroup?: string;
+    icon?: string;
+  };
+}
+
+/**
+ * Filter static sidebar navigation items based on user capabilities.
+ *
+ * - Items without `requiredPermission` are always visible (e.g., Dashboard)
+ * - Super-admin sees everything
+ * - For accordion items, sub-items are not filtered individually
+ *   (the parent permission controls visibility of the whole group)
+ *
+ * @param items - Navigation items (may include requiredPermission)
+ * @param capabilities - Current user's admin capabilities
+ * @param hasPermission - The permission check the guards ask, for a system
+ *   permission no capability flag stands for
+ * @returns Filtered navigation items the user has permission to see
+ */
+export function filterNavigationItems(
+  items: NavigationItem[],
+  capabilities: AdminCapabilities,
+  hasPermission: (permission: string) => boolean
+): NavigationItem[] {
+  if (capabilities.isSuperAdmin) return items;
+
+  return items.filter(item => {
+    // Items without requiredPermission are always visible
+    if (!item.requiredPermission) return true;
+
+    // A list is any-of: holding any one of the permissions shows the item.
+    if (Array.isArray(item.requiredPermission)) {
+      return item.requiredPermission.some(permission =>
+        hasCapabilityForPermission(permission, capabilities, hasPermission)
+      );
+    }
+
+    // Check against the user's permission set
+    return hasCapabilityForPermission(
+      item.requiredPermission,
+      capabilities,
+      hasPermission
+    );
+  });
+}
+
+/**
+ * Filter dynamic collection items based on per-collection read permission.
+ *
+ * A collection is visible where the server's answer lets the user read it,
+ * a super-admin's answer included, which gives every entity. The permission
+ * list's super-admin flag is not consulted: it is a separate request, and an
+ * older one would otherwise show what a newer answer refuses.
+ * This runs AFTER the existing `admin.hidden` / `admin.isPlugin` filters.
+ *
+ * @param collections - Collections already filtered by hidden/plugin flags
+ * @param capabilities - Current user's admin capabilities
+ * @returns Collections the user has read permission for
+ */
+export function filterCollectionItems<T extends FilterableCollection>(
+  collections: T[],
+  capabilities: AdminCapabilities
+): T[] {
+  return collections.filter(collection => {
+    const slug = collection.slug || collection.name;
+    const collectionCaps = capabilities.collections[slug];
+    return collectionCaps?.canRead === true;
+  });
+}
+
+/**
+ * Filter dynamic single items based on per-single read permission.
+ *
+ * A single is visible where the server's answer lets the user read it, as
+ * for collections.
+ * This runs AFTER the existing `admin.hidden` filter.
+ *
+ * @param singles - Singles already filtered by hidden flag
+ * @param capabilities - Current user's admin capabilities
+ * @returns Singles the user has read permission for
+ */
+export function filterSingleItems<T extends FilterableSingle>(
+  singles: T[],
+  capabilities: AdminCapabilities
+): T[] {
+  return singles.filter(single => {
+    const collectionCaps = capabilities.collections[single.slug];
+    return collectionCaps?.canRead === true;
+  });
+}
+
+/**
+ * Check if a user has the capability corresponding to a permission slug.
+ *
+ * Maps well-known permission slugs to AdminCapabilities boolean flags. Any
+ * other permission on a system resource is asked as the guards ask it
+ * (`hasPermission`), a `manage-` permission counting as the plain ones it
+ * stands for. Falls back to checking the permission slug against the
+ * capabilities collections map for dynamic collection permissions.
+ */
+function hasCapabilityForPermission(
+  permission: string,
+  capabilities: AdminCapabilities,
+  hasPermission: (permission: string) => boolean
+): boolean {
+  // Map well-known permissions to capability flags
+  switch (permission) {
+    case "read-users":
+      return capabilities.canViewUsers;
+    case "read-roles":
+      return capabilities.canViewRoles;
+    case "read-media":
+      return capabilities.canViewMedia;
+    case "create-users":
+    case "update-users":
+      return capabilities.canManageUsers;
+    case "create-roles":
+    case "update-roles":
+      return capabilities.canManageRoles;
+    // Webhooks are a system resource with no collection-capability entry. Any
+    // webhook grant reveals the nav item: read/update view the list, create
+    // reaches the create form from it.
+    case "read-webhooks":
+    case "update-webhooks":
+    case "create-webhooks":
+      return capabilities.canViewWebhooks;
+    // Content releases are a system resource too, so the generic branch below
+    // would look them up in the per-collection map, find nothing, and answer
+    // false for a caller who holds the grant.
+    case "read-content-releases":
+    case "create-content-releases":
+    case "publish-content-releases":
+      return capabilities.canViewReleases;
+    default: {
+      // For dynamic permissions like "read-posts", parse and check collections
+      const dashIdx = permission.indexOf("-");
+      if (dashIdx === -1) return false;
+
+      const action = permission.slice(0, dashIdx);
+      const resource = permission.slice(dashIdx + 1);
+      // Settings and the Email hub are system resources, with no entry in the
+      // per-collection map: their permissions are the permission list's.
+      if (SYSTEM_RESOURCE_SET.has(resource)) return hasPermission(permission);
+      const collectionCaps = capabilities.collections[resource];
+
+      if (!collectionCaps) return false;
+
+      switch (action) {
+        case "read":
+          return collectionCaps.canRead;
+        case "create":
+          return collectionCaps.canCreate;
+        case "update":
+          return collectionCaps.canUpdate;
+        case "delete":
+          return collectionCaps.canDelete;
+        case "publish":
+          return collectionCaps.canPublish;
+        case "unpublish":
+          return collectionCaps.canUnpublish;
+        default:
+          return false;
+      }
+    }
+  }
+}

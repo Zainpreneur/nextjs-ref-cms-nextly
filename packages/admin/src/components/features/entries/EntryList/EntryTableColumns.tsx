@@ -1,0 +1,819 @@
+"use client";
+
+/**
+ * Entry Table Columns Generator
+ *
+ * Dynamically generates TanStack React Table column definitions from collection
+ * field schemas. Supports all field types with appropriate cell renderers and
+ * configurable column widths, sorting, and visibility.
+ *
+ * @module components/entries/EntryList/EntryTableColumns
+ * @see https://tanstack.com/table/v8/docs/api/core/column-def
+ * @since 1.0.0
+ */
+
+import type { FieldConfig, DataFieldConfig } from "nextly/config";
+
+import type {
+  CellRenderer,
+  NextlyColumn,
+} from "@admin/components/ui/table/data-table";
+import { formatDateWithAdminTimezone } from "@admin/hooks/useAdminDateFormatter";
+import { fieldLabel } from "@admin/lib/field-label";
+import type { WorkflowStepKind } from "@admin/types/workflows";
+
+import { entryTitleField } from "../entry-title";
+import {
+  isFieldTranslated,
+  type LocaleTranslationMeta,
+} from "../translation-meta";
+
+import { EntryTableCell } from "./EntryTableCell";
+import { LanguageChips } from "./LanguageChips";
+import { ReviewCell, rowReviewParts } from "./ReviewCell";
+import type { TitleLanguage } from "./TitleLanguageSelect";
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/**
+ * Data field configuration with guaranteed name property.
+ * Used for fields that can be displayed as table columns.
+ */
+type NamedDataFieldConfig = DataFieldConfig & { name: string };
+
+/**
+ * Minimal collection information needed for column generation.
+ * Compatible with DynamicCollectionRecord from nextly.
+ */
+export interface CollectionForColumns {
+  /** Collection slug identifier */
+  slug: string;
+  /** Display label for the collection (usually plural) */
+  label?: string;
+  /** Field definitions for the collection */
+  fields: FieldConfig[];
+  /**
+   * Whether this collection has the built-in Draft / Published lifecycle
+   * enabled. Mirrors `defineCollection({ status: true })` and the matching
+   * Schema Builder Advanced-tab toggle. Drives bulk Publish / Unpublish
+   * actions in the table's bulk-action bar — those buttons only render
+   * when this is true.
+   */
+  status?: boolean;
+  /**
+   * The workflow that holds the collection's publishing, where one is attached: the list offers
+   * its bulk moves (Submit for review, Assign…, Send back…) only then.
+   */
+  workflow?: {
+    slug: string;
+    label: string;
+    /** Its stages in order, by name and label: the list's stage filter offers them. */
+    stages?: readonly { name: string; label: string }[];
+    /** Its steps, by kind: the bulk moves are found among them (`bulkMoveSteps`). */
+    steps?: readonly { name: string; label: string; kind: WorkflowStepKind }[];
+  } | null;
+  /**
+   * Whether the table shows each row's translation state: a collection with multilingual content
+   * (i18n), listed for a user who may read every language's state. When true, the table renders
+   * a per-row translation-completeness column from each row's `_translations` map, and a
+   * language filter.
+   */
+  localized?: boolean;
+  /**
+   * Whether the collection is removed from code: its entries are listed and
+   * nothing that writes to them is offered.
+   */
+  removedFromCode?: boolean;
+  /**
+   * Whether the admin's own Delete is withheld from this collection's entries
+   * (`admin.disableDelete`): they are deleted through an action of their own,
+   * which a plugin offers instead.
+   */
+  disableDelete?: boolean;
+  /** Admin UI configuration */
+  admin?: {
+    /** Default columns to display in list view */
+    defaultColumns?: string[];
+    /** Field to use as the document title */
+    useAsTitle?: string;
+  };
+}
+
+/**
+ * Options for generating entry table columns.
+ */
+export interface GenerateColumnsOptions {
+  /** Collection configuration with fields and admin settings */
+  collection: CollectionForColumns;
+  /** Callback when edit action is triggered */
+  onEdit: (entryId: string) => void;
+  /** Callback when delete action is triggered */
+  onDelete: (entryId: string) => void;
+  /** Whether to include selection column (default: true) */
+  enableSelection?: boolean;
+  /** Whether to include actions column (default: true) */
+  enableActions?: boolean;
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/**
+ * Field types that support sorting in the table.
+ */
+const SORTABLE_FIELD_TYPES: readonly string[] = [
+  "text",
+  "textarea",
+  "number",
+  "date",
+  "select",
+  "email",
+  "checkbox",
+  // An id sorts as text, which groups icons by set and then by name.
+  "icon",
+];
+
+/**
+ * Default number of data columns to show when defaultColumns is not specified.
+ */
+const DEFAULT_COLUMN_COUNT = 4;
+
+/** Field types never shown as a column: they hold nested or related data. */
+const NON_COLUMN_TYPES: readonly string[] = [
+  "group",
+  "relationship",
+  "repeater",
+  "component",
+];
+
+/**
+ * Whether the list picks a field as a default column by itself: a named data
+ * field the form shows. A field the form hides (`admin.hidden`) is set by some
+ * other control, so it is left out here; it stays on offer as a column, and a
+ * collection's own `defaultColumns` may still name it.
+ */
+export function isDefaultColumnField(field: {
+  name?: unknown;
+  type?: unknown;
+  admin?: unknown;
+}): field is { name: string; type: string } {
+  if (typeof field.name !== "string" || field.name.length === 0) return false;
+  if (typeof field.type !== "string" || NON_COLUMN_TYPES.includes(field.type)) {
+    return false;
+  }
+  const admin = field.admin;
+  return !(
+    typeof admin === "object" &&
+    admin !== null &&
+    (admin as { hidden?: unknown }).hidden === true
+  );
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/**
+ * Determines if a field type supports sorting.
+ *
+ * @param field - Field configuration to check
+ * @returns True if the field can be sorted
+ */
+function isSortableField(field: FieldConfig): boolean {
+  return SORTABLE_FIELD_TYPES.includes(field.type);
+}
+
+/**
+ * Type guard to check if a field is a named data field (has a name property).
+ *
+ * @param field - Field configuration to check
+ * @returns True if the field is a data field with a name
+ */
+function isDataField(field: FieldConfig): field is NamedDataFieldConfig {
+  return "name" in field && typeof field.name === "string";
+}
+
+/**
+ * Recursively gets all data fields from a list of fields, including nested ones.
+ *
+ * @param fields - Array of field configurations
+ * @returns Array of named data fields
+ */
+function getAllDataFields(fields: FieldConfig[]): NamedDataFieldConfig[] {
+  const dataFields: NamedDataFieldConfig[] = [];
+
+  for (const field of fields) {
+    // Only include direct data fields that are not complex/layout types
+    if (isDataField(field) && !NON_COLUMN_TYPES.includes(field.type)) {
+      dataFields.push(field);
+    }
+  }
+
+  return dataFields;
+}
+
+/**
+ * Gets the default columns to display when admin.defaultColumns is not specified.
+ * Returns the first N data fields plus updatedAt.
+ *
+ * @param fields - Array of field configurations
+ * @returns Array of field names to display as columns
+ */
+function getDefaultColumns(fields: FieldConfig[]): string[] {
+  // Data fields the form shows, never a hidden one or a layout field.
+  const dataFields = fields
+    .flatMap(field => (isDefaultColumnField(field) ? [field.name] : []))
+    .slice(0, DEFAULT_COLUMN_COUNT);
+
+  // Always include title, slug, id, createdAt and updatedAt.
+  // 07-admin-bugs-feedback, the user expects both timestamps visible
+  // in the entries table without having to open the column toggler.
+  // Updated alone is the "what changed last" signal but Created is the
+  // "when did this exist" signal — both are first-class metadata.
+  return [...dataFields, "title", "slug", "id", "createdAt", "updatedAt"];
+}
+
+/**
+ * Gets all available column IDs for a collection.
+ * Includes all data field names plus built-in columns (id, createdAt, updatedAt).
+ *
+ * @param collection - Collection configuration
+ * @returns Array of all column IDs that can be displayed
+ */
+export function getAvailableColumns(
+  collection: CollectionForColumns
+): string[] {
+  const dataFields = getAllDataFields(collection.fields).map(f => f.name);
+  const useAsTitle = collection.admin?.useAsTitle;
+
+  // These columns are always available as built-ins
+  const builtInColumns = ["id", "title", "slug", "createdAt", "updatedAt"];
+
+  // Translation-completeness column, only for localized collections.
+  if (collection.localized) {
+    builtInColumns.push("translations");
+  }
+
+  // Where each row stands in its workflow, only for a collection a workflow holds.
+  if (collection.workflow) {
+    builtInColumns.push("review");
+  }
+
+  if (useAsTitle && !builtInColumns.includes(useAsTitle)) {
+    builtInColumns.push(useAsTitle);
+  }
+
+  // Add built-in columns and structural columns, then unique them
+  return Array.from(
+    new Set(["select", ...builtInColumns, ...dataFields, "actions"])
+  );
+}
+
+/**
+ * Gets the default visible columns for a collection.
+ * Uses admin.defaultColumns if defined, otherwise auto-generates defaults.
+ *
+ * @param collection - Collection configuration
+ * @returns Array of column IDs that should be visible by default
+ */
+export function getDefaultVisibleColumns(
+  collection: CollectionForColumns
+): string[] {
+  // Always include structural columns
+  const structural = ["select", "actions"];
+  // Get data columns from config or auto-generate
+  const dataColumns =
+    collection.admin?.defaultColumns || getDefaultColumns(collection.fields);
+
+  // Filter out the columns we want to explicitly position
+  const coreColumns = ["id", "title", "slug", "updatedAt"];
+  const useAsTitle = collection.admin?.useAsTitle;
+  if (useAsTitle) coreColumns.push(useAsTitle);
+
+  const otherColumns = dataColumns.filter(col => !coreColumns.includes(col));
+
+  // Build the ordered data columns
+  let orderedDataColumns: string[] = [];
+
+  // 1. ID (Note: keep 'id' in availableColumns for the toggler, but skip pushing it to default visible columns)
+
+  // 2. Title (either useAsTitle or 'title')
+  if (useAsTitle && useAsTitle !== "id") {
+    orderedDataColumns.push(useAsTitle);
+  } else {
+    orderedDataColumns.push("title");
+  }
+
+  // 3. Slug
+  orderedDataColumns.push("slug");
+
+  // 4. Description (if it's in the data columns and not used as title)
+  if (dataColumns.includes("description") && useAsTitle !== "description") {
+    orderedDataColumns.push("description");
+  }
+
+  orderedDataColumns.push("createdAt");
+  orderedDataColumns.push("updatedAt");
+
+  // 5. Translation-completeness column for localized collections.
+  if (collection.localized) {
+    orderedDataColumns.push("translations");
+  }
+
+  // The Review column, for a collection a workflow holds.
+  if (collection.workflow) {
+    orderedDataColumns.push("review");
+  }
+
+  // 6. Remaining data columns
+  orderedDataColumns = [...orderedDataColumns, ...otherColumns];
+
+  // Remove any duplicates, structural columns, and the ID column from default visibility
+  const uniqueDataColumns = Array.from(new Set(orderedDataColumns)).filter(
+    col => !structural.includes(col) && col !== "id"
+  );
+
+  return [
+    structural[0], // "select"
+    ...uniqueDataColumns,
+    structural[1], // "actions"
+  ];
+}
+
+/**
+ * The data field `fieldName` names among `fields` themselves, not inside a
+ * group or repeater: a row holds such a field's value under its own name,
+ * where a nested one's sits inside its parent's value.
+ */
+export function findTopLevelField(
+  fields: FieldConfig[],
+  fieldName: string
+): NamedDataFieldConfig | undefined {
+  return fields.find(
+    (field): field is NamedDataFieldConfig =>
+      isDataField(field) && field.name === fieldName
+  );
+}
+
+/**
+ * Finds a field configuration by name, handling nested fields in layout wrappers.
+ *
+ * @param fields - Array of field configurations
+ * @param fieldName - Name of the field to find
+ * @returns Field configuration or undefined if not found
+ */
+function findFieldByName(
+  fields: FieldConfig[],
+  fieldName: string
+): NamedDataFieldConfig | undefined {
+  for (const field of fields) {
+    // Direct match - only data fields have names
+    if (isDataField(field) && field.name === fieldName) {
+      return field;
+    }
+
+    // Check nested fields in array/group
+    const fieldType = field.type as string;
+    if (fieldType === "repeater" && "fields" in field) {
+      const found = findFieldByName(field.fields as FieldConfig[], fieldName);
+      if (found) return found;
+    }
+
+    if (field.type === "group" && "fields" in field) {
+      const found = findFieldByName(field.fields as FieldConfig[], fieldName);
+      if (found) return found;
+    }
+  }
+
+  return undefined;
+}
+
+// ============================================================================
+// Main Column Generator
+// ============================================================================
+
+export function getEntryTitleField(
+  collection: CollectionForColumns
+): string | undefined {
+  // Resolve from ACTUAL schema fields. `getAvailableColumns` always injects a
+  // synthetic "title" column, so testing it would always win and leave
+  // collections without a real title field with an empty primary column.
+  return pickTitleFieldName(
+    collection.admin?.useAsTitle,
+    getAllDataFields(collection.fields).map(field => field.name)
+  );
+}
+
+/**
+ * Which COLUMN names an entry.
+ *
+ * The preference order comes from `entry-title`, shared with the editor and
+ * comparison headings so a document is not called one thing by its editor and
+ * another by the page beside it. Only the last resort is decided here, because
+ * a column needs a field that exists where a heading needs text.
+ */
+export function pickTitleFieldName(
+  useAsTitle: string | undefined,
+  fieldNames: readonly string[]
+): string {
+  // A column has to name a field that exists, so where nothing is conventional
+  // this falls back to the first field and finally to `id`: a table with an
+  // empty primary column is worse than one showing an unhelpful field.
+  return entryTitleField(useAsTitle, fieldNames) ?? fieldNames[0] ?? "id";
+}
+
+/**
+ * Builds unified-DataTable columns from a collection schema.
+ *
+ * Produces `NextlyColumn` definitions for the built-in columns
+ * (id/title/slug/createdAt/updatedAt) and every data field, reusing
+ * `EntryTableCell` for field rendering so cell output is identical to the
+ * legacy table. The select and actions columns are omitted — the DataTable
+ * renders selection and the row-action menu itself. Column visibility is
+ * applied by marking columns `hidden` from the passed visibility map.
+ */
+export interface EntryColumnActions {
+  /** Open a row in a given content language. Absent leaves the marks inert. */
+  openInLocale?: (entryId: string, locale: string) => void;
+  /** The title column's titles in a language the reader chose. Absent shows the list's own. */
+  titlesIn?: TitlesShownIn;
+}
+
+/** Titles shown in a chosen language, over the title column. */
+export interface TitlesShownIn {
+  /** The language chosen. */
+  language: TitleLanguage;
+  /** The default language, which the list's own read shows titles in. */
+  defaultLanguage: TitleLanguage;
+  /** Each row's title in the chosen language, by id, once read; a row not returned is absent. */
+  titles: ReadonlyMap<string, unknown> | undefined;
+  /**
+   * Whether the list's own titles may be another language's: the list reads the default
+   * language with fallback, so where the default language falls back to another, a title it
+   * lacks is that other language's, and nothing on the row says which.
+   */
+  defaultMayFallBack?: boolean;
+}
+
+/**
+ * Whether a row's own title, from the list's read, may be another language's than the default:
+ * where the default may fall back to another language, or the row says its default language
+ * holds nothing. Such a title is never presented as the default language's.
+ */
+export function listTitleMayBeAnotherLanguages(
+  row: Record<string, unknown>,
+  shownIn: Pick<TitlesShownIn, "defaultLanguage" | "defaultMayFallBack">
+): boolean {
+  if (shownIn.defaultMayFallBack === true) return true;
+  const defaultMeta = (
+    row._translations as Record<string, { translated?: boolean }> | undefined
+  )?.[shownIn.defaultLanguage.code];
+  return defaultMeta?.translated === false;
+}
+
+/** The `dir` a language's text is written in. */
+const dirOf = (language: TitleLanguage): "rtl" | "ltr" =>
+  language.rtl ? "rtl" : "ltr";
+
+/**
+ * The title column's cell for titles in a chosen language, drawn by the column's own cell so a
+ * title looks the same in either language.
+ *
+ * A row shows a title in the chosen language only where the read in that language returned one
+ * that is present (`isFieldTranslated`). Anything else (not read yet, not translated, a row or
+ * field that read did not return, a read that was refused) shows the list's own title, in the
+ * default language,
+ * marked with its language once the read has answered, so a default title is never passed off
+ * as a translation. Each title carries its language's `lang` and `dir`.
+ */
+function titleInLanguageCell(
+  base: CellRenderer<Record<string, unknown>>,
+  titleName: string,
+  shownIn: TitlesShownIn
+): CellRenderer<Record<string, unknown>> {
+  return ctx => {
+    const id = ctx.row.id;
+    const title =
+      typeof id === "string" || typeof id === "number"
+        ? shownIn.titles?.get(String(id))
+        : undefined;
+    // Present by the one rule a translated value is judged by, so a structured value (a rich
+    // text title) counts as a translation as a non-blank string does, and the column's own cell
+    // draws it.
+    if (isFieldTranslated(title)) {
+      return (
+        <span
+          lang={shownIn.language.code}
+          dir={dirOf(shownIn.language)}
+          data-title-language={shownIn.language.code}
+        >
+          {base({
+            ...ctx,
+            value: title,
+            row: { ...ctx.row, [titleName]: title },
+          })}
+        </span>
+      );
+    }
+    // The list's own title is marked as the default language's only where it can only be that.
+    if (listTitleMayBeAnotherLanguages(ctx.row, shownIn)) return base(ctx);
+    return (
+      <span className="inline-flex flex-wrap items-baseline gap-x-1.5">
+        <span
+          lang={shownIn.defaultLanguage.code}
+          dir={dirOf(shownIn.defaultLanguage)}
+          data-title-language={shownIn.defaultLanguage.code}
+        >
+          {base(ctx)}
+        </span>
+        {shownIn.titles !== undefined && (
+          <span className="text-xs text-muted-foreground">
+            ({shownIn.defaultLanguage.label})
+          </span>
+        )}
+      </span>
+    );
+  };
+}
+
+/**
+ * The columns the list's sort can order by: the ones its table marks sortable. The one answer
+ * both the sort menu and a sort carried in the list's address are held to.
+ */
+export function sortableColumnNames(
+  collection: CollectionForColumns
+): ReadonlySet<string> {
+  return new Set(
+    buildEntryColumns(collection)
+      .filter(column => column.sortable)
+      .map(column => column.name)
+  );
+}
+
+/**
+ * The sort a link asked for, when it names a column the sort menu can order by
+ * (`field` ascending, `-field` descending), or `undefined` for anything else, which the list
+ * then ignores rather than refuses.
+ */
+export function linkedSortFor(
+  param: string | null | undefined,
+  collection: CollectionForColumns | undefined
+): string | undefined {
+  if (!param || !collection) return undefined;
+  const name = param.startsWith("-") ? param.slice(1) : param;
+  return sortableColumnNames(collection).has(name) ? param : undefined;
+}
+
+/**
+ * The lifecycle a link asks the list to show (`?status=draft` or `?status=published`), for a
+ * collection with the Draft / Published lifecycle; `undefined` for anything else, and the list
+ * then shows every entry. A collection without the lifecycle has no status to narrow by.
+ */
+export function linkedStatusFor(
+  param: string | null | undefined,
+  collection: CollectionForColumns | undefined
+): "draft" | "published" | undefined {
+  if (collection?.status !== true) return undefined;
+  return param === "draft" || param === "published" ? param : undefined;
+}
+
+/** A choice the reader made from the list's own controls, and the collection it was made on. */
+export interface ChosenForCollection {
+  collectionSlug: string;
+  value: string;
+}
+
+/**
+ * What the list asks with, for one control (its sort, its status): the reader's own choice, then
+ * what its address carried, then `fallback`. A choice holds only on the collection it was made
+ * on, because the list is the same component from one collection to the next: a field of the
+ * first is not one of the second, and carried over it would order nothing while overriding the
+ * new address's own value.
+ */
+export function choiceInForce(
+  chosen: ChosenForCollection | undefined,
+  collectionSlug: string,
+  linked: string | undefined,
+  fallback: string
+): string {
+  const own =
+    chosen?.collectionSlug === collectionSlug ? chosen.value : undefined;
+  return own ?? linked ?? fallback;
+}
+
+export function buildEntryColumns(
+  collection: CollectionForColumns,
+  /**
+   * Whether a column is visible to this reader. Taken as the predicate the
+   * shared columns control already exposes, rather than as a record of hidden
+   * names — a record is a second spelling of the same question, and only this
+   * file knew how to read it.
+   */
+  isColumnVisible?: (name: string) => boolean,
+  actions?: EntryColumnActions
+): NextlyColumn<Record<string, unknown>>[] {
+  const isHidden = (name: string) =>
+    isColumnVisible ? !isColumnVisible(name) : false;
+
+  const columnNames = getAvailableColumns(collection).filter(
+    name => name !== "select" && name !== "actions"
+  );
+
+  const cols: NextlyColumn<Record<string, unknown>>[] = [];
+
+  for (const columnName of columnNames) {
+    const field = findFieldByName(collection.fields, columnName);
+    const hidden = isHidden(columnName);
+
+    if (!field) {
+      // One chip per language, so a row says WHICH languages need work and
+      // what kind. Offered by `getAvailableColumns` for localized collections
+      // only, so a non-localized table is unchanged.
+      if (columnName === "translations") {
+        cols.push({
+          name: "translations",
+          header: "Languages",
+          sortable: false,
+          hidden,
+          cell: ({ row }) => (
+            <LanguageChips
+              translations={
+                row._translations as
+                  | Record<string, LocaleTranslationMeta>
+                  | undefined
+              }
+              // The document's own status speaks for every language only on a
+              // collection with the Draft / Published lifecycle: elsewhere a
+              // field named `status` is the author's own.
+              {...(collection.status === true
+                ? { documentStatus: row.status }
+                : {})}
+              {...(actions?.openInLocale && typeof row.id === "string"
+                ? {
+                    onOpenLocale: (locale: string) =>
+                      actions.openInLocale?.(row.id as string, locale),
+                  }
+                : {})}
+            />
+          ),
+        });
+        continue;
+      }
+      // Where each part of the row stands in the collection's workflow, as the list read placed it.
+      if (columnName === "review") {
+        cols.push({
+          name: "review",
+          header: "Review",
+          sortable: false,
+          hidden,
+          cell: ({ row }) => <ReviewCell parts={rowReviewParts(row)} />,
+        });
+        continue;
+      }
+      if (columnName === "createdAt" || columnName === "updatedAt") {
+        cols.push({
+          name: columnName,
+          header: columnName === "createdAt" ? "Created" : "Updated",
+          sortable: true,
+          hidden,
+          cell: ({ value, row }) => {
+            const raw =
+              (value as string | undefined) ||
+              ((columnName === "createdAt"
+                ? row.created_at
+                : row.updated_at) as string | undefined);
+            if (!raw) return <span className="text-muted-foreground">-</span>;
+            return (
+              <span className="whitespace-nowrap text-sm text-muted-foreground">
+                {formatDateWithAdminTimezone(
+                  raw,
+                  {
+                    year: "numeric",
+                    month: "short",
+                    day: "numeric",
+                    hour: "2-digit",
+                    minute: "2-digit",
+                    timeZoneName: "short",
+                  },
+                  "-"
+                )}
+              </span>
+            );
+          },
+        });
+        continue;
+      }
+
+      if (columnName === "id") {
+        cols.push({
+          name: "id",
+          header: "ID",
+          hidden,
+          cell: ({ value }) => {
+            const v = typeof value === "string" ? value : "";
+            const display = v.length > 8 ? `${v.slice(0, 8)}...` : v;
+            return (
+              <span
+                className="font-mono text-xs text-muted-foreground"
+                title={v}
+              >
+                {display}
+              </span>
+            );
+          },
+        });
+        continue;
+      }
+
+      if (columnName === "title") {
+        cols.push({
+          name: "title",
+          header: "Title",
+          sortable: true,
+          hidden,
+          cell: ({ value }) => {
+            const v = typeof value === "string" ? value : "";
+            if (!v) return <span className="text-muted-foreground">-</span>;
+            return <span className="text-sm text-foreground">{v}</span>;
+          },
+        });
+        continue;
+      }
+
+      // Headed "Address", the entry header's word for it: "slug" is the
+      // code's name, never an author's.
+      if (columnName === "slug") {
+        cols.push({
+          name: "slug",
+          header: "Address",
+          sortable: true,
+          hidden,
+          cell: ({ value }) => {
+            const v = typeof value === "string" ? value : "";
+            if (!v) return <span className="text-muted-foreground">-</span>;
+            return (
+              <span className="font-mono text-sm text-foreground">{v}</span>
+            );
+          },
+        });
+        continue;
+      }
+
+      continue;
+    }
+
+    // Data field — reuse EntryTableCell so field rendering stays identical.
+    cols.push({
+      name: field.name,
+      header: fieldLabel(field),
+      sortable: isSortableField(field),
+      hidden,
+      fieldType: field.type,
+      align: field.type === "checkbox" ? "center" : undefined,
+      cell: ({ value, row }) => (
+        <EntryTableCell
+          field={field}
+          value={value}
+          entry={row}
+          collectionSlug={collection.slug}
+        />
+      ),
+    });
+  }
+
+  // The title column shows titles in the language the reader chose, where one is chosen. It is
+  // not sortable then: the list orders by the default language's titles, not the ones shown.
+  const titlesIn = actions?.titlesIn;
+  if (titlesIn) {
+    const titleName = getEntryTitleField(collection);
+    const index = cols.findIndex(column => column.name === titleName);
+    const base = index >= 0 ? cols[index].cell : undefined;
+    if (titleName && base) {
+      cols[index] = {
+        ...cols[index],
+        sortable: false,
+        cell: titleInLanguageCell(base, titleName, titlesIn),
+      };
+    }
+  }
+
+  return cols;
+}
+
+// ============================================================================
+// Type Extensions for TanStack Table
+// ============================================================================
+
+declare module "@tanstack/react-table" {
+  // Reason: TData is required by the generic interface signature for module
+  // augmentation but is not referenced in the custom meta properties below.
+  interface ColumnMeta<TData, TValue> {
+    /** The field type for custom rendering */
+    fieldType?: string;
+    /** Full field configuration for advanced rendering */
+    fieldConfig?: FieldConfig;
+  }
+}

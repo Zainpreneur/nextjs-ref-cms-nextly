@@ -1,0 +1,723 @@
+/**
+ * Field Transform Utilities
+ *
+ * Utilities for serializing/deserializing complex field data for database storage.
+ * Handles transformation of array, group, blocks, json, relationship, date, and point fields.
+ *
+ * @module lib/field-transform
+ * @since 1.0.0
+ */
+
+import type {
+  FieldConfig,
+  DataFieldConfig,
+} from "../../collections/fields/types";
+import { normalizeRelationshipValue } from "../../domains/collections/services/collection-utils";
+import { NextlyError } from "../../errors";
+import { addressableFields } from "../addressable-fields";
+
+import { detachData } from "./detach";
+import { storageTypeToken } from "./plugin-storage";
+import {
+  formatRichTextOutput,
+  isRichTextValue,
+  type RichTextOutputFormat,
+  type RichTextStyles,
+} from "./rich-text-html";
+
+// ============================================================
+// Types
+// ============================================================
+
+/**
+ * Field types that require JSON serialization for storage.
+ * These types store complex nested data structures.
+ */
+const JSON_SERIALIZABLE_TYPES = ["repeater", "group", "json"] as const;
+
+/**
+ * Options for transform operations.
+ */
+export interface TransformOptions {
+  /**
+   * Whether to recursively transform nested fields.
+   * When true, processes relationships and dates within complex structures.
+   * @default true
+   */
+  recursive?: boolean;
+
+  /**
+   * Output format for rich text fields.
+   * - `json` - Return only the Lexical JSON structure (default)
+   * - `html` - Return only the HTML string
+   * - `both` - Return an object with both `json` and `html` properties
+   * @default "json"
+   */
+  richTextFormat?: RichTextOutputFormat;
+}
+
+// ============================================================
+// Type Guards
+// ============================================================
+
+/**
+ * Check if a field type requires JSON serialization.
+ */
+function isJSONSerializableType(type: string): boolean {
+  return JSON_SERIALIZABLE_TYPES.includes(
+    type as (typeof JSON_SERIALIZABLE_TYPES)[number]
+  );
+}
+
+/**
+ * Check if a value looks like it's already been JSON serialized (is a string).
+ */
+function isAlreadySerialized(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  return (
+    (trimmed.startsWith("[") && trimmed.endsWith("]")) ||
+    (trimmed.startsWith("{") && trimmed.endsWith("}"))
+  );
+}
+
+/**
+ * Check if a field is a data field with a name property.
+ */
+function isNamedDataField(
+  field: FieldConfig
+): field is DataFieldConfig & { name: string } {
+  return "name" in field && typeof field.name === "string";
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+/**
+ * Build a field lookup map for efficient field access by name.
+ */
+function buildFieldMap(fields: FieldConfig[]): Map<string, FieldConfig> {
+  const flatFields = fields;
+  const map = new Map<string, FieldConfig>();
+
+  for (const field of flatFields) {
+    if (isNamedDataField(field)) {
+      map.set(field.name, field);
+    }
+  }
+
+  return map;
+}
+
+/**
+ * A copy of `data` with each value a declared field holds replaced by what
+ * `visit` returns for it. An empty value, or a key no field declares, passes
+ * through untouched. The walk every field-shaped read transform here makes.
+ */
+function mapDeclaredValues(
+  data: Record<string, unknown>,
+  fields: FieldConfig[],
+  visit: (value: unknown, field: FieldConfig, key: string) => unknown
+): Record<string, unknown> {
+  const result: Record<string, unknown> = { ...data };
+  const fieldMap = buildFieldMap(fields);
+
+  for (const [key, value] of Object.entries(result)) {
+    if (value === undefined || value === null) continue;
+    const field = fieldMap.get(key);
+    if (!field) continue;
+    result[key] = visit(value, field, key);
+  }
+
+  return result;
+}
+
+/**
+ * Extract ID from a relationship value.
+ * Handles both simple IDs and polymorphic {relationTo, value} objects.
+ */
+function extractRelationshipId(value: unknown): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+
+  // Already an ID string
+  if (typeof value === "string") {
+    return value;
+  }
+
+  // Populated object with id property
+  if (typeof value === "object" && value !== null) {
+    const obj = value as Record<string, unknown>;
+
+    // Polymorphic relationship: { relationTo: string, value: string | object }
+    if ("relationTo" in obj && "value" in obj) {
+      const innerValue = obj.value;
+      // Extract ID from inner value if it's a populated object
+      if (
+        typeof innerValue === "object" &&
+        innerValue !== null &&
+        "id" in innerValue
+      ) {
+        return {
+          relationTo: obj.relationTo,
+          value: (innerValue as Record<string, unknown>).id,
+        };
+      }
+      return value; // Already in correct format
+    }
+
+    // Simple populated object: { id: string, ...otherFields }
+    if ("id" in obj) {
+      return obj.id;
+    }
+  }
+
+  // Return as-is if we can't extract an ID
+  return value;
+}
+
+/**
+ * Process a value recursively to handle nested relationships and dates.
+ */
+function processNestedValue(
+  value: unknown,
+  nestedFields: FieldConfig[] | undefined
+): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+
+  // If we have field definitions, use them for precise transformation
+  if (nestedFields && Array.isArray(nestedFields)) {
+    const fieldMap = buildFieldMap(nestedFields);
+
+    if (Array.isArray(value)) {
+      // Array of objects (repeater rows or blocks)
+      return value.map(item => {
+        if (typeof item === "object" && item !== null) {
+          return processObjectWithFields(
+            item as Record<string, unknown>,
+            fieldMap
+          );
+        }
+        return item;
+      });
+    }
+
+    if (typeof value === "object") {
+      return processObjectWithFields(
+        value as Record<string, unknown>,
+        fieldMap
+      );
+    }
+  }
+
+  return value;
+}
+
+/**
+ * Process an object using a field map for transformation.
+ */
+function processObjectWithFields(
+  obj: Record<string, unknown>,
+  fieldMap: Map<string, FieldConfig>
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+
+  for (const [key, val] of Object.entries(obj)) {
+    const field = fieldMap.get(key);
+
+    if (!field) {
+      // No field definition - pass through as-is
+      result[key] = val;
+      continue;
+    }
+
+    // Transform based on field type
+    result[key] = transformValueForStorage(val, field);
+  }
+
+  return result;
+}
+
+/**
+ * Transform a single value based on its field type for storage.
+ */
+function transformValueForStorage(value: unknown, field: FieldConfig): unknown {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  switch (field.type) {
+    case "relationship":
+    case "upload": {
+      // Extract IDs from populated objects
+      const relField = field as { hasMany?: boolean };
+      if (relField.hasMany && Array.isArray(value)) {
+        return value.map(v => extractRelationshipId(v));
+      }
+      return extractRelationshipId(value);
+    }
+
+    case "date": {
+      // Ensure ISO string format
+      if (value instanceof Date) {
+        return value.toISOString();
+      }
+      return value;
+    }
+
+    case "repeater": {
+      // Process nested fields within repeater rows
+      const repeaterField = field as { fields?: FieldConfig[] };
+      if (Array.isArray(value) && repeaterField.fields) {
+        return processNestedValue(value, repeaterField.fields);
+      }
+      return value;
+    }
+
+    case "group": {
+      // Process nested fields within group
+      const groupField = field as { fields?: FieldConfig[] };
+      if (typeof value === "object" && value !== null && groupField.fields) {
+        return processNestedValue(value, groupField.fields);
+      }
+      return value;
+    }
+
+    default:
+      return value;
+  }
+}
+
+// ============================================================
+// Main Transform Functions
+// ============================================================
+
+/**
+ * Transform entry data before storing in database.
+ *
+ * Performs the following transformations:
+ * - Serializes arrays/groups/blocks/json to JSON strings
+ * - Extracts IDs from populated relationship/upload objects
+ * - Ensures dates are in ISO string format
+ * - Recursively processes nested fields
+ *
+ * @param data - Entry data to transform
+ * @param fields - Field configurations for the collection
+ * @param options - Transform options
+ * @returns Transformed data ready for database storage
+ * @throws NextlyError (VALIDATION_ERROR with code "TRANSFORM_FAILED") if serialization fails
+ *
+ * @example
+ * ```typescript
+ * const storedData = transformForStorage(
+ *   { title: 'Hello', tags: [{ name: 'news' }], author: { id: '123', name: 'John' } },
+ *   collectionFields
+ * );
+ * // Result: { title: 'Hello', tags: '[{"name":"news"}]', author: '123' }
+ * ```
+ */
+export function transformForStorage(
+  data: Record<string, unknown>,
+  fields: FieldConfig[],
+  options: TransformOptions = {}
+): Record<string, unknown> {
+  const { recursive = true } = options;
+  const result: Record<string, unknown> = {};
+  const fieldMap = buildFieldMap(fields);
+
+  for (const [key, value] of Object.entries(data)) {
+    if (value === undefined) {
+      continue;
+    }
+
+    const field = fieldMap.get(key);
+
+    // Pass through unknown fields (system fields like id, createdAt, updatedAt)
+    if (!field) {
+      result[key] = value;
+      continue;
+    }
+
+    try {
+      // First, recursively transform nested relationships/dates if needed
+      let processedValue: unknown = value;
+      if (recursive) {
+        processedValue = transformValueForStorage(value, field);
+      }
+
+      // Then serialize complex types to JSON strings
+      if (isJSONSerializableType(field.type)) {
+        // Skip if null or already serialized
+        if (processedValue === null) {
+          result[key] = null;
+        } else if (isAlreadySerialized(processedValue)) {
+          result[key] = processedValue;
+        } else {
+          result[key] = JSON.stringify(processedValue);
+        }
+      } else if (field.type === "relationship" || field.type === "upload") {
+        // Handle relationship/upload - extract IDs
+        const relField = field as { hasMany?: boolean };
+        if (relField.hasMany && Array.isArray(processedValue)) {
+          result[key] = processedValue.map(v => extractRelationshipId(v));
+        } else {
+          result[key] = extractRelationshipId(processedValue);
+        }
+      } else if (field.type === "date") {
+        // Ensure ISO string format
+        if (processedValue instanceof Date) {
+          result[key] = processedValue.toISOString();
+        } else {
+          result[key] = processedValue;
+        }
+      } else {
+        result[key] = processedValue;
+      }
+    } catch (error) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path: key,
+            code: "TRANSFORM_FAILED",
+            message: "Field transformation failed.",
+          },
+        ],
+        logContext: {
+          fieldName: key,
+          fieldType: field.type,
+          operation: "serialize",
+          cause: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Transform entry data after reading from database.
+ *
+ * Performs the following transformations:
+ * - Parses JSON strings back to objects for repeater/group/blocks/json fields
+ * - Handles already-parsed data gracefully
+ *
+ * Note: Relationship expansion is handled by CollectionRelationshipService,
+ * and date parsing is handled by the database adapter.
+ *
+ * @param data - Entry data from database
+ * @param fields - Field configurations for the collection
+ * @returns Transformed data ready for application use
+ * @throws NextlyError (VALIDATION_ERROR with code "TRANSFORM_FAILED") if deserialization fails
+ *
+ * @example
+ * ```typescript
+ * const appData = transformFromStorage(
+ *   { title: 'Hello', tags: '[{"name":"news"}]', author: '123' },
+ *   collectionFields
+ * );
+ * // Result: { title: 'Hello', tags: [{ name: 'news' }], author: '123' }
+ * ```
+ */
+export function transformFromStorage(
+  data: Record<string, unknown>,
+  fields: FieldConfig[]
+): Record<string, unknown> {
+  return mapDeclaredValues(data, fields, (value, field, key) => {
+    // Only parse JSON serializable types
+    if (!isJSONSerializableType(field.type)) {
+      return value;
+    }
+
+    try {
+      // Parse JSON strings back to objects
+      if (typeof value === "string") {
+        try {
+          return JSON.parse(value) as unknown;
+        } catch {
+          // If parsing fails, keep original value
+          // This handles cases where the string is not valid JSON
+          return value;
+        }
+      }
+      // If already an object/array, keep as-is (database might have returned parsed data)
+      return value;
+    } catch (error) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path: key,
+            code: "TRANSFORM_FAILED",
+            message: "Field transformation failed.",
+          },
+        ],
+        logContext: {
+          fieldName: key,
+          fieldType: field.type,
+          operation: "deserialize",
+          cause: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+  });
+}
+
+/**
+ * Get a list of field names that will be JSON serialized.
+ * Useful for debugging and understanding what fields are transformed.
+ *
+ * @param fields - Field configurations
+ * @returns Array of field names that will be JSON serialized
+ */
+export function getSerializedFieldNames(fields: FieldConfig[]): string[] {
+  const fieldMap = buildFieldMap(fields);
+  const serializedFields: string[] = [];
+
+  for (const [name, field] of fieldMap) {
+    if (isJSONSerializableType(field.type)) {
+      serializedFields.push(name);
+    }
+  }
+
+  return serializedFields;
+}
+
+/**
+ * Check if a field type requires transformation.
+ * Returns true for fields that need special handling (relationships, dates, complex types).
+ *
+ * @param fieldType - The field type to check
+ * @returns Whether the field type requires transformation
+ */
+export function requiresTransformation(fieldType: string): boolean {
+  return (
+    isJSONSerializableType(fieldType) ||
+    fieldType === "relationship" ||
+    fieldType === "upload" ||
+    fieldType === "date"
+  );
+}
+
+/**
+ * Normalize relationship and upload field values on write input, at any
+ * nesting depth.
+ *
+ * A read at depth serves a relationship as the populated row, an upload as the
+ * media object, and a multi-target one as `{ relationTo, value: row }`. All
+ * come back on save, and stored as they arrive they put a whole row snapshot in
+ * the column: later reads then serve that stale copy instead of reloading the
+ * target, so an edit to the target never appears.
+ *
+ * Groups and repeaters are walked rather than skipped. Their contents are
+ * serialized to JSON wholesale, so a reference left populated inside one is
+ * written as the row and never recognised as a reference again; a depth-0
+ * read then gives that row where every other read gives the id.
+ *
+ * Mutates `data` in place, reducing each value to the reference it stands for.
+ */
+export function normalizeRelationshipFields(
+  data: Record<string, unknown>,
+  fields: FieldConfig[]
+): void {
+  // The fields stored on this object, those inside a group with no name among them, at every
+  // level the walk reaches: such a group stores its fields where it sits.
+  for (const field of addressableFields(fields) as unknown as FieldConfig[]) {
+    if (!("name" in field) || !field.name) continue;
+    const value = data[field.name];
+    if (value == null) continue;
+
+    if (field.type === "relationship") {
+      data[field.name] = normalizeRelationshipField(field, value);
+      continue;
+    }
+
+    // An upload is a reference to a media row, reduced item by item as a
+    // relationship's is: the id, or the pair a multi-target one names. A list
+    // is kept whole, as the top-level upload reduction keeps it.
+    if (field.type === "upload") {
+      data[field.name] = normalizeRelationshipValue(
+        value,
+        Array.isArray((field as { relationTo?: unknown }).relationTo)
+      );
+      continue;
+    }
+
+    const nested = "fields" in field ? (field.fields as FieldConfig[]) : null;
+    if (!nested || nested.length === 0) continue;
+
+    if (field.type === "repeater") {
+      if (!Array.isArray(value)) continue;
+      for (const row of value) {
+        if (row && typeof row === "object" && !Array.isArray(row)) {
+          normalizeRelationshipFields(row as Record<string, unknown>, nested);
+        }
+      }
+    } else if (field.type === "group") {
+      if (typeof value === "object" && !Array.isArray(value)) {
+        normalizeRelationshipFields(value as Record<string, unknown>, nested);
+      }
+    }
+  }
+}
+
+/**
+ * The document a validator is shown.
+ *
+ * A relationship read at a populating depth comes back as the related row, and
+ * a multi-target one wrapped with the collection it names. A field's public
+ * value is the document id, and a custom validator is written against that —
+ * handed a row it compares an object to a string, or calls a string method on
+ * it and throws, rejecting a form the user did not otherwise change.
+ *
+ * Reduced on a detached copy rather than in place, because the submitted shape
+ * is what the hooks between validation and storage still expect to see.
+ */
+export function relationshipValidationView(
+  data: Record<string, unknown>,
+  fields: FieldConfig[]
+): Record<string, unknown> {
+  const view = detachData(data);
+  normalizeRelationshipFields(view, fields);
+  return view;
+}
+
+/**
+ * Reduce one relationship value to the reference it stands for.
+ *
+ * Reads the target list from either shape a field can carry it in: code-first
+ * fields declare `relationTo`, Builder-authored ones `options.target`.
+ */
+function normalizeRelationshipField(
+  field: FieldConfig,
+  value: unknown
+): unknown {
+  const config = field as {
+    relationTo?: unknown;
+    hasMany?: boolean;
+    options?: { target?: unknown; relationType?: string };
+  };
+  const isPolymorphic =
+    Array.isArray(config.relationTo) || Array.isArray(config.options?.target);
+  const hasMany =
+    config.hasMany === true || config.options?.relationType === "manyToMany";
+
+  const normalized = normalizeRelationshipValue(value, isPolymorphic);
+
+  // A single relationship holds one value; an array reaching it means the form
+  // sent a list for a field that stores one reference.
+  if (!hasMany && Array.isArray(normalized)) {
+    return normalized.length > 0 ? normalized[0] : null;
+  }
+  return normalized;
+}
+
+/**
+ * Coerce string values for `field.type === "date"` columns into `Date`
+ * objects, mutating `data` in place. Drizzle binds `timestamp` columns
+ * by calling `.toISOString()` on the bound value, so an ISO string
+ * travelling through the adapter unmodified surfaces as
+ * `value.toISOString is not a function` at the driver layer. JSON
+ * request bodies always deliver dates as strings, so mutation services
+ * must coerce before handing the row to the adapter.
+ *
+ * Non-string values (existing `Date`, `null`, `undefined`) pass through
+ * untouched, so the function is idempotent and safe to call on rows
+ * that were coerced upstream.
+ *
+ * The `fields` parameter is intentionally structural rather than
+ * `FieldConfig[]`: collections feed their stored `FieldDefinition[]`
+ * (from `schemas/dynamic-collections.ts`) through the same path as
+ * singles' static `FieldConfig[]`. Both shapes carry `name` + `type` as
+ * strings, which is all this routine inspects.
+ */
+export function coerceDateFieldsToDate(
+  data: Record<string, unknown>,
+  fields: ReadonlyArray<{ name?: string; type?: string }>
+): void {
+  // The fields stored on this object, those inside a group with no name among them: a group with
+  // no name stores its fields where it sits, so a date inside one is a column of this row too.
+  for (const field of addressableFields(fields) as unknown as typeof fields) {
+    if (!field.name) continue;
+    // A timestamp-backed plugin type binds to the same column a `date` does,
+    // so it needs the same coercion: Drizzle refuses to bind a string there.
+    if (storageTypeToken(field) !== "date") continue;
+    const value = data[field.name];
+    if (typeof value === "string") {
+      data[field.name] = new Date(value);
+    }
+  }
+}
+
+// ============================================================
+// Rich Text Transformation
+// ============================================================
+
+/**
+ * Transform rich text fields in entry data to the requested output format.
+ *
+ * This function processes all rich text fields in the data and converts them
+ * to the specified format (JSON, HTML, or both). It handles nested rich text
+ * fields within arrays, groups, and blocks.
+ *
+ * @param data - Entry data containing rich text fields
+ * @param fields - Field configurations for the collection/single
+ * @param format - The desired output format for rich text fields
+ * @param styles - How the HTML is styled: Nextly's inline look (`"default"`)
+ *   or classes only, for a site's own CSS (`"none"`). Ignored for JSON.
+ * @returns Data with rich text fields transformed to the requested format
+ *
+ * @example
+ * ```typescript
+ * // Get rich text as HTML only
+ * const result = transformRichTextFields(data, fields, "html");
+ *
+ * // Get rich text as both JSON and HTML
+ * const result = transformRichTextFields(data, fields, "both");
+ * // => { content: { json: {...}, html: "<p>...</p>" } }
+ * ```
+ */
+export function transformRichTextFields(
+  data: Record<string, unknown>,
+  fields: FieldConfig[],
+  format: RichTextOutputFormat = "json",
+  styles: RichTextStyles = "default"
+): Record<string, unknown> {
+  // If format is JSON, no transformation needed (default behavior)
+  if (format === "json") {
+    return data;
+  }
+
+  // A nested row (a repeater's item, a group's value) in the same format.
+  const nested = (
+    row: Record<string, unknown>,
+    nestedFields: FieldConfig[]
+  ): Record<string, unknown> =>
+    transformRichTextFields(row, nestedFields, format, styles);
+
+  return mapDeclaredValues(data, fields, (value, field) => {
+    if (field.type === "richText") {
+      return isRichTextValue(value)
+        ? formatRichTextOutput(value, format, { styles })
+        : value;
+    }
+
+    // Rich text nested in a repeater's rows or in a group.
+    const nestedFields = (field as { fields?: FieldConfig[] }).fields;
+    if (field.type === "repeater" && Array.isArray(value) && nestedFields) {
+      return value.map(item =>
+        typeof item === "object" && item !== null
+          ? nested(item as Record<string, unknown>, nestedFields)
+          : item
+      );
+    }
+    if (field.type === "group" && typeof value === "object" && nestedFields) {
+      return nested(value as Record<string, unknown>, nestedFields);
+    }
+
+    return value;
+  });
+}

@@ -1,0 +1,122 @@
+import { fileURLToPath } from "node:url";
+
+import tsconfigPaths from "vite-tsconfig-paths";
+import { defineConfig } from "vitest/config";
+
+// The supported ranges, as the build inlines them.
+import { frameworkRanges } from "../../scripts/framework-ranges.mjs";
+
+// With forward slashes, as Vite writes every module id it hands a plugin: on
+// Windows `fileURLToPath` answers with backslashes, and an importer such as
+// `D:/repo/templates/blog/src/lib/rss.ts` would never start with them.
+const BLOG_LIB = fileURLToPath(
+  new URL("../../templates/blog/src/lib/", import.meta.url)
+).replaceAll("\\", "/");
+const BASE_SITE_URL = fileURLToPath(
+  new URL("../../templates/base/src/lib/site-url.ts", import.meta.url)
+);
+// A template's approach config is copied to the project's root as
+// `nextly.config.ts`, so it imports the template's source as `./src/...`.
+const BLOG_CONFIGS = fileURLToPath(
+  new URL("../../templates/blog/configs/", import.meta.url)
+).replaceAll("\\", "/");
+const BLOG_ROOT = fileURLToPath(
+  new URL("../../templates/blog/", import.meta.url)
+).replaceAll("\\", "/");
+
+export default defineConfig({
+  plugins: [
+    tsconfigPaths(),
+    // A scaffolded blog gets `lib/site-url` from the base template, laid over
+    // the blog's own `lib`, so blog code imports it from beside itself; the
+    // blog's source does not carry it. Resolved here as the scaffold lays it.
+    // A test that loads one of the blog's approach configs where it sits, in
+    // `configs/`, resolves its `./src/...` imports from the blog's root, as
+    // they resolve in the project the config is copied into.
+    {
+      name: "blog-config-at-project-root",
+      resolveId(source, importer) {
+        return source.startsWith("./src/") &&
+          importer?.replaceAll("\\", "/").startsWith(BLOG_CONFIGS)
+          ? this.resolve(`${BLOG_ROOT}${source.slice(2)}`, importer, {
+              skipSelf: true,
+            })
+          : null;
+      },
+    },
+    {
+      name: "blog-lib-from-base",
+      resolveId(source, importer) {
+        return source === "./site-url" &&
+          importer?.replaceAll("\\", "/").startsWith(BLOG_LIB)
+          ? BASE_SITE_URL
+          : null;
+      },
+    },
+  ],
+  define: {
+    __NEXTLY_FRAMEWORK_RANGES__: JSON.stringify(frameworkRanges()),
+  },
+  // Template components are written for Next.js, which compiles JSX with the
+  // automatic runtime and never imports React for it.
+  esbuild: { jsx: "automatic" },
+  resolve: {
+    // Template code imports Nextly, which this package never installs: it only
+    // writes those imports into the projects it scaffolds. A test that runs
+    // template code gets the recording stub instead.
+    alias: [
+      {
+        find: /^nextly(?:\/config|\/runtime|\/database\/seeders)?$/,
+        replacement: fileURLToPath(
+          new URL("./src/__tests__/stubs/nextly.ts", import.meta.url)
+        ),
+      },
+      // The blog's search loads the Pagefind bundle its build generates;
+      // tests get a stand-in whose searches answer when the test says.
+      {
+        find: /^\/pagefind\/pagefind\.js$/,
+        replacement: fileURLToPath(
+          new URL("./src/__tests__/stubs/pagefind.ts", import.meta.url)
+        ),
+      },
+      // Template code sits outside this package, so a bare `react` import
+      // from it would look for a node_modules beside the templates. Tests
+      // that render it use this package's React, the one the test library
+      // renders with.
+      {
+        find: /^(react|react-dom)(\/.*)?$/,
+        replacement: `${fileURLToPath(new URL("./node_modules/", import.meta.url))}$1$2`,
+      },
+      // Blog template code imports its own source through `@/`, which a
+      // scaffolded blog project's tsconfig maps to its `src`.
+      {
+        find: /^@\/(.*)$/,
+        replacement: `${fileURLToPath(
+          new URL("../../templates/blog/src/", import.meta.url)
+        )}$1`,
+      },
+    ],
+  },
+  test: {
+    // What each file loaded on its last run, so `--changed` and `related` pick
+    // tests from real dependencies rather than a static import graph.
+    experimental: { recordDependencies: true },
+    name: "create-nextly-app",
+    globals: true,
+    environment: "node",
+    include: ["src/**/*.test.ts", "src/**/*.spec.ts"],
+    exclude: ["node_modules", "dist", ".turbo", "**/*.d.ts"],
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "json", "html"],
+      exclude: [
+        "node_modules/",
+        "dist/",
+        "**/*.test.ts",
+        "**/*.spec.ts",
+        "**/index.ts",
+      ],
+    },
+    testTimeout: 10000,
+  },
+});

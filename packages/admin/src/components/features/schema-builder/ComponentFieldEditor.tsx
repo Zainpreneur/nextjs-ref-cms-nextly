@@ -1,0 +1,490 @@
+"use client";
+
+/**
+ * ComponentFieldEditor Component
+ *
+ * Editor for configuring component field settings.
+ * Features:
+ * - Mode toggle (Single component vs Multi-component/Dynamic Zone)
+ * - Component selector (dropdown for single, multi-select for multi)
+ * - Repeatable toggle (array of instances)
+ * - Min/max rows configuration (when repeatable)
+ * - initCollapsed toggle (start instances collapsed)
+ * - isSortable toggle (allow drag-to-reorder)
+ *
+ * @module components/features/schema-builder/ComponentFieldEditor
+ */
+
+import {
+  Badge,
+  Checkbox,
+  Input,
+  Label,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+  Switch,
+} from "@nextlyhq/ui";
+import type { JSX } from "react";
+import { useCallback, useMemo, useRef } from "react";
+
+import * as Icons from "@admin/components/icons";
+import { Link } from "@admin/components/ui/link";
+import { ROUTES } from "@admin/constants/routes";
+import { useFieldGroups } from "@admin/hooks/queries";
+
+import { EditorAlert } from "./EditorAlert";
+import type { ComponentFieldEditorProps, ComponentFieldMode } from "./types";
+
+// ============================================================
+// ComponentFieldEditor Component
+// ============================================================
+
+// Field groups are called field groups in the UI. The `component` spelling that remains here is
+// the STORED one and stays: it is the field type written into `fields` JSON and the registry key
+// the API is addressed by, so renaming it would make existing content unreadable.
+export function ComponentFieldEditor({
+  component,
+  onComponentChange,
+  components,
+  onComponentsChange,
+  repeatable,
+  onRepeatableChange,
+  minRows,
+  onMinRowsChange,
+  maxRows,
+  onMaxRowsChange,
+  initCollapsed,
+  onInitCollapsedChange,
+  isSortable,
+  onIsSortableChange,
+}: ComponentFieldEditorProps): JSX.Element {
+  const multiSelectionCacheRef = useRef<string[] | undefined>(undefined);
+
+  // Fetch available components
+  const { data: componentsData, isLoading } = useFieldGroups({
+    pagination: { page: 0, pageSize: 100 },
+    sorting: [{ field: "label", direction: "asc" }],
+    filters: {},
+  });
+
+  const availableComponents = componentsData?.items || [];
+
+  // Determine current mode based on props
+  const currentMode: ComponentFieldMode = useMemo(() => {
+    if (Array.isArray(components)) return "multi";
+    return "single";
+  }, [components]);
+
+  // Handle mode change
+  const handleModeChange = useCallback(
+    (newMode: ComponentFieldMode) => {
+      if (newMode === "single") {
+        // Cache multi selection so it can be restored if user switches back.
+        const selectedComponents =
+          components && components.length > 0
+            ? components
+            : multiSelectionCacheRef.current;
+
+        if (selectedComponents && selectedComponents.length > 0) {
+          multiSelectionCacheRef.current = [...selectedComponents];
+        }
+
+        // Switch to single mode: keep the first selected component.
+        const firstComponent = selectedComponents?.[0] || component;
+        onComponentsChange(undefined);
+        onComponentChange(firstComponent);
+      } else {
+        // Switch to multi mode: restore previous selection when available.
+        let initialComponents =
+          multiSelectionCacheRef.current &&
+          multiSelectionCacheRef.current.length > 0
+            ? [...multiSelectionCacheRef.current]
+            : component
+              ? [component]
+              : [];
+
+        // Keep currently selected single component in the restored list.
+        if (component && !initialComponents.includes(component)) {
+          initialComponents = [component, ...initialComponents];
+        }
+
+        onComponentChange(undefined);
+        onComponentsChange(initialComponents);
+      }
+    },
+    [component, components, onComponentChange, onComponentsChange]
+  );
+
+  // Handle single component selection
+  const handleSingleComponentChange = useCallback(
+    (value: string) => {
+      if (value === "__none__") {
+        onComponentChange(undefined);
+      } else {
+        onComponentChange(value);
+      }
+    },
+    [onComponentChange]
+  );
+
+  // Handle multi-component toggle
+  const handleMultiComponentToggle = useCallback(
+    (slug: string, checked: boolean) => {
+      const current = components || [];
+      if (checked) {
+        // Add component
+        if (!current.includes(slug)) {
+          const updated = [...current, slug];
+          multiSelectionCacheRef.current = updated;
+          onComponentsChange(updated);
+        }
+      } else {
+        // Remove component
+        const filtered = current.filter(c => c !== slug);
+        multiSelectionCacheRef.current =
+          filtered.length > 0 ? filtered : undefined;
+        onComponentsChange(filtered);
+      }
+    },
+    [components, onComponentsChange]
+  );
+
+  // Handle min rows change
+  const handleMinRowsChange = useCallback(
+    (value: string) => {
+      const num = value ? parseInt(value, 10) : undefined;
+      onMinRowsChange(num && !isNaN(num) && num >= 0 ? num : undefined);
+    },
+    [onMinRowsChange]
+  );
+
+  // Handle max rows change
+  const handleMaxRowsChange = useCallback(
+    (value: string) => {
+      const num = value ? parseInt(value, 10) : undefined;
+      onMaxRowsChange(num && !isNaN(num) && num > 0 ? num : undefined);
+    },
+    [onMaxRowsChange]
+  );
+
+  // Loading state
+  if (isLoading) {
+    return (
+      <div className="space-y-4">
+        <div className="flex items-center gap-2">
+          <Icons.Puzzle className="h-4 w-4 text-muted-foreground" />
+          <Label className="text-xs font-medium">Settings</Label>
+        </div>
+        <div className="flex items-center justify-center p-6">
+          <Icons.Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+          <span className="ml-2 text-sm text-muted-foreground">
+            Loading field groups...
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  // Empty state - no components defined
+  if (availableComponents.length === 0) {
+    return (
+      <div className="space-y-4">
+        <div className="flex items-center gap-2">
+          <Icons.Puzzle className="h-4 w-4 text-muted-foreground" />
+          <Label className="text-xs font-medium">Settings</Label>
+        </div>
+        {/* PR H feedback 2.2: subtle EditorAlert replaces the loud
+            amber empty state. */}
+        <EditorAlert>
+          <div className="space-y-2">
+            <p>
+              No field groups available. Create a field group first to use this
+              field type.
+            </p>
+            <Link
+              href={ROUTES.BUILDER_FIELD_GROUPS_NEW}
+              className="inline-flex items-center gap-1 text-foreground hover:underline"
+            >
+              <Icons.Plus className="h-3 w-3" />
+              Create field group
+            </Link>
+          </div>
+        </EditorAlert>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Section Header */}
+      <div className="flex items-center gap-2">
+        <Icons.Puzzle className="h-4 w-4 text-muted-foreground" />
+        {/* "Settings": the options header above already names the type in
+            its plain words, and every Builder label is in sentence case. */}
+        <Label className="text-xs font-medium">Settings</Label>
+      </div>
+
+      {/* Mode Toggle */}
+      <div className="space-y-2">
+        <Label className="text-xs font-medium text-muted-foreground">
+          Field mode
+        </Label>
+        <div className="grid grid-cols-2 gap-3">
+          {/* Full-strength foreground on hover so the border state change is perceivable. */}
+          <button
+            type="button"
+            // aria-pressed says which one is chosen, which the fill alone does not.
+            aria-pressed={currentMode === "single"}
+            onClick={() => handleModeChange("single")}
+            className={`
+              flex items-center gap-3 p-4 rounded-md  border border-border transition-all duration-200 cursor-pointer
+              ${
+                currentMode === "single"
+                  ? "border-primary text-primary bg-primary/5"
+                  : "border-border bg-background hover-subtle-row hover:border-foreground text-muted-foreground"
+              }
+            `}
+          >
+            <Icons.Puzzle
+              className={`h-6 w-6 shrink-0 ${currentMode === "single" ? "text-primary" : ""}`}
+            />
+            <div className="flex flex-col items-start gap-0.5">
+              <span className="text-sm font-semibold">Single</span>
+              {/* Helper text stays muted in both states; selection is carried by
+                  the card border, fill and title. */}
+              <span className="text-xs text-muted-foreground">One type</span>
+            </div>
+          </button>
+          {/* Full-strength foreground on hover so the border state change is perceivable. */}
+          <button
+            type="button"
+            aria-pressed={currentMode === "multi"}
+            onClick={() => handleModeChange("multi")}
+            className={`
+              flex items-center gap-3 p-4 rounded-md  border border-border transition-all duration-200 cursor-pointer
+              ${
+                currentMode === "multi"
+                  ? "border-primary text-primary bg-primary/5"
+                  : "border-border bg-background hover-subtle-row hover:border-foreground text-muted-foreground"
+              }
+            `}
+          >
+            <Icons.LayoutGrid
+              className={`h-6 w-6 shrink-0 ${currentMode === "multi" ? "text-primary" : ""}`}
+            />
+            <div className="flex flex-col items-start gap-0.5">
+              <span className="text-sm font-semibold">Dynamic zone</span>
+              {/* Helper text stays muted in both states; selection is carried by
+                  the card border, fill and title. */}
+              <span className="text-xs text-muted-foreground">
+                Multiple types
+              </span>
+            </div>
+          </button>
+        </div>
+        <p className="text-xs text-muted-foreground mt-2">
+          {currentMode === "single"
+            ? "Embed one specific field group"
+            : "Allow editors to choose from multiple field groups"}
+        </p>
+      </div>
+
+      {/* Component Selection */}
+      <div className="space-y-2 pt-2  border-t border-border">
+        <Label className="text-xs font-medium">
+          {currentMode === "single" ? "Field group" : "Available field groups"}
+        </Label>
+
+        {currentMode === "single" ? (
+          // Single component selector
+          <Select
+            value={component || "__none__"}
+            onValueChange={handleSingleComponentChange}
+          >
+            <SelectTrigger aria-label="Field group" className="h-8 text-sm">
+              <SelectValue placeholder="Select a field group" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__none__">
+                <span className="text-muted-foreground">
+                  No field group selected
+                </span>
+              </SelectItem>
+              {availableComponents.map(comp => (
+                <SelectItem key={comp.slug} value={comp.slug}>
+                  <div className="flex items-center gap-2">
+                    <Icons.Puzzle className="h-3.5 w-3.5 text-muted-foreground" />
+                    <span>{comp.label || comp.slug}</span>
+                    {comp.admin?.category && (
+                      <Badge variant="outline" className="text-xs ml-1">
+                        {comp.admin.category}
+                      </Badge>
+                    )}
+                  </div>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        ) : (
+          // Multi-component selector (checkboxes)
+          <div className="space-y-2 max-h-48 overflow-y-auto rounded-md  border border-border p-2">
+            {availableComponents.map(comp => {
+              const isSelected = components?.includes(comp.slug) || false;
+              return (
+                <label
+                  key={comp.slug}
+                  className={`
+                    flex items-center gap-2 p-2 rounded-md cursor-pointer transition-colors
+                    ${isSelected ? "bg-primary/5" : "hover:bg-accent"}
+                  `}
+                >
+                  <Checkbox
+                    checked={isSelected}
+                    onCheckedChange={checked =>
+                      handleMultiComponentToggle(comp.slug, checked === true)
+                    }
+                  />
+                  <Icons.Puzzle className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="text-sm flex-1">
+                    {comp.label || comp.slug}
+                  </span>
+                  {comp.admin?.category && (
+                    <Badge variant="outline" className="text-xs">
+                      {comp.admin.category}
+                    </Badge>
+                  )}
+                </label>
+              );
+            })}
+          </div>
+        )}
+
+        {currentMode === "multi" && (
+          <div className="flex items-center gap-2">
+            <Badge variant="default" className="text-xs">
+              {components?.length || 0} selected
+            </Badge>
+            {(!components || components.length === 0) && (
+              <span className="text-xs text-muted-foreground">
+                Select at least one field group
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Repeatable Toggle */}
+      <div className="space-y-3 pt-2  border-t border-border">
+        <Label className="text-xs font-medium text-muted-foreground">
+          Instance options
+        </Label>
+
+        <ToggleRow
+          label="Repeatable"
+          help="Allow multiple instances"
+          checked={repeatable || false}
+          onCheckedChange={onRepeatableChange}
+        />
+
+        {/* Min/Max Rows (when repeatable) */}
+        {repeatable && (
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="min-rows" className="text-xs font-medium">
+                Min Instances
+              </Label>
+              <Input
+                id="min-rows"
+                type="number"
+                min={0}
+                value={minRows ?? ""}
+                onChange={e => handleMinRowsChange(e.target.value)}
+                placeholder="0"
+                className="h-8 text-sm"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="max-rows" className="text-xs font-medium">
+                Max Instances
+              </Label>
+              <Input
+                id="max-rows"
+                type="number"
+                min={1}
+                value={maxRows ?? ""}
+                onChange={e => handleMaxRowsChange(e.target.value)}
+                placeholder="No limit"
+                className="h-8 text-sm"
+              />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Admin Options */}
+      <div className="space-y-3 pt-2  border-t border-border">
+        <Label className="text-xs font-medium text-muted-foreground">
+          Admin options
+        </Label>
+
+        {/* Init Collapsed Toggle */}
+        <ToggleRow
+          label="Collapsed by default"
+          help="Start with instances collapsed"
+          checked={initCollapsed || false}
+          onCheckedChange={onInitCollapsedChange}
+        />
+
+        {/* Is Sortable Toggle (when repeatable) */}
+        {repeatable && (
+          <ToggleRow
+            label="Allow reordering"
+            help="Drag to reorder instances"
+            checked={isSortable !== false}
+            onCheckedChange={onIsSortableChange}
+          />
+        )}
+      </div>
+
+      {/* PR H feedback 2.2: subtle EditorAlert replaces the
+          bg-primary/5 Tip box. */}
+      <EditorAlert>
+        Field groups are reusable sets of fields. Each instance stores its own
+        data in a separate table.
+      </EditorAlert>
+    </div>
+  );
+}
+
+/**
+ * One on/off setting: its name, a line on what it does, and the switch, which
+ * the name labels so a screen reader announces what it turns on.
+ */
+function ToggleRow({
+  label,
+  help,
+  checked,
+  onCheckedChange,
+}: {
+  label: string;
+  help: string;
+  checked: boolean;
+  onCheckedChange: (checked: boolean) => void;
+}): JSX.Element {
+  return (
+    <div className="flex items-center justify-between">
+      <div className="space-y-0.5">
+        <Label className="text-sm font-medium">{label}</Label>
+        <p className="text-xs text-muted-foreground">{help}</p>
+      </div>
+      <Switch
+        aria-label={label}
+        checked={checked}
+        onCheckedChange={onCheckedChange}
+      />
+    </div>
+  );
+}

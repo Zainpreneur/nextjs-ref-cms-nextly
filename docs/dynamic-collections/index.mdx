@@ -1,0 +1,86 @@
+---
+title: Dynamic Collections
+description: What the Visual Schema Builder creates, and how it coexists with collections defined in code.
+---
+
+A collection defined in `nextly.config.ts` exists because you wrote it. A collection built
+in the [Visual Schema Builder](/docs/schema-builder) exists because someone created it in
+the admin, and its definition lives in the database. The second kind is a **dynamic
+collection**.
+
+Both produce the same thing downstream: real database tables, the same REST and Direct API,
+the same admin screens, the same access control. The difference is where the definition is
+stored and who can change it.
+
+## Availability
+
+| | |
+|---|---|
+| Built in | Created through the Visual Schema Builder at `/admin/builder/collections` |
+| Permission | Creating and editing schema is an admin capability, separate from editing content |
+
+## Which to use
+
+| Use code-first when | Use the Schema Builder when |
+|---|---|
+| The shape is part of your application's logic | The shape is part of the site's content |
+| You want it reviewed in a pull request | You want a non-developer to add a field without a deploy |
+| It ships with your repository | It differs between environments, or is created by a client |
+
+The two coexist. A project can define `posts` in code and let an editor add a `testimonials`
+collection in the admin, and nothing about either changes because the other exists.
+
+## Moving between them
+
+A collection built in the admin can be moved into code with `nextly db:sync --promote <slug>`,
+without recreating the table or losing content; only its slug and fields are carried over
+([Collections](/docs/configuration/collections)). Add `--dry-run` to see the snippet it would
+append and the registry row it would remove, changing nothing. The other direction is not supported: a
+code-first collection that has been synced shows read-only in the Schema Builder.
+
+## What differs from a code-first collection
+
+- Its **runtime definition** lives in a database row. The generated migration, however,
+  carries both the table DDL and a serialized copy of the field definition, so once you commit
+  it the shape *is* in git and *is* reviewable in a pull request.
+- A metadata-only edit — renaming a label, changing help text — emits **no SQL migration**,
+  because nothing about the table changed. In development the builder also mirrors the entity
+  into a committable `ui-schema.json`, so such an edit usually still leaves something to
+  review. That mirror is best-effort and development-only: treat the absence of a migration as
+  the reliable signal, and the manifest as a convenience rather than a guarantee.
+- The trade is narrower than "no oversight": structural changes arrive as a committed
+  migration you can review, and presentational ones usually arrive in the development
+  manifest.
+- It **does** generate a SQL migration file under your `migrationsDir`, and that file is
+  what recreates the table and its registry row in another environment. **Commit it.**
+  Deploying without it leaves the collection unreproducible outside the database it was
+  created in.
+- A many-to-many relationship field stores its links in a junction table of its own, and the
+  migration follows that table through the field's life: adding the field creates it, removing
+  the field drops it (a field added later under the same name starts with no links), renaming
+  the field — or changing its `junctionTable` — renames it, indexes and constraints included, so
+  the links travel with the name; pointing the field at another collection replaces its table,
+  and dropping the collection drops every junction the collection's own fields own. Two
+  many-to-many fields cannot share one junction table, since a link does not record which field
+  made it. Rename one many-to-many field per save — with two renamed in one save the builder
+  cannot tell which old table belongs to which new field, and refuses rather than guess.
+- In development a save also changes the database, as one schema apply under the schema lock,
+  so it never runs beside `nextly migrate`, `db:sync` or another schema change; one that meets
+  the lock held is refused with nothing written. The apply compares every table the builder
+  owns with what was recorded for it, so a table changed outside the builder refuses the save,
+  naming that table: bring it in step (apply its own change in its editor, or run
+  `nextly db:sync`) and save again. PostgreSQL applies the change whole or not at all. MySQL
+  and SQLite apply each schema statement as it runs, so a save the database refuses part-way
+  keeps what ran before the refusal; saving again finishes the rest.
+- A Required field added to a table that has rows is filled with its default where it has one,
+  and otherwise with its type's empty value; a date with the moment of the save. The column
+  keeps no default afterwards.
+- On SQLite, the saved migration file does not make a field leaving translation NOT NULL when
+  it is Required or Unique, although the database in development does. A database built from
+  the files alone keeps that column nullable.
+
+## Related
+
+- [Visual Schema Builder](/docs/schema-builder) — the interface that creates these
+- [Collections](/docs/configuration/collections) — the code-first equivalent
+- [Production migrations](/docs/guides/production-migrations)

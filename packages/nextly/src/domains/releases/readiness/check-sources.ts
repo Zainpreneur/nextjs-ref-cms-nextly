@@ -1,0 +1,335 @@
+/**
+ * Where a release's checks come from: sources, each declared once and
+ * registered at boot by the feature that owns it.
+ *
+ * ```ts
+ * export const approvals = defineReleaseCheckSource({
+ *   key: "workflows.approval",
+ *   severity: "hard",
+ *   codes: ["NOT_APPROVED"],
+ *   check: async (batch, ctx) => [],
+ * });
+ * registerReleaseCheckSource(approvals);
+ * ```
+ *
+ * A source answers for one batch of a release's members at a time, and
+ * reports FINDINGS: a member and a code. The codes are a closed union the
+ * source declares, so a client renders a code it knows rather than prose a
+ * source wrote, and the type of `check` holds a source to its own codes.
+ *
+ * Hard findings stop a release from being scheduled or published now; soft
+ * ones are notes. Which is which is the source's, declared once, so one source
+ * cannot report the same code as hard on one release and soft on another.
+ *
+ * The registry is open and typed so features can add sources without editing
+ * the service that asks them. Only core's own sources are registered for now:
+ * a source runs inside scheduling, publishing now and adding to a scheduled
+ * release, and a plugin's source would need its failures kept from stopping
+ * those.
+ *
+ * @module domains/releases/readiness/check-sources
+ */
+import { NextlyError } from "../../../errors";
+import type { ReleaseMemberAction } from "../../../schemas/releases/types";
+import type { ValidationIssue } from "../../../shared/lib/entry-validation";
+import type { UserContext } from "../../collections/services/collection-types";
+import { stopReleasesHolding } from "../early-stop";
+import type { ReleaseRecheckTarget } from "../release-recheck";
+import type {
+  DocumentRef,
+  ReleaseMemberRow,
+  ReleaseRow,
+} from "../releases-repository";
+import type { DueMember } from "../resolve-release-effect";
+
+/**
+ * Whether a finding stops the release (`hard`) or is a note (`soft`).
+ */
+export type ReleaseCheckSeverity = "hard" | "soft";
+
+/** Every severity, for a runtime check of a source declared in JavaScript. */
+const SEVERITIES: readonly ReleaseCheckSeverity[] = ["hard", "soft"];
+
+/**
+ * One thing a source found about one member.
+ *
+ * @typeParam Code - The codes the reporting source declares.
+ */
+export interface ReleaseCheckFinding<Code extends string = string> {
+  memberId: string;
+  code: Code;
+  /**
+   * Facts a reader needs beside the code, such as which other release holds
+   * the document, or which fields are missing. Identifiers and field paths,
+   * never sentences: the client words them.
+   */
+  detail?: Readonly<Record<string, string | null | readonly string[]>>;
+}
+
+/** The scope a member's document lives in. */
+export interface ReleaseCheckScope {
+  scopeKind: ReleaseMemberRow["scopeKind"];
+  scopeSlug: string;
+}
+
+/**
+ * What a source may ask of the world outside its batch.
+ *
+ * Every answer is the one the release's own run would reach: the run performs
+ * each member as its recorded author, through the ordinary write, so a check
+ * that asked anything else could pass a member the run then refuses.
+ */
+export interface ReleaseCheckReads {
+  /** Which of these user ids belong to users who exist and are active. */
+  liveAuthors(ids: readonly string[]): Promise<ReadonlySet<string>>;
+  /**
+   * The identity the run would act as for this author, with their roles, or
+   * `null` when there is nobody to act as.
+   */
+  actingAs(authorId: string): Promise<UserContext | null>;
+  /**
+   * Which of these entries in this scope this person may perform this
+   * lifecycle action on, through the same access gate the run's write meets:
+   * every one or none, unless the gate's rule answers a filter, and then the
+   * entries it matches.
+   */
+  mayPerform(
+    user: UserContext,
+    scope: ReleaseCheckScope,
+    action: ReleaseMemberAction,
+    entryIds: readonly string[]
+  ): Promise<ReadonlySet<string>>;
+  /**
+   * Whether the scope still declares a draft/published lifecycle: the
+   * condition a document had to meet to join the release, asked again.
+   */
+  declaresLifecycle(scope: ReleaseCheckScope): Promise<boolean>;
+  /**
+   * Whether the scope is a collection or Single removed from code: its
+   * registry row says the app's code defines it, and the running
+   * configuration no longer declares it. The run's write to it is refused,
+   * by the same decision this answers with.
+   */
+  removedFromCode(scope: ReleaseCheckScope): Promise<boolean>;
+  /**
+   * Whether the scope declares a per-language lifecycle its translation table
+   * physically lacks, which a document-wide write refuses on.
+   */
+  companionLacksLifecycle(scope: ReleaseCheckScope): Promise<boolean>;
+  /** Which of these documents still exist, as `documentRefKey` keys. */
+  existing(refs: readonly DocumentRef[]): Promise<ReadonlySet<string>>;
+  /**
+   * What the release's write of each of these documents of one scope, as
+   * this person and for this action, would be refused with by validation and
+   * field rules, judged without writing, keyed by entry id: read for the
+   * scope once rather than per document. Empty for a document that would
+   * pass, or that is not there.
+   */
+  publishProblems(
+    scope: ReleaseCheckScope,
+    entryIds: readonly string[],
+    user: UserContext,
+    action: ReleaseMemberAction
+  ): Promise<ReadonlyMap<string, readonly ValidationIssue[]>>;
+  /**
+   * For each of these documents of one scope, the other languages holding
+   * unreleased work that would make the release's document-wide write refuse,
+   * whatever its action, keyed by entry id: read for the scope once rather
+   * than per document.
+   */
+  heldDraftLocales(
+    scope: ReleaseCheckScope,
+    entryIds: readonly string[]
+  ): Promise<ReadonlyMap<string, readonly string[]>>;
+  /**
+   * The scheduled releases' members for these documents, keyed by
+   * `documentRefKey`, this release's own included.
+   */
+  scheduledMemberships(
+    refs: readonly DocumentRef[]
+  ): Promise<ReadonlyMap<string, readonly DueMember[]>>;
+}
+
+/**
+ * What a source is told about the release it is checking.
+ */
+export interface ReleaseCheckContext {
+  release: ReleaseRow;
+  /** One reading of the clock for the whole check. */
+  now: Date;
+  reads: ReleaseCheckReads;
+}
+
+/**
+ * A source of findings.
+ *
+ * @typeParam Code - The codes it may report. `check` can return no other.
+ */
+export interface ReleaseCheckSource<Code extends string = string> {
+  /** `<feature>.<name>` in lowercase, such as `core.author`. */
+  key: string;
+  severity: ReleaseCheckSeverity;
+  /** Every code this source reports, in upper snake case. */
+  codes: readonly Code[];
+  /**
+   * The findings for one batch of members, at most
+   * {@link READINESS_BATCH_SIZE} of them. Only members of the batch may be
+   * named.
+   */
+  check(
+    batch: readonly ReleaseMemberRow[],
+    ctx: ReleaseCheckContext
+  ): Promise<readonly ReleaseCheckFinding<Code>[]>;
+  /**
+   * How this source says that what it judges has changed, so a scheduled
+   * release holding the documents it names is checked again then and
+   * stopped on a hard problem, rather than at its instant: for example, an
+   * approval withdrawn.
+   *
+   * Called once when the source is registered, and handed the function to
+   * call with what changed. Declared with the source, so a source cannot add
+   * a hard problem the early stop would miss: a hard source outside core
+   * must declare one. Core's own sources need none, because core's events
+   * (a draft saved, grants changed, a document deleted, a schema changed)
+   * are wired to the early stop where they happen.
+   */
+  signal?: (recheck: (target: ReleaseRecheckTarget) => Promise<void>) => void;
+}
+
+/**
+ * Whether each scope is removed from code, asked once per check: every
+ * source and every batch of one check share its context.
+ */
+const removedByCheck = new WeakMap<
+  ReleaseCheckContext,
+  Map<string, Promise<boolean>>
+>();
+
+/**
+ * The members whose collection or Single the configuration still declares:
+ * the only ones a check that reads a document's own tables may ask about.
+ *
+ * A removed entity's tables may already be gone (half-retired, or lost
+ * outside a migration), so asking about its documents would fail the whole
+ * check rather than answer, and nothing may write to them whatever such a
+ * check found. `core.removed-from-code` reports each such document, and is
+ * the one problem named for it.
+ */
+export async function membersInDeclaredScopes<M extends ReleaseMemberRow>(
+  members: readonly M[],
+  ctx: ReleaseCheckContext
+): Promise<M[]> {
+  let asked = removedByCheck.get(ctx);
+  if (asked === undefined) {
+    asked = new Map();
+    removedByCheck.set(ctx, asked);
+  }
+  const keyOf = (member: M) => `${member.scopeKind}:${member.scopeSlug}`;
+  const removed = new Set<string>();
+  for (const member of members) {
+    const key = keyOf(member);
+    let answer = asked.get(key);
+    if (answer === undefined) {
+      answer = ctx.reads.removedFromCode(member);
+      asked.set(key, answer);
+    }
+    if (await answer) removed.add(key);
+  }
+  return members.filter(member => !removed.has(keyOf(member)));
+}
+
+/**
+ * How many members a source is handed at once. A release larger than this is
+ * checked in several batches, and answered only once every batch is checked.
+ */
+export const READINESS_BATCH_SIZE = 200;
+
+/** `<feature>.<name>`, lowercase, the namespace keeping two features apart. */
+const SOURCE_KEY = /^[a-z][a-z0-9-]*\.[a-z][a-z0-9-]*$/;
+
+/** A code a client switches on: upper snake case. */
+const FINDING_CODE = /^[A-Z][A-Z0-9_]*$/;
+
+/**
+ * The namespace of core's own sources, whose changes core's events report to
+ * the early stop where they happen.
+ */
+const CORE_NAMESPACE = "core.";
+
+/**
+ * Declare a source, refusing one whose key, severity or codes are malformed.
+ *
+ * Generic over the codes so `check` is typed to report only those: a finding
+ * with a code the source did not declare does not compile.
+ */
+export function defineReleaseCheckSource<const Code extends string>(
+  source: ReleaseCheckSource<Code>
+): ReleaseCheckSource<Code> {
+  const problem = sourceProblem(source);
+  if (problem !== null) {
+    throw NextlyError.internal({
+      logContext: {
+        reason: "invalid-release-check-source",
+        key: source.key,
+        detail: problem,
+      },
+    });
+  }
+  return source;
+}
+
+/** What is wrong with a declared source, or `null` when nothing is. */
+function sourceProblem(source: ReleaseCheckSource<string>): string | null {
+  if (!SOURCE_KEY.test(source.key)) {
+    return `A release check source key must be "<feature>.<name>" in lowercase, such as "core.author"; got "${source.key}".`;
+  }
+  if (!SEVERITIES.includes(source.severity)) {
+    return `Release check source "${source.key}" must be "hard" or "soft".`;
+  }
+  if (source.codes.length === 0) {
+    return `Release check source "${source.key}" declares no codes.`;
+  }
+  if (new Set(source.codes).size !== source.codes.length) {
+    return `Release check source "${source.key}" declares a code twice.`;
+  }
+  const bad = source.codes.find(code => !FINDING_CODE.test(code));
+  if (bad !== undefined) {
+    return `Release check source "${source.key}" has code "${bad}"; codes are upper snake case.`;
+  }
+  if (
+    source.severity === "hard" &&
+    !source.key.startsWith(CORE_NAMESPACE) &&
+    source.signal === undefined
+  ) {
+    return `Release check source "${source.key}" is hard and declares no signal: a hard source outside core must say when what it judges changes, so a scheduled release is stopped then.`;
+  }
+  return null;
+}
+
+const sources = new Map<string, ReleaseCheckSource>();
+
+/**
+ * Make a source part of every release's checks.
+ *
+ * Registering a key again REPLACES it, keeping its place in the order, so a
+ * development reload that re-runs every registration does not run a source
+ * twice.
+ */
+export function registerReleaseCheckSource<Code extends string>(
+  source: ReleaseCheckSource<Code>
+): void {
+  sources.set(source.key, defineReleaseCheckSource(source));
+  // Connected as it is registered, so no source is in the checks without its
+  // signal reaching the early stop. A reload hands it the same function again.
+  source.signal?.(stopReleasesHolding);
+}
+
+/** Every registered source, in the order they were first registered. */
+export function releaseCheckSources(): readonly ReleaseCheckSource[] {
+  return [...sources.values()];
+}
+
+/** Forget every source. For tests only. */
+export function clearReleaseCheckSourcesForTests(): void {
+  sources.clear();
+}

@@ -1,0 +1,470 @@
+/**
+ * Gives archive rows written before `nextly_i18n_archive` recorded an entity's kind the kind of the
+ * entity they belong to, where the registries can say which one that is.
+ *
+ * Such rows carry {@link UNKNOWN_ARCHIVE_KIND}: Singles and field groups archived as well as
+ * collections, so no single kind is true of all of them. A slug names at most one collection or
+ * Single (the two share one namespace) and at most one field group, so a slug that exactly one
+ * registry holds is that entity's. Its rows are labelled only from the moment that entity was
+ * created: a slug can be reused, and a deleted collection's translations archived before a Single
+ * took its slug are not the Single's.
+ *
+ * One pass settles every row it finds: a row whose owner is certain gets that owner's kind, and
+ * the rest become {@link UNRESOLVED_ARCHIVE_KIND} for good. Only the rows of a slug whose one
+ * holder's creation time cannot be read as a date are left unknown, for a run that can read it. Deciding once matters because the
+ * registries change: while a collection and a field group share a slug, their rows are
+ * ambiguous, and after the collection is deleted the field group would look like their only
+ * owner. Nothing deletes an unresolved row, and a restore names it with the `--kind` that would
+ * claim it.
+ *
+ * Only the new column is written. The archived values themselves are never changed.
+ *
+ * @module domains/i18n/migration/label-legacy-archive-rows
+ */
+import type { SupportedDialect } from "@nextlyhq/adapter-drizzle/types";
+import {
+  and,
+  count,
+  eq,
+  getTableName,
+  inArray,
+  notInArray,
+  sql,
+} from "drizzle-orm";
+import type { AnyColumn, SQL } from "drizzle-orm";
+
+import { loadedDialect } from "../../../database/dialect-tables";
+import type { dynamicCollectionsMysql } from "../../../schemas/dynamic-collections/mysql";
+import type { dynamicCollectionsPg } from "../../../schemas/dynamic-collections/postgres";
+import type { dynamicCollectionsSqlite } from "../../../schemas/dynamic-collections/sqlite";
+import type {
+  buildDynamicFieldGroupsMysql,
+  buildDynamicFieldGroupsPg,
+  buildDynamicFieldGroupsSqlite,
+} from "../../../schemas/dynamic-field-groups";
+import type { dynamicSinglesMysql } from "../../../schemas/dynamic-singles/mysql";
+import type { dynamicSinglesPg } from "../../../schemas/dynamic-singles/postgres";
+import type { dynamicSinglesSqlite } from "../../../schemas/dynamic-singles/sqlite";
+import {
+  nextlyI18nArchiveTables,
+  UNKNOWN_ARCHIVE_KIND,
+  UNRESOLVED_ARCHIVE_KIND,
+} from "../../../schemas/nextly-i18n-archive";
+import { resolveFieldGroupRegistryName } from "../../field-groups/storage/resolve-storage-names";
+
+import type { I18nTransitionKind } from "./transition-state";
+
+/**
+ * The slice of Drizzle this drives: distinct reads, a registry read and a scoped UPDATE. Declared
+ * narrowly, as the other archive helpers do, so the dialect's database type stays out of the port.
+ */
+interface LabelDb {
+  selectDistinct(columns: Record<string, unknown>): {
+    from(table: unknown): { where(condition: unknown): Promise<unknown> };
+  };
+  select(columns: Record<string, unknown>): {
+    from(table: unknown): { where(condition: unknown): Promise<unknown> };
+  };
+  update(table: unknown): {
+    set(values: Record<string, unknown>): {
+      where(condition: unknown): Promise<unknown>;
+    };
+  };
+}
+
+/** What labelling needs of the connection. */
+export interface LabelArchiveAdapter {
+  dialect: SupportedDialect;
+  tableExists(tableName: string): Promise<boolean>;
+  /** Which tables exist, for finding which name the field-group registry has on this database. */
+  listTables(): Promise<string[]>;
+  getDrizzle<T = unknown>(): T;
+}
+
+type RegistryTable =
+  | typeof dynamicCollectionsPg
+  | typeof dynamicCollectionsMysql
+  | typeof dynamicCollectionsSqlite
+  | typeof dynamicSinglesPg
+  | typeof dynamicSinglesMysql
+  | typeof dynamicSinglesSqlite
+  | ReturnType<typeof buildDynamicFieldGroupsPg>
+  | ReturnType<typeof buildDynamicFieldGroupsMysql>
+  | ReturnType<typeof buildDynamicFieldGroupsSqlite>;
+
+/**
+ * Each registry, with the kind the archive records for its entities, on this database. The
+ * field-group registry is found by name, since its storage migration renames it: reading only the
+ * old name would miss every field group on a migrated database, and make a collection sharing a
+ * slug look like its rows' only owner.
+ */
+async function registries(
+  adapter: LabelArchiveAdapter
+): Promise<{ kind: I18nTransitionKind; table: RegistryTable }[]> {
+  const fieldGroupRegistry = await resolveFieldGroupRegistryName(adapter);
+  // The loaded dialect's own tables and builder, so only that dialect's files
+  // are imported; `createAdapter` loads them.
+  const loaded = loadedDialect(adapter.dialect);
+  const collections = loaded.tables.dynamicCollections;
+  const singles = loaded.tables.dynamicSingles;
+  const fieldGroups =
+    loaded.builders.buildDynamicFieldGroups(fieldGroupRegistry);
+  return [
+    { kind: "collection", table: collections },
+    { kind: "single", table: singles },
+    { kind: "fieldGroup", table: fieldGroups },
+  ];
+}
+
+/** How many slugs one registry read names, inside every dialect's bound-parameter limit. */
+const SLUGS_PER_READ = 200;
+
+/**
+ * One entity holding a slug, with when it was created as its registry row reads: an invalid date,
+ * or none, where `created_at` holds text that is no date.
+ */
+interface Holder {
+  kind: I18nTransitionKind;
+  createdAt: Date | null;
+}
+
+/** Every entity holding one of `slugs`, with its kind and when it was created. */
+async function holdersOf(
+  adapter: LabelArchiveAdapter,
+  db: LabelDb,
+  slugs: string[]
+): Promise<Map<string, Holder[]>> {
+  const holders = new Map<string, Holder[]>();
+  for (const { kind, table } of await registries(adapter)) {
+    // A database that never registered an entity of this kind has no table for it, and so no
+    // holder of any slug.
+    if (!(await adapter.tableExists(getTableName(table)))) continue;
+    const rows: { slug: string; createdAt: Date | null }[] = [];
+    for (let i = 0; i < slugs.length; i += SLUGS_PER_READ) {
+      rows.push(
+        ...((await db
+          .select({ slug: table.slug, createdAt: table.createdAt })
+          .from(table)
+          .where(inArray(table.slug, slugs.slice(i, i + SLUGS_PER_READ)))) as {
+          slug: string;
+          createdAt: Date | null;
+        }[])
+      );
+    }
+    for (const row of rows) {
+      holders.set(row.slug, [
+        ...(holders.get(row.slug) ?? []),
+        { kind, createdAt: row.createdAt },
+      ]);
+    }
+  }
+  return holders;
+}
+
+/**
+ * `archived_at` as seconds since the epoch, converted by the database that wrote it.
+ *
+ * Compared as instants rather than as dates handed to the driver, because the two sides were
+ * written by different clocks. MySQL's `archived_at` is the server's `CURRENT_TIMESTAMP` in its own
+ * time zone, while a registry's `created_at` is written and read back by the driver in the
+ * application's; a date bound against the column would be off by the difference between them.
+ */
+function archivedEpoch(dialect: SupportedDialect, column: AnyColumn): SQL {
+  switch (dialect) {
+    case "postgresql":
+      return sql`extract(epoch from ${column})`;
+    case "mysql":
+      return sql`UNIX_TIMESTAMP(${column})`;
+    case "sqlite":
+      return sql`${column}`;
+  }
+}
+
+/**
+ * How long after an entity's recorded creation a row has to have been archived to be counted as
+ * its own, in seconds.
+ *
+ * PostgreSQL and MySQL keep a registry's creation time without a time zone, and it is written in
+ * more than one zone (the application's clock, or the database's `now()` in the session's zone),
+ * so read back it can be off by any UTC offset. On PostgreSQL `archived_at` is an instant, so the
+ * widest offset there is, fourteen hours, keeps a row archived before the entity existed from
+ * ever passing. On MySQL every one of the three is zone-less and session-local: the registry's
+ * `created_at` (often the database's `NOW(3)`), `archived_at` (`CURRENT_TIMESTAMP(3)`), and the
+ * epoch `UNIX_TIMESTAMP` takes of it now, and the session's zone can differ each time. Forty-two
+ * hours covers three offsets at their extremes. A row archived within the window of its entity's
+ * creation stays unresolved, and is still restored by naming its kind. SQLite stores both as
+ * epoch seconds, so only its rounding needs room.
+ */
+function creationMargin(dialect: SupportedDialect): number {
+  const hour = 60 * 60;
+  if (dialect === "mysql") return 42 * hour;
+  if (dialect === "postgresql") return 14 * hour;
+  return 1;
+}
+
+/** The entity the labelling gives a slug's unknown rows: the slug's one holder, or none. */
+export interface LegacyLabel {
+  kind: I18nTransitionKind;
+  /** When the holder was created; a row archived before it belongs to an earlier holder. */
+  createdAt: Date;
+}
+
+/**
+ * What the labelling does with `slug`'s unknown rows, from its holders: labels them for the slug's
+ * one holder; leaves them unknown while that holder's creation time cannot be read as a date,
+ * since no row can be judged against it and settling them would be for good; and settles the rest
+ * unresolved.
+ */
+function judgeSlug(
+  holders: Map<string, Holder[]>,
+  slug: string
+): { label: LegacyLabel } | "waits" | "unresolved" {
+  const found = holders.get(slug) ?? [];
+  const holder = found[0];
+  if (found.length !== 1 || holder === undefined) return "unresolved";
+  const { kind, createdAt } = holder;
+  if (!(createdAt instanceof Date) || Number.isNaN(createdAt.getTime())) {
+    return "waits";
+  }
+  return { label: { kind, createdAt } };
+}
+
+/** The label for `slug` (`judgeSlug`), where its rows get one. */
+function labelFrom(
+  holders: Map<string, Holder[]>,
+  slug: string
+): LegacyLabel | undefined {
+  const judged = judgeSlug(holders, slug);
+  return typeof judged === "object" ? judged.label : undefined;
+}
+
+/**
+ * The label `labelLegacyArchiveRows` would give `slug`'s unknown rows, read and not written: a
+ * dry run counts the slug's legacy rows by it, through `ownedSince`, as the labelling sets them.
+ */
+export async function legacyLabelFor(
+  adapter: LabelArchiveAdapter,
+  slug: string
+): Promise<LegacyLabel | undefined> {
+  const db = adapter.getDrizzle<LabelDb>();
+  return labelFrom(await holdersOf(adapter, db, [slug]), slug);
+}
+
+/**
+ * The condition an unknown row meets to be its label's entity's: archived well after the entity
+ * was created (`creationMargin`), compared as instants (`archivedEpoch`). Rows archived before
+ * the entity existed belong to whatever held the slug then.
+ */
+export function ownedSince(
+  dialect: SupportedDialect,
+  archivedAt: AnyColumn,
+  createdAt: Date
+): SQL {
+  return sql`${archivedEpoch(dialect, archivedAt)} >= ${Math.floor(createdAt.getTime() / 1000) + creationMargin(dialect)}`;
+}
+
+/** One kind the labelling gives unknown rows, and the rows it gives it, by their condition. */
+interface PlannedLabel {
+  kind: string;
+  where: SQL | undefined;
+}
+
+/**
+ * What `labelLegacyArchiveRows` does, read and not written: each labelled slug's rows (unknown,
+ * the slug's, archived after its holder was created) with the kind they get, and then every row
+ * still unknown, which becomes unresolved. `kindColumn: false` plans for an archive older than the
+ * kind, whose rows all become unknown once the column is added.
+ */
+async function planLegacyArchiveLabels(
+  adapter: LabelArchiveAdapter,
+  { kindColumn = true }: { kindColumn?: boolean } = {}
+): Promise<PlannedLabel[]> {
+  const db = adapter.getDrizzle<LabelDb>();
+  const { nextlyI18nArchive: archive } = nextlyI18nArchiveTables(
+    adapter.dialect
+  );
+  const unknown = kindColumn
+    ? eq(archive.entityKind, UNKNOWN_ARCHIVE_KIND)
+    : undefined;
+  const slugs = (
+    (await db
+      .selectDistinct({ slug: archive.collection })
+      .from(archive)
+      .where(unknown)) as { slug: string }[]
+  ).map(r => r.slug);
+  if (slugs.length === 0) return [];
+
+  const holders = await holdersOf(adapter, db, slugs);
+  const planned: PlannedLabel[] = [];
+  const waiting: string[] = [];
+  for (const slug of slugs) {
+    const judged = judgeSlug(holders, slug);
+    if (judged === "waits") waiting.push(slug);
+    if (typeof judged !== "object") continue;
+    const { label } = judged;
+    planned.push({
+      kind: label.kind,
+      where: and(
+        unknown,
+        eq(archive.collection, slug),
+        ownedSince(adapter.dialect, archive.archivedAt, label.createdAt)
+      ),
+    });
+  }
+  // Every row this pass did not label stays without an owner, decided now rather than later,
+  // except the rows of a slug that waits for its holder's creation time to read as a date.
+  planned.push({
+    kind: UNRESOLVED_ARCHIVE_KIND,
+    where: and(
+      unknown,
+      waiting.length === 0 ? undefined : notInArray(archive.collection, waiting)
+    ),
+  });
+  return planned;
+}
+
+/**
+ * Hands the unresolved rows of `slugs` back to the labelling: they become unknown again, for the
+ * next `labelLegacyArchiveRows` to judge. For rows settled while their owner's registry row held
+ * a creation date that was wrong (`repair-sqlite-registry-timestamps`): a row is marked
+ * unresolved once and never read again, so a corrected date alone would not reach it. Rows of any
+ * other address, and rows already given a kind, are left as they are. Nothing where the database
+ * has no archive.
+ */
+export async function reopenUnresolvedArchiveRows(
+  adapter: Pick<LabelArchiveAdapter, "dialect" | "tableExists" | "getDrizzle">,
+  slugs: readonly string[]
+): Promise<void> {
+  const { nextlyI18nArchive: archive } = nextlyI18nArchiveTables(
+    adapter.dialect
+  );
+  if (
+    slugs.length === 0 ||
+    !(await adapter.tableExists(getTableName(archive)))
+  ) {
+    return;
+  }
+  const db = adapter.getDrizzle<LabelDb>();
+  for (let i = 0; i < slugs.length; i += SLUGS_PER_READ) {
+    await db
+      .update(archive)
+      .set({ entityKind: UNKNOWN_ARCHIVE_KIND })
+      .where(unresolvedOf(archive, slugs.slice(i, i + SLUGS_PER_READ)));
+  }
+}
+
+/** The unresolved rows of `slugs`: what `reopenUnresolvedArchiveRows` hands back. */
+function unresolvedOf(
+  archive: ReturnType<typeof nextlyI18nArchiveTables>["nextlyI18nArchive"],
+  slugs: readonly string[]
+): SQL | undefined {
+  return and(
+    eq(archive.entityKind, UNRESOLVED_ARCHIVE_KIND),
+    inArray(archive.collection, [...slugs])
+  );
+}
+
+/**
+ * Whether the archive holds a row `reopenUnresolvedArchiveRows` would hand back for `slugs`: an
+ * unresolved row of one of them. False where the database has no archive.
+ */
+export async function holdsUnresolvedArchiveRowsOf(
+  adapter: Pick<LabelArchiveAdapter, "dialect" | "tableExists" | "getDrizzle">,
+  slugs: readonly string[]
+): Promise<boolean> {
+  const { nextlyI18nArchive: archive } = nextlyI18nArchiveTables(
+    adapter.dialect
+  );
+  if (
+    slugs.length === 0 ||
+    !(await adapter.tableExists(getTableName(archive)))
+  ) {
+    return false;
+  }
+  const db = adapter.getDrizzle<LabelDb>();
+  for (let i = 0; i < slugs.length; i += SLUGS_PER_READ) {
+    const [row] = (await db
+      .select({ n: count() })
+      .from(archive)
+      .where(unresolvedOf(archive, slugs.slice(i, i + SLUGS_PER_READ)))) as {
+      n: number | string;
+    }[];
+    if (Number(row?.n ?? 0) > 0) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether the archive holds a row the labelling would read: one of unknown kind. False where the
+ * database has no archive. An archive from before rows recorded their kind has no column to ask,
+ * and the read fails: its rows all become unknown once the column is added.
+ */
+export async function holdsUnknownArchiveRows(
+  adapter: Pick<LabelArchiveAdapter, "dialect" | "tableExists" | "getDrizzle">
+): Promise<boolean> {
+  const { nextlyI18nArchive: archive } = nextlyI18nArchiveTables(
+    adapter.dialect
+  );
+  if (!(await adapter.tableExists(getTableName(archive)))) return false;
+  const [row] = (await adapter
+    .getDrizzle<LabelDb>()
+    .select({ n: count() })
+    .from(archive)
+    .where(eq(archive.entityKind, UNKNOWN_ARCHIVE_KIND))) as {
+    n: number | string;
+  }[];
+  return Number(row?.n ?? 0) > 0;
+}
+
+/**
+ * Settles the unknown rows: those whose owner the registries identify get its kind, and the rest
+ * become unresolved, but for those waiting for their holder's creation time to read as a date
+ * (`judgeSlug`). Idempotent: it reads and writes only rows still unknown, so it can run before
+ * every read that scopes the archive by kind.
+ */
+export async function labelLegacyArchiveRows(
+  adapter: LabelArchiveAdapter
+): Promise<void> {
+  const db = adapter.getDrizzle<LabelDb>();
+  const { nextlyI18nArchive: archive } = nextlyI18nArchiveTables(
+    adapter.dialect
+  );
+  // In order: each slug's own rows first, then every row left unknown.
+  for (const { kind, where } of await planLegacyArchiveLabels(adapter)) {
+    await db.update(archive).set({ entityKind: kind }).where(where);
+  }
+}
+
+/**
+ * How many rows `labelLegacyArchiveRows` would give each kind, counted from its own plan and
+ * written nowhere; kinds it would give no row are left out. `kindColumn: false` counts for an
+ * archive older than the kind, whose rows all become unknown once the column is added.
+ */
+export async function countLegacyArchiveLabels(
+  adapter: LabelArchiveAdapter,
+  options: { kindColumn?: boolean } = {}
+): Promise<{ kind: string; rows: number }[]> {
+  const db = adapter.getDrizzle<LabelDb>();
+  const { nextlyI18nArchive: archive } = nextlyI18nArchiveTables(
+    adapter.dialect
+  );
+  const counts = new Map<string, number>();
+  let labelled = 0;
+  for (const { kind, where } of await planLegacyArchiveLabels(
+    adapter,
+    options
+  )) {
+    const [row] = (await db
+      .select({ n: count() })
+      .from(archive)
+      .where(where)) as { n: number | string }[];
+    // The last step labels what the steps before it left unknown.
+    const rows =
+      kind === UNRESOLVED_ARCHIVE_KIND
+        ? Number(row?.n ?? 0) - labelled
+        : Number(row?.n ?? 0);
+    if (kind !== UNRESOLVED_ARCHIVE_KIND) labelled += rows;
+    if (rows > 0) counts.set(kind, (counts.get(kind) ?? 0) + rows);
+  }
+  return [...counts].map(([kind, rows]) => ({ kind, rows }));
+}

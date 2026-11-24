@@ -1,0 +1,624 @@
+/**
+ * Single Configuration Types
+ *
+ * Type definitions for Singles.
+ * Singles are single-document entities for storing site-wide configuration
+ * such as site settings, navigation menus, footers, and homepage configurations.
+ *
+ * Key differences from Collections:
+ * - Only one document per Single (no list view)
+ * - No create/delete operations (auto-created on first access)
+ * - Simplified hooks (4 vs 8 for Collections)
+ * - Simplified access control (read/update only)
+ *
+ * @module singles/config/types
+ * @since 1.0.0
+ */
+
+import type { FieldConfig } from "../../collections/fields/types";
+import type { SingleAccessControl } from "../../domains/auth/services/access-control-types";
+import type { PreviewViewportsDeclaration } from "../../domains/collections/services/preview-viewports";
+import type { Workflow } from "../../domains/workflows/types";
+import type { HookHandler } from "../../hooks/types";
+import type { RevalidateConfig } from "../../revalidation/types";
+// Builder-facing content-versioning options surfaced on the Single config.
+import type { VersionsConfig } from "../../schemas/versions/types";
+
+// ============================================================
+// Single Labels
+// ============================================================
+
+/**
+ * Display label for a Single.
+ *
+ * Unlike Collections which have singular/plural forms, Singles only need
+ * a singular label since there's always exactly one document.
+ *
+ * @example
+ * ```typescript
+ * const label: SingleLabel = {
+ *   singular: 'Site Settings',
+ * };
+ * ```
+ */
+export interface SingleLabel {
+  /**
+   * Display name for the Single.
+   * Used in the Admin UI sidebar, breadcrumbs, and page titles.
+   *
+   * @example 'Site Settings', 'Header Navigation', 'Footer'
+   */
+  singular: string;
+}
+
+// ============================================================
+// Admin Options
+// ============================================================
+
+/**
+ * Admin panel configuration options for a Single.
+ *
+ * Controls how the Single appears and behaves in the Admin UI.
+ * Simpler than CollectionAdminOptions since there's no list view.
+ *
+ * @example
+ * ```typescript
+ * const admin: SingleAdminOptions = {
+ *   group: 'Settings',
+ *   icon: 'Settings',
+ *   description: 'Site configuration',
+ * };
+ * ```
+ */
+/**
+ * Where a Single previews.
+ *
+ * Deliberately the same shape as `CollectionPreviewConfig`: both answer the one
+ * question "given this document, what is its address on the site", and the
+ * resolver that answers it for collections is the resolver that should answer
+ * it here. A second shape would mean a second resolution, and two of those
+ * agree only until one is edited.
+ *
+ * The argument is the Single's own document rather than an entry, which is the
+ * only difference that matters — a Single is addressed by slug and has no id.
+ */
+export interface SinglePreviewConfig {
+  /**
+   * Computes the URL from the Single's document, or declines by returning
+   * `null`.
+   *
+   * `null` says "not previewable right now" — a document whose path field is
+   * still empty, say — which is a different state from a Single that declares no
+   * preview at all: the first becomes previewable, the second never does.
+   */
+  url: (document: Record<string, unknown>) => string | null;
+
+  /**
+   * Whether to open the preview in a new browser tab.
+   * @default true
+   */
+  openInNewTab?: boolean;
+
+  /**
+   * Custom label for the preview button.
+   * @default "Preview"
+   */
+  label?: string;
+
+  /**
+   * The viewport widths the preview pane offers, as a list or as a function.
+   *
+   * The same declaration a collection's preview takes, and read by the same
+   * mint path — `resolvePreviewViewports` is given whichever declaration the
+   * document has, and does not know which kind of document it came from.
+   *
+   * Declared rather than inferred: nothing in this system can know the widths a
+   * site's CSS actually breaks at, so a shipped phone/tablet/desktop list would
+   * be a claim about somebody else's stylesheet.
+   *
+   * The function form is evaluated per mint, on the server, so a source that
+   * CHANGES — a site's stored breakpoints, edited in the page builder — stays
+   * current instead of being captured once at boot. Only the resolved list ever
+   * reaches the browser.
+   *
+   * @example
+   * ```typescript
+   * breakpoints: [
+   *   { label: "Phone", width: 390 },
+   *   { label: "Desktop", width: 1280 },
+   * ]
+   * ```
+   */
+  breakpoints?: PreviewViewportsDeclaration;
+}
+
+export interface SingleAdminOptions {
+  /**
+   * Group name for organizing Singles in the sidebar.
+   * Singles with the same group appear together under a common heading.
+   *
+   * @example 'Settings', 'Navigation', 'Content'
+   */
+  group?: string;
+
+  /**
+   * Icon identifier for the Single.
+   * Should be a valid icon name from the icon library (e.g., Lucide).
+   *
+   * @example 'Settings', 'Menu', 'Home', 'FileText'
+   */
+  icon?: string;
+
+  /**
+   * Hide the Single from Admin UI navigation.
+   * The Single is still accessible via direct URL and API.
+   *
+   * @default false
+   */
+  hidden?: boolean;
+
+  /** Sort order within sidebar group (lower = higher position, default: 100) */
+  order?: number;
+
+  /** Custom sidebar group slug. When set, item moves from its default section to this custom group */
+  sidebarGroup?: string;
+
+  /**
+   * Where this Single is served on the site.
+   *
+   * A Single with a Draft / Published lifecycle has drafts worth sharing, and a
+   * shared preview link needs somewhere to open. Nothing outside the
+   * application can work that out — whether the homepage Single is at `/`, at
+   * `/home`, or under a locale segment is decided by a route file — so it is
+   * declared here, exactly as a collection declares its own.
+   *
+   * Absent means this Single is not previewable, and the admin says so rather
+   * than handing out a link with nowhere to land.
+   */
+  preview?: SinglePreviewConfig;
+
+  /**
+   * Description text displayed below the Single title.
+   * Use this to provide helpful context for editors.
+   *
+   * @example 'Configure site settings like name, logo, and SEO defaults.'
+   */
+  description?: string;
+
+  /**
+   * @experimental Where the admin opens this Single: `"form"`, or the path of
+   * a document view offered on one of its top-level field types. Every admin
+   * link meant to open it follows this: the sidebar, the Content screen, a
+   * dashboard card's row. The form keeps its own address whatever this says,
+   * and the admin opens the form instead for a reader who may not update the
+   * Single, and for the Single opened in a language other than the default.
+   *
+   * Without it, the Single opens as a collection of the same shape would: in
+   * a view that asks to open first for its main field (the first top-level
+   * field that is not hidden, not `title` and not `slug`), so a Single whose
+   * main field is a page layout opens in the Page Builder, and in the form
+   * otherwise. `"form"` keeps it in the form.
+   *
+   * A path no view offered on a field type answers, or one whose field type
+   * is not among the Single's top-level fields, stops the boot. A view a
+   * plugin declares on a collection's slug is never a Single's.
+   *
+   * @example
+   * ```typescript
+   * admin: { opensIn: "form" }
+   * ```
+   */
+  opensIn?: string;
+}
+
+// ============================================================
+// Access Control
+// ============================================================
+
+// SingleAccessControl is imported from domains/auth/services/access-control-types
+// and re-exported from this module for convenience.
+// See access-control-types.ts for the full interface definition.
+
+// ============================================================
+// Lifecycle Hooks
+// ============================================================
+
+/**
+ * Lifecycle hooks for Singles.
+ *
+ * Singles support a subset of Collection hooks since they only have
+ * read and update operations (no create or delete).
+ *
+ * **Hook Execution Order for Read:**
+ * 1. `beforeRead` - Before fetching from database
+ * 2. Database read
+ * 3. `afterRead` - After fetching, can transform data
+ *
+ * **Hook Execution Order for Update:**
+ * 1. `beforeValidate` - Before the schema's rules are enforced
+ * 2. Validation
+ * 3. `beforeChange` - After validation, on the data about to be written
+ * 4. Database update
+ * 5. `afterChange` - After database write, for side effects
+ *
+ * The validation gate is what separates the two write hooks. Supply or repair a
+ * value in `beforeValidate` if you want the rules applied to what you produced;
+ * use `beforeChange` to derive the value that gets stored, knowing the document
+ * has already passed them.
+ *
+ * @example
+ * ```typescript
+ * const hooks: SingleHooks = {
+ *   afterChange: [
+ *     async ({ doc }) => {
+ *       // Revalidate frontend cache when settings change
+ *       await fetch('/api/revalidate?tag=site-settings', { method: 'POST' });
+ *     },
+ *   ],
+ * };
+ * ```
+ */
+export interface SingleHooks {
+  /**
+   * Runs before reading the Single document.
+   * Can modify query parameters or execute side effects.
+   *
+   * @example
+   * ```typescript
+   * beforeRead: [
+   *   async ({ req }) => {
+   *     console.log(`User ${req.user?.id} reading settings`);
+   *   },
+   * ]
+   * ```
+   */
+  beforeRead?: HookHandler[];
+
+  /**
+   * Runs after reading the Single document.
+   * Can transform the data before it's returned to the client.
+   *
+   * @example
+   * ```typescript
+   * afterRead: [
+   *   async ({ doc }) => {
+   *     // Add computed property
+   *     return { ...doc, fullAddress: `${doc.street}, ${doc.city}` };
+   *   },
+   * ]
+   * ```
+   */
+  afterRead?: HookHandler[];
+
+  /**
+   * Runs before the schema's declared rules are enforced.
+   *
+   * The phase for coercing input, or for supplying a value you want validated:
+   * what it returns goes through the gate. Use it rather than `beforeChange`
+   * whenever the write would fail validation without your handler.
+   *
+   * @example
+   * ```typescript
+   * beforeValidate: [
+   *   async ({ data }) => {
+   *     // Normalize input before the rules are applied to it
+   *     return { ...data, siteName: data.siteName?.trim() };
+   *   },
+   * ]
+   * ```
+   */
+  beforeValidate?: HookHandler[];
+
+  /**
+   * Runs after validation passes, before the database write.
+   *
+   * The phase for deriving the value that gets stored, on a document that has
+   * already satisfied the schema. What it returns is written WITHOUT being
+   * re-validated, so a handler that supplies a required field belongs in
+   * `beforeValidate` instead -- by the time this runs, the write would already
+   * have been rejected.
+   *
+   * @example
+   * ```typescript
+   * beforeChange: [
+   *   async ({ data }) => {
+   *     // Derive a stored value from data already known to be valid
+   *     return { ...data, slugified: slugify(data.siteName) };
+   *   },
+   * ]
+   * ```
+   */
+  beforeChange?: HookHandler[];
+
+  /**
+   * Runs after updating the Single document.
+   * Useful for side effects like cache invalidation, notifications, etc.
+   *
+   * @example
+   * ```typescript
+   * afterChange: [
+   *   async ({ doc }) => {
+   *     // Invalidate CDN cache
+   *     await invalidateCache(['site-settings', 'header', 'footer']);
+   *   },
+   * ]
+   * ```
+   */
+  afterChange?: HookHandler[];
+}
+
+// ============================================================
+// Single Configuration
+// ============================================================
+
+/**
+ * Complete Single configuration interface.
+ *
+ * This is the main interface for defining a Single in code.
+ * Only `slug` and `fields` are required; all other properties have defaults.
+ *
+ * Singles are similar to Collections but simpler:
+ * - Single document per Single (no list view)
+ * - Auto-created on first access
+ * - Only read/update operations (no create/delete)
+ * - Table naming: `single_` prefix (e.g., `single_site_settings`)
+ *
+ * @example
+ * ```typescript
+ * import { defineSingle, text, upload, array, group } from 'nextly';
+ *
+ * export default defineSingle({
+ *   slug: 'site-settings',
+ *   label: { singular: 'Site Settings' },
+ *   admin: {
+ *     group: 'Settings',
+ *     icon: 'Settings',
+ *     description: 'Site configuration',
+ *   },
+ *   fields: [
+ *     text({ name: 'siteName', required: true, label: 'Site Name' }),
+ *     text({ name: 'tagline', label: 'Tagline' }),
+ *     upload({ name: 'logo', relationTo: 'media', label: 'Logo' }),
+ *     group({
+ *       name: 'seo',
+ *       label: 'SEO Defaults',
+ *       fields: [
+ *         text({ name: 'metaTitle', label: 'Default Meta Title' }),
+ *         text({ name: 'metaDescription', label: 'Default Meta Description' }),
+ *       ],
+ *     }),
+ *   ],
+ *   access: {
+ *     read: true,
+ *     update: ({ roles }) => roles.includes('admin'),
+ *   },
+ * });
+ * ```
+ */
+export interface SingleConfig {
+  /**
+   * Unique identifier for the Single.
+   *
+   * Used as the database table name (with `single_` prefix), API endpoint,
+   * and internal reference. Must be:
+   * - Unique across all Singles AND Collections
+   * - URL-friendly (lowercase, no spaces)
+   * - Not a reserved name
+   *
+   * @example 'site-settings', 'header', 'footer', 'homepage'
+   */
+  slug: string;
+
+  /**
+   * Field definitions for the Single.
+   *
+   * An array of field configurations that define the document structure.
+   * Supports all 26 field types from the Collections system.
+   *
+   * @example
+   * ```typescript
+   * fields: [
+   *   text({ name: 'siteName', required: true }),
+   *   upload({ name: 'logo', relationTo: 'media' }),
+   *   array({
+   *     name: 'socialLinks',
+   *     fields: [
+   *       text({ name: 'platform', required: true }),
+   *       text({ name: 'url', required: true }),
+   *     ],
+   *   }),
+   * ]
+   * ```
+   */
+  fields: FieldConfig[];
+
+  /**
+   * @experimental Where this Single is served on the site, as one fixed path:
+   * `"/"` for a homepage, `"/about"` for an About page.
+   *
+   * One answer for every reader that needs the page's public address, read
+   * through `publicAddressOf`. A Single without one is not public yet: it
+   * gets no address, never a guessed one.
+   *
+   * The path starts with `/`, has no trailing `/` (except `"/"` itself),
+   * query, fragment or placeholder, and is spelled as a browser sends it.
+   * Nothing may sit under `/admin`, `/api` or another path the runtime keeps.
+   * Two Singles at one address stop the configuration, naming both.
+   *
+   * @example "/", "/about", "/legal/privacy"
+   */
+  publicAddress?: string;
+
+  /**
+   * @experimental Internal/private storage (D30). Stays in the merged schema
+   * (accessible via services / raw db) but hidden from the admin nav (implies
+   * `admin.hidden`).
+   */
+  internal?: boolean;
+
+  /**
+   * Display label for the Admin UI.
+   * If not provided, the label is auto-generated from the slug.
+   *
+   * @example
+   * ```typescript
+   * label: { singular: 'Site Settings' }
+   * ```
+   */
+  label?: SingleLabel;
+
+  /**
+   * Enable the Draft / Published lifecycle for this Single.
+   *
+   * When `true`, Nextly injects a `status` system column on the data table
+   * (NOT NULL, default `'draft'`) and the admin edit page shows separate
+   * Save Draft / Publish buttons. Public callers querying with
+   * `{ status: { equals: "published" } }` will only see published values;
+   * drafts remain admin-only.
+   *
+   * Mirrors the Schema Builder's Advanced tab "Status (Draft / Published)"
+   * toggle so code-first and Builder configurations converge on the same
+   * underlying behaviour.
+   *
+   * @default false
+   */
+  status?: boolean;
+
+  /**
+   * Enable content versioning (revision history) for this Single.
+   *
+   * Currently active: when enabled, every update records a restorable snapshot
+   * of the assembled document in the global `nextly_versions` table, written
+   * inside the same transaction as the write. Omitted = unversioned.
+   *
+   * Reserved (accepted but NOT yet enforced): the `drafts`, `autosave`, and
+   * `maxPerDoc` retention settings on {@link VersionsConfig} are parsed and
+   * persisted for forward compatibility, but are not wired up yet, so enabling
+   * versioning is capture/history only regardless of those settings. The
+   * deprecated `status: true` alias does not yet drive a version draft
+   * lifecycle; use the separate `status` option for the draft/published column.
+   *
+   * @default undefined (unversioned)
+   */
+  versions?: boolean | VersionsConfig;
+
+  /**
+   * The editorial workflow this Single's documents move through on their way
+   * to publishing, from `defineWorkflow` or `reviewWorkflow`. One workflow may
+   * serve any number of collections and Singles; each has at most one. It
+   * needs drafts kept beside the live version: `status` on and drafts enabled
+   * in `versions`, or the configuration is refused, saying which is missing.
+   * Declaring it changes nothing at runtime yet.
+   *
+   * @experimental
+   */
+  workflow?: Workflow;
+
+  /**
+   * Enable multilingual content for this Single. When `true`, translatable
+   * fields store a value per configured locale (text-like fields localize by
+   * default; override per field with the field's `localized` flag). Requires a
+   * `localization` block in the app config.
+   *
+   * @default false
+   */
+  localized?: boolean;
+
+  /**
+   * Webhook recording policy for this Single. When `false` (or
+   * `{ record: false }`), writes to this Single record NO event to the webhook
+   * outbox, so nothing is ever delivered to subscribed endpoints. The object
+   * form leaves room for finer policy later without a breaking change.
+   *
+   * @default true (writes are recorded)
+   */
+  webhooks?: boolean | { record?: boolean };
+
+  /**
+   * Admin panel configuration options.
+   * Controls how the Single appears in the Admin UI.
+   */
+  admin?: SingleAdminOptions;
+
+  /**
+   * Access control for read/update operations.
+   * Defines who can view and modify the Single document.
+   *
+   * Each operation can be:
+   * - A **function** receiving `AccessControlContext` (user, roles, permissions) → returns boolean
+   * - A **boolean** for simple allow/deny
+   * - **Omitted** to fall back to database role/permission checks
+   *
+   * @example
+   * ```typescript
+   * access: {
+   *   read: true,
+   *   update: ({ roles }) => roles.includes('admin'),
+   * }
+   * ```
+   */
+  access?: SingleAccessControl;
+
+  /**
+   * Lifecycle hooks.
+   * Custom logic that runs during read/update operations.
+   */
+  hooks?: SingleHooks;
+
+  /**
+   * Custom database table name.
+   *
+   * If not specified, the table name is generated from the slug
+   * with a `single_` prefix (e.g., 'site-settings' -> 'single_site_settings').
+   *
+   * @example 'single_site_config', 'global_settings'
+   */
+  dbName?: string;
+
+  /**
+   * Description of the Single.
+   *
+   * Displayed in the Admin UI and used for documentation.
+   * If not provided, falls back to `admin.description`.
+   */
+  description?: string;
+
+  /**
+   * Cache-revalidation configuration. When a Next cache adapter is registered,
+   * every write to this single busts its `nextly:single:{slug}` cache tag, so
+   * tagged reads refresh on save. Use `tags` to bust extra shared tags on every
+   * write, or `disable` to opt this single out of automatic revalidation.
+   *
+   * @default undefined (automatic revalidation on when a cache adapter exists)
+   */
+  revalidate?: RevalidateConfig;
+
+  /**
+   * Custom metadata for plugins and extensions.
+   *
+   * Store arbitrary data that can be accessed by hooks, plugins,
+   * or custom code. Not persisted to the database.
+   *
+   * @example
+   * ```typescript
+   * custom: {
+   *   cacheKey: 'global:site-settings',
+   * }
+   * ```
+   */
+  custom?: Record<string, unknown>;
+
+  /**
+   * Whether to enable automatic input sanitization for this Single.
+   *
+   * When `true` (default), the global sanitization hook strips HTML tags
+   * from plain-text fields (text, textarea, email) before database storage.
+   *
+   * Set to `false` to disable automatic HTML tag stripping for text fields.
+   * Use with caution — only disable if this Single intentionally stores
+   * HTML in text fields.
+   *
+   * @default true
+   */
+  sanitize?: boolean;
+}

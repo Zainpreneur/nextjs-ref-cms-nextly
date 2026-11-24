@@ -1,0 +1,1785 @@
+/**
+ * CollectionEntryService — Thin facade for collection entry CRUD operations.
+ *
+ * This file was originally a 6,490-line god file. It has been decomposed into
+ * focused single-responsibility services:
+ *
+ * - {@link CollectionAccessService} — Access control evaluation (RBAC + collection rules)
+ * - {@link CollectionHookService} — Hook context building and stored hook management
+ * - {@link CollectionQueryService} — Read operations (list, count, group, get)
+ * - {@link CollectionMutationService} — Write operations (create, update, delete)
+ * - {@link CollectionBulkService} — Bulk and batch operations
+ *
+ * Utility functions live in `collection-utils.ts` and shared types in `collection-types.ts`.
+ *
+ * This facade preserves the original public API so that all callers (DI container,
+ * API handlers, tests) continue to work unchanged.
+ */
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import type { TransactionContext } from "@nextlyhq/adapter-drizzle/types";
+
+import { withWriteParts } from "@nextly/hooks/hook-language";
+import type { HookRegistry } from "@nextly/hooks/hook-registry";
+import type {
+  RichTextOutputFormat,
+  RichTextStyles,
+} from "@nextly/lib/rich-text-html";
+
+import {
+  everyLanguageOf,
+  queryWriteLanguagesFor,
+  readLanguagesFor,
+  withRuleLanguage,
+  writeAsNamedLanguagesFor,
+  writeLanguagesFor,
+} from "../../auth/access/rule-language";
+import type { AuthenticatedScope } from "../../auth/authenticated-scope";
+import type { RequestActor } from "../../auth/request-actor";
+import type { RBACAccessControlService } from "../../domains/auth/services/rbac-access-control-service";
+import { assertWellFormedFilter } from "../../domains/collections/query/filter-shape";
+import {
+  type LifecycleParts,
+  movesShared,
+} from "../../domains/collections/services/all-locales-lifecycle";
+import { CollectionAccessService } from "../../domains/collections/services/collection-access-service";
+import { CollectionBulkService } from "../../domains/collections/services/collection-bulk-service";
+import { CollectionHookService } from "../../domains/collections/services/collection-hook-service";
+import {
+  CollectionMutationService,
+  type FieldRewriteCall,
+} from "../../domains/collections/services/collection-mutation-service";
+import { CollectionQueryService } from "../../domains/collections/services/collection-query-service";
+import type {
+  CollectionServiceResult,
+  UserContext,
+  BulkOperationResult,
+  BatchOperationResult,
+  BulkOperationOptions,
+  BulkUpdateEntry,
+} from "../../domains/collections/services/collection-types";
+import {
+  publishCallerOf,
+  publishGate,
+} from "../../domains/collections/services/publish-gate";
+import {
+  publishParts,
+  publishValueRefusal,
+  type PublishPartsRequest,
+} from "../../domains/collections/services/publish-parts";
+import type { DynamicCollectionService } from "../../domains/dynamic-collections";
+import type { SanitizedLocalizationConfig } from "../../domains/i18n/config/types";
+import { EVERY_LOCALE } from "../../domains/i18n/locale-selector";
+import {
+  type LocalizationSource,
+  localizationNow,
+} from "../../domains/i18n/localization-source";
+import {
+  readInFirstPublishedLanguage,
+  readOfEveryLanguage,
+} from "../../domains/i18n/read-in-language";
+import { resolveLocaleChain } from "../../domains/i18n/resolve-locale";
+import { releaseVisibilityFor } from "../../domains/releases/release-visibility";
+import type { RetentionRunner } from "../../domains/retention/runner";
+import type { FieldSources } from "../../domains/versions/restored-from";
+import type { WebhookFastDrainScheduler } from "../../domains/webhooks/after-drain";
+import { errorEnvelopeFields } from "../../errors/from-service-envelope";
+import { NextlyError } from "../../errors/nextly-error";
+import type {
+  CacheRevalidator,
+  RevalidationIntent,
+} from "../../revalidation/types";
+import type { ValidationIssue } from "../../shared/lib/entry-validation";
+import { applyFieldWriteAccess } from "../../shared/lib/field-level-registry";
+import type { HiddenFieldPaths } from "../../shared/lib/filterable-fields";
+import type { PaginatedResponse } from "../../types/pagination";
+import { BaseService } from "../base-service";
+import type { CollectionFileManager } from "../collection-file-manager";
+import type { FieldGroupDataService } from "../field-groups/field-group-data-service";
+import type { Logger } from "../shared";
+
+import type { CollectionRelationshipService } from "./collection-relationship-service";
+import type { WhereFilter } from "./query-operators";
+import type { HookExemptRead, TrustBound } from "./trust-grant";
+
+export {
+  type CollectionServiceResult,
+  type UserContext,
+  type BulkOperationResult,
+  type BatchOperationResult,
+  type BulkOperationOptions,
+  type BulkCreateOptions,
+  type BulkUpdateEntry,
+} from "../../domains/collections/services/collection-types";
+
+/**
+ * The failure envelope for a filter that is not well formed, or `null` when
+ * it is.
+ *
+ * Judged here, on the whole filter as the caller gave it, before the read
+ * hooks run: they are ordinary user code that writes audit rows and spends
+ * rate-limit budget, and a request that was never going to be answered must
+ * not charge the caller for it. It is also the one point that sees the
+ * language filter (`_translated`) before the query service takes it out of
+ * the filter, and a malformed one used to be taken out and ignored, which
+ * dropped the filter. The translators downstream refuse everything else again
+ * for filters that do not pass through here, such as a read hook's.
+ */
+function refusedFilter<T>(where: unknown): CollectionServiceResult<T> | null {
+  try {
+    assertWellFormedFilter(where, { allowTranslated: true });
+    return null;
+  } catch (error: unknown) {
+    // The check throws only a NextlyError; anything else is a fault, not a
+    // refusal, and goes on as one.
+    if (!NextlyError.is(error)) throw error;
+    // Status and message come from the error, which carries its code's
+    // canonical status, so no second copy of the mapping lives here.
+    return {
+      success: false,
+      statusCode: error.statusCode,
+      message: error.publicMessage,
+      data: null,
+      ...errorEnvelopeFields(error),
+    };
+  }
+}
+
+/** What publishing or unpublishing every language of an entry takes. */
+type EveryLanguageLifecycleParams = {
+  collectionName: string;
+  /**
+   * Skip cache revalidation for this write (the outbox drain still runs).
+   * Set by callers that own their cache strategy — a CLI, seed, or
+   * bulk-import write — so it does not fan out a revalidation per row.
+   */
+  disableRevalidate?: boolean;
+  entryId: string;
+  user?: UserContext;
+  overrideAccess?: boolean;
+  /**
+   * Which collections a trusted read may reach as relationships are expanded.
+   * Absent means every populated target inherits the caller's trust. Only ever
+   * narrows, and never admits a target's drafts.
+   */
+  trusted?: TrustBound;
+  /**
+   * Set by the REST dispatcher: the route already authorized this POST as
+   * `update`, so the preliminary update gate skips its redundant RBAC re-check.
+   */
+  routeAuthorized?: boolean;
+  /** API-key scope; gates the unconditional publish or unpublish check. */
+  authenticatedScope?: AuthenticatedScope;
+  /**
+   * The request's data: only the version it was made from (`_rev`) and the
+   * overwrite choice (`_overwrite`) are read, as a save's data carries them,
+   * and every language is judged against that version.
+   */
+  data?: Readonly<Record<string, unknown>>;
+  /**
+   * The HTTP request behind this transition, when one produced it, told to
+   * its hooks.
+   */
+  request?: Request;
+  /** Seeds the context every hook of this transition shares. */
+  context?: Record<string, unknown>;
+  /** The parts the transition moves, where fewer than all; see `LifecycleParts`. */
+  parts?: LifecycleParts;
+  /** Who performed the transition, recorded on the events and told to the publish gate. */
+  actor?: RequestActor;
+  /** A publish made without review, with the caller's reason, told to the publish gate. */
+  withoutReview?: { reason: string };
+  /** Set by the publish of chosen parts, which asked the publish gate's early answer already. */
+  gateAskedEarly?: boolean;
+};
+
+/**
+ * CollectionEntryService handles all entry-level CRUD operations for dynamic collections.
+ *
+ * This is a thin facade that delegates to focused split services. The constructor
+ * signature and public API are unchanged from the original implementation.
+ *
+ * @extends BaseService - Provides adapter access, transaction helpers
+ */
+export class CollectionEntryService extends BaseService {
+  private readonly accessService: CollectionAccessService;
+  private readonly hookService: CollectionHookService;
+  private readonly queryService: CollectionQueryService;
+  private readonly mutationService: CollectionMutationService;
+  private readonly bulkService: CollectionBulkService;
+
+  /** The site's languages as they are now: the source may be the language registry. */
+  private get localization(): SanitizedLocalizationConfig | undefined {
+    return localizationNow(this.localizationSource);
+  }
+
+  constructor(
+    adapter: DrizzleAdapter,
+    logger: Logger,
+    fileManager: CollectionFileManager,
+    collectionService: DynamicCollectionService,
+    relationshipService: CollectionRelationshipService,
+    hookRegistry: HookRegistry,
+    fieldGroupDataService?: FieldGroupDataService,
+    rbacAccessControlService?: RBACAccessControlService,
+    /**
+     * The normalized localization config, forwarded to the services below. Kept here too: every operation runs inside `withRuleLanguage`
+     * with the languages it involves, so each rule it asks is told them. A
+     * read is told its language and the ones it falls back to, a write the
+     * language it writes (the default one when it takes no locale, as a bulk
+     * write and a write on a caller's transaction do; a duplicate also the
+     * languages its source read falls back to), and an operation on the whole
+     * entry every language.
+     */
+    private readonly localizationSource?: LocalizationSource,
+    /**
+     * Offers a retention pass after a write — both of them: the webhook event
+     * ledger and the audit trails, each on its own window and its own gate. The
+     * runner decides which are configured, so a construction site that forwards
+     * only one policy silently leaves that domain unpruned rather than failing.
+     *
+     * Wired here rather than at a caller because every write path that appends
+     * an event runs through this service — the dispatcher-facing handler,
+     * `CollectionService`, and direct callers alike — so this is the one place
+     * that covers them all.
+     */
+    private readonly retentionRunner?: RetentionRunner,
+    /**
+     * Kicks an immediate, bounded drain after a write (via Next `after()`), so
+     * the first delivery attempt does not wait for the next scheduled trigger.
+     * Wired at the same seam as `retentionRunner` for the same reason.
+     */
+    private readonly fastDrainScheduler?: WebhookFastDrainScheduler,
+    /**
+     * Resolves the cache revalidator that flushes a write's revalidation intent
+     * post-commit. Wired at the same seam as `fastDrainScheduler` because every
+     * event-appending write runs through this service. A resolver (not the
+     * instance) so it is read at flush time: this service is constructed during
+     * boot, before a Next cache adapter registers, and an eager capture would
+     * memoize the no-op default. Returns undefined when no adapter is present.
+     */
+    private readonly resolveCacheRevalidator?: () =>
+      | CacheRevalidator
+      | undefined
+  ) {
+    super(adapter, logger);
+
+    this.accessService = new CollectionAccessService(
+      adapter,
+      logger,
+      rbacAccessControlService
+    );
+    this.hookService = new CollectionHookService(hookRegistry);
+
+    // What a due release makes visible. Built once and shared by the read
+    // paths below, so the cheap check's memo is shared too — a cache per read
+    // would reload the earliest scheduled instant on every request and lose the
+    // entire point of having one.
+    const releaseVisibility = releaseVisibilityFor(adapter);
+
+    this.queryService = new CollectionQueryService(
+      adapter,
+      logger,
+      fileManager,
+      collectionService,
+      relationshipService,
+      this.accessService,
+      this.hookService,
+      fieldGroupDataService,
+      localizationSource,
+      releaseVisibility,
+      // The write's own judgement, asked when the read shows a pending change
+      // to a caller who may publish and not update. Read when a read asks it,
+      // after the mutation service below exists.
+      args => this.mutationService.workingDraftPromotionRefused(args)
+    );
+    this.mutationService = new CollectionMutationService(
+      adapter,
+      logger,
+      fileManager,
+      collectionService,
+      relationshipService,
+      this.accessService,
+      this.hookService,
+      fieldGroupDataService,
+      localizationSource
+    );
+    this.bulkService = new CollectionBulkService(
+      adapter,
+      logger,
+      this.accessService,
+      this.queryService,
+      this.mutationService
+    );
+  }
+
+  /**
+   * The languages a read of `params` involves: its own and its fallbacks, or
+   * every language where it also reads translation states.
+   */
+  private readLanguages(params: {
+    locale?: string;
+    fallbackLocale?: string | false;
+    translationStatus?: boolean;
+    where?: unknown;
+    translations?: "all";
+  }) {
+    return readLanguagesFor(
+      this.localization,
+      params.locale,
+      params.fallbackLocale,
+      params
+    );
+  }
+
+  async listEntries(
+    params: {
+      collectionName: string;
+      user?: UserContext;
+      search?: string;
+      page?: number;
+      limit?: number;
+      depth?: number;
+      select?: Record<string, boolean>;
+      where?: WhereFilter;
+      richTextFormat?: RichTextOutputFormat;
+      /** How rich text HTML is styled: `"none"` for classes only. */
+      richTextStyles?: RichTextStyles;
+      /** Draft/Published lifecycle scope; forwarded to the query service. */
+      status?: "published" | "draft" | "all";
+      overrideAccess?: boolean;
+      /**
+       * Which collections a trusted read may reach as relationships are expanded.
+       * Absent means every populated target inherits the caller's trust. Only ever
+       * narrows, and never admits a target's drafts.
+       */
+      trusted?: TrustBound;
+      /** Requested content locale (i18n M4) — forwarded to the query service. */
+      locale?: string;
+      /** Fallback control (`false`/`"none"` disables fallback). */
+      fallbackLocale?: string | false;
+      context?: Record<string, unknown>;
+      /** The HTTP request behind this operation, when one produced it. */
+      request?: Request;
+      /** Route authorization already ran the coarse RBAC gate, so it is skipped. */
+      routeAuthorized?: boolean;
+      /** Caller's authenticated scope; a scoped key is judged on its read grant. */
+      authenticatedScope?: AuthenticatedScope;
+      /** The API key behind `authenticatedScope`, by id, passed through for `_waitingForMe`. */
+      apiKeyId?: string;
+      /** Give each row its review state under `_review` (a list read only). */
+      reviewState?: boolean;
+      /** A grant waiving the collection's read hooks, honoured by the query service. */
+      hookExemptRead?: HookExemptRead;
+    } /** The sort, offset and hidden fields, as the query service reads them. */ & Pick<
+      Parameters<CollectionQueryService["listEntries"]>[0],
+      "sort" | "offset" | "unknownSort" | "hiddenFields" | "countUpTo"
+    >
+  ): Promise<CollectionServiceResult<PaginatedResponse<unknown>>> {
+    return (
+      refusedFilter(params.where) ??
+      withRuleLanguage(this.readLanguages(params), () =>
+        this.queryService.listEntries(readOfEveryLanguage(params))
+      )
+    );
+  }
+
+  /**
+   * Every reason a list read would refuse this caller's query, or none. See
+   * the query service; judged in the language the read it stands for would
+   * judge its rules in, as `listEntries` is.
+   *
+   * @experimental
+   */
+  async queryReadableProblems(
+    params: Parameters<CollectionQueryService["queryReadableProblems"]>[0]
+  ): ReturnType<CollectionQueryService["queryReadableProblems"]> {
+    return withRuleLanguage(this.readLanguages(params), () =>
+      this.queryService.queryReadableProblems(params)
+    );
+  }
+
+  async countEntries(params: {
+    collectionName: string;
+    user?: UserContext;
+    search?: string;
+    where?: WhereFilter;
+    overrideAccess?: boolean;
+    /**
+     * Which collections a trusted read may reach as relationships are expanded.
+     * Absent means every populated target inherits the caller's trust. Only ever
+     * narrows, and never admits a target's drafts.
+     */
+    trusted?: TrustBound;
+    /** Requested content locale (i18n M4) — forwarded to the query service. */
+    locale?: string;
+    /** Fallback control (`false`/`"none"` disables fallback). */
+    fallbackLocale?: string | false;
+    context?: Record<string, unknown>;
+    /** The HTTP request behind this operation, when one produced it. */
+    request?: Request;
+    /** Route authorization already ran the coarse RBAC gate, so it is skipped. */
+    routeAuthorized?: boolean;
+    /** Caller's authenticated scope; a scoped key is judged on its read grant. */
+    authenticatedScope?: AuthenticatedScope;
+    /** The API key behind `authenticatedScope`, by id, passed through for `_waitingForMe`. */
+    apiKeyId?: string;
+    /**
+     * Draft/Published filter override (only effective when the collection has
+     * the status lifecycle). Declared rather than merely forwarded: `params`
+     * reaches the query service whole, so an undeclared option travels at
+     * runtime while looking absent to every reader of this signature -- and the
+     * one thing nobody re-checks is an option that appears not to exist.
+     */
+    status?: "published" | "draft" | "all";
+    /** A grant waiving the collection's read hooks, honoured by the query service. */
+    hookExemptRead?: HookExemptRead;
+    /** Fields the read leaves out, refused in its filter; see the query service. */
+    hiddenFields?: HiddenFieldPaths;
+  }): Promise<CollectionServiceResult<{ totalDocs: number }>> {
+    return (
+      refusedFilter(params.where) ??
+      withRuleLanguage(this.readLanguages(params), () =>
+        this.queryService.countEntries(readOfEveryLanguage(params))
+      )
+    );
+  }
+
+  /**
+   * How many rows `countEntries` would count, read no further than a cap.
+   *
+   * Through the same refusal and rule-language wrapping as the count, so the
+   * bounded count and the exact one are one door with two reads behind it.
+   *
+   * @experimental
+   */
+  async countEntriesUpTo(
+    params: Parameters<CollectionQueryService["countEntriesUpTo"]>[0]
+  ): ReturnType<CollectionQueryService["countEntriesUpTo"]> {
+    return (
+      refusedFilter(params.where) ??
+      withRuleLanguage(this.readLanguages(params), () =>
+        this.queryService.countEntriesUpTo(params)
+      )
+    );
+  }
+
+  /**
+   * How many rows carry each distinct value of one field.
+   *
+   * Forwarded whole rather than rebuilt: the query service answers this over
+   * the same resolved row set it counts, and a parameter dropped here would
+   * make the buckets describe a wider set than the count beside them.
+   */
+  async groupEntries(
+    params: Parameters<CollectionQueryService["groupEntries"]>[0]
+  ): ReturnType<CollectionQueryService["groupEntries"]> {
+    return (
+      refusedFilter(params.where) ??
+      withRuleLanguage(this.readLanguages(params), () =>
+        this.queryService.groupEntries(params)
+      )
+    );
+  }
+
+  /** How many rows fall in each interval of a recent window. */
+  async timeseriesEntries(
+    params: Parameters<CollectionQueryService["timeseriesEntries"]>[0]
+  ): ReturnType<CollectionQueryService["timeseriesEntries"]> {
+    return (
+      refusedFilter(params.where) ??
+      withRuleLanguage(this.readLanguages(params), () =>
+        this.queryService.timeseriesEntries(params)
+      )
+    );
+  }
+
+  async getEntry(params: {
+    collectionName: string;
+    entryId: string;
+    user?: UserContext;
+    depth?: number;
+    select?: Record<string, boolean>;
+    richTextFormat?: RichTextOutputFormat;
+    /** How rich text HTML is styled: `"none"` for classes only. */
+    richTextStyles?: RichTextStyles;
+    overrideAccess?: boolean;
+    /**
+     * Which collections a trusted read may reach as relationships are expanded.
+     * Absent means every populated target inherits the caller's trust. Only ever
+     * narrows, and never admits a target's drafts.
+     */
+    trusted?: TrustBound;
+    /**
+     * Draft/Published filter override (only effective when collection.status
+     * === true). 'all' bypasses the default published-only filter — used by
+     * the admin so unpublished entries stay reachable. Forwarded to the
+     * query service which maps it to a SQL predicate.
+     */
+    status?: "published" | "draft" | "all";
+    /**
+     * Opt in to the working-draft overlay (draft/published split): a trusted
+     * editor read returns the pending working draft in place of the live row.
+     * Forwarded to the query service, which gates it on update trust.
+     */
+    includeWorkingDraft?: boolean;
+    /** Requested content locale (i18n M4) — forwarded to the query service. */
+    locale?: string;
+    /** Fallback control (`false`/`"none"` disables fallback). */
+    fallbackLocale?: string | false;
+    context?: Record<string, unknown>;
+    /** The HTTP request behind this operation, when one produced it. */
+    request?: Request;
+    /** Route authorization already ran the coarse RBAC gate, so it is skipped. */
+    routeAuthorized?: boolean;
+    /** Caller's authenticated scope; a scoped key is judged on its read grant. */
+    authenticatedScope?: AuthenticatedScope;
+    /** A grant waiving the collection's read hooks, honoured by the query service. */
+    hookExemptRead?: HookExemptRead;
+    /**
+     * Whole-document fallback: where the entry is not found in the requested
+     * language, answer in the first language of its fallback chain that has
+     * it, and say which (`_locale`).
+     */
+    wholeDocumentFallback?: boolean;
+    /** Attach `_sources`: for each translatable field, the language its value came from. */
+    sourceLocales?: boolean;
+    /** `"all"`: attach every language's values beside the read's own (`_allLocales`). */
+    translations?: "all";
+    /** Attach `_details`; see `CollectionQueryService.getEntry`. */
+    details?: boolean;
+  }) {
+    // Rules are judged in the languages the read was asked in, `locale=all`
+    // included; the query reads what that request stands for.
+    const read = (locale: string | undefined) => {
+      const inLanguage = { ...params, locale };
+      return withRuleLanguage(this.readLanguages(inLanguage), () =>
+        this.queryService.getEntry(readOfEveryLanguage(inLanguage))
+      );
+    };
+    const chain = params.wholeDocumentFallback
+      ? resolveLocaleChain(
+          this.localization,
+          params.locale,
+          params.fallbackLocale
+        )
+      : null;
+    const [first, ...rest] = chain ?? [];
+    if (first === undefined) return read(params.locale);
+    return readInFirstPublishedLanguage([first, ...rest], read);
+  }
+
+  /**
+   * Batches a write-triggered pass may run. Small on purpose: the write path is
+   * the only retention trigger an install without a drain has, so the pass must
+   * be awaited to survive a serverless invocation being frozen after the
+   * response — which means one save per interval pays for it, and that save
+   * should not be waiting on a full backlog sweep. Ten thousand rows an hour
+   * from this path alone keeps ahead of most sites; anything with a drain gets
+   * the full budget there.
+   */
+  private static readonly WRITE_PATH_PRUNE_BATCHES = 2;
+
+  /**
+   * Run a retention pass after a successful write, if one is due.
+   *
+   * Awaited rather than fired and forgotten: on a serverless runtime the
+   * invocation can be frozen or torn down as soon as the response is returned,
+   * so a detached promise may never get past the gate — and for an install with
+   * no drain this is the only trigger there is. `maybeRun` absorbs its own
+   * failures, so this cannot turn a successful save into an error.
+   */
+  private async offerRetentionPass(): Promise<void> {
+    await this.retentionRunner?.maybeRun(
+      CollectionEntryService.WRITE_PATH_PRUNE_BATCHES
+    );
+  }
+
+  /**
+   * Run the post-write side effects only when the mutation actually recorded a
+   * change (and therefore appended an outbox event). A rejected write — a
+   * validation or access failure surfaced as `success: false`, or a bulk/batch
+   * operation where every item failed — recorded nothing, so kicking the drain
+   * would deliver unrelated pending events for a write that changed nothing (and
+   * let a failed, possibly unauthorized attempt trigger outbound webhooks). The
+   * three result shapes report "recorded something" differently. `success` is
+   * not a reliable proxy in either direction: a create/update/delete can commit
+   * the event and then return `success: false` when a post-commit hook throws,
+   * and a `publishAllLocales` no-op (or a no-op update) returns `success: true`
+   * having recorded nothing. So a single write keys off the explicit
+   * `eventRecorded` flag, which every event-writing path sets. Bulk/batch results
+   * carry the same flag for their committed-but-hook-failed items on top of the
+   * success count.
+   */
+  private async afterWriteIfRecorded(
+    result:
+      | CollectionServiceResult<unknown>
+      | BulkOperationResult<unknown>
+      | BatchOperationResult,
+    disableRevalidate = false
+  ): Promise<void> {
+    // All of it describes a committed write. A write made inside an enclosing
+    // SQLite transaction is a savepoint that transaction can still undo, so
+    // there it waits for that commit, and never runs for a rollback.
+    await this.afterCommit(() =>
+      this.runPostWriteEffects(result, disableRevalidate)
+    );
+  }
+
+  /** The post-write side effects {@link afterWriteIfRecorded} runs once durable. */
+  private async runPostWriteEffects(
+    result:
+      | CollectionServiceResult<unknown>
+      | BulkOperationResult<unknown>
+      | BatchOperationResult,
+    disableRevalidate: boolean
+  ): Promise<void> {
+    // Revalidation flushes whenever a committed write produced intents. It is
+    // NOT tied to the outbox-event gate below: an intent is only ever set after
+    // a write commits, so its presence is the "content changed" signal, and a
+    // publish-all-locales or a batch create (which record no outbox event) still
+    // bust their tags. The per-operation `disableRevalidate` escape hatch skips
+    // it (a CLI / seed / bulk-import write that owns its own cache strategy);
+    // the outbox drain still runs, so webhooks and retention are unaffected.
+    if (!disableRevalidate) {
+      await this.flushRevalidation(result);
+    }
+
+    // Retention is opportunistic write-path cleanup — the write path is the only
+    // prune trigger for installs with no webhook drain, so even a write to only
+    // opted-out (`webhooks: false`) entities must still offer a pass. It is NOT
+    // the outbox gate, but it IS gated on a committed write: a rejected request
+    // (validation / access / not-found) — and a no-op that wrote nothing —
+    // committed no content, so paying for an awaited outbox-deletion pass on its
+    // behalf is wasted latency. An opted-out write still qualifies (it carries a
+    // revalidation intent even though it recorded no event), so coverage holds.
+    if (CollectionEntryService.hasCommittedWrite(result)) {
+      await this.offerRetentionPass();
+    }
+
+    // The fast drain, by contrast, only matters when an outbox event was actually
+    // recorded to deliver. Every result — single, bulk (`successCount`), and
+    // batch (`successful`) — carries an aggregated `eventRecorded`, so a write of
+    // only opted-out entries records nothing and schedules no drain, rather than
+    // draining unrelated pending events off a positive success count.
+    if (result.eventRecorded === true) {
+      this.fastDrainScheduler?.offer();
+    }
+  }
+
+  /**
+   * Whether a mutation result represents at least one committed content write.
+   * A single create/update/delete carries the explicit `committed` flag (set the
+   * moment its transaction commits, independent of the recording and revalidation
+   * opt-outs), so even a write that opts out of BOTH — no event, no intent — is
+   * covered, while a rejected request (validation / access / not-found) and a
+   * `publishAllLocales` no-op are not. Bulk/batch results use their positive
+   * counts; `eventRecorded` covers a committed-but-hook-failed batch. NOT keyed
+   * off `success`, which a no-op update also reports.
+   */
+  private static hasCommittedWrite(
+    result:
+      | CollectionServiceResult<unknown>
+      | BulkOperationResult<unknown>
+      | BatchOperationResult
+  ): boolean {
+    if ("committed" in result && result.committed === true) return true;
+    if (result.eventRecorded === true) return true;
+    if ("successCount" in result && result.successCount > 0) return true;
+    if ("successful" in result && result.successful > 0) return true;
+    // Covers single ops that flush an intent without setting `committed` (e.g. a
+    // publish-all-locales transition) — a present intent means content changed.
+    if ("revalidationIntent" in result && result.revalidationIntent != null) {
+      return true;
+    }
+    if (
+      "revalidationIntents" in result &&
+      (result.revalidationIntents?.length ?? 0) > 0
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Flush a committed write's cache-revalidation intents through the registered
+   * revalidator (a no-op when no cache adapter is present). Runs on the same
+   * gate as the drain — a write that recorded nothing revalidates nothing — and
+   * absorbs its own failure so it never turns a committed write into an error.
+   * Awaited (like the retention pass) so an async revalidator's work is not left
+   * detached, where a serverless response could cut it off before it completes.
+   */
+  private async flushRevalidation(
+    result:
+      | CollectionServiceResult<unknown>
+      | BulkOperationResult<unknown>
+      | BatchOperationResult
+  ): Promise<void> {
+    const intents =
+      "revalidationIntents" in result && result.revalidationIntents
+        ? result.revalidationIntents
+        : "revalidationIntent" in result && result.revalidationIntent
+          ? [result.revalidationIntent]
+          : [];
+    await this.flushRevalidationIntents(intents);
+  }
+
+  /**
+   * Flush an explicit set of revalidation intents collected by a caller-owned
+   * transaction (for example the `CollectionService` transaction wrappers, whose
+   * return values carry only the entry). Shares the automatic post-write path:
+   * a no-op when no cache adapter is registered, and self-absorbing on error so
+   * a revalidator fault never turns a committed write into a failure.
+   */
+  /**
+   * Run the write-path maintenance the automatic paths run, for the
+   * `CollectionService.withTransaction` wrapper to call after a tx-API write
+   * commits. The wrappers return only the entry, so — like
+   * `flushRevalidationIntents` — these cannot be triggered from the wrapper's own
+   * result. Mirrors `afterWriteIfRecorded`: a committed write offers the
+   * opportunistic retention pass (the write path is the only prune trigger for an
+   * install with no drain, so tx-API writes must offer it too, or `nextly_events`
+   * grows unbounded), and a recorded event schedules the fast drain. No-ops when
+   * the respective runner/scheduler is unwired.
+   */
+  async offerPostCommitTxMaintenance(opts: {
+    committedWrite: boolean;
+    recordedEvent: boolean;
+  }): Promise<void> {
+    if (opts.committedWrite) {
+      await this.offerRetentionPass();
+    }
+    if (opts.recordedEvent) {
+      this.fastDrainScheduler?.offer();
+    }
+  }
+
+  async flushRevalidationIntents(intents: RevalidationIntent[]): Promise<void> {
+    if (intents.length === 0) return;
+    // Resolve at flush time so a Next cache adapter registered after this
+    // service was constructed (at request time, well after boot) is honored.
+    const revalidator = this.resolveCacheRevalidator?.();
+    if (!revalidator) return;
+    try {
+      // Await so a Promise-returning revalidator finishes here; `revalidateTag`
+      // is synchronous, so this adds no latency for the common case.
+      await revalidator.flush(intents);
+    } catch (error) {
+      this.logger.error("Cache revalidation failed after a write", { error });
+    }
+  }
+
+  async createEntry(
+    params: {
+      collectionName: string;
+      /**
+       * Skip cache revalidation for this write (the outbox drain still runs).
+       * Set by callers that own their cache strategy — a CLI, seed, or
+       * bulk-import write — so it does not fan out a revalidation per row.
+       */
+      disableRevalidate?: boolean;
+      user?: UserContext;
+      /** Who performed the write, recorded on the outbox event. */
+      actor?: RequestActor;
+      overrideAccess?: boolean;
+      /**
+       * Which collections a trusted read may reach as relationships are expanded.
+       * Absent means every populated target inherits the caller's trust. Only ever
+       * narrows, and never admits a target's drafts.
+       */
+      trusted?: TrustBound;
+      /** Write locale (i18n M5) — translatable values stored for this language. */
+      locale?: string;
+      context?: Record<string, unknown>;
+      /** The HTTP request behind this operation, when one produced it. */
+      request?: Request;
+      /**
+       * The caller's authenticated scope. For a scoped API-key REST create the
+       * publish transition gate (create-as-published) judges the key's OWN grants.
+       */
+      authenticatedScope?: AuthenticatedScope;
+    },
+    body: Record<string, unknown>,
+    depth?: number
+  ) {
+    // Its hooks are told it moves the shared part by the mutation service,
+    // which every create reaches.
+    const result = await withRuleLanguage(
+      writeLanguagesFor(this.localization, params.locale),
+      () => this.mutationService.createEntry(params, body, depth)
+    );
+    await this.afterWriteIfRecorded(result, params.disableRevalidate);
+    return result;
+  }
+
+  /**
+   * Whether this user may update the entry, without performing the update.
+   *
+   * For callers that write something other than the document and still owe it
+   * the document's own update rules. See the mutation service for why this
+   * shares `updateEntry`'s evaluation rather than restating it.
+   */
+  async canUpdateEntry(params: {
+    collectionName: string;
+    entryId: string;
+    user?: UserContext;
+    routeAuthorized?: boolean;
+    /** API-key scope; judges the update gate on the key's own grant. */
+    authenticatedScope?: AuthenticatedScope;
+    /** The language the write acts in, which a rule's filter is matched in. */
+    locale?: string;
+  }): Promise<boolean> {
+    return this.mutationService.canUpdateEntry(params);
+  }
+
+  /**
+   * Whether this caller may make a write naming `nextStatus` of the entry: the
+   * lifecycle gate an update asks, only where it moves the row into or out of
+   * published, judged without writing. See the mutation service.
+   *
+   * @experimental
+   */
+  async canMoveEntryStatus(params: {
+    collectionName: string;
+    entryId: string;
+    nextStatus: string;
+    user?: UserContext;
+    authenticatedScope?: AuthenticatedScope;
+    locale?: string;
+  }): Promise<boolean> {
+    return this.mutationService.canMoveEntryStatus(params);
+  }
+
+  /**
+   * Whether this caller may delete the entry, judged by the delete's own gate
+   * in every language it holds, without deleting it or running a hook. See
+   * the mutation service.
+   *
+   * @experimental
+   */
+  async canDeleteEntry(params: {
+    collectionName: string;
+    entryId: string;
+    user?: UserContext;
+    /** API-key scope; judges the delete gate on the key's own grant. */
+    authenticatedScope?: AuthenticatedScope;
+  }): Promise<boolean> {
+    // In every language, as `deleteEntry` asks its gate.
+    return withRuleLanguage(everyLanguageOf(this.localization), () =>
+      this.mutationService.canDeleteEntry(params)
+    );
+  }
+
+  /**
+   * What a release's write of these entries, for its action, would be
+   * refused with by validation and field rules, judged without writing. See
+   * the mutation service.
+   */
+  async releasePublishIssues(params: {
+    collectionName: string;
+    entryIds: readonly string[];
+    user: UserContext;
+    action: "publish" | "unpublish";
+  }): Promise<Map<string, ValidationIssue[]>> {
+    return withRuleLanguage(everyLanguageOf(this.localization), () =>
+      this.mutationService.releasePublishIssues(params)
+    );
+  }
+
+  /**
+   * Which of these entries a write of the action by this caller would find
+   * inside its rule's filter, judged as a write to every language is. See the
+   * mutation service.
+   *
+   * @experimental
+   */
+  async entriesWithinWriteFilter(
+    params: Parameters<CollectionMutationService["entriesWithinWriteFilter"]>[0]
+  ): ReturnType<CollectionMutationService["entriesWithinWriteFilter"]> {
+    return withRuleLanguage(everyLanguageOf(this.localization), () =>
+      this.mutationService.entriesWithinWriteFilter(params)
+    );
+  }
+
+  /**
+   * Bring a language's pending change up to date with the shared values
+   * someone else published since it began. See the mutation service.
+   *
+   * @experimental
+   */
+  async takeLiveSharedValues(
+    params: Parameters<CollectionMutationService["takeLiveSharedValues"]>[0]
+  ): ReturnType<CollectionMutationService["takeLiveSharedValues"]> {
+    // A write to one language's change: its rules see that language, as a
+    // save of it does.
+    return withRuleLanguage(
+      writeLanguagesFor(this.localization, params.locale ?? undefined),
+      () => this.mutationService.takeLiveSharedValues(params)
+    );
+  }
+
+  /**
+   * Rewrite one field of an entry on its live copy and on every pending draft
+   * that holds it, without publishing. See the mutation service.
+   *
+   * @experimental
+   */
+  async rewriteField(
+    call: FieldRewriteCall
+  ): ReturnType<CollectionMutationService["rewriteField"]> {
+    // Judged as an update in the language it writes: a translated field's
+    // language, or every rule's default for a shared one.
+    const result = await withRuleLanguage(
+      writeLanguagesFor(this.localization, call.request.locale),
+      () => this.mutationService.rewriteField(call)
+    );
+    // The live copy changed, so its pages revalidate and its event is
+    // delivered, as an update of it does.
+    await this.afterWriteIfRecorded(result);
+    return result;
+  }
+
+  /**
+   * Each of these entries as a release would put it live, read as stored. See
+   * the mutation service.
+   */
+  async releaseGoingLiveDocuments(params: {
+    collectionName: string;
+    entryIds: readonly string[];
+  }): Promise<Map<string, Record<string, unknown>>> {
+    return this.mutationService.releaseGoingLiveDocuments(params);
+  }
+
+  /**
+   * Whether a release's document-wide write of this collection would meet a
+   * translation table without its per-language status. See the mutation
+   * service.
+   */
+  async releaseCompanionLacksStatus(params: {
+    collectionName: string;
+  }): Promise<boolean> {
+    return this.mutationService.releaseCompanionLacksStatus(params);
+  }
+
+  /**
+   * The languages whose unreleased work a release's document-wide write of
+   * these entries would be refused over.
+   */
+  async releaseHeldDraftLocales(params: {
+    collectionName: string;
+    entryIds: readonly string[];
+  }): Promise<Map<string, string[]>> {
+    return withRuleLanguage(everyLanguageOf(this.localization), () =>
+      this.mutationService.releaseHeldDraftLocales(params)
+    );
+  }
+
+  async updateEntry(
+    params: {
+      collectionName: string;
+      /**
+       * Skip cache revalidation for this write (the outbox drain still runs).
+       * Set by callers that own their cache strategy — a CLI, seed, or
+       * bulk-import write — so it does not fan out a revalidation per row.
+       */
+      disableRevalidate?: boolean;
+      entryId: string;
+      user?: UserContext;
+      /** Who performed the write, recorded on the outbox event. */
+      actor?: RequestActor;
+      overrideAccess?: boolean;
+      /**
+       * Which collections a trusted read may reach as relationships are expanded.
+       * Absent means every populated target inherits the caller's trust. Only ever
+       * narrows, and never admits a target's drafts.
+       */
+      trusted?: TrustBound;
+      /** Write locale (i18n M5) — translatable values updated for this language. */
+      locale?: string;
+      context?: Record<string, unknown>;
+      /** The HTTP request behind this operation, when one produced it. */
+      request?: Request;
+      /**
+       * Set when this write restores an earlier version, recorded on the
+       * version it captures.
+       */
+      sourceVersionNo?: number;
+      /**
+       * The fields this write restored, and the version each came from,
+       * recorded per field on the version it captures (see `restored-from`).
+       */
+      restoredFrom?: FieldSources;
+      /**
+       * Set when this write restores a version: held as the working draft, and
+       * refused where the document cannot hold one rather than written live.
+       */
+      requireHeldDraft?: boolean;
+      /**
+       * The caller's authenticated scope. For a scoped API-key REST write the
+       * publish/unpublish transition gate judges the key's OWN grants.
+       */
+      authenticatedScope?: AuthenticatedScope;
+    },
+    body: Record<string, unknown>,
+    depth?: number
+  ) {
+    // The body is read once, here: the value rules below, the write's gate and the write itself
+    // all judge this copy. Read again, a body whose values change between reads (a getter, a
+    // proxy) could be judged by the value rules as one save and gated and stored as another.
+    const sent = { ...body };
+    // A save that publishes is judged by the value rules a publish of chosen languages applies,
+    // with the save's own values counted in the language it writes: they go live with it.
+    if (sent.status === "published") {
+      const refusal = await this.valueRuleRefusal(
+        params,
+        params.locale === EVERY_LOCALE
+          ? "all"
+          : [params.locale ?? this.localization?.defaultLocale ?? ""],
+        params.locale === EVERY_LOCALE ? undefined : sent,
+        params.locale
+      );
+      if (refusal) return refusal;
+    }
+    const result = await withRuleLanguage(
+      writeLanguagesFor(this.localization, params.locale),
+      () => this.mutationService.updateEntry(params, sent, depth)
+    );
+    await this.afterWriteIfRecorded(result, params.disableRevalidate);
+    return result;
+  }
+
+  /**
+   * Publish every language of an entry at once. Refused first where a language going live
+   * breaks a value rule a publish of chosen languages applies, so the two ways of publishing
+   * every language agree.
+   */
+  async publishAllLocales(params: EveryLanguageLifecycleParams) {
+    const refusal = await this.valueRuleRefusal(params, "all");
+    if (refusal) return refusal;
+    return this.transitionEveryLanguage(params);
+  }
+
+  /** The transition of every language (or of `params.parts`), judged by its own rules alone. */
+  private async transitionEveryLanguage(params: EveryLanguageLifecycleParams) {
+    // Its hooks are told whether the transition moves the shared part.
+    const result = await withRuleLanguage(
+      everyLanguageOf(this.localization),
+      () =>
+        withWriteParts({ shared: movesShared(params.parts) }, () =>
+          this.mutationService.publishAllLocales(params)
+        )
+    );
+    await this.afterWriteIfRecorded(result, params.disableRevalidate);
+    return result;
+  }
+
+  /**
+   * Why the value rules refuse putting `locales` of an entry live, or null: read as a publish of
+   * chosen parts reads the entry, with `written`'s translated values laid over the one language
+   * written, since a save that publishes puts them live. Null too where the entry cannot be read:
+   * the write itself answers that.
+   */
+  private async valueRuleRefusal(
+    params: Pick<
+      EveryLanguageLifecycleParams,
+      | "collectionName"
+      | "entryId"
+      | "user"
+      | "overrideAccess"
+      | "authenticatedScope"
+    >,
+    locales: readonly string[] | "all",
+    written?: Readonly<Record<string, unknown>>,
+    /** The language the save writes, as it names it, which its field rules are asked in. */
+    writeLocale?: string
+  ): Promise<CollectionServiceResult | null> {
+    // Nothing to read where no value rule could refuse: most collections.
+    if (
+      !(await this.mutationService.valueRulesCanRefuse(params.collectionName))
+    ) {
+      return null;
+    }
+    // The publish rule is asked too: in each language written, or, for every language, in every
+    // language. A caller it refuses is answered by the write's own access refusal, never told
+    // what the entry holds.
+    const read = await this.mutationService.publishPartsReads(params, {
+      action: "publish",
+      // Each language's rule, in that language: every language for a publish of all of them.
+      locales,
+      shared: locales === "all",
+    });
+    if ("answer" in read) return null;
+    const { state } = read;
+    // The languages the value rules judge: each one written, or, for every language, each stored
+    // one not yet live. Where the caller may not publish one of them, the transition refuses it as
+    // access, and the value rules say nothing of what the entry holds there. A language refused
+    // that is not judged here is not one this publish puts live.
+    const judged =
+      locales === "all"
+        ? state.configured.filter(locale => {
+            const stored = state.languages.get(locale);
+            return stored !== undefined && !stored.live;
+          })
+        : locales;
+    if (
+      read.sharedRefusal !== null ||
+      judged.some(locale => read.languageRefusals.has(locale))
+    ) {
+      return null;
+    }
+    if (written === undefined || locales === "all") {
+      return publishValueRefusal(state, locales);
+    }
+    // Only what the save may write counts: a value its field rules refuse is not written, so it
+    // cannot stand in for one the language lacks.
+    // A deep copy: the field write rules delete denied values in place, nested ones too, and the
+    // save and its hooks must still be handed what was submitted.
+    const writable = structuredClone({ ...written });
+    if (params.overrideAccess !== true) {
+      // Asked in the language the save writes, as the save itself asks them, so a field rule
+      // that answers by language answers here as it will there.
+      await withRuleLanguage(
+        writeLanguagesFor(this.localization, writeLocale),
+        () =>
+          applyFieldWriteAccess({
+            kind: "collection",
+            slug: params.collectionName,
+            data: writable,
+            operation: "update",
+            user: params.user,
+            authenticatedScope: params.authenticatedScope,
+            overrideAccess: false,
+            id: params.entryId,
+          })
+      );
+    }
+    const languages = new Map(state.languages);
+    for (const locale of locales) {
+      const stored = languages.get(locale);
+      const own = Object.fromEntries(
+        state.fields
+          .filter(field => field.translatable && field.name in writable)
+          .map(field => [field.name, writable[field.name]])
+      );
+      languages.set(locale, {
+        live: stored?.live ?? false,
+        values: { ...stored?.values, ...own },
+      });
+    }
+    return publishValueRefusal({ ...state, languages }, locales);
+  }
+
+  /**
+   * What publishing every language of an entry would do, language by
+   * language, without doing it. Asked in every language, as the publish is,
+   * and writing nothing, so it owes none of a write's side effects.
+   */
+  previewPublishAllLocales(params: EveryLanguageLifecycleParams) {
+    return withRuleLanguage(everyLanguageOf(this.localization), () =>
+      this.mutationService.previewPublishAllLocales(params)
+    );
+  }
+
+  /**
+   * Publish or unpublish the parts of an entry the request chooses: some of its languages, or
+   * every one, and its shared part, or say what doing so would do.
+   *
+   * @experimental
+   */
+  publishParts(
+    params: EveryLanguageLifecycleParams,
+    request: PublishPartsRequest
+  ) {
+    return publishParts(params.entryId, request, {
+      reads: ask =>
+        withRuleLanguage(everyLanguageOf(this.localization), async () => {
+          const read = await this.mutationService.publishPartsReads(params, {
+            action: request.direction,
+            ...ask,
+          });
+          return "answer" in read ? read.answer : read;
+        }),
+      gate: publishGate(),
+      collection: params.collectionName,
+      caller: publishCallerOf(params),
+      ...(params.actor === undefined ? {} : { actor: params.actor }),
+      ...(params.withoutReview === undefined
+        ? {}
+        : { withoutReview: params.withoutReview }),
+      // The transition of every language, told which parts it moves.
+      move: (direction, parts, describe) => {
+        // The gate's early answer was asked above, with the rest of the request: the move asks
+        // only its verdict under the lock.
+        const scoped = {
+          ...params,
+          ...(parts === undefined ? {} : { parts }),
+          gateAskedEarly: true,
+        };
+        if (describe) return this.previewPublishAllLocales(scoped);
+        // The value rules were judged above, with the rest of the request.
+        return direction === "publish"
+          ? this.transitionEveryLanguage(scoped)
+          : this.unpublishAllLocales(scoped);
+      },
+    });
+  }
+
+  /**
+   * Take every language of an entry down at once.
+   *
+   * The counterpart publishing has had since i18n M7 and withdrawing never did.
+   * Same shape deliberately: a caller that can publish every language should not
+   * have to learn a different call to reverse it.
+   */
+  async unpublishAllLocales(params: EveryLanguageLifecycleParams) {
+    // Asked of the languages it takes down: every one, or the chosen ones where a request
+    // chooses some, as the request was judged before the transition.
+    const result = await withRuleLanguage(
+      params.parts === undefined
+        ? everyLanguageOf(this.localization)
+        : { locales: [...params.parts.locales] },
+      () =>
+        withWriteParts({ shared: movesShared(params.parts) }, () =>
+          this.mutationService.unpublishAllLocales(params)
+        )
+    );
+    await this.afterWriteIfRecorded(result, params.disableRevalidate);
+    return result;
+  }
+
+  async deleteEntry(params: {
+    collectionName: string;
+    /**
+     * Skip cache revalidation for this write (the outbox drain still runs).
+     * Set by callers that own their cache strategy — a CLI, seed, or
+     * bulk-import write — so it does not fan out a revalidation per row.
+     */
+    disableRevalidate?: boolean;
+    entryId: string;
+    user?: UserContext;
+    /** Who performed the delete, recorded on the outbox event. */
+    actor?: RequestActor;
+    overrideAccess?: boolean;
+    /**
+     * Which collections a trusted read may reach as relationships are expanded.
+     * Absent means every populated target inherits the caller's trust. Only ever
+     * narrows, and never admits a target's drafts.
+     */
+    trusted?: TrustBound;
+    routeAuthorized?: boolean;
+    context?: Record<string, unknown>;
+    /** The HTTP request behind this operation, when one produced it. */
+    request?: Request;
+    /** API-key scope; judges the delete gate on the key's own grant. */
+    authenticatedScope?: AuthenticatedScope;
+  }) {
+    // Its hooks are told it moves the shared part by the mutation service,
+    // which every delete reaches.
+    const result = await withRuleLanguage(
+      everyLanguageOf(this.localization),
+      () => this.mutationService.deleteEntry(params)
+    );
+    await this.afterWriteIfRecorded(result, params.disableRevalidate);
+    return result;
+  }
+
+  /**
+   * Resolve this collection's localized companion verdicts on the pooled connection.
+   *
+   * Call it BEFORE opening a transaction whose body uses the `*InTransaction` methods below.
+   * Those cannot do it themselves: resolving issues a query, a query against a missing relation
+   * aborts the whole transaction on PostgreSQL, and a pooled probe taken while a transaction is
+   * open waits for a connection that transaction will not release.
+   *
+   * Skipping it throws nothing. The write commits and its durable version snapshot and outbound
+   * event silently omit every localized component value.
+   */
+  async warmLocalizedReadiness(collectionName: string): Promise<void> {
+    return this.mutationService.warmLocalizedReadiness(collectionName);
+  }
+
+  /**
+   * Rebuild the record of which media items every entry of a collection uses,
+   * for `nextly media reindex-usage`. Returns how many entries it read.
+   */
+  async rebuildMediaUsage(collectionName: string): Promise<number> {
+    return this.mutationService.rebuildMediaUsage(collectionName);
+  }
+
+  /**
+   * Remove a document's pending working-draft sidecar under the same parent-row
+   * lock a draft save takes, so a discard cannot delete a draft that a
+   * concurrent save committed after the discard's checks. The discard handler
+   * has already authorized read and update on the document.
+   */
+  // Params are taken from the method being delegated to rather than restated,
+  // for the reason the note below records: a restated list forwards the whole
+  // object at runtime while the type denies the fields it omits, so a caller
+  // naming the language of the pending change it is discarding could not say so.
+  async discardWorkingDraft(
+    params: Parameters<CollectionMutationService["discardWorkingDraft"]>[0]
+  ): Promise<void> {
+    await this.discardWorkingDraftCounted(params);
+  }
+
+  /**
+   * {@link discardWorkingDraft}, answering how many drafts it removed, counted
+   * by the delete made under the document's lock. A separate method so the
+   * published `discardWorkingDraft` keeps its contract.
+   */
+  async discardWorkingDraftCounted(
+    params: Parameters<CollectionMutationService["discardWorkingDraft"]>[0]
+  ): Promise<number> {
+    // The draft is deleted under the language as named, so one the site no
+    // longer configures is told every language, not the default.
+    // The shared part's draft shows in every language, so discarding it is judged in each.
+    return withRuleLanguage(
+      params.shared === true
+        ? writeLanguagesFor(this.localization, EVERY_LOCALE)
+        : writeAsNamedLanguagesFor(
+            this.localization,
+            params.locale ?? undefined
+          ),
+      () => this.mutationService.discardWorkingDraft(params)
+    );
+  }
+
+  // Params are taken from the method being delegated to rather than restated here. Restating them
+  // had already dropped `overrideAccess`, `routeAuthorized` and `transitionAuth`: the object is
+  // forwarded whole, so those kept working at runtime while the type denied they existed, and a
+  // caller doing a trusted server write through this facade could not say so without a cast.
+  async createEntryInTransaction(
+    tx: TransactionContext,
+    params: Parameters<
+      CollectionMutationService["createEntryInTransaction"]
+    >[1],
+    body: Record<string, unknown>
+  ): Promise<CollectionServiceResult<unknown>> {
+    return withRuleLanguage(
+      writeLanguagesFor(this.localization, undefined),
+      () => this.mutationService.createEntryInTransaction(tx, params, body)
+    );
+  }
+
+  async updateEntryInTransaction(
+    tx: TransactionContext,
+    params: Parameters<
+      CollectionMutationService["updateEntryInTransaction"]
+    >[1],
+    body: Record<string, unknown>
+  ): Promise<CollectionServiceResult<unknown>> {
+    return withRuleLanguage(
+      writeLanguagesFor(this.localization, undefined),
+      () => this.mutationService.updateEntryInTransaction(tx, params, body)
+    );
+  }
+
+  async deleteEntryInTransaction(
+    tx: TransactionContext,
+    params: {
+      collectionName: string;
+      entryId: string;
+      user?: UserContext;
+      /**
+       * Trusted server work, which the gate lets through before any check.
+       * Declared for the reason the scope below is: a spread carrying it
+       * would otherwise be dropped silently.
+       */
+      overrideAccess?: boolean;
+      /**
+       * The caller's own grants when they arrived on an API key. Declared here
+       * or a spread carrying it is silently dropped: a spread into an object
+       * literal is exempt from excess-property checking, so the omission
+       * compiles clean and the gate never sees the scope.
+       */
+      authenticatedScope?: AuthenticatedScope;
+      /** Who performed the delete, recorded on the outbox event. */
+      actor?: RequestActor;
+      /** Arbitrary data passed to this operation's hooks via context. */
+      context?: Record<string, unknown>;
+      /** The HTTP request behind this operation, when one produced it. */
+      request?: Request;
+    }
+  ): Promise<CollectionServiceResult<{ deleted: boolean }>> {
+    return withRuleLanguage(everyLanguageOf(this.localization), () =>
+      this.mutationService.deleteEntryInTransaction(tx, params)
+    );
+  }
+
+  async duplicateEntry(params: {
+    collectionName: string;
+    /**
+     * Skip cache revalidation for this write (the outbox drain still runs).
+     * Set by callers that own their cache strategy — a CLI, seed, or
+     * bulk-import write — so it does not fan out a revalidation per row.
+     */
+    disableRevalidate?: boolean;
+    entryId: string;
+    user?: UserContext;
+    overrides?: Record<string, unknown>;
+    overrideAccess?: boolean;
+    /**
+     * Which collections a trusted read may reach as relationships are expanded.
+     * Absent means every populated target inherits the caller's trust. Only ever
+     * narrows, and never admits a target's drafts.
+     */
+    trusted?: TrustBound;
+    context?: Record<string, unknown>;
+    /** The HTTP request behind this operation, when one produced it. */
+    request?: Request;
+    /** Acting identity from the transport, forwarded to the recorded event. */
+    actor?: RequestActor;
+    /** API-key scope; judges the create-as-published on the key's own grant. */
+    authenticatedScope?: AuthenticatedScope;
+  }) {
+    // A duplicate writes the default language, copying what a read of the
+    // source shows there, which falls back to other languages where it has
+    // no value; so it is told the default and each language it falls back to.
+    const result = await withRuleLanguage(
+      readLanguagesFor(this.localization, undefined),
+      () => this.bulkService.duplicateEntry(params)
+    );
+    await this.afterWriteIfRecorded(result, params.disableRevalidate);
+    return result;
+  }
+
+  /**
+   * @experimental Create an entry that copies a stored one, reading the
+   * source as the caller first; see the bulk service's `createFromSource`.
+   * Server-only: no REST route reaches it.
+   */
+  async createEntryFromSource(
+    params: Parameters<CollectionBulkService["createFromSource"]>[0] & {
+      /** Skip cache revalidation for this write (the outbox drain still runs). */
+      disableRevalidate?: boolean;
+    }
+  ) {
+    // Judged in the languages a duplicate is: the copy writes `locale` and
+    // reads the source there, falling back as a read of it does.
+    const result = await withRuleLanguage(
+      readLanguagesFor(this.localization, params.locale),
+      () => this.bulkService.createFromSource(params)
+    );
+    await this.afterWriteIfRecorded(result, params.disableRevalidate);
+    return result;
+  }
+
+  /**
+   * @experimental {@link createEntryFromSource} on the caller's transaction:
+   * the source is read and the entry created on `tx`, so a dry run rolled
+   * back after it judges the copy exactly as the create itself.
+   */
+  async createEntryFromSourceInTransaction(
+    tx: TransactionContext,
+    params: Parameters<CollectionBulkService["createFromSource"]>[0]
+  ): Promise<CollectionServiceResult<unknown>> {
+    return withRuleLanguage(
+      readLanguagesFor(this.localization, params.locale),
+      () => this.bulkService.createFromSource(params, tx)
+    );
+  }
+
+  // Phase 4.5: bulk methods carry full records on update (caller needs
+  // the post-mutation values) and minimal {id} records on delete.
+  async bulkDeleteEntries(params: {
+    collectionName: string;
+    /**
+     * Skip cache revalidation for this write (the outbox drain still runs).
+     * Set by callers that own their cache strategy — a CLI, seed, or
+     * bulk-import write — so it does not fan out a revalidation per row.
+     */
+    disableRevalidate?: boolean;
+    ids: string[];
+    user?: UserContext;
+    /** Who performed the delete, recorded on each entry's outbox event. */
+    actor?: RequestActor;
+    overrideAccess?: boolean;
+    /**
+     * Which collections a trusted read may reach as relationships are expanded.
+     * Absent means every populated target inherits the caller's trust. Only ever
+     * narrows, and never admits a target's drafts.
+     */
+    trusted?: TrustBound;
+    routeAuthorized?: boolean;
+    context?: Record<string, unknown>;
+    /** The HTTP request behind this operation, when one produced it. */
+    request?: Request;
+    /** API-key scope; judges each per-id delete on the key's own grant. */
+    authenticatedScope?: AuthenticatedScope;
+  }): Promise<BulkOperationResult<{ id: string }>> {
+    const result = await withRuleLanguage(
+      everyLanguageOf(this.localization),
+      () => this.bulkService.bulkDeleteEntries(params)
+    );
+    await this.afterWriteIfRecorded(result, params.disableRevalidate);
+    return result;
+  }
+
+  async bulkUpdateEntries(params: {
+    collectionName: string;
+    /**
+     * Skip cache revalidation for this write (the outbox drain still runs).
+     * Set by callers that own their cache strategy — a CLI, seed, or
+     * bulk-import write — so it does not fan out a revalidation per row.
+     */
+    disableRevalidate?: boolean;
+    ids: string[];
+    data: Record<string, unknown>;
+    user?: UserContext;
+    overrideAccess?: boolean;
+    /**
+     * Which collections a trusted read may reach as relationships are expanded.
+     * Absent means every populated target inherits the caller's trust. Only ever
+     * narrows, and never admits a target's drafts.
+     */
+    trusted?: TrustBound;
+    routeAuthorized?: boolean;
+    context?: Record<string, unknown>;
+    /** The HTTP request behind this operation, when one produced it. */
+    request?: Request;
+    /** Acting identity from the transport, forwarded to the recorded event. */
+    actor?: RequestActor;
+    /** API-key scope; judges each per-id transition on the key's own grant. */
+    authenticatedScope?: AuthenticatedScope;
+    /**
+     * Each id's own version, judged per document; see the bulk service's
+     * `bulkUpdateEntries`.
+     */
+    revs?: unknown;
+  }): Promise<BulkOperationResult<Record<string, unknown>>> {
+    const result = await withRuleLanguage(
+      writeLanguagesFor(this.localization, undefined),
+      () => this.bulkService.bulkUpdateEntries(params)
+    );
+    await this.afterWriteIfRecorded(result, params.disableRevalidate);
+    return result;
+  }
+
+  async bulkUpdateByQuery(
+    params: {
+      collectionName: string;
+      /**
+       * Skip cache revalidation for this write (the outbox drain still runs).
+       * Set by callers that own their cache strategy — a CLI, seed, or
+       * bulk-import write — so it does not fan out a revalidation per row.
+       */
+      disableRevalidate?: boolean;
+      where: WhereFilter;
+      data: Record<string, unknown>;
+      user?: UserContext;
+      overrideAccess?: boolean;
+      /**
+       * Which collections a trusted read may reach as relationships are expanded.
+       * Absent means every populated target inherits the caller's trust. Only ever
+       * narrows, and never admits a target's drafts.
+       */
+      trusted?: TrustBound;
+      /** Route auth already ran; response is still redacted for this user */
+      routeAuthorized?: boolean;
+      context?: Record<string, unknown>;
+      /** The HTTP request behind this operation, when one produced it. */
+      request?: Request;
+      /** Acting identity from the transport, forwarded to the recorded event. */
+      actor?: RequestActor;
+      /** API-key scope; judges the collection gate + transitions on the key's own grant. */
+      authenticatedScope?: AuthenticatedScope;
+      /** Refused: an update by query names no ids to give versions for. */
+      revs?: unknown;
+    },
+    options?: BulkOperationOptions & { limit?: number }
+  ): Promise<BulkOperationResult<Record<string, unknown>>> {
+    // Thrown, as the bulk service throws any request-level refusal: there are
+    // no items yet to report a partial failure on.
+    assertWellFormedFilter(params.where, { allowTranslated: true });
+    // It writes the default language, so its rule judges that one, while
+    // its filter may choose the rows by any language's translation state, so
+    // it is told every language as well: the REST gate, which cannot see the
+    // filter in the body, tells the same.
+    const result = await withRuleLanguage(
+      queryWriteLanguagesFor(this.localization),
+      () => this.bulkService.bulkUpdateByQuery(params, options)
+    );
+    await this.afterWriteIfRecorded(result, params.disableRevalidate);
+    return result;
+  }
+
+  async bulkDeleteByQuery(
+    params: {
+      collectionName: string;
+      /**
+       * Skip cache revalidation for this write (the outbox drain still runs).
+       * Set by callers that own their cache strategy — a CLI, seed, or
+       * bulk-import write — so it does not fan out a revalidation per row.
+       */
+      disableRevalidate?: boolean;
+      where: WhereFilter;
+      user?: UserContext;
+      /** Who performed the delete, recorded on each entry's outbox event. */
+      actor?: RequestActor;
+      /** Caller's authenticated scope; a scoped key is judged on its own grant. */
+      authenticatedScope?: AuthenticatedScope;
+      routeAuthorized?: boolean;
+      overrideAccess?: boolean;
+      /**
+       * Which collections a trusted read may reach as relationships are expanded.
+       * Absent means every populated target inherits the caller's trust. Only ever
+       * narrows, and never admits a target's drafts.
+       */
+      trusted?: TrustBound;
+      context?: Record<string, unknown>;
+      /** The HTTP request behind this operation, when one produced it. */
+      request?: Request;
+    },
+    options?: { limit?: number }
+  ): Promise<BulkOperationResult<{ id: string }>> {
+    assertWellFormedFilter(params.where, { allowTranslated: true });
+    const result = await withRuleLanguage(
+      everyLanguageOf(this.localization),
+      () => this.bulkService.bulkDeleteByQuery(params, options)
+    );
+    await this.afterWriteIfRecorded(result, params.disableRevalidate);
+    return result;
+  }
+
+  async createEntries(
+    params: {
+      collectionName: string;
+      /**
+       * Skip cache revalidation for this write (the outbox drain still runs).
+       * Set by callers that own their cache strategy — a CLI, seed, or
+       * bulk-import write — so it does not fan out a revalidation per row.
+       */
+      disableRevalidate?: boolean;
+      user?: UserContext;
+      overrideAccess?: boolean;
+      /** Arbitrary data passed to hooks via context */
+      context?: Record<string, unknown>;
+      /** The HTTP request behind this operation, when one produced it. */
+      request?: Request;
+      /**
+       * Which collections a trusted read may reach as relationships are expanded.
+       * Absent means every populated target inherits the caller's trust. Only ever
+       * narrows, and never admits a target's drafts.
+       */
+      trusted?: TrustBound;
+      authenticatedScope?: AuthenticatedScope;
+    },
+    entries: Record<string, unknown>[],
+    options?: BulkOperationOptions
+  ): Promise<BatchOperationResult> {
+    const result = await withRuleLanguage(
+      writeLanguagesFor(this.localization, undefined),
+      () => this.bulkService.createEntries(params, entries, options)
+    );
+    await this.afterWriteIfRecorded(result, params.disableRevalidate);
+    return result;
+  }
+
+  async createEntriesInTransaction(
+    tx: TransactionContext,
+    params: {
+      collectionName: string;
+      user?: UserContext;
+      authenticatedScope?: AuthenticatedScope;
+    },
+    entries: Record<string, unknown>[],
+    options?: BulkOperationOptions
+  ): Promise<BatchOperationResult> {
+    return withRuleLanguage(
+      writeLanguagesFor(this.localization, undefined),
+      () =>
+        this.bulkService.createEntriesInTransaction(
+          tx,
+          params,
+          entries,
+          options
+        )
+    );
+  }
+
+  async updateEntries(
+    params: {
+      collectionName: string;
+      /**
+       * Skip cache revalidation for this write (the outbox drain still runs).
+       * Set by callers that own their cache strategy — a CLI, seed, or
+       * bulk-import write — so it does not fan out a revalidation per row.
+       */
+      disableRevalidate?: boolean;
+      user?: UserContext;
+      overrideAccess?: boolean;
+      authenticatedScope?: AuthenticatedScope;
+    },
+    entries: BulkUpdateEntry[],
+    options?: BulkOperationOptions
+  ): Promise<BatchOperationResult> {
+    const result = await withRuleLanguage(
+      writeLanguagesFor(this.localization, undefined),
+      () => this.bulkService.updateEntries(params, entries, options)
+    );
+    await this.afterWriteIfRecorded(result, params.disableRevalidate);
+    return result;
+  }
+
+  async updateEntriesInTransaction(
+    tx: TransactionContext,
+    params: {
+      collectionName: string;
+      user?: UserContext;
+      authenticatedScope?: AuthenticatedScope;
+    },
+    entries: BulkUpdateEntry[],
+    options?: BulkOperationOptions
+  ): Promise<BatchOperationResult> {
+    return withRuleLanguage(
+      writeLanguagesFor(this.localization, undefined),
+      () =>
+        this.bulkService.updateEntriesInTransaction(
+          tx,
+          params,
+          entries,
+          options
+        )
+    );
+  }
+
+  async deleteEntries(
+    params: {
+      collectionName: string;
+      /**
+       * Skip cache revalidation for this write (the outbox drain still runs).
+       * Set by callers that own their cache strategy — a CLI, seed, or
+       * bulk-import write — so it does not fan out a revalidation per row.
+       */
+      disableRevalidate?: boolean;
+      user?: UserContext;
+      /** Who performed the delete, recorded on each entry's outbox event. */
+      actor?: RequestActor;
+    },
+    ids: string[],
+    options?: BulkOperationOptions
+  ): Promise<BatchOperationResult> {
+    const result = await withRuleLanguage(
+      everyLanguageOf(this.localization),
+      () => this.bulkService.deleteEntries(params, ids, options)
+    );
+    await this.afterWriteIfRecorded(result, params.disableRevalidate);
+    return result;
+  }
+
+  async deleteEntriesInTransaction(
+    tx: TransactionContext,
+    params: {
+      collectionName: string;
+      user?: UserContext;
+      /** Who performed the delete, recorded on each entry's outbox event. */
+      actor?: RequestActor;
+    },
+    ids: string[],
+    options?: BulkOperationOptions
+  ): Promise<BatchOperationResult> {
+    return withRuleLanguage(everyLanguageOf(this.localization), () =>
+      this.bulkService.deleteEntriesInTransaction(tx, params, ids, options)
+    );
+  }
+}

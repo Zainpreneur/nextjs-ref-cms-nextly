@@ -1,0 +1,1139 @@
+/**
+ * A migration's SQL text as the statements the runner executes, one per
+ * driver call, and the check that decides whether they may run inside the
+ * runner's transaction at all.
+ *
+ * Splitting is pure: it reads the text through the shared scanner
+ * (`sql-scan.ts`) — the one the drop guard reads through — and never refuses.
+ * What may not run is a separate question (`statementRefusals`), asked by
+ * every path before it executes anything and by none that only previews.
+ *
+ * @module domains/schema/migrate/split-sql
+ */
+import type { SupportedDialect } from "../../../database/schema-registry";
+import { NextlyError } from "../../../errors/nextly-error";
+
+import { scanSql } from "./sql-scan";
+
+/** The marker drizzle-kit writes between the statements of a generated file. */
+const BREAKPOINT = "--> statement-breakpoint";
+
+/**
+ * The first line that marks a migration file to run outside a transaction,
+ * statement by statement, so it can hold a statement a transaction refuses,
+ * such as PostgreSQL's `CREATE INDEX CONCURRENTLY`.
+ */
+export const NO_TRANSACTION_MARKER = "-- nextly:no-transaction";
+
+/**
+ * Whether a migration file's text is marked to run outside a transaction:
+ * its first line, past a byte-order mark and trailing whitespace, is
+ * `NO_TRANSACTION_MARKER`. Only the first line counts, so the marker is a
+ * decision about the whole file, made where a reader sees it first.
+ */
+export function marksNoTransaction(content: string): boolean {
+  const firstLine = content.replace(/^\uFEFF/, "").split("\n", 1)[0] ?? "";
+  return firstLine.trimEnd() === NO_TRANSACTION_MARKER;
+}
+
+/**
+ * How a migration unit runs, as far as the refusals need to know: inside the
+ * runner's transaction or outside one, and whether it is a migration file or
+ * a plugin's module, which are marked to run outside one differently.
+ */
+export interface MigrationRunMode {
+  transaction: boolean;
+  unit: "file" | "module";
+}
+
+/** An unmarked migration file: the mode every unit has unless marked. */
+const IN_TRANSACTION_FILE: MigrationRunMode = {
+  transaction: true,
+  unit: "file",
+};
+
+/** How the author marks a unit of this kind to run outside a transaction. */
+function markAdvice(unit: MigrationRunMode["unit"]): string {
+  return unit === "module"
+    ? "set `transaction: false` on the module"
+    : `make \`${NO_TRANSACTION_MARKER}\` the file's first line`;
+}
+
+/**
+ * drizzle-kit's breakpoint markers and whole-line comments removed, leaving
+ * every string, quoted name, block comment and dollar-quoted body as written.
+ *
+ * Two marker shapes: standalone on its own line, and inline after a `;`
+ * (`CREATE INDEX ...;--> statement-breakpoint`). The marker is removed and
+ * whatever follows it on the line is kept as SQL. A marker counts only where
+ * the scanner reads code or the start of a line comment — MySQL does not read
+ * `-->` as a comment, so it has to be found in code as well — and never
+ * inside a quoted segment, where the text is data, a block comment, where a
+ * line beginning `--` can hold the `*\/` that closes it, or the rest of an
+ * earlier line comment.
+ */
+function withoutMarkers(sql: string, dialect?: SupportedDialect): string {
+  const commentStarts = new Set<number>();
+  // Characters no marker or comment line can start at.
+  const opaque: boolean[] = new Array<boolean>(sql.length).fill(false);
+  for (const segment of scanSql(sql, dialect)) {
+    if (segment.kind === "code") continue;
+    opaque.fill(true, segment.start, segment.end);
+    if (segment.kind === "line-comment") {
+      commentStarts.add(segment.start);
+      opaque[segment.start] = false;
+    }
+  }
+  const markerAt = (at: number) =>
+    !opaque[at] && sql.startsWith(BREAKPOINT, at);
+
+  let lineStart = 0;
+  return sql
+    .split("\n")
+    .map(line => {
+      const entry = { line, start: lineStart };
+      lineStart += line.length + 1;
+      return entry;
+    })
+    .filter(({ line, start }) => {
+      const first = line.search(/\S/);
+      if (first === -1) return true;
+      const at = start + first;
+      if (markerAt(at)) return false;
+      // Only a line that begins a line comment is a comment line; one that
+      // begins inside a quoted segment or a block comment continues it.
+      if (!commentStarts.has(at)) return true;
+      // Pure comment lines go, unless they mention DDL a reader may want kept.
+      const trimmed = line.trim();
+      return (
+        trimmed.includes("CREATE") ||
+        trimmed.includes("ALTER") ||
+        trimmed.includes("DROP") ||
+        trimmed.includes("INSERT")
+      );
+    })
+    .map(({ line, start }) => {
+      let out = "";
+      for (let i = 0; i < line.length; i++) {
+        if (markerAt(start + i)) {
+          i += BREAKPOINT.length - 1;
+          continue;
+        }
+        out += line[i];
+      }
+      return out;
+    })
+    .join("\n");
+}
+
+/**
+ * Whether a split fragment holds anything to execute: text outside its
+ * comments. Every such fragment is a statement, whatever its first keyword —
+ * `CALL`, `SET`, `COMMENT ON`, `DO` — so a migration's statement is never
+ * dropped for not being one the splitter recognises. A fragment of comments
+ * alone, the tail after a file's last semicolon, is not. On MySQL an
+ * executable comment (`/*! ... *\/`) is text MySQL runs, so it counts.
+ */
+export function hasExecutableText(
+  statement: string,
+  dialect: SupportedDialect | undefined
+): boolean {
+  return scanSql(statement, dialect).some(segment => {
+    if (segment.kind === "line-comment") return false;
+    if (segment.kind === "block-comment") return segment.executable;
+    if (segment.kind !== "code") return true;
+    return /\S/.test(statement.slice(segment.start, segment.end));
+  });
+}
+
+/**
+ * The statement's leading keywords, upper-cased, as the server reads them:
+ * comments skipped, and on MySQL an executable comment's body read as the
+ * code it is. Reading stops at the first quoted segment.
+ */
+export function leadingWords(
+  statement: string,
+  dialect: SupportedDialect | undefined,
+  count: number
+): string[] {
+  const words: string[] = [];
+  for (const token of serverTokens(statement, dialect)) {
+    if (typeof token !== "string") break;
+    words.push(token);
+    if (words.length === count) break;
+  }
+  return words;
+}
+
+/**
+ * A string, a quoted name or a PostgreSQL dollar-quoted body among a
+ * statement's tokens: one unit, never a keyword. `kind` says which. `name`
+ * is a quoted name's text, upper-cased; a string or a body has none.
+ */
+export interface QuotedToken {
+  kind: "string" | "body" | "name";
+  name: string | undefined;
+  /**
+   * A string's value, only when the scan reads it exactly (`SqlSegment`'s
+   * `text`); undefined for an inexact string, and absent on a name or body.
+   */
+  text?: string;
+  /**
+   * PostgreSQL's `U&"..."`, whose escapes the scan does not decode: `name` is
+   * then the text as written, not the name the server reads.
+   */
+  escaped?: boolean;
+  /**
+   * A quoted name's content as written, its case kept: `name` is folded to
+   * upper case for comparing, which PostgreSQL's quoted names do not do.
+   */
+  written?: string;
+}
+
+/**
+ * A statement's tokens as the server reads them (`serverTokens`), as a list,
+ * for a reader that needs to look ahead or back. The one tokenizer: a reader
+ * of a statement's shape reads through this rather than a second one.
+ */
+export function statementTokens(
+  statement: string,
+  dialect: SupportedDialect | undefined
+): Array<string | QuotedToken> {
+  return [...serverTokens(statement, dialect)];
+}
+
+/**
+ * The tokens of a statement as the server reads them, in order: each word,
+ * upper-cased with any `@`/`@@` prefix and `.` qualifiers it carries, each
+ * other non-space character on its own, and each quoted segment as one
+ * `QuotedToken`. Comments are skipped, and on MySQL an executable comment's
+ * body (`/*!40014 SET ... *\/`, version number left out) is read as the
+ * code it is, its own strings and quoted names included. MySQL does not nest
+ * comments, so a body is read one level deep and no further.
+ */
+function* serverTokens(
+  text: string,
+  dialect: SupportedDialect | undefined,
+  readExecutable = true
+): Generator<string | QuotedToken> {
+  for (const segment of scanSql(text, dialect)) {
+    switch (segment.kind) {
+      case "code":
+        yield* wordTokens(text.slice(segment.start, segment.end));
+        break;
+      case "line-comment":
+        break;
+      case "block-comment":
+        if (segment.executable && readExecutable) {
+          const body = executableBody(text.slice(segment.start, segment.end));
+          yield* serverTokens(body, dialect, false);
+        }
+        break;
+      case "quoted-name":
+        // A name cut off before its closing quote names nothing the server
+        // reads, so it is no name at all and every reader fails closed on it.
+        yield {
+          kind: "name",
+          name: segment.unterminated
+            ? undefined
+            : segment.content.toUpperCase(),
+          ...(segment.unterminated ? {} : { written: segment.content }),
+          ...(segment.unicodeEscaped ? { escaped: true } : {}),
+        };
+        break;
+      case "string":
+        yield { kind: "string", name: undefined, text: segment.text };
+        break;
+      default:
+        yield { kind: "body", name: undefined };
+    }
+  }
+}
+
+/**
+ * The tokens of a stretch of code: each word, upper-cased with any `@`/`@@`
+ * prefix and `.` qualifiers it carries, and each other non-space character.
+ */
+function wordTokens(code: string): string[] {
+  return (code.match(/@{0,2}[A-Za-z_][\w$.]*|\S/g) ?? []).map(token =>
+    token.toUpperCase()
+  );
+}
+
+/** A MySQL executable comment's body: its `/*!NNNNN` opener and `*\/` dropped. */
+function executableBody(comment: string): string {
+  return comment.replace(/^\/\*M?!\d*/i, "").replace(/\*\/$/, "");
+}
+
+/**
+ * What a statement does to the runner's transaction.
+ *
+ * - `bracket`: it opens or closes one — `BEGIN` (with any modifiers:
+ *   SQLite's `DEFERRED`/`IMMEDIATE`/`EXCLUSIVE`, PostgreSQL's isolation and
+ *   access modes, `WORK`/`TRANSACTION`), `START TRANSACTION` (with any
+ *   characteristics), `COMMIT`, `END`. A unit that runs inside the runner's
+ *   own transaction has a pair wrapping it whole left out, and any other
+ *   bracket refused (`splitSqlStatements`): a COMMIT would end the runner's
+ *   transaction early, and a BEGIN inside it fails on SQLite.
+ * - `refused`: it would undo or hand off the runner's transaction —
+ *   `ROLLBACK`/`ABORT`, `COMMIT PREPARED`, `PREPARE TRANSACTION`, MySQL's
+ *   `XA`. Leaving it out would change what the file does, and running it
+ *   would roll back work the runner then records.
+ * - `savepoint`: `SAVEPOINT`, `RELEASE [SAVEPOINT]` and
+ *   `ROLLBACK [WORK | TRANSACTION] TO [SAVEPOINT]`. They work inside the
+ *   runner's transaction and undo at most part of the unit, so there they
+ *   run as written.
+ *
+ * Read from the statement's leading keywords only. A `BEGIN` or `END` inside
+ * a PostgreSQL `DO` or function body is inside a dollar-quoted segment and
+ * never leads a statement; PL/pgSQL's `END IF`/`END LOOP` live only there.
+ */
+export function transactionControlOf(
+  statement: string,
+  dialect?: SupportedDialect
+): TransactionControl | null {
+  const [first, second, third] = leadingWords(statement, dialect, 3);
+  const control = TRANSACTION_CONTROL.get(first ?? "");
+  return control === undefined ? null : control(second, third);
+}
+
+/** What a statement does to the runner's transaction (`transactionControlOf`). */
+type TransactionControl = "bracket" | "refused" | "savepoint";
+
+/** Reads a statement's transaction control from its second and third words. */
+type ControlReader = (
+  second: string | undefined,
+  third: string | undefined
+) => TransactionControl | null;
+
+/**
+ * A statement's transaction control by its first keyword, read from the
+ * words after it. A first keyword missing here controls no transaction.
+ */
+const TRANSACTION_CONTROL: ReadonlyMap<string, ControlReader> = new Map<
+  string,
+  ControlReader
+>([
+  ["BEGIN", () => "bracket"],
+  ["END", () => "bracket"],
+  ["START", second => (second === "TRANSACTION" ? "bracket" : null)],
+  ["COMMIT", second => (second === "PREPARED" ? "refused" : "bracket")],
+  ["ROLLBACK", rollbackControl],
+  ["SAVEPOINT", () => "savepoint"],
+  ["RELEASE", () => "savepoint"],
+  ["ABORT", () => "refused"],
+  ["XA", () => "refused"],
+  ["PREPARE", second => (second === "TRANSACTION" ? "refused" : null)],
+]);
+
+/**
+ * `ROLLBACK [WORK | TRANSACTION] TO` returns to a savepoint the file set,
+ * inside the runner's transaction; a bare ROLLBACK, with or without the
+ * optional word, ends that transaction.
+ */
+function rollbackControl(
+  second: string | undefined,
+  third: string | undefined
+): TransactionControl {
+  const next = second === "WORK" || second === "TRANSACTION" ? third : second;
+  return next === "TO" ? "savepoint" : "refused";
+}
+
+/**
+ * The session setting a statement changes that outlives the transaction,
+ * or undefined when it changes none.
+ *
+ * The runner executes on a pooled connection that goes back to the pool —
+ * at boot, the application's own pool — so a session setting a migration
+ * makes stays on that connection for whatever it serves next:
+ * `SET FOREIGN_KEY_CHECKS = 0` leaves foreign keys unchecked for unrelated
+ * requests. Transaction-scoped forms are not session settings: PostgreSQL's
+ * `SET LOCAL`, `SET CONSTRAINTS` and `SET TRANSACTION`, which a unit run
+ * outside a transaction may not hold (`needsTransactionReason`), and a MySQL
+ * SET of user variables only (`SET @x = ...`), which only code that reads
+ * them sees; a system variable anywhere in a SET's list is a session
+ * setting (`mysqlSessionSetting`). MySQL's
+ * `SET TRANSACTION` configures the connection's NEXT transaction, so it is
+ * refused with the rest.
+ *
+ * SQLite runs on the process's one connection, and its `PRAGMA`s are not
+ * judged here. The one that matters, `foreign_keys`, cannot change inside a
+ * transaction, so a unit that runs in one cannot change it; a unit that runs
+ * outside one may not write it (`foreignKeyPragmaOf`), because the runner
+ * switches enforcement off around that unit and restores it afterwards.
+ */
+function sessionSettingOf(
+  statement: string,
+  dialect: SupportedDialect | undefined
+): string | undefined {
+  if (dialect === "mysql") return mysqlSessionSetting(statement);
+  if (dialect !== "postgresql") return undefined;
+  const [first, second, third] = leadingWords(statement, dialect, 3);
+  return postgresSessionSetting(first, second, third);
+}
+
+/**
+ * PostgreSQL's `SET` and `SET SESSION`, and `RESET` and `DISCARD`, which
+ * the setting reads as their own keyword. Not the transaction-scoped forms.
+ */
+function postgresSessionSetting(
+  first: string | undefined,
+  second: string | undefined,
+  third: string | undefined
+): string | undefined {
+  if (first === "RESET" || first === "DISCARD") return first;
+  if (first !== "SET" || TRANSACTION_SCOPED_SETS.has(second ?? "")) {
+    return undefined;
+  }
+  // The setting named past the SESSION scope word: what the refusal tells
+  // the operator they changed.
+  return (second === "SESSION" ? third : second) ?? first;
+}
+
+/**
+ * MySQL's `SET` of anything but user variables: the first system variable
+ * among its targets, or undefined when every target is a user variable.
+ *
+ * SET takes a list — `SET @x = 1, FOREIGN_KEY_CHECKS = 0` — so every target
+ * in it is read, not only the first: mysqldump's header
+ * `SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0`
+ * saves the setting in a user variable and then switches it off. A target is
+ * a user variable when it starts with a single `@` (`@x`, `@'x'`, `` @`x` ``);
+ * anything else — a bare or quoted name, `@@x`, a scope word or `@@scope.`
+ * prefix, `NAMES`, `CHARACTER SET` — changes the session.
+ */
+function mysqlSessionSetting(statement: string): string | undefined {
+  const tokens = serverTokens(statement, "mysql");
+  if (tokens.next().value !== "SET") return undefined;
+  for (const [target, next] of setTargets(tokens)) {
+    const userVariable =
+      typeof target === "string" &&
+      target.startsWith("@") &&
+      !target.startsWith("@@");
+    if (!userVariable) return mysqlSettingName(target, next);
+  }
+  return undefined;
+}
+
+/**
+ * The first two tokens of each assignment in a SET's list, read from the
+ * tokens after SET. Assignments are separated by the commas outside any
+ * parenthesis; a comma inside a string is part of a quoted token already.
+ */
+function* setTargets(
+  tokens: Iterable<string | QuotedToken>
+): Generator<(string | QuotedToken)[]> {
+  let depth = 0;
+  let target: (string | QuotedToken)[] = [];
+  for (const token of tokens) {
+    if (token === "," && depth === 0) {
+      yield target;
+      target = [];
+      continue;
+    }
+    if (token === "(") depth += 1;
+    else if (token === ")") depth = Math.max(0, depth - 1);
+    if (target.length < 2) target.push(token);
+  }
+  yield target;
+}
+
+/** The scope words MySQL's SET takes before a system variable. */
+const MYSQL_SCOPES = new Set([
+  "SESSION",
+  "GLOBAL",
+  "LOCAL",
+  "PERSIST",
+  "PERSIST_ONLY",
+]);
+
+/** A system variable's `@@` prefix, with the scope it may name. */
+const MYSQL_SCOPE_PREFIX =
+  /^@@(?:(?:SESSION|GLOBAL|LOCAL|PERSIST|PERSIST_ONLY)\.)?/;
+
+/**
+ * The system variable a MySQL SET target names, past a scope word or an
+ * `@@scope.` prefix: what the refusal tells the operator they changed.
+ * SET is named when the target names nothing readable.
+ */
+function mysqlSettingName(
+  target: string | QuotedToken | undefined,
+  next: string | QuotedToken | undefined
+): string {
+  const named =
+    typeof target === "string" && MYSQL_SCOPES.has(target) ? next : target;
+  const name =
+    typeof named === "string"
+      ? named.replace(MYSQL_SCOPE_PREFIX, "")
+      : named?.name;
+  return name === undefined || name === "" ? "SET" : name;
+}
+
+/**
+ * The words after PostgreSQL's SET that make it last only until the
+ * transaction ends: `SET LOCAL`, `SET CONSTRAINTS`, `SET TRANSACTION`.
+ */
+const TRANSACTION_SCOPED_SETS = new Set([
+  "LOCAL",
+  "CONSTRAINTS",
+  "TRANSACTION",
+]);
+
+/**
+ * Why a statement needs the transaction that a unit run outside one does
+ * not have, or undefined when it needs none.
+ *
+ * - The unit's own `BEGIN`, `START TRANSACTION`, `COMMIT` and `END`: in a
+ *   unit run outside a transaction each statement commits as it runs, so a
+ *   COMMIT has nothing to end, and a BEGIN would open a transaction that
+ *   holds every later statement and that the runner never ends.
+ * - Savepoints: PostgreSQL refuses one outside a transaction block, SQLite
+ *   opens a transaction for one that the runner never ends, and MySQL, with
+ *   each statement committed as it runs, keeps nothing to return to.
+ * - PostgreSQL's `SET LOCAL`, `SET CONSTRAINTS` and `SET TRANSACTION`: each
+ *   lasts until the transaction ends, and outside one PostgreSQL warns and
+ *   ignores it, so the statements after it run without the setting the
+ *   author wrote it for.
+ */
+function needsTransactionReason(
+  statement: string,
+  dialect: SupportedDialect | undefined
+): string | undefined {
+  const control = transactionControlOf(statement, dialect);
+  if (control === "bracket") {
+    return "opens or ends a transaction, and each statement of a unit run outside one commits as it runs.";
+  }
+  if (control === "savepoint") {
+    return "marks or returns to a savepoint, which exists only inside a transaction.";
+  }
+  if (dialect !== "postgresql") return undefined;
+  const [first, second] = leadingWords(statement, dialect, 2);
+  return first === "SET" && TRANSACTION_SCOPED_SETS.has(second ?? "")
+    ? "lasts only until the transaction ends, and outside one PostgreSQL ignores it."
+    : undefined;
+}
+
+/** How the author moves a statement into a unit that runs in a transaction. */
+function inTransactionAdvice(unit: MigrationRunMode["unit"]): string {
+  return unit === "module"
+    ? "move it to a module without `transaction: false`, which runs in one"
+    : `move it to a file without \`${NO_TRANSACTION_MARKER}\` as its first line, which runs in one`;
+}
+
+/**
+ * The SQLite foreign-key pragma a statement writes, or undefined when it
+ * writes none: `PRAGMA [schema.]foreign_keys = ...` or
+ * `PRAGMA [schema.]defer_foreign_keys = ...`, either spelling of the
+ * assignment. Reading one (`PRAGMA foreign_keys`) changes nothing.
+ */
+function foreignKeyPragmaOf(
+  statement: string,
+  dialect: SupportedDialect | undefined
+): string | undefined {
+  if (dialect !== "sqlite") return undefined;
+  const [first, name, assignment] = leadingWords(statement, dialect, 3);
+  if (first !== "PRAGMA" || (assignment !== "=" && assignment !== "(")) {
+    return undefined;
+  }
+  const pragma = name?.slice(name.lastIndexOf(".") + 1);
+  return pragma === "FOREIGN_KEYS" || pragma === "DEFER_FOREIGN_KEYS"
+    ? pragma.toLowerCase()
+    : undefined;
+}
+
+/** A statement as a refusal quotes it: its first line, bounded. */
+function quoted(statement: string): string {
+  const line = statement.split("\n")[0] ?? statement;
+  return `"${line.length > 120 ? `${line.slice(0, 117)}...` : line}"`;
+}
+
+/**
+ * Why a session-setting statement is refused, and what to write instead.
+ * Foreign-key checks get their own advice: switching them off is the usual
+ * reason to reach for the setting, and there is a way to do without it.
+ */
+function sessionSettingMessage(
+  statement: string,
+  setting: string,
+  dialect: SupportedDialect | undefined,
+  mode: MigrationRunMode
+): string {
+  const lingers = `${quoted(statement)} changes a session setting (${setting}) that would stay on the pooled connection after the migration, and apply to whatever that connection serves next.`;
+  if (dialect === "mysql" && setting === "FOREIGN_KEY_CHECKS") {
+    return `${lingers} Order the statements instead — create a table before the tables that reference it, and drop it after them — or drop the foreign key and add it back within the migration.`;
+  }
+  if (dialect === "postgresql") {
+    return setting === "RESET" || setting === "DISCARD"
+      ? `${quoted(statement)} resets session state on a pooled connection the application shares. Remove it.`
+      : mode.transaction
+        ? `${lingers} Use SET LOCAL ${setting.toLowerCase()} ..., which ends with the migration's transaction.`
+        : // Outside a transaction SET LOCAL has nothing to end with, and
+          // does nothing.
+          `${lingers} A ${mode.unit} that runs outside a transaction has none for SET LOCAL to end with: move the statements that need the setting to one that runs in a transaction, and use SET LOCAL there.`;
+  }
+  return `${lingers} Remove it, or keep the value in a user variable (SET @name = ...), which only statements that read it see.`;
+}
+
+/** One statement a migration may not run, and why. */
+export interface StatementRefusal {
+  statement: string;
+  code:
+    | "TRANSACTION_CONTROL_IN_MIGRATION"
+    | "NEEDS_TRANSACTION_IN_MIGRATION"
+    | "SESSION_SETTING_IN_MIGRATION"
+    | "NOT_TRANSACTIONAL_IN_MIGRATION";
+  message: string;
+}
+
+/**
+ * The statements in a split migration that the runner refuses to execute.
+ * Pure, so a preview can report them; `assertRunnableStatements` is the
+ * refusal every executing path makes before its first statement runs.
+ */
+export function statementRefusals(
+  statements: readonly string[],
+  dialect: SupportedDialect | undefined,
+  mode: MigrationRunMode = IN_TRANSACTION_FILE
+): StatementRefusal[] {
+  return statements.flatMap(statement => {
+    const refusal = refusalOf(statement, dialect, mode);
+    return refusal === undefined ? [] : [refusal];
+  });
+}
+
+/**
+ * What only a unit run outside a transaction is refused: a statement that
+ * needs the transaction it does not have, and on SQLite a write to the
+ * foreign-key setting the runner holds for it.
+ */
+function outsideTransactionRefusal(
+  statement: string,
+  dialect: SupportedDialect | undefined,
+  unit: MigrationRunMode["unit"]
+): StatementRefusal | undefined {
+  const needs = needsTransactionReason(statement, dialect);
+  if (needs !== undefined) {
+    return {
+      statement,
+      code: "NEEDS_TRANSACTION_IN_MIGRATION",
+      message: `${quoted(statement)} ${needs} It needs a transaction, and this ${unit} runs outside one: ${inTransactionAdvice(unit)}.`,
+    };
+  }
+  const pragma = foreignKeyPragmaOf(statement, dialect);
+  return pragma === undefined
+    ? undefined
+    : {
+        statement,
+        code: "SESSION_SETTING_IN_MIGRATION",
+        message: `${quoted(statement)} changes ${pragma}, which the runner sets for a ${unit} that runs outside a transaction: it switches foreign-key enforcement off before the first statement, checks every reference after the last, and restores the setting afterwards. Remove it.`,
+      };
+}
+
+/** Why the runner refuses one statement in a unit run as `mode` says. */
+function refusalOf(
+  statement: string,
+  dialect: SupportedDialect | undefined,
+  mode: MigrationRunMode
+): StatementRefusal | undefined {
+  const control = transactionControlOf(statement, dialect);
+  if (control === "refused") {
+    return {
+      statement,
+      code: "TRANSACTION_CONTROL_IN_MIGRATION",
+      message: transactionControlMessage(statement, dialect, mode),
+    };
+  }
+  // A bracket left after the split removed a wrapper (`splitSqlStatements`):
+  // it would commit part of the unit, or open a transaction inside the
+  // runner's. A unit run outside a transaction refuses it below, with the
+  // other statements that need one.
+  if (control === "bracket" && mode.transaction) {
+    return {
+      statement,
+      code: "TRANSACTION_CONTROL_IN_MIGRATION",
+      message: bracketMessage(statement, dialect, mode),
+    };
+  }
+  const outsideOnly = mode.transaction
+    ? undefined
+    : outsideTransactionRefusal(statement, dialect, mode.unit);
+  if (outsideOnly !== undefined) return outsideOnly;
+  const setting = sessionSettingOf(statement, dialect);
+  if (setting !== undefined) {
+    return {
+      statement,
+      code: "SESSION_SETTING_IN_MIGRATION",
+      message: sessionSettingMessage(statement, setting, dialect, mode),
+    };
+  }
+  const outside = outsideTransactionReason(statement, dialect, mode);
+  // A statement the database runs only outside a transaction runs in a unit
+  // marked to run outside one.
+  if (outside === undefined || (outside.markable && !mode.transaction)) {
+    return undefined;
+  }
+  return {
+    statement,
+    code: "NOT_TRANSACTIONAL_IN_MIGRATION",
+    message: outside.markable
+      ? `${quoted(statement)} ${outside.reason} To run it as a migration, ${markAdvice(mode.unit)}: the ${mode.unit} then runs outside a transaction, statement by statement, and a failure part-way leaves the statements before it applied.`
+      : `${quoted(statement)} ${outside.reason} Remove it.`,
+  };
+}
+
+/**
+ * Why a bracket part-way through a unit run in a transaction is refused, and
+ * how to get what it was written for. A unit is one transaction, so the way
+ * to commit part of it first is a unit of its own; the unit marked to run
+ * outside a transaction is named because it commits each statement as it
+ * runs and so needs no COMMIT either.
+ */
+function bracketMessage(
+  statement: string,
+  dialect: SupportedDialect | undefined,
+  mode: MigrationRunMode
+): string {
+  const keyword = leadingWords(statement, dialect, 1)[0] ?? "it";
+  const marked =
+    mode.unit === "module"
+      ? "A module with `transaction: false`"
+      : `A file whose first line is \`${NO_TRANSACTION_MARKER}\``;
+  const effect =
+    bracketSideOf(statement, dialect) === "open"
+      ? "would open a transaction inside the one the runner holds"
+      : "would end the runner's transaction early, committing what came before it on its own";
+  return `${quoted(statement)}: a migration ${mode.unit} runs as one transaction, and this ${keyword} ${effect}. A ${mode.unit} wrapped whole in one BEGIN ... COMMIT runs as written. To commit part of it first, split the ${mode.unit} there into two, each its own transaction. ${marked} runs statement by statement, committing each as it runs, and takes no BEGIN or COMMIT.`;
+}
+
+/**
+ * Why a statement that ends or hands off a transaction is refused: inside
+ * the runner's transaction it would end that transaction, and outside one it
+ * would act on a transaction the runner does not own.
+ */
+function transactionControlMessage(
+  statement: string,
+  dialect: SupportedDialect | undefined,
+  mode: MigrationRunMode
+): string {
+  const keyword = leadingWords(statement, dialect, 1)[0] ?? "it";
+  if (!mode.transaction) {
+    return `${quoted(statement)}: a migration may not contain ${keyword}, which ends or hands off a transaction the runner does not own. Remove it.`;
+  }
+  const savepoint =
+    keyword === "ROLLBACK"
+      ? ", or undo part of it with SAVEPOINT name and ROLLBACK TO SAVEPOINT name"
+      : "";
+  return `${quoted(statement)}: a migration runs inside the runner's own transaction, so it may not contain ${keyword}. Remove it and let the ${mode.unit} run as one transaction${savepoint}.`;
+}
+
+/**
+ * Why a statement cannot run inside the migration's transaction, and
+ * whether marking the unit to run outside one lets it run — or undefined
+ * when it runs inside one.
+ *
+ * Markable: the database refuses these inside a transaction, and runs them
+ * outside one.
+ *
+ * - PostgreSQL: `VACUUM`, anything `CONCURRENTLY` (`CREATE`/`DROP INDEX`,
+ *   `REINDEX`), `CREATE`/`DROP DATABASE`, `CREATE`/`DROP TABLESPACE`,
+ *   `ALTER SYSTEM`, and `CLUSTER` naming no table.
+ * - SQLite: `VACUUM`.
+ *
+ * Not markable: they leave state on the connection after the migration, so
+ * running them outside a transaction would not help.
+ *
+ * - SQLite's `ATTACH` and `DETACH` change which databases the process's one
+ *   connection sees.
+ * - MySQL's `LOCK TABLES`/`UNLOCK TABLES` (and the INSTANCE forms) commit
+ *   the transaction implicitly, and the locks stay with the pooled
+ *   connection.
+ *
+ * PostgreSQL's `ALTER TYPE ... ADD VALUE` is not among them: from
+ * PostgreSQL 12 it runs inside a transaction, though the value it adds
+ * cannot be used before that transaction commits. Nor is `REFRESH
+ * MATERIALIZED VIEW CONCURRENTLY`, or `CLUSTER` naming its table: both run
+ * inside one.
+ */
+function outsideTransactionReason(
+  statement: string,
+  dialect: SupportedDialect | undefined,
+  mode: MigrationRunMode
+): OutsideTransactionReason | undefined {
+  const words = leadingWords(statement, dialect, 6);
+  switch (dialect) {
+    case "postgresql":
+      return (
+        postgresOutsideTransactionReason(words, mode.unit) ??
+        clusterOutsideTransactionReason(statement, mode.unit)
+      );
+    case "sqlite":
+      return sqliteOutsideTransactionReason(words[0], mode.unit);
+    case "mysql":
+      return mysqlOutsideTransactionReason(words, mode.transaction);
+    default:
+      return undefined;
+  }
+}
+
+/** Why a statement cannot run inside a transaction, and whether marking helps. */
+interface OutsideTransactionReason {
+  reason: string;
+  markable: boolean;
+}
+
+/** The reason a statement the database refuses inside a transaction gives. */
+function cannotRunInOne(unit: MigrationRunMode["unit"]): string {
+  return `cannot run inside a transaction, and this ${unit} runs in one.`;
+}
+
+/** The first words of PostgreSQL's statements that may run CONCURRENTLY. */
+const CONCURRENT_STATEMENTS = new Set(["CREATE", "DROP", "REINDEX"]);
+
+/** The first words of PostgreSQL's `CREATE`/`DROP DATABASE|TABLESPACE`. */
+const CREATE_OR_DROP = new Set(["CREATE", "DROP"]);
+
+/** What PostgreSQL's `CREATE`/`DROP` refuses inside a transaction. */
+const SERVER_OBJECTS = new Set(["DATABASE", "TABLESPACE"]);
+
+/** PostgreSQL's statements that run only outside a transaction. */
+function postgresOutsideTransactionReason(
+  words: readonly string[],
+  unit: MigrationRunMode["unit"]
+): OutsideTransactionReason | undefined {
+  const [first = "", second = ""] = words;
+  if (first === "VACUUM")
+    return { reason: cannotRunInOne(unit), markable: true };
+  if (CONCURRENT_STATEMENTS.has(first) && words.includes("CONCURRENTLY")) {
+    return {
+      reason: `builds or drops concurrently, which PostgreSQL cannot do inside a transaction, and this ${unit} runs in one.`,
+      markable: true,
+    };
+  }
+  if (CREATE_OR_DROP.has(first) && SERVER_OBJECTS.has(second)) {
+    return { reason: cannotRunInOne(unit), markable: true };
+  }
+  if (first === "ALTER" && second === "SYSTEM") {
+    return {
+      reason: `changes the server's configuration, which cannot be done inside a transaction, and this ${unit} runs in one.`,
+      markable: true,
+    };
+  }
+  return undefined;
+}
+
+/**
+ * PostgreSQL's `CLUSTER` naming no table — `CLUSTER` or `CLUSTER VERBOSE` —
+ * which reclusters every table clustered before and which the server refuses
+ * inside a transaction block, where `CLUSTER t` runs.
+ *
+ * The leading words stop at a quoted segment, so a statement holding one —
+ * `CLUSTER "Posts"` — names a table, and is left to run. Any other shape,
+ * an option list among them, is left to the server to judge.
+ */
+function clusterOutsideTransactionReason(
+  statement: string,
+  unit: MigrationRunMode["unit"]
+): OutsideTransactionReason | undefined {
+  const words = leadingWords(statement, "postgresql", 3);
+  if (words[0] !== "CLUSTER") return undefined;
+  const quoted = scanSql(statement, "postgresql").some(
+    segment => segment.kind === "string" || segment.kind === "quoted-name"
+  );
+  if (quoted) return undefined;
+  const rest = words[1] === "VERBOSE" ? words.slice(2) : words.slice(1);
+  if (rest.some(word => word !== ";")) return undefined;
+  return {
+    reason: `reclusters every table, which PostgreSQL cannot do inside a transaction, and this ${unit} runs in one.`,
+    markable: true,
+  };
+}
+
+/**
+ * SQLite's `VACUUM`, which runs only outside a transaction, and its
+ * `ATTACH`/`DETACH`, which change the connection whatever the transaction.
+ */
+function sqliteOutsideTransactionReason(
+  first: string | undefined,
+  unit: MigrationRunMode["unit"]
+): OutsideTransactionReason | undefined {
+  if (first === "VACUUM")
+    return { reason: cannotRunInOne(unit), markable: true };
+  return first === "ATTACH" || first === "DETACH"
+    ? {
+        reason:
+          "changes which databases the process's one connection sees, and that outlives the migration.",
+        markable: false,
+      }
+    : undefined;
+}
+
+/** What MySQL's `LOCK` and `UNLOCK` lock, as a statement this refuses. */
+const MYSQL_LOCK_TARGETS = new Set(["TABLES", "TABLE", "INSTANCE"]);
+
+/**
+ * MySQL's `LOCK`/`UNLOCK TABLES` and the INSTANCE forms, and `USE`, which
+ * switches the connection's default database: it stays on the pooled
+ * connection, and the runner's own writes after the unit, which name their
+ * tables unqualified, would reach that database instead of the app's.
+ */
+function mysqlOutsideTransactionReason(
+  words: readonly string[],
+  inTransaction: boolean
+): OutsideTransactionReason | undefined {
+  const [first, second = ""] = words;
+  if (first === "USE") {
+    return {
+      reason:
+        "switches the connection's default database, which stays on the pooled connection after the migration and sends the runner's own ledger writes to that database.",
+      markable: false,
+    };
+  }
+  if (first !== "LOCK" && first !== "UNLOCK") return undefined;
+  if (!MYSQL_LOCK_TARGETS.has(second)) return undefined;
+  return {
+    reason: inTransaction
+      ? "commits the migration's transaction implicitly and holds its locks on the pooled connection after the migration."
+      : "holds its locks on the pooled connection after the migration.",
+    markable: false,
+  };
+}
+
+/**
+ * Refuses a migration with any statement `statementRefusals` names, before
+ * anything runs. `source` names the file or module for the operator.
+ */
+export function assertRunnableStatements(
+  statements: readonly string[],
+  dialect: SupportedDialect | undefined,
+  source: string,
+  mode: MigrationRunMode = IN_TRANSACTION_FILE
+): void {
+  const refusals = statementRefusals(statements, dialect, mode);
+  if (refusals.length === 0) return;
+  throw NextlyError.invalidInput({
+    message: `${source} was refused, and nothing in it ran. ${refusals
+      .map(refusal => refusal.message)
+      .join(" ")}`,
+    logContext: {
+      source,
+      refusals: refusals.map(refusal => refusal.code),
+    },
+  });
+}
+
+/** What a routine or trigger definition creates, as its CREATE names it. */
+const ROUTINE_KINDS = new Set(["TRIGGER", "PROCEDURE", "FUNCTION", "EVENT"]);
+
+/**
+ * Words after END that close a construct no BEGIN or CASE opened: MySQL's
+ * `END IF`, `END LOOP`, `END WHILE`, `END REPEAT`, PL/SQL-style `END FOR`.
+ */
+const NON_BLOCK_ENDS = new Set(["IF", "LOOP", "WHILE", "REPEAT", "FOR"]);
+
+/**
+ * What `codeTokens` reads a string, a quoted name or a dollar-quoted body as.
+ * No code token can equal it, so a quoted `"begin"` never reads as BEGIN.
+ */
+const QUOTED_TOKEN = "<quoted>";
+
+/**
+ * The code tokens of a text: its words, upper-cased, every other non-space
+ * character on its own, and each quoted segment as one `QUOTED_TOKEN`.
+ * Comments produce none.
+ *
+ * A quoted segment stays a token so the token before a keyword is the one
+ * the server reads there: in `WHEN NEW.status = 'published' BEGIN` it is the
+ * string, not the `=`, which would make BEGIN read as a name.
+ */
+function codeTokens(
+  text: string,
+  dialect: SupportedDialect | undefined
+): string[] {
+  const tokens: string[] = [];
+  for (const segment of scanSql(text, dialect)) {
+    if (segment.kind === "line-comment" || segment.kind === "block-comment") {
+      continue;
+    }
+    if (segment.kind !== "code") {
+      tokens.push(QUOTED_TOKEN);
+      continue;
+    }
+    const code = text.slice(segment.start, segment.end);
+    for (const token of code.match(/[A-Za-z_][\w$]*|\S/g) ?? []) {
+      tokens.push(token.toUpperCase());
+    }
+  }
+  return tokens;
+}
+
+/** Tokens around a word that make it a name rather than a keyword. */
+const NAME_BEFORE = new Set([".", ",", "(", "=", "SELECT", "SET"]);
+const NAME_AFTER = new Set(["=", ",", ")", "."]);
+
+/**
+ * Whether the BEGIN, CASE or END at `i` is a keyword rather than a name.
+ *
+ * Any of them directly after a `.` is a qualified name — `NEW.end`,
+ * `t.begin`. A BEGIN is also a name where only a name can stand: after a
+ * comma, an opening parenthesis, `=`, SELECT or SET, or before `=`, a comma,
+ * a closing parenthesis or a `.`. CASE and END are judged by the dot alone,
+ * because a CASE expression stands exactly where a name can, and its END is
+ * followed by whatever follows an expression.
+ */
+function isBlockKeyword(tokens: readonly string[], i: number): boolean {
+  const before = tokens[i - 1];
+  if (before === ".") return false;
+  if (tokens[i] !== "BEGIN") return true;
+  return !NAME_BEFORE.has(before ?? "") && !NAME_AFTER.has(tokens[i + 1] ?? "");
+}
+
+/**
+ * Whether `text` — a statement read up to a `;` — is a routine or trigger
+ * definition whose `BEGIN ... END` body is still open at that `;`.
+ *
+ * `CREATE [OR REPLACE] [DEFINER = ...] TRIGGER|PROCEDURE|FUNCTION|EVENT`, the
+ * kind named before any parenthesis. Its body is a compound statement whose
+ * inner `;`s separate the body's own statements: SQLite's and MySQL's
+ * triggers, MySQL's procedures, functions and events, PostgreSQL's
+ * `BEGIN ATOMIC` function bodies. Such a definition reaches the driver as ONE
+ * statement, as a client with a `DELIMITER` would send it.
+ *
+ * Nesting counts `BEGIN` and `CASE` as openers and `END` as their closer —
+ * `END CASE` included — while `END IF`, `END LOOP`, `END WHILE` and
+ * `END REPEAT` close constructs that were never counted. Only a definition is
+ * read this way; everywhere else a `;` ends the statement.
+ */
+function insideRoutineBody(
+  text: string,
+  dialect: SupportedDialect | undefined
+): boolean {
+  const words = codeTokens(text, dialect);
+  const kindAt = routineKindAt(words);
+  return kindAt !== undefined && openBlocks(words, kindAt + 1) > 0;
+}
+
+/**
+ * Where a routine or trigger definition names its kind, or undefined when
+ * the words are not one: they open with CREATE, and a kind comes before any
+ * parenthesis.
+ */
+function routineKindAt(words: readonly string[]): number | undefined {
+  if (words[0] !== "CREATE") return undefined;
+  const kindAt = words.findIndex(w => ROUTINE_KINDS.has(w) || w === "(");
+  return kindAt === -1 || words[kindAt] === "(" ? undefined : kindAt;
+}
+
+/**
+ * How many `BEGIN` and `CASE` blocks are still open after the words from
+ * `from` on, each `END` closing one and never going below none.
+ */
+function openBlocks(words: readonly string[], from: number): number {
+  let depth = 0;
+  for (let i = from; i < words.length; i++) {
+    const word = words[i];
+    if (!isBlockKeyword(words, i)) continue;
+    if (word === "BEGIN" || word === "CASE") depth += 1;
+    else if (word === "END" && !NON_BLOCK_ENDS.has(words[i + 1] ?? "")) {
+      depth = Math.max(0, depth - 1);
+      // `END CASE` is one closer; its CASE opens nothing.
+      if (words[i + 1] === "CASE") i += 1;
+    }
+  }
+  return depth;
+}
+
+/**
+ * The statements `sql` holds, one per driver call, in order.
+ *
+ * Split at every `;` in code, never inside a string, a quoted name, a
+ * comment, a PostgreSQL dollar-quoted body or a routine's or trigger's
+ * `BEGIN ... END` body (`insideRoutineBody`) — so a `DO $$ ... ; ... $$`
+ * block, a function body or a `CREATE TRIGGER ... BEGIN ...; END` reaches
+ * the driver whole, and its `END` is never read as a transaction bracket.
+ * A fragment with nothing but comments is dropped, and so, in a unit that
+ * runs in the runner's transaction, is a bracket pair wrapping the whole
+ * unit (`withoutWrappingBrackets`). `mode` is how the unit runs. Every other
+ * bracket is kept, in either mode, so `statementRefusals` names it rather
+ * than the split dropping it unseen. Everything else is kept as written,
+ * including statements the runner will refuse: refusing is
+ * `statementRefusals`' job.
+ */
+export function splitSqlStatements(
+  sql: string,
+  dialect?: SupportedDialect,
+  mode: Pick<MigrationRunMode, "transaction"> = IN_TRANSACTION_FILE
+): string[] {
+  const cleaned = withoutMarkers(sql, dialect);
+  const statements: string[] = [];
+  const collect = (fragment: string): void => {
+    const statement = fragment.trim();
+    if (!hasExecutableText(statement, dialect)) return;
+    statements.push(statement);
+  };
+
+  let current = "";
+  for (const segment of scanSql(cleaned, dialect)) {
+    const text = cleaned.slice(segment.start, segment.end);
+    if (segment.kind !== "code") {
+      current += text;
+      continue;
+    }
+    let from = 0;
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] !== ";") continue;
+      const statement = current + text.slice(from, i);
+      // A `;` inside a routine's or trigger's body separates the body's own
+      // statements, not the file's.
+      if (insideRoutineBody(statement, dialect)) continue;
+      collect(statement);
+      current = "";
+      from = i + 1;
+    }
+    current += text.slice(from);
+  }
+  collect(current);
+  return mode.transaction
+    ? withoutWrappingBrackets(statements, dialect)
+    : statements;
+}
+
+/**
+ * The statements without a bracket pair that wraps the whole unit: an opening
+ * `BEGIN` or `START TRANSACTION` as the first statement, a closing `COMMIT`
+ * or `END` as the last, and no other bracket between them.
+ *
+ * A unit that runs in the runner's transaction already runs whole, so such a
+ * wrapper asks for exactly what happens without it, and leaving it out
+ * changes nothing; run, its BEGIN fails on SQLite and its COMMIT would end
+ * the runner's transaction before the ledger row is written. A unit with any
+ * other bracket — a COMMIT part-way through, a second BEGIN, one without its
+ * pair — meant part of itself to commit on its own, which leaving brackets
+ * out would silently undo, so every bracket in it is kept for
+ * `statementRefusals` to refuse. Only a unit whose two brackets are its only
+ * ones loses them, so splitting what this returns again returns it unchanged.
+ */
+export function withoutWrappingBrackets(
+  statements: string[],
+  dialect: SupportedDialect | undefined
+): string[] {
+  const brackets = statements.filter(
+    statement => bracketSideOf(statement, dialect) !== undefined
+  );
+  if (brackets.length !== 2) return statements;
+  const first = statements[0];
+  const last = statements[statements.length - 1];
+  return bracketSideOf(first, dialect) === "open" &&
+    bracketSideOf(last, dialect) === "close"
+    ? statements.slice(1, -1)
+    : statements;
+}
+
+/** Whether a transaction bracket opens (`BEGIN`, `START`) or closes one. */
+function bracketSideOf(
+  statement: string,
+  dialect: SupportedDialect | undefined
+): "open" | "close" | undefined {
+  if (transactionControlOf(statement, dialect) !== "bracket") return undefined;
+  const [first] = leadingWords(statement, dialect, 1);
+  return first === "BEGIN" || first === "START" ? "open" : "close";
+}

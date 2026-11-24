@@ -1,0 +1,212 @@
+/**
+ * The Page Builder as a screen of its own: its address, a reload, the way back
+ * to the document's form, and recovering work after a reload without saving.
+ *
+ * Driven through the playground's homepage Single, whose `layout` field is a
+ * blocks field and its main field, so a link to it opens the builder; and
+ * through the field's card on its form.
+ *
+ * @module tests/builder-screen
+ */
+import { expect, type Page } from "@playwright/test";
+
+import { test } from "./support/test";
+import { gotoAdmin } from "./support/admin";
+import { LOCK } from "./support/locks";
+import { canvasFrame } from "./support/canvas-frame";
+
+// Shares state with other specs; see support/locks.ts for what each lock guards.
+test.describe.configure({ lock: [LOCK.homepage] });
+
+const OPEN_BUILDER_ACTION = /^Open in builder$/;
+/**
+ * The Page Builder card on the form, whose way in is named as the document
+ * bar's is, so a lookup by that name is scoped to the card.
+ */
+const PAGE_BUILDER_CARD = '[data-slot="page-builder-card"]';
+const HOMEPAGE_API = "/admin/api/singles/homepage";
+const BUILDER_URL = /\/admin\/singles\/homepage\/builder\?field=layout$/;
+const FORM_URL = /\/admin\/singles\/homepage$/;
+
+function heading(id: string, text: string) {
+  return { id, type: "core/heading", version: 1, props: { text, level: "h2" } };
+}
+
+async function seed(page: Page, nodes: unknown[]): Promise<void> {
+  const stored = await page.request.patch(HOMEPAGE_API, {
+    data: {
+      layout: { formatVersion: 1, kind: "page", nodes },
+      _overwrite: true,
+    },
+  });
+  expect(stored.ok(), `seeding the homepage layout: ${stored.status()}`).toBe(
+    true
+  );
+}
+
+/** The ⋯ menu's Open as form, the builder's way to the document's form. */
+async function openAsForm(page: Page): Promise<void> {
+  await page
+    .locator('[data-topbar="end"]')
+    .getByRole("button", { name: "More actions" })
+    .click();
+  await page.getByRole("menuitem", { name: "Open as form" }).click();
+}
+
+function block(page: Page, id: string) {
+  return canvasFrame(page).locator(`.nx-canvas [data-nx-node="${id}"]`).first();
+}
+
+async function openBuilder(page: Page): Promise<void> {
+  await gotoAdmin(page, "/singles/homepage");
+  await page
+    .locator(PAGE_BUILDER_CARD)
+    .getByRole("link", { name: OPEN_BUILDER_ACTION })
+    .click();
+  await expect(page).toHaveURL(BUILDER_URL);
+}
+
+test.describe("the Page Builder's own screen", () => {
+  test("opens at its own address, and a reload keeps it there", async ({
+    page,
+  }) => {
+    await seed(page, [heading("kept", "A heading that survives a reload")]);
+    await openBuilder(page);
+    await expect(block(page, "kept")).toBeVisible({ timeout: 30_000 });
+
+    await page.reload();
+
+    await expect(page).toHaveURL(BUILDER_URL);
+    await expect(block(page, "kept")).toBeVisible({ timeout: 30_000 });
+  });
+
+  test("goes back to the document's form by Open as form", async ({ page }) => {
+    await seed(page, [heading("h", "Back to the form")]);
+    await openBuilder(page);
+    await expect(block(page, "h")).toBeVisible({ timeout: 30_000 });
+
+    // The Homepage opens in the builder, so its arrow leaves for the Content
+    // screen; the ⋯ menu's Open as form is the way to its form.
+    await openAsForm(page);
+
+    await expect(page).toHaveURL(/\/admin\/singles\/homepage$/);
+    await expect(
+      page
+        .locator(PAGE_BUILDER_CARD)
+        .getByRole("link", { name: OPEN_BUILDER_ACTION })
+    ).toBeVisible();
+  });
+
+  test("Back keeps the change between the page's form and its builder, and asks only when it leaves the page", async ({
+    page,
+  }) => {
+    await seed(page, [heading("stays", "Stays"), heading("goes", "Goes")]);
+    // Arrived by clicks from elsewhere in the admin, as an author does: the
+    // Content screen's row opens the Homepage's builder, Open as form its
+    // form, and the card the builder again. The history holds somewhere off
+    // the page, then the page's builder, its form and its builder.
+    await gotoAdmin(page, "/content");
+    const row = page
+      .getByRole("table", { name: "Singles" })
+      .getByRole("link", { name: "Homepage", exact: true });
+    // Drawn with the builder's address once the reader's access has arrived.
+    await expect(row).toHaveAttribute("href", BUILDER_URL);
+    await row.click();
+    await expect(page).toHaveURL(BUILDER_URL);
+    await openAsForm(page);
+    await expect(page).toHaveURL(FORM_URL);
+    await page
+      .locator(PAGE_BUILDER_CARD)
+      .getByRole("link", { name: OPEN_BUILDER_ACTION })
+      .click();
+    await expect(page).toHaveURL(BUILDER_URL);
+    await expect(block(page, "goes")).toBeVisible({ timeout: 30_000 });
+    await block(page, "goes").click();
+    await page.keyboard.press("Delete");
+    await expect(block(page, "goes")).toHaveCount(0);
+
+    // Back to the same page's form: one document, so nothing asks.
+    await page.goBack({ waitUntil: "commit" });
+    await expect(page).toHaveURL(FORM_URL);
+    await expect(
+      page
+        .locator(PAGE_BUILDER_CARD)
+        .getByRole("link", { name: OPEN_BUILDER_ACTION })
+    ).toBeVisible();
+    await expect(page.getByRole("alertdialog")).toHaveCount(0);
+
+    // And the change is still there: Forward into the builder shows it.
+    await page.goForward({ waitUntil: "commit" });
+    await expect(page).toHaveURL(BUILDER_URL);
+    await expect(block(page, "stays")).toBeVisible({ timeout: 30_000 });
+    await expect(block(page, "goes")).toHaveCount(0);
+
+    // Back three times: to the form and the first builder, the same page, and
+    // then off it, which asks.
+    await page.goBack({ waitUntil: "commit" });
+    await expect(page).toHaveURL(FORM_URL);
+    await page.goBack({ waitUntil: "commit" });
+    await expect(page).toHaveURL(BUILDER_URL);
+    await expect(page.getByRole("alertdialog")).toHaveCount(0);
+    // Started as the browser's button starts it, not by Playwright's `goBack`,
+    // which waits for a navigation: the guard cancels this one before it moves.
+    await page.evaluate(() => window.history.back());
+    const question = page.getByRole("alertdialog");
+    await expect(question).toBeVisible();
+    // Asked on the page Back would have left: it has not moved.
+    await expect(page).toHaveURL(BUILDER_URL);
+    await question.getByRole("button", { name: "Keep Editing" }).click();
+    await expect(page).toHaveURL(BUILDER_URL);
+  });
+
+  test("offers work left unsaved by a reload, and restores it", async ({
+    page,
+  }) => {
+    await seed(page, [heading("stays", "Stays"), heading("goes", "Goes")]);
+    await openBuilder(page);
+    await expect(block(page, "goes")).toBeVisible({ timeout: 30_000 });
+
+    // One edit, recorded as this author's recovery point: the editor writes
+    // it through the versions API a moment after the document changes.
+    const recorded = page.waitForRequest(
+      request =>
+        request.method() === "PUT" &&
+        new URL(request.url()).pathname.endsWith("/autosave")
+    );
+    await block(page, "goes").click();
+    await page.keyboard.press("Delete");
+    await expect(block(page, "goes")).toHaveCount(0);
+    await recorded;
+
+    // Reloaded without saving: the stored page still holds both blocks, and
+    // Save offers the work the reload would otherwise have lost, with no
+    // banner above the editor saying it a second time.
+    await page.reload();
+    await expect(block(page, "goes")).toBeVisible({ timeout: 30_000 });
+    const save = page.locator('[data-topbar="end"] [data-action="save"]');
+    await expect(save).toHaveText("Save");
+    await expect(
+      page
+        .getByRole("status")
+        .filter({ hasText: /You have unsaved changes from/ })
+    ).toHaveCount(0);
+
+    // Save says what is waiting, and keeps it.
+    await save.click();
+    const offer = page.getByRole("dialog");
+    await expect(
+      offer.getByText("Changes from your last visit aren't saved yet.")
+    ).toBeVisible();
+    await offer.getByRole("button", { name: "Save", exact: true }).click();
+
+    await expect(block(page, "goes")).toHaveCount(0);
+    await expect(block(page, "stays")).toBeVisible();
+
+    // Kept as one edit the author can undo: Undo brings the stored page
+    // back, rather than being disabled by a fresh editor.
+    const undo = page.getByRole("button", { name: "Undo" });
+    await expect(undo).toBeEnabled();
+    await undo.click();
+    await expect(block(page, "goes")).toBeVisible();
+  });
+});

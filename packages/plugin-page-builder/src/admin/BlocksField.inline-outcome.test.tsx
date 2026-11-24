@@ -1,0 +1,644 @@
+// @vitest-environment jsdom
+
+/**
+ * What the editor does when an inline edit could not be written.
+ *
+ * The builder's own suite asserts that a refused commit KEEPS the passage open,
+ * because the author's words live in the editor and nowhere else. That is only
+ * half of it: the surface can hold the passage perfectly and this host can
+ * still close the canvas a moment later, which unmounts the editor and takes
+ * the words with it. The distinction exists to be acted on, and this file is
+ * where it is acted on.
+ *
+ * The inline surface is replaced with a recorder that answers a chosen outcome.
+ * What is under test is this component's response to that answer, so driving
+ * the answer directly is the assertion; producing a genuine refusal would need
+ * a real editor, a real document race, and would still be observed here.
+ *
+ * @module admin/BlocksField.inline-outcome.test
+ */
+import { ShortcutProvider } from "@nextlyhq/ui";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
+import * as React from "react";
+import {
+  useForm,
+  useWatch,
+  type Control,
+  type FieldValues,
+} from "react-hook-form";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { BlockDocument } from "@nextlyhq/blocks-engine";
+import type { InlineEditOutcome } from "@nextlyhq/builder/shell";
+import { closedDocumentSession } from "../__tests__/closed-document-session";
+
+/** What the inline surface answers when this test's editor is finished. */
+let outcome: InlineEditOutcome = { status: "unchanged" };
+
+/** Errors raised for the author. */
+const errors: string[] = [];
+
+/** The value the field has written back to the form. */
+let saved: unknown;
+
+/** How many times the inline passage has been asked to commit. */
+let commits = 0;
+
+/**
+ * The document the save form was handed, so the WORDS can be followed.
+ *
+ * Counting commits proves the flow was entered and nothing about what it
+ * carried: an editor that committed and then snapshotted the stale document
+ * would satisfy a call count while saving a pattern without the text the author
+ * had just typed, which is the entire defect.
+ */
+let savedFrom: unknown;
+
+/**
+ * What the editor asked to run before an action stores the document, as the
+ * editor hosting it registers it. Called here the way that host calls it.
+ */
+let beforeAction: ((action: string) => void | Promise<void>) | undefined;
+/**
+ * Every mounted caller's handler, as the admin keeps them: each runs before
+ * an action, in turn, not only the one that registered last.
+ */
+const actionHandlers = new Set<(action: string) => void | Promise<void>>();
+
+/** The save-as-pattern verb the editor published, so a test can run it. */
+let offeredSaveVerb: (() => void) | undefined;
+
+// The editor asks the session's grants for shared styles; this file is not
+// about them, so the author holds the right to change the site's design.
+vi.mock("@nextlyhq/plugin-sdk/client", () => ({
+  useCan: (permission: string) => permission === "update-site-style",
+}));
+
+vi.mock("@nextlyhq/ui", async importOriginal => {
+  // Spread rather than replaced: the shell below is the REAL module and draws
+  // real components from here, so a closed literal would blank them.
+  const real = await importOriginal<Record<string, unknown>>();
+  return {
+    ...real,
+    toast: {
+      error: (message: string) => errors.push(message),
+      success: () => {},
+      info: () => {},
+    },
+  };
+});
+
+vi.mock("@nextlyhq/builder/shell", async importOriginal => {
+  const real = await importOriginal<Record<string, unknown>>();
+  const nothing = (): null => null;
+  const passthrough = ({
+    children,
+  }: {
+    children?: React.ReactNode;
+  }): React.JSX.Element => <>{children}</>;
+  return {
+    ...real,
+    /*
+     * The exit affordance is the subject. The real shell draws it from
+     * `onExit`, and this stub renders the same handler behind a button so a
+     * test can press it — asserting on the handler prop instead would pass on
+     * a shell that never rendered a way out.
+     */
+    BuilderShell: ({
+      onExit,
+      children,
+    }: {
+      onExit?: () => void;
+      children?: React.ReactNode;
+    }): React.JSX.Element => (
+      // The shortcut context comes with the real shell, and the save form holds
+      // the keyboard while it is open — so a plain div here fails inside the
+      // form rather than telling us anything about the subject.
+      <ShortcutProvider>
+        <div>
+          <button type="button" onClick={onExit}>
+            Leave editor
+          </button>
+          {children}
+        </div>
+      </ShortcutProvider>
+    ),
+    BreakpointManager: nothing,
+    BreakpointSwitcher: nothing,
+    InspectorPanel: nothing,
+    Canvas: nothing,
+    /*
+     * Records the save-as-pattern verb as well as passing children through. The
+     * verb is published to the toolbar, the context menu and the palette alike,
+     * so capturing it here is capturing what all three would run — and running
+     * it is the only way to observe what the editor does with an open passage.
+     */
+    BlockKeyboardActions: ({
+      children,
+      onSaveAsPattern,
+    }: {
+      children?: React.ReactNode;
+      onSaveAsPattern?: () => void;
+    }): React.JSX.Element => {
+      offeredSaveVerb = onSaveAsPattern;
+      return <>{children}</>;
+    },
+    /*
+     * Passed THROUGH, not stubbed to nothing: the canvas renders inside it, so
+     * a stub would take the recorder below out of the tree along with it. The
+     * real one reads the verbs context, which the passthrough above does not
+     * provide.
+     */
+    BlockContextMenu: passthrough,
+    BlockToolbar: nothing,
+    EditorCommandPalette: nothing,
+    DropIndicator: nothing,
+    InsertPanel: nothing,
+    RepairNotice: nothing,
+    LayersPanel: nothing,
+    TokensPanel: nothing,
+    OnboardingChecklist: nothing,
+    SelectionBreadcrumb: nothing,
+    SpacingOverlay: nothing,
+    useBuilderChecklist: () => ({
+      visible: false,
+      steps: [],
+      dismiss: () => {},
+    }),
+    // `draggingBlockName` is part of the state this hook reports and is what
+    // the editor asks "is a drag happening" — a stub omitting it answers
+    // `undefined`, which is not `null`, so the editor hides its chrome for a
+    // drag that is not happening.
+    useCanvasDrag: () => ({
+      handlers: {},
+      target: null,
+      draggingId: null,
+      draggingBlockName: null,
+    }),
+    useEditorState: () => ({
+      document: { formatVersion: 1, kind: "page", nodes: [] },
+      selectedId: null,
+      selection: { ids: [], primary: null },
+      apply: () => null,
+      applyAll: () => null,
+      select: () => {},
+      undo: () => {},
+      redo: () => {},
+      canUndo: false,
+      canRedo: false,
+      undoDepth: 0,
+    }),
+    useInlineText: () => ({ onDoubleClick: () => {} }),
+    /*
+     * Answers the chosen outcome AND reports it the way the real hook does —
+     * through the callback, on every commit including the host's own. A stub
+     * that only returned it would let this file pass against a host that never
+     * wired the callback at all, which is the defect this replaced.
+     *
+     * That the REAL hook reports from blur, from being superseded and from
+     * unmount is asserted in the builder's own suite against the real hook.
+     * The division is deliberate: there, that the outcome is produced; here,
+     * that this component acts on it.
+     */
+    useInlineEditing: (
+      _editor: unknown,
+      _load: unknown,
+      onFinished?: (finished: InlineEditOutcome) => void
+    ) => ({
+      editing: null,
+      editingRich: null,
+      begin: () => false,
+      commit: () => {
+        commits += 1;
+        onFinished?.(outcome);
+        return outcome;
+      },
+      cancel: () => {},
+      onDoubleClick: () => {},
+    }),
+  };
+});
+
+// The question before a publish registers a before-action of its own, which
+// this harness would take for the host commit's; it has its own tests.
+vi.mock("./publish-offer", () => ({
+  usePublishOffer: () => null,
+  useFormPublishOffer: () => null,
+  usePublishQuestion: () => ({ offer: () => Promise.resolve(), dialog: null }),
+  // Page checks asks which parts aren't published; answered as unknown, so
+  // it lists none and these tests stay on what they test.
+  askReadiness: async () => null,
+}));
+vi.mock("./removal-hold-client", () => ({
+  useRemovalHold: () => null,
+  useRemovalQuestion: () => ({ hold: () => Promise.resolve(), dialog: null }),
+}));
+
+/** Asking the stored style again, as the editor does after a save. */
+const refetchStoredStyle = async () => ({ isError: false });
+// The stored site style arrives through the editor's one read, the plugin's
+// route; that read's request is asserted in `site-style-read.test`.
+vi.mock("./site-style-read", () => ({
+  useStoredSiteStyle: () => ({
+    data: undefined,
+    isPending: false,
+    error: null,
+    refetch: refetchStoredStyle,
+  }),
+}));
+
+vi.mock("@nextlyhq/plugin-sdk/admin", async () => ({
+  // The empty page's starter pages read, offering none: no case here starts
+  // a page from one.
+  readPluginRoute: async () => ({ items: [] }),
+  // Where the page opens and the pin's id, which the top bar reads; no
+  // collection is named here, so the exit goes to the form.
+  useDocumentOpensIn: () => null,
+  PIN_TO_DASHBOARD_ACTION: "pin-to-dashboard",
+  // The canvas's media read, answering nothing: these cases draw no image.
+  // One function for every call, as the admin's own hook keeps it.
+  useMediaResolver: (
+    read => () =>
+      read
+  )(() => Promise.resolve(null)),
+  // The Fallback picker's library search, finding nothing: no case here
+  // opens it. One function for every call, as the admin's own hook keeps it.
+  useMediaSearcher: (
+    search => () =>
+      search
+  )(() => Promise.resolve([])),
+  // The host's font table, which the real entry re-exports from core.
+  WEB_FONT_FORMATS: (await import("nextly/config")).WEB_FONT_FORMATS,
+  // The media library, drawn as nothing: these cases never open it.
+  MediaPickerDialog: () => null,
+  // The media library's upload, which an Image's empty state offers: these
+  // cases upload nothing.
+  useUploadMedia: () => ({ mutateAsync: () => new Promise<never>(() => {}) }),
+  loadInlineRichTextEditor: () => new Promise<never>(() => {}),
+  usePluginClientConfig: () => undefined,
+  // No document around the field: the state every case here was written
+  // against, and the one that offers every component.
+  useDocumentIdentity: () => null,
+  navigateTo: vi.fn(),
+  // Nor a language the field could know: the component read asks for the
+  // app default.
+  useDocumentLocale: () => null,
+  /*
+   * The library read. Absent here rather than stubbed with patterns, because
+   * these cases are about other surfaces and an offered pattern would change
+   * what the palette contains. `pending: false` says the read ANSWERED with
+   * nothing, which is the site with an empty library — the state every one of
+   * these cases was written against.
+   */
+  usePluginRoute: () => ({
+    data: undefined,
+    pending: false,
+    error: null,
+    refetch: () => {},
+  }),
+  /*
+   * The save form's write and the two helpers that phrase its refusals. Never
+   * exercised by these cases — they stop at whether the form opens — but the
+   * modules the form imports resolve them at load, so omitting one is a missing
+   * export rather than an unused stub.
+   */
+  usePluginRouteMutation: () => ({
+    write: async () => ({ message: "Pattern created.", item: { id: "p1" } }),
+    pending: false,
+    error: null,
+  }),
+  apiErrorMessage: (_error: unknown, fallback: string) => fallback,
+  validationIssues: () => [],
+  /*
+   * `schedule` is what the editor actually calls; `record`/`clear` were a shape
+   * this mock invented and nothing has. It went unnoticed because the call sits
+   * behind "the document changed since it opened", which no case here had
+   * reached — so the stub answered every question it was asked and none of the
+   * ones it would be.
+   */
+  useDocumentCheckpoint: () => ({ schedule: () => {} }),
+  useEntryFieldsPanel: () => null,
+  useReportUnsavedWork: () => {},
+  // The form's storing gate, which site style writes are tracked with.
+  useTrackedWrite: () => () => {},
+  // The session a header edited in place opens; none is opened here.
+  useDocumentSession: () => closedDocumentSession(),
+  useBeforeDocumentAction: (
+    handler: (action: string) => void | Promise<void>
+  ) => {
+    const latest = React.useRef(handler);
+    React.useEffect(() => {
+      latest.current = handler;
+    });
+    React.useEffect(() => {
+      const run = (action: string) => latest.current(action);
+      actionHandlers.add(run);
+      return () => {
+        actionHandlers.delete(run);
+      };
+    }, []);
+    beforeAction = async action => {
+      for (const run of actionHandlers) await run(action);
+    };
+  },
+  // The header's controls the bar places; drawn by the admin, not here.
+  DocumentSaveAndPublish: () => null,
+  useDocumentLifeStage: () => null,
+  useDocumentActions: () => null,
+  useSuppressAdminChrome: () => {},
+  // No preview here: the top bar's Preview draws nothing.
+  useDocumentPreview: () => null,
+  // No one signed in: the editor keeps no preferences.
+  useCurrentUserId: () => null,
+  useDocumentStatus: () => null,
+  // The editor registers its restore; nothing here offers one.
+  useDocumentRestore: () => undefined,
+  useUpdateSingleDocument: () => ({
+    mutateAsync: async () => ({ success: true }),
+    isPending: false,
+  }),
+}));
+
+// Imported after the mocks, which is what makes them take effect.
+/*
+ * The save form, replaced by a recorder.
+ *
+ * What is under test here is which DOCUMENT the editor hands over, and the real
+ * form would only let that be observed through a full submit. The form itself is
+ * exercised against the real components in `BlocksField.savePattern.test`; this
+ * file is about the editor's response to an inline outcome.
+ */
+vi.mock("./SavePatternPrompt", () => ({
+  SavePatternPrompt: ({
+    document,
+  }: {
+    document: BlockDocument | null;
+    selectedIds: readonly string[];
+    onClose: () => void;
+  }): React.JSX.Element | null => {
+    savedFrom = document;
+    return document === null ? null : <div role="dialog">save form</div>;
+  },
+}));
+
+const { PageBuilderView } = await import("./editor/PageBuilderView");
+
+/**
+ * The blocks field's declaration, as the admin hands it to the view. Typed at
+ * the boundary because `FieldConfig` is the closed union of the built-in
+ * shapes, and a contributed type such as `blocks` has no arm in it.
+ */
+const BODY_FIELD = { name: "body", type: "blocks" } as never;
+
+/**
+ * The view's way back to the edit form. Leaving is what unmounts the editor
+ * and the author's words with it, so a call here is the editor closing.
+ */
+const exit = vi.fn();
+
+/** Watches what the field writes back, which is what a save actually persists. */
+function Saved({
+  control,
+}: {
+  control: Control<FieldValues>;
+}): React.JSX.Element | null {
+  saved = useWatch({ control, name: "body" });
+  return null;
+}
+
+/** The builder's document view, open on the form's `body` field. */
+function Host(): React.JSX.Element {
+  const { control } = useForm<FieldValues>({
+    defaultValues: { body: undefined },
+  });
+  return (
+    <>
+      <PageBuilderView
+        control={control}
+        field={BODY_FIELD}
+        readOnly={false}
+        exit={exit}
+      />
+      <Saved control={control} />
+    </>
+  );
+}
+
+/** Mount the builder's view, which opens the editor. */
+function openEditor(): void {
+  render(<Host />);
+}
+
+beforeEach(() => {
+  exit.mockClear();
+  outcome = { status: "unchanged" };
+  errors.length = 0;
+  saved = undefined;
+  commits = 0;
+  savedFrom = undefined;
+  offeredSaveVerb = undefined;
+  beforeAction = undefined;
+});
+
+afterEach(() => {
+  cleanup();
+});
+
+describe("leaving the editor with an inline edit that could not be written", () => {
+  it("does not close while the passage is still holding the author's words", () => {
+    outcome = { status: "refused", reason: "moved-on" };
+
+    openEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Leave editor" }));
+
+    // Closing unmounts the canvas and the editor attached to it, and the typed
+    // passage exists nowhere else — so this is the difference between the
+    // author keeping their paragraph and losing it without being asked.
+    expect(exit).not.toHaveBeenCalled();
+    // Nor is the document handed back: a refused passage declines the whole
+    // way out, the commit included, not only the step that unmounts.
+    expect(saved).toBeUndefined();
+  });
+
+  it("tells the author why leaving did nothing", () => {
+    outcome = { status: "refused", reason: "moved-on" };
+
+    openEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Leave editor" }));
+
+    // Refusing in silence is its own defect: the exit button would simply stop
+    // working, with nothing on screen explaining it.
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("edited somewhere else");
+  });
+
+  it("says a capped passage can be shortened rather than blaming another editor", () => {
+    outcome = { status: "refused", reason: "rejected" };
+
+    openEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Leave editor" }));
+
+    expect(exit).not.toHaveBeenCalled();
+    expect(errors[0]).toContain("Shortening");
+  });
+
+  it("closes and says the typing was lost when the passage was discarded", () => {
+    // Nothing is being held, so refusing to close would trap the author in an
+    // editor they cannot leave to protect words that are already gone.
+    outcome = { status: "discarded" };
+
+    openEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Leave editor" }));
+
+    expect(exit).toHaveBeenCalledTimes(1);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("not saved");
+  });
+
+  it("says which passage is blocking when the editor could not be opened", () => {
+    // The author double-clicked and nothing happened. Without a message that is
+    // the editor appearing broken, on the one path where it is working exactly
+    // as intended — protecting words it refused to overwrite.
+    outcome = { status: "unavailable" };
+
+    openEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Leave editor" }));
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("has not been saved");
+    // Nothing is being held HERE, so leaving is not blocked.
+    expect(exit).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes silently when the edit finished normally", () => {
+    // The control. An editor that refused to close, or complained, whenever an
+    // inline edit had been open would pass every case above.
+    outcome = { status: "unchanged" };
+
+    openEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Leave editor" }));
+
+    expect(exit).toHaveBeenCalledTimes(1);
+    expect(errors).toEqual([]);
+  });
+});
+
+describe("saving with an inline edit that could not be written", () => {
+  /**
+   * A save started any way at all: the editor hosting this asks every action
+   * that stores the document to wait for what the builder registered, and that
+   * is what this calls.
+   */
+  async function save(): Promise<void> {
+    await act(async () => {
+      await beforeAction?.("save");
+    });
+  }
+
+  it("still saves the rest of the document when the passage was refused", async () => {
+    /*
+     * The opposite of leaving. Withholding the save would lose everything else
+     * the author had done in order to protect a paragraph that is not going
+     * anywhere — it stays in the editor, on screen, and the message is what
+     * tells them it is still there.
+     */
+    outcome = { status: "refused", reason: "moved-on" };
+
+    openEditor();
+    await save();
+
+    expect(saved).toMatchObject({ kind: "page" });
+    expect(exit).not.toHaveBeenCalled();
+    expect(errors).toHaveLength(1);
+  });
+
+  it("finishes the passage for a save started without the keyboard", async () => {
+    // Nothing is pressed: a button or a menu item saves through the same
+    // request, which the old shortcut listener never heard.
+    outcome = { status: "unchanged" };
+
+    openEditor();
+    expect(saved).toBeUndefined();
+    await save();
+
+    expect(saved).toMatchObject({ kind: "page" });
+  });
+
+  it("saves without complaining when the edit finished normally", async () => {
+    // The control: a message on every save would train the author to ignore it.
+    outcome = { status: "unchanged" };
+
+    openEditor();
+    await save();
+
+    expect(saved).toMatchObject({ kind: "page" });
+    expect(errors).toEqual([]);
+  });
+});
+
+describe("saving a pattern while a passage is still open", () => {
+  it("saves the COMMITTED document, not the one the editor was holding", () => {
+    /*
+     * A rich-text editor holds the author's text itself while they type — the
+     * canvas keeps the caret still — so the document the editor holds during an
+     * open passage is the one from before it. A form snapshotting that stores a
+     * pattern missing what is on screen, silently.
+     *
+     * Followed by IDENTITY rather than by counting the commit. An editor that
+     * committed and then snapshotted the stale document would satisfy a call
+     * count perfectly while doing exactly the thing this exists to prevent.
+     */
+    const written = {
+      formatVersion: 1,
+      kind: "page",
+      nodes: [
+        { id: "typed", type: "core/text", version: 1, props: { text: "new" } },
+      ],
+    } as unknown as BlockDocument;
+    outcome = { status: "written", document: written };
+    openEditor();
+
+    React.act(() => {
+      offeredSaveVerb?.();
+    });
+
+    expect(commits).toBe(1);
+    expect(savedFrom).toBe(written);
+  });
+
+  it("declines to open the form when the commit was REFUSED", () => {
+    // The same rule leaving the editor follows, and for the same reason: the
+    // words are in the passage and nowhere else. Opening a modal over them
+    // invites the author to save a pattern without the text they just wrote,
+    // and to walk away from the passage while they are at it.
+    outcome = { status: "refused", reason: "Too large." };
+    openEditor();
+
+    React.act(() => {
+      offeredSaveVerb?.();
+    });
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // And nothing was handed over, so there is no document waiting to be saved
+    // from behind a form that did not open.
+    expect(savedFrom).toBeNull();
+  });
+
+  it("opens it when the commit went through", () => {
+    // The control. Without it the case above passes against an editor whose
+    // save verb never opens anything.
+    openEditor();
+
+    React.act(() => {
+      offeredSaveVerb?.();
+    });
+
+    expect(screen.getByRole("dialog")).toBeTruthy();
+  });
+});

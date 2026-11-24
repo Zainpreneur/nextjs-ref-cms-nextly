@@ -1,0 +1,892 @@
+import { runInNewContext } from "node:vm";
+
+import { afterEach, describe, expect, it } from "vitest";
+import { z } from "zod";
+
+import type { FieldConfig } from "@nextly/collections";
+import type { DynamicCollectionRecord } from "../../../schemas/dynamic-collections/types";
+import {
+  clearFieldTypes,
+  registerFieldType,
+} from "../field-types/field-type-registry";
+import { ZodGenerator } from "./zod-generator";
+
+const createCollection = (
+  fields: FieldConfig[],
+  overrides?: Partial<DynamicCollectionRecord>
+): DynamicCollectionRecord =>
+  ({
+    slug: "article",
+    labels: { singular: "Article", plural: "Articles" },
+    description: "Article collection description",
+    timestamps: true,
+    fields,
+    ...overrides,
+  }) as unknown as DynamicCollectionRecord;
+
+/**
+ * Extracts a field's generated schema definition line from the schema code.
+ * e.g., returns "z.string().min(5).max(50)" for a line `  title: z.string().min(5).max(50),`
+ */
+function extractFieldSchema(
+  code: string,
+  fieldName: string
+): string | undefined {
+  const line = code
+    .split("\n")
+    .find(l => l.trimStart().startsWith(`${fieldName}:`));
+  if (!line) return undefined;
+  const afterColon = line.substring(line.indexOf(":") + 1).trim();
+  return afterColon.endsWith(",") ? afterColon.slice(0, -1) : afterColon;
+}
+
+/**
+ * Extracts the inner schema string of a nested group field `groupName`.
+ * e.g., for `  meta: z.object({ title: z.string() }),`, returns `title: z.string()`
+ */
+function extractGroupObjectInner(
+  code: string,
+  groupName: string
+): string | undefined {
+  const line = code
+    .split("\n")
+    .find(l => l.trimStart().startsWith(`${groupName}:`));
+  if (!line) return undefined;
+  const trimmed = line.trim();
+  const prefix = `${groupName}: z.object({`;
+  const startIdx = trimmed.indexOf(prefix);
+  if (startIdx === -1) return undefined;
+  const afterPrefix = trimmed.substring(startIdx + prefix.length);
+  return afterPrefix.replace(/\s*\}\),?$/, "").trim();
+}
+
+afterEach(() => {
+  clearFieldTypes();
+});
+
+describe("ZodGenerator — Top-level vs Nested equivalence", () => {
+  const testCases: Array<{
+    kind: string;
+    field: FieldConfig;
+  }> = [
+    {
+      kind: "text with min/max and required",
+      field: {
+        name: "testField",
+        type: "text",
+        minLength: 5,
+        maxLength: 100,
+        required: true,
+      } as FieldConfig,
+    },
+    {
+      kind: "text with hasMany and min/max rows",
+      field: {
+        name: "testField",
+        type: "text",
+        hasMany: true,
+        minRows: 2,
+        maxRows: 10,
+        required: false,
+      } as FieldConfig,
+    },
+    {
+      kind: "textarea with min/max length",
+      field: {
+        name: "testField",
+        type: "textarea",
+        minLength: 10,
+        maxLength: 500,
+        required: true,
+      } as FieldConfig,
+    },
+    {
+      kind: "password with min/max length",
+      field: {
+        name: "testField",
+        type: "password",
+        minLength: 8,
+        maxLength: 64,
+        required: true,
+      } as FieldConfig,
+    },
+    {
+      kind: "email required",
+      field: {
+        name: "testField",
+        type: "email",
+        required: true,
+      } as FieldConfig,
+    },
+    {
+      kind: "icon required",
+      field: {
+        name: "testField",
+        type: "icon",
+        required: true,
+      } as FieldConfig,
+    },
+    {
+      kind: "richtext optional",
+      field: {
+        name: "testField",
+        type: "richText",
+        required: false,
+      } as FieldConfig,
+    },
+    {
+      kind: "code field",
+      field: {
+        name: "testField",
+        type: "code",
+        required: true,
+      } as FieldConfig,
+    },
+    {
+      kind: "number with min/max",
+      field: {
+        name: "testField",
+        type: "number",
+        min: 0,
+        max: 100,
+        required: true,
+      } as FieldConfig,
+    },
+    {
+      kind: "number with hasMany",
+      field: {
+        name: "testField",
+        type: "number",
+        hasMany: true,
+        minRows: 1,
+        maxRows: 5,
+        required: false,
+      } as FieldConfig,
+    },
+    {
+      kind: "checkbox field",
+      field: {
+        name: "testField",
+        type: "checkbox",
+        required: true,
+      } as FieldConfig,
+    },
+    {
+      kind: "date field",
+      field: {
+        name: "testField",
+        type: "date",
+        required: true,
+      } as FieldConfig,
+    },
+    {
+      kind: "select field with options",
+      field: {
+        name: "testField",
+        type: "select",
+        options: [
+          { label: "Draft", value: "draft" },
+          { label: "Published", value: "published" },
+          { label: "Archived", value: "archived" },
+        ],
+        required: true,
+      } as FieldConfig,
+    },
+    {
+      kind: "select field with hasMany",
+      field: {
+        name: "testField",
+        type: "select",
+        options: [
+          { label: "Tech", value: "tech" },
+          { label: "News", value: "news" },
+        ],
+        hasMany: true,
+        required: false,
+      } as FieldConfig,
+    },
+    {
+      kind: "radio field with options",
+      field: {
+        name: "testField",
+        type: "radio",
+        options: [
+          { label: "Light", value: "light" },
+          { label: "Dark", value: "dark" },
+        ],
+        required: true,
+      } as FieldConfig,
+    },
+    {
+      kind: "upload field single",
+      field: {
+        name: "testField",
+        type: "upload",
+        required: true,
+      } as FieldConfig,
+    },
+    {
+      kind: "upload field with hasMany",
+      field: {
+        name: "testField",
+        type: "upload",
+        hasMany: true,
+        required: false,
+      } as FieldConfig,
+    },
+    {
+      kind: "relationship field single",
+      field: {
+        name: "testField",
+        type: "relationship",
+        relationTo: "users",
+        required: true,
+      } as FieldConfig,
+    },
+    {
+      kind: "relationship field polymorphic hasMany",
+      field: {
+        name: "testField",
+        type: "relationship",
+        relationTo: ["users", "teams"],
+        hasMany: true,
+        required: false,
+      } as FieldConfig,
+    },
+    {
+      kind: "json field",
+      field: {
+        name: "testField",
+        type: "json",
+        required: false,
+      } as FieldConfig,
+    },
+    {
+      kind: "chips field with min/max",
+      field: {
+        name: "testField",
+        type: "chips",
+        minChips: 1,
+        maxChips: 5,
+        required: true,
+      } as FieldConfig,
+    },
+  ];
+
+  for (const { kind, field } of testCases) {
+    it(`produces equivalent Zod schema top-level vs nested for ${kind}`, () => {
+      const gen = new ZodGenerator({ includeComments: false });
+
+      // Top-level field
+      const topCol = createCollection([field]);
+      const topResult = gen.generateSchema(topCol);
+      const topSchema = extractFieldSchema(topResult.code, "testField");
+
+      // Nested inside a group
+      const nestedGroupField: FieldConfig = {
+        name: "nestedGroup",
+        type: "group",
+        required: true,
+        fields: [field],
+      } as FieldConfig;
+      const nestedCol = createCollection([nestedGroupField]);
+      const nestedResult = gen.generateSchema(nestedCol);
+      const nestedInner = extractGroupObjectInner(
+        nestedResult.code,
+        "nestedGroup"
+      );
+
+      expect(topSchema).toBeDefined();
+      expect(nestedInner).toBeDefined();
+      expect(nestedInner).toBe(`testField: ${topSchema}`);
+    });
+  }
+});
+
+describe("ZodGenerator — Individual Field Generation", () => {
+  const gen = new ZodGenerator({ includeComments: false });
+
+  it("generates string validation with min and max for text fields", () => {
+    const col = createCollection([
+      {
+        name: "title",
+        type: "text",
+        minLength: 3,
+        maxLength: 50,
+        required: true,
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain("title: z.string().min(3).max(50),");
+  });
+
+  it("generates array of strings for text fields with hasMany", () => {
+    const col = createCollection([
+      {
+        name: "tags",
+        type: "text",
+        hasMany: true,
+        minRows: 1,
+        maxRows: 5,
+        required: false,
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain(
+      "tags: z.array(z.string()).min(1).max(5).nullish(),"
+    );
+  });
+
+  it("generates number schema with min and max bounds", () => {
+    const col = createCollection([
+      {
+        name: "rating",
+        type: "number",
+        min: 1,
+        max: 5,
+        required: true,
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain("rating: z.number().min(1).max(5),");
+  });
+
+  it("generates enum schema for select fields with options", () => {
+    const col = createCollection([
+      {
+        name: "status",
+        type: "select",
+        options: [
+          { label: "Active", value: "active" },
+          { label: "Pending", value: "pending" },
+          { label: "Disabled", value: "disabled" },
+        ],
+        required: true,
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain(
+      'status: z.enum(["active", "pending", "disabled"]),'
+    );
+  });
+
+  it("falls back to z.string() for select fields with empty options", () => {
+    const col = createCollection([
+      {
+        name: "emptySelect",
+        type: "select",
+        options: [],
+        required: true,
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain("emptySelect: z.string(),");
+  });
+
+  it("generates enum schema for radio fields", () => {
+    const col = createCollection([
+      {
+        name: "plan",
+        type: "radio",
+        options: [
+          { label: "Free", value: "free" },
+          { label: "Pro", value: "pro" },
+        ],
+        required: true,
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain('plan: z.enum(["free", "pro"]),');
+  });
+
+  it("generates datetime schema for date fields", () => {
+    const col = createCollection([
+      {
+        name: "publishedAt",
+        type: "date",
+        required: false,
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain("publishedAt: z.string().datetime().nullish(),");
+  });
+
+  it("generates boolean schema for checkbox fields", () => {
+    const col = createCollection([
+      {
+        name: "isFeatured",
+        type: "checkbox",
+        required: true,
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain("isFeatured: z.boolean(),");
+  });
+
+  it("generates email validation for email fields", () => {
+    const col = createCollection([
+      {
+        name: "contactEmail",
+        type: "email",
+        required: true,
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain("contactEmail: z.string().email(),");
+  });
+
+  it("generates an icon id shape check that parses ids and refuses other strings", () => {
+    const col = createCollection([
+      { name: "badge", type: "icon", required: true } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    const expression = extractFieldSchema(code, "badge");
+    expect(expression).toBeDefined();
+    // The generated source is evaluated against the same zod it imports, so
+    // what is asserted is the schema a consumer actually runs.
+    const schema = runInNewContext(String(expression), { z }) as z.ZodType;
+    expect(schema.safeParse("lucide:star").success).toBe(true);
+    // Only the shape is judged: an unregistered set still parses.
+    expect(schema.safeParse("acme:rocket-2").success).toBe(true);
+    expect(schema.safeParse("Star").success).toBe(false);
+    expect(schema.safeParse("lucide:").success).toBe(false);
+    expect(schema.safeParse("lucide:Star").success).toBe(false);
+    // No longer than the varchar(255) column the id is stored in.
+    const longest = `lucide:${"a".repeat(255 - "lucide:".length)}`;
+    expect(schema.safeParse(longest).success).toBe(true);
+    expect(schema.safeParse(`${longest}a`).success).toBe(false);
+  });
+
+  it('lets an optional icon field be cleared to "", and a required one not', () => {
+    const col = createCollection([
+      { name: "badge", type: "icon" } as FieldConfig,
+      { name: "mark", type: "icon", required: true } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    const parse = (name: string): z.ZodType =>
+      runInNewContext(String(extractFieldSchema(code, name)), {
+        z,
+      }) as z.ZodType;
+    const optional = parse("badge");
+    // "" is what the admin clears an optional icon to.
+    expect(optional.safeParse("").success).toBe(true);
+    expect(optional.safeParse(null).success).toBe(true);
+    expect(optional.safeParse(undefined).success).toBe(true);
+    expect(optional.safeParse("lucide:star").success).toBe(true);
+    // Any other string is still judged by its shape and length.
+    expect(optional.safeParse("Star").success).toBe(false);
+    expect(optional.safeParse(" ").success).toBe(false);
+    expect(
+      optional.safeParse(`lucide:${"a".repeat(255 - "lucide:".length)}a`)
+        .success
+    ).toBe(false);
+    const required = parse("mark");
+    expect(required.safeParse("").success).toBe(false);
+    expect(required.safeParse("lucide:star").success).toBe(true);
+  });
+
+  it('refuses "" for an icon required by `validation: { required: true }`', () => {
+    // The Schema Builder's spelling of a requirement. The entry validator
+    // refuses "" for it as missing, so the generated schema must too.
+    const col = createCollection([
+      {
+        name: "mark",
+        type: "icon",
+        validation: { required: true },
+      } as unknown as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    const schema = runInNewContext(String(extractFieldSchema(code, "mark")), {
+      z,
+    }) as z.ZodType;
+    expect(schema.safeParse("").success).toBe(false);
+    expect(schema.safeParse("lucide:star").success).toBe(true);
+  });
+
+  it("generates polymorphic schema for upload fields with array relationTo", () => {
+    const col = createCollection([
+      {
+        name: "attachment",
+        type: "upload",
+        relationTo: ["images", "documents"],
+        required: true,
+      } as unknown as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain(
+      "attachment: z.object({ relationTo: z.string(), value: z.string() }),"
+    );
+  });
+
+  it("generates polymorphic array schema for upload fields with relationTo and hasMany", () => {
+    const col = createCollection([
+      {
+        name: "attachments",
+        type: "upload",
+        relationTo: ["images", "documents"],
+        hasMany: true,
+        required: false,
+      } as unknown as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain("attachments: z.array(z.string()).nullish(),");
+  });
+
+  it("generates polymorphic array schema for relationship fields with hasMany", () => {
+    const col = createCollection([
+      {
+        name: "relatedItems",
+        type: "relationship",
+        relationTo: ["posts", "pages"],
+        hasMany: true,
+        required: true,
+      } as unknown as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain(
+      "relatedItems: z.array(z.object({ relationTo: z.string(), value: z.string() })),"
+    );
+  });
+
+  it("generates chips schema with minChips and maxChips", () => {
+    const col = createCollection([
+      {
+        name: "keywords",
+        type: "chips",
+        minChips: 2,
+        maxChips: 8,
+        required: true,
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain("keywords: z.array(z.string()).min(2).max(8),");
+  });
+
+  it("generates z.any() for JSON fields", () => {
+    const col = createCollection([
+      {
+        name: "metadata",
+        type: "json",
+        required: false,
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain("metadata: z.any().nullish(),");
+  });
+
+  it("generates empty object schema for groups without data fields", () => {
+    const col = createCollection([
+      {
+        name: "emptyGroup",
+        type: "group",
+        fields: [],
+        required: true,
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain("emptyGroup: z.object({}),");
+  });
+});
+
+describe("ZodGenerator — Nested Recursion Depth", () => {
+  const gen = new ZodGenerator({ includeComments: false });
+
+  it("handles group nested inside another group", () => {
+    const col = createCollection([
+      {
+        name: "level1",
+        type: "group",
+        required: true,
+        fields: [
+          {
+            name: "level2",
+            type: "group",
+            required: true,
+            fields: [
+              {
+                name: "deepText",
+                type: "text",
+                minLength: 4,
+                required: true,
+              } as FieldConfig,
+            ],
+          } as FieldConfig,
+        ],
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain(
+      "level1: z.object({ level2: z.object({ deepText: z.string().min(4) }) }),"
+    );
+  });
+
+  it("handles repeater nested inside a group", () => {
+    const col = createCollection([
+      {
+        name: "configGroup",
+        type: "group",
+        required: true,
+        fields: [
+          {
+            name: "items",
+            type: "repeater",
+            minRows: 1,
+            maxRows: 3,
+            required: true,
+            fields: [
+              {
+                name: "key",
+                type: "text",
+                required: true,
+              } as FieldConfig,
+              {
+                name: "value",
+                type: "number",
+                required: false,
+              } as FieldConfig,
+            ],
+          } as FieldConfig,
+        ],
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain(
+      // Each row carries its saved id, optional as a create may leave it out.
+      "configGroup: z.object({ items: z.array(z.object({ id: z.string().optional(), key: z.string(), value: z.number().nullish() })).min(1).max(3) }),"
+    );
+  });
+
+  it("handles group nested inside a repeater", () => {
+    const col = createCollection([
+      {
+        name: "sections",
+        type: "repeater",
+        required: true,
+        fields: [
+          {
+            name: "header",
+            type: "group",
+            required: true,
+            fields: [
+              {
+                name: "title",
+                type: "text",
+                required: true,
+              } as FieldConfig,
+            ],
+          } as FieldConfig,
+        ],
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain(
+      "sections: z.array(z.object({ id: z.string().optional(), header: z.object({ title: z.string() }) })),"
+    );
+  });
+});
+
+describe("ZodGenerator — repeater row ids", () => {
+  it("leaves a row's own id field to the author, adding no saved id beside it", () => {
+    const gen = new ZodGenerator({ includeComments: false });
+    const col = createCollection([
+      {
+        name: "codes",
+        type: "repeater",
+        required: true,
+        fields: [{ name: "id", type: "number", required: true } as FieldConfig],
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain("codes: z.array(z.object({ id: z.number() })),");
+  });
+});
+
+describe("ZodGenerator — Plugin Fields & Storage Fallback", () => {
+  it("emits custom plugin zod schema with parentheses when provided", () => {
+    registerFieldType({
+      type: "rating",
+      storage: "number",
+      component: "@acme/ratings#Rating",
+      codegen: {
+        zodSchema: () => "z.number().min(1).max(5)",
+      },
+    });
+
+    const gen = new ZodGenerator({ includeComments: false });
+    const col = createCollection([
+      {
+        name: "userScore",
+        type: "rating",
+        required: false,
+      } as unknown as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain("userScore: (z.number().min(1).max(5)).nullish(),");
+  });
+
+  it("falls back to storage type schema when plugin declares no zodSchema", () => {
+    registerFieldType({
+      type: "custom-count",
+      storage: "number",
+      component: "@acme/count#Count",
+    });
+
+    const gen = new ZodGenerator({ includeComments: false });
+    const col = createCollection([
+      {
+        name: "count",
+        type: "custom-count",
+        required: true,
+      } as unknown as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain("count: z.number(),");
+  });
+
+  it("handles plugin storage fallback inside nested group", () => {
+    registerFieldType({
+      type: "custom-badge",
+      storage: "text",
+      component: "@acme/badge#Badge",
+    });
+
+    const gen = new ZodGenerator({ includeComments: false });
+    const col = createCollection([
+      {
+        name: "details",
+        type: "group",
+        required: true,
+        fields: [
+          {
+            name: "badge",
+            type: "custom-badge",
+            required: false,
+          } as unknown as FieldConfig,
+        ],
+      } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain(
+      "details: z.object({ badge: z.string().nullish() }),"
+    );
+  });
+});
+
+describe("ZodGenerator — Schema Variants & Exports", () => {
+  it("generates Base, CreateInput (omits id/timestamps), and UpdateInput (partial except id) schemas", () => {
+    const gen = new ZodGenerator({
+      includeComments: true,
+      generateTypes: true,
+    });
+    const col = createCollection([
+      { name: "title", type: "text", required: true } as FieldConfig,
+      { name: "body", type: "textarea", required: false } as FieldConfig,
+    ]);
+    const { code, filename, collectionSlug } = gen.generateSchema(col);
+
+    expect(filename).toBe("article.zod.ts");
+    expect(collectionSlug).toBe("article");
+
+    // Base Schema
+    expect(code).toContain("export const ArticleSchema = z.object({");
+    expect(code).toContain("  id: z.string(),");
+    expect(code).toContain("  title: z.string(),");
+    expect(code).toContain("  body: z.string().nullish(),");
+    expect(code).toContain("  createdAt: z.string().datetime(),");
+    expect(code).toContain("  updatedAt: z.string().datetime(),");
+
+    // Create Input Schema
+    expect(code).toContain(
+      "export const ArticleCreateInputSchema = ArticleSchema.omit({\n  id: true,\n  _rev: true,\n  createdAt: true,\n  updatedAt: true,\n});"
+    );
+
+    // Update Input Schema
+    expect(code).toContain(
+      "export const ArticleUpdateInputSchema = ArticleSchema.partial()\n  .required({ id: true })\n  .extend({ _overwrite: z.boolean().optional() });"
+    );
+
+    // Type Exports
+    expect(code).toContain(
+      "export type Article = z.infer<typeof ArticleSchema>;"
+    );
+    expect(code).toContain(
+      "export type ArticleCreateInput = z.infer<typeof ArticleCreateInputSchema>;"
+    );
+    expect(code).toContain(
+      "export type ArticleUpdateInput = z.infer<typeof ArticleUpdateInputSchema>;"
+    );
+  });
+
+  it("respects schemaPrefix option", () => {
+    const gen = new ZodGenerator({ schemaPrefix: "Cms" });
+    const col = createCollection([
+      { name: "title", type: "text", required: true } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).toContain("export const CmsArticleSchema = z.object({");
+    expect(code).toContain(
+      "export const CmsArticleCreateInputSchema = CmsArticleSchema.omit({"
+    );
+    expect(code).toContain(
+      "export const CmsArticleUpdateInputSchema = CmsArticleSchema.partial()"
+    );
+  });
+
+  it("omits type exports when generateTypes is false", () => {
+    const gen = new ZodGenerator({ generateTypes: false });
+    const col = createCollection([
+      { name: "title", type: "text", required: true } as FieldConfig,
+    ]);
+    const { code } = gen.generateSchema(col);
+    expect(code).not.toContain("export type Article =");
+  });
+
+  it("generates index file with sorted exports for multiple collections", () => {
+    const gen = new ZodGenerator();
+    const cols = [
+      createCollection([], { slug: "posts" }),
+      createCollection([], { slug: "authors" }),
+      createCollection([], { slug: "categories" }),
+    ];
+
+    const indexFile = gen.generateIndexFile(cols);
+    expect(indexFile.filename).toBe("index.ts");
+    expect(indexFile.code).toContain('export * from "./authors.zod";');
+    expect(indexFile.code).toContain('export * from "./categories.zod";');
+    expect(indexFile.code).toContain('export * from "./posts.zod";');
+
+    const authorIdx = indexFile.code.indexOf('"./authors.zod"');
+    const catIdx = indexFile.code.indexOf('"./categories.zod"');
+    const postIdx = indexFile.code.indexOf('"./posts.zod"');
+    expect(authorIdx).toBeLessThan(catIdx);
+    expect(catIdx).toBeLessThan(postIdx);
+  });
+
+  it("generates all schemas with generateAllSchemas", () => {
+    const gen = new ZodGenerator();
+    const cols = [
+      createCollection([], { slug: "posts" }),
+      createCollection([], { slug: "authors" }),
+    ];
+    const results = gen.generateAllSchemas(cols);
+    expect(results).toHaveLength(2);
+    expect(results[0].collectionSlug).toBe("posts");
+    expect(results[1].collectionSlug).toBe("authors");
+  });
+});
+
+describe("ZodGenerator — where the schema file gets Zod", () => {
+  // The schema files are written into the app, which depends on `nextly` but
+  // not necessarily on `zod`: under pnpm or Yarn Plug'n'Play a bare `zod` import
+  // does not resolve there. `nextly/zod` re-exports the Zod Nextly itself uses.
+  it("imports z from nextly/zod, never from zod directly", () => {
+    const { code } = new ZodGenerator({
+      includeComments: false,
+    }).generateSchema(
+      createCollection([{ name: "title", type: "text" } as FieldConfig])
+    );
+
+    expect(code).toContain('import { z } from "nextly/zod";');
+    expect(code).not.toMatch(/from ["']zod["']/);
+  });
+});

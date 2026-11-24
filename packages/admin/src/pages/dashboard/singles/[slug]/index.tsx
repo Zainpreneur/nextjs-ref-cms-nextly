@@ -1,0 +1,569 @@
+/**
+ * Single Edit Page
+ *
+ * Page component for editing Single documents.
+ * Unlike collection entries, Singles don't have a list view -
+ * this page renders directly as the edit form.
+ *
+ * Features:
+ * - Fetches Single schema and document data
+ * - Renders SingleForm with all field types
+ * - Auto-save and draft recovery
+ * - Unsaved changes protection
+ * - Toast notifications on save
+ *
+ * @module pages/dashboard/singles/[slug]
+ * @since 1.0.0
+ */
+
+import { Alert, AlertDescription, Button } from "@nextlyhq/ui";
+import { useQueryClient } from "@tanstack/react-query";
+import type { FieldConfig } from "nextly/config";
+import type React from "react";
+import { useCallback, useRef } from "react";
+
+import { usePinAction } from "@admin/components/features/dashboard/pin-action";
+import type { DocumentViewMount } from "@admin/components/features/entries/EntryForm";
+import { documentViewMount } from "@admin/components/features/entries/EntryForm/document-view-mount";
+import { DOCUMENT_COLUMN_INSET } from "@admin/components/features/entries/EntryForm/DocumentEditorLayout";
+import { DocumentViewGate } from "@admin/components/features/entries/EntryForm/DocumentViewGate";
+import { usePublishPartsAction } from "@admin/components/features/entries/publish-parts/usePublishPartsAction";
+import { languageLabelOf } from "@admin/components/features/entries/publishAllOutcomes";
+import {
+  isRemovedFromCode,
+  removedEntityHasNoTable,
+} from "@admin/components/features/entries/removed-from-code-notice";
+import { RemovedFromCodeNotice } from "@admin/components/features/entries/RemovedFromCodeNotice";
+import { useScheduleDocumentAction } from "@admin/components/features/releases/ScheduleDocumentAction";
+import { ScheduledReleaseBanner } from "@admin/components/features/releases/ScheduledReleaseBanner";
+import {
+  SingleForm,
+  type SingleSchema,
+} from "@admin/components/features/singles";
+import {
+  CONTENT_MEASURE_LENGTH,
+  CONTENT_PAGE_MEASURE,
+} from "@admin/components/layout/content-measure";
+import { MeasuredPageFrame } from "@admin/components/layout/MeasuredPageFrame";
+import { PageContainer } from "@admin/components/layout/page-container";
+import { PageErrorFallback } from "@admin/components/shared/error-fallbacks";
+import { EditorOutline } from "@admin/components/shared/loading-frame/outlines";
+import { QueryErrorBoundary } from "@admin/components/shared/query-error-boundary";
+import { toast } from "@admin/components/ui";
+import { Link } from "@admin/components/ui/link";
+import { ROUTES, buildRoute } from "@admin/constants/routes";
+import { usePlaceStartupReads } from "@admin/hooks/queries/usePluginRoute";
+import { useSingleEditorDocument } from "@admin/hooks/queries/useSingleEditorDocument";
+import {
+  singleDocumentKeys,
+  useSingleSchema,
+  useUpdateSingleDocument,
+} from "@admin/hooks/queries/useSingles";
+import { useEditorLocale } from "@admin/hooks/useEditorLocale";
+import { useLocalization } from "@admin/hooks/useLocalization";
+import {
+  type RefusedForm,
+  reloadDocument,
+  useSharedFieldsRecovery,
+} from "@admin/hooks/useSharedFieldsRecovery";
+import { useTranslationMode } from "@admin/hooks/useTranslationMode";
+import { apiErrorMessage } from "@admin/lib/api/parseApiError";
+import { staleVersionOf, type ShownCopy } from "@admin/lib/document-version";
+import { navigateTo } from "@admin/lib/navigation";
+import { documentViewMissing } from "@admin/lib/plugins/document-view-registry";
+
+// ============================================================================
+// Types
+// ============================================================================
+
+interface SingleEditPageProps {
+  /**
+   * `view` is present on a document-view address
+   * (`/admin/singles/<slug>/<view>`), which this page also answers.
+   */
+  params?: { slug?: string; view?: string };
+}
+
+// ============================================================================
+// Sub-components
+// ============================================================================
+
+/**
+ * Loading skeleton for the Single edit page.
+ */
+function SingleEditPageSkeleton() {
+  // The editor's outline, the one the frame drew for this address while the
+  // session was checked: the bar's controls at once, then the fields and the
+  // side panel at the editor's own geometry.
+  return (
+    <EditorOutline
+      sideWidth={360}
+      columnClassName={DOCUMENT_COLUMN_INSET}
+      columnStyle={{ maxWidth: CONTENT_MEASURE_LENGTH }}
+    />
+  );
+}
+
+// ============================================================================
+// Component
+// ============================================================================
+
+/**
+ * The Single's fields, once its schema has loaded. Loosely typed as the schema
+ * API serves them; the same runtime fields the form renders (see the cast at
+ * `SingleForm` below).
+ */
+function formFieldsOf(
+  schema: { fields?: unknown } | undefined
+): FieldConfig[] | undefined {
+  return schema?.fields as FieldConfig[] | undefined;
+}
+
+/**
+ * Single Edit Page
+ *
+ * Displays a form for editing a Single document.
+ * The form fields are dynamically generated based on the Single schema.
+ *
+ * Unlike collection entry pages, Singles:
+ * - Go directly to edit form (no list view)
+ * - Cannot be deleted
+ * - Auto-create if accessed before any data exists
+ *
+ * @param props - Page props with route params
+ * @returns Single edit page component
+ */
+export default function SingleEditPage({
+  params,
+}: SingleEditPageProps): React.ReactElement {
+  const slug = params?.slug;
+  // What the parts plugins add to this page read as they open, started as
+  // the page first renders, as the entry editor's are.
+  // The page's own place, and the form inside its editor, whose document id
+  // is not known until the Single has loaded: a read naming it is not
+  // started, and its part reads it on mounting.
+  const partsStartup = usePlaceStartupReads([
+    { place: "single.edit", ids: slug === undefined ? null : { single: slug } },
+    {
+      place: "entry.form",
+      ids: slug === undefined ? null : { kind: "single", slug, entryId: null },
+    },
+  ]);
+
+  // i18n: active content language for this editor. `undefined` = the app's default locale (the
+  // backend resolves it). Switching triggers a refetch (useSingleDocument is keyed by locale) and
+  // routes saves to the chosen language. Inert for non-localized singles.
+  const { locale, changeLocale, seedFromLocale, clearSeed } = useEditorLocale();
+  const {
+    defaultLocale,
+    enabled: localizationEnabled,
+    locales,
+  } = useLocalization();
+
+  // Fetch Single schema (field definitions)
+  const {
+    data: schema,
+    isLoading: isLoadingSchema,
+    error: schemaError,
+  } = useSingleSchema(slug);
+
+  const { translateFrom, enterTranslationMode, exitTranslationMode } =
+    useTranslationMode({
+      activeLocale: locale,
+      defaultLocale,
+    });
+
+  // What this editor reads: the document it edits, and — while translating — the
+  // source-language document shown alongside it.
+  const {
+    document,
+    isLoading: isLoadingDocument,
+    error: documentError,
+    sourceDoc,
+    isNonDefaultLocale,
+    latest,
+  } = useSingleEditorDocument({
+    slug,
+    locale,
+    defaultLocale,
+    localizationEnabled,
+    // Ask for the pending change only where the split applies. The server gates
+    // it on an actual update-capability probe regardless.
+    draftsEnabled: schema?.draftsEnabled === true,
+    translateFrom,
+    fields: formFieldsOf(schema),
+  });
+
+  /*
+   * Above this page's loading and error returns, because it is a hook. What it
+   * produces is only read once those guards pass; while the schema or the
+   * document is still loading it reports no action, which is correct.
+   */
+  // The reader's own pin of this Single, offered beside "Schedule…".
+  const pin = usePinAction(
+    document && slug ? { targetType: "single", targetSlug: slug } : null
+  );
+  // Schedule…, on the Publish split: on its own at a time, with a release or
+  // in a new one. A release of its own is named after the Single.
+  const schedule = useScheduleDocumentAction({
+    scopeKind: "single",
+    scopeSlug: slug,
+    entryId: document?.id,
+    lifecycleEnabled: schema?.status,
+    onDefaultLocale: !isNonDefaultLocale,
+    // A Single is named by its schema, not by a field the form holds.
+    documentTitle: () => schema?.label || slug,
+    // With no drafts, a save of a live Single is published at once.
+    savesGoLive:
+      schema?.draftsEnabled !== true && document?.status === "published",
+    // A release moves every language of a translated Single together.
+    languages:
+      localizationEnabled && schema?.localized === true
+        ? locales.map(each => each.label)
+        : undefined,
+  });
+
+  // "Choose what to publish…", on the Publish split: each language of a translated Single, and
+  // separately its shared fields; a Single that is not translated offers its shared fields, which
+  // are the whole document.
+  // How to read the copy the editor shows, filled by the editor once it is drawn, so a publish
+  // of chosen parts is refused when the Single changed since the editor opened it.
+  const shownCopy = useRef<(() => ShownCopy) | null>(null);
+  const publishParts = usePublishPartsAction({
+    target: slug && document ? { kind: "single", slug } : undefined,
+    shown: () => shownCopy.current?.(),
+    lifecycleEnabled: schema?.status,
+    languages:
+      localizationEnabled && schema?.localized === true
+        ? locales.map(each => each.code)
+        : [],
+    labelOf: languageLabelOf(locales),
+    currentLocale: locale,
+    defaultLocale,
+    sharedPending:
+      (document as { _sharedChangesPending?: unknown } | undefined)
+        ?._sharedChangesPending === true,
+  });
+
+  // Update mutation — routes the save to the active language's companion row.
+  const { mutateAsync: updateDocument, isPending: isUpdating } =
+    useUpdateSingleDocument(slug || "", locale);
+
+  // Above the page's returns, as a hook.
+  const reportSaveFailure = useSingleSaveFailure({
+    slug,
+    document,
+    locale,
+    schema,
+  });
+
+  const isLoading = isLoadingSchema || isLoadingDocument;
+  const error = schemaError || documentError;
+
+  /**
+   * The page's measure, on every branch.
+   *
+   * `CONTENT_PAGE_MEASURE` rather than a literal: a Single is a document, and
+   * it shares the translation pane with entries — the pane stops padding where
+   * the editor goes edge-to-edge, so a Single rendering into an UNMEASURED page
+   * would be the one consumer still expecting that padding to be there.
+   *
+   * Every branch carries it — loading, each error state, and the editor —
+   * because they are the SAME page at different moments. Measuring only the
+   * editor would leave the skeleton full-width and reflow the page the instant
+   * data arrived.
+   */
+
+  // Missing slug error state
+  if (!slug) {
+    return (
+      <PageContainer width={CONTENT_PAGE_MEASURE}>
+        <Alert variant="destructive">
+          <AlertDescription>
+            No Single was specified in the URL.
+          </AlertDescription>
+        </Alert>
+        <div className="mt-6">
+          <Link href={ROUTES.BUILDER_SINGLES}>
+            <Button variant="outline">← Back to Singles</Button>
+          </Link>
+        </div>
+      </PageContainer>
+    );
+  }
+
+  // Loading state
+  if (isLoading) {
+    return <SingleEditPageSkeleton />;
+  }
+
+  // A Single removed from code is named, with its next step, above whatever
+  // else this page has to say; where its table is gone, in place of the
+  // failed read, which says nothing the notice does not.
+  const removedFromCode = isRemovedFromCode(schema);
+  const removedNotice =
+    schema && removedFromCode ? (
+      <RemovedFromCodeNotice
+        entity={{ kind: "single", label: schema.label || slug, slug }}
+        state={schema.removedFromCodeState}
+      />
+    ) : null;
+
+  if (error && removedEntityHasNoTable(schema)) {
+    return (
+      <PageContainer width={CONTENT_PAGE_MEASURE}>
+        {removedNotice}
+        <div className="mt-6">
+          <Link href={ROUTES.BUILDER_SINGLES}>
+            <Button variant="outline">← Back to Singles</Button>
+          </Link>
+        </div>
+      </PageContainer>
+    );
+  }
+
+  // Error state: no Single to show. A failed re-read of the Single on screen
+  // keeps the editor, read-only until a read succeeds.
+  if (error) {
+    return (
+      <PageContainer width={CONTENT_PAGE_MEASURE}>
+        {removedNotice ? <div className="mb-6">{removedNotice}</div> : null}
+        <Alert variant="destructive">
+          {/* The server's message as it is: it already says what went wrong
+              ("Not found.", "You can't see Home."). */}
+          <AlertDescription>
+            {apiErrorMessage(error, "The Single couldn't be loaded.")}
+          </AlertDescription>
+        </Alert>
+        <div className="mt-6">
+          <Link href={ROUTES.BUILDER_SINGLES}>
+            <Button variant="outline">← Back to Singles</Button>
+          </Link>
+        </div>
+      </PageContainer>
+    );
+  }
+
+  // Schema not found
+  if (!schema) {
+    return (
+      <PageContainer width={CONTENT_PAGE_MEASURE}>
+        <Alert variant="destructive">
+          <AlertDescription>
+            Single &quot;{slug}&quot; not found.
+          </AlertDescription>
+        </Alert>
+        <div className="mt-6">
+          <Link href={ROUTES.BUILDER_SINGLES}>
+            <Button variant="outline">← Back to Singles</Button>
+          </Link>
+        </div>
+      </PageContainer>
+    );
+  }
+
+  // Document not found (should auto-create, but handle edge case)
+  if (!document) {
+    return (
+      <PageContainer width={CONTENT_PAGE_MEASURE}>
+        <Alert variant="destructive">
+          <AlertDescription>
+            Failed to load document data for Single &quot;{slug}&quot;.
+          </AlertDescription>
+        </Alert>
+        <div className="mt-6">
+          <Link href={ROUTES.BUILDER_SINGLES}>
+            <Button variant="outline">← Back to Singles</Button>
+          </Link>
+        </div>
+      </PageContainer>
+    );
+  }
+
+  const singleLabel = schema.label || slug;
+
+  // Handle form submission
+  // Answers with the stored document, so the form starts from what the server
+  // kept rather than from what it sent.
+  const handleSubmit = async (
+    data: Record<string, unknown>,
+    form?: RefusedForm
+  ) => {
+    try {
+      const stored = await updateDocument(data);
+      toast.success(`${singleLabel} has been updated successfully.`);
+      return stored;
+    } catch (err) {
+      reportSaveFailure(err, form);
+      throw err; // Re-throw to prevent form from marking as clean
+    }
+  };
+
+  // Handle cancel - navigate back to Singles list
+  const handleCancel = () => {
+    navigateTo(ROUTES.BUILDER_SINGLES);
+  };
+
+  return (
+    <DocumentViewGate
+      missing={documentViewMissing("single", slug, params?.view, schema.fields)}
+    >
+      <QueryErrorBoundary fallback={<PageErrorFallback />}>
+        {/* Through the shared frame rather than a bare container: translation
+          mode asks to suppress `pageFrame` from inside the form, and only this
+          component reacts to that. A page that declared its own measure here
+          would keep the two-pane translation surface inside the content
+          measure while the entry editor beside it took the whole panel. */}
+        <MeasuredPageFrame contentCarriesMeasure>
+          {schedule.dialog}
+          {publishParts.dialog}
+          <SingleForm
+            shownCopy={shownCopy}
+            revealOutline={<SingleEditPageSkeleton />}
+            revealWaiting={partsStartup.pending}
+            /* Under the editor's header, for the reason the entry editor
+             gives. */
+            documentBanner={
+              <>
+                {/* First in the banner order: it changes what every control
+                    below means, as nothing here can be changed. */}
+                {removedFromCode ? (
+                  <RemovedFromCodeNotice
+                    entity={{ kind: "single", label: singleLabel, slug }}
+                    state={schema.removedFromCodeState}
+                    variant="strip"
+                  />
+                ) : null}
+                <ScheduledReleaseBanner
+                  document={
+                    slug
+                      ? {
+                          scopeKind: "single",
+                          scopeSlug: slug,
+                          entryId: document.id,
+                        }
+                      : undefined
+                  }
+                  onDefaultLocale={!isNonDefaultLocale}
+                />
+              </>
+            }
+            // ApiSingle.fields is SchemaField[] (loose `type: string`); SingleSchema
+            // expects FieldConfig[] (discriminated). The runtime payload is the
+            // same; widening here until the schema layer unifies on FieldConfig.
+            schema={schema as unknown as SingleSchema}
+            document={document}
+            /* A Single is a release member exactly as a collection entry is — the
+             engine models both and the release detail page links to both — so
+             omitting this control here would leave the Single half reachable
+             only through the API. With the form's own actions, matching the
+             collection editor. */
+            documentActions={
+              removedFromCode
+                ? []
+                : [
+                    ...(publishParts.contributed === null
+                      ? []
+                      : [publishParts.contributed]),
+                    ...(schedule.contributed === null
+                      ? []
+                      : [schedule.contributed]),
+                    ...(pin === null ? [] : [pin]),
+                  ]
+            }
+            onSubmit={handleSubmit}
+            isSubmitting={isUpdating}
+            onCancel={handleCancel}
+            // i18n: active language + switcher + inline source values for translatable fields.
+            locale={locale}
+            onLocaleChange={changeLocale}
+            {...(seedFromLocale === undefined ? {} : { seedFromLocale })}
+            onSeedHandled={clearSeed}
+            sourceValues={isNonDefaultLocale ? sourceDoc : undefined}
+            translation={{
+              from: translateFrom,
+              sourceDocument: sourceDoc,
+              onEnter: enterTranslationMode,
+              onExit: exitTranslationMode,
+            }}
+            // collections, so the page route owns navigation. Breadcrumbs and
+            // DocumentTabs (Edit / API) are removed; the API view is reachable
+            // via the consolidated dropdown in the system header.
+            onViewApi={() =>
+              navigateTo(buildRoute(ROUTES.SINGLE_API, { slug }))
+            }
+            documentView={singleDocumentView(params)}
+            latest={latest}
+          />
+        </MeasuredPageFrame>
+      </QueryErrorBoundary>
+    </DocumentViewGate>
+  );
+}
+
+/** The plugin view this Single's address names, or `undefined` on its edit address. */
+function singleDocumentView(
+  params: SingleEditPageProps["params"]
+): DocumentViewMount | undefined {
+  const slug = params?.slug;
+  return documentViewMount(
+    "single",
+    slug,
+    params?.view,
+    slug === undefined ? undefined : buildRoute(ROUTES.SINGLE_EDIT, { slug })
+  );
+}
+
+/**
+ * Reports a failed save of a Single. A publish refused over shared values
+ * someone else published since offers to take them, and the reload that
+ * follows shows the change brought up to date; the form, as it is when the
+ * author acts, is saved as the pending change first. Any other failure is
+ * reported as it always was.
+ */
+function useSingleSaveFailure(args: {
+  slug?: string;
+  document?: { id?: string } | null;
+  locale?: string;
+  /** The Single's schema, for the labels a refusal names its fields by. */
+  schema?: { fields?: readonly { name?: string; label?: unknown }[] } | null;
+}): (error: unknown, form: RefusedForm | undefined) => void {
+  const slug = args.slug ?? "";
+  const documentId = args.document?.id;
+  const { locale } = args;
+  const queryClient = useQueryClient();
+  const recover = useSharedFieldsRecovery({
+    scope: slug && documentId ? { kind: "single", slug, documentId } : null,
+    locale,
+    fields: args.schema?.fields ?? NO_FIELDS,
+    // Answers once the reloaded document is back, which the recovery waits
+    // for before letting the editor save again.
+    onTaken: useCallback(
+      () =>
+        reloadDocument(queryClient, singleDocumentKeys.detail(slug), locale),
+      [queryClient, slug, locale]
+    ),
+  });
+  return useCallback(
+    (error: unknown, form: RefusedForm | undefined) => {
+      // A save made from an older version: the editor's conflict tells the
+      // author who changed it and offers what to do, so no toast says it
+      // twice. The Single is read again, so the current version reaches the
+      // editor, whose form keeps the refused edits until the author chooses.
+      if (staleVersionOf(error)) {
+        void queryClient.invalidateQueries({
+          queryKey: singleDocumentKeys.detail(slug),
+        });
+        return;
+      }
+      if (!recover(error, form)) {
+        toast.error(
+          error instanceof Error ? error.message : "Failed to save changes"
+        );
+      }
+    },
+    [recover, queryClient, slug]
+  );
+}
+
+const NO_FIELDS: readonly { name?: string }[] = [];

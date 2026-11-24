@@ -1,0 +1,355 @@
+/**
+ * Singles Detail API Route Handlers for Next.js
+ *
+ * These route handlers can be re-exported in your Next.js application to provide
+ * individual Single management endpoints at /api/singles/[slug].
+ *
+ * Services are auto-initialized on first request using environment variables:
+ * - DB_DIALECT: Database dialect ("postgresql" | "mysql" | "sqlite")
+ * - DATABASE_URL: Database connection string
+ *
+ * @example
+ * ```typescript
+ * // In your Next.js app: app/api/singles/[slug]/route.ts
+ * export { GET, PATCH } from 'nextly/api/singles-detail';
+ * ```
+ *
+ * @module api/singles-detail
+ */
+
+import { apiKeyScopeFrom } from "../auth/authenticated-scope";
+import { actorFromAuthContext } from "../auth/request-actor";
+import { getService } from "../di";
+import {
+  isTruthyParam,
+  parseFallbackParam,
+  parseRichTextStyles,
+  parseTranslationsParam,
+} from "../dispatcher/helpers/validation";
+import type { SingleResult } from "../domains/singles/types";
+import { shownWorkflowSummary } from "../domains/workflows/stage-presentation";
+import { errorFromServiceEnvelope } from "../errors/from-service-envelope";
+import { NextlyError } from "../errors/nextly-error";
+import { getCachedNextly } from "../init";
+import { withTimezoneFormatting } from "../lib/date-formatting";
+import { transformRichTextFields } from "../lib/field-transform";
+import type { RichTextOutputFormat } from "../lib/rich-text-html";
+import { resolveRoleSlugs } from "../services/lib/permissions";
+import type { SingleEntryService } from "../services/singles/single-entry-service";
+import type { SingleRegistryService } from "../services/singles/single-registry-service";
+
+import { readJsonBody } from "./read-json-body";
+import { respondDoc, respondMutation } from "./response-shapes";
+import { requireRouteCollectionAccess } from "./route-auth";
+import { withErrorHandler } from "./with-error-handler";
+
+/**
+ * Context object for dynamic route handlers.
+ * Next.js passes route params as a Promise.
+ */
+interface RouteContext {
+  params: Promise<{ slug: string }>;
+}
+
+async function getSingleEntryService(): Promise<SingleEntryService> {
+  await getCachedNextly();
+  return getService("singleEntryService");
+}
+
+async function getSingleRegistry(): Promise<SingleRegistryService> {
+  await getCachedNextly();
+  return getService("singleRegistryService");
+}
+
+/**
+ * Bridge for the legacy `SingleResult` shape (`{ success, statusCode,
+ * data?, message?, errors? }`) emitted by `SingleEntryService`. The service
+ * still uses the result-shape pattern; converting it to a thrown
+ * `NextlyError` at the route boundary keeps the wire format canonical
+ * without touching the service layer.
+ *
+ * Mapping:
+ *   - 404 to `NextlyError.notFound`. The slug goes to `logContext`; the
+ *     public message stays the spec §13.8-compliant "Not found." (no echo).
+ *   - 400 to `NextlyError.validation`. Per-field `errors[]` translate to
+ *     the canonical `data.errors[]` shape; the legacy `field` becomes
+ *     `path` and a generic `INVALID` code fills the missing slot.
+ *   - Anything else to `NextlyError.internal`. The legacy status / message
+ *     are preserved in `logContext` so operators can correlate.
+ *
+ * Remove once `SingleEntryService` is migrated to throw directly.
+ */
+function throwFromSingleResult<T>(
+  result: SingleResult<T>,
+  slug: string
+): never {
+  const logContext: Record<string, unknown> = {
+    slug,
+    legacyStatusCode: result.statusCode,
+    legacyMessage: result.message,
+  };
+  if (result.errors) logContext.legacyErrors = result.errors;
+
+  // Rebuilt through the shared converter, so a Single hook's typed error --
+  // `authRequired()`, `rateLimited()`, a plugin's own code -- reaches the
+  // caller as itself. Every status outside 400/403/404 used to become a 500,
+  // and a rate limit lost the interval the route needs for `Retry-After`.
+  //
+  // The legacy `{field}` issues are normalised to the canonical `{path}` shape
+  // the converter reads.
+  throw errorFromServiceEnvelope(
+    {
+      ...result,
+      errors: result.errors?.map(e => ({
+        path: e.field,
+        // The per-field reason travels with the issue; dropping it here would
+        // have the converter substitute a generic one.
+        code: e.code,
+        message: e.message,
+      })),
+    },
+    logContext
+  );
+}
+
+const VALID_RICH_TEXT_FORMATS = ["json", "html", "both"] as const;
+
+function parseRichTextFormat(value: string | null): RichTextOutputFormat {
+  if (!value) return "json";
+  const normalized = value.toLowerCase();
+  if (VALID_RICH_TEXT_FORMATS.includes(normalized as RichTextOutputFormat)) {
+    return normalized as RichTextOutputFormat;
+  }
+  return "json";
+}
+
+/**
+ * GET handler for retrieving a Single document by slug.
+ *
+ * This is a public endpoint - no authentication required.
+ * If the Single document doesn't exist, it will be auto-created with default
+ * field values.
+ *
+ * Query Parameters:
+ * - depth: Relationship expansion depth (reserved for future use)
+ * - locale: Locale for localized fields (reserved for future use)
+ * - richTextFormat: Output format for rich text fields ("json" | "html" | "both")
+ *   - "json" (default): Return Lexical JSON structure only
+ *   - "html": Return HTML string only
+ *   - "both": Return object with both { json, html } properties
+ * - richTextStyles: How rich text HTML is styled ("default" | "none"); "none"
+ *   gives classes only, for the site's own CSS
+ *
+ * Response:
+ * - 200 OK: bare document object (canonical `respondDoc` shape).
+ * - On error: `application/problem+json` per spec §10.1.
+ */
+export const GET = withErrorHandler(
+  async (request: Request, context: RouteContext): Promise<Response> => {
+    const { slug } = await context.params;
+    const service = await getSingleEntryService();
+
+    const { searchParams } = new URL(request.url);
+    const depth = searchParams.get("depth")
+      ? parseInt(searchParams.get("depth")!, 10)
+      : undefined;
+    const locale = searchParams.get("locale") || undefined;
+    // i18n: `?fallback-locale=none` disables fallback so an untranslated field reads empty
+    // (the admin editor relies on this); `?translation-status=1` attaches the per-locale
+    // `_translations` overview for the language pills. Both no-op for non-localized singles.
+    const fallbackLocale = searchParams.get("fallback-locale") || undefined;
+    const translationStatus = searchParams.get("translation-status") === "1";
+    // `?fallback=document`: answer in the first published language of the
+    // chain where the Single is not published in the requested one.
+    const wholeDocumentFallback = parseFallbackParam(
+      searchParams.get("fallback") ?? undefined
+    );
+    // `?source-locales=1` attaches `_sources`, each translatable value's
+    // language; `?translations=all` attaches every language's values
+    // (`_allLocales`), as an entry's read does.
+    const sourceLocales = isTruthyParam(
+      searchParams.get("source-locales") ?? undefined
+    );
+    const translations = parseTranslationsParam(
+      searchParams.get("translations") ?? undefined
+    );
+    const richTextFormat = parseRichTextFormat(
+      searchParams.get("richTextFormat")
+    );
+    const richTextStyles = parseRichTextStyles(
+      searchParams.get("richTextStyles")
+    );
+
+    const result = await service.get(slug, {
+      depth,
+      locale,
+      fallbackLocale,
+      translationStatus,
+      wholeDocumentFallback,
+      sourceLocales,
+      translations,
+    });
+
+    if (!result.success) {
+      throwFromSingleResult(result, slug);
+    }
+
+    let responseData = result.data;
+    if (richTextFormat !== "json" && result.data) {
+      const registry = await getSingleRegistry();
+      const single = await registry.getSingleBySlug(slug);
+
+      if (single?.fields && Array.isArray(single.fields)) {
+        responseData = transformRichTextFields(
+          result.data,
+          single.fields,
+          richTextFormat,
+          richTextStyles
+        ) as typeof result.data;
+      }
+    }
+
+    return withTimezoneFormatting(respondDoc(responseData));
+  }
+);
+
+/**
+ * PATCH handler for updating a Single document.
+ *
+ * Requires a verified session or API key with update access to the Single,
+ * matching the dispatcher's `updateSingleDocument` authorization. If the
+ * Single document doesn't exist, it will be auto-created first, then
+ * updated with the provided data.
+ *
+ * Note: Singles cannot be deleted. They represent persistent site-wide
+ * configuration that always exists once accessed.
+ *
+ * Request Body:
+ * - Any fields defined in the Single schema
+ * - System fields (id, createdAt) are ignored if included
+ *
+ * Response:
+ * - 200 OK: `{ "message": "...", "item": { ... } }` (updated document).
+ * - On error: `application/problem+json` per spec §10.1.
+ */
+export const PATCH = withErrorHandler(
+  async (request: Request, context: RouteContext): Promise<Response> => {
+    const { slug } = await context.params;
+    // Capture the authorized identity so the update runs as this user. Route
+    // auth already ran the coarse RBAC gate, so `routeAuthorized` skips only
+    // that re-check; `overrideAccess` stays false so stored single access rules
+    // and field-level write access are still enforced with this user, and the
+    // response stays redacted to what they may read. Without forwarding the
+    // user, the standalone route ran the update anonymously and diverged from
+    // the dispatcher's updateSingleDocument.
+    // The language the write names, read before authorizing: the rule is
+    // told it, as the dispatcher's updateSingleDocument tells it.
+    const { searchParams } = new URL(request.url);
+    const locale = searchParams.get("locale") || undefined;
+
+    // A Single is its one document, refused about it as the dispatcher's
+    // Single routes refuse: a caller who may not read it is told it is missing.
+    const auth = await requireRouteCollectionAccess(request, "update", slug, {
+      method: "updateSingleDocument",
+      params: locale === undefined ? {} : { locale },
+      namesOne: true,
+    });
+
+    const service = await getSingleEntryService();
+
+    const body = await readJsonBody<Record<string, unknown>>(request, { slug });
+
+    // Include resolved role slugs so field-level `access.read` (which redacts
+    // the response under `routeAuthorized`) evaluates against the caller's
+    // roles, matching the collection route path. Session auth carries role IDs,
+    // so they are resolved; API-key auth already carries slugs.
+    const roles = await resolveRoleSlugs(auth);
+    const user = {
+      id: auth.userId,
+      name: auth.userName,
+      email: auth.userEmail,
+      roles,
+      // A representative singular `role` so field-level `access.update`/
+      // `access.read` callbacks reading `req.user.role` see an authorized
+      // value instead of stripping fields for a legitimate caller.
+      role: roles?.[0],
+    };
+
+    const result = await service.update(slug, body, {
+      locale,
+      user,
+      // Record who performed the write on the outbox event: an API-key caller
+      // attributes to the key itself, not the user that owns it. Resolved from
+      // the same auth context the route already verified.
+      actor: actorFromAuthContext(auth),
+      overrideAccess: false,
+      // Guard on a resolved user id (matches the dispatcher) so the
+      // RBAC-skip only applies to an authenticated caller.
+      routeAuthorized: !!user.id,
+      // Build the scope from the auth context so a publish transition (and the
+      // super-admin gate) judges an API key on its OWN stamped grants, not the
+      // owner's — the route only authorized `update`. Mirrors the dispatcher.
+      //
+      // Through `apiKeyScopeFrom`, which carries the caller's roles and the
+      // permission ROWS a rule's permission list is built from. The literal
+      // this replaces named `actorType` and `permissions` only, so a documented
+      // `permissions.includes("site:publish")` was handed the stored slugs and
+      // denied a key that held the grant.
+      authenticatedScope:
+        auth.authMethod === "api-key" ? apiKeyScopeFrom(auth) : undefined,
+    });
+
+    if (!result.success) {
+      throwFromSingleResult(result, slug);
+    }
+
+    // PATCH on a Single document: canonical mutation envelope so admins
+    // get a server-authored toast plus the refreshed document body.
+    return withTimezoneFormatting(
+      respondMutation("Single updated.", result.data)
+    );
+  }
+);
+
+/**
+ * GET handler for retrieving Single schema/metadata by slug.
+ *
+ * This endpoint returns the Single's schema configuration, not the document data.
+ * Useful for Admin UI to understand the field structure.
+ *
+ * Requires a verified session or API key with read access to the Single,
+ * matching the dispatcher's `getSingleSchema` authorization.
+ *
+ * Response:
+ * - 200 OK: bare schema object (canonical `respondDoc` shape).
+ * - 401 / 404 / 500: `application/problem+json` per spec §10.1.
+ *
+ * @example
+ * ```bash
+ * curl -H "Authorization: Bearer <token>" \
+ *   "http://localhost:3000/api/singles/site-settings/schema"
+ * # => {"slug":"site-settings","label":"Site Settings","fields":[...]}
+ * ```
+ */
+export function getSchema(request: Request, slug: string): Promise<Response> {
+  return withErrorHandler(async (req: Request) => {
+    await requireRouteCollectionAccess(req, "read", slug);
+
+    const registry = await getSingleRegistry();
+    const single = await registry.getSingleBySlug(slug);
+
+    if (!single) {
+      // Per §13.7: identifier (slug) goes to logContext, never the public
+      // message. The public response is the canonical "Not found." sentence.
+      throw NextlyError.notFound({ logContext: { slug } });
+    }
+
+    // The workflow that holds this Single's publishing, as the other Single
+    // schema reads name it (`null` where none is attached), so a client can
+    // tell whether a review state is coming whichever reader it mounts.
+    return respondDoc({
+      ...single,
+      workflow: await shownWorkflowSummary("single", slug),
+    });
+  })(request);
+}

@@ -1,0 +1,391 @@
+// What: shared connect-time DB version check.
+// Why: each dialect has version-dependent capabilities (RENAME COLUMN on
+// SQLite 3.25+, transactional DDL on MySQL 8+, etc). This helper hard-fails
+// at connect on real dialects below minimum, lets recognized cloud variants
+// (MariaDB, TiDB, Aurora, PlanetScale, Vitess) proceed with a warning, and
+// hard-fails on completely unparseable strings. F17 in the schema
+// architecture plan.
+
+// Why local imports only: adapter-drizzle is upstream of nextly
+// in the dep graph. Importing from nextly here would create a
+// circular dependency. SupportedDialect and DatabaseError already exist
+// in adapter-drizzle's own type system.
+import type { SupportedDialect } from "./types";
+import type { DatabaseError } from "./types/error";
+
+// Why these minimums: PG 15 ships native MERGE + nbtree dedup needed for
+// our schema rename pipeline. MySQL 8.0 ships native RENAME COLUMN.
+// SQLite 3.38 ships strict tables + native unixepoch(). Older versions
+// would force fallback paths that v1 explicitly does not implement.
+export const NEXTLY_MIN_DB_VERSIONS = {
+  postgresql: { major: 15, minor: 0 },
+  mysql: { major: 8, minor: 0 },
+  sqlite: { major: 3, minor: 38 },
+} as const;
+
+// What: typed error thrown when a real DB version is below minimum or a
+// version string cannot be parsed.
+// Why: implements adapter-drizzle's DatabaseError interface so existing
+// isDatabaseError() type guards work. Stores dialect + detected/required
+// versions on the instance so callers can build upgrade-guidance UI from
+// the error fields without parsing the message.
+export class UnsupportedDialectVersionError
+  extends Error
+  implements DatabaseError
+{
+  public readonly kind = "unsupported_version" as const;
+  public readonly dialect: SupportedDialect;
+  public readonly detectedVersion: string;
+  public readonly requiredVersion: string;
+  public override readonly cause?: Error;
+
+  constructor(args: {
+    dialect: SupportedDialect;
+    detectedVersion: string;
+    requiredVersion: string;
+    message: string;
+    cause?: Error;
+  }) {
+    super(args.message);
+    this.name = "UnsupportedDialectVersionError";
+    this.dialect = args.dialect;
+    this.detectedVersion = args.detectedVersion;
+    this.requiredVersion = args.requiredVersion;
+    this.cause = args.cause;
+  }
+}
+
+// What: minimal duck-typed query interface so this helper does not pull in
+// pg / mysql2 / better-sqlite3 types directly.
+// Why: keeps adapter-drizzle dependency-free of the per-dialect drivers.
+// query() returns unknown because Promise<unknown> is already a subtype of
+// unknown; the helper awaits at the call site, which works for both sync
+// and async return shapes.
+export interface VersionQueryClient {
+  query?: (sql: string) => unknown;
+  prepare?: (sql: string) => { get: () => unknown };
+}
+
+// What: optional callback so adapters can route the variant warning through
+// their own logger.
+// Why: the helper itself does not depend on a logger module; the adapter
+// owns logger config and is the right place to surface the warning.
+export interface CheckDialectVersionOptions {
+  onWarning?: (message: string) => void;
+}
+
+// What: doc URL embedded in error messages.
+// Why: gives users a single landing page with upgrade instructions per
+// dialect + cloud provider. Filled in PR-2.
+const DOCS_URL = "https://nextlyhq.com/docs/database/support";
+
+// What: recognized MySQL-protocol-compatible variants. Detection of any of
+// these tokens in the version string causes a warning instead of a hard-
+// fail.
+// Why: these databases speak the MySQL wire protocol but use their own
+// version schemes (MariaDB 10.x, TiDB 6.x advertising MySQL 5.7, Aurora's
+// custom suffix). Hard-failing them would lock out a large fraction of
+// real cloud users on first install. We warn so the user knows we have not
+// regression-tested against their variant; we proceed because the wire
+// protocol is compatible enough that most operations work.
+const VARIANT_TOKENS = [
+  "mariadb",
+  "tidb",
+  "aurora",
+  "planetscale",
+  "vitess",
+] as const;
+
+/** A MySQL-compatible server the version string names. */
+export type DialectVariant = (typeof VARIANT_TOKENS)[number];
+
+/** What the version check learned about the server it connected to. */
+export interface DialectVersionInfo {
+  /**
+   * The MySQL-compatible variant the version string names, or null for the
+   * dialect's own server (and always null on PostgreSQL and SQLite).
+   */
+  variant: DialectVariant | null;
+  /**
+   * Whether the server can key a unique index on an expression, such as `NULLIF(col, '')`.
+   * PostgreSQL and SQLite always can. MySQL can from 8.0.13 (functional key parts). The
+   * MySQL-compatible variants are reported as unable: MariaDB has no functional key parts, and
+   * the others are not tested, so a rule that needs one is refused there rather than left
+   * unenforced. Optional, so a `DialectVersionInfo` written before this was reported still is
+   * one; absent means unknown, which a caller reads as unable.
+   */
+  functionalIndexes?: boolean;
+  /**
+   * Whether the server enforces CHECK constraints, not merely accepts the
+   * syntax. MySQL before 8.0.16 parses a CHECK and ignores it, so a rule a
+   * declaration means to guarantee would hold nothing; MySQL 8.0.16 and later
+   * enforce. The MySQL-compatible variants are reported as not enforcing:
+   * MariaDB does from 10.2 and the others are not tested, so a rule that must
+   * hold is refused there rather than trusted to a server this cannot speak
+   * for. PostgreSQL and SQLite always enforce. Absent means unknown, which a
+   * caller reads as not enforcing where a rule must hold.
+   */
+  enforcesCheckConstraints?: boolean;
+  /**
+   * The server's own version string, as it answered `version()`. A refusal
+   * that depends on the version names it, so the operator sees which server
+   * answered rather than a threshold without an actor.
+   */
+  serverVersion?: string;
+}
+
+// What: the variants that reject `SELECT ... FOR SHARE` as a syntax error.
+// Why: MariaDB spells the shared lock `LOCK IN SHARE MODE` only, and TiDB
+// refuses both spellings unless its no-op functions are switched on. MySQL
+// 8, Aurora MySQL and Vitess/PlanetScale accept `FOR SHARE`.
+const VARIANTS_WITHOUT_FOR_SHARE: ReadonlySet<DialectVariant> = new Set([
+  "mariadb",
+  "tidb",
+]);
+
+/**
+ * Whether a MySQL-dialect server accepts `SELECT ... FOR SHARE`: true for
+ * MySQL itself and the variants that do, false for MariaDB and TiDB.
+ */
+export function acceptsForShare(variant: DialectVariant | null): boolean {
+  return variant === null || !VARIANTS_WITHOUT_FOR_SHARE.has(variant);
+}
+
+const POSTGRES_REGEX = /^PostgreSQL (\d+)\.(\d+)/;
+const MYSQL_REGEX = /^(\d+)\.(\d+)\.(\d+)/;
+const SQLITE_REGEX = /^(\d+)\.(\d+)\.(\d+)/;
+
+interface ParsedVersion {
+  major: number;
+  minor: number;
+  /** Read where the dialect's minimum is not the whole answer (MySQL's functional key parts). */
+  patch?: number;
+}
+
+/** MySQL's first release with functional key parts. */
+const MYSQL_FUNCTIONAL_KEY_PARTS = { major: 8, minor: 0, patch: 13 };
+
+/** MySQL's first release that enforces CHECK constraints. */
+const MYSQL_ENFORCED_CHECKS = { major: 8, minor: 0, patch: 16 };
+
+/** Whether a real MySQL release has functional key parts. */
+function mysqlHasFunctionalKeyParts(version: ParsedVersion): boolean {
+  return atOrAfter(version, MYSQL_FUNCTIONAL_KEY_PARTS);
+}
+
+/** Whether a real MySQL release enforces CHECK constraints. */
+function mysqlEnforcesCheckConstraints(version: ParsedVersion): boolean {
+  return atOrAfter(version, MYSQL_ENFORCED_CHECKS);
+}
+
+/** Whether `version` is at or past `at`, compared part by part. */
+function atOrAfter(
+  version: ParsedVersion,
+  at: { major: number; minor: number; patch?: number }
+): boolean {
+  const { major, minor, patch = 0 } = version;
+  if (major !== at.major) return major > at.major;
+  if (minor !== at.minor) return minor > at.minor;
+  return patch >= (at.patch ?? 0);
+}
+
+function parsePostgres(raw: string): ParsedVersion | null {
+  const match = POSTGRES_REGEX.exec(raw);
+  if (!match) return null;
+  return { major: Number(match[1]), minor: Number(match[2]) };
+}
+
+function parseMySQL(raw: string): ParsedVersion | null {
+  const match = MYSQL_REGEX.exec(raw);
+  if (!match) return null;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+  };
+}
+
+function parseSQLite(raw: string): ParsedVersion | null {
+  const match = SQLITE_REGEX.exec(raw);
+  if (!match) return null;
+  return { major: Number(match[1]), minor: Number(match[2]) };
+}
+
+function detectVariant(raw: string): DialectVariant | null {
+  const lower = raw.toLowerCase();
+  for (const token of VARIANT_TOKENS) {
+    if (lower.includes(token)) return token;
+  }
+  return null;
+}
+
+// What: compares detected version to required minimum.
+// Why: simple major-minor comparison is sufficient; we do not gate on patch.
+function meetsMinimum(
+  detected: ParsedVersion,
+  required: { major: number; minor: number }
+): boolean {
+  if (detected.major > required.major) return true;
+  if (detected.major < required.major) return false;
+  return detected.minor >= required.minor;
+}
+
+// What: queries the DB for its version string and validates it under the
+// hybrid policy.
+// Why: called as the first DB-content step inside each adapter's connect()
+// method.
+//
+// Decision tree:
+//   1. Variant token present (MariaDB/TiDB/Aurora/PlanetScale/Vitess)?
+//      -> emit warning via options.onWarning, return the variant.
+//   2. Strict regex matches and version >= minimum?
+//      -> return successfully.
+//   3. Strict regex matches but version < minimum?
+//      -> throw UnsupportedDialectVersionError (real-DB-too-old path).
+//   4. Strict regex does not match AND no variant token detected?
+//      -> throw UnsupportedDialectVersionError (truly unparseable path).
+export async function checkDialectVersion(
+  client: VersionQueryClient,
+  dialect: SupportedDialect,
+  options?: CheckDialectVersionOptions
+): Promise<DialectVersionInfo> {
+  const required = NEXTLY_MIN_DB_VERSIONS[dialect];
+  const requiredStr = `${required.major}.${required.minor}+`;
+
+  let raw: string;
+  if (dialect === "sqlite") {
+    raw = await querySqliteVersion(client);
+  } else if (dialect === "postgresql") {
+    raw = await queryPostgresVersion(client);
+  } else {
+    raw = await queryMysqlVersion(client);
+  }
+
+  // Step 1: variant check. Only meaningful for MySQL — Postgres-flavored
+  // services (Neon, Supabase, RDS PG, Aurora PG) all return canonical
+  // "PostgreSQL X.Y..." strings and pass the strict regex naturally.
+  const variant = dialect === "mysql" ? detectVariant(raw) : null;
+  if (variant) {
+    const warning =
+      `Detected ${variant} ('${raw}'). Nextly is regression-tested ` +
+      `against real MySQL 8.0+ only; this MySQL-compatible variant is not ` +
+      `officially supported in v1 but most operations should work. ` +
+      `See ${DOCS_URL}.`;
+    if (options?.onWarning) options.onWarning(warning);
+    return {
+      variant,
+      functionalIndexes: false,
+      enforcesCheckConstraints: false,
+      serverVersion: raw,
+    };
+  }
+
+  // Step 2/3: strict regex parse for real dialects.
+  let parsed: ParsedVersion | null;
+  if (dialect === "postgresql") parsed = parsePostgres(raw);
+  else if (dialect === "mysql") parsed = parseMySQL(raw);
+  else parsed = parseSQLite(raw);
+
+  if (!parsed) {
+    // Step 4: truly unparseable. Hard-fail so we surface the issue at boot
+    // rather than silently letting the user proceed and hit cryptic errors
+    // later.
+    throw new UnsupportedDialectVersionError({
+      dialect,
+      detectedVersion: raw,
+      requiredVersion: requiredStr,
+      message:
+        `Could not parse ${dialect} version from '${raw}'. ` +
+        `Nextly requires ${dialect} ${requiredStr}. ` +
+        `If you are on a known MySQL-compatible variant we did not detect, ` +
+        `please file an issue. See ${DOCS_URL}.`,
+    });
+  }
+
+  if (!meetsMinimum(parsed, required)) {
+    const labels: Record<SupportedDialect, string> = {
+      postgresql: "PostgreSQL",
+      mysql: "MySQL",
+      sqlite: "SQLite",
+    };
+    throw new UnsupportedDialectVersionError({
+      dialect,
+      detectedVersion: `${parsed.major}.${parsed.minor}`,
+      requiredVersion: requiredStr,
+      message:
+        `${labels[dialect]} ${requiredStr} required; detected ` +
+        `${parsed.major}.${parsed.minor}. See ${DOCS_URL}.`,
+    });
+  }
+  return {
+    variant: null,
+    serverVersion: raw,
+    ...(dialect !== "mysql"
+      ? { functionalIndexes: true, enforcesCheckConstraints: true }
+      : {
+          functionalIndexes: mysqlHasFunctionalKeyParts(parsed),
+          enforcesCheckConstraints: mysqlEnforcesCheckConstraints(parsed),
+        }),
+  };
+}
+
+// What: PG version query.
+// Why: pg's Client/PoolClient.query() returns { rows: [{ version: "..." }] }.
+async function queryPostgresVersion(
+  client: VersionQueryClient
+): Promise<string> {
+  if (!client.query) {
+    throw new Error("PostgreSQL client missing query() method");
+  }
+  const result = (await client.query("SELECT version()")) as {
+    rows?: Array<{ version?: unknown }>;
+  };
+  const row = result.rows?.[0];
+  const version = row?.version;
+  if (typeof version !== "string") {
+    throw new Error(
+      `Unexpected response shape from SELECT version(): ${JSON.stringify(result)}`
+    );
+  }
+  return version;
+}
+
+// What: MySQL version query.
+// Why: mysql2's Connection.query() returns [rows, fields] where rows[0]
+// has the column aliased as 'version'.
+async function queryMysqlVersion(client: VersionQueryClient): Promise<string> {
+  if (!client.query) {
+    throw new Error("MySQL client missing query() method");
+  }
+  const result = (await client.query("SELECT VERSION() AS version")) as Array<
+    Array<{ version?: unknown }>
+  >;
+  const row = result?.[0]?.[0];
+  const version = row?.version;
+  if (typeof version !== "string") {
+    throw new Error(
+      `Unexpected response shape from SELECT VERSION(): ${JSON.stringify(result)}`
+    );
+  }
+  return version;
+}
+
+// What: SQLite version query via better-sqlite3's prepare/get.
+// Why: better-sqlite3 is synchronous, so this is a plain function returning
+// a resolved Promise. The helper awaits it uniformly with PG/MySQL paths.
+function querySqliteVersion(client: VersionQueryClient): Promise<string> {
+  if (!client.prepare) {
+    return Promise.reject(new Error("SQLite client missing prepare() method"));
+  }
+  const stmt = client.prepare("SELECT sqlite_version() AS version");
+  const row = stmt.get() as { version?: unknown } | undefined;
+  const version = row?.version;
+  if (typeof version !== "string") {
+    return Promise.reject(
+      new Error(
+        `Unexpected response shape from SELECT sqlite_version(): ${JSON.stringify(row)}`
+      )
+    );
+  }
+  return Promise.resolve(version);
+}

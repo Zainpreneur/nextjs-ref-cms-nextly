@@ -1,0 +1,669 @@
+/**
+ * `@nextlyhq/blocks-react` — the React renderer for Nextly block documents.
+ *
+ * This entry renders documents with React alone. It imports no Next.js, no
+ * admin code, and no CMS runtime, so a document can be rendered from a plain
+ * React app, a test, or a script with nothing else installed. The Next-coupled
+ * helpers live at `@nextlyhq/blocks-react/next`, and `layering.test.ts` turns
+ * that separation into a hard failure rather than a convention.
+ *
+ * Everything here is a Server Component and none of it is a client component,
+ * so a page whose blocks are all server blocks ships no JavaScript for the
+ * renderer itself.
+ *
+ * @module index
+ */
+export type {
+  AccordionTitleLevel,
+  BindingIssuesHandler,
+  BlockHostPolicy,
+  BlockRenderArgs,
+  BlocksFieldShapeRef,
+  BlocksFieldShapes,
+  BlocksSiteSettings,
+  BlocksSiteValues,
+  BlocksDataProvider,
+  BlocksDataProviderFactory,
+  BlocksFilter,
+  BlocksFilterOp,
+  BlocksPublicReader,
+  BlocksQuery,
+  BlocksResult,
+  DefaultDataProviderOptions,
+  EntryContentCanvas,
+  EntryContentNote,
+  FormAfterSendingDrawing,
+  FormDrawing,
+  FormFieldDrawing,
+  FormFieldKind,
+  FormReference,
+  FormUnavailableDrawing,
+  ListBaseReader,
+  NamedQueryFailure,
+  NamedQueryFailureCode,
+  NamedQueryHost,
+  NamedQueryLookup,
+  NamedQueryRunData,
+  ListPageContext,
+  PageBindings,
+  PageContext,
+  PageForms,
+  PageIssue,
+  PageReadReport,
+  QueryBudget,
+  QueryBudgetOptions,
+  ReadClaim,
+  ReadKind,
+  UnreadBlock,
+  ListBatchReads,
+  ReactBlockDefinition,
+  ResolvedIcon,
+  ResolvedMedia,
+} from "./context";
+export {
+  createDefaultDataProvider,
+  isBindingIssue,
+  createQueryBudget,
+  createStandaloneContext,
+  DEFAULT_MAX_QUERIES,
+  defineBlock,
+  READ_KINDS,
+  emptyDataProvider,
+} from "./context";
+
+export { PageRenderer } from "./page-renderer";
+// The page outline a page's blocks read as `ctx.outline`: every heading it
+// draws, with the anchor each is drawn with.
+export type {
+  OutlineArea,
+  OutlineHeading,
+  OutlinePart,
+  PageOutline,
+} from "./outline";
+// The same reading for a caller judging a page's headings without drawing
+// it, such as the editor's page checks.
+export { pageOutline } from "./outline";
+export type { HeadingRank } from "./blocks/heading-anchors";
+// A simple form's fields with their defaults applied, their sent names among
+// them, for the editor to show the name a field's answer goes under.
+export {
+  formFields,
+  MAX_FIELDS as FORM_MAX_FIELDS,
+} from "./blocks/form-fields";
+// A Form's picked form, by the rule the block draws with, for the editor's
+// panel, canvas notice and page checks. `@experimental`.
+export { pickedForm } from "./blocks/form";
+// Binding sources read on a server, carried to the editor's canvas and read
+// back there. `@experimental` with the editor's binding sources.
+export {
+  bindingsFromWire,
+  bindingsToWire,
+  noPublicFields,
+  type WireBindings,
+} from "./binding-wire";
+export type { PageRendererProps } from "./page-renderer";
+// Re-exported because `PageRendererProps.siteStyles` NAMES it, and a prop a
+// consumer cannot type is a prop they cannot pass without reaching past this
+// package into the engine. The type-surface ratchet is what caught it: a public
+// declaration naming an engine type the entry does not export is a surface that
+// compiles here and not at the call site.
+//
+// The rest are `SiteSheetInput`'s TRANSITIVE closure, and they are not padding.
+// Naming the outer type alone lets a consumer declare a variable and not build
+// one: the tokens are a `SiteTokenSet` of `SiteToken`s whose `kind` is a
+// `TokenKind`, the fonts are `FontFaceDef`s of `FontSource`s, and `darkMode`
+// is a `DarkModeStrategy`. A caller writing a site's design system needs every
+// one of them by name, so withholding any makes the prop typeable but unusable —
+// which is the same defect as not exporting the outer type, one level in.
+/**
+ * The cascade behind a page, for chrome that names where a value came from.
+ *
+ * Exported because the reconciliation it needs — named classes, block bases, the
+ * token prefix and the fetch predicate, each resolved from two tiers — is
+ * private to this package. A consumer assembling its own context compiles a
+ * cascade the page never had, and the shortfall is silent: no class declaration
+ * reaches the trace, so every value from a named class reports as set by nobody.
+ */
+/**
+ * Resized copies of an image, for a route that sizes a page's images to where
+ * they are drawn: the `imageCopies` option's shape.
+ *
+ * @experimental
+ */
+export type { ImageCopies, ImageCopy } from "./image-slot";
+export { pageStyleTrace } from "./page-style-trace";
+export type { PageStyleCascade, PageStyleTraceInput } from "./page-style-trace";
+
+export type {
+  DarkModeStrategy,
+  // The element tier's keys and the site's text, which `SiteTokenSet` and
+  // the compile context now carry: the same closure, one type further in.
+  ElementBaseKey,
+  FluidSizes,
+  FontFaceDef,
+  FontSource,
+  SiteSheetInput,
+  SiteTextEntry,
+  SiteTextMap,
+  SiteTextRole,
+  SiteTextUnderline,
+  SiteToken,
+  SiteTokenSet,
+  TokenKind,
+} from "@nextlyhq/blocks-engine";
+
+/**
+ * How this renderer reconciles a route context and a stored site tier.
+ *
+ * Published because a surface deciding anything from "the breakpoints this page
+ * compiles against" must read the SAME answer the render will use, and the
+ * precedences are not guessable from the inputs: the site tier wins for
+ * `breakpoints` and `blockBases`, the route wins for `namedClasses` and
+ * `previewContainer`, and each skips only `undefined` — so a stored `null`
+ * survives and means something.
+ *
+ * A parallel implementation of a reconciliation is a second answer that agrees
+ * until the day it does not, and this rule offers three separate ways to
+ * disagree — an inverted precedence, a wrong fallthrough, and a stated `null`
+ * discarded by a nullish coalesce. None of them is visible from the inputs, so
+ * a caller that reads the rule carefully and rewrites it is no safer than one
+ * that guesses.
+ */
+export { sharedStyleInputs, type ReconciledStyleInputs } from "./page-renderer";
+/**
+ * The one way to give a compile context the site's element tier, derived
+ * from the site text map it carries (the engine's `siteTextElementBases`).
+ *
+ * Public because a host assembling its own compile context must reach the
+ * same answer the renderer does. Spreading the tier in by hand is the second
+ * implementation that would drift: `withTypographyDefaults` leaves a context
+ * that states its own `elementBases` alone, and a caller open-coding that
+ * check is one `??` away from overwriting a host's deliberate choice.
+ */
+export { withTypographyDefaults } from "./blocks/typography-defaults";
+/**
+ * Whether an image or embed address may be requested, by the renderer's one
+ * filter: exported so a caller judging what a page draws, such as an unbind
+ * keeping what visitors see, asks the same question the image block does.
+ */
+export { fetchableUrl } from "./blocks/props";
+/**
+ * Which provider an Embed's link is from, by the block's own table: exported
+ * so the editor, which says what it found as a link is pasted and sizes the
+ * block from it, and the thumbnail copy, which fetches only from the
+ * provider's fixed host, answer from the table the block renders by.
+ *
+ * @experimental
+ */
+export {
+  detectEmbed,
+  type EmbedMatch,
+  type EmbedProviderId,
+  type EmbedShape,
+  type ThumbnailSource,
+} from "./blocks/embed-providers";
+/**
+ * The attribute on the box an Embed with no link draws on the editor's
+ * canvas, which the editor draws its link field over.
+ *
+ * @experimental
+ */
+export { EMBED_EMPTY_ATTRIBUTE } from "./blocks/embed";
+/**
+ * What a click on a picture does, by the Image's one reading of its props:
+ * exported so the editor's panel shows the choice the render follows.
+ *
+ * @experimental
+ */
+export { type WhenClicked, whenClickedOf } from "./blocks/props";
+// The element a container preset (Section, Box) renders its root as, which an
+// editor reads to say what the page will hold.
+export { containerRootTag } from "./blocks/container-root";
+
+export { BlockBoundary, BlockList } from "./block-boundary";
+// `NODE_ID_ATTRIBUTE` is published deliberately: an editor hit-testing on the
+// attribute must not hard-code its spelling, or the renderer and the editor hold
+// two copies of one string and the editor breaks silently when it moves.
+//
+// `SLOTS_ATTRIBUTE` is public for the same reason: an editor looking for a
+// container to draw an affordance on asks this attribute rather than keeping
+// its own copy of the string the renderer emits. `LIST_ACTION_ATTRIBUTE` too:
+// the editor's canvas acts on the action a list's note offers by it, and
+// `LIST_REF_ATTRIBUTE` is the reference its copy action copies. The two Entry
+// content attributes are what the canvas's sheet draws that block's content
+// and notes by.
+export {
+  EDITOR_NAMESPACE,
+  ENTRY_CONTENT_DRAWN_ATTRIBUTE,
+  ENTRY_CONTENT_NOTE_ATTRIBUTE,
+  INSTANCE_ATTRIBUTE,
+  LIST_ACTION_ATTRIBUTE,
+  LIST_REF_ATTRIBUTE,
+  NODE_ID_ATTRIBUTE,
+  PROP_ATTRIBUTE,
+  SLOTS_ATTRIBUTE,
+} from "./block-boundary";
+// The render-safe attribute rule, public so an editor asks it instead of
+// keeping a second copy that would accept names the renderer drops.
+export { isAllowedAttribute } from "./block-boundary";
+export type {
+  BlockBoundaryProps,
+  BlockListProps,
+  BoundaryBindings,
+  HidingItem,
+  ItemHiddenAs,
+} from "./block-boundary";
+// The binding pass's own types, which the props above and a block's `bound`
+// argument name. A consumer passing bindings or reading a bound value has no
+// other path to them: the engine is this package's dependency, not theirs.
+// Named by this package's published declarations, so a consumer can write
+// the type of what it passes or receives without a dependency on the engine.
+export type {
+  BindingDemand,
+  BlockSeoRead,
+  ComponentLookup,
+  ConditionDayStart,
+  ConditionDemand,
+  ConditionSubject,
+  DocumentCode,
+  DocumentSeo,
+  EntryContentIssueCode,
+  ImageValue,
+  ListFields,
+  SeoBinding,
+  SeoTextSegment,
+  SourceDemand,
+} from "@nextlyhq/blocks-engine";
+export type {
+  BindablePropKind,
+  BindingFieldShape,
+  BooleanParam,
+  ChoiceParam,
+  DayParam,
+  EntryParam,
+  ListNamedQuery,
+  NamedQueryChoice,
+  NamedQueryDeclaration,
+  NamedQueryDefinition,
+  NamedQueryParam,
+  NamedQueryParamValue,
+  NamedQueryParamValues,
+  NamedQueryParams,
+  NamedQueryReader,
+  NamedQueryResult,
+  NamedQueryRows,
+  NamedQueryRunArgs,
+  NamedReadFilter,
+  NamedReadQuery,
+  NumberParam,
+  TextParam,
+  BindingFormatter,
+  BindingIssue,
+  BindingIssueCode,
+  ConditionIssue,
+  ConditionIssueCode,
+  BindingRun,
+  BindingSchemaRef,
+  BindingSchemaSource,
+  BindingSources,
+  BlockPropsLookup,
+  BoundValue,
+  BoundValues,
+  CheckedFormat,
+  FormatEnv,
+  FormatResult,
+  FormattedValue,
+  FieldStoragePrimitive,
+} from "@nextlyhq/blocks-engine";
+
+/**
+ * Draw stored rich text as React.
+ *
+ * The CMS derives HTML from the same stored shape; this draws a React tree.
+ * Both read the type and format bits from `blocks-engine`, which is the only
+ * thing they can share — this package may not import the CMS.
+ */
+export { RichText, type RichTextProps } from "./rich-text";
+export { BlockPlaceholder } from "./placeholder";
+export type { BlockPlaceholderProps, PlaceholderReason } from "./placeholder";
+
+export {
+  createBlockResolver,
+  migrationSourceFor,
+  offeredSiteBlocks,
+  offeredSiteForms,
+  registeredBlocks,
+  SITE_BLOCKS_SERVICE,
+  SITE_COPY,
+  SITE_FORMS_SERVICE,
+  SITE_NAMED_QUERIES_SERVICE,
+  SITE_PAGE_DATA_LIMIT_SERVICE,
+  siteCopyOf,
+} from "./resolver";
+export type { BlockResolver, SiteCopyMark, SiteFormsService } from "./resolver";
+// What `offeredSiteBlocks` answers, a site's blocks read-only, and the views
+// it hands out.
+export type {
+  BlockRegistryReader,
+  BlockTypeLookup,
+  NestingSource,
+  SlotDefaultSource,
+  SupportDefinition,
+} from "@nextlyhq/blocks-engine";
+
+export {
+  // Public because the WRITE path needs it, and unlike the shared-input identity
+  // a writer can compute the SAME value a reader does: this is a pure function
+  // of the host's pattern list, and `effectiveCompile` calls it on exactly that
+  // list. A writer that could not compute the same label would stamp nothing,
+  // every stored sheet would read as stale, and a site with a policy would
+  // recompile its CSS on every render for ever.
+  fetchPolicyLabel,
+  // The one question `"use client"` cannot answer: given a STORED page, does it
+  // contain a block that needs JavaScript? Public because the callers who need
+  // it are outside this package — a host deciding what to serve, an editor
+  // warning an author what a block costs.
+  islandsFor,
+  resolvePageStyles,
+  resolvePageStylesWithTrace,
+  styleTextForInjection,
+} from "./styles";
+export type {
+  PageStyles,
+  ResolvedPageStyles,
+  ResolveStyleOptions,
+} from "./styles";
+
+/**
+ * Exported because `resolvePageStyles` has a precondition a caller could not otherwise meet.
+ *
+ * That helper expects the document it is handed to be the one that will RENDER. Called with a raw
+ * document it emits rules for nodes a reader withholds, publishing the colours, fonts and
+ * `url(...)` of a block nobody was served. `PageRenderer` runs these passes itself, so the ordinary
+ * path is safe; a consumer assembling styles directly had the unsafe path available and no safe
+ * one.
+ *
+ * The two are not interchangeable, and the difference is the whole point of publishing both.
+ * `pruneHiddenNodes` is the gating pass ALONE, which is what a caller wants once it has run the
+ * rest itself. `prepareDocumentForRead` is the whole sequence — format guard, shape repair against
+ * the site's own caps, migration, gating, address repair, and pruning the subtrees a placeholder
+ * replaces — and is the only thing that produces the tree the page actually presents. Gating alone
+ * leaves a tree LARGER than the render's, so styles resolved against it still ship rules for nodes
+ * the page drops.
+ *
+ * 🔴 Neither of them is the flow for serving a page's stored STYLESHEET, and preparing a document
+ * then resolving styles against the result is the pairing that looks like it. What the second call
+ * needs to know is whether the first REMOVED anything, and the prepared tree it receives no longer
+ * says: a node the placeholder pass dropped takes its markup off the page while the block-type
+ * defaults and named classes it pulled into the sheet stay, because those tiers are keyed by type
+ * and by class rather than by node. `preparePageForRead` does both halves and answers that question
+ * from the evidence, which is why it exists rather than a documented instruction to pass a flag.
+ */
+export { pruneHiddenNodes } from "./visibility";
+/**
+ * @experimental How an editor judges a page's conditions for an entry, the
+ * route's way, drawing its own node in place of a block they hide, and one
+ * block with its conditions lifted, as an editor draws one that holds.
+ */
+export { liftedNode, type EntryJudgement } from "./visibility";
+export {
+  pageBindingRun,
+  prepareDocumentForRead,
+  rendersOwnMarkup,
+} from "./prepare-document";
+/**
+ * @experimental The tree the renderer walks, placeholders included, for a
+ * surface listing a page's parts beside a picture of it.
+ */
+export { prepareDocumentAsDrawn } from "./prepare-document";
+/**
+ * @experimental The component definitions as the renderer reads them,
+ * repaired on demand, for an editor surface that composes a page beside the
+ * renderer and must compose the same tree.
+ */
+export { repairingLookup } from "./prepare-document";
+/**
+ * @experimental When a day starts for a visibility condition on a date field,
+ * in the site's zone, for an editor surface judging conditions as the
+ * published page judges them.
+ */
+export { conditionDayStart } from "./blocks/list-read";
+/**
+ * @experimental A stored document made sound to walk, as the renderer makes
+ * it before drawing: for an editor surface that reads the tree the renderer
+ * draws, so a node the renderer drops is one it drops too.
+ */
+export { sanitizeDocument } from "./sanitize";
+/**
+ * @experimental The collections a page's lists draw, whose field shapes judge
+ * their items' bindings: one walk for the published route and the editor.
+ */
+export { listCollections } from "./list-collections";
+/**
+ * @experimental The same walk, for the lists `wanted` keeps, each list's
+ * props filled by a binding run where one is given: the editor's change
+ * check watches the collection a bound list draws, not its stored fallback.
+ */
+export { listCollectionsWhere } from "./list-collections";
+/**
+ * @experimental A list's query as the engine reads it, which
+ * {@link listCollectionsWhere} hands to the `wanted` it is given, and the
+ * types it is written in.
+ */
+export type {
+  ListFilter,
+  ListFilterOp,
+  ListFilterScalar,
+  ListQuery,
+  ListRelation,
+  ListSortKey,
+} from "@nextlyhq/blocks-engine";
+export type { PrepareDocumentArgs, PreparedDocument } from "./prepare-document";
+export { preparePageForRead } from "./read-page";
+export type { PreparedPage, ReadPageArgs } from "./read-page";
+
+/**
+ * The engine types this package's own options are written in terms of.
+ *
+ * **A package that names a type in its public API owes that type to its
+ * callers.** These originate in `@nextlyhq/blocks-engine`, which is a
+ * DEPENDENCY of this package rather than a peer — so a host installing
+ * `@nextlyhq/blocks-react` does not have it as a direct dependency and cannot
+ * import from it. A type that reaches the built `.d.ts` in a parameter
+ * position while no export statement names it leaves a host able to SEE the
+ * name it is required to pass with no way to write it down.
+ *
+ * **The set is CLOSED, which is why it is larger than the names this package's
+ * own signatures mention.** An exported type is only as writable as its parts:
+ * a host handed `BlockDefinition` can name it and still be unable to write
+ * down the `supports` object it must pass, or the `seo()` return it must
+ * produce. Every type reachable from one exported here is therefore exported
+ * too, so annotating any PART of the surface needs no second package.
+ *
+ * `/next` re-exports none of these. Its declarations import the `next` and
+ * `nextly` peers, so a standalone install cannot load that entry at all; this
+ * one imports nothing but the engine and resolves wherever the package does.
+ *
+ * `nextly`'s own types are deliberately NOT re-exported here. `nextly` is a
+ * PEER dependency, so a host has installed it directly and should name
+ * `ContentEntry`, `RenderContext` and the route shapes from `nextly/runtime`
+ * where they live. Two import paths for one type is a worse cost than one
+ * import a host already has the package for.
+ */
+export type {
+  // Renamed, because this package declares its own `BlockRenderArgs`: a
+  // one-parameter React specialization pinned to `PageContext`, which is what a
+  // block written against `ReactBlockDefinition` receives. The engine's takes a
+  // second parameter and leaves the context open, so a consumer annotating
+  // `BlockDefinition<Props, CustomContext>` needs THIS one and cannot reach it
+  // under a name already taken by a narrower type.
+  BlockRenderArgs as EngineBlockRenderArgs,
+  AnyBlockDefinition,
+  Binding,
+  BindingFormat,
+  // Reachable from `BindingFormat`, whose variants are derived from the shape
+  // map keyed by this type. A type a consumer can reach through a re-exported
+  // one but cannot name is a hole in the surface.
+  BindingFormatType,
+  // Reachable from `Binding`, whose non-single branch is typed as
+  // `Exclude<BindingSource, "single">` so the vocabulary has one owner. A type
+  // a consumer can reach through a re-exported one but cannot name is a hole in
+  // the surface, which `type-surface.test.ts` refuses.
+  BindingSource,
+  // Reachable from `BlockDefinition.converters`, which a block declares to be
+  // turned into another type.
+  BlockConversion,
+  BlockConversionContext,
+  BlockConverter,
+  BlockDefinition,
+  BlockDocument,
+  BlockEditorMeta,
+  BlockExample,
+  BlockIcon,
+  BlockIsland,
+  BlockMigrationInfo,
+  BlockNode,
+  BlockOrigin,
+  BlockPart,
+  BlockRenderResult,
+  BlockSeoContribution,
+  BlockSeoImage,
+  BlockSupportValue,
+  BlockSupports,
+  BlockVariation,
+  BreakpointDef,
+  BreakpointId,
+  BreakpointSet,
+  CompiledPageCss,
+  ComponentPath,
+  Condition,
+  // Reachable from `BlockDefinition.contentModel`, which a block author
+  // declares; a type reachable through a re-exported one but unnamed is a hole.
+  ContentKind,
+  ContentModel,
+  DocumentFormatVersion,
+  DocumentKind,
+  DocumentLimits,
+  DocumentSettings,
+  IssueCode,
+  IssueSeverity,
+  MayFetchUrl,
+  MigrateFn,
+  // A migration step's drops, reachable from `BlockDefinition`.
+  MigrationDrops,
+  MigrationMap,
+  // A migration step's renames, reachable from `BlockDefinition`.
+  MigrationRenames,
+  MigrationSource,
+  NamedClass,
+  NodeStyles,
+  NodeVisibility,
+  // The tab a prop names, reachable from `PropSchema`.
+  PropGroup,
+  PropSchema,
+  RemotePattern,
+  RemotePatternInput,
+  SlotLock,
+  SlotSpec,
+  BreakpointContextOptions,
+  // Composition. `PrepareDocumentArgs` names the definitions map in a
+  // parameter position and the stages name what came back, so a host that
+  // cannot write these down cannot annotate the call it is required to make.
+  ComponentUnresolvedReason,
+  DefinitionsById,
+  // A resolved node maps each exposed prop to the placement exposure feeding it.
+  PropExposure,
+  ResolvedBlockNode,
+  ResolvedDocument,
+  UnresolvedInstance,
+  // Named by the composition and exposed-property types above: a resolution's
+  // options carry a work allowance, and an exposed property states its type,
+  // so a host typing either needs these without reaching into the engine.
+  ExposedPropertyType,
+  ResolveComponentOptions,
+  WorkAllowance,
+  // Named by the engine's insert of a locked subtree, which types above reach:
+  // where a block lands, and the block that lands there.
+  OpPosition,
+  Placed,
+  // A host's checker for custom CSS, reachable from `StyleCompileContext`.
+  CustomCssLevel,
+  CustomCssPolicy,
+  StyleCompileContext,
+  StyleOrigin,
+  StyleState,
+  StyleTraceEntry,
+  StyleValue,
+  StyleValues,
+  TokenRef,
+  ValidationIssue,
+} from "@nextlyhq/blocks-engine";
+
+/**
+ * The container names a preview compile emits its breakpoints against.
+ *
+ * Re-exported beside {@link BreakpointContextOptions} because a consumer of this
+ * package does not depend on the engine directly: without them, the previewing
+ * surface would have to hard-code the same reserved identifiers in its own
+ * `container-name`, and a name spelled twice is a name that can be spelled
+ * differently.
+ */
+export {
+  PREVIEW_VIEWPORT_CONTAINER,
+  UNPREVIEWABLE_CONTAINER,
+  /*
+   * The FACTORY as well as the constants, because it is the only supplied way
+   * off the predictable default.
+   *
+   * `PREVIEW_VIEWPORT_CONTAINER` is a default rather than a reservation — an
+   * ancestor declaring the same name captures the viewport queries — so a
+   * surface rendering third-party blocks is meant to mint its own. Under pnpm
+   * an application declaring only this package cannot reliably import a
+   * transitive dependency, so omitting this left the collision-safe path
+   * reachable only by adding `@nextlyhq/blocks-engine` to its manifest or by
+   * reimplementing the name validation, and the second is the one people do.
+   */
+  previewContainerFor,
+} from "@nextlyhq/blocks-engine";
+export {
+  PREVIEW_CONTAINER_STYLE,
+  previewContainerStyle,
+} from "./preview-container";
+
+// The render's own discovery, for a caller outside the render that needs the
+// same answer. Exported because a publish-time check walking stored documents
+// for component ids asks a DIFFERENT question — it reports gated instances,
+// discarded slot content and pre-override ids the renderer never requests.
+export {
+  unsuppliedComponentIds,
+  COMPONENT_DOCUMENT_FIELD,
+  type ComponentSource,
+} from "./component-source";
+// The same discovery for a reader that needs the definitions themselves: the
+// page builder's Layout choices read a region's components, nested ones
+// included, at the posture the published route reads them.
+export { definitionsFor } from "./component-source";
+// What a page reads when published, counted where it is edited: the
+// published route's own read stages, run with the editor's reads.
+// `@experimental` with the read budget.
+export {
+  countPageReads,
+  type CountedBindings,
+  type CountedDrawing,
+  type CountedRegion,
+  type PageReadCountArgs,
+} from "./page-read-count";
+export type {
+  BindingsAsk,
+  EntrySource,
+  PageWhere,
+  RouteMedia,
+} from "./page-read-stages";
+
+// How a page and the regions of its Layout share one site sheet and keep
+// their own styles apart: one answer for the published route and the editor's
+// canvas, so an author sees the cascade a visitor gets.
+export { layoutPartSheets, type PagePart, type PartSheet } from "./page-parts";
+// The area type `PagePart` names, re-exported so a consumer of this entry can
+// name it without a dependency on the engine.
+export type { RegionArea } from "@nextlyhq/blocks-engine";

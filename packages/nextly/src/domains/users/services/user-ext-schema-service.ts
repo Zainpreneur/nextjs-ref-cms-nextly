@@ -1,0 +1,1767 @@
+/**
+ * UserExtSchemaService
+ *
+ * Generates database schemas for the `user_ext` table that stores custom user fields.
+ * Handles SQL migration generation, Drizzle TypeScript schema code generation,
+ * runtime Drizzle table object creation, and schema hashing for change detection.
+ *
+ * The `user_ext` table extends the built-in `users` table with custom fields defined
+ * via `defineConfig({ users: { fields: [...] } })` or the admin UI.
+ *
+ * Base columns:
+ * - `id`: text PK
+ * - `user_id`: text FK → users.id (unique, NOT NULL, cascade delete)
+ * - `created_at`, `updated_at`: timestamps
+ *
+ * Supports PostgreSQL, MySQL, and SQLite dialects.
+ *
+ * @module services/users/user-ext-schema-service
+ * @since 1.0.0
+ *
+ * @example
+ * ```typescript
+ * const schemaService = new UserExtSchemaService('postgresql');
+ *
+ * // Generate SQL migration for the user_ext table
+ * const sql = schemaService.generateMigrationSQL(userConfig.fields);
+ *
+ * // Generate Drizzle TypeScript schema code
+ * const code = schemaService.generateSchemaCode(userConfig.fields);
+ *
+ * // Generate runtime Drizzle table object for querying
+ * const table = schemaService.generateRuntimeSchema(userConfig.fields);
+ *
+ * // Compute schema hash for change detection
+ * const hash = schemaService.computeSchemaHash(userConfig.fields);
+ * ```
+ */
+
+import type { Table, Column } from "drizzle-orm";
+import {
+  mysqlTable,
+  text as mysqlText,
+  boolean as mysqlBoolean,
+  datetime as mysqlDatetime,
+  json as mysqlJson,
+  varchar as mysqlVarchar,
+  double as mysqlDouble,
+  uniqueIndex as mysqlUniqueIndex,
+} from "drizzle-orm/mysql-core";
+import {
+  pgTable,
+  text as pgText,
+  varchar as pgVarchar,
+  boolean as pgBoolean,
+  timestamp as pgTimestamp,
+  jsonb as pgJsonb,
+  doublePrecision as pgDoublePrecision,
+  uniqueIndex as pgUniqueIndex,
+} from "drizzle-orm/pg-core";
+import {
+  sqliteTable,
+  customType,
+  text as sqliteText,
+  integer as sqliteInteger,
+  real as sqliteReal,
+  uniqueIndex as sqliteUniqueIndex,
+} from "drizzle-orm/sqlite-core";
+
+import {
+  isTextField,
+  isTextareaField,
+  isEmailField,
+  isNumberField,
+  isCheckboxField,
+  isDateField,
+  isSelectField,
+  isRadioField,
+  isDataField,
+} from "../../../collections/fields/guards";
+import type { DataFieldConfig } from "../../../collections/fields/types";
+import { NextlyError } from "../../../errors";
+import { env } from "../../../lib/env";
+import type { UserFieldDefinitionRecord } from "../../../schemas/user-field-definitions/types";
+import type { Logger } from "../../../services/shared";
+import type {
+  UserFieldConfig,
+  UserUrlFieldConfig,
+  UserPhoneFieldConfig,
+} from "../../../users/config/types";
+import {
+  checkUserFieldName,
+  userFieldColumnName,
+  userFieldUniqueRejection,
+} from "../../../users/config/validate-user-config";
+import {
+  getFieldType,
+  isPluginFieldTypeOnSurface,
+} from "../../schema/field-types/field-type-registry";
+import { runRaw } from "../../schema/pipeline/pre-resolution/executor";
+import { isIdempotencyError } from "../../schema/pipeline/sql-statement-utils";
+import { columnIndexSql } from "../../schema/pipeline/sql-templates/create-index";
+import {
+  applyStatementsInTries,
+  type BusyTableWait,
+} from "../../schema/services/apply-migration-statements";
+import {
+  columnTypeIsIndexable,
+  uniquenessCanBeAnIndex,
+} from "../../schema/services/index-name";
+import { sqliteTimestampColumns } from "../../schema/services/runtime-schema-generator";
+import { calculateSchemaHash } from "../../schema/services/schema-hash";
+
+import type { UserFieldDefinitionService } from "./user-field-definition-service";
+
+// ============================================================
+// Constants
+// ============================================================
+
+const TABLE_NAME = "user_ext";
+
+// ============================================================
+// Drizzle Runtime Types
+// ============================================================
+
+/**
+ * Runtime-generated Drizzle table — columns are dynamic so we cannot
+ * express the full shape statically. Property access (e.g., `table.user_id`)
+ * uses the `Record<string, unknown>` intersection.
+ */
+type DrizzleRuntimeTable = Table & Record<string, unknown>;
+
+// ============================================================
+// Types
+// ============================================================
+
+export type SupportedDialect = "postgresql" | "mysql" | "sqlite";
+
+/**
+ * SQL column type definitions for each dialect.
+ */
+const SQL_COLUMN_TYPES: Record<
+  SupportedDialect,
+  {
+    uuid: string;
+    text: string;
+    varchar: (length: number) => string;
+    boolean: string;
+    integer: string;
+    number: string;
+    timestamp: string;
+    json: string;
+  }
+> = {
+  postgresql: {
+    uuid: "UUID",
+    text: "TEXT",
+    varchar: (length: number) => `VARCHAR(${length})`,
+    boolean: "BOOLEAN",
+    integer: "INTEGER",
+    // Eight bytes, as a collection's number and MySQL's and SQLite's user
+    // numbers are: REAL is four on PostgreSQL and rounds past seven digits.
+    number: "DOUBLE PRECISION",
+    timestamp: "TIMESTAMP WITH TIME ZONE",
+    json: "JSONB",
+  },
+  mysql: {
+    uuid: "VARCHAR(36)",
+    text: "TEXT",
+    varchar: (length: number) => `VARCHAR(${length})`,
+    boolean: "BOOLEAN",
+    integer: "INT",
+    number: "DOUBLE",
+    timestamp: "DATETIME",
+    json: "JSON",
+  },
+  sqlite: {
+    uuid: "TEXT",
+    text: "TEXT",
+    varchar: () => "TEXT",
+    boolean: "INTEGER",
+    integer: "INTEGER",
+    number: "REAL",
+    timestamp: "INTEGER",
+    json: "TEXT",
+  },
+};
+
+/**
+ * The column a user field is stored in, described once.
+ *
+ * The statements that create and alter `user_ext` spell it (`spellColumn`), and the runtime table
+ * every read and write goes through declares it (`runtimeColumn`), from this one answer. Two
+ * mappings kept side by side had drifted, and Drizzle encodes and decodes a value by the type it
+ * is told, so a column declared as another type than the one made translated values wrongly: a
+ * PostgreSQL date read as a plain timestamp moved by the session's offset, and a SQLite list
+ * bound to a plain text column made the whole custom write fail.
+ */
+type UserExtColumn =
+  | { kind: "text" }
+  | { kind: "varchar"; length: number }
+  | { kind: "number" }
+  | { kind: "boolean" }
+  | { kind: "timestamp" }
+  | { kind: "json" };
+
+/**
+ * Identifier quote characters for each dialect.
+ */
+const QUOTE_CHAR: Record<SupportedDialect, string> = {
+  postgresql: '"',
+  mysql: "`",
+  sqlite: '"',
+};
+
+/**
+ * Timestamp default value by dialect.
+ */
+const TIMESTAMP_DEFAULT: Record<SupportedDialect, string> = {
+  postgresql: "DEFAULT NOW()",
+  mysql: "DEFAULT CURRENT_TIMESTAMP",
+  sqlite: "DEFAULT (strftime('%s', 'now'))",
+};
+
+/**
+ * Whether a stored field's carried options declare it `admin.hidden`: the
+ * sync keeps a field's declared `admin` among them (`carriedUserFieldOptions`).
+ */
+function declaredHidden(
+  pluginOptions: Record<string, unknown> | null | undefined
+): boolean {
+  const admin = pluginOptions?.admin;
+  return (
+    typeof admin === "object" &&
+    admin !== null &&
+    (admin as { hidden?: unknown }).hidden === true
+  );
+}
+
+// ============================================================
+// UserExtSchemaService
+// ============================================================
+
+/**
+ * A SQLite JSON column that tolerates values written before it was one.
+ *
+ * SQLite has no JSON type, so the value is held as text. Drizzle's built-in
+ * `{ mode: "json" }` would encode and decode it, but decoding is
+ * unconditional: a row written while this column was plain text can hold a
+ * bare string such as `hello`, and `JSON.parse` throws on it. The read path
+ * treats a failed `user_ext` query as the table being absent and returns the
+ * user with no custom fields at all, so one legacy row would silently empty
+ * every custom field on that user.
+ *
+ * Encoding is unconditional — that is the half worth having, since a plain
+ * text column stored a live object as `[object Object]`. Decoding falls back
+ * to the raw string, which is exactly what such a row meant when it was
+ * written.
+ */
+const sqliteTolerantJson = customType<{ data: unknown; driverData: string }>({
+  dataType: () => "text",
+  toDriver: (value: unknown): string => JSON.stringify(value),
+  fromDriver: (value: string): unknown => {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value;
+    }
+  },
+});
+
+/** The PostgreSQL column `column` is declared as at runtime. */
+function postgresColumn(name: string, column: UserExtColumn) {
+  switch (column.kind) {
+    case "varchar":
+      return pgVarchar(name, { length: column.length });
+    case "text":
+      return pgText(name);
+    case "number":
+      return pgDoublePrecision(name);
+    case "boolean":
+      return pgBoolean(name);
+    case "timestamp":
+      return pgTimestamp(name, { withTimezone: true });
+    case "json":
+      return pgJsonb(name);
+  }
+}
+
+/** The MySQL column `column` is declared as at runtime. */
+function mysqlColumn(name: string, column: UserExtColumn) {
+  switch (column.kind) {
+    case "varchar":
+      return mysqlVarchar(name, { length: column.length });
+    case "text":
+      return mysqlText(name);
+    case "number":
+      return mysqlDouble(name);
+    case "boolean":
+      return mysqlBoolean(name);
+    case "timestamp":
+      return mysqlDatetime(name);
+    case "json":
+      return mysqlJson(name);
+  }
+}
+
+/**
+ * The SQLite column `column` is declared as at runtime. SQLite spells several kinds alike, a list
+ * and a text both as TEXT, so the kind rather than the spelling picks the encoding.
+ */
+function sqliteColumn(name: string, column: UserExtColumn) {
+  switch (column.kind) {
+    case "varchar":
+    case "text":
+      return sqliteText(name);
+    case "number":
+      return sqliteReal(name);
+    case "boolean":
+      return sqliteInteger(name, { mode: "boolean" });
+    case "timestamp":
+      return sqliteInteger(name, { mode: "timestamp" });
+    case "json":
+      return sqliteTolerantJson(name);
+  }
+}
+
+export class UserExtSchemaService {
+  private readonly dialect: SupportedDialect;
+  private readonly q: string;
+  private readonly fieldDefService?: UserFieldDefinitionService;
+  private readonly logger?: Logger;
+
+  /** Cached merged fields from both code and UI sources */
+  private mergedFields: UserFieldConfig[] | null = null;
+
+  /**
+   * Fields the last merge left out because another field is stored in their
+   * column. The boot carries on without them; `nextly migrate` refuses, so it
+   * never reports storage ready for a configured field that has none.
+   */
+  private columnCollisions: Array<{
+    field: string;
+    column: string;
+    heldBy: string;
+  }> = [];
+
+  constructor(
+    dialect?: SupportedDialect,
+    fieldDefService?: UserFieldDefinitionService,
+    logger?: Logger
+  ) {
+    this.dialect = dialect || env.DB_DIALECT || "postgresql";
+    this.q = QUOTE_CHAR[this.dialect];
+    this.fieldDefService = fieldDefService;
+    this.logger = logger;
+  }
+
+  // ============================================================
+  // Merged Fields (Code + UI)
+  // ============================================================
+
+  /**
+   * Load merged fields from both code (`defineConfig()`) and UI
+   * (`user_field_definitions` table) sources.
+   *
+   * Must be called after `syncCodeFields()` so the database reflects
+   * the latest code-defined fields. The result is cached internally
+   * and exposed via `getMergedFieldConfigs()`.
+   *
+   * If no `UserFieldDefinitionService` was provided, this is a no-op.
+   */
+  async loadMergedFields(): Promise<void> {
+    if (!this.fieldDefService) return;
+
+    const records = await this.fieldDefService.getMergedFields();
+
+    // A custom field's name is assigned over the built-ins on the user object
+    // and replaces the built-in's validation in the merged schema, so one
+    // named `email` or `id` displaces the real one. Creating such a field is
+    // refused, but a row predating that check must not be honoured: dropping
+    // it here keeps it out of the column list, the select and both schemas at
+    // once. The row is left alone so the name can be recovered by hand.
+    const usable: UserFieldConfig[] = [];
+    const columns = new Map<string, string>();
+    this.columnCollisions = [];
+    for (const record of records) {
+      const rejection = checkUserFieldName(record.name);
+      if (rejection) {
+        this.logger?.warn(
+          "[UserExtSchemaService] Ignoring user field with an unusable name",
+          { name: record.name, reason: rejection.code }
+        );
+        continue;
+      }
+      // A code field and an admin field can each pass on their own and still
+      // be stored in one column (`fooBar`, `foo_bar`). The first keeps it;
+      // the other is left out rather than break the table's statements, and is
+      // recorded so a strict run can refuse instead.
+      const column = userFieldColumnName(record.name);
+      const heldBy = columns.get(column);
+      if (heldBy !== undefined) {
+        this.logger?.warn(
+          "[UserExtSchemaService] Ignoring user field stored in a column another field already uses",
+          { name: record.name, column, heldBy }
+        );
+        this.columnCollisions.push({ field: record.name, column, heldBy });
+        continue;
+      }
+      columns.set(column, record.name);
+      usable.push(this.convertRecordToFieldConfig(record));
+    }
+
+    this.mergedFields = usable;
+  }
+
+  /**
+   * Reload merged fields from the database, clearing any stale cache.
+   *
+   * Called after field CRUD operations (create, update, delete) to
+   * ensure the in-memory merged fields reflect the latest DB state.
+   */
+  async reloadMergedFields(): Promise<void> {
+    this.mergedFields = null;
+    await this.loadMergedFields();
+  }
+
+  /**
+   * Ensure the `user_ext` table exists and has columns for all
+   * current merged fields.
+   *
+   * Executes CREATE TABLE IF NOT EXISTS followed by ALTER TABLE
+   * ADD COLUMN for each field. Safe to call multiple times (idempotent).
+   *
+   * @param db - Drizzle database instance for executing raw SQL
+   * @param options.strict - Throw a statement's failure unless what it creates
+   *   already exists. The boot leaves it off, since nothing there may stop the
+   *   app starting; `nextly migrate` turns it on, so it never reports storage
+   *   ready that it could not create.
+   */
+  async ensureUserExtSchema(
+    db: unknown,
+    options: {
+      strict?: boolean;
+      /**
+       * Where given (a Schema Builder save of a user field), each statement waits for a table
+       * another session is using in short tries, as `nextly migrate` waits.
+       */
+      busyTable?: BusyTableWait;
+    } = {}
+  ): Promise<void> {
+    const strict = options.strict === true;
+    const busyTable = options.busyTable;
+    if (strict && this.columnCollisions.length > 0) {
+      throw NextlyError.validation({
+        errors: this.columnCollisions.map(c => ({
+          path: "users.fields",
+          code: "USER_FIELD_NAME_DUPLICATE",
+          message: `Field '${c.field}' would be stored in the column '${c.column}', which the field '${c.heldBy}' already uses`,
+        })),
+        logContext: { collisions: this.columnCollisions },
+      });
+    }
+    const fields = this.getMergedFieldConfigs();
+    if (fields.length === 0) return;
+
+    // The generated statements, with leading comment lines (e.g. "-- Create
+    // user extension table") stripped so the DDL itself runs.
+    const statements = this.generateMigrationSQL(fields)
+      .split("\n--> statement-breakpoint\n")
+      .map(stmt =>
+        stmt
+          .split("\n")
+          .filter(line => {
+            const t = line.trim();
+            return t && !t.startsWith("--");
+          })
+          .join("\n")
+          .trim()
+      )
+      .filter(Boolean);
+    // The table first, then any column it lacks, then the indexes and
+    // constraints: on a table that predates a field, the field's index can
+    // only be made once its column has been added.
+    const isCreateTable = (stmt: string) => /^CREATE TABLE/i.test(stmt);
+
+    // 1. CREATE TABLE IF NOT EXISTS (with all columns). runRaw picks the
+    //    dialect's call: SQLite's Drizzle database has no .execute(), so
+    //    calling it threw and was taken for "already exists".
+    const plan = [...statements.filter(isCreateTable)];
+
+    // 2. ALTER TABLE ADD COLUMN for each field (handles case where
+    //    table exists but is missing columns for newly created fields)
+    for (const field of fields) {
+      if (!("name" in field) || !field.name) continue;
+
+      const columnName = this.toSnakeCase(field.name);
+      const columnType = this.getColumnType(field);
+      if (!columnType) continue;
+
+      let alterSQL: string;
+      if (this.dialect === "postgresql") {
+        alterSQL = `ALTER TABLE ${this.q}${TABLE_NAME}${this.q} ADD COLUMN IF NOT EXISTS ${this.q}${columnName}${this.q} ${columnType}`;
+      } else {
+        // MySQL and SQLite don't support IF NOT EXISTS for ADD COLUMN
+        alterSQL = `ALTER TABLE ${this.q}${TABLE_NAME}${this.q} ADD COLUMN ${this.q}${columnName}${this.q} ${columnType}`;
+      }
+
+      plan.push(alterSQL);
+    }
+
+    // 3. The indexes and constraints, now that every column exists.
+    plan.push(...statements.filter(s => !isCreateTable(s)));
+
+    if (busyTable !== undefined) {
+      await this.runPlanInTries(plan, strict, busyTable);
+      return;
+    }
+    for (const stmt of plan) {
+      await this.runDdl(db, stmt, strict);
+    }
+  }
+
+  /**
+   * The plan as one change that waits for a busy table in short tries, as `nextly migrate` waits,
+   * so a stop after an earlier statement says what of it stayed. What `runDdl` passes over is
+   * passed over here too; a busy table's stop is reported whatever `strict` asks.
+   */
+  private async runPlanInTries(
+    plan: readonly string[],
+    strict: boolean,
+    busyTable: BusyTableWait
+  ): Promise<void> {
+    let refusal: NextlyError | null = null;
+    try {
+      await applyStatementsInTries(
+        busyTable,
+        plan,
+        "the user fields' table change",
+        (error, statement) => {
+          if (
+            !strict ||
+            isIdempotencyError(error) ||
+            this.isOwnForeignKeyRerun(error, statement)
+          ) {
+            return true;
+          }
+          refusal = this.textColumnUniqueRefusal(error, statement);
+          return false;
+        }
+      );
+    } catch (error) {
+      if (NextlyError.is(error) && error.code === "NEXTLY_TABLE_BUSY") {
+        throw error;
+      }
+      throw refusal ?? error;
+    }
+  }
+
+  /**
+   * Whether a column of this type takes a plain unique index on this dialect.
+   * A JSON column takes none anywhere; MySQL indexes a TEXT column only with a
+   * key length, which a unique field's index has not, so a plugin type stored
+   * as long text gets no index there. PostgreSQL and SQLite index text columns
+   * as they are.
+   */
+  private canCarryUniqueIndex(columnType: string): boolean {
+    if (/json/i.test(columnType)) return false;
+    // The shared rule collections and components ask, which knows every TEXT and BLOB size.
+    return uniquenessCanBeAnIndex(columnType, this.dialect);
+  }
+
+  /**
+   * Run one schema statement. A table, index, constraint or column that
+   * already exists is what a re-run expects, and is ignored. Any other failure
+   * is thrown when `strict`, and ignored otherwise.
+   */
+  private async runDdl(
+    db: unknown,
+    statement: string,
+    strict: boolean
+  ): Promise<void> {
+    try {
+      await runRaw(db, statement, this.dialect);
+    } catch (error) {
+      if (!strict || isIdempotencyError(error)) return;
+      if (this.isOwnForeignKeyRerun(error, statement)) return;
+      throw this.textColumnUniqueRefusal(error, statement) ?? error;
+    }
+  }
+
+  /**
+   * A unique index MySQL refused because its column is TEXT, as the refusal
+   * the person running `nextly migrate` can act on; null for any other
+   * failure. A column made before a unique field became a VARCHAR on MySQL is
+   * still TEXT: adding the field's column finds it already there and leaves
+   * it, with every value whole, so its index is all that fails (error 1170).
+   */
+  private textColumnUniqueRefusal(
+    error: unknown,
+    statement: string
+  ): NextlyError | null {
+    if (this.dialect !== "mysql") return null;
+    const column = new RegExp(`uq_${TABLE_NAME}_([a-z0-9_]+)`).exec(
+      statement
+    )?.[1];
+    if (!column || column === "user_id") return null;
+    let refusedForText = false;
+    for (let e: unknown = error, depth = 0; e && depth < 5; depth++) {
+      const { errno, message } = e as { errno?: unknown; message?: unknown };
+      if (
+        errno === 1170 ||
+        (typeof message === "string" &&
+          message.includes("used in key specification without a key length"))
+      ) {
+        refusedForText = true;
+        break;
+      }
+      e = (e as { cause?: unknown }).cause;
+    }
+    if (!refusedForText) return null;
+    const field =
+      this.getMergedFieldConfigs().find(
+        f => "name" in f && f.name && this.toSnakeCase(f.name) === column
+      )?.name ?? column;
+    const message = `The user field '${field}' is stored in a TEXT column on MySQL, which cannot carry its unique index. Its values are left as they are. Change the column to VARCHAR(255) once no value is longer, or remove \`unique\` from the field, then run \`nextly migrate\` again.`;
+    return NextlyError.validation({
+      errors: [
+        {
+          path: "users.fields",
+          code: "USER_FIELD_UNIQUE_UNSUPPORTED",
+          message,
+        },
+      ],
+      cause: error instanceof Error ? error : undefined,
+      logContext: { field, column, reason: message },
+    });
+  }
+
+  /**
+   * MySQL has no `ADD CONSTRAINT IF NOT EXISTS`, so re-adding `user_ext`'s
+   * own foreign key on a re-run fails with a duplicate name (error 1826).
+   * That name is this table's alone, so here, and only here, it means the key
+   * is already in place. The shared matcher never takes 1826 as "already
+   * exists": elsewhere the name may be held by an unrelated constraint.
+   */
+  private isOwnForeignKeyRerun(error: unknown, statement: string): boolean {
+    if (this.dialect !== "mysql") return false;
+    if (!statement.includes(`fk_${TABLE_NAME}_user_id`)) return false;
+    const messages = [error, (error as { cause?: unknown })?.cause].map(e =>
+      e instanceof Error ? e.message : ""
+    );
+    return messages.some(m =>
+      m.includes(
+        `Duplicate foreign key constraint name 'fk_${TABLE_NAME}_user_id'`
+      )
+    );
+  }
+
+  /**
+   * Get the cached merged field configs.
+   *
+   * Returns field configs from both code and UI sources (loaded via
+   * `loadMergedFields()`). Returns an empty array if not yet loaded
+   * or if no fields exist.
+   */
+  getMergedFieldConfigs(): UserFieldConfig[] {
+    return this.mergedFields ?? [];
+  }
+
+  /**
+   * Check whether merged fields have been loaded and contain at least one field.
+   */
+  hasMergedFields(): boolean {
+    return this.mergedFields !== null && this.mergedFields.length > 0;
+  }
+
+  /**
+   * Convert a `UserFieldDefinitionRecord` (DB row) to a `UserFieldConfig`
+   * compatible with the field type system.
+   *
+   * Maps DB record properties to the discriminated union shape expected
+   * by schema generation, runtime table creation, and field type guards.
+   */
+  private convertRecordToFieldConfig(
+    record: UserFieldDefinitionRecord
+  ): UserFieldConfig {
+    const base: Record<string, unknown> = {
+      name: record.name,
+      label: record.label,
+      required: record.required,
+    };
+    // `unique` has no column of its own on the row, so the sync stores it
+    // among the field's other options. Read back here, the table gets the
+    // field's unique index rather than an unconstrained column.
+    if (record.pluginOptions?.unique === true) base.unique = true;
+
+    // Map admin options (placeholder → admin.placeholder, description → admin.description)
+    const adminOpts: Record<string, unknown> = {};
+    if (record.placeholder) adminOpts.placeholder = record.placeholder;
+    if (record.description) adminOpts.description = record.description;
+    // A field declared `admin.hidden` keeps the flag: the row has no column
+    // for it, so the sync carries the declared `admin` among the field's
+    // options. Dropped here, a read asking to leave hidden fields out
+    // (`showHiddenFields: false`) would return this one.
+    if (declaredHidden(record.pluginOptions)) adminOpts.hidden = true;
+    if (Object.keys(adminOpts).length > 0) base.admin = adminOpts;
+
+    // Validation bounds ride the stored row so the schema builder and the
+    // zod checks see the same constraints for UI- and code-defined fields.
+    const textBounds: Record<string, unknown> = {};
+    if (record.minLength != null) textBounds.minLength = record.minLength;
+    if (record.maxLength != null) textBounds.maxLength = record.maxLength;
+    const numberBounds: Record<string, unknown> = {};
+    if (record.minValue != null) numberBounds.min = record.minValue;
+    if (record.maxValue != null) numberBounds.max = record.maxValue;
+
+    switch (record.type) {
+      case "text":
+        return {
+          ...base,
+          ...textBounds,
+          type: "text",
+          defaultValue: record.defaultValue ?? undefined,
+        } as UserFieldConfig;
+      case "textarea":
+        return {
+          ...base,
+          ...textBounds,
+          type: "textarea",
+          defaultValue: record.defaultValue ?? undefined,
+        } as UserFieldConfig;
+      case "email":
+        return {
+          ...base,
+          type: "email",
+          defaultValue: record.defaultValue ?? undefined,
+        } as UserFieldConfig;
+      case "url":
+        return {
+          ...base,
+          ...textBounds,
+          type: "url",
+          defaultValue: record.defaultValue ?? undefined,
+        } as UserFieldConfig;
+      case "phone":
+        return {
+          ...base,
+          ...textBounds,
+          type: "phone",
+          defaultValue: record.defaultValue ?? undefined,
+        } as UserFieldConfig;
+      case "number":
+        return {
+          ...base,
+          ...numberBounds,
+          type: "number",
+          defaultValue: record.defaultValue
+            ? Number(record.defaultValue)
+            : undefined,
+        } as UserFieldConfig;
+      case "checkbox":
+        return {
+          ...base,
+          type: "checkbox",
+          defaultValue:
+            record.defaultValue === "true" || record.defaultValue === "1",
+        } as unknown as UserFieldConfig;
+      case "date":
+        return { ...base, type: "date" } as UserFieldConfig;
+      case "select":
+        return {
+          ...base,
+          type: "select",
+          options: record.options || [],
+          ...(record.hasMany ? { hasMany: true } : {}),
+          defaultValue: record.defaultValue ?? undefined,
+        } as UserFieldConfig;
+      case "radio":
+        return {
+          ...base,
+          type: "radio",
+          options: record.options || [],
+          defaultValue: record.defaultValue ?? undefined,
+        } as UserFieldConfig;
+      default: {
+        // A plugin type that opted into the users surface keeps its own id so
+        // the admin renders the plugin's editor component; its column comes from
+        // the declared storage primitive (see getColumnType). A type not enabled
+        // on this surface (registration alone is not authorization) degrades to a
+        // text column so stray data is never stranded.
+        const isPluginType = isPluginFieldTypeOnSurface(record.type, "users");
+        return {
+          ...base,
+          ...textBounds,
+          type: isPluginType ? record.type : "text",
+          defaultValue: record.defaultValue ?? undefined,
+        } as UserFieldConfig;
+      }
+    }
+  }
+
+  // ============================================================
+  // SQL Migration Generation
+  // ============================================================
+
+  /**
+   * Generate SQL migration for creating the `user_ext` table.
+   *
+   * Creates a table with:
+   * - Base columns: id, user_id (FK → users.id, unique)
+   * - Field columns: generated from UserFieldConfig definitions
+   * - Timestamp columns: created_at, updated_at
+   * - Unique index on user_id
+   *
+   * @param fields - User field definitions
+   * @returns SQL migration string
+   */
+  generateMigrationSQL(fields: UserFieldConfig[]): string {
+    const types = SQL_COLUMN_TYPES[this.dialect];
+    const tsDefault = TIMESTAMP_DEFAULT[this.dialect];
+
+    const lines: string[] = [];
+    lines.push(`-- Create user extension table: ${TABLE_NAME}`);
+    lines.push(`CREATE TABLE IF NOT EXISTS ${this.q}${TABLE_NAME}${this.q} (`);
+
+    // Primary key
+    if (this.dialect === "mysql") {
+      lines.push(`  ${this.q}id${this.q} varchar(36) PRIMARY KEY NOT NULL,`);
+    } else {
+      lines.push(`  ${this.q}id${this.q} text PRIMARY KEY NOT NULL,`);
+    }
+
+    // user_id FK (unique, NOT NULL, cascade delete)
+    if (this.dialect === "mysql") {
+      lines.push(`  ${this.q}user_id${this.q} varchar(36) NOT NULL,`);
+    } else {
+      lines.push(`  ${this.q}user_id${this.q} text NOT NULL,`);
+    }
+
+    // Field columns
+    for (const field of fields) {
+      if (!this.isUserDataField(field)) continue;
+
+      const columnSQL = this.generateColumnSQL(field);
+      if (columnSQL) {
+        lines.push(`  ${columnSQL},`);
+      }
+    }
+
+    // Timestamp columns
+    lines.push(
+      `  ${this.q}created_at${this.q} ${types.timestamp} NOT NULL ${tsDefault},`
+    );
+    lines.push(
+      `  ${this.q}updated_at${this.q} ${types.timestamp} NOT NULL ${tsDefault}`
+    );
+
+    lines.push(");");
+
+    let sql = lines.join("\n");
+
+    // Indexes
+    const indexStatements: string[] = [];
+
+    // Unique index on user_id
+    const userIdIndexName = `uq_${TABLE_NAME}_user_id`;
+    if (this.dialect === "mysql") {
+      indexStatements.push(
+        `CREATE UNIQUE INDEX ${this.q}${userIdIndexName}${this.q} ON ${this.q}${TABLE_NAME}${this.q}(${this.q}user_id${this.q});`
+      );
+    } else {
+      indexStatements.push(
+        `CREATE UNIQUE INDEX IF NOT EXISTS ${this.q}${userIdIndexName}${this.q} ON ${this.q}${TABLE_NAME}${this.q}(${this.q}user_id${this.q});`
+      );
+    }
+
+    // Foreign key constraint (PostgreSQL and MySQL only — SQLite has limited ALTER TABLE)
+    if (this.dialect === "postgresql") {
+      indexStatements.push(
+        `ALTER TABLE ${this.q}${TABLE_NAME}${this.q} ADD CONSTRAINT ${this.q}fk_${TABLE_NAME}_user_id${this.q} FOREIGN KEY (${this.q}user_id${this.q}) REFERENCES ${this.q}users${this.q}(${this.q}id${this.q}) ON DELETE CASCADE;`
+      );
+    } else if (this.dialect === "mysql") {
+      indexStatements.push(
+        `ALTER TABLE ${this.q}${TABLE_NAME}${this.q} ADD CONSTRAINT ${this.q}fk_${TABLE_NAME}_user_id${this.q} FOREIGN KEY (${this.q}user_id${this.q}) REFERENCES ${this.q}users${this.q}(${this.q}id${this.q}) ON DELETE CASCADE;`
+      );
+    }
+
+    // Field-level unique indexes
+    for (const field of fields) {
+      if (!this.isUserDataField(field)) continue;
+      if (!("name" in field) || !field.name) continue;
+      if (!("unique" in field && field.unique)) continue;
+      // A column that cannot carry a unique index on every dialect (a
+      // textarea, a JSON column): validation refuses `unique` there now, and
+      // a definition stored before is left without the index rather than stop
+      // the table being made.
+      if (
+        userFieldUniqueRejection(field) ||
+        !this.canCarryUniqueIndex(this.getColumnType(field) ?? "")
+      ) {
+        this.logger?.warn(
+          "[UserExtSchemaService] Leaving out a unique index its column cannot carry",
+          { name: field.name, type: field.type }
+        );
+        continue;
+      }
+
+      const columnName = this.toSnakeCase(field.name);
+      const indexName = `uq_${TABLE_NAME}_${columnName}`;
+
+      if (this.dialect === "mysql") {
+        indexStatements.push(
+          `CREATE UNIQUE INDEX ${this.q}${indexName}${this.q} ON ${this.q}${TABLE_NAME}${this.q}(${this.q}${columnName}${this.q});`
+        );
+      } else {
+        indexStatements.push(
+          `CREATE UNIQUE INDEX IF NOT EXISTS ${this.q}${indexName}${this.q} ON ${this.q}${TABLE_NAME}${this.q}(${this.q}${columnName}${this.q});`
+        );
+      }
+    }
+
+    // Field-level regular indexes
+    for (const field of fields) {
+      if (!this.isUserDataField(field)) continue;
+      if (!("name" in field) || !field.name) continue;
+      if (!("index" in field && field.index)) continue;
+      // Skip if already indexed as unique
+      if ("unique" in field && field.unique) continue;
+
+      const columnName = this.toSnakeCase(field.name);
+      const indexName = `idx_${TABLE_NAME}_${columnName}`;
+      const columnType = this.getColumnType(field) ?? "";
+      // A column the dialect cannot index at all (MySQL's JSON) gets none, as a collection's and a
+      // component's do, rather than a statement the server refuses.
+      if (!columnTypeIsIndexable(columnType, this.dialect)) continue;
+
+      // Rendered by the schema pipeline's own rule, so an unbounded text, a TEXT column MySQL
+      // refuses to index whole, is keyed by the same prefix a collection's column is.
+      const indexSql = columnIndexSql(
+        TABLE_NAME,
+        indexName,
+        columnName,
+        columnType,
+        this.dialect,
+        name => `${this.q}${name}${this.q}`
+      );
+      indexStatements.push(`${indexSql};`);
+    }
+
+    // Append indexes with statement breakpoints
+    if (indexStatements.length > 0) {
+      sql += "\n--> statement-breakpoint\n";
+      sql += indexStatements.join("\n--> statement-breakpoint\n");
+    }
+
+    return sql;
+  }
+
+  /**
+   * Generate DROP TABLE migration for the `user_ext` table.
+   *
+   * @returns Object with SQL string and migration file name
+   */
+  generateDropTableMigration(): {
+    migrationSQL: string;
+    migrationFileName: string;
+  } {
+    const dropStatement =
+      this.dialect === "sqlite"
+        ? `DROP TABLE IF EXISTS ${this.q}${TABLE_NAME}${this.q};`
+        : `DROP TABLE IF EXISTS ${this.q}${TABLE_NAME}${this.q} CASCADE;`;
+
+    const migrationSQL = `-- Drop user extension table: ${TABLE_NAME}\n${dropStatement}`;
+
+    return {
+      migrationSQL,
+      migrationFileName: `${Date.now()}_drop_${TABLE_NAME}.sql`,
+    };
+  }
+
+  // ============================================================
+  // Runtime Drizzle Table Generation
+  // ============================================================
+
+  /**
+   * Generate a Drizzle table object at runtime for querying user_ext data.
+   *
+   * Used for UI-created custom user fields that don't have pre-compiled schemas.
+   * The returned table object can be passed to Drizzle queries.
+   *
+   * @param fields - User field definitions
+   * @returns A Drizzle table object
+   *
+   * @example
+   * ```typescript
+   * const table = schemaService.generateRuntimeSchema(userConfig.fields);
+   * const rows = await db.select().from(table).where(eq(table.user_id, userId));
+   * ```
+   */
+  generateRuntimeSchema(fields: UserFieldConfig[]): DrizzleRuntimeTable {
+    switch (this.dialect) {
+      case "postgresql":
+        return this.generatePostgresSchema(fields);
+      case "mysql":
+        return this.generateMySQLSchema(fields);
+      case "sqlite":
+        return this.generateSQLiteSchema(fields);
+      default:
+        throw new Error(`Unsupported dialect: ${String(this.dialect)}`);
+    }
+  }
+
+  private generatePostgresSchema(
+    fields: UserFieldConfig[]
+  ): DrizzleRuntimeTable {
+    const columns: Record<string, unknown> = {
+      id: pgText("id").primaryKey(),
+      user_id: pgText("user_id").notNull(),
+      // Time-zone aware, as the statements make them: a plain timestamp
+      // decodes the value a non-UTC session hands back at the wrong instant.
+      created_at: pgTimestamp("created_at", { withTimezone: true })
+        .defaultNow()
+        .notNull(),
+      updated_at: pgTimestamp("updated_at", { withTimezone: true })
+        .defaultNow()
+        .notNull(),
+    };
+
+    Object.assign(columns, this.fieldColumns(fields));
+
+    // Drizzle ORM requires dialect-specific column builders for columns — not publicly
+    // exported, so a cast through `never` is unavoidable for runtime-generated column maps.
+
+    return pgTable(
+      TABLE_NAME,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Drizzle ORM requires dialect-specific column type
+      columns as any,
+      (table: Record<string, Column>) => ({
+        userIdIdx: pgUniqueIndex(`uq_${TABLE_NAME}_user_id`).on(
+          table.user_id as never
+        ),
+      })
+    );
+  }
+
+  private generateMySQLSchema(fields: UserFieldConfig[]): DrizzleRuntimeTable {
+    const columns: Record<string, unknown> = {
+      id: mysqlVarchar("id", { length: 36 }).primaryKey(),
+      user_id: mysqlVarchar("user_id", { length: 36 }).notNull(),
+      // DATETIME, as the statements make them.
+      created_at: mysqlDatetime("created_at").defaultNow().notNull(),
+      updated_at: mysqlDatetime("updated_at").defaultNow().notNull(),
+    };
+
+    Object.assign(columns, this.fieldColumns(fields));
+
+    // Drizzle ORM requires dialect-specific column builders for columns — not publicly
+    // exported, so a cast through `never` is unavoidable for runtime-generated column maps.
+
+    return mysqlTable(
+      TABLE_NAME,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Drizzle ORM requires dialect-specific column type
+      columns as any,
+      (table: Record<string, Column>) => ({
+        userIdIdx: mysqlUniqueIndex(`uq_${TABLE_NAME}_user_id`).on(
+          table.user_id as never
+        ),
+      })
+    );
+  }
+
+  private generateSQLiteSchema(fields: UserFieldConfig[]): DrizzleRuntimeTable {
+    const columns: Record<string, unknown> = {
+      id: sqliteText("id").primaryKey(),
+      user_id: sqliteText("user_id").notNull(),
+      ...sqliteTimestampColumns(),
+    };
+
+    Object.assign(columns, this.fieldColumns(fields));
+
+    // Drizzle ORM requires dialect-specific column builders for columns — not publicly
+    // exported, so a cast through `never` is unavoidable for runtime-generated column maps.
+
+    return sqliteTable(
+      TABLE_NAME,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Drizzle ORM requires dialect-specific column type
+      columns as any,
+      (table: Record<string, Column>) => ({
+        userIdIdx: sqliteUniqueIndex(`uq_${TABLE_NAME}_user_id`).on(
+          table.user_id as never
+        ),
+      })
+    );
+  }
+
+  // ============================================================
+  // Drizzle TypeScript Code Generation
+  // ============================================================
+
+  /**
+   * Generate TypeScript/Drizzle schema code for the `user_ext` table.
+   *
+   * Produces a complete TypeScript file with imports, table definition,
+   * indexes, and inferred types.
+   *
+   * @param fields - User field definitions
+   * @returns TypeScript source code string
+   */
+  generateSchemaCode(fields: UserFieldConfig[]): string {
+    const dialectConfig = this.getDialectConfig();
+
+    // Determine required imports
+    const baseImports = this.collectRequiredImports(fields);
+
+    const imports = `import { ${dialectConfig.tableFunction}, ${baseImports.join(", ")} } from '${dialectConfig.importPath}';`;
+
+    // Generate field columns
+    // UserFieldConfig is already a subset of DataFieldConfig, no type predicate needed
+    const fieldColumns = fields
+      .filter(f => this.isUserDataField(f) && "name" in f && !!f.name)
+      .map(f => {
+        const drizzleType = this.mapFieldToDrizzleCode(f);
+        const modifiers: string[] = [];
+
+        if ("required" in f && f.required) modifiers.push(".notNull()");
+        if ("unique" in f && f.unique) modifiers.push(".unique()");
+
+        const defaultValue = "defaultValue" in f ? f.defaultValue : undefined;
+        if (defaultValue !== undefined && defaultValue !== null) {
+          if (typeof defaultValue === "string") {
+            modifiers.push(`.default('${defaultValue}')`);
+          } else {
+            modifiers.push(`.default(${String(defaultValue)})`);
+          }
+        }
+
+        return `  ${f.name}: ${drizzleType}${modifiers.join("")},`;
+      })
+      .join("\n");
+
+    // Generate timestamp columns
+    const timestampColumns = this.generateTimestampColumnsCode();
+
+    // Generate base columns code
+    const baseColumnsCode = this.generateBaseColumnsCode();
+
+    // Generate unique index on user_id
+    const indexCode = `  userIdIdx: uniqueIndex('uq_${TABLE_NAME}_user_id').on(table.user_id),`;
+
+    // Field-level indexes (non-unique indexed fields only)
+    const fieldIndexes = fields
+      .filter(
+        f =>
+          this.isUserDataField(f) &&
+          "name" in f &&
+          !!f.name &&
+          "index" in f &&
+          f.index &&
+          !("unique" in f && f.unique)
+      )
+      .map(
+        f =>
+          `  ${f.name}Idx: index('idx_${TABLE_NAME}_${this.toSnakeCase(f.name)}').on(table.${f.name}),`
+      )
+      .join("\n");
+
+    const allIndexes = fieldIndexes
+      ? `${indexCode}\n${fieldIndexes}`
+      : indexCode;
+
+    return `${imports}
+
+/**
+ * User extension table: ${TABLE_NAME}
+ * Stores custom user fields defined via defineConfig() or admin UI.
+ * Generated by nextly
+ */
+export const ${TABLE_NAME} = ${dialectConfig.tableFunction}('${TABLE_NAME}', {
+${baseColumnsCode}
+${fieldColumns}
+${timestampColumns}
+}, (table) => ({
+${allIndexes}
+}));
+
+export type UserExt = typeof ${TABLE_NAME}.$inferSelect;
+export type NewUserExt = typeof ${TABLE_NAME}.$inferInsert;
+`;
+  }
+
+  // ============================================================
+  // Schema Hashing
+  // ============================================================
+
+  /**
+   * Compute a deterministic hash for the given user fields.
+   *
+   * Reuses the existing schema hash utility that normalizes fields,
+   * sorts keys, and produces a SHA-256 hash. Used for change detection
+   * to determine when migrations are needed.
+   *
+   * @param fields - User field definitions
+   * @returns 64-character hex string (SHA-256 hash)
+   */
+  computeSchemaHash(fields: UserFieldConfig[]): string {
+    return calculateSchemaHash(fields as unknown as DataFieldConfig[]);
+  }
+
+  // ============================================================
+  // Field Column Mapping (SQL)
+  // ============================================================
+
+  private generateColumnSQL(field: UserFieldConfig): string | null {
+    if (!("name" in field) || !field.name) return null;
+
+    const columnName = this.toSnakeCase(field.name);
+    const columnType = this.getColumnType(field);
+    if (!columnType) return null;
+
+    const parts = [`${this.q}${columnName}${this.q}`, columnType];
+
+    if ("required" in field && field.required) {
+      parts.push("NOT NULL");
+    }
+
+    if (isCheckboxField(field) && field.defaultValue !== undefined) {
+      const defaultVal =
+        this.dialect === "sqlite"
+          ? field.defaultValue
+            ? 1
+            : 0
+          : field.defaultValue;
+      parts.push(`DEFAULT ${String(defaultVal)}`);
+    }
+
+    return parts.join(" ");
+  }
+
+  /**
+   * The user-surface-only types (url, phone) store as text; they are not
+   * canonical field types, so the shared guards never match them.
+   */
+  private isUserSurfaceTextField(
+    field: UserFieldConfig
+  ): field is UserUrlFieldConfig | UserPhoneFieldConfig {
+    return field.type === "url" || field.type === "phone";
+  }
+
+  /**
+   * Whether a user field backs a column: either a canonical data field or
+   * one of the user-surface text types the shared guard cannot know about.
+   */
+  private isUserDataField(field: UserFieldConfig): boolean {
+    // Captured before the guards below narrow `field` to `never` on their
+    // false branch, which would leave `.type` inaccessible.
+    const fieldType = field.type;
+    return (
+      this.isUserSurfaceTextField(field) ||
+      isDataField(field) ||
+      // A plugin-contributed type is a real data field only when it opted into
+      // the users surface — it then maps to a storage-primitive column and must
+      // not be skipped by the built-in guards. Registration alone is not enough:
+      // an entries-only type must never be treated as a user column.
+      isPluginFieldTypeOnSurface(fieldType, "users")
+    );
+  }
+
+  /**
+   * The column type this dialect gives `field`, spelled exactly as the CREATE TABLE and ADD COLUMN
+   * statements spell it.
+   *
+   * The same value `generateColumnSQL` and `ensureUserExtSchema` put into their column
+   * definitions, exposed so a caller that needs only the type can ask for it
+   * instead of restating this mapping or recovering it from rendered SQL.
+   *
+   * `null` where this service would emit no column at all, which is the same condition that makes
+   * those statements skip a field.
+   */
+  columnTypeFor(field: UserFieldConfig): string | null {
+    return this.getColumnType(field);
+  }
+
+  private getColumnType(field: UserFieldConfig): string | null {
+    const column = this.columnFor(field);
+    return column === null ? null : this.spellColumn(column);
+  }
+
+  /** The SQL this dialect's statements spell `column` as. */
+  private spellColumn(column: UserExtColumn): string {
+    const types = SQL_COLUMN_TYPES[this.dialect];
+    switch (column.kind) {
+      case "varchar":
+        return types.varchar(column.length);
+      case "text":
+        return types.text;
+      case "number":
+        return types.number;
+      case "boolean":
+        return types.boolean;
+      case "timestamp":
+        return types.timestamp;
+      case "json":
+        return types.json;
+    }
+  }
+
+  /**
+   * The column `field` is stored in, or `null` where this service gives it none: the one answer
+   * the statements and the runtime table both read.
+   */
+  private columnFor(field: UserFieldConfig): UserExtColumn | null {
+    // Captured before the built-in guards narrow `field` to `never`.
+    const fieldType = field.type;
+
+    if (this.isUserSurfaceTextField(field)) {
+      return { kind: "varchar", length: field.maxLength || 255 };
+    }
+    if (isTextField(field)) {
+      return this.textColumn(field.maxLength, field.unique === true);
+    }
+    if (isTextareaField(field)) {
+      return { kind: "text" };
+    }
+    if (isEmailField(field)) {
+      return { kind: "varchar", length: 255 };
+    }
+    if (isNumberField(field)) {
+      return { kind: "number" };
+    }
+    if (isCheckboxField(field)) {
+      return { kind: "boolean" };
+    }
+    if (isDateField(field)) {
+      return { kind: "timestamp" };
+    }
+    if (isSelectField(field)) {
+      return field.hasMany
+        ? { kind: "json" }
+        : { kind: "varchar", length: 255 };
+    }
+    if (isRadioField(field)) {
+      return { kind: "varchar", length: 255 };
+    }
+
+    // Plugin-contributed types persist as their declared storage primitive, so
+    // a plugin field on the users surface gets a real column keyed off that
+    // primitive instead of being silently skipped. Surface-gated: a type not
+    // enabled on "users" is not mapped here even if it is registered.
+    const pluginStorage = isPluginFieldTypeOnSurface(fieldType, "users")
+      ? getFieldType(fieldType)?.storage
+      : undefined;
+    if (pluginStorage) {
+      switch (pluginStorage) {
+        case "text": {
+          const { maxLength, unique } = field as {
+            maxLength?: number;
+            unique?: unknown;
+          };
+          return this.textColumn(maxLength, unique === true);
+        }
+        case "longText":
+          return { kind: "text" };
+        case "number":
+          return { kind: "number" };
+        case "boolean":
+          return { kind: "boolean" };
+        case "timestamp":
+          return { kind: "timestamp" };
+        case "json":
+          return { kind: "json" };
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * The column a text value is stored in, for a built-in text field and a
+   * plugin type stored as text alike: a varchar of its length when it has one
+   * (see `textLength`), else TEXT.
+   */
+  private textColumn(
+    maxLength: number | undefined,
+    unique: boolean
+  ): UserExtColumn {
+    const length = this.textLength(maxLength, unique);
+    return length === null ? { kind: "text" } : { kind: "varchar", length };
+  }
+
+  /**
+   * How many characters a text value's column holds, or null when it is TEXT
+   * and holds any length: its `maxLength`, else 255 for a unique field on
+   * MySQL. MySQL cannot index a TEXT column without a key length, so there a
+   * unique field's index could never be made; a varchar, as the schema
+   * pipeline gives a MySQL text column, can carry it.
+   */
+  private textLength(maxLength: number | undefined, unique: boolean) {
+    if (typeof maxLength === "number" && maxLength > 0) return maxLength;
+    if (this.dialect === "mysql" && unique) return 255;
+    return null;
+  }
+
+  /**
+   * How many characters a field's `user_ext` column holds, for a built-in text
+   * field or a plugin type stored as text; null for any other column, or one
+   * that holds any length. A write checks a value against it first: a longer
+   * one fails at the driver, where a failed `user_ext` write is read as the
+   * table being absent.
+   */
+  textColumnLength(field: UserFieldConfig): number | null {
+    // Read from the column the field is stored in, so the check and the
+    // column are one answer: a URL, email, select or radio is a VARCHAR as
+    // much as a text with a length is.
+    if (this.dialect !== "sqlite") {
+      const column = this.columnFor(field);
+      return column?.kind === "varchar" ? column.length : null;
+    }
+    // SQLite stores every one of these as TEXT, which holds any length; a
+    // text field is still held to its own length there.
+    const { maxLength, unique } = field as {
+      maxLength?: number;
+      unique?: unknown;
+    };
+    if (isTextField(field) || this.pluginUserStorage(field) === "text") {
+      return this.textLength(maxLength, unique === true);
+    }
+    return null;
+  }
+
+  // ============================================================
+  // Field Column Mapping (Runtime Drizzle)
+  // ============================================================
+
+  /**
+   * The declared storage primitive of a users-surface plugin field, or null for
+   * a built-in / unregistered / non-users type. The column type across the DDL,
+   * runtime schema, and code-gen paths all key off this so they never diverge.
+   */
+  private pluginUserStorage(
+    field: UserFieldConfig
+  ): "text" | "longText" | "boolean" | "number" | "timestamp" | "json" | null {
+    const type = field.type;
+    if (!isPluginFieldTypeOnSurface(type, "users")) return null;
+    return getFieldType(type)?.storage ?? null;
+  }
+
+  /** The runtime columns of `fields`, by field name: those the statements make a column for. */
+  private fieldColumns(fields: UserFieldConfig[]): Record<string, unknown> {
+    const columns: Record<string, unknown> = {};
+    for (const field of fields) {
+      if (!this.isUserDataField(field)) continue;
+      if (!("name" in field) || !field.name) continue;
+      const column = this.runtimeFieldColumn(field);
+      if (column) columns[field.name] = column;
+    }
+    return columns;
+  }
+
+  /**
+   * The runtime column `field` is read and written through: the column `columnFor` describes, which
+   * is the one the statements made, NOT NULL where the CREATE TABLE makes it so. `null` where the
+   * statements make no column.
+   */
+  private runtimeFieldColumn(field: UserFieldConfig): unknown {
+    if (!("name" in field) || !field.name) return null;
+    const column = this.columnFor(field);
+    if (column === null) return null;
+    const declared = this.runtimeColumn(this.toSnakeCase(field.name), column);
+    const isRequired = "required" in field && field.required === true;
+    return isRequired ? declared.notNull() : declared;
+  }
+
+  /** The Drizzle column this dialect declares `column` as, under `name`. */
+  private runtimeColumn(
+    name: string,
+    column: UserExtColumn
+  ): { notNull(): unknown } {
+    if (this.dialect === "postgresql") return postgresColumn(name, column);
+    if (this.dialect === "mysql") return mysqlColumn(name, column);
+    return sqliteColumn(name, column);
+  }
+
+  // ============================================================
+  // Field Column Mapping (Drizzle Code Generation)
+  // ============================================================
+
+  private mapFieldToDrizzleCode(field: UserFieldConfig): string {
+    if (!("name" in field) || !field.name) return "";
+    const colName = this.toSnakeCase(field.name);
+
+    if (this.dialect === "sqlite") {
+      return this.mapFieldToSQLiteCode(field, colName);
+    }
+    if (this.dialect === "mysql") {
+      return this.mapFieldToMySQLCode(field, colName);
+    }
+    return this.mapFieldToPostgresCode(field, colName);
+  }
+
+  private mapFieldToPostgresCode(
+    field: UserFieldConfig,
+    colName: string
+  ): string {
+    const pluginStorage = this.pluginUserStorage(field);
+    if (pluginStorage) {
+      switch (pluginStorage) {
+        case "number":
+          return `doublePrecision('${colName}')`;
+        case "boolean":
+          return `boolean('${colName}')`;
+        case "timestamp":
+          return `timestamp('${colName}')`;
+        case "json":
+          return `jsonb('${colName}')`;
+        default:
+          return `text('${colName}')`; // text / longText
+      }
+    }
+    if (this.isUserSurfaceTextField(field)) {
+      return `varchar('${colName}', { length: ${field.maxLength ?? 255} })`;
+    }
+    if (isTextField(field)) {
+      return field.maxLength
+        ? `varchar('${colName}', { length: ${field.maxLength} })`
+        : `text('${colName}')`;
+    }
+    if (isTextareaField(field)) {
+      return `text('${colName}')`;
+    }
+    if (isEmailField(field)) {
+      return `varchar('${colName}', { length: 255 })`;
+    }
+    if (isNumberField(field)) {
+      return `doublePrecision('${colName}')`;
+    }
+    if (isCheckboxField(field)) {
+      return `boolean('${colName}')`;
+    }
+    if (isDateField(field)) {
+      return `timestamp('${colName}')`;
+    }
+    if (isSelectField(field)) {
+      return field.hasMany ? `jsonb('${colName}')` : `text('${colName}')`;
+    }
+    if (isRadioField(field)) {
+      return `text('${colName}')`;
+    }
+    return `text('${colName}')`;
+  }
+
+  private mapFieldToMySQLCode(field: UserFieldConfig, colName: string): string {
+    const pluginStorage = this.pluginUserStorage(field);
+    if (pluginStorage) {
+      switch (pluginStorage) {
+        case "number":
+          return `double('${colName}')`;
+        case "boolean":
+          return `boolean('${colName}')`;
+        case "timestamp":
+          return `timestamp('${colName}')`;
+        case "json":
+          return `json('${colName}')`;
+        case "longText":
+          return `text('${colName}')`;
+        default:
+          return `varchar('${colName}', { length: 255 })`; // text
+      }
+    }
+    if (this.isUserSurfaceTextField(field)) {
+      return `varchar('${colName}', { length: ${field.maxLength ?? 255} })`;
+    }
+    if (
+      isTextField(field) ||
+      isEmailField(field) ||
+      isSelectField(field) ||
+      isRadioField(field)
+    ) {
+      return `varchar('${colName}', { length: 255 })`;
+    }
+    if (isTextareaField(field)) {
+      return `text('${colName}')`;
+    }
+    if (isNumberField(field)) {
+      return `double('${colName}')`;
+    }
+    if (isCheckboxField(field)) {
+      return `boolean('${colName}')`;
+    }
+    if (isDateField(field)) {
+      return `timestamp('${colName}')`;
+    }
+    return `varchar('${colName}', { length: 255 })`;
+  }
+
+  private mapFieldToSQLiteCode(
+    field: UserFieldConfig,
+    colName: string
+  ): string {
+    const pluginStorage = this.pluginUserStorage(field);
+    if (pluginStorage) {
+      switch (pluginStorage) {
+        case "number":
+          return `real('${colName}')`;
+        case "boolean":
+          return `integer('${colName}', { mode: 'boolean' })`;
+        case "timestamp":
+          return `integer('${colName}', { mode: 'timestamp' })`;
+        default:
+          return `text('${colName}')`; // text / longText / json
+      }
+    }
+    if (isNumberField(field)) {
+      return `real('${colName}')`;
+    }
+    if (isCheckboxField(field)) {
+      return `integer('${colName}', { mode: 'boolean' })`;
+    }
+    if (isDateField(field)) {
+      return `integer('${colName}', { mode: 'timestamp' })`;
+    }
+    return `text('${colName}')`;
+  }
+
+  // ============================================================
+  // Code Generation Helpers
+  // ============================================================
+
+  private getDialectConfig(): { tableFunction: string; importPath: string } {
+    switch (this.dialect) {
+      case "mysql":
+        return {
+          tableFunction: "mysqlTable",
+          importPath: "drizzle-orm/mysql-core",
+        };
+      case "sqlite":
+        return {
+          tableFunction: "sqliteTable",
+          importPath: "drizzle-orm/sqlite-core",
+        };
+      case "postgresql":
+      default:
+        return {
+          tableFunction: "pgTable",
+          importPath: "drizzle-orm/pg-core",
+        };
+    }
+  }
+
+  private collectRequiredImports(fields: UserFieldConfig[]): string[] {
+    const imports = new Set<string>(["text", "uniqueIndex"]);
+
+    if (this.dialect === "sqlite") {
+      imports.add("integer");
+      imports.add("real");
+    } else {
+      imports.add("varchar");
+      imports.add("timestamp");
+    }
+
+    // Check if any field needs index() (non-unique indexed fields)
+    const hasNonUniqueIndex = fields.some(
+      f =>
+        isDataField(f) &&
+        "index" in f &&
+        f.index &&
+        !("unique" in f && f.unique)
+    );
+    if (hasNonUniqueIndex) {
+      imports.add("index");
+    }
+
+    for (const field of fields) {
+      if (!this.isUserDataField(field)) continue;
+
+      // Plugin fields import the drizzle builder for their storage primitive,
+      // matching mapFieldTo*Code, so generated schemas compile.
+      const pluginStorage = this.pluginUserStorage(field);
+      if (pluginStorage) {
+        if (this.dialect === "sqlite") {
+          if (pluginStorage === "number") imports.add("real");
+          if (pluginStorage === "boolean" || pluginStorage === "timestamp")
+            imports.add("integer");
+        } else if (this.dialect === "mysql") {
+          if (pluginStorage === "number") imports.add("double");
+          if (pluginStorage === "boolean") imports.add("boolean");
+          if (pluginStorage === "timestamp") imports.add("timestamp");
+          if (pluginStorage === "json") imports.add("json");
+          if (pluginStorage === "text") imports.add("varchar");
+        } else {
+          if (pluginStorage === "number") imports.add("doublePrecision");
+          if (pluginStorage === "boolean") imports.add("boolean");
+          if (pluginStorage === "timestamp") imports.add("timestamp");
+          if (pluginStorage === "json") imports.add("jsonb");
+        }
+        continue;
+      }
+
+      if (this.dialect === "sqlite") {
+        if (isNumberField(field)) imports.add("real");
+        if (isCheckboxField(field)) imports.add("integer");
+        if (isDateField(field)) imports.add("integer");
+      } else if (this.dialect === "mysql") {
+        if (
+          isTextField(field) ||
+          isEmailField(field) ||
+          isSelectField(field) ||
+          isRadioField(field)
+        ) {
+          imports.add("varchar");
+        }
+        if (isNumberField(field)) imports.add("double");
+        if (isCheckboxField(field)) imports.add("boolean");
+        if (isDateField(field)) imports.add("timestamp");
+        if (isSelectField(field) && field.hasMany) imports.add("json");
+      } else {
+        // PostgreSQL
+        if (isTextField(field) && field.maxLength) imports.add("varchar");
+        if (isEmailField(field)) imports.add("varchar");
+        if (isNumberField(field)) imports.add("doublePrecision");
+        if (isCheckboxField(field)) imports.add("boolean");
+        if (isDateField(field)) imports.add("timestamp");
+        if (isSelectField(field) && field.hasMany) imports.add("jsonb");
+      }
+    }
+
+    return Array.from(imports);
+  }
+
+  private generateBaseColumnsCode(): string {
+    if (this.dialect === "sqlite") {
+      return `  // Base columns
+  id: text('id').primaryKey().notNull(),
+  user_id: text('user_id').notNull(),`;
+    }
+
+    if (this.dialect === "mysql") {
+      return `  // Base columns
+  id: varchar('id', { length: 36 }).primaryKey().notNull(),
+  user_id: varchar('user_id', { length: 36 }).notNull(),`;
+    }
+
+    // PostgreSQL
+    return `  // Base columns
+  id: text('id').primaryKey().notNull(),
+  user_id: text('user_id').notNull(),`;
+  }
+
+  private generateTimestampColumnsCode(): string {
+    if (this.dialect === "sqlite") {
+      return `  // Timestamps
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull().$defaultFn(() => new Date()).$onUpdate(() => new Date()),`;
+    }
+
+    return `  // Timestamps
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),`;
+  }
+
+  // ============================================================
+  // Utility Methods
+  // ============================================================
+
+  private toSnakeCase(name: string): string {
+    return userFieldColumnName(name);
+  }
+}

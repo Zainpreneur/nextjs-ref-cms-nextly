@@ -1,0 +1,924 @@
+// Builds a TableSpec from a Nextly FieldConfig[] (the format dynamic_collections
+// stores + the format the dispatcher receives). This is the "desired state"
+// input to our diff engine.
+//
+// Phase 5 (2026-05-01): the type-mapping logic that used to live here was
+// duplicated against `runtime-schema-generator.ts`, with predictable drift.
+// Both now delegate to `services/field-column-descriptor.ts` for the
+// per-dialect token rendering. Adding a field type means updating one
+// place; the diff engine and the runtime Drizzle builder stay in lockstep.
+//
+// Type-token alignment with introspection:
+// The diff compares this output against the live-DB introspection output.
+// The descriptor module renders introspection-aligned tokens:
+//
+//   PG udt_name   - "text", "varchar", "bool", "float8", "timestamp", "jsonb",
+//                   "uuid", "bytea", "int4", "int8" (note: udt_name returns
+//                   abbreviated forms, not the SQL standard names)
+//   MySQL COLUMN_TYPE - full declared type as written: "varchar(255)", "int(11)",
+//                       "tinyint(1)", "double", "json", "text"
+//   SQLite PRAGMA type - declared type as written. drizzle-orm/sqlite-core emits
+//                        LOWERCASE types ("text", "integer", "real"), so PRAGMA
+//                        returns lowercase. We emit lowercase tokens to match.
+//
+// Reserved columns: runtime-schema-generator.ts always injects id + created_at
+// + updated_at, plus title/slug unless the user defined fields by those names.
+// Both paths now read the system-column set from the descriptor module.
+
+import type { SupportedDialect } from "@nextlyhq/adapter-drizzle/types";
+
+import { NextlyError } from "../../../../errors/nextly-error";
+import { STORAGE_FORMAT } from "../../../../schemas/storage-format";
+import { fieldGroupStructuralDefaults } from "../../../field-groups/services/field-group-schema-service";
+import { resolveLocalizedFieldNames } from "../../../i18n/classify-fields";
+import {
+  assertIndexBuildable,
+  type WeighedColumn,
+} from "../../extension/naming";
+import { builderColumnIsUnique } from "../../field-rules";
+import {
+  componentRelationshipHoldsReferenceList,
+  fieldsStoredOnRow,
+  getColumnDescriptor,
+  getComponentRowColumnDescriptor,
+  getSingleRowColumnDescriptor,
+  componentRelationIsSingleReference,
+  type ColumnOrigin,
+  kindAndSizes,
+  systemColumnsForFields,
+  relationHoldsReferenceList,
+  relationshipStoresJson,
+  relationStorageShape,
+} from "../../services/field-column-descriptor";
+import {
+  columnTypeIsIndexable,
+  indexNameForColumn,
+  indexNameForColumns,
+  uniqueIndexNameForColumn,
+  uniquenessCanBeAnIndex,
+} from "../../services/index-name";
+
+import {
+  indexKey,
+  isManagedIndexName,
+  resolveDeclaredIndexName,
+} from "./index-util";
+import type { ColumnSpec, IndexSpec, TableSpec } from "./types";
+
+/**
+ * Drop indexes that duplicate an earlier one by logical key (same column set +
+ * uniqueness). The system slug index and a user/injected `unique` slug field
+ * both target `unique(slug)`; keep the first (system) and drop the redundant
+ * one so migrations don't emit two indexes for the same constraint.
+ */
+function dedupeIndexes(indexes: IndexSpec[]): IndexSpec[] {
+  const seen = new Set<string>();
+  return indexes.filter(i => {
+    const key = indexKey(i);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+// Minimal field shape we read. The real FieldDefinition type has many more
+// attributes; we only need name + type + required + hasMany + relationTo for
+// diff purposes (the descriptor module pulls hasMany/relationTo via attribute
+// access, so structurally-typed input works as long as those keys exist).
+interface MinimalFieldDef {
+  name: string;
+  type: string;
+  required?: boolean;
+  hasMany?: boolean;
+  relationTo?: unknown;
+  unique?: boolean;
+  index?: boolean;
+  localized?: boolean;
+  /** A Builder relationship's options, where `relationType` says whether it is one-to-one. */
+  options?: unknown;
+}
+
+/** Optional toggles that affect which system columns are injected. */
+export interface BuildDesiredTableOptions {
+  /** When true, a `status` system column is injected (varchar/text NOT NULL DEFAULT 'draft'). */
+  hasStatus?: boolean;
+  /**
+   * When true, this collection is localized: fields resolved as translatable are stored in the
+   * companion `_locales` table (migration-owned) and MUST be omitted from the main table's
+   * desired state, or the diff engine would try to re-add columns the localization migration
+   * dropped.
+   */
+  localized?: boolean;
+  /**
+   * Which builder made this table. Required, because a text field with no stated width has no one
+   * right answer: the Schema Builder's two creators and the pipeline each read silence differently,
+   * and the diff has to describe the column the way whatever built it did.
+   */
+  builtBy: ColumnOrigin;
+  /**
+   * Compound indexes the entity's config declared.
+   *
+   * Code-first entities only: registry rows (Builder-created entities) store
+   * no indexes, so a Builder collection cannot declare one in v1.
+   */
+  indexes?: readonly DeclaredIndex[];
+}
+
+/**
+ * Build a TableSpec for the diff engine from a list of Nextly fields.
+ * Field type tokens are translated to introspection-aligned strings via
+ * the shared descriptor module so the diff can compare them directly
+ * against live-DB output. Reserved system columns (id, title, slug,
+ * created_at, updated_at, and conditionally status) are injected to match
+ * runtime-schema-generator's behavior — the descriptor module owns that list.
+ */
+/** Inputs the index rules need that only the caller can determine. */
+/**
+ * A compound index an entity declared in its config, or that a schema hook
+ * contributed to an entity table.
+ *
+ * Named separately from `IndexConfig` so the diff layer does not import the
+ * collections config surface: this is the shape, whoever supplied it.
+ */
+export interface DeclaredIndex {
+  /** FIELD names as authored. Order is significant. */
+  fields: string[];
+  unique?: boolean;
+  name?: string;
+}
+
+interface CollectionIndexContext<F> {
+  hasSlugColumn: boolean;
+  hasCreatedAtColumn: boolean;
+  /** Collections carry an owner column; singles and components do not. */
+  hasCreatedByColumn?: boolean;
+  /** Fields whose columns live in the companion `_locales` table. */
+  localizedNames: ReadonlySet<string>;
+  /**
+   * The column a field materialises, or null when it materialises none (a
+   * component field stores its data in its own table and must receive no
+   * index). Supplied by the caller so the field-to-column mapping stays in
+   * the descriptor module rather than being recomputed here: a descriptor
+   * change would otherwise produce indexes naming columns that do not exist.
+   */
+  columnNameFor: (field: F) => string | null;
+  /**
+   * Whether a relationship is indexed as a single foreign key. Defaults to the collection rule; a
+   * component passes the rule its creator follows (`componentRelationIsSingleReference`), which
+   * indexes only a relationship naming one collection whose value is not a JSON list.
+   */
+  isSingleRelation?: (field: F) => boolean;
+  /**
+   * Compound indexes the config declared, which nothing emitted before.
+   *
+   * `CollectionConfig.indexes` has been validated and then discarded since it
+   * was added, so an app that declared one has been running without it.
+   */
+  declaredIndexes?: readonly DeclaredIndex[];
+  /**
+   * The logical kind of the column a field materialises, with the sizes that
+   * kind reads, or null when it materialises none.
+   *
+   * Needed because a declared index is refused for ALL THREE dialects rather
+   * than the live one: an index that only works where its author develops is a
+   * deployment failure with no local reproduction. The width matters as much
+   * as the kind: MySQL limits a whole key to 3,072 bytes, so four ordinary
+   * text fields can each be keyable and their index still not be.
+   */
+  columnFor?: (field: F) => Omit<WeighedColumn, "name"> | null;
+  /**
+   * The system columns this table carries, by column name, weighed as the
+   * index rules weigh a column. A declared index may name `id`, `createdAt`
+   * or `updatedAt`, and resolves them here rather than among the fields.
+   */
+  systemColumns?: ReadonlyMap<string, Omit<WeighedColumn, "name">>;
+  /**
+   * Whether an index on this column can exist at all, asked per column.
+   *
+   * Supplied rather than derived here because it depends on the dialect AND the column type,
+   * and because the statements that create indexes ask the same question: a desired schema that
+   * declares an index the generator deliberately never writes makes every diff propose creating
+   * it and every apply refuse it.
+   */
+  columnIsIndexable?: (field: F, column: string) => boolean;
+  /**
+   * Whether the column's uniqueness can be carried as a NAMED index, asked per column.
+   *
+   * Strictly narrower than `columnIsIndexable`, and a separate question: MySQL can neither index
+   * nor uniquely key a `TEXT` column without a length, so the generators keep such a column's
+   * uniqueness as an inline constraint and emit no index for it. A desired schema that declared
+   * `uq_<table>_<column>` anyway would propose creating an index no generator writes and no server
+   * accepts, once per reconcile, forever.
+   *
+   * REQUIRED, deliberately. An optional field defaulting to "yes, index it" would make a call site
+   * that forgot to supply it indistinguishable from one that answered permissively — and the
+   * permissive answer is precisely the behaviour this rule exists to remove, so forgetting would
+   * revert to the defect silently. The point of one shared rule is that there is nowhere left to
+   * forget it; an optional field with a lenient default rebuilds that place inside the option bag.
+   */
+  uniquenessIsIndexable: (field: F, column: string) => boolean;
+  /**
+   * Whether the field's column is unique, by the rule of whatever creates the table.
+   *
+   * The Schema Builder's collection and Single creator makes a one-to-one relationship's column
+   * unique by its cardinality, with no `unique` flag (`builderColumnIsUnique`); the field-group and
+   * code-first creators read the flag alone. Asked of the caller, and required, for the reason
+   * `uniquenessIsIndexable` is: a desired schema that read the flag alone for a Builder table left
+   * the one-to-one's uniqueness out of every migration written from it, so the table took
+   * duplicates.
+   */
+  fieldIsUnique: (field: F) => boolean;
+}
+
+/**
+ * The indexes a collection table should carry, derived from its fields.
+ *
+ * Shared with the runtime schema generator rather than restated there. Two
+ * places decide what a collection table looks like — this one, which the diff
+ * compares against, and the Drizzle table the push path builds — and when only
+ * one of them knew about indexes, a push rebuilt the table without them and
+ * the indexes were silently lost.
+ */
+export function collectionIndexSpecs<F extends MinimalFieldDef>(
+  tableName: string,
+  fields: readonly F[],
+  context: CollectionIndexContext<F>
+): IndexSpec[] {
+  const { columnNameFor } = context;
+
+  // System slug(unique)+created_at, plus per-field unique/index and a
+  // single-relationship auto-index (matches the runtime live-DDL). hasMany /
+  // polymorphic relationships are JSON columns and get NO index.
+  const indexes: IndexSpec[] = [];
+  if (context.hasSlugColumn) {
+    indexes.push({
+      name: indexNameForColumn(tableName, "slug"),
+      columns: ["slug"],
+      unique: true,
+    });
+  }
+  if (context.hasCreatedByColumn) {
+    // Owner-scoped reads filter on created_by, and the collection service
+    // creates this index for every table that has the column. Recording it
+    // here is what lets a rebuilt table get it back: a SQLite rebuild drops
+    // every index the replacement table does not declare, and the restore
+    // replays only what the snapshot carries.
+    indexes.push({
+      name: indexNameForColumn(tableName, "created_by"),
+      columns: ["created_by"],
+      unique: false,
+    });
+  }
+  if (context.hasCreatedAtColumn) {
+    indexes.push({
+      name: indexNameForColumn(tableName, "created_at"),
+      columns: ["created_at"],
+      unique: false,
+    });
+  }
+  for (const field of fields) {
+    if (context.localizedNames.has(field.name)) continue; // companion-owned; no main-table index
+    const col = columnNameFor(field);
+    // A field materialising no column (e.g. a component, which stores its data
+    // in its own table) gets no index: one on a nonexistent column is invalid
+    // DDL. Asking the descriptor per field, rather than checking whether a
+    // column of that name exists, keeps a component named after a system
+    // column from indexing the system-injected column instead.
+    if (col === null) continue;
+    const isSingleRelation = context.isSingleRelation
+      ? context.isSingleRelation(field)
+      : (field.type === "relationship" || field.type === "upload") &&
+        field.hasMany !== true &&
+        !Array.isArray(field.relationTo);
+    // Asked through the same rule the generators use. Where a dialect cannot key the column they
+    // keep the uniqueness inline and write no index, so declaring one here would make every diff
+    // propose a `CREATE UNIQUE INDEX` the server refuses.
+    const uniqueIsIndexable =
+      context.fieldIsUnique(field) && context.uniquenessIsIndexable(field, col);
+    // A relationship unique by its cardinality alone keeps the plain index it has always had
+    // beside its unique one: every one-to-one made before its uniqueness was declared carries it,
+    // and dropping it would plan an operation for a column that is already unique.
+    const keepsPlainIndex = !uniqueIsIndexable || field.unique !== true;
+
+    if (uniqueIsIndexable) {
+      indexes.push({
+        name: uniqueIndexNameForColumn(tableName, col),
+        columns: [col],
+        unique: true,
+      });
+    }
+    if (
+      keepsPlainIndex &&
+      (field.index === true || isSingleRelation) &&
+      (context.columnIsIndexable?.(field, col) ?? true)
+    ) {
+      indexes.push({
+        name: indexNameForColumn(tableName, col),
+        columns: [col],
+        unique: false,
+      });
+    }
+  }
+  indexes.push(...declaredIndexSpecs(tableName, fields, context));
+  // What schema hooks contributed to the table is applied afterwards, by
+  // `withEntityContributions`, over the spec this builds — the one helper dev
+  // push and the migration stream share.
+  return dedupeIndexes(indexes);
+}
+
+/**
+ * The specs for indexes the config DECLARED, as opposed to those derived from
+ * individual fields.
+ *
+ * Refused rather than skipped when a field cannot carry one. Skipping would
+ * mean an author writes a unique compound index, sees no error, and discovers
+ * on the first duplicate row that it was never created.
+ */
+function declaredIndexSpecs<F extends MinimalFieldDef>(
+  tableName: string,
+  fields: readonly F[],
+  context: CollectionIndexContext<F>
+): IndexSpec[] {
+  const declared = context.declaredIndexes ?? [];
+  if (declared.length === 0) return [];
+
+  return declared.map(entry => {
+    const path = `${tableName}.indexes`;
+    if (entry.fields.length === 0) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path,
+            code: "INVALID",
+            message: "An index must name at least one field.",
+          },
+        ],
+      });
+    }
+    if (entry.name !== undefined && !isManagedIndexName(entry.name)) {
+      throw NextlyError.validation({
+        errors: [
+          {
+            path,
+            code: "INVALID",
+            message: `An explicit index name must start with "idx_" or "uq_"; "${entry.name}" would never be reconciled by the diff engine.`,
+          },
+        ],
+      });
+    }
+
+    const resolved = entry.fields.map(fieldName =>
+      declaredIndexColumn(tableName, fieldName, fields, context)
+    );
+    const columns = resolved.map(column => column.name);
+    const unique = entry.unique === true;
+    // Judged by the rules an extension table's index is judged by, on every
+    // dialect: which kinds can be keyed or carry uniqueness, and MySQL's
+    // limit on the whole key's width. A column whose kind the caller could
+    // not supply is left out, and the width is then not summed over the part
+    // that is known — a total too small passes for the wrong reason.
+    const weighed = resolved.flatMap(column =>
+      column.weighed === null ? [] : [column.weighed]
+    );
+    assertIndexBuildable(
+      {
+        columns,
+        unique,
+        ...(entry.name !== undefined ? { name: entry.name } : {}),
+      },
+      weighed,
+      tableName,
+      weighed.length === resolved.length
+    );
+    return {
+      name: entry.name ?? indexNameForColumns(tableName, columns, unique),
+      columns,
+      unique,
+    };
+  });
+}
+
+/**
+ * The column one declared index field resolves to, or a refusal: its name,
+ * and the column as the index rules weigh it when the caller can say.
+ */
+function declaredIndexColumn<F extends MinimalFieldDef>(
+  tableName: string,
+  fieldName: string,
+  fields: readonly F[],
+  context: CollectionIndexContext<F>
+): { name: string; weighed: WeighedColumn | null } {
+  const refuse = (message: string): never => {
+    throw NextlyError.validation({
+      errors: [{ path: `${tableName}.indexes`, code: "INVALID", message }],
+    });
+  };
+
+  const target = resolveDeclaredIndexName(
+    fieldName,
+    fields,
+    context.localizedNames
+  );
+  if (target.kind === "refused") return refuse(target.message);
+
+  if (target.kind === "system") {
+    // A system column is weighed from its own descriptor, the same way a
+    // field's is, so the MySQL key-width check counts it rather than skipping
+    // it. Absent from the map means this table does not carry the column.
+    const system = context.systemColumns?.get(target.column);
+    if (system === undefined) {
+      return refuse(
+        `Index names "${fieldName}", whose system column "${target.column}" this table does not carry.`
+      );
+    }
+    return { name: target.column, weighed: { ...system, name: target.column } };
+  }
+
+  const column = context.columnNameFor(target.field);
+  if (column === null) {
+    return refuse(
+      `Index names the field "${fieldName}", which materialises no column on this table.`
+    );
+  }
+  const described = context.columnFor?.(target.field) ?? null;
+  return {
+    name: column,
+    weighed: described === null ? null : { ...described, name: column },
+  };
+}
+
+export function buildDesiredTableFromFields(
+  tableName: string,
+  fields: MinimalFieldDef[],
+  dialect: SupportedDialect,
+  options: BuildDesiredTableOptions
+): TableSpec {
+  const columns: ColumnSpec[] = [];
+
+  // Localized fields live in the companion `_locales` table (migration-owned); omit them
+  // from the main table's desired columns/indexes. A localized `title`/`slug` field is thus
+  // absent from main: the user field is skipped below, and the system column is not re-injected
+  // because `hasTitleField`/`hasSlugField` see the (localized) user field as present. Classified
+  // from the declared list, as the companion and the entry write classify them, so a field inside
+  // a group with no name stays on the row, where both of those keep it.
+  const localizedNames = options.localized
+    ? new Set(resolveLocalizedFieldNames(fields, true))
+    : new Set<string>();
+  // The fields whose columns sit on the row, those inside a group with no name among them, as the
+  // creating SQL and the runtime table read them (`fieldsStoredOnRow`). Read whole, the group's
+  // missing name stopped the descriptor, and with it every save whose desired schema held one.
+  const stored = fieldsStoredOnRow(fields);
+
+  // Reserved system columns first, as the runtime schema injects them: the
+  // same helper decides which a user field replaces, so the diff input stays in
+  // lockstep with the runtime schema and DDL. status only when Draft/Published
+  // is enabled.
+  const systemColumns = systemColumnsForFields(
+    stored as unknown as Parameters<typeof systemColumnsForFields>[0],
+    dialect,
+    {
+      builtBy: options.builtBy,
+      hasStatus: options.hasStatus,
+      // Singles (`single_` prefix) get no owner column; collections (`dc_`) do.
+      isSingle: tableName.startsWith("single_"),
+    }
+  );
+  for (const reserved of systemColumns) {
+    columns.push({
+      name: reserved.name,
+      type: reserved.dialectType,
+      nullable: reserved.nullable,
+      // Forward descriptor default so the classifier doesn't flag status as
+      // `add_required_field_no_default` and require TTY confirmation.
+      default: reserved.default,
+      // Forward the primary-key marker too. The diff exempts primary keys
+      // from the nullability comparison, and without this the exemption
+      // would cover core tables only — every Schema-Builder table would keep
+      // emitting the nullability change SQLite can never satisfy.
+      ...(reserved.primaryKey ? { primaryKey: true as const } : {}),
+    });
+  }
+
+  // User-defined fields — descriptor module handles layout-only filtering,
+  // hasMany/relationTo promotion to JSON, and per-dialect token rendering. A
+  // Single's reference columns accept NULL (`getSingleRowColumnDescriptor`).
+  const describeUserColumn = tableName.startsWith("single_")
+    ? getSingleRowColumnDescriptor
+    : getColumnDescriptor;
+  for (const field of stored) {
+    if (localizedNames.has(field.name)) continue; // lives in the companion table
+    const desc = describeUserColumn(
+      // The descriptor's input type is FieldDefinition; this util is
+      // structurally compatible (same name/type/required/hasMany/relationTo
+      // keys). Cast through unknown to bridge the two surface types
+      // without leaking either back through the module graph.
+      field as unknown as Parameters<typeof getColumnDescriptor>[0],
+      dialect,
+      options.builtBy
+    );
+    if (!desc) continue;
+    columns.push(userColumnSpec(field, desc, dialect));
+  }
+
+  const indexes = collectionIndexSpecs(tableName, stored, {
+    hasSlugColumn: columns.some(c => c.name === "slug"),
+    hasCreatedAtColumn: columns.some(c => c.name === "created_at"),
+    hasCreatedByColumn: columns.some(c => c.name === "created_by"),
+    columnIsIndexable: (_field, col) =>
+      columnTypeIsIndexable(
+        columns.find(c => c.name === col)?.type ?? "",
+        dialect
+      ),
+    uniquenessIsIndexable: (_field, col) =>
+      uniquenessCanBeAnIndex(
+        columns.find(c => c.name === col)?.type ?? "",
+        dialect
+      ),
+    // The Builder's collection and Single creator makes a one-to-one's column unique, so the
+    // table it describes does too; a code-first table reads the flag alone.
+    fieldIsUnique: field =>
+      options.builtBy === "collection"
+        ? builderColumnIsUnique(field)
+        : // A code-first list relation marked unique is refused at start; asked here too, so a
+          // table that still carries one is never described as keeping it.
+          field.unique === true && !relationHoldsReferenceList(field),
+    localizedNames,
+    columnNameFor: field =>
+      getColumnDescriptor(
+        field as unknown as Parameters<typeof getColumnDescriptor>[0],
+        dialect,
+        options.builtBy
+      )?.name ?? null,
+    columnFor: field => {
+      const descriptor = getColumnDescriptor(
+        field as unknown as Parameters<typeof getColumnDescriptor>[0],
+        dialect,
+        options.builtBy
+      );
+      // A field stored in another table has no column to weigh.
+      if (descriptor === null || descriptor.kind === "skip") return null;
+      // The kind narrowed past `skip`, which the object itself is not.
+      return kindAndSizes({ ...descriptor, kind: descriptor.kind });
+    },
+    systemColumns: new Map(
+      systemColumns.map(column => [column.name, kindAndSizes(column)])
+    ),
+    ...(options.indexes !== undefined
+      ? { declaredIndexes: options.indexes }
+      : {}),
+  });
+
+  return { name: tableName, columns, indexes };
+}
+
+/**
+ * The marker a collection or Single column of a relation carries for the conversion a switch
+ * between one related entry and many needs: a cast reads neither a bare id as a list nor a list's
+ * one id. SQLite keeps both as text, so its diff plans no type change to mark. A relation naming
+ * several targets is not marked as a list: it holds `{ relationTo, value }` references, which the
+ * list conversion does not make, and a switch to it over values is refused before anything runs.
+ */
+/**
+ * A user field's column as the desired schema states it, from its descriptor: the default is left
+ * to the application, and a relation's column carries its markers (`referenceMarkerOn`).
+ */
+function userColumnSpec(
+  field: MinimalFieldDef,
+  desc: { name: string; dialectType: string; nullable: boolean; kind: string },
+  dialect: SupportedDialect,
+  component = false
+): ColumnSpec {
+  return {
+    name: desc.name,
+    type: desc.dialectType,
+    nullable: desc.nullable,
+    default: undefined,
+    ...referenceMarkerOn(field, desc.kind, dialect, component),
+  };
+}
+
+function referenceMarkerOn(
+  field: MinimalFieldDef,
+  kind: string,
+  dialect: SupportedDialect,
+  component = false
+): Pick<
+  ColumnSpec,
+  "holdsReferenceList" | "holdsSingleReference" | "referenceShape"
+> {
+  // The shape on every dialect, so a migration snapshot records what the column holds.
+  const referenceShape = relationStorageShape(field, component);
+  const shape = referenceShape === undefined ? {} : { referenceShape };
+  if (dialect === "sqlite") return shape;
+  if (kind === "fkSingle") return { ...shape, holdsSingleReference: true };
+  const list =
+    kind === "json" &&
+    (component
+      ? componentRelationshipHoldsReferenceList(field)
+      : relationshipStoresJson(field) && !Array.isArray(field.relationTo));
+  return list ? { ...shape, holdsReferenceList: true } : shape;
+}
+
+/**
+ * Build a TableSpec for the diff engine from a component's user fields.
+ * Injects component system columns (_parent_id, _parent_table, _parent_field,
+ * _order, _component_type) instead of collection system columns (title, slug).
+ * Used by previewDesiredSchema when processing desired.components.
+ */
+/** Gives each of a field group's system columns the default its creator gives it. */
+function declareStructuralDefaults(
+  columns: ColumnSpec[],
+  dialect: SupportedDialect
+): void {
+  const structuralDefaults = fieldGroupStructuralDefaults(dialect);
+  for (const column of columns) {
+    const columnDefault = structuralDefaults.get(column.name);
+    if (columnDefault !== undefined) column.default = columnDefault;
+  }
+}
+
+export function buildDesiredTableFromComponentFields(
+  tableName: string,
+  fields: MinimalFieldDef[],
+  dialect: SupportedDialect,
+  options: {
+    localized?: boolean;
+    /** Which builder made this table — see `BuildDesiredTableOptions`. */
+    builtBy: ColumnOrigin;
+    /**
+     * The discriminator this table actually carries.
+     *
+     * 🔴 A system column, so its name is never a preference: the only two
+     * spellings are the two storage generations, and which one a table has is a
+     * fact about that table. Naming the other turns the diff into an add paired
+     * with a destructive drop, which the classifier refuses — so the operation
+     * never applies and never goes away.
+     *
+     * Defaults to the spelling this release's DDL writes, which is right for a
+     * table about to be created and for every database that has not migrated.
+     */
+    typeColumn?: string;
+  }
+): TableSpec {
+  const typeColumn = options.typeColumn ?? STORAGE_FORMAT.columns.type;
+  const columns: ColumnSpec[] = [];
+  // The fields that own a column on the row. A group with no name only lays fields out: it has no
+  // column, and the fields inside it are stored on this row as the ones beside it are, as the
+  // field-group creator makes them (`columnFields`) and the instance write stores them. Both read
+  // `fieldsStoredOnRow`, so the desired table and the created one name the same columns.
+  const namedFields = fieldsStoredOnRow(fields);
+
+  // i18n: when the component is localized, its translatable fields live in the
+  // companion `comp_<slug>_locales` table (migration-owned) and MUST be omitted
+  // from the main component table's desired columns — same rule as collections.
+  const localizedNames = options.localized
+    ? new Set(resolveLocalizedFieldNames(fields, true))
+    : new Set<string>();
+
+  // Component system columns — mirrors field-group-schema-service.ts DDL.
+  if (dialect === "postgresql") {
+    columns.push({
+      name: "id",
+      type: "text",
+      nullable: false,
+      default: undefined,
+      // Component tables declare `id` as their primary key, so it takes
+      // the same nullability exemption as every other primary key.
+      primaryKey: true,
+    });
+    columns.push({
+      name: STORAGE_FORMAT.columns.parentId,
+      type: "text",
+      nullable: false,
+      default: undefined,
+    });
+    columns.push({
+      name: STORAGE_FORMAT.columns.parentTable,
+      type: "varchar",
+      nullable: false,
+      default: undefined,
+    });
+    columns.push({
+      name: STORAGE_FORMAT.columns.parentField,
+      type: "varchar",
+      nullable: false,
+      default: undefined,
+    });
+    columns.push({
+      name: STORAGE_FORMAT.columns.order,
+      type: "int4",
+      nullable: true,
+      default: undefined,
+    });
+    columns.push({
+      name: typeColumn,
+      type: "varchar",
+      nullable: true,
+      default: undefined,
+    });
+  } else if (dialect === "mysql") {
+    columns.push({
+      name: "id",
+      type: "varchar(36)",
+      nullable: false,
+      default: undefined,
+      // Component tables declare `id` as their primary key, so it takes
+      // the same nullability exemption as every other primary key.
+      primaryKey: true,
+    });
+    columns.push({
+      name: STORAGE_FORMAT.columns.parentId,
+      type: "varchar(36)",
+      nullable: false,
+      default: undefined,
+    });
+    columns.push({
+      name: STORAGE_FORMAT.columns.parentTable,
+      type: "varchar(255)",
+      nullable: false,
+      default: undefined,
+    });
+    columns.push({
+      name: STORAGE_FORMAT.columns.parentField,
+      type: "varchar(255)",
+      nullable: false,
+      default: undefined,
+    });
+    columns.push({
+      name: STORAGE_FORMAT.columns.order,
+      type: "int(11)",
+      nullable: true,
+      default: undefined,
+    });
+    columns.push({
+      name: typeColumn,
+      type: "varchar(255)",
+      nullable: true,
+      default: undefined,
+    });
+  } else {
+    // sqlite
+    columns.push({
+      name: "id",
+      type: "text",
+      nullable: false,
+      default: undefined,
+      // Component tables declare `id` as their primary key, so it takes
+      // the same nullability exemption as every other primary key.
+      primaryKey: true,
+    });
+    columns.push({
+      name: STORAGE_FORMAT.columns.parentId,
+      type: "text",
+      nullable: false,
+      default: undefined,
+    });
+    columns.push({
+      name: STORAGE_FORMAT.columns.parentTable,
+      type: "text",
+      nullable: false,
+      default: undefined,
+    });
+    columns.push({
+      name: STORAGE_FORMAT.columns.parentField,
+      type: "text",
+      nullable: false,
+      default: undefined,
+    });
+    columns.push({
+      name: STORAGE_FORMAT.columns.order,
+      type: "integer",
+      nullable: true,
+      default: undefined,
+    });
+    columns.push({
+      name: typeColumn,
+      type: "text",
+      nullable: true,
+      default: undefined,
+    });
+  }
+
+  // User-defined fields.
+  for (const field of namedFields) {
+    if (localizedNames.has(field.name)) continue; // lives in the companion table
+    const desc = getComponentRowColumnDescriptor(
+      field as unknown as Parameters<typeof getColumnDescriptor>[0],
+      dialect,
+      options.builtBy
+    );
+    if (!desc) continue;
+    columns.push(userColumnSpec(field, desc, dialect, true));
+  }
+
+  // Timestamp columns — type tokens must match PostgreSQL udt_name / MySQL
+  // COLUMN_TYPE as returned by introspection. Component DDL uses
+  // timestamp({ withTimezone: false }) (pg → "timestamp"), DATETIME (mysql), INTEGER (sqlite).
+  if (dialect === "postgresql") {
+    columns.push({
+      name: "created_at",
+      type: "timestamp",
+      nullable: false,
+      default: undefined,
+    });
+    columns.push({
+      name: "updated_at",
+      type: "timestamp",
+      nullable: false,
+      default: undefined,
+    });
+  } else if (dialect === "mysql") {
+    columns.push({
+      name: "created_at",
+      type: "datetime",
+      nullable: false,
+      default: undefined,
+    });
+    columns.push({
+      name: "updated_at",
+      type: "datetime",
+      nullable: false,
+      default: undefined,
+    });
+  } else {
+    columns.push({
+      name: "created_at",
+      type: "integer",
+      nullable: false,
+      default: undefined,
+    });
+    columns.push({
+      name: "updated_at",
+      type: "integer",
+      nullable: false,
+      default: undefined,
+    });
+  }
+
+  // The defaults the field group's creator gives its system columns
+  // (`fieldGroupStructuralDefaults`), declared from the same answer. Left out, every table the
+  // creator made read as carrying defaults the schema did not, and its first save dropped them, so
+  // an insert that leaves `_order` or a timestamp to the database stored NULL or failed NOT NULL.
+  declareStructuralDefaults(columns, dialect);
+
+  // Component tables have no slug. They get a composite index on the parent-link
+  // columns plus the system created_at index — mirroring field-group-schema-service.ts
+  // (idx_<table>_parent). The parent index is required so the migrate:create snapshot
+  // matches the table the apply pipeline builds; otherwise the live index reads as an
+  // unmanaged extra and `migrate:resolve --applied` verify emits a spurious drop_index.
+  const indexes: IndexSpec[] = [
+    {
+      name: `${STORAGE_FORMAT.indexPrefix}${tableName}_parent`,
+      columns: [
+        STORAGE_FORMAT.columns.parentId,
+        STORAGE_FORMAT.columns.parentTable,
+        STORAGE_FORMAT.columns.parentField,
+      ],
+      unique: false,
+    },
+    // The per-field rules are the same ones a collection gets, and they are
+    // taken from the shared helper rather than restated: a component table
+    // materialises `idx_<table>_<column>` for an indexed or single-relationship
+    // field and `uq_<table>_<column>` for a unique one, exactly as
+    // FieldGroupSchemaService creates them. Listing only the parent and
+    // created_at indexes here left the rest out of the snapshot, so a SQLite
+    // rebuild dropped them and nothing put them back — including the unique
+    // ones, which is a constraint silently disappearing, not just an index.
+    ...collectionIndexSpecs(tableName, namedFields, {
+      // A relation holding a list of references takes no plain index even when it asks for one,
+      // as the creator writes none (`componentRelationshipHoldsReferenceList` says why). A single
+      // polymorphic reference is one object and keeps an index it asks for.
+      columnIsIndexable: (field, col) =>
+        !componentRelationshipHoldsReferenceList(field) &&
+        columnTypeIsIndexable(
+          columns.find(c => c.name === col)?.type ?? "",
+          dialect
+        ),
+      uniquenessIsIndexable: (_field, col) =>
+        uniquenessCanBeAnIndex(
+          columns.find(c => c.name === col)?.type ?? "",
+          dialect
+        ),
+      // The field-group creator makes a column unique on the flag alone, a relationship included,
+      // but never a relation holding a list, which no index can keep unique.
+      fieldIsUnique: field =>
+        field.unique === true && !relationHoldsReferenceList(field),
+      // Components have no slug column; created_at is present when the
+      // component carries timestamps.
+      hasSlugColumn: false,
+      // The component creator indexes a relationship only when it references one entry, which a
+      // relation holding a JSON list (a many-to-many included) never does. Asked through the rule
+      // the creator asks, so the two declare the same indexes.
+      isSingleRelation: componentRelationIsSingleReference,
+      hasCreatedAtColumn: columns.some(c => c.name === "created_at"),
+      localizedNames,
+      columnNameFor: field =>
+        getComponentRowColumnDescriptor(
+          field as unknown as Parameters<typeof getColumnDescriptor>[0],
+          dialect,
+          options.builtBy
+        )?.name ?? null,
+    }),
+  ];
+  return { name: tableName, columns, indexes: dedupeIndexes(indexes) };
+}

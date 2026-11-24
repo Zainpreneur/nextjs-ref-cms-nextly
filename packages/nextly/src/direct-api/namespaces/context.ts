@@ -1,0 +1,87 @@
+/**
+ * Direct API Namespace Context
+ *
+ * Defines the `NextlyContext` interface consumed by every namespace factory
+ * under `./namespaces/`. The `Nextly` core class implements this interface
+ * (with `@internal` accessors) so each namespace module can reach the services
+ * and default config it needs without holding a reference to the concrete
+ * class.
+ *
+ * Every member is marked `@internal`: these are implementation details of the
+ * Direct API, not public API. Namespace modules are the only intended
+ * consumers.
+ *
+ * @packageDocumentation
+ */
+
+import type { CredentialDeps } from "../../auth/credentials/verify-credentials";
+import type { SessionRoles } from "../../auth/session/session-roles";
+import type { AuditLogWriter } from "../../domains/audit/audit-log-writer";
+import type { ApiKeyService } from "../../domains/auth/services/api-key-service";
+import type { AuthService } from "../../domains/auth/services/auth-service";
+import type { IdentityService } from "../../domains/auth/services/identity-service";
+import type { PermissionService } from "../../domains/auth/services/permission-service";
+import type { RBACAccessControlService } from "../../domains/auth/services/rbac-access-control-service";
+import type { RolePermissionService } from "../../domains/auth/services/role-permission-service";
+import type { RoleService } from "../../domains/auth/services/role-service";
+import type { EmailDeliveryActivity } from "../../domains/email/delivery-activity";
+import type { FieldGroupMetadataService } from "../../domains/field-groups/services/field-group-metadata-service";
+import type { CollectionsHandler } from "../../services/collections-handler";
+import type { EmailProviderService } from "../../services/email/email-provider-service";
+import type { EmailService } from "../../services/email/email-service";
+import type { EmailTemplateService } from "../../services/email/email-template-service";
+import type { FieldGroupRegistryService } from "../../services/field-groups/field-group-registry-service";
+import type { MediaService } from "../../services/media/media-service";
+import type { SingleEntryService } from "../../services/singles/single-entry-service";
+import type { SingleRegistryService } from "../../services/singles/single-registry-service";
+import type { UserAccountService } from "../../services/users/user-account-service";
+import type { UserFieldDefinitionService } from "../../services/users/user-field-definition-service";
+import type { UserService } from "../../services/users/user-service";
+import type { DirectAPIConfig } from "../types/index";
+
+/**
+ * What the Direct API's `login` needs besides the password check: the roles
+ * the token carries, and the audit trail every sign-in is recorded on.
+ *
+ * @internal
+ */
+export interface DirectLoginDeps {
+  /** The account's roles in force, and the soonest moment one lapses. */
+  fetchSessionRoles(userId: string): Promise<SessionRoles>;
+  /** The same writer the login endpoint records its sign-ins with. */
+  auditLog: AuditLogWriter;
+}
+
+/**
+ * Services and config exposed to namespace modules by the `Nextly` core class.
+ *
+ * @internal
+ */
+export interface NextlyContext {
+  /** @internal */ readonly defaultConfig: DirectAPIConfig;
+  /** @internal */ readonly formsCollectionSlug: string;
+  /** @internal */ readonly submissionsCollectionSlug: string;
+
+  /** @internal */ readonly collectionsHandler: CollectionsHandler;
+  /** @internal */ readonly singleEntryService: SingleEntryService;
+  /** @internal */ readonly singleRegistryService: SingleRegistryService;
+  /** @internal */ readonly authService: AuthService;
+  /** @internal */ readonly passwordCredentialDeps: CredentialDeps;
+  /** @internal */ readonly directLoginDeps: DirectLoginDeps;
+  /** @internal */ readonly userAccountService: UserAccountService;
+  /** @internal */ readonly userService: UserService;
+  /** @internal */ readonly mediaService: MediaService;
+  /** @internal */ readonly fieldGroupRegistryService: FieldGroupRegistryService;
+  /** @internal */ readonly fieldGroupMetadataService: FieldGroupMetadataService;
+  /** @internal */ readonly emailProviderService: EmailProviderService;
+  /** @internal */ readonly emailTemplateService: EmailTemplateService;
+  /** @internal */ readonly userFieldDefinitionService: UserFieldDefinitionService;
+  /** @internal */ readonly emailSendService: EmailService;
+  /** @internal */ readonly emailDeliveryActivity: EmailDeliveryActivity;
+  /** @internal */ readonly rbacRoleService: RoleService;
+  /** @internal */ readonly rbacPermissionService: PermissionService;
+  /** @internal */ readonly rbacRolePermissionService: RolePermissionService;
+  /** @internal */ readonly rbacAccessControlService: RBACAccessControlService;
+  /** @internal */ readonly apiKeyService: ApiKeyService;
+  /** @internal */ readonly identityService: IdentityService;
+}

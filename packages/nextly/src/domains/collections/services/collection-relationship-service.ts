@@ -1,0 +1,5603 @@
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import {
+  and,
+  getColumns,
+  inArray,
+  sql,
+  type Column,
+  type SQL,
+  type Table,
+} from "drizzle-orm";
+
+import type { FieldDefinition } from "@nextly/schemas/dynamic-collections";
+
+import { relatedRowReads } from "../../../auth/access/population-read";
+import { readsAsVisitor } from "../../../auth/access/resolve-actor";
+import {
+  readOf,
+  type FilteredRead,
+  type RuleFilter,
+} from "../../../auth/access/rule-answer";
+import {
+  currentRuleLanguage,
+  ruleLanguageKey,
+  type RuleLanguage,
+  withRuleLanguage,
+} from "../../../auth/access/rule-language";
+import { ruleLanguageKeyOf } from "../../../auth/access/rule-language-key";
+import type { AuthenticatedScope } from "../../../auth/authenticated-scope";
+import { currentPrincipal } from "../../../auth/principal-scope";
+import { canReadSystemResource } from "../../../auth/resource-readable";
+import type { FieldConfig } from "../../../collections/fields/types";
+import { getDialectTables } from "../../../database";
+import { container } from "../../../di/container";
+import { NextlyError } from "../../../errors/nextly-error";
+import { rethrowIfRuleCouldNotRun } from "../../../errors/rule-could-not-run";
+import {
+  convertTimestampsToCamelCase,
+  keysToCamelCase,
+} from "../../../lib/case-conversion";
+import { normalizeMediaUrls } from "../../../lib/media-variant";
+import {
+  resolveStatusFilter,
+  type StatusFilter,
+} from "../../../lib/status-filter";
+import type {
+  CollectionFileManager,
+  CompanionSchema,
+} from "../../../services/collection-file-manager";
+import type {
+  RelatedRowReadContext,
+  TargetReadPolicy,
+} from "../../../services/collections/related-row-read-context";
+import {
+  applyMediaTrustBound,
+  boundRefuses,
+  callerId,
+  identifiedCallerMayRead,
+  judgedFor,
+} from "../../../services/collections/trust-bound";
+import type { TrustBound } from "../../../services/collections/trust-grant";
+import {
+  assumedBound,
+  boundReaches,
+  TRUSTS_EVERY_COLLECTION,
+} from "../../../services/collections/trust-grant";
+import type { FieldGroupDataService } from "../../../services/field-groups/field-group-data-service";
+import type { Logger } from "../../../services/shared";
+import { BaseService } from "../../../shared/base-service";
+import { detachData } from "../../../shared/lib/detach";
+import {
+  anyFieldGroupHasAccessRule,
+  applyFieldReadAccess,
+  callerAccessGrants,
+  type CallerGrants,
+  runFieldHooks,
+  type ReadAccessRedactions,
+} from "../../../shared/lib/field-level-registry";
+import {
+  type FieldGroupReach,
+  instanceFields,
+  reachesPasswordField,
+  stripPasswordFieldValues,
+  stripServerOnlyColumns,
+} from "../../../shared/lib/password-fields";
+import type { RBACAccessControlService } from "../../auth/services/rbac-access-control-service";
+import type { DynamicCollectionService } from "../../dynamic-collections";
+import {
+  liveFieldGroupReadPass,
+  withFieldGroupEvidence,
+  type LiveFieldGroupReadPass,
+} from "../../field-groups/live-read-access";
+import { passwordReachOf } from "../../field-groups/password-reach";
+import { extractFieldGroupReferences } from "../../field-groups/storage/field-group-field-type";
+import {
+  fillCompanionFields,
+  populateCompanionFields,
+  selectRowsWithCompanion,
+} from "../../i18n/companion-join";
+import {
+  idsPublishedInLanguageOf,
+  publishedInLanguageCondition,
+  valuesBesideRow,
+} from "../../i18n/read-in-language";
+import { resolveCompanionSchemaReadiness } from "../../i18n/runtime/companion-readiness";
+import {
+  NO_DECISIONS,
+  type ReleaseDecisions,
+} from "../../releases/release-scope";
+import {
+  NO_RELEASE_VISIBILITY,
+  type ReleaseVisibility,
+} from "../../releases/release-visibility";
+import {
+  fieldsStoredOnRow,
+  junctionLinkColumnsOf,
+  junctionTableTo,
+  usesJunctionTable,
+} from "../../schema/services/field-column-descriptor";
+import {
+  localizedFilterContext,
+  matchColumn,
+  ruleFilterCondition,
+  type DynamicSchema,
+} from "../query/filter-condition";
+
+import { CollectionAccessService } from "./collection-access-service";
+import type { UserContext } from "./collection-types";
+import {
+  collectionTableName,
+  decodeJsonFieldValues,
+  getTableName,
+} from "./collection-utils";
+
+/**
+ * System-entity columns that hold secrets and must never ride along a
+ * populated relationship. System entities have no schema field list, so
+ * they are stripped by column name (both snake_case as stored and the
+ * camelCase form some conversions produce).
+ */
+const SYSTEM_ENTITY_SECRET_COLUMNS = ["passwordHash", "password_hash"] as const;
+
+/**
+ * What one read's walk has resolved for the field groups its related rows
+ * hold: each target's pass, and the caller's grants. Keyed by the read's
+ * access context, so a walk reaching one target through many rows resolves
+ * its field-group schemas once, and reads the caller's roles once.
+ */
+interface RelatedFieldGroupState {
+  passes: Map<string, Promise<LiveFieldGroupReadPass | undefined>>;
+  grants: () => Promise<CallerGrants>;
+  /**
+   * The field groups' own evidence, across every pass the walk makes: a later
+   * one restores what an earlier removed, and the entity's own pass is shown
+   * it too (`withFieldGroupEvidence`), since its store cannot hold it.
+   */
+  redactions: ReadAccessRedactions;
+}
+const relatedFieldGroupState = new WeakMap<object, RelatedFieldGroupState>();
+
+/**
+ * Default depth for relationship population.
+ * Default depth for relationship population.
+ */
+export const DEFAULT_RELATIONSHIP_DEPTH = 2;
+
+/**
+ * Maximum allowed depth to prevent performance issues.
+ */
+export const MAX_RELATIONSHIP_DEPTH = 5;
+
+/**
+ * The two link columns of a many-to-many junction. Every junction read and
+ * write asks this one place, so the columns the runtime queries are the
+ * columns the DDL made. The DDL names the source column from the source's
+ * TABLE (`dc_my_posts` gives `my_posts_id`), so a hyphen in the source slug is
+ * written as an underscore here too; a hyphen-free slug names the same column
+ * it always did. The DDL takes the target column from the target slug as
+ * written, so that side stays as written.
+ */
+export function junctionLinkColumns(
+  sourceCollectionName: string,
+  targetCollectionName: string
+): { sourceColumn: string; targetColumn: string } {
+  return junctionLinkColumnsOf(
+    getTableName(sourceCollectionName),
+    targetCollectionName
+  );
+}
+
+/**
+ * The depth an expansion runs to for the depth a read asked for: absent means
+ * the default, and the result is held between 0 and the maximum. At 0 a read
+ * populates nothing and gives every relationship as stored.
+ */
+export function effectiveRelationshipDepth(depth: number | undefined): number {
+  return Math.min(
+    Math.max(depth ?? DEFAULT_RELATIONSHIP_DEPTH, 0),
+    MAX_RELATIONSHIP_DEPTH
+  );
+}
+
+/** Carried across one read's nested-hook pass. */
+interface NestedHookStateBase {
+  /**
+   * Rows already visited. Batch expansion hands the same object to every parent
+   * that references it, so this is what keeps a transform from compounding
+   * with the reference count; it also breaks a reference cycle.
+   */
+  visited: Set<Record<string, unknown>>;
+  /** One schema read per collection per read, rather than per row per depth. */
+  fields: Map<string, FieldDefinition[]>;
+  /**
+   * One registry read per field group per read, for the same reason: a page of
+   * entries holds the same component in every row. `null` for a field group
+   * the registry does not know.
+   */
+  fieldGroups: Map<string, Promise<FieldDefinition[] | null>>;
+  /**
+   * Physical table per collection, filled by the same registry read as
+   * `fields`. A walked row's contributed hidden columns are keyed by this name,
+   * which for a `dbName` collection is not `dc_<slug>`.
+   */
+  tables: Map<string, string>;
+  /**
+   * Label field per target, keyed by collection AND the field's declared
+   * override, since two relationships can point at one collection and name
+   * different labels. Resolving it costs a metadata read, and the label is
+   * rebuilt for every related row.
+   */
+  labelFields: Map<string, Promise<string>>;
+  /**
+   * The values field access removed from each related row, keyed by the row
+   * object, shared across the whole read. The walk applies access to each row
+   * before its parent's hooks (so a hook cannot read a denied child field to copy
+   * it), recording what it removed here; finalize re-applies access after every
+   * hook, restoring those values as evidence and re-judging the current content,
+   * so anything a hook reintroduced, mutated, or added is caught.
+   */
+  redactions: ReadAccessRedactions;
+  /**
+   * Every related row the pass reached, in visit order, with what is needed to
+   * finish it. These entries drive the finalize step after every hook has run: it
+   * re-applies access to each row (see `redactions`), then rebuilds labels last
+   * from the values that survived.
+   */
+  pending: Array<{
+    row: Record<string, unknown>;
+    collection: string;
+    field: FieldDefinition;
+    /**
+     * How many hops from the document the row was reached at. Expansion honours
+     * the depth remaining when it reaches a row, so the SAME row reached one hop
+     * in and two hops in carries different population: the nearer occurrence has
+     * its own relationships expanded where the deeper one has bare ids.
+     */
+    depth: number;
+    /**
+     * The language the row's rules and hooks were told when the walk reached
+     * it: the read's own, or, for a row in one language's values beside a read
+     * of every language, that language. The finalize step re-judges the row in
+     * it, and keeps its authoritative version under it, so one language's
+     * answer is never another's.
+     */
+    language: RuleLanguage;
+  }>;
+  /**
+   * The AUTHORITATIVE version of each related row, keyed by collection and id: a
+   * deep copy taken once the walk and the finalize step have fully sanitized it,
+   * before any source-collection `afterRead` hook can reach it.
+   *
+   * The response's related rows are rebuilt from these rather than inspected for
+   * tampering (see
+   * {@link CollectionRelationshipService.reprojectRelatedRows}). A source hook is
+   * free to clone, reshape, reorder, or write to a related row; whatever it did is
+   * discarded when the row is re-derived, so no reshape has to be DETECTED to be
+   * undone. A related row's presentation is its own collection's authority, so a
+   * source hook cannot change it — including its allowed fields.
+   *
+   * Copies, never the live rows: a hook that mutates a related row in place would
+   * otherwise corrupt the very version this restores from.
+   */
+  sanitized: Map<string, { depth: number; row: Record<string, unknown> }>;
+}
+
+/** The state the walk carries; named separately so the interface reads first. */
+type NestedHookState = NestedHookStateBase;
+
+function createNestedHookState(): NestedHookState {
+  return {
+    visited: new Set(),
+    fields: new Map(),
+    fieldGroups: new Map(),
+    tables: new Map(),
+    labelFields: new Map(),
+    redactions: new WeakMap(),
+    pending: [],
+    sanitized: new Map(),
+  };
+}
+
+/**
+ * The collection a nested value belongs to, and the row itself.
+ *
+ * A polymorphic relationship is expanded as `{ relationTo, value }`, so the
+ * target is knowable per VALUE even though the field declares several. The
+ * discriminator is validated against what the field declares, so a stored value
+ * naming a collection the field never pointed at cannot direct another
+ * collection's hooks at this row.
+ */
+/**
+ * Whether a field stores its values as the discriminated `{ relationTo, value }`
+ * pair rather than as bare ids.
+ *
+ * Decided by the ARRAY FORM of `relationTo`, not by how many targets it names: a
+ * field declaring a single target as an array (`relationTo: ["posts"]`) uses the
+ * same pair a multi-target field does, because the storage shape follows how the
+ * target was declared. Counting targets instead reads that pair as the row.
+ *
+ * Mirrors {@link declaredTargets}: a many-to-many field resolves its one target
+ * from `options.target` and stores bare ids, whatever `relationTo` says.
+ */
+function isDiscriminatedRelationship(field: FieldDefinition): boolean {
+  if (field.options?.relationType === "manyToMany" && field.options.target) {
+    return false;
+  }
+  return Array.isArray(field.relationTo);
+}
+
+/**
+ * What one relationship value actually holds.
+ *
+ * - `reference` — a bare id, or the pair a discriminated field stores while
+ *   nothing is populated. It carries no fields, so there is nothing to sanitize
+ *   and nothing to rebuild.
+ * - `populated` — an expanded row, with the collection it belongs to.
+ * - `unresolvable` — an expanded row whose collection cannot be established: a
+ *   pair naming a collection the field never declared, or a bare row under a
+ *   field naming several targets, where nothing in the value says which one it
+ *   came from.
+ */
+type RelationshipValueShape =
+  | { kind: "reference" }
+  | { kind: "unresolvable" }
+  | {
+      kind: "populated";
+      collection: string;
+      row: Record<string, unknown>;
+      discriminated: boolean;
+    };
+
+/**
+ * Read a relationship value's shape, once, for every reader that needs it.
+ *
+ * The walk and the response rebuild both have to agree about which values are
+ * discriminated and which collection a row belongs to. Deciding that separately
+ * in each is how they drift: one treating a `{ relationTo, value }` pair as the
+ * row evaluates the target's rules against an object holding neither of its
+ * fields, and the other drops a relationship nothing touched.
+ */
+function readRelationshipValueShape(
+  value: unknown,
+  field: FieldDefinition
+): RelationshipValueShape {
+  if (value === null || value === undefined) return { kind: "reference" };
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return { kind: "reference" };
+  }
+  // The same resolver expansion uses, so a Schema Builder relationship -- whose
+  // target lives in `options.target` with no `relationTo` at all -- is walked
+  // rather than skipped.
+  const targets = declaredTargets(field);
+  if (targets.length === 0) return { kind: "reference" };
+
+  const record = value as Record<string, unknown>;
+  // Only a field that DECLARES the pair shape is read as one, so a target
+  // collection that legitimately defines its own string `relationTo` field is
+  // not mistaken for a wrapper and skipped.
+  if (
+    isDiscriminatedRelationship(field) &&
+    typeof record.relationTo === "string"
+  ) {
+    const inner = record.value;
+    if (inner === null || typeof inner !== "object" || Array.isArray(inner)) {
+      // The pair is still carrying an id: a reference, not an expanded row.
+      return { kind: "reference" };
+    }
+    // Validated against what the field declares: nothing checks the stored slug
+    // on the way in, so an unvalidated one would let a writer aim another
+    // collection's rules and hooks at this row.
+    if (!targets.includes(record.relationTo)) return { kind: "unresolvable" };
+    return {
+      kind: "populated",
+      collection: record.relationTo,
+      row: inner as Record<string, unknown>,
+      discriminated: true,
+    };
+  }
+
+  if (targets.length > 1) return { kind: "unresolvable" };
+  return {
+    kind: "populated",
+    collection: targets[0],
+    row: record,
+    discriminated: false,
+  };
+}
+
+function resolveNestedTarget(
+  row: Record<string, unknown>,
+  field: FieldDefinition
+): { collection: string; row: Record<string, unknown> } | null {
+  const shape = readRelationshipValueShape(row, field);
+  return shape.kind === "populated"
+    ? { collection: shape.collection, row: shape.row }
+    : null;
+}
+
+/**
+ * The caller a related row is redacted for.
+ *
+ * Carried separately from {@link RelationshipExpansionOptions} because the fetch
+ * helpers need only these two of its fields, and passing the whole options bag
+ * down would let a depth value leak into a redaction decision.
+ */
+/**
+ * The caller a related row is fetched, judged and redacted for.
+ *
+ * The shared shape, carried unchanged by every layer that can reach a related
+ * row. Kept as a local name because this service refers to it constantly and
+ * "access" reads better at those call sites than the full noun.
+ */
+type RelatedRowAccess = RelatedRowReadContext;
+
+/**
+ * The languages a related row is read in: every language the surrounding read falls back
+ * through, else the one it resolved to, else none.
+ */
+function targetLocaleChain(access: RelatedRowAccess): readonly string[] | null {
+  return access.localeChain ?? (access.locale ? [access.locale] : null);
+}
+
+/** A target's translations, read in the same statement as its rows, in the chain they were read in. */
+interface TargetTranslations {
+  rows: Record<string, unknown>[];
+  localeChain: readonly string[];
+}
+
+/**
+ * Whether this expansion may see a target's UNPUBLISHED rows.
+ *
+ * Deliberately not {@link trustsTarget}. Trust answers *who may read a row*;
+ * draft-ness answers *whether the row is ready to be read by anyone*, and a
+ * caller can be entitled to the first without the second.
+ *
+ * A caller that supplies `trusted` has declared it serves ONE FIXED AUDIENCE —
+ * that is the only reason to bound a bypass it already holds. Such a caller
+ * never inherits a widened lifecycle, even for a collection it explicitly
+ * trusts, because trusting a collection says its PUBLISHED content may be
+ * shown, not that its pending edits may. A public route is the case that makes
+ * this concrete: it pre-renders, so a draft pulled in through a relationship is
+ * written to a static artifact and outlives the row being unpublished.
+ *
+ * An unbounded trusted caller — the admin UI, a server task — keeps today's
+ * behaviour, because it has already decided who is asking.
+ */
+function widensLifecycle(access: RelatedRowAccess): boolean {
+  if (access.overrideAccess !== true) return false;
+  return access.trusted === TRUSTS_EVERY_COLLECTION;
+}
+
+/**
+ * Whether this expansion may read ONE target collection trusted.
+ *
+ * `overrideAccess` alone says the CALLER is trusted. It says nothing about the
+ * collection a relationship happens to point at, which the caller never named
+ * and may not serve to the same audience. Asking per target is what lets a
+ * caller that knows its audience — a public route, say — keep the bypass for
+ * what it declared and read everything else as that audience would.
+ *
+ * Absent predicate means unchanged behaviour, so a caller that has already
+ * decided who is asking keeps today's semantics rather than being narrowed by
+ * a default it never chose.
+ */
+function trustsTarget(
+  access: RelatedRowAccess,
+  targetCollection: string
+): boolean {
+  if (access.overrideAccess !== true) return false;
+  return boundReaches(access.trusted, targetCollection);
+}
+
+/**
+ * Options for relationship expansion. The match-column cache is carried by a
+ * nested hop as the verdict map is, and declared once, on the context it
+ * belongs to.
+ */
+export interface RelationshipExpansionOptions
+  extends Pick<RelatedRowReadContext, "targetRuleMatches" | "localeChain"> {
+  /**
+   * The table the entry's own row is in, where it is not its collection's
+   * (`dc_<slug>`): a Single's, whose many-to-many links are kept in junctions
+   * named from it. The entry's top level only; a related row's links are
+   * read from its own collection's table.
+   * @internal
+   */
+  manyToManySourceTable?: string;
+
+  /**
+   * Maximum depth to expand relationships (0-5).
+   * - 0: No expansion, return IDs only
+   * - 1: Expand immediate relationships
+   * - 2+: Expand nested relationships recursively
+   * @default 2
+   */
+  depth?: number;
+
+  /**
+   * Current depth level (used internally for recursion).
+   * @internal
+   */
+  currentDepth?: number;
+
+  /**
+   * The caller a related row's field-level `access.read` rules are evaluated
+   * against.
+   *
+   * Expansion spreads the whole related row into the parent entry, and the
+   * parent entity's field registry never describes a related collection's
+   * fields — so without the caller here, a field the target collection protects
+   * is returned to anyone who populates the relationship. Absent means
+   * anonymous, which denies any rule that inspects the user, matching how the
+   * parent entry is redacted.
+   */
+  user?: Record<string, unknown>;
+
+  /**
+   * Trusted read: skip field-level read rules on related rows, matching
+   * `applyFieldReadAccess`. Secret stripping (passwords, system columns) is NOT
+   * skipped — a system caller has no reason to receive a password hash.
+   */
+  overrideAccess?: boolean;
+
+  /**
+   * Narrows `overrideAccess` to the collections a caller names, judged per
+   * expansion TARGET. See {@link RelatedRowAccess.trusted}.
+   */
+  trusted?: TrustBound;
+
+  /**
+   * Opt in to evaluating the target collection's field read rules. Set by the
+   * read paths that forward a real caller; see {@link RelatedRowAccess}.
+   */
+  enforceFieldAccess?: boolean;
+  /**
+   * Whose field rules related rows are judged by, when that is not the caller.
+   * See {@link RelatedRowReadContext.fieldAccessUser}. Applied to the access
+   * pass alone — hooks keep seeing `user`, who is who is actually asking.
+   */
+  fieldAccessUser?: Record<string, unknown>;
+
+  /**
+   * Evaluate the target collection's own read rules even when field redaction
+   * is off. See {@link RelatedRowAccess.enforceCollectionAccess}.
+   */
+  enforceCollectionAccess?: boolean;
+
+  /**
+   * Defer the target's field read rules to the post-assembly pass. Only a
+   * caller that runs {@link CollectionRelationshipService.applyNestedFieldHooks}
+   * over the finished document may set this. See
+   * {@link RelatedRowAccess.fieldAccessStage}.
+   */
+  fieldAccessStage?: "fetch" | "assembled";
+
+  /**
+   * Collects the ids withheld because a target collection refused the caller,
+   * so a completeness check can tell a refusal from a failure.
+   *
+   * @internal
+   */
+  withheldByAccess?: Set<string>;
+
+  /**
+   * Target read policies already resolved during this expansion.
+   *
+   * Carried by a nested hop so the whole expansion resolves each target
+   * collection's rules once. Not part of what a caller supplies.
+   *
+   * @internal
+   */
+  targetPolicies?: Map<string, Promise<TargetReadPolicy>>;
+
+  /**
+   * Companion schemas already looked up during this expansion, carried by a
+   * nested hop for the same reason the policy map is.
+   *
+   * @internal
+   */
+  targetCompanions?: Map<string, Promise<CompanionSchema | null>>;
+
+  /**
+   * Target access verdicts already decided during this expansion, carried by
+   * a nested hop for the same reason the policy map is.
+   *
+   * @internal
+   */
+  targetVerdicts?: Map<string, Promise<FilteredRead>>;
+
+  /**
+   * The caller's authenticated scope, when one applies.
+   *
+   * A scoped API key is judged on its OWN stamped grant rather than its
+   * owner's roles, so a super-admin-owned key must not inherit the bypass its
+   * owner's session would get.
+   */
+  authenticatedScope?: AuthenticatedScope;
+
+  /**
+   * The caller's Draft/Published intent, when they asked to see everything.
+   *
+   * Deliberately narrow: `"all"` is the only value that propagates into
+   * expansion. It is a statement about the caller's trust — the admin sends it
+   * on every read for exactly that reason — whereas a concrete `draft` or
+   * `published` names the lifecycle of the collection being read and says
+   * nothing about what that collection points at. Absent means a related row is
+   * filtered to the published default, which is what a direct read of it would
+   * do.
+   */
+  status?: "all";
+  /**
+   * The language this read resolved to, forwarded so a target collection's read
+   * rule can be applied when it filters on a localized field.
+   *
+   * Pass the resolved locale, not the raw request parameter: see
+   * {@link RelatedRowAccess.locale}.
+   */
+  locale?: string;
+
+  /**
+   * What the batch path gives a hasMany relationship that stores nothing.
+   *
+   * - `"empty"` (the default): an empty list, which is what a list read has
+   *   always given for a document's own unset to-many field. List callers map
+   *   over it, so the default keeps that public shape as it was.
+   * - `"null"`: the value as stored, as {@link
+   *   CollectionRelationshipService.expandRelationships} keeps it. Asked for by
+   *   the batch path's own nested calls (repeater and group rows, and related
+   *   rows expanded for the depth remaining), whose unset values a list has
+   *   always returned as stored: a repeater row went through the single-entry
+   *   expansion, and a related row was not expanded at all.
+   *
+   * Read only by {@link CollectionRelationshipService.batchExpandRelationships};
+   * the single-entry expansion always keeps the stored value.
+   */
+  unsetHasMany?: "empty" | "null";
+}
+
+/**
+ * Checks if a field is a relationship field.
+ */
+function isRelationshipField(field: FieldDefinition): boolean {
+  return field.type === "relationship";
+}
+
+/**
+ * Checks if a field is an upload field.
+ */
+function isUploadField(field: FieldDefinition): boolean {
+  return field.type === "upload";
+}
+
+/**
+ * Checks if a field is a repeater or group field (container with nested rows).
+ */
+function isRepeaterOrGroupField(field: FieldDefinition): boolean {
+  return field.type === "repeater" || field.type === "group";
+}
+
+/**
+ * Checks if a field is a group field (container with nested fields).
+ */
+function isGroupField(field: FieldDefinition): boolean {
+  return field.type === "group";
+}
+
+/**
+ * Gets nested fields from a repeater or group field.
+ */
+function getNestedFields(field: FieldDefinition): FieldDefinition[] {
+  if (field.fields && Array.isArray(field.fields)) {
+    return field.fields;
+  }
+  return [];
+}
+
+/**
+ * Whether a field's value is rows of the document's own rather than a
+ * reference: a group's or repeater's, or a component's, whose fields the
+ * component declares (`extractFieldGroupReferences` reads both spellings).
+ */
+function holdsOwnRows(field: FieldDefinition): boolean {
+  if (getNestedFields(field).length > 0) return true;
+  const { single, many } = extractFieldGroupReferences(field);
+  return single !== undefined || many !== undefined;
+}
+
+/**
+ * Each language's value of each of `fields` beside `entry` (`_allLocales`,
+ * `{ field: { code: value } }`), with the map that holds it and the rule
+ * language that value is answered in, so the walk reads it and the
+ * reprojection replaces it in the same places, each in its own language: the
+ * frame the read's own field pipeline judges that language's values in.
+ */
+function eachLanguageValue(
+  entry: Record<string, unknown>,
+  fields: readonly FieldDefinition[]
+): {
+  field: FieldDefinition;
+  values: Record<string, unknown>;
+  code: string;
+  language: RuleLanguage;
+}[] {
+  const every = valuesBesideRow(entry);
+  if (!every) return [];
+  return fieldsStoredOnRow(fields).flatMap(field => {
+    const keyed = every[field.name];
+    if (keyed === null || typeof keyed !== "object" || Array.isArray(keyed)) {
+      return [];
+    }
+    const values = keyed as Record<string, unknown>;
+    return Object.keys(values).map(code => ({
+      field,
+      values,
+      code,
+      language: { locale: code, locales: [code] },
+    }));
+  });
+}
+
+/**
+ * Safely parses JSON data if it's a string, otherwise returns as-is.
+ * Handles cases where repeater/group field data hasn't been deserialized yet.
+ */
+function parseJsonIfString(data: unknown): unknown {
+  if (typeof data === "string") {
+    try {
+      return JSON.parse(data);
+    } catch {
+      return data;
+    }
+  }
+  return data;
+}
+
+/**
+ * The row objects inside a container value (a `group` object, or a `repeater`
+ * array), parsing a JSON string first. Non-object entries are dropped. Used to
+ * walk an original and its clone in parallel when transferring redaction evidence.
+ */
+function containerRowsOf(value: unknown): Record<string, unknown>[] {
+  const parsed = parseJsonIfString(value);
+  if (Array.isArray(parsed)) {
+    return parsed.filter(
+      (row): row is Record<string, unknown> =>
+        row !== null && typeof row === "object"
+    );
+  }
+  if (parsed !== null && typeof parsed === "object") {
+    return [parsed as Record<string, unknown>];
+  }
+  return [];
+}
+
+/**
+ * Extracts the ID from a relationship field value.
+ * Handles both raw IDs (strings) and expanded objects ({id: "..."}).
+ */
+function extractRelationshipId(value: unknown): unknown {
+  if (value == null) return value;
+  if (typeof value === "string") return value;
+  if (
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    value !== null &&
+    "id" in value
+  ) {
+    return (value as Record<string, unknown>).id;
+  }
+  return value;
+}
+
+/**
+ * A resolved relationship value: which collection the row is read from, and
+ * whether the stored value named that collection itself.
+ *
+ * `discriminated` decides what the populated row has to carry back, not where
+ * it is read from — a value that named its collection has to keep saying so in
+ * the response, or saving the document back loses it.
+ */
+interface RelationshipRef {
+  collection: string;
+  id: string;
+  discriminated: boolean;
+}
+
+/**
+ * Keeps a populated multi-target value round-trippable, and keeps it out of the
+ * related row's own namespace.
+ *
+ * The write path reduces a populated object to a bare id unless it still says
+ * which collection it came from, and a bare id resolves against the field's
+ * first declared target — so a document read at depth and saved back unchanged
+ * would silently retarget or drop the relationship.
+ *
+ * The row is nested under `value` rather than carrying the discriminator beside
+ * its own columns: a target collection may legitimately define a field called
+ * `value` or `relationTo` (neither is reserved), and merging would overwrite
+ * that field's real data, including re-adding a key that field-level access
+ * had just removed. Nesting also keeps one shape at every depth — `value` is
+ * the id when nothing was populated, and the row when something was.
+ */
+function withReferenceIdentity(
+  row: Record<string, unknown>,
+  ref: RelationshipRef
+): Record<string, unknown> {
+  if (!ref.discriminated) return row;
+  return { relationTo: ref.collection, value: row };
+}
+
+/**
+ * The collections a relationship field is allowed to point at.
+ *
+ * A many-to-many field keeps its target under `options.target`, matching how
+ * {@link getTargetCollection} resolves one.
+ */
+function declaredTargets(field: FieldDefinition): string[] {
+  if (field.options?.relationType === "manyToMany" && field.options.target) {
+    return [field.options.target];
+  }
+  if (Array.isArray(field.relationTo)) return field.relationTo;
+  if (typeof field.relationTo === "string") return [field.relationTo];
+  const target = field.options?.target;
+  return typeof target === "string" ? [target] : [];
+}
+
+/**
+ * Reads a relationship value that carries its own target collection.
+ *
+ * A field declaring several targets cannot store a bare id, because the id
+ * alone does not say which table it belongs to; it stores a
+ * `{ relationTo, value }` pair instead. The stored collection decides which
+ * table the id is read from, so it is only honoured when the field declares
+ * it: nothing validates the slug on the way in, and trusting it as written
+ * would let a writer name any collection and have the row read back out of it,
+ * bypassing that collection's own read rules.
+ *
+ * Returns null for any other shape, leaving the caller on the single-target
+ * path where the field's own target is the right answer.
+ */
+function readPolymorphicRef(
+  value: unknown,
+  allowedTargets: string[]
+): RelationshipRef | null {
+  // Dialects without a native object column hand the pair back as the JSON
+  // text it was stored as. Only a value that actually parses to the pair is
+  // treated as one: an ordinary id is a bare string, and a Postgres array
+  // literal opens with the same brace but is not JSON, so both fall through
+  // to the single-target path rather than being mistaken for a reference.
+  const candidate =
+    typeof value === "string" && value.startsWith("{")
+      ? parseJsonObject(value)
+      : value;
+  if (
+    candidate === null ||
+    typeof candidate !== "object" ||
+    Array.isArray(candidate)
+  ) {
+    return null;
+  }
+  const { relationTo, value: id } = candidate as Record<string, unknown>;
+  if (typeof relationTo !== "string" || typeof id !== "string") return null;
+  if (!allowedTargets.includes(relationTo)) return null;
+  return { collection: relationTo, id, discriminated: true };
+}
+
+/**
+ * Whether a value is stored as a `{ relationTo, value }` pair, regardless of
+ * which collection it names. Distinguishes "not a pair" from "a pair naming a
+ * collection this field never declared", so the second can be left alone
+ * rather than treated as an id and sent to the wrong table.
+ */
+function isPolymorphicRefShape(value: unknown): boolean {
+  const candidate =
+    typeof value === "string" && value.startsWith("{")
+      ? parseJsonObject(value)
+      : value;
+  if (
+    candidate === null ||
+    typeof candidate !== "object" ||
+    Array.isArray(candidate)
+  ) {
+    return false;
+  }
+  const { relationTo, value: id } = candidate as Record<string, unknown>;
+  return typeof relationTo === "string" && typeof id === "string";
+}
+
+/** Parses JSON text to an object, or null when it is not one. */
+function parseJsonObject(text: string): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The caller an expansion judges every related row for, from the options it was
+ * handed. Built in one place so a single-entry and a batched expansion can
+ * never carry different callers for the same request.
+ */
+function relatedRowAccessOf(
+  options: RelationshipExpansionOptions
+): RelatedRowAccess {
+  return {
+    enforceFieldAccess: options.enforceFieldAccess,
+    enforceCollectionAccess: options.enforceCollectionAccess,
+    fieldAccessStage: options.fieldAccessStage,
+    user: options.user,
+    // Carried BESIDE `user`, never folded into it. A preview judges a related
+    // row's fields as the sharer while every hook goes on seeing the
+    // anonymous bearer; dropping it here silently restores the anonymous
+    // reading for the whole expansion, which is the direction that leaks.
+    fieldAccessUser: options.fieldAccessUser,
+    overrideAccess: options.overrideAccess,
+    trusted: assumedBound(options.trusted),
+    authenticatedScope: options.authenticatedScope,
+    locale: options.locale,
+    localeChain: options.localeChain,
+    status: options.status,
+    withheldByAccess: options.withheldByAccess,
+    // One per expansion, so a relationship holding many references reads its
+    // target's rules once rather than once per value. A nested hop inherits
+    // the map rather than starting its own: several children populating the
+    // same collection would otherwise each resolve its policy again, which
+    // is the repetition this cache exists to remove. Created fresh only for
+    // the outermost call, because a collection's rules can change between
+    // requests.
+    targetPolicies: options.targetPolicies ?? new Map(),
+    // Shared and inherited exactly as the policy map is, for the same reason:
+    // a nested hop starting its own would re-read the metadata of a collection
+    // an ancestor already looked up.
+    targetCompanions: options.targetCompanions ?? new Map(),
+    // And the access verdicts, likewise: the caller is the same on every hop,
+    // so a target already judged for it is not asked again.
+    targetVerdicts: options.targetVerdicts ?? new Map(),
+    // And the match columns, built from those verdicts' filters.
+    targetRuleMatches: options.targetRuleMatches ?? new Map(),
+  };
+}
+
+/**
+ * Strips expanded relationship objects in a data row down to just their IDs.
+ * Used when depth=0 to ensure no nested relationships are returned as full objects.
+ * Recursively handles nested repeater/group fields.
+ */
+function stripRelationshipsToIds(
+  row: Record<string, unknown>,
+  fields: FieldDefinition[]
+): Record<string, unknown> {
+  const stripped = { ...row };
+
+  for (const field of fields) {
+    const fieldName = field.name;
+    if (
+      !fieldName ||
+      stripped[fieldName] === undefined ||
+      stripped[fieldName] === null
+    )
+      continue;
+
+    // The same reductions the batch path's depth-0 read makes, so the two
+    // agree on what "as ids" means.
+    if (isRelationshipField(field)) {
+      stripped[fieldName] = relationshipValueToIds(stripped[fieldName], field);
+    } else if (field.type === "repeater" || field.type === "group") {
+      const nestedFields = getNestedFields(field);
+      if (nestedFields.length === 0) continue;
+      stripped[fieldName] = stripContainerRows(
+        stripped[fieldName],
+        field,
+        nestedFields
+      );
+    }
+  }
+
+  return stripped;
+}
+
+/**
+ * Checks if a target collection name is a system entity.
+ * System entities are managed tables like users, not dynamic collections.
+ */
+function isSystemEntity(targetName: string): boolean {
+  const systemEntities = ["users", "roles", "permissions"];
+  return systemEntities.includes(targetName.toLowerCase());
+}
+
+/**
+ * The physical table a system entity's rows are read from. The entity names
+ * above ARE their table names, so this is the name itself; it exists so no
+ * caller reaches for `getTableName`, whose `dc_` prefix names a table that does
+ * not exist and would match none of the columns contributed to the real one.
+ */
+function systemEntityTableName(targetName: string): string {
+  return targetName.toLowerCase();
+}
+
+/**
+ * Gets the system table schema for known system entities.
+ * @param targetName - System entity name (e.g., "users")
+ * @param dialect - Database dialect
+ * @returns Schema or null if not a valid system entity
+ */
+function getSystemEntityTable(targetName: string, dialect?: string) {
+  if (targetName.toLowerCase() !== "users") return null;
+
+  const tables = getDialectTables(dialect);
+  return tables.users;
+}
+
+/**
+ * Gets the default label field for a system entity.
+ * @param targetName - System entity name
+ * @returns Default label field name
+ */
+function getSystemEntityLabelField(targetName: string): string {
+  if (targetName.toLowerCase() === "users") {
+    return "name"; // Users have a "name" field for display
+  }
+  return "id"; // Fallback to ID
+}
+
+/**
+ * System-entity label field, honoring an explicit `targetLabelField` unless it
+ * names a secret column (e.g. users `passwordHash`). The label is copied onto
+ * the expanded row before row-level redaction runs, so a secret label field
+ * would leak the hash via `label` even though the column itself is stripped.
+ */
+function resolveSystemEntityLabelField(
+  targetName: string,
+  targetLabelField?: string
+): string {
+  if (
+    targetLabelField &&
+    !(SYSTEM_ENTITY_SECRET_COLUMNS as readonly string[]).includes(
+      targetLabelField
+    )
+  ) {
+    return targetLabelField;
+  }
+  return getSystemEntityLabelField(targetName);
+}
+
+/**
+ * Recursively collects all media IDs from a data object based on field definitions.
+ * Handles nested upload fields inside repeater and group fields.
+ *
+ * @param data - The data object to extract media IDs from
+ * @param fields - Field definitions
+ * @returns Array of all media IDs found
+ */
+function collectAllMediaIds(
+  data: Record<string, unknown>,
+  fields: FieldDefinition[]
+): string[] {
+  if (!data || typeof data !== "object") return [];
+
+  const mediaIds: string[] = [];
+
+  for (const field of fields) {
+    const fieldName = field.name;
+    if (!fieldName || data[fieldName] === undefined || data[fieldName] === null)
+      continue;
+
+    if (isUploadField(field)) {
+      // Upload field - collect its IDs
+      const ids = normalizeToIdArray(data[fieldName]);
+      mediaIds.push(...ids);
+    } else if (isRepeaterOrGroupField(field)) {
+      // Repeater field - recurse into each row
+      // Handle both parsed arrays and JSON strings (pre-deserialization)
+      const nestedFields = getNestedFields(field);
+      const rawArrayData = data[fieldName];
+      const arrayData = parseJsonIfString(rawArrayData);
+      if (Array.isArray(arrayData)) {
+        for (const row of arrayData) {
+          if (row && typeof row === "object") {
+            const nestedIds = collectAllMediaIds(row, nestedFields);
+            mediaIds.push(...nestedIds);
+          }
+        }
+      }
+    } else if (isGroupField(field)) {
+      // Group field - recurse into the group object
+      // Handle both parsed objects and JSON strings (pre-deserialization)
+      const nestedFields = getNestedFields(field);
+      const rawGroupData = data[fieldName];
+      const groupData = parseJsonIfString(rawGroupData);
+      if (
+        groupData &&
+        typeof groupData === "object" &&
+        !Array.isArray(groupData)
+      ) {
+        const nestedIds = collectAllMediaIds(
+          groupData as Record<string, unknown>,
+          nestedFields
+        );
+        mediaIds.push(...nestedIds);
+      }
+    }
+  }
+
+  return mediaIds;
+}
+
+/**
+ * Recursively expands media IDs in a data object using the provided media lookup map.
+ * Handles nested upload fields inside repeater and group fields.
+ *
+ * @param data - The data object to expand
+ * @param fields - Field definitions
+ * @param mediaMap - Map of media ID to full media object
+ * @returns The data with expanded media objects
+ */
+function expandMediaInData(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- recursive data structure
+  data: any,
+  fields: FieldDefinition[],
+  mediaMap: Map<string, Record<string, unknown>>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- recursive data structure
+): any {
+  if (!data || typeof data !== "object") return data;
+
+  const result = Array.isArray(data) ? [...data] : { ...data };
+
+  for (const field of fields) {
+    const fieldName = field.name;
+    if (!fieldName || result[fieldName] === undefined) continue;
+
+    if (isUploadField(field)) {
+      // Upload field - expand IDs to full media objects
+      const value = result[fieldName];
+      if (value === null || value === undefined) continue;
+
+      const hasMany = field.hasMany === true;
+      const ids = normalizeToIdArray(value);
+
+      if (ids.length === 0) {
+        result[fieldName] = hasMany ? [] : null;
+      } else if (hasMany) {
+        // Return array of media objects, maintaining order
+        result[fieldName] = ids
+          .map(id => mediaMap.get(String(id)))
+          .filter(Boolean);
+      } else {
+        // Return single media object
+        result[fieldName] = mediaMap.get(String(ids[0])) || null;
+      }
+    } else if (isRepeaterOrGroupField(field)) {
+      // Repeater field - recurse into each row
+      // Handle both parsed arrays and JSON strings (pre-deserialization)
+      const nestedFields = getNestedFields(field);
+      const rawArrayData = result[fieldName];
+      const arrayData = parseJsonIfString(rawArrayData);
+      if (Array.isArray(arrayData)) {
+        result[fieldName] = arrayData.map(row => {
+          if (row && typeof row === "object") {
+            return expandMediaInData(row, nestedFields, mediaMap);
+          }
+          return row;
+        });
+      }
+    } else if (isGroupField(field)) {
+      // Group field - recurse into the group object
+      // Handle both parsed objects and JSON strings (pre-deserialization)
+      const nestedFields = getNestedFields(field);
+      const rawGroupData = result[fieldName];
+      const groupData = parseJsonIfString(rawGroupData);
+      if (
+        groupData &&
+        typeof groupData === "object" &&
+        !Array.isArray(groupData)
+      ) {
+        result[fieldName] = expandMediaInData(
+          groupData,
+          nestedFields,
+          mediaMap
+        );
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Gets the target collection name from a relationship field.
+ * For polymorphic relationships (relationTo is array), returns the first collection.
+ */
+function getTargetCollection(field: FieldDefinition): string | undefined {
+  // A many-to-many field's junction table is created from `options.target`
+  // (see generateJunctionTable), so resolve m2m targets from there FIRST. A
+  // stale or legacy `relationTo` would otherwise make reads/writes derive a
+  // different junction-table name than the one that physically exists.
+  if (field.options?.relationType === "manyToMany" && field.options.target) {
+    return field.options.target;
+  }
+  if (field.relationTo) {
+    return Array.isArray(field.relationTo)
+      ? field.relationTo[0]
+      : field.relationTo;
+  }
+  // Other Builder-authored relationship fields may also carry the target under
+  // `options.target`; fall back to it when `relationTo` is absent.
+  return field.options?.target;
+}
+
+/**
+ * Determines if a relationship field stores multiple values.
+ * Code-first relationship fields use hasMany; UI-built collections use
+ * options.relationType === "manyToMany". Either signals many-to-many.
+ */
+function isHasManyRelationship(field: FieldDefinition): boolean {
+  if (field.options?.relationType === "manyToMany") {
+    return true;
+  }
+  if (field.hasMany === true) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Parses a PostgreSQL array string into a JavaScript array.
+ * PostgreSQL arrays are returned as strings like: {"uuid1","uuid2"}
+ */
+function parsePostgresArray(value: unknown): string[] | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  // Check if it's a PostgreSQL array format: {item1,item2} or {"item1","item2"}
+  if (value.startsWith("{") && value.endsWith("}")) {
+    const inner = value.slice(1, -1);
+    if (inner === "") return [];
+    // Handle quoted values: {"uuid1","uuid2"}
+    // Split by comma, but handle quoted strings
+    const items: string[] = [];
+    let current = "";
+    let inQuotes = false;
+    for (let i = 0; i < inner.length; i++) {
+      const char = inner[i];
+      if (char === '"' && (i === 0 || inner[i - 1] !== "\\")) {
+        inQuotes = !inQuotes;
+      } else if (char === "," && !inQuotes) {
+        items.push(current.replace(/^"|"$/g, ""));
+        current = "";
+      } else {
+        current += char;
+      }
+    }
+    if (current) {
+      items.push(current.replace(/^"|"$/g, ""));
+    }
+    return items;
+  }
+  return null;
+}
+
+/**
+ * Returns the stored values as their original items when the field holds a
+ * list, so a caller can read each one's own target collection. Null for every
+ * other shape, including a Postgres array literal — that format carries bare
+ * ids, which have no collection to read.
+ */
+function readItemArray(value: unknown): unknown[] | null {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string" && value.startsWith("[")) {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Reads a single relationship value as the collection and id it refers to.
+ * Falls back to the field's own target for the ordinary single-target case,
+ * where the stored value is just an id.
+ */
+function readRelationshipRef(
+  value: unknown,
+  fallbackCollection: string,
+  allowedTargets: string[]
+): RelationshipRef | null {
+  if (value == null) return null;
+  const polymorphic = readPolymorphicRef(value, allowedTargets);
+  if (polymorphic) return polymorphic;
+  // A pair naming an undeclared collection is not an id — reading it as one
+  // would send the whole object to the loader as a bound parameter.
+  if (isPolymorphicRefShape(value)) return null;
+  const id = extractRelationshipId(value);
+  return typeof id === "string"
+    ? { collection: fallbackCollection, id, discriminated: false }
+    : null;
+}
+
+/**
+ * The display column a relationship field asks its target for, or "" when it
+ * asks for none and the label is auto-selected.
+ *
+ * Read from both shapes expansion supports — a Schema Builder field keeps it
+ * under `options`, and a field may carry it at its root — so the two readers
+ * that need it (the label rebuild and the snapshot key) cannot disagree about
+ * which column a field asked for.
+ */
+function declaredLabelField(field: FieldDefinition): string {
+  const override =
+    field.options?.targetLabelField ??
+    (field as Record<string, unknown>).targetLabelField;
+  return typeof override === "string" ? override : "";
+}
+
+/**
+ * Identifies a related row AS ONE FIELD PRESENTS IT: the row itself, plus the
+ * display column the field asked for.
+ *
+ * Two relationship fields can point at the same row and ask for different
+ * labels, and batch expansion fetches per field — so each holds its own row
+ * object carrying its own label. Keyed on the row alone, one field's sanitized
+ * version would overwrite the other's and then be restored into both, giving one
+ * of them the wrong label.
+ */
+function relatedRowSnapshotKey(
+  collection: string,
+  id: string,
+  field: FieldDefinition,
+  /**
+   * The rule language the row was answered in (`ruleLanguageKeyOf`). A read of
+   * every language populates one target in each language's values beside it,
+   * each with that language's values, hooks and rules, so the same row is a
+   * different answer in each and keeps a version of its own per language.
+   */
+  language: string
+): string {
+  // The same NUL separator {@link relationKey} uses, and for the same reason: it
+  // cannot appear in a slug, an id, a field name or a language key, so no two
+  // distinct tuples can collapse onto one key.
+  return `${relationKey(collection, id)}\u0000${declaredLabelField(field)}\u0000${language}`;
+}
+
+/**
+ * The documents a relationship field's stored value points at, each as the
+ * collection it is read from and its id, in the order the value holds them.
+ *
+ * The same reading expansion makes of the value — a bare id against the
+ * field's own target, a `{ relationTo, value }` pair against the collection it
+ * names when the field declares it, a list for a field holding several — so a
+ * caller asking what a document links to gets the documents a read would
+ * populate, and no others. Empty for a field with no target, and for a value
+ * that names none.
+ */
+export function relationshipTargetsOf(
+  field: FieldDefinition,
+  value: unknown
+): Array<{ collection: string; id: string }> {
+  const target = getTargetCollection(field);
+  if (!target) return [];
+  const allowed = declaredTargets(field);
+  const refs = isHasManyRelationship(field)
+    ? normalizeToRelationshipRefs(value, target, allowed)
+    : [readRelationshipRef(value, target, allowed)].filter(
+        (ref): ref is RelationshipRef => ref !== null
+      );
+  return refs.map(ref => ({ collection: ref.collection, id: ref.id }));
+}
+
+/**
+ * Identifies a related row by collection AND id, because an id is only unique
+ * within its own collection. A field naming several targets can hold the same
+ * id for two of them, and a lookup keyed on the id alone would hand back
+ * whichever row was fetched last.
+ */
+export function relationKey(collection: string, id: string): string {
+  // A NUL separator cannot appear in a slug or an id, so no two distinct
+  // pairs can collapse to the same key.
+  return `${collection}\u0000${id}`;
+}
+
+/**
+ * The rows one relationship field's batched fetch returned: by reference key
+ * (a many-to-many field: by source entry id, each holding a list of rows).
+ */
+type RelationDataMap = Map<
+  string,
+  Record<string, unknown> | Record<string, unknown>[]
+>;
+
+/** The lookup map of each fetched relationship field, by field name. */
+type RelationDataMaps = Record<string, RelationDataMap>;
+
+/** A related row a batched fetch returned, with the collection it came from. */
+interface FetchedRow {
+  collection: string;
+  row: Record<string, unknown>;
+}
+
+/**
+ * Record the rows a batched fetch returned for `refs`, each with the collection
+ * it was read from, so the batch path can expand them further while depth
+ * remains. A reference the fetch returned nothing for (missing, or withheld
+ * from this caller) records nothing, so nothing is expanded on its behalf.
+ */
+function collectFetchedRows(
+  refs: RelationshipRef[],
+  fetched: Map<string, Record<string, unknown>>,
+  into: FetchedRow[]
+): void {
+  for (const ref of refs) {
+    const row = fetched.get(relationKey(ref.collection, ref.id));
+    if (row) into.push({ collection: ref.collection, row });
+  }
+}
+
+/**
+ * Put the expanded version of each fetched row in place of the row itself, in
+ * every lookup map, so every entry referencing a row is assigned the expanded
+ * one. A row with no expanded version stays as fetched.
+ */
+function replaceFetchedRows(
+  dataMaps: RelationDataMaps,
+  expandedRows: Map<Record<string, unknown>, Record<string, unknown>>
+): void {
+  for (const dataMap of Object.values(dataMaps)) {
+    for (const [key, value] of dataMap) {
+      dataMap.set(
+        key,
+        Array.isArray(value)
+          ? value.map(row => expandedRows.get(row) ?? row)
+          : (expandedRows.get(value) ?? value)
+      );
+    }
+  }
+}
+
+/**
+ * The references a relationship field holds across a page of entries, each
+ * against the collection it names: every entry of a to-many value, or the one
+ * value of a to-one field. Read the same way the assembly reads each entry's
+ * value back, so a row is fetched for exactly the references assigned.
+ */
+function referencesAcross(
+  entries: Record<string, unknown>[],
+  field: FieldDefinition,
+  targetCollection: string
+): RelationshipRef[] {
+  const targets = declaredTargets(field);
+  if (isHasManyRelationship(field)) {
+    return entries.flatMap(entry =>
+      normalizeToRelationshipRefs(entry[field.name], targetCollection, targets)
+    );
+  }
+  return entries
+    .map(entry =>
+      readRelationshipRef(entry[field.name], targetCollection, targets)
+    )
+    .filter((ref): ref is RelationshipRef => ref !== null);
+}
+
+/**
+ * How deep a relationship field may be populated: its own `maxDepth`, under
+ * `options` (the Schema Builder's shape) or at its root, else the maximum. Both
+ * expansions ask this one place, so they bound a field alike.
+ */
+function fieldMaxDepthOf(field: FieldDefinition): number {
+  return field.options?.maxDepth ?? field.maxDepth ?? MAX_RELATIONSHIP_DEPTH;
+}
+
+/**
+ * Whether a field could hold anything expansion reaches: a relationship, an
+ * upload, or a container whose rows might. An entry with none of these is
+ * returned by the batch path as it is.
+ */
+function mayHoldExpandable(field: FieldDefinition): boolean {
+  return (
+    isUploadField(field) ||
+    isRepeaterOrGroupField(field) ||
+    isRelationshipField(field)
+  );
+}
+
+/**
+ * The nested fields of a container whose rows hold something expansion
+ * reaches (a relationship, an upload, or a further container), or null when
+ * there is nothing in them to expand. Both expansions ask this one place
+ * before descending into a container's rows.
+ */
+function expandableNestedFields(
+  field: FieldDefinition
+): FieldDefinition[] | null {
+  if (isRelationshipField(field)) return null;
+  const nestedFields = getNestedFields(field);
+  const reachable = nestedFields.some(
+    f =>
+      isRelationshipField(f) ||
+      isUploadField(f) ||
+      f.type === "repeater" ||
+      f.type === "group"
+  );
+  return reachable ? nestedFields : null;
+}
+
+/**
+ * Every row one repeater or group field holds across a page of entries, and
+ * where each row's expanded version goes back to. A JSON string the storage
+ * handed back is parsed, and a repeater's parsed list replaces the stored
+ * value on the entry, so the expanded rows land in the value returned.
+ */
+function containerRowsAcross(
+  entries: Record<string, unknown>[],
+  field: FieldDefinition
+): {
+  rows: Record<string, unknown>[];
+  placeBack: Array<(row: Record<string, unknown>) => void>;
+} {
+  const rows: Record<string, unknown>[] = [];
+  const placeBack: Array<(row: Record<string, unknown>) => void> = [];
+  for (const entry of entries) {
+    const rawData = entry[field.name];
+    if (rawData === undefined || rawData === null) continue;
+    const parsed = parseJsonIfString(rawData);
+
+    if (field.type === "repeater") {
+      if (!Array.isArray(parsed)) continue;
+      const list: unknown[] = [...parsed];
+      entry[field.name] = list;
+      list.forEach((row, index) => {
+        if (!row || typeof row !== "object") return;
+        rows.push(row as Record<string, unknown>);
+        placeBack.push(expanded => {
+          list[index] = expanded;
+        });
+      });
+    } else if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      rows.push(parsed as Record<string, unknown>);
+      placeBack.push(expanded => {
+        entry[field.name] = expanded;
+      });
+    }
+  }
+  return { rows, placeBack };
+}
+
+/**
+ * An entry with its relationship fields assigned the rows the batch fetched
+ * for them. A field whose value the lookup cannot resolve keeps what is stored.
+ */
+function withRelationData(
+  entry: Record<string, unknown>,
+  relationFields: FieldDefinition[],
+  dataMaps: RelationDataMaps,
+  unsetHasMany: "empty" | "null"
+): Record<string, unknown> {
+  const expandedEntry = { ...entry };
+  for (const field of relationFields) {
+    const dataMap = dataMaps[field.name];
+    if (!dataMap) continue;
+    const populated = populatedRelationValue(
+      entry,
+      field,
+      dataMap,
+      unsetHasMany
+    );
+    if (populated) expandedEntry[field.name] = populated.value;
+  }
+  return expandedEntry;
+}
+
+/**
+ * One relationship field's populated value for one entry, from the rows its
+ * batched fetch returned, or undefined to leave the stored value in place.
+ *
+ * Each value is resolved the same way the fetch resolved it, so a value that
+ * names its own collection is looked up under that collection, and a
+ * polymorphic one keeps saying which collection it came from.
+ */
+function populatedRelationValue(
+  entry: Record<string, unknown>,
+  field: FieldDefinition,
+  dataMap: RelationDataMap,
+  unsetHasMany: "empty" | "null"
+): { value: unknown } | undefined {
+  if (field.options?.relationType === "manyToMany") {
+    return { value: dataMap.get(entry.id as string) || [] };
+  }
+  const hasMany = isHasManyRelationship(field);
+  // An unset to-many value is given as the caller asked (`unsetHasMany`): left
+  // as stored for the nested calls, or, by default, read below as an empty
+  // list, exactly as a list read always gave it at the top level.
+  if (hasMany && unsetHasMany === "null" && !entry[field.name]) {
+    return undefined;
+  }
+  const fieldTarget = getTargetCollection(field);
+  if (!fieldTarget) return undefined;
+
+  if (hasMany) {
+    const refs = normalizeToRelationshipRefs(
+      entry[field.name],
+      fieldTarget,
+      declaredTargets(field)
+    );
+    const rows = refs.map(ref => {
+      const row = dataMap.get(relationKey(ref.collection, ref.id));
+      return row && !Array.isArray(row) ? withReferenceIdentity(row, ref) : row;
+    });
+    return { value: rows.filter(Boolean) };
+  }
+  const ref = readRelationshipRef(
+    entry[field.name],
+    fieldTarget,
+    declaredTargets(field)
+  );
+  if (!ref) return undefined;
+  const row = dataMap.get(relationKey(ref.collection, ref.id));
+  if (!row) return undefined;
+  return { value: Array.isArray(row) ? row : withReferenceIdentity(row, ref) };
+}
+
+/**
+ * An entry as a depth-0 read gives it: each relationship as its id(s), and the
+ * relationships inside its repeater and group rows too, since the save flow
+ * may store whole related objects inside that JSON. A container holding no
+ * relationship is left exactly as stored.
+ */
+function unexpandedEntry(
+  entry: Record<string, unknown>,
+  fields: FieldDefinition[]
+): Record<string, unknown> {
+  const normalized = { ...entry };
+  for (const field of fields) {
+    const value = normalized[field.name];
+    if (value === null || value === undefined) continue;
+    if (field.type === "repeater" || field.type === "group") {
+      const nestedFields = getNestedFields(field);
+      const holdsRelations = nestedFields.some(
+        f =>
+          isRelationshipField(f) || f.type === "repeater" || f.type === "group"
+      );
+      if (!holdsRelations) continue;
+      normalized[field.name] = stripContainerRows(value, field, nestedFields);
+    } else if (isRelationshipField(field)) {
+      normalized[field.name] = relationshipValueToIds(value, field);
+    }
+  }
+  return normalized;
+}
+
+/**
+ * A relationship value reduced to its id(s): each entry of a to-many list, or
+ * the one value of a to-one field.
+ */
+function relationshipValueToIds(
+  value: unknown,
+  field: FieldDefinition
+): unknown {
+  const hasMany = field.hasMany || field.options?.relationType === "manyToMany";
+  return hasMany && Array.isArray(value)
+    ? value.map(v => extractRelationshipId(v))
+    : extractRelationshipId(value);
+}
+
+/**
+ * A repeater's or group's stored value with the relationships in its rows
+ * reduced to ids, parsing a JSON string first. A value that is neither a list
+ * of rows nor a row is returned as stored.
+ */
+function stripContainerRows(
+  value: unknown,
+  field: FieldDefinition,
+  nestedFields: FieldDefinition[]
+): unknown {
+  const parsed = parseJsonIfString(value);
+  if (field.type === "repeater" && Array.isArray(parsed)) {
+    return parsed.map((row: Record<string, unknown>) =>
+      row && typeof row === "object"
+        ? stripRelationshipsToIds(row, nestedFields)
+        : row
+    );
+  }
+  if (
+    field.type === "group" &&
+    parsed &&
+    typeof parsed === "object" &&
+    !Array.isArray(parsed)
+  ) {
+    return stripRelationshipsToIds(
+      parsed as Record<string, unknown>,
+      nestedFields
+    );
+  }
+  return value;
+}
+
+/**
+ * Pairs every id in a list-valued relationship with the collection it belongs
+ * to. A multi-target field stores one `{ relationTo, value }` pair per entry,
+ * and each may name a different collection, so a single target resolved from
+ * the field would send most of them to the wrong table.
+ *
+ * Reads each id against its own item from {@link normalizeToIdArray}, which
+ * maps list values one-to-one, so the id and the collection always describe
+ * the same entry. Entries naming an undeclared collection are dropped, so the
+ * result may be shorter than the stored list; the fetch and the lookup derive
+ * it the same way, so they stay consistent.
+ */
+function normalizeToRelationshipRefs(
+  value: unknown,
+  fallbackCollection: string,
+  allowedTargets: string[]
+): RelationshipRef[] {
+  const items = readItemArray(value);
+  return normalizeToIdArray(value)
+    .map((id, index) => {
+      const item = items ? items[index] : undefined;
+      const ref = items ? readPolymorphicRef(item, allowedTargets) : null;
+      if (ref) return ref;
+      // Dropped rather than resolved against the field's own target: the value
+      // names a collection this field never declared, so there is no reference
+      // here to honour.
+      if (items && isPolymorphicRefShape(item)) return null;
+      return { collection: fallbackCollection, id, discriminated: false };
+    })
+    .filter((ref): ref is RelationshipRef => ref !== null);
+}
+
+/**
+ * Normalizes a relationship field value to an array of IDs.
+ * Handles various formats:
+ * - Single string ID
+ * - Array of string IDs
+ * - PostgreSQL array string format
+ * - Objects with id property
+ * - Polymorphic objects with value property
+ */
+function normalizeToIdArray(value: unknown): string[] {
+  if (value == null) return [];
+
+  // Already an array
+  if (Array.isArray(value)) {
+    return value.map(item => {
+      if (typeof item === "string") return item;
+      if (typeof item === "object" && item !== null) {
+        return String(
+          (item as Record<string, unknown>).value ||
+            (item as Record<string, unknown>).id ||
+            item
+        );
+      }
+      return String(item);
+    });
+  }
+
+  // PostgreSQL array string
+  const parsed = parsePostgresArray(value);
+  if (parsed !== null) {
+    return parsed;
+  }
+
+  // JSON array string (from serialized upload fields with hasMany)
+  if (typeof value === "string" && value.startsWith("[")) {
+    try {
+      const jsonParsed = JSON.parse(value);
+      if (Array.isArray(jsonParsed)) {
+        return jsonParsed.map(item => {
+          if (typeof item === "string") return item;
+          if (typeof item === "object" && item !== null) {
+            return String(
+              (item as Record<string, unknown>).value ||
+                (item as Record<string, unknown>).id ||
+                item
+            );
+          }
+          return String(item);
+        });
+      }
+    } catch {
+      // Not valid JSON, fall through to single string handling
+    }
+  }
+
+  // Single string ID
+  if (typeof value === "string") {
+    return [value];
+  }
+
+  // Object with id or value
+  if (typeof value === "object" && value !== null) {
+    const id =
+      (value as Record<string, unknown>).value ||
+      (value as Record<string, unknown>).id;
+    // eslint-disable-next-line @typescript-eslint/no-base-to-string
+    if (id) return [String(id)];
+  }
+
+  return [];
+}
+
+/**
+ * CollectionRelationshipService handles all relationship expansion and junction table operations
+ * for dynamic collections.
+ *
+ * Responsibilities:
+ * - Expand relationships for single entries and batch operations
+ * - Fetch related entries (oneToOne, manyToOne, oneToMany)
+ * - Manage many-to-many relationships via junction tables
+ * - Determine best label fields for display
+ *
+ * Uses the database adapter pattern for multi-database support (PostgreSQL, MySQL, SQLite).
+ * Currently uses Drizzle queries with dynamic schemas and SQL tagged templates for complex
+ * relationship queries that involve dynamic table names.
+ *
+ * @extends BaseService - Provides adapter access and Drizzle compatibility layer
+ *
+ * @example
+ * ```typescript
+ * const relationshipService = new CollectionRelationshipService(
+ *   adapter, logger, fileManager, collectionService
+ * );
+ * const expanded = await relationshipService.expandRelationships(entry, 'posts', fields);
+ * ```
+ */
+// The minimal raw-SQL surface the junction-table code needs from a database
+// handle. Both the pooled `this.db` and a transaction-scoped Drizzle instance
+// (from `tx.getDrizzle()`) satisfy it, so junction writes can run either on the
+// pool (default) or inside a caller's transaction (when an executor is passed),
+// keeping the junction write atomic with the entry write.
+// Each method is optional because a given dialect's Drizzle handle exposes only
+// a subset: SQLite's better-sqlite3 handle has `all`/`run` (no `execute`),
+// while the Postgres/MySQL handles have `execute` (no `all`/`run`). The
+// junction raw-SQL helpers below are dialect-gated, so the method they call is
+// always present for the current dialect.
+export type RelationshipDbExecutor = {
+  all?(query: unknown): unknown[];
+  run?(query: unknown): unknown;
+  execute?(query: unknown): Promise<unknown>;
+};
+
+// The columns a related-row read reaches for on a target's table.
+//
+// A dynamic collection's Drizzle table is built at runtime from stored field
+// metadata, so there is no compile-time type for it and the loader hands back
+// an untyped value. Naming the two columns that are actually read keeps those
+// accesses checked, and keeps the rest of the table opaque rather than
+// asserting a shape it may not have: `status` is optional because a collection
+// without Draft/Published has no such column, and `id` is `unknown` because it
+// is only ever handed to Drizzle as a column reference, never read as a value.
+type TargetTableColumns = {
+  id: unknown;
+  status?: unknown;
+};
+
+/**
+ * The key a related row's fetch selects the match of the target's read rule
+ * filter under, beside the row's own columns. A field name cannot begin with
+ * `$`, so it names no column.
+ */
+const RULE_MATCH = "$ruleMatch";
+
+/**
+ * Strip a related row to its identity (`id` and `label`), in place: the answer
+ * for a row whose schema cannot be resolved, which leaves no field to judge.
+ */
+function stripToIdentity(row: Record<string, unknown>): void {
+  for (const key of Object.keys(row)) {
+    if (key !== "id" && key !== "label") delete row[key];
+  }
+  // Defense in depth: the label is normally a display field (never a
+  // password — a password can't be configured as a label), but a row
+  // migrated from before that guard could carry a bcrypt hash here, so
+  // drop a hash-shaped label rather than surface it.
+  if (typeof row.label === "string" && row.label.startsWith("$2")) {
+    delete row.label;
+  }
+}
+
+export class CollectionRelationshipService extends BaseService {
+  /**
+   * Decides whether a caller may read a TARGET collection at all.
+   *
+   * Built on first use rather than injected: this service is constructed before
+   * the one that owns the access service, and resolving it lazily keeps that
+   * ordering intact. Stateless, so a second instance costs nothing but the
+   * construction.
+   */
+  private accessService: CollectionAccessService | null = null;
+
+  constructor(
+    adapter: DrizzleAdapter,
+    logger: Logger,
+    private readonly fileManager: CollectionFileManager,
+    private readonly collectionService: DynamicCollectionService,
+    /**
+     * What a due release makes visible in the TARGET collection.
+     *
+     * Not a trust question. `widensLifecycle` and `expansionStatusScope` decide
+     * whether this CALLER may see unpublished content, and a bounded caller
+     * deliberately inherits nothing. A due release is the other kind of fact:
+     * the target document IS published, for everyone, so it reaches a bounded
+     * caller too and that is correct rather than a leak.
+     */
+    private readonly releaseVisibility: ReleaseVisibility = NO_RELEASE_VISIBILITY
+  ) {
+    super(adapter, logger);
+  }
+
+  /**
+   * The documents a due release would publish in the target collection.
+   *
+   * Only asked when the read is bounded to published: an unbounded expansion
+   * already returns the row, so there is nothing to reveal and nothing to pay
+   * for.
+   */
+  private async targetDecisions(
+    targetCollection: string,
+    statusFilter: StatusFilter | null,
+    now: Date
+  ): Promise<ReleaseDecisions> {
+    // Only a PUBLIC read is widened by a due release. Read off the filter,
+    // which carries why its set was chosen, rather than asking the values
+    // again — a second answer to that question disagrees the moment a
+    // workflow's public and non-public sets are not complementary.
+    if (statusFilter === null || !statusFilter.isPublicRead) {
+      return NO_DECISIONS;
+    }
+    return this.releaseVisibility.decisions({
+      scopeKind: "collection",
+      scopeSlug: targetCollection,
+      now,
+    });
+  }
+
+  private resolveAccessService(): CollectionAccessService {
+    if (!this.accessService) {
+      this.accessService = new CollectionAccessService(
+        this.adapter,
+        this.logger,
+        // Optional, and nothing used here needs it: the code-defined read gate
+        // is independent of RBAC. Requiring it would make every target refuse
+        // in a boot that legitimately omits the service.
+        container.has("rbacAccessControlService")
+          ? container.get<RBACAccessControlService>("rbacAccessControlService")
+          : undefined
+      );
+    }
+    return this.accessService;
+  }
+
+  /**
+   * Drop the rows of a target collection this caller may not read.
+   *
+   * A related row belongs to another collection and carries that collection's
+   * own `access.read`. Without this, a caller refused the collection outright
+   * still obtains its rows by populating a relationship that points at them.
+   *
+   * The verdict is for the whole TARGET, not per row: the gate answers per
+   * caller and operation, so every row of one target is admitted or refused
+   * together. It is answered by the target's OWN `checkCollectionAccess`,
+   * rather than by a second reading of the same question.
+   *
+   * Opt-in for the same reason field-level enforcement is: an entry point that
+   * has not been given the caller yet would judge everyone anonymous and hide
+   * rows from entitled callers.
+   */
+  /**
+   * Read the rows a relationship points at, as this caller may see them.
+   *
+   * The only place a related row is fetched. Six call sites used to repeat the
+   * same five steps — resolve the schema, select by id, normalize timestamps,
+   * apply the target collection's read rules, redact its protected fields — and
+   * every capability a related row was missing had to be added to each of them
+   * and then audited for the one that was forgotten. That audit has been run
+   * three times: for the caller's scope, for the read locale, and for two
+   * caches. Behind one seam each of those becomes a single change.
+   *
+   * System entities keep the lean path deliberately: they have no collection
+   * record, so no config rule and no hooks apply, and their secrets are
+   * stripped by column name during redaction instead.
+   *
+   * Returns only the rows this caller may read. A refused row is simply absent —
+   * one unreadable reference must not refuse the whole parent read — so callers
+   * must not assume the result lines up with the ids they asked for.
+   */
+  /**
+   * The Draft/Published predicate a read of this target resolves to, or
+   * undefined when none applies.
+   *
+   * What propagates from the surrounding read is not a status VALUE but whether
+   * the published-only default was deliberately bypassed. A concrete
+   * `?status=draft` names the lifecycle of the collection being listed, not of
+   * everything it points at — a draft page should still show its published
+   * author — so only "read everything" travels, and it travels because it is a
+   * statement about the caller's trust rather than about the query.
+   *
+   * System entities have no lifecycle and no collection record to ask.
+   */
+  private async resolveTargetStatusFilter(
+    targetCollection: string,
+    schema: TargetTableColumns,
+    access: RelatedRowAccess
+  ): Promise<StatusFilter | null> {
+    if (isSystemEntity(targetCollection)) return null;
+    // Guarded on the column, not only on the collection's flag: a collection
+    // whose status was switched off keeps the flag until its schema is
+    // reapplied, and naming a column the table lacks fails the whole read.
+    if (!schema.status) return null;
+
+    let hasStatus: boolean;
+    try {
+      const policy = await this.resolveTargetReadPolicy(
+        targetCollection,
+        this.resolveAccessService(),
+        access
+      );
+      hasStatus = policy.hasStatus;
+    } catch {
+      // The lifecycle could not be established, so the safe reading is that the
+      // collection has one and the caller gets the published-only default.
+      hasStatus = true;
+    }
+
+    const statusFilter = resolveStatusFilter({
+      collectionHasStatus: hasStatus,
+      // The LIFECYCLE question, not the trust question — see widensLifecycle.
+      overrideAccess: widensLifecycle(access),
+      explicit: access.status,
+      // A visitor's expansion sees published rows only, as its own read does.
+      publishedOnly: readsAsVisitor(access),
+    });
+    return statusFilter;
+  }
+
+  private async readTargetRows(
+    targetCollection: string,
+    ids: string[],
+    access: RelatedRowAccess
+  ): Promise<Record<string, unknown>[]> {
+    if (ids.length === 0) return [];
+
+    // Authorization is a PRECONDITION, so it runs before the work it protects.
+    // The verdict is collection-level — whether this caller may read the
+    // target at all — and depends on nothing the queries below would load, so
+    // a refused caller costs no metadata read, no lifecycle resolution and no
+    // row select. The referenced ids are recorded as withheld: a caller
+    // refused the whole target is not owed the difference between a row that
+    // exists and one that does not, and a completeness check reads the
+    // absence as deliberate either way.
+    const read = await this.callerMayReadTarget(targetCollection, access);
+    if (!read.allowed && read.filter === undefined) {
+      this.recordWithheldIds(targetCollection, ids, access);
+      return [];
+    }
+
+    const schema = isSystemEntity(targetCollection)
+      ? getSystemEntityTable(targetCollection)
+      : await this.fileManager.loadDynamicSchema(targetCollection);
+    if (!schema) return [];
+
+    // Draft/Published applies to a related row exactly as it applies to a direct
+    // read of it. Without this, a caller who is 404'd asking for an unpublished
+    // row is handed the whole thing — status column included — by populating a
+    // relationship that points at it.
+    const statusFilter = await this.resolveTargetStatusFilter(
+      targetCollection,
+      schema,
+      access
+    );
+
+    // A read rule that answered a filter shows the caller the rows it
+    // matches. Whether each row matches is selected as a column of this same
+    // fetch rather than added to its WHERE, so a row the filter does not
+    // match is still fetched and recorded below as withheld on purpose, and
+    // an id no row has stays unrecorded, as a dangling reference.
+    const filter = read.filter;
+    const match =
+      filter === undefined
+        ? undefined
+        : await this.memoizedRuleMatch(
+            access,
+            targetCollection,
+            statusFilter,
+            () =>
+              this.ruleMatch(
+                targetCollection,
+                filter,
+                schema,
+                statusFilter,
+                access
+              )
+          );
+    const { entries, translations } = await this.selectTargetRows(
+      targetCollection,
+      schema,
+      ids,
+      match,
+      access
+    );
+
+    const matching = new Set<Record<string, unknown>>();
+    const fetched = entries.map(entry => {
+      // The match is taken off before the row goes further, so it is never
+      // redacted, labelled or returned as one of the row's fields.
+      const { [RULE_MATCH]: matches, ...columns } = entry;
+      const row = convertTimestampsToCamelCase(columns);
+      if (match === undefined || matches === 1) matching.add(row);
+      return row;
+    });
+    // Filtered here rather than in the query above so the rows this removes are
+    // recorded as deliberately withheld. Narrowing the fetch would drop them
+    // before anything could distinguish "exists, wrong lifecycle" from "does
+    // not exist" — and a caller checking its expansion for completeness reads
+    // an unexplained absence as evidence lost and refuses the whole parent.
+    // A row that was never there stays unrecorded, because a dangling
+    // reference is a data problem and must not be dressed up as a refusal.
+    // A due release publishes the target, so a row it names is admitted even
+    // though its stored status still says otherwise. Reading the author
+    // directly already honours this; an expansion that did not would make the
+    // same document published when asked for by name and missing when arrived
+    // at by reference.
+    // A due release also WITHDRAWS. Applying only the reveal half left a
+    // scheduled takedown visible through every relationship that pointed at it,
+    // while a direct read of the same document honoured it.
+    const decisions = await this.targetDecisions(
+      targetCollection,
+      statusFilter,
+      new Date()
+    );
+    const revealed = new Set(decisions.reveal);
+    const hidden = new Set(decisions.hide);
+    const lifecycleRows = statusFilter
+      ? fetched.filter(row => {
+          const id = typeof row.id === "string" ? row.id : null;
+          // Withdrawn wins over the stored status: the row still says
+          // published, which is exactly what the release is undoing.
+          if (id !== null && hidden.has(id)) return false;
+          // Membership, because a read bounded to "not yet public" covers every
+          // state the workflow does not publish.
+          return (
+            statusFilter.values.includes(row.status as string) ||
+            (id !== null && revealed.has(id))
+          );
+        })
+      : fetched;
+    // Published in the read's language too, as a direct read of the target in
+    // that language finds it: a target withheld there is withheld here, and
+    // recorded as withheld rather than filled from a fallback language.
+    const inLanguage = statusFilter
+      ? await this.idsPublishedInReadLanguage(
+          targetCollection,
+          schema,
+          lifecycleRows,
+          statusFilter,
+          access,
+          decisions.reveal,
+          translations
+        )
+      : null;
+    const rows = lifecycleRows.filter(
+      row =>
+        matching.has(row) && (inLanguage === null || inLanguage.has(row.id))
+    );
+    this.recordWithheld(targetCollection, fetched, rows, access);
+
+    // A target whose translatable values live in its companion is read with them, in the language
+    // chain of the read that reached it, as a direct read of the target is. Before the redaction,
+    // so a translated value is judged by its field's read rule like any other.
+    await this.fillTargetTranslations(
+      targetCollection,
+      rows,
+      statusFilter,
+      access,
+      translations,
+      revealed
+    );
+    // Redaction runs before any caller derives a label from a row: a label
+    // copies a field's value under another key, so one taken from an unredacted
+    // row survives the redaction of its own source field.
+    await this.redactRelatedRows(targetCollection, rows, access);
+    return rows;
+  }
+
+  /**
+   * Of `rows`, the ids published in the language the read asked for, by the
+   * rule a direct read of the target applies (`publishedInLanguageCondition`),
+   * a due release's reveals included. Null where that rule keeps nothing out:
+   * a read with no language, a system entity, a target that publishes no
+   * language on its own, or one whose translations table is not there yet.
+   *
+   * Judged on `translations`, the rows' translations read in the statement
+   * that read the rows, where there are some: one state of the translations
+   * table answers both which rows there are and where each is published.
+   * Asked of the table otherwise.
+   */
+  private async idsPublishedInReadLanguage(
+    targetCollection: string,
+    schema: Table & { id: Column },
+    rows: Record<string, unknown>[],
+    statusFilter: StatusFilter,
+    access: RelatedRowAccess,
+    revealed: readonly string[],
+    translations: TargetTranslations | null
+  ): Promise<ReadonlySet<unknown> | null> {
+    const localeChain = targetLocaleChain(access);
+    if (!localeChain || rows.length === 0 || isSystemEntity(targetCollection)) {
+      return null;
+    }
+    const companion = await this.resolveTargetCompanion(
+      targetCollection,
+      access
+    );
+    if (
+      !companion ||
+      (await resolveCompanionSchemaReadiness(this.adapter, companion)) !==
+        "ready"
+    ) {
+      return null;
+    }
+    if (translations) {
+      return idsPublishedInLanguageOf({
+        companion,
+        statusFilter,
+        revealed,
+        localeChain: translations.localeChain,
+        ids: rows.map(row => row.id),
+        companionRows: translations.rows,
+      });
+    }
+    const condition = publishedInLanguageCondition({
+      companion,
+      statusFilter,
+      revealed,
+      localeChain,
+      mainIdColumn: schema.id,
+    });
+    if (!condition) return null;
+    const found = (await this.db
+      .select({ id: schema.id })
+      .from(schema)
+      .where(
+        and(
+          inArray(
+            schema.id,
+            rows.map(row => row.id)
+          ),
+          condition
+        )
+      )) as { id: unknown }[];
+    return new Set(found.map(row => row.id));
+  }
+
+  /**
+   * The target's rows for `ids`, with each row's rule match when the read rule answered a filter,
+   * and their translations in the same statement when the target keeps its translatable values in
+   * a companion that is there to join to: one round trip where reading them after the rows took
+   * two. A target with no companion, a system entity, or a read with no language reads its rows
+   * alone, and its translations, if any, are filled after. `schema` is the target's table itself,
+   * a collection's runtime table or a system entity's, since its columns are selected from it.
+   */
+  private async selectTargetRows(
+    targetCollection: string,
+    schema: Table & { id: Column },
+    ids: unknown[],
+    match: SQL<number> | undefined,
+    access: RelatedRowAccess
+  ): Promise<{
+    entries: Record<string, unknown>[];
+    translations: TargetTranslations | null;
+  }> {
+    const projection =
+      match === undefined
+        ? undefined
+        : { ...getColumns(schema), [RULE_MATCH]: match };
+    const where = inArray(schema.id, ids);
+    const localeChain = targetLocaleChain(access);
+    const companion =
+      localeChain && !isSystemEntity(targetCollection)
+        ? await this.resolveTargetCompanion(targetCollection, access)
+        : null;
+    if (
+      localeChain &&
+      companion &&
+      (await resolveCompanionSchemaReadiness(this.adapter, companion)) ===
+        "ready"
+    ) {
+      const joined = await selectRowsWithCompanion({
+        db: this.db,
+        mainTable: schema,
+        projection,
+        where,
+        companionTable: companion.table,
+        localeChain: [...localeChain],
+      });
+      return {
+        entries: joined.rows,
+        translations: { rows: joined.companionRows, localeChain },
+      };
+    }
+    const entries = (await (
+      projection === undefined
+        ? this.db.select().from(schema)
+        : this.db.select(projection).from(schema)
+    ).where(where)) as Record<string, unknown>[];
+    return { entries, translations: null };
+  }
+
+  /**
+   * Fill `rows` of `targetCollection` with their translatable values from its companion, in the
+   * language chain the surrounding read resolved. Nothing to do for a target with no companion,
+   * a system entity, or a read with no language.
+   */
+  private async fillTargetTranslations(
+    targetCollection: string,
+    rows: Record<string, unknown>[],
+    statusFilter: StatusFilter | null,
+    access: RelatedRowAccess,
+    // The translations the rows were read with, when they came in the same statement.
+    translations: TargetTranslations | null = null,
+    // The rows a due release reveals: their languages' rows are read whatever
+    // their status, as the release will publish them (`PopulateCompanionArgs.revealed`).
+    revealed?: ReadonlySet<unknown>
+  ): Promise<void> {
+    const localeChain = targetLocaleChain(access);
+    if (!localeChain || rows.length === 0 || isSystemEntity(targetCollection)) {
+      return;
+    }
+    const companion = await this.resolveTargetCompanion(
+      targetCollection,
+      access
+    );
+    if (!companion) return;
+    if (translations) {
+      fillCompanionFields({
+        rows,
+        companionRows: translations.rows,
+        localizedFields: companion.localizedFields,
+        localeChain: [...translations.localeChain],
+        statusValues:
+          companion.hasStatus && statusFilter ? statusFilter.values : undefined,
+        revealed,
+      });
+      return;
+    }
+    await populateCompanionFields({
+      db: this.db as never,
+      companionTable: companion.table,
+      readiness: await resolveCompanionSchemaReadiness(this.adapter, companion),
+      localizedFields: companion.localizedFields,
+      rows,
+      // A copy: the read's chain is shared and read-only, and the fill takes a list of its own.
+      localeChain: [...localeChain],
+      statusValues:
+        companion.hasStatus && statusFilter ? statusFilter.values : undefined,
+      revealed,
+    });
+  }
+
+  /**
+   * Whether each row of the target matches its read rule's `filter`, as a
+   * column to select: `1` for a row it matches, `0` for one it does not.
+   * Built in the language the read resolved to and under its Draft/Published
+   * filter, as a direct read of the target builds it. `undefined` for a
+   * filter that constrains nothing, which every row matches. A filter that
+   * cannot be built matches no row.
+   */
+  private async ruleMatch(
+    targetCollection: string,
+    filter: RuleFilter,
+    schema: DynamicSchema,
+    statusFilter: StatusFilter | null,
+    access: RelatedRowAccess
+  ): Promise<SQL<number> | undefined> {
+    // Every language the surrounding read falls back through, as a direct
+    // read of the target is judged in; else the one it resolved to.
+    const localeChain = targetLocaleChain(access);
+    const companion = localeChain
+      ? await this.resolveTargetCompanion(targetCollection, access)
+      : null;
+    const condition = await ruleFilterCondition(
+      {
+        collectionName: targetCollection,
+        filter,
+        schema,
+        localizedCtx: localizedFilterContext(
+          companion,
+          localeChain,
+          schema,
+          statusFilter?.values
+        ),
+      },
+      // A rule's filter may not name a field inside a component, which the
+      // builder refuses before it looks for a component table, so it is not
+      // told where they are.
+      {
+        getCollection: name => this.collectionService.getCollection(name),
+        adapter: this.adapter,
+      },
+      this.logger
+    );
+    return condition === undefined ? undefined : matchColumn(condition);
+  }
+
+  /**
+   * Which rows of the target collection this caller may read: all, none, or
+   * those its read rule's filter matches — decided before its rows are
+   * queried, and once per expansion for a dynamic target.
+   */
+  private async callerMayReadTarget(
+    targetCollection: string,
+    access: RelatedRowAccess
+  ): Promise<FilteredRead> {
+    // Deliberately NOT keyed on `enforceFieldAccess`. That flag asks whether a
+    // related row's FIELDS should be redacted; this asks whether the caller may
+    // see the row at all, and the two have different callers. A Single's
+    // authorization view populates without field redaction so its rule reads
+    // real values — but if the response is going to withhold the row, the
+    // preliminary view has to withhold it too, or the rule approves a document
+    // on evidence the response then removes and side effects run in between.
+    if (!access.enforceCollectionAccess && !access.enforceFieldAccess) {
+      return readOf(true);
+    }
+    if (trustsTarget(access, targetCollection)) return readOf(true);
+    if (isSystemEntity(targetCollection)) {
+      // A system entity carries no stored collection rules, so the dynamic
+      // path below has nothing to evaluate. A direct read of `users` requires
+      // the `read-users` grant, and with no stored policy to fall back on, that
+      // grant IS the whole rule; its secrets are stripped by name during
+      // redaction for whoever may read it.
+      //
+      // A caller that holds a bypass and REFUSED this target asked to be read
+      // as the caller would: the grant decides, and a route serving the public
+      // holds none, so its refused rows stay withheld.
+      //
+      // Kept with the expansion's other verdicts, by target: the caller and
+      // its bypass do not change within one expansion, and a schema with
+      // several relationships to `users` asked the same question once per
+      // field otherwise, each a permission lookup.
+      return this.memoizedVerdict(access, targetCollection, async () => {
+        if (boundRefuses(access, targetCollection)) {
+          return readOf(
+            await canReadSystemResource(
+              targetCollection.toLowerCase(),
+              callerId(access),
+              access.authenticatedScope
+            )
+          );
+        }
+        // A read holding no bypass is asked what its direct read asks.
+        // Answered "yes" for everyone before, which let a key or a person
+        // refused `users` by name read a post's author through the
+        // relationship.
+        return readOf(
+          await identifiedCallerMayRead(access, targetCollection.toLowerCase())
+        );
+      });
+    }
+
+    // The redaction basis when the read names one, as a preview does, so a
+    // link never shows a row its sharer could not read.
+    const user = judgedFor(access) as UserContext | undefined;
+
+    // One verdict for the whole target: every row of it is admitted or
+    // withheld together, and the rule is asked once — per EXPANSION, not per
+    // fetch. A `hasMany` field fetches its references concurrently and each
+    // fetch arrives here on its own, so the pending verdict is cached across
+    // them; without that a five-hundred-reference field asked the rule five
+    // hundred times at once.
+    return this.targetVerdict(user, targetCollection, access);
+  }
+
+  /** Record every referenced id as withheld, for a target refused outright. */
+  private recordWithheldIds(
+    targetCollection: string,
+    ids: readonly string[],
+    access: RelatedRowAccess
+  ): void {
+    if (!access.withheldByAccess) return;
+    for (const id of ids) {
+      access.withheldByAccess.add(relationKey(targetCollection, id));
+    }
+  }
+
+  /**
+   * Note which rows a refusal removed, so a caller checking its expansion for
+   * completeness reads them as absent on purpose rather than as evidence lost.
+   *
+   * Keyed by collection AND id, because an id is only unique within its own
+   * collection: two targets can carry the same one, and a bare-id record would
+   * let a refusal in the first excuse a genuine load failure in the second.
+   */
+  private recordWithheld(
+    targetCollection: string,
+    before: Record<string, unknown>[],
+    after: Record<string, unknown>[],
+    access: RelatedRowAccess
+  ): void {
+    if (!access.withheldByAccess || before.length === after.length) return;
+    const kept = new Set(after);
+    for (const row of before) {
+      if (kept.has(row)) continue;
+      if (typeof row.id === "string") {
+        access.withheldByAccess.add(relationKey(targetCollection, row.id));
+      }
+    }
+  }
+
+  /**
+   * The target collection's read policy, resolved once per expansion.
+   *
+   * Reading it costs a collection-metadata query, and a `hasMany` relationship
+   * fetches one row at a time — so resolving per row turns a relationship with
+   * hundreds of values into hundreds of metadata reads against the same pool
+   * the row fetches need.
+   */
+  private resolveTargetReadPolicy(
+    targetCollection: string,
+    accessService: CollectionAccessService,
+    access: RelatedRowAccess
+  ): Promise<TargetReadPolicy> {
+    const cached = access.targetPolicies?.get(targetCollection);
+    if (cached) return cached;
+
+    // The PENDING lookup is cached, not its result. A `hasMany` relationship
+    // fetches its references concurrently, so every one of them reaches this
+    // point before the first has anything to store — caching only the resolved
+    // value leaves each of them issuing its own metadata read, which is the
+    // pool pressure the cache exists to avoid.
+    const pending = (async (): Promise<TargetReadPolicy> => {
+      const collection =
+        await this.collectionService.getCollection(targetCollection);
+      return {
+        hasStatus: (collection as { status?: boolean }).status === true,
+      };
+    })();
+    access.targetPolicies?.set(targetCollection, pending);
+    return pending;
+  }
+
+  /**
+   * The target collection's companion schema, looked up once per expansion.
+   *
+   * The PENDING lookup is cached rather than its result: references are
+   * confirmed concurrently, so every one of them reaches this point before the
+   * first has anything to store, and caching only the settled value leaves each
+   * issuing its own metadata read.
+   */
+  private resolveTargetCompanion(
+    targetCollection: string,
+    access: RelatedRowAccess
+  ): Promise<CompanionSchema | null> {
+    const cached = access.targetCompanions?.get(targetCollection);
+    if (cached) return cached;
+    const pending = this.fileManager.loadCompanionSchema(targetCollection);
+    access.targetCompanions?.set(targetCollection, pending);
+    return pending;
+  }
+
+  /** The cached verdict for this target, or a fresh one when none is pending. */
+  private targetVerdict(
+    user: UserContext | undefined,
+    targetCollection: string,
+    access: RelatedRowAccess
+  ): Promise<FilteredRead> {
+    return this.memoizedVerdict(access, targetCollection, () =>
+      relatedRowReads(
+        targetCollection,
+        {
+          user: user && {
+            id: String(user.id),
+            role: user.role,
+            roles: user.roles,
+          },
+          scope: access.authenticatedScope,
+          principal: currentPrincipal(),
+          // Without the access-control service, the Public role as this
+          // service's own database records it, as its direct gate reads it.
+          visitorWithoutService: () =>
+            this.resolveAccessService().ownDatabaseVisitor(),
+        },
+        container.has("rbacAccessControlService")
+          ? container.get<RBACAccessControlService>("rbacAccessControlService")
+          : undefined
+      )
+    );
+  }
+
+  /**
+   * The verdict this expansion already holds for the target, or `decide`'s,
+   * kept for the rest of the expansion. Pending verdicts are kept too, so
+   * fields fetched concurrently share one question rather than each asking.
+   * A verdict that fails is not kept, so the next ask decides again rather
+   * than repeating the failure for the rest of the expansion.
+   */
+  private memoizedVerdict(
+    access: RelatedRowAccess,
+    targetCollection: string,
+    decide: () => Promise<FilteredRead>
+  ): Promise<FilteredRead> {
+    const verdicts = access.targetVerdicts;
+    const cached = verdicts?.get(targetCollection);
+    if (cached) return cached;
+    const pending = decide();
+    if (verdicts) {
+      verdicts.set(targetCollection, pending);
+      pending.catch(() => {
+        if (verdicts.get(targetCollection) === pending) {
+          verdicts.delete(targetCollection);
+        }
+      });
+    }
+    return pending;
+  }
+
+  /**
+   * The match column this expansion already built for the target, or
+   * `build`'s, kept for the rest of the expansion. The target's filter is its
+   * kept verdict's, fixed for the expansion, so the column depends only on the
+   * target, the status filter and the language it is built under.
+   */
+  private memoizedRuleMatch(
+    access: RelatedRowAccess,
+    targetCollection: string,
+    statusFilter: StatusFilter | null,
+    build: () => Promise<SQL<number> | undefined>
+  ): Promise<SQL<number> | undefined> {
+    const key = JSON.stringify([
+      targetCollection,
+      statusFilter?.values ?? null,
+      access.localeChain ?? access.locale ?? null,
+    ]);
+    const cached = access.targetRuleMatches?.get(key);
+    if (cached) return cached;
+    const pending = build();
+    access.targetRuleMatches?.set(key, pending);
+    return pending;
+  }
+
+  /**
+   * Run a SELECT-style raw SQL tag and return its rows in a normalized
+   * `{ rows: [...] }` shape regardless of dialect.
+   *
+   * Drizzle's raw-execute result shape differs across drivers:
+   *   - Postgres (node-postgres): `db.execute(sqlTag)` → `{ rows: [...] }`
+   *   - MySQL (mysql2): `db.execute(sqlTag)` → a `[rows, fieldPackets]` tuple
+   *     (or a flat rows array), NOT `{ rows }`
+   *   - SQLite (better-sqlite3): `db.all(sqlTag)` → `unknown[]` (no execute())
+   *
+   * Without this helper, the junction-table code paths blow up at runtime on
+   * SQLite (`this.db.execute is not a function`) and on MySQL (reading
+   * `.rows` off the tuple yields undefined). The MySQL normalization mirrors
+   * the defensive handling in schema/pipeline/classifier/count-helpers.ts.
+   */
+  private async selectRawSql(
+    query: unknown,
+    // Run on the caller's transaction handle when provided, else the pool.
+    db: RelationshipDbExecutor = this.db
+  ): Promise<{ rows: unknown[] }> {
+    if (this.dialect === "sqlite") {
+      // SQLite's handle exposes all(); the dialect gate guarantees it here.
+      const rows = db.all!(query);
+      return { rows };
+    }
+    // Postgres/MySQL handles expose execute().
+    const result: unknown = await db.execute!(query);
+    if (this.dialect === "mysql" && Array.isArray(result)) {
+      // Tuple form `[rows, fieldPackets]` -> take rows; a flat rows array (first
+      // element is a row object, not an array) is already the rows.
+      const first = result[0];
+      return { rows: Array.isArray(first) ? (first as unknown[]) : result };
+    }
+    return result as { rows: unknown[] };
+  }
+
+  /**
+   * Run an INSERT / UPDATE / DELETE / DDL raw SQL tag, dialect-aware.
+   * Same rationale as `selectRawSql`. Returns void since callers don't
+   * inspect the mutation result here. Accepts an optional handle for the same
+   * reason as `selectRawSql` (defaults to the pool).
+   */
+  private async mutateRawSql(
+    query: unknown,
+    db: RelationshipDbExecutor = this.db
+  ): Promise<void> {
+    if (this.dialect === "sqlite") {
+      // SQLite's handle exposes run(); the dialect gate guarantees it here.
+      db.run!(query);
+      return;
+    }
+    // Postgres/MySQL handles expose execute().
+    await db.execute!(query);
+  }
+
+  /**
+   * Determine the best label field for a collection.
+   * Tries to find a meaningful text field, not just ID.
+   *
+   * @param collectionName - Name of the collection or system entity
+   * @param targetLabelField - Optional explicitly specified label field
+   * @returns The best field name to use as a label
+   */
+  async getBestLabelField(
+    collectionName: string,
+    targetLabelField?: string
+  ): Promise<string> {
+    try {
+      // Check if this is a system entity first. Never surface a secret column
+      // as a label (see resolveSystemEntityLabelField).
+      if (isSystemEntity(collectionName)) {
+        return resolveSystemEntityLabelField(collectionName, targetLabelField);
+      }
+
+      const collection =
+        await this.collectionService.getCollection(collectionName);
+      const fields = ((
+        (collection as Record<string, unknown>).schemaDefinition as
+          | Record<string, unknown>
+          | undefined
+      )?.fields ||
+        (collection as Record<string, unknown>).fields ||
+        []) as FieldDefinition[];
+
+      // If targetLabelField is provided, validate it exists in the collection.
+      // A `password` field is excluded: it must never become the label, or its
+      // hash would ride along in `label` past the row-level redaction.
+      if (targetLabelField) {
+        const fieldExists = fields.some(
+          f =>
+            f.name === targetLabelField &&
+            f.type !== "relationship" &&
+            f.type !== "password"
+        );
+
+        if (fieldExists) {
+          this.logger.info(
+            `[LabelField] Using specified targetLabelField "${targetLabelField}" for collection "${collectionName}"`
+          );
+          return targetLabelField;
+        } else {
+          this.logger.warn(
+            `[LabelField] Specified targetLabelField "${targetLabelField}" not found in collection "${collectionName}", falling back to auto-detection`
+          );
+        }
+      }
+
+      // Priority order for label fields
+      const labelPriority = [
+        "name",
+        "title",
+        "label",
+        "email",
+        "slug",
+        "username",
+      ];
+
+      // First try priority fields. A `password` field named like a priority
+      // label (e.g. "email") must never be chosen — its hash would be copied
+      // into `label` and survive the row-level password redaction.
+      for (const labelField of labelPriority) {
+        if (
+          fields.some(
+            f =>
+              f.name === labelField &&
+              f.type !== "relationship" &&
+              f.type !== "password"
+          )
+        ) {
+          this.logger.info(
+            `[LabelField] Using priority field "${labelField}" for collection "${collectionName}"`
+          );
+          return labelField;
+        }
+      }
+
+      // Fallback: find first text-like field (not ID, not relationship,
+      // never a password).
+      const textField = fields.find(
+        f =>
+          f.name !== "id" &&
+          f.type !== "relationship" &&
+          f.type !== "password" &&
+          (f.type === "text" || f.type === "email")
+      );
+
+      if (textField) {
+        this.logger.info(
+          `[LabelField] Using first text field "${textField.name}" for collection "${collectionName}"`
+        );
+        return textField.name;
+      }
+
+      // Last resort: use id
+      this.logger.warn(
+        `[LabelField] No suitable label field found for "${collectionName}", falling back to ID`
+      );
+      return "id";
+    } catch (error) {
+      this.logger.error(
+        `[LabelField] Error getting label field for "${collectionName}"`,
+        { error: error }
+      );
+      return "id";
+    }
+  }
+
+  /**
+   * Batch expand relationships for multiple entries (optimized for N+1 prevention).
+   * Groups queries by relationship type to minimize database round trips.
+   *
+   * Supports depth parameter:
+   * - depth=0: No expansion, return entries as-is
+   * - depth=1: Expand immediate relationships
+   * - depth=2+: Expand nested relationships recursively, exactly as
+   *   {@link expandRelationships} expands one entry: a related row reached
+   *   with depth remaining has its own relationships and uploads expanded to
+   *   that depth.
+   *
+   * Stays batched at every depth. The related rows one hop fetched are grouped
+   * by the collection they belong to and each group is expanded by ONE
+   * recursive call, and the rows of every repeater or group across the page are
+   * expanded together, so a page costs a fixed number of reads per depth level
+   * per target collection, never one per row.
+   *
+   * @param entries - Array of entries to expand
+   * @param collectionName - Name of the collection
+   * @param fields - Field definitions for the collection
+   * @param options - Expansion options including depth control
+   * @returns Entries with expanded relationship data
+   */
+  async batchExpandRelationships(
+    entries: Record<string, unknown>[],
+    collectionName: string,
+    declaredFields: FieldDefinition[],
+    options: RelationshipExpansionOptions = {}
+  ): Promise<Record<string, unknown>[]> {
+    // The references the row holds, those inside a group with no name among them (`rowReferenceFields`).
+    const fields = rowReferenceFields(declaredFields);
+    const {
+      depth = DEFAULT_RELATIONSHIP_DEPTH,
+      currentDepth = 0,
+      unsetHasMany = "empty",
+    } = options;
+    // The caller travels with every fetch below so each related row is judged
+    // by its own collection's field rules.
+    const access = relatedRowAccessOf(options);
+
+    // Clamp depth to valid range
+    const effectiveDepth = effectiveRelationshipDepth(depth);
+
+    // If depth is 0, don't expand relationships but still normalize
+    // repeater/group fields to strip any embedded relationship objects to IDs.
+    // This is needed because the save flow may store full relationship objects
+    // inside repeater/group JSON data.
+    if (effectiveDepth === 0) {
+      return entries.map(entry => unexpandedEntry(entry, fields));
+    }
+
+    if (entries.length === 0) return [];
+
+    // A level the requested depth does not reach gives its relationships as
+    // ids, as the single-entry path does at the same level.
+    if (currentDepth >= effectiveDepth) {
+      return entries.map(entry => stripRelationshipsToIds(entry, fields));
+    }
+
+    // Nothing here can hold a relationship or an upload: the entries are
+    // returned as they are.
+    if (!fields.some(mayHoldExpandable)) return entries;
+
+    const relationFields = fields.filter(f => isRelationshipField(f));
+    const { dataMaps, fetchedRows } = await this.batchFetchRelationData(
+      entries,
+      collectionName,
+      relationFields,
+      currentDepth,
+      access
+    );
+
+    // A related row reached with depth to spare is expanded to the depth
+    // remaining, its own relationships and uploads included, as the
+    // single-entry path expands it. The rows are replaced in the lookup maps
+    // before they are assigned below, so every entry referencing a row gets the
+    // expanded one.
+    if (currentDepth + 1 < effectiveDepth && fetchedRows.length > 0) {
+      const expandedRows = await this.expandFetchedRows(fetchedRows, {
+        depth: effectiveDepth,
+        currentDepth: currentDepth + 1,
+        // A related row's unset to-many value stays as stored, as it always
+        // reached a list and as the read by id gives it.
+        unsetHasMany: "null",
+        ...access,
+      });
+      replaceFetchedRows(dataMaps, expandedRows);
+    }
+
+    // Every upload the page holds, nested ones included, read in one batch.
+    const uploadDataMap =
+      (await this.mediaLookupFor(entries, fields, access)) ?? new Map();
+
+    const expandedEntries = entries.map(entry =>
+      withRelationData(entry, relationFields, dataMaps, unsetHasMany)
+    );
+
+    // Relationships and uploads nested inside repeater/group fields, expanded
+    // at THIS level, as the single-entry path expands a container's rows at
+    // the level of the entry holding them.
+    await this.batchExpandContainerRows(
+      expandedEntries,
+      collectionName,
+      fields,
+      // A container row's unset to-many value stays as stored, as it did when
+      // each row went through the single-entry expansion.
+      { depth: effectiveDepth, currentDepth, unsetHasMany: "null", ...access }
+    );
+
+    // Expand upload fields (media references) - including nested fields in
+    // arrays/groups. Use recursive function to expand media at any nesting
+    // depth.
+    return expandedEntries.map(entry =>
+      expandMediaInData(entry, fields, uploadDataMap)
+    );
+  }
+
+  /**
+   * Fetch, for a page of entries, the rows every relationship field names: one
+   * batched read per field and target collection, never one per entry.
+   *
+   * A field whose `maxDepth` the level being expanded has reached is skipped,
+   * judged as the single-entry path judges it, so it keeps its stored id(s).
+   *
+   * @returns The lookup map of each fetched field, by field name, and every row
+   *   fetched with the collection it was read from, so the rows can be expanded
+   *   further while depth remains.
+   */
+  private async batchFetchRelationData(
+    entries: Record<string, unknown>[],
+    collectionName: string,
+    relationFields: FieldDefinition[],
+    currentDepth: number,
+    access: RelatedRowAccess
+  ): Promise<{ dataMaps: RelationDataMaps; fetchedRows: FetchedRow[] }> {
+    const dataMaps: RelationDataMaps = {};
+    const fetchedRows: FetchedRow[] = [];
+    for (const field of relationFields) {
+      const targetCollection = getTargetCollection(field);
+      if (!targetCollection) continue;
+      if (currentDepth >= fieldMaxDepthOf(field)) continue;
+      dataMaps[field.name] = await this.batchFetchFieldRows(
+        entries,
+        collectionName,
+        field,
+        targetCollection,
+        access,
+        fetchedRows
+      );
+    }
+    return { dataMaps, fetchedRows };
+  }
+
+  /**
+   * One relationship field's rows across a page of entries, recording each row
+   * fetched in `fetchedRows`.
+   *
+   * A many-to-many field is read through its junction, keyed by the source
+   * entry's id; every other field is read from the references its values hold,
+   * each against the collection it names.
+   */
+  private async batchFetchFieldRows(
+    entries: Record<string, unknown>[],
+    collectionName: string,
+    field: FieldDefinition,
+    targetCollection: string,
+    access: RelatedRowAccess,
+    fetchedRows: FetchedRow[]
+  ): Promise<RelationDataMap> {
+    if (field.options?.relationType === "manyToMany") {
+      const dataMap = await this.batchFetchManyToManyRelations(
+        collectionName,
+        entries.map(e => e.id) as string[],
+        field,
+        access
+      );
+      for (const rows of dataMap.values()) {
+        for (const row of rows) {
+          fetchedRows.push({ collection: targetCollection, row });
+        }
+      }
+      return dataMap;
+    }
+    const refs = referencesAcross(entries, field, targetCollection);
+    const dataMap = await this.batchFetchRefs(refs, field, access);
+    collectFetchedRows(refs, dataMap, fetchedRows);
+    return dataMap;
+  }
+
+  /**
+   * The media items the upload fields of `entries` point at, nested ones
+   * included, read in one batch and narrowed to what the caller may see, by
+   * id. Null when the entries point at no media, so no read is made.
+   *
+   * Not wrapped in a catch that answers with nothing: doing so put the raw ids
+   * on the wire, which reads to a caller exactly like media that is absent, and
+   * is what kept a broken media fetch invisible until images appeared to
+   * vanish. Both expansions in this service read media here, so they fail the
+   * same way.
+   */
+  private async mediaLookupFor(
+    entries: Record<string, unknown>[],
+    fields: FieldDefinition[],
+    access: RelatedRowAccess
+  ): Promise<Map<string, Record<string, unknown>> | null> {
+    const mediaIds = entries.flatMap(entry =>
+      collectAllMediaIds(entry, fields)
+    );
+    if (mediaIds.length === 0) return null;
+    const mediaRecords = await applyMediaTrustBound(
+      await this.fetchMediaByIds([...new Set(mediaIds)]),
+      access
+    );
+    return new Map(mediaRecords.map(media => [String(media.id), media]));
+  }
+
+  /**
+   * Expand the related rows one batched hop fetched, one level further, the
+   * way {@link expandRelationships} expands each related row it fetches.
+   *
+   * The rows are grouped by the collection they were read from and each group
+   * is expanded by ONE {@link batchExpandRelationships} call with that
+   * collection's own fields, so a page of entries costs a fixed number of reads
+   * per target collection at each depth rather than one per row. Each row is
+   * judged by its own collection's rules inside that call, by the caller
+   * `options` carries, and the per-read caches travel with it.
+   *
+   * A row reached through several references is one object here (the batch
+   * fetch hands every referencing entry the same row), so it is expanded once.
+   * A collection whose fields cannot be resolved (a system entity such as
+   * `users`) keeps its rows as fetched, as the single-entry path does.
+   *
+   * @returns The expanded version of each fetched row, keyed by the row object
+   *   the fetch returned.
+   */
+  private async expandFetchedRows(
+    fetchedRows: FetchedRow[],
+    options: RelationshipExpansionOptions
+  ): Promise<Map<Record<string, unknown>, Record<string, unknown>>> {
+    const byCollection = new Map<string, Set<Record<string, unknown>>>();
+    for (const { collection, row } of fetchedRows) {
+      const rows = byCollection.get(collection);
+      if (rows) {
+        rows.add(row);
+      } else {
+        byCollection.set(collection, new Set([row]));
+      }
+    }
+
+    const expanded = new Map<
+      Record<string, unknown>,
+      Record<string, unknown>
+    >();
+    for (const [collection, rowSet] of byCollection) {
+      const targetFields = await this.getCollectionFields(collection);
+      if (targetFields.length === 0) continue;
+      const rows = [...rowSet];
+      const result = await this.batchExpandRelationships(
+        rows,
+        collection,
+        targetFields,
+        options
+      );
+      rows.forEach((row, index) => expanded.set(row, result[index]));
+    }
+    return expanded;
+  }
+
+  /**
+   * Expand the relationships and uploads held inside the repeater and group
+   * fields of a page of entries, in place.
+   *
+   * Every row of one container field, across every entry, is expanded by ONE
+   * {@link batchExpandRelationships} call with the container's nested fields,
+   * at the level `options` names, so a page of entries holding many rows costs
+   * the same reads as one entry holding one. A JSON string the storage handed
+   * back is parsed first, and the parsed value replaces it, as before.
+   */
+  private async batchExpandContainerRows(
+    entries: Record<string, unknown>[],
+    collectionName: string,
+    fields: FieldDefinition[],
+    options: RelationshipExpansionOptions
+  ): Promise<void> {
+    for (const field of fields) {
+      if (!field.name) continue;
+      if (field.type !== "repeater" && field.type !== "group") continue;
+      const nestedFields = expandableNestedFields(field);
+      if (!nestedFields) continue;
+
+      const { rows, placeBack } = containerRowsAcross(entries, field);
+      if (rows.length === 0) continue;
+
+      const expanded = await this.batchExpandRelationships(
+        rows,
+        collectionName,
+        nestedFields,
+        options
+      );
+      expanded.forEach((row, index) => placeBack[index](row));
+    }
+  }
+
+  /**
+   * Batch fetch references that may span several collections, one query per
+   * collection. A field declaring several targets holds values from more than
+   * one of them, so a single fetch against the field's first target would miss
+   * every value pointing anywhere else.
+   *
+   * Keys the result by collection and id together, since the caller resolves a
+   * row from the reference it started with and an id alone does not identify
+   * one across collections.
+   *
+   * @param refs - References to load, duplicates allowed
+   * @param field - Field definition, for label resolution
+   * @returns Map of {@link relationKey} to expanded entry data
+   */
+  private async batchFetchRefs(
+    refs: RelationshipRef[],
+    field: FieldDefinition,
+    access: RelatedRowAccess
+  ): Promise<Map<string, Record<string, unknown>>> {
+    const idsByCollection = new Map<string, Set<string>>();
+    for (const { collection, id } of refs) {
+      const ids = idsByCollection.get(collection);
+      if (ids) {
+        ids.add(id);
+      } else {
+        idsByCollection.set(collection, new Set([id]));
+      }
+    }
+
+    const merged = new Map<string, Record<string, unknown>>();
+    for (const [collection, ids] of idsByCollection) {
+      const dataMap = await this.batchFetchRelatedEntries(
+        collection,
+        [...ids],
+        field,
+        access
+      );
+      for (const [id, row] of dataMap) {
+        merged.set(relationKey(collection, id), row);
+      }
+    }
+    return merged;
+  }
+
+  /**
+   * Batch fetch related entries for oneToOne/manyToOne/oneToMany relations.
+   * Returns a Map of ID -> { id, label }.
+   * Uses Drizzle's inArray for clean, type-safe queries.
+   *
+   * @param targetCollection - Name of the target collection or system entity
+   * @param relatedIds - Array of IDs to fetch
+   * @param field - Field definition
+   * @returns Map of ID to expanded entry data
+   */
+  async batchFetchRelatedEntries(
+    targetCollection: string,
+    relatedIds: string[],
+    field: FieldDefinition,
+    access: RelatedRowAccess = { trusted: TRUSTS_EVERY_COLLECTION }
+  ): Promise<Map<string, Record<string, unknown>>> {
+    const resultMap = new Map<string, Record<string, unknown>>();
+
+    if (relatedIds.length === 0) return resultMap;
+
+    try {
+      // Check if this is a system entity (like "users")
+      if (isSystemEntity(targetCollection)) {
+        const targetSchema = getSystemEntityTable(targetCollection);
+        if (!targetSchema) {
+          this.logger.warn(`Unknown system entity: ${targetCollection}`);
+          return resultMap;
+        }
+
+        // Guard against a secret column being used as the label — the hash
+        // would be copied into `label` before row redaction (see
+        // resolveSystemEntityLabelField).
+        const labelField = resolveSystemEntityLabelField(
+          targetCollection,
+          field.options?.targetLabelField
+        );
+
+        const readable = await this.readTargetRows(
+          targetCollection,
+          relatedIds,
+          access
+        );
+        for (const row of readable) {
+          resultMap.set(row.id as string, {
+            ...row,
+            label: row[labelField] || row.id,
+          });
+        }
+      } else {
+        // Handle dynamic collections
+        const labelField = await this.getBestLabelField(
+          targetCollection,
+          field.options?.targetLabelField
+        );
+
+        const readable = await this.readTargetRows(
+          targetCollection,
+          relatedIds,
+          access
+        );
+        for (const row of readable) {
+          resultMap.set(row.id as string, {
+            ...row,
+            // Falls back to the id when the label's source field did not
+            // survive redaction, so a related row stays identifiable.
+            label: row[labelField] || row.id,
+          });
+        }
+      }
+    } catch (error) {
+      // A rule that could not run never answered: the request ends with
+      // that, not with related entries missing from the map.
+      rethrowIfRuleCouldNotRun(error);
+      this.logger.error(
+        `Failed to batch fetch entries for ${targetCollection}`,
+        { error: error }
+      );
+    }
+
+    return resultMap;
+  }
+
+  /**
+   * Batch fetch manyToMany relations for multiple source entries.
+   * Returns a Map of sourceEntryId -> Array<{ id, label }>.
+   *
+   * @param sourceCollectionName - Name of the source collection
+   * @param sourceEntryIds - Array of source entry IDs
+   * @param field - Field definition
+   * @returns Map of source ID to array of related entries
+   */
+  async batchFetchManyToManyRelations(
+    sourceCollectionName: string,
+    sourceEntryIds: string[],
+    field: FieldDefinition,
+    access: RelatedRowAccess = { trusted: TRUSTS_EVERY_COLLECTION }
+  ): Promise<Map<string, Record<string, unknown>[]>> {
+    const resultMap = new Map<string, Record<string, unknown>[]>();
+
+    if (sourceEntryIds.length === 0) return resultMap;
+
+    // Use the dual-aware helper instead of `field.options!.target!`. Code-first
+    // collections (defined via `relationship({ relationTo, hasMany })`) put
+    // the target on `field.relationTo`; UI-built collections put it under
+    // `field.options.target`. Hard-asserting only the UI shape means
+    // code-first inserts crash with "Cannot read properties of undefined".
+    const targetCollectionName = getTargetCollection(field);
+    if (!targetCollectionName) {
+      this.logger.error(
+        `[CollectionRelationshipService] Cannot determine target collection for field "${field.name}" - check that either field.relationTo or field.options.target is set.`
+      );
+      return resultMap;
+    }
+
+    try {
+      // The junction's stored ids, through the one junction read.
+      const groupedRelations = await this.fetchManyToManyTargetIdsOf(
+        sourceCollectionName,
+        sourceEntryIds,
+        field
+      );
+
+      // Get all unique target IDs
+      const allTargetIds = [...new Set([...groupedRelations.values()].flat())];
+
+      if (allTargetIds.length === 0) {
+        // Initialize empty arrays for all source entries
+        for (const sourceId of sourceEntryIds) {
+          resultMap.set(sourceId, []);
+        }
+        return resultMap;
+      }
+
+      const labelField = await this.getBestLabelField(
+        targetCollectionName,
+        field.options?.targetLabelField
+      );
+      const readableTargetRows = await this.readTargetRows(
+        targetCollectionName,
+        allTargetIds,
+        access
+      );
+
+      // Build target entry map
+      const targetEntryMap = new Map(
+        readableTargetRows.map((row: Record<string, unknown>) => {
+          // Falls back to the id when the label's source field did not survive
+          // redaction.
+          const label = row[labelField] || row.id;
+          return [row.id, { ...row, label }];
+        })
+      );
+
+      // Map results back to source entries
+      for (const sourceId of sourceEntryIds) {
+        const targetIds = groupedRelations.get(sourceId) ?? [];
+        resultMap.set(
+          sourceId,
+          targetIds.map(id => targetEntryMap.get(id)).filter(Boolean) as Record<
+            string,
+            unknown
+          >[]
+        );
+      }
+    } catch (error) {
+      // A rule that could not run never answered: the request ends with
+      // that, not with every source relating to nothing.
+      rethrowIfRuleCouldNotRun(error);
+      this.logger.error("Failed to batch fetch manyToMany relations", {
+        error: error,
+      });
+      // Initialize empty arrays for all source entries on error
+      for (const sourceId of sourceEntryIds) {
+        resultMap.set(sourceId, []);
+      }
+    }
+
+    return resultMap;
+  }
+
+  /**
+   * Expand relationship data for a single entry with depth control.
+   *
+   * Supports depth parameter:
+   * - depth=0: No expansion, return IDs only
+   * - depth=1: Expand immediate relationships
+   * - depth=2+: Expand nested relationships recursively
+   *
+   * Also respects field-level `maxDepth` configuration to prevent
+   * over-fetching on specific relationship fields.
+   *
+   * @param entry - Entry to expand
+   * @param collectionName - Name of the collection
+   * @param fields - Field definitions
+   * @param options - Expansion options including depth control
+   * @returns Entry with expanded relationship data
+   */
+  async expandRelationships(
+    entry: Record<string, unknown>,
+    collectionName: string,
+    declaredFields: FieldDefinition[],
+    options: RelationshipExpansionOptions = {}
+  ): Promise<Record<string, unknown>> {
+    // The references the row holds, those inside a group with no name among them (`rowReferenceFields`).
+    const fields = rowReferenceFields(declaredFields);
+    const { depth = DEFAULT_RELATIONSHIP_DEPTH, currentDepth = 0 } = options;
+    // Travels with every nested expansion and row fetch, so a related row at
+    // any depth is judged by its own collection's field rules.
+    const access = relatedRowAccessOf(options);
+
+    // Clamp depth to valid range
+    const effectiveDepth = effectiveRelationshipDepth(depth);
+
+    // If we've reached the requested depth, don't expand further
+    // but still normalize repeater/group fields to strip embedded relationship objects
+    if (currentDepth >= effectiveDepth) {
+      return stripRelationshipsToIds(entry, fields);
+    }
+
+    const expandedEntry = { ...entry };
+
+    // Filter for relationship fields.
+    const relationFields = fields.filter(f => isRelationshipField(f));
+
+    for (const field of relationFields) {
+      const relationType = field.options?.relationType || "manyToOne";
+      const targetCollection = getTargetCollection(field);
+      const hasMany = isHasManyRelationship(field);
+
+      if (!targetCollection) {
+        continue;
+      }
+      // A many-to-many field has no parent-row value (its links live in the
+      // junction table, keyed by entry.id), so the `entry[field.name]` guard
+      // would wrongly skip it on single-entry reads. Only non-m2m fields read
+      // their FK id(s) off the row, so gate on the row value for those.
+      if (relationType !== "manyToMany" && !entry[field.name]) {
+        continue;
+      }
+
+      // Check field-level maxDepth (from relationship field config)
+      // Field maxDepth limits how deep this specific field can be populated
+      if (currentDepth >= fieldMaxDepthOf(field)) {
+        // Don't expand this field, keep the ID(s)
+        continue;
+      }
+
+      // Get targetLabelField from either options or root level
+      const targetLabelField =
+        field.options?.targetLabelField ||
+        ((field as Record<string, unknown>).targetLabelField as
+          | string
+          | undefined);
+
+      try {
+        if (relationType === "manyToMany") {
+          // Fetch related entries through junction table
+          const relatedEntries = await this.fetchManyToManyRelationsFrom(
+            options.manyToManySourceTable ?? getTableName(collectionName),
+            entry.id as string,
+            field,
+            undefined,
+            access
+          );
+
+          const labelField = await this.getBestLabelField(
+            targetCollection,
+            targetLabelField
+          );
+
+          // Expand nested relationships if depth allows
+          const expandedRelated = await Promise.all(
+            relatedEntries.map(async (rel: Record<string, unknown>) => {
+              const baseExpanded = {
+                id: rel.id,
+                label: rel[labelField] || rel.id,
+                ...rel, // Include all fields from related entry
+              };
+
+              // Recursively expand nested relationships if we have depth remaining
+              if (currentDepth + 1 < effectiveDepth) {
+                const targetFields =
+                  await this.getCollectionFields(targetCollection);
+                if (targetFields.length > 0) {
+                  return this.expandRelationships(
+                    baseExpanded,
+                    targetCollection,
+                    targetFields,
+                    {
+                      depth: effectiveDepth,
+                      currentDepth: currentDepth + 1,
+                      ...access,
+                    }
+                  );
+                }
+              }
+              return baseExpanded;
+            })
+          );
+
+          expandedEntry[field.name] = expandedRelated;
+        } else if (hasMany) {
+          // Handle hasMany relationships - array of IDs stored directly.
+          // Each entry carries its own collection when the field declares
+          // several targets, so they are resolved per value rather than once
+          // for the whole field.
+          const refs = normalizeToRelationshipRefs(
+            entry[field.name],
+            targetCollection,
+            declaredTargets(field)
+          );
+
+          if (refs.length > 0) {
+            // Two values in the same field can come from different
+            // collections, and each names its own label field — so the lookup
+            // is per collection, resolved once each rather than once per row.
+            const labelFields = new Map<string, Promise<string>>();
+            const labelFieldFor = (collection: string): Promise<string> => {
+              const cached = labelFields.get(collection);
+              if (cached) return cached;
+              const pending = this.getBestLabelField(
+                collection,
+                targetLabelField
+              );
+              labelFields.set(collection, pending);
+              return pending;
+            };
+
+            // Fetch all related entries
+            const expandedRelated = await Promise.all(
+              refs.map(async ref => {
+                const { collection: relatedCollection, id } = ref;
+                const relatedEntry = await this.fetchRelatedEntry(
+                  relatedCollection,
+                  id,
+                  access
+                );
+
+                if (!relatedEntry) return null;
+
+                const labelField = await labelFieldFor(relatedCollection);
+
+                let baseExpanded: Record<string, unknown> = {
+                  id: relatedEntry.id,
+                  label: relatedEntry[labelField] || relatedEntry.id,
+                  ...relatedEntry,
+                };
+
+                // Recursively expand nested relationships if we have depth remaining
+                if (currentDepth + 1 < effectiveDepth) {
+                  const targetFields =
+                    await this.getCollectionFields(relatedCollection);
+                  if (targetFields.length > 0) {
+                    baseExpanded = await this.expandRelationships(
+                      baseExpanded,
+                      relatedCollection,
+                      targetFields,
+                      {
+                        depth: effectiveDepth,
+                        currentDepth: currentDepth + 1,
+                        ...access,
+                      }
+                    );
+                  }
+                }
+
+                return withReferenceIdentity(baseExpanded, ref);
+              })
+            );
+
+            expandedEntry[field.name] = expandedRelated.filter(Boolean);
+          } else {
+            expandedEntry[field.name] = [];
+          }
+        } else {
+          // oneToOne, manyToOne, oneToMany - already have the ID
+          const storedValue = entry[field.name];
+          // A multi-target field stores the collection next to the id. Passing
+          // the whole pair to the row loader binds an object where the driver
+          // expects a string, so the query throws and the value never expands.
+          const polymorphicRef = readPolymorphicRef(
+            storedValue,
+            declaredTargets(field)
+          );
+          // A pair naming a collection the field never declared is left as it
+          // is stored: reading it as an id would send the object to the loader,
+          // and honouring the collection would read a row out of a table this
+          // field was never allowed to reach.
+          if (!polymorphicRef && isPolymorphicRefShape(storedValue)) continue;
+          const relatedCollection =
+            polymorphicRef?.collection ?? targetCollection;
+          const relatedId = polymorphicRef
+            ? polymorphicRef.id
+            : (storedValue as string);
+
+          if (relatedId) {
+            const relatedEntry = await this.fetchRelatedEntry(
+              relatedCollection,
+              relatedId,
+              access
+            );
+
+            if (relatedEntry) {
+              const labelField = await this.getBestLabelField(
+                relatedCollection,
+                targetLabelField
+              );
+
+              let expandedRelated: Record<string, unknown> = {
+                id: relatedEntry.id,
+                label: relatedEntry[labelField] || relatedEntry.id,
+                ...relatedEntry, // Include all fields from related entry
+              };
+
+              // Recursively expand nested relationships if we have depth remaining
+              if (currentDepth + 1 < effectiveDepth) {
+                // The row came from the collection the value named, so its own
+                // fields are the ones to walk for the next hop.
+                const targetFields =
+                  await this.getCollectionFields(relatedCollection);
+                if (targetFields.length > 0) {
+                  expandedRelated = await this.expandRelationships(
+                    expandedRelated,
+                    relatedCollection,
+                    targetFields,
+                    {
+                      depth: effectiveDepth,
+                      currentDepth: currentDepth + 1,
+                      ...access,
+                    }
+                  );
+                }
+              }
+
+              expandedEntry[field.name] = polymorphicRef
+                ? withReferenceIdentity(expandedRelated, polymorphicRef)
+                : expandedRelated;
+            }
+          }
+        }
+      } catch (error) {
+        // A rule that could not run never answered: the request ends with
+        // that, not with the relation left unexpanded.
+        rethrowIfRuleCouldNotRun(error);
+        // If expansion fails, keep the original value
+        this.logger.error(`Failed to expand relation ${field.name}`, {
+          error: error,
+        });
+      }
+    }
+
+    // Expand relationship fields nested inside repeater/group fields
+    for (const field of fields) {
+      const fieldName = field.name;
+      if (
+        !fieldName ||
+        expandedEntry[fieldName] === undefined ||
+        expandedEntry[fieldName] === null
+      )
+        continue;
+
+      // Only recurse into a container whose rows hold relationships, uploads
+      // or further nesting; a relationship field was expanded above.
+      const nestedFields = expandableNestedFields(field);
+      if (!nestedFields) continue;
+
+      if (field.type === "repeater") {
+        const rawData = expandedEntry[fieldName];
+        const arrayData = parseJsonIfString(rawData);
+        if (Array.isArray(arrayData)) {
+          expandedEntry[fieldName] = await Promise.all(
+            arrayData.map(async (row: Record<string, unknown>) => {
+              if (row && typeof row === "object") {
+                return this.expandRelationships(
+                  row,
+                  collectionName,
+                  nestedFields,
+                  { depth: effectiveDepth, currentDepth, ...access }
+                );
+              }
+              return row;
+            })
+          );
+        }
+      } else if (field.type === "group") {
+        const rawData = expandedEntry[fieldName];
+        const groupData = parseJsonIfString(rawData);
+        if (
+          groupData &&
+          typeof groupData === "object" &&
+          !Array.isArray(groupData)
+        ) {
+          expandedEntry[fieldName] = await this.expandRelationships(
+            groupData as Record<string, unknown>,
+            collectionName,
+            nestedFields,
+            { depth: effectiveDepth, currentDepth, ...access }
+          );
+        }
+      }
+    }
+
+    // Expand upload fields (media references) - including nested fields in
+    // arrays/groups - through the same media read the batch path makes.
+    const mediaMap = await this.mediaLookupFor([expandedEntry], fields, access);
+    if (mediaMap) {
+      // Use recursive function to expand media at any nesting depth
+      return expandMediaInData(expandedEntry, fields, mediaMap);
+    }
+
+    return expandedEntry;
+  }
+
+  /**
+   * Fetch media records by IDs.
+   * Uses the media table to retrieve full media objects.
+   *
+   * @param ids - Array of media IDs
+   * @returns Array of media records
+   */
+  private async fetchMediaByIds(
+    ids: string[]
+  ): Promise<Record<string, unknown>[]> {
+    if (ids.length === 0) return [];
+
+    try {
+      // Resolve the dialect-specific media schema from the adapter's tables.
+      // Using Drizzle's typed query builder (rather than raw sql.execute) keeps
+      // this dialect-agnostic — better-sqlite3 doesn't expose `.execute()` on
+      // Drizzle, and hand-rolled SQL routing per dialect is fragile. The same
+      // pattern is used by batchFetchRelatedEntries for the "users" entity.
+      const dialect = this.adapter.getCapabilities().dialect;
+      const tables = getDialectTables(dialect);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dialect table schemas are dialect-specific Drizzle types
+      const mediaTable = (tables as Record<string, any>).media;
+
+      if (!mediaTable) {
+        throw NextlyError.internal({
+          logContext: {
+            op: "fetchMediaByIds",
+            detail: "media table schema not registered for dialect",
+            dialect,
+          },
+        });
+      }
+
+      const rows = (await this.db
+        .select()
+        .from(mediaTable)
+        .where(inArray(mediaTable.id, ids))) as Record<string, unknown>[];
+
+      // Recursively convert snake_case fields to camelCase for API response
+      // Database may return snake_case columns (thumbnail_url, mime_type, etc.)
+      // This handles nested objects and arrays within media records
+      return rows.map(row => {
+        const camel = keysToCamelCase(row) as Record<string, unknown>;
+        // URLs as the storage wrote them: the local adapter's own base, a
+        // path by default, which the app's pages resolve on any host, or a
+        // cloud adapter's absolute URL (normalizeMediaUrls). A consumer that
+        // hands one outside the app makes it absolute with toPublicMediaUrl.
+        return normalizeMediaUrls(camel);
+      });
+    } catch (error) {
+      // Raised, not swallowed — same contract as the Singles read path. An
+      // empty list here degrades a failed fetch into upload fields that read
+      // back as null, which the caller cannot tell apart from an entry that
+      // references no media, so a broken fetch looks like vanished images.
+      throw NextlyError.internal({
+        cause: error instanceof Error ? error : undefined,
+        logContext: {
+          op: "fetchMediaByIds",
+          dialect: this.adapter.getCapabilities().dialect,
+          mediaIds: ids.length,
+        },
+      });
+    }
+  }
+
+  /**
+   * Get field definitions for a collection.
+   * Helper method for recursive relationship expansion.
+   *
+   * @param collectionName - Name of the collection
+   * @returns Field definitions or empty array if not found
+   */
+  private async getCollectionFields(
+    collectionName: string
+  ): Promise<FieldDefinition[]> {
+    try {
+      // System entities don't have field definitions
+      if (isSystemEntity(collectionName)) {
+        return [];
+      }
+
+      const collection =
+        await this.collectionService.getCollection(collectionName);
+      // Both shapes, the same way `getRedactionTarget` reads them: a
+      // Builder-created collection carries `schemaDefinition`, while
+      // `getCollection` returns the raw row for a code-first one and its fields
+      // sit at the top level. Reading only the first resolved a code-first
+      // target to nothing, and the caller's `targetFields.length > 0` guard
+      // then skipped the nested hop entirely — silently, at any depth.
+      const fields =
+        (
+          (collection as Record<string, unknown>).schemaDefinition as
+            | Record<string, unknown>
+            | undefined
+        )?.fields ?? (collection as Record<string, unknown>).fields;
+      return Array.isArray(fields) ? (fields as FieldDefinition[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Strip values the caller may not see from related rows before they are
+   * merged into a response. Relationship expansion spreads the entire related
+   * row into the parent entry, so without this a related collection's password
+   * fields (or the users entity's password hash) would be returned to any
+   * caller that populates the relationship. Called once per fetch with the row
+   * set, so the target schema is loaded at most once per relation, not per row.
+   *
+   * Two independent passes, because they answer different questions:
+   * secrets are stripped for everyone, while field-level `access.read` is
+   * evaluated against the caller. The parent entry's own redaction cannot cover
+   * either one: it runs against the SOURCE collection's field registry, which
+   * never describes a related collection's fields.
+   */
+  /**
+   * {@link redactWalkedRow} for a row the nested walk resolved, by its own
+   * collection's fields and table as the walk cached them.
+   */
+  private async redactNestedRow(
+    resolved: { collection: string; row: Record<string, unknown> },
+    state: NestedHookState
+  ): Promise<void> {
+    const targetFields = await this.fieldsForNestedWalk(
+      resolved.collection,
+      state
+    );
+    this.redactWalkedRow(
+      resolved.collection,
+      resolved.row,
+      targetFields,
+      await this.tableForNestedWalk(resolved.collection, state),
+      await this.passwordReach(targetFields)
+    );
+  }
+
+  /**
+   * Redact one row the relationship walk has just populated.
+   *
+   * Both walks do the same three things and did them in two copies; a
+   * redaction written twice is a redaction one copy can be updated without.
+   *
+   * The secret-column strip is unconditional and repeated on every walk: a
+   * system entity (users) has no field registry, so the password strip — which
+   * reads the registry — never sees its secret columns, and a source hook can
+   * reintroduce one onto the populated row after the fetch stripped it.
+   */
+  private redactWalkedRow(
+    collection: string,
+    row: Record<string, unknown>,
+    targetFields: FieldDefinition[],
+    /** The physical table `collection` reads from; see `tableForNestedWalk`. */
+    tableName: string,
+    /** Where the password strip follows field groups held inline. */
+    reach: FieldGroupReach
+  ): void {
+    if (reachesPasswordField(targetFields, reach)) {
+      stripPasswordFieldValues(row, targetFields, reach);
+    }
+    if (isSystemEntity(collection)) {
+      for (const col of SYSTEM_ENTITY_SECRET_COLUMNS) {
+        delete row[col];
+      }
+    }
+    stripServerOnlyColumns(row, tableName);
+  }
+
+  private async redactRelatedRows(
+    targetCollection: string,
+    rows: Record<string, unknown>[],
+    access: RelatedRowAccess = { trusted: TRUSTS_EVERY_COLLECTION }
+  ): Promise<void> {
+    if (rows.length === 0) return;
+    // The system owner column and any contributed hidden column must never
+    // ride along a populated relationship: a collection readable by
+    // non-creators would otherwise leak a related row's creator user id
+    // through the nested payload. Stripped from every related row before
+    // anything else reads it — this runs at each expansion level, so nested
+    // relations are covered too. Keyed by the target's PHYSICAL table, which
+    // is where its contributed columns are recorded.
+    //
+    // System entities expose secret columns that are not schema fields, so
+    // strip them by name. They carry no user-defined field rules, so there is
+    // nothing for the access pass below to evaluate.
+    if (isSystemEntity(targetCollection)) {
+      const tableName = systemEntityTableName(targetCollection);
+      for (const row of rows) {
+        stripServerOnlyColumns(row, tableName);
+        for (const col of SYSTEM_ENTITY_SECRET_COLUMNS) delete row[col];
+      }
+      return;
+    }
+    // Dynamic collections: drop password-type field values using the TARGET
+    // collection's schema — the source collection's fields never describe a
+    // related row. If the schema can't be resolved we cannot tell which
+    // fields are secret, so fail closed: strip every non-identity field
+    // rather than risk returning a row that carries a password hash.
+    const target = await this.getRedactionTarget(targetCollection);
+    if (target !== null) {
+      for (const row of rows) stripServerOnlyColumns(row, target.tableName);
+    }
+    const targetFields = target?.fields ?? null;
+    if (targetFields === null) {
+      for (const row of rows) stripToIdentity(row);
+      // Nothing but id/label survives, so there is no field left to judge.
+      return;
+    }
+    // Secrets first, and for every caller: a trusted read has no more use for a
+    // password hash than an anonymous one.
+    const reach = await this.passwordReach(targetFields);
+    if (reachesPasswordField(targetFields, reach)) {
+      for (const row of rows) {
+        stripPasswordFieldValues(row, targetFields, reach);
+      }
+    }
+    // Secrets above are unconditional and stay here. The target's FIELD rules
+    // are the caller's to place: a read that finishes with the post-assembly
+    // pass defers them there so the row's own masking hooks are judged on a
+    // whole row, which is the order a direct read uses. Every other caller
+    // applies them now, because nothing later will.
+    if (access.fieldAccessStage !== "assembled") {
+      await this.applyRelatedRowReadAccess(targetCollection, rows, access);
+    }
+  }
+
+  /**
+   * Apply each nested related row's OWN collection field `afterRead` hooks,
+   * once the document is fully assembled.
+   *
+   * A field hook is the transforming half of a field's read protections -- the
+   * half that masks a value on the way out. Running it at fetch time would be
+   * wrong: related rows are read BEFORE the recursion that expands their own
+   * relationships, so a hook masking on `data.organization.classification`
+   * would see a raw id. A direct read expands first and runs field hooks last,
+   * and expansion may be stricter than the target's own endpoint but never
+   * looser.
+   *
+   * So this runs once, from the read path, over the finished document.
+   *
+   * `state` is shared across every entry in one read. Batch expansion hands the
+   * SAME row object to every parent that references it, so a per-entry
+   * traversal would run that row's hooks once per reference and compound any
+   * transform that is not idempotent. It also carries the schema cache: without
+   * it a hundred-row listing re-reads the same two collections' fields on every
+   * row, one metadata query at a time.
+   */
+  /** A state a caller can share across every entry in one read. */
+  createNestedHookState(): NestedHookState {
+    return createNestedHookState();
+  }
+
+  async applyNestedFieldHooks(
+    entry: Record<string, unknown>,
+    collectionName: string,
+    access: RelatedRowAccess,
+    state?: NestedHookState
+  ): Promise<void> {
+    // Only a real read applies these. A caller clearing the flag is assembling
+    // the evidence a document-dependent rule is judged on and wants the row
+    // unredacted -- the same reason the access pass is gated on it.
+    if (!access.enforceFieldAccess) return;
+
+    // A caller that shares a state across a listing finishes the rows itself,
+    // once every entry has been walked. One that does not is a single document,
+    // so its walk is already complete here.
+    const shared = state ?? createNestedHookState();
+    await this.walkDocument(
+      entry,
+      await this.fieldsForNestedWalk(collectionName, shared),
+      access,
+      shared
+    );
+    if (!state) await this.finalizeRelatedRows(shared, access);
+  }
+
+  /**
+   * {@link applyNestedFieldHooks} for a document described by its own fields
+   * rather than by a collection: a Single, whose fields the collection registry
+   * does not hold. The same walk and the same finish, so a related row is
+   * answered alike from an entry and from a Single. One document, so its walk
+   * is finished here; the caller keeps `state` to reproject the document after
+   * each of its own hook phases ({@link reprojectDocumentRelatedRows}).
+   */
+  async applyNestedFieldHooksToDocument(
+    doc: Record<string, unknown>,
+    fields: FieldDefinition[],
+    access: RelatedRowAccess,
+    state: NestedHookState
+  ): Promise<void> {
+    if (!access.enforceFieldAccess) return;
+    await this.walkDocument(doc, fields, access, state);
+    await this.finalizeRelatedRows(state, access);
+  }
+
+  /**
+   * The top of the walk: the document's own fields, and every language's
+   * values carried beside it (`_allLocales`, `{ field: { code: value } }`).
+   *
+   * A read of every language populates the related rows inside each
+   * language's component values as it does the document's own, so each of
+   * those rows is a related row like any other and is walked by the same
+   * field. A row both places share is claimed once (`visited`).
+   */
+  private async walkDocument(
+    entry: Record<string, unknown>,
+    fields: FieldDefinition[],
+    access: RelatedRowAccess,
+    state: NestedHookState
+  ): Promise<void> {
+    await this.walkFields(entry, fields, access, state, 0);
+    for (const { field, values, code, language } of eachLanguageValue(
+      entry,
+      fields
+    )) {
+      await withRuleLanguage(language, () =>
+        this.walkFieldValue(values[code], field, access, state, 0)
+      );
+    }
+  }
+
+  /**
+   * Re-apply each related row's field access, then rebuild the labels.
+   *
+   * The walk already applied access to each row (before its parent's hooks, so a
+   * parent hook cannot read a denied child field to copy it). This runs it again
+   * because a hook can REINTRODUCE a denied field onto an already-redacted row
+   * (assigning `data.child.secret` to mask or derive a value), mutate a row in
+   * place, or add/replace/reorder rows -- and without a pass after the hooks that
+   * would be returned. It re-judges the current content (a cached verdict cannot
+   * be trusted once a hook may have changed what a rule reads), restoring from the
+   * shared `redactions` what a prior pass removed from each row so a rule reading
+   * a now-denied sibling as evidence still sees it -- keeping an unchanged verdict
+   * stable, as a direct read's single pass would, while judging everything a hook
+   * touched afresh.
+   *
+   * Called more than once per read, and safe to repeat: once after the related
+   * rows' OWN field hooks (so the source collection's hooks are handed already
+   * sanitized rows), and again after the SOURCE collection's code and stored
+   * afterRead hooks. Those hooks receive the whole assembled document and can
+   * write a denied field straight back onto a related row (`entry.author.secret`);
+   * the root-level read-access pass evaluates only the source collection's schema
+   * and never descends into a related row, so without a pass here after them the
+   * reintroduced value is returned. It leaves `pending` in place for exactly that
+   * repeat; the state is scoped to one read and discarded when it finishes.
+   *
+   * Labels come last of all, from the values that survived: a label copies a
+   * field under another key, so one rebuilt earlier would outlive the removal of
+   * its own source field.
+   */
+  async finalizeRelatedRows(
+    state: NestedHookState,
+    access: RelatedRowAccess
+  ): Promise<void> {
+    if (!access.enforceFieldAccess) return;
+    // Each row re-judged in the language the walk judged it in.
+    for (const { row, collection, language } of state.pending) {
+      await withRuleLanguage(language, () =>
+        this.applyRelatedRowReadAccess(
+          collection,
+          [row],
+          access,
+          state.redactions
+        )
+      );
+    }
+    for (const { row, collection, field } of state.pending) {
+      await this.refreshRelatedRowLabel(row, field, { collection }, state);
+    }
+    // Last, once every related row is fully sanitized and no source hook has run
+    // yet: keep a copy of each as the authoritative version the response is
+    // rebuilt from. Taken here rather than during the walk because a row is not
+    // final until the loops above have re-judged it — a sibling parent's hooks,
+    // in a listing that shares one row object between entries, run before this.
+    for (const { row, collection, field, depth, language } of state.pending) {
+      if (typeof row.id !== "string") continue;
+      const key = relatedRowSnapshotKey(
+        collection,
+        row.id,
+        field,
+        ruleLanguageKeyOf(language)
+      );
+      // The NEAREST occurrence wins. A row reached deeper in the document was
+      // expanded with less depth remaining, so restoring that version into a
+      // shallower field would strip a level of expansion the response had — and
+      // which no hook touched. Occurrences at equal depth expanded alike, so the
+      // first is as good as the last.
+      const recorded = state.sanitized.get(key);
+      if (recorded && recorded.depth <= depth) continue;
+      state.sanitized.set(key, {
+        depth,
+        row: detachData<Record<string, unknown>>(row),
+      });
+    }
+  }
+
+  /**
+   * Rebuild the ASSEMBLED response's related rows from the authoritative versions
+   * the walk produced, discarding whatever a source-collection `afterRead` hook —
+   * code, stored, or field-level — did to them.
+   *
+   * A source hook receives the whole assembled document, and the root read-access
+   * pass evaluates only the SOURCE collection's schema and never descends into a
+   * related row. So a hook can write a denied target field back onto one, clone or
+   * reshape one, append or reorder nested rows inside one, or return a rebuilt
+   * document whose related rows are objects the walk never held. Detecting each of
+   * those and undoing it is unbounded work: every reshape variant has to be
+   * modelled, and a rule that reads a value the reshape moved falls open on the
+   * copy.
+   *
+   * Rebuilding instead makes the question moot. Each populated related row in the
+   * response is replaced by a copy of the sanitized version recorded in
+   * `state.sanitized`, matched on the collection and id the response itself names.
+   * No tampering has to be found, because none of it survives. A related row the
+   * walk never sanitized — one a hook fabricated — has no authoritative version, so
+   * it is reduced to the bare reference rather than returned with unjudged fields.
+   *
+   * Runs after EVERY source hook phase, not only the last: a hook in one phase can
+   * copy a value off a related row it just contaminated onto a SOURCE field, which
+   * the next phase would then read. Restoring between phases means every phase is
+   * handed clean related rows. It costs no query — the versions are already in hand.
+   *
+   * Runs before selection projects rows to slices, so the response holds whole,
+   * consistent related rows at the point selection reads them.
+   */
+  async reprojectRelatedRows(
+    entries: Record<string, unknown>[],
+    collectionName: string,
+    access: RelatedRowAccess,
+    state: NestedHookState
+  ): Promise<void> {
+    // NOT gated on `overrideAccess`. A trusted read skips the field RULES, but
+    // password and system-secret stripping is unconditional even for trusted
+    // reads, so the recorded versions are stripped either way and restoring them
+    // is what removes a secret a source hook wrote back.
+    if (!access.enforceFieldAccess) return;
+    await this.reprojectDocuments(
+      entries,
+      await this.fieldsForNestedWalk(collectionName, state),
+      state
+    );
+  }
+
+  /**
+   * {@link reprojectRelatedRows} for a document described by its own fields: a
+   * Single, reprojected after each of its own hook phases with the state its
+   * walk ({@link applyNestedFieldHooksToDocument}) kept, as an entry is after
+   * its collection's.
+   */
+  async reprojectDocumentRelatedRows(
+    doc: Record<string, unknown>,
+    fields: FieldDefinition[],
+    access: RelatedRowAccess,
+    state: NestedHookState
+  ): Promise<void> {
+    if (!access.enforceFieldAccess) return;
+    await this.reprojectDocuments([doc], fields, state);
+  }
+
+  /**
+   * Rebuild the related rows of `entries` by `fields`: each document's own
+   * values and every language's values beside it (`_allLocales`), the places
+   * the walk reached them ({@link walkDocument}).
+   */
+  private async reprojectDocuments(
+    entries: Record<string, unknown>[],
+    fields: FieldDefinition[],
+    state: NestedHookState
+  ): Promise<void> {
+    // Rows rebuilt during THIS pass, so a row several parents reference stays ONE
+    // object across the response — the sharing batch expansion produced — instead
+    // of becoming a separate copy per reference.
+    const rebuilt = new Map<string, Record<string, unknown>>();
+    for (const entry of entries) {
+      await this.reprojectFields(entry, fields, state, rebuilt);
+      for (const { field, values, code, language } of eachLanguageValue(
+        entry,
+        fields
+      )) {
+        await withRuleLanguage(language, () =>
+          this.reprojectValueAt(values, code, field, state, rebuilt)
+        );
+      }
+    }
+  }
+
+  /**
+   * Rebuild every relationship value held at one level of the response, and
+   * descend through containers to reach the ones nested inside them.
+   */
+  private async reprojectFields(
+    holder: Record<string, unknown>,
+    fields: readonly FieldDefinition[],
+    state: NestedHookState,
+    rebuilt: Map<string, Record<string, unknown>>
+  ): Promise<void> {
+    // The fields stored at this level, as the walk reads them (`walkFields`).
+    for (const field of fieldsStoredOnRow(fields)) {
+      if (!field.name) continue;
+      // A hook can hand a container or a populated hasMany back as the JSON string
+      // storage keeps it as; left a string there is no value here to rebuild.
+      this.decodeJsonBackedFieldInPlace(holder, field);
+      await this.reprojectValueAt(holder, field.name, field, state, rebuilt);
+    }
+  }
+
+  /**
+   * Rebuild the related rows in `holder[key]`, one value of `field`.
+   *
+   * Container rows (a group's, a repeater's or a component's, a zone's
+   * included) belong to the SOURCE document, so they carry no authoritative
+   * version of their own and are descended into rather than replaced, by the
+   * fields the walk read them with (`holdsOwnRows`, `containedFields`): a
+   * container the walk reached is one this pass reaches. Only a relationship
+   * value names another collection's row.
+   */
+  private async reprojectValueAt(
+    holder: Record<string, unknown>,
+    key: string,
+    field: FieldDefinition,
+    state: NestedHookState,
+    rebuilt: Map<string, Record<string, unknown>>
+  ): Promise<void> {
+    const value = holder[key];
+    if (value === null || value === undefined) return;
+
+    if (holdsOwnRows(field)) {
+      for (const row of containerRowsOf(value)) {
+        await this.reprojectFields(
+          row,
+          await this.containedFields(field, row, state),
+          state,
+          rebuilt
+        );
+      }
+      return;
+    }
+    // An upload points at the built-in media entity, which registers no field
+    // rules and is never sanitized as a related row.
+    if (!isRelationshipField(field) || isUploadField(field)) return;
+
+    holder[key] = this.reprojectRelationshipValue(value, field, state, rebuilt);
+  }
+
+  /** Rebuild one relationship field's value, mapping a list one entry at a time so
+   *  each entry is matched against its OWN target collection. */
+  private reprojectRelationshipValue(
+    value: unknown,
+    field: FieldDefinition,
+    state: NestedHookState,
+    rebuilt: Map<string, Record<string, unknown>>
+  ): unknown {
+    const items = readItemArray(value);
+    if (items) {
+      // An entry whose identity cannot be read has no reference left to keep, and
+      // a list must not carry a hole where it stood: expansion drops an entry it
+      // cannot resolve rather than leaving a gap between the ones it did.
+      return items
+        .map(item =>
+          this.reprojectRelationshipItem(item, field, state, rebuilt)
+        )
+        .filter(item => item !== null && item !== undefined);
+    }
+    return this.reprojectRelationshipItem(value, field, state, rebuilt);
+  }
+
+  /**
+   * Rebuild one relationship entry from its authoritative version.
+   *
+   * A value that is still a bare reference is returned untouched: it carries no
+   * fields, so there is nothing that could have been tampered with. A POPULATED row
+   * is replaced by a copy of the sanitized version recorded for the collection and
+   * id it names — and reduced to that bare reference when no such version exists,
+   * because a populated row the walk never judged is one no rule has been applied
+   * to. A row whose identity cannot be read at all (a clone a hook stripped the id
+   * from) has no reference left to keep, so it is dropped.
+   */
+  private reprojectRelationshipItem(
+    item: unknown,
+    field: FieldDefinition,
+    state: NestedHookState,
+    rebuilt: Map<string, Record<string, unknown>>
+  ): unknown {
+    const shape = readRelationshipValueShape(item, field);
+    // A reference carries no fields, so there is nothing here to rebuild — and
+    // replacing it would drop a relationship no hook ever touched.
+    if (shape.kind === "reference") return item;
+    if (shape.kind === "unresolvable") return null;
+
+    const id = extractRelationshipId(shape.row);
+    if (typeof id !== "string") return null;
+    const ref: RelationshipRef = {
+      collection: shape.collection,
+      id,
+      discriminated: shape.discriminated,
+    };
+    // The version kept in the language this value is answered in: the read's
+    // own, or the side language the reprojection entered for it.
+    const key = relatedRowSnapshotKey(
+      ref.collection,
+      ref.id,
+      field,
+      ruleLanguageKey()
+    );
+
+    const already = rebuilt.get(key);
+    if (already) return withReferenceIdentity(already, ref);
+
+    const authoritative = state.sanitized.get(key)?.row;
+    if (!authoritative) {
+      return ref.discriminated
+        ? { relationTo: ref.collection, value: ref.id }
+        : ref.id;
+    }
+    // A copy per pass: the recorded version is restored again after the next
+    // source hook phase, and handing out the recorded object itself would let a
+    // hook mutate the very thing that pass restores from.
+    const copy = detachData<Record<string, unknown>>(authoritative);
+    rebuilt.set(key, copy);
+    return withReferenceIdentity(copy, ref);
+  }
+
+  /**
+   * The collection's fields, read once per collection per read.
+   *
+   * A target whose schema will not load runs no hooks, and the read continues.
+   *
+   * That is weaker than a read protection deserves, and it is the only answer
+   * the registry supports: it reports "this is not a registered collection" and
+   * "the lookup failed" the same way, so a relationship pointing at a built-in
+   * entity is indistinguishable from a real failure. Refusing on it would deny
+   * ordinary reads. The failure is logged rather than swallowed.
+   *
+   * Refusing becomes correct once the registry can answer whether a slug IS a
+   * collection separately from what its fields are.
+   */
+  private async fieldsForNestedWalk(
+    collectionName: string,
+    state: NestedHookState
+  ): Promise<FieldDefinition[]> {
+    const cached = state.fields.get(collectionName);
+    if (cached) return cached;
+
+    // A system entity has no dynamic-collection record and registers no field
+    // hooks, so there is nothing to look up.
+    if (isSystemEntity(collectionName)) {
+      state.fields.set(collectionName, []);
+      state.tables.set(collectionName, systemEntityTableName(collectionName));
+      return [];
+    }
+
+    let fields: FieldDefinition[] = [];
+    try {
+      const collection =
+        await this.collectionService.getCollection(collectionName);
+      // Recorded from this same read so the walk's redaction costs no second
+      // registry lookup; see `tableForNestedWalk`.
+      state.tables.set(
+        collectionName,
+        collectionTableName(collection, collectionName)
+      );
+      const raw =
+        (
+          (collection as Record<string, unknown>).schemaDefinition as
+            | Record<string, unknown>
+            | undefined
+        )?.fields ?? (collection as Record<string, unknown>).fields;
+      fields = Array.isArray(raw) ? (raw as FieldDefinition[]) : [];
+    } catch (error: unknown) {
+      // A relationship can point at something that is not a registered
+      // collection -- `users` behind an author field -- and the lookup reports
+      // that as an untyped "not found", the same shape a genuine failure takes.
+      // Since the two cannot be told apart here, refusing would deny ordinary
+      // reads, so this logs and leaves the target's hooks unrun.
+      this.logger.error(
+        `Nested field hooks skipped for "${collectionName}": its schema could not be read.`,
+        { error: error }
+      );
+    }
+
+    state.fields.set(collectionName, fields);
+    return fields;
+  }
+
+  /**
+   * The physical table a walked row's collection reads from, resolved by the
+   * registry read `fieldsForNestedWalk` already makes and caches.
+   *
+   * Falls back to the `dc_<slug>` convention only when that read failed, the
+   * case the walk has already logged as one it cannot describe. The row was
+   * stripped under its real table when it was fetched; this pass is the
+   * repeat that catches a hook reintroducing a column.
+   */
+  private async tableForNestedWalk(
+    collectionName: string,
+    state: NestedHookState
+  ): Promise<string> {
+    await this.fieldsForNestedWalk(collectionName, state);
+    return state.tables.get(collectionName) ?? getTableName(collectionName);
+  }
+
+  /**
+   * Decode a JSON-backed field held as a string into its objects, in place, so the
+   * walk can descend into the relationships inside or behind it.
+   *
+   * A source `afterRead` hook can return a value as the storage string SQLite keeps
+   * it as (the normal read decodes these before this walk; a hook that reshapes the
+   * document can hand one back as a string). Two field kinds are JSON-backed:
+   * `group`/`repeater` containers, and a POPULATED `hasMany` or polymorphic
+   * relationship, which serializes to a JSON array (`[...]`) or object
+   * (`{"relationTo":...}`). Left a string, {@link walkFieldValue} derives no rows
+   * from it and a denied target field inside would reach the response.
+   *
+   * A relationship is decoded only when the string opens with `[` or `{`: a bare id
+   * is left alone (parsing `"12"` would coerce it to a number), and a Postgres
+   * array literal (`{id,...}`) is not JSON so {@link parseJsonIfString} returns it
+   * unchanged. Writing the decoded value back matches the shape a normal read
+   * returns.
+   */
+  private decodeJsonBackedFieldInPlace(
+    holder: Record<string, unknown>,
+    field: FieldDefinition
+  ): void {
+    const value = holder[field.name];
+    if (typeof value !== "string") return;
+    if (isRepeaterOrGroupField(field)) {
+      holder[field.name] = parseJsonIfString(value);
+    } else if (isRelationshipField(field)) {
+      // A populated `hasMany`/polymorphic relationship serializes to a JSON array
+      // (`[...]`) or object (`{"relationTo":...}`). Detect it by the first
+      // NON-WHITESPACE character, so a hook that hands back pretty-printed JSON
+      // (a leading newline or spaces) is still decoded rather than left a string
+      // the walk cannot descend — otherwise a denied field inside would reach the
+      // response. A bare id or a Postgres array literal is left alone:
+      // parseJsonIfString only replaces the value when JSON.parse succeeds, and
+      // neither is valid JSON.
+      const start = value.trimStart();
+      if (start.startsWith("[") || start.startsWith("{")) {
+        holder[field.name] = parseJsonIfString(value);
+      }
+    }
+  }
+
+  /**
+   * Re-apply field access to the related rows already sanitized beneath `entry`,
+   * after `entry`'s own field hooks ran (first walk only).
+   *
+   * The post-hook re-descent walks NEW children a hook added but skips ones already
+   * visited. A field hook can instead reintroduce a denied field on an EXISTING
+   * child in place; that child would stay contaminated while `entry` unwinds to its
+   * PARENT, whose hooks could copy the value onto an allowed key the later
+   * sanitization no longer looks at. Re-applying the existing children's access here
+   * — without re-running their hooks — re-strips such reintroductions before `entry`
+   * returns to its parent. The re-walk of the assembled response covers reshaped
+   * rows separately.
+   */
+  private async reapplyDescendantAccess(
+    entry: Record<string, unknown>,
+    collectionName: string,
+    access: RelatedRowAccess,
+    state: NestedHookState,
+    depth: number
+  ): Promise<void> {
+    if (depth > MAX_RELATIONSHIP_DEPTH) return;
+    const fields = await this.fieldsForNestedWalk(collectionName, state);
+    // The fields stored at this level, as the walk reads them (`walkFields`).
+    for (const field of fieldsStoredOnRow(fields)) {
+      await this.reapplyFieldValueAccess(
+        entry[field.name],
+        field,
+        access,
+        state,
+        depth
+      );
+    }
+  }
+
+  /** Reach the related rows inside one field value — a relationship directly, or one
+   *  nested in a group/repeater — and re-apply access to each already-visited row,
+   *  recursing into its own relations. See {@link reapplyDescendantAccess}. */
+  private async reapplyFieldValueAccess(
+    value: unknown,
+    field: FieldDefinition,
+    access: RelatedRowAccess,
+    state: NestedHookState,
+    depth: number
+  ): Promise<void> {
+    if (value === null || value === undefined) return;
+    const rows = (Array.isArray(value) ? value : [value]).filter(
+      (row): row is Record<string, unknown> =>
+        typeof row === "object" && row !== null
+    );
+    if (rows.length === 0) return;
+
+    if (holdsOwnRows(field)) {
+      // A container: its rows belong to THIS collection; descend to reach any
+      // relationship inside them, a component's by the walk's own fields.
+      for (const row of rows) {
+        for (const inner of fieldsStoredOnRow(
+          await this.containedFields(field, row, state)
+        )) {
+          await this.reapplyFieldValueAccess(
+            row[inner.name],
+            inner,
+            access,
+            state,
+            depth
+          );
+        }
+      }
+      return;
+    }
+    // An upload points at the built-in media entity, which registers no field rules.
+    if (isUploadField(field)) return;
+
+    for (const row of rows) {
+      const resolved = resolveNestedTarget(row, field);
+      if (!resolved) continue;
+      // Only ALREADY-VISITED children: a new one is handled by the re-descent that
+      // runs the hooks path, and re-applying to it here would be redundant.
+      if (!state.visited.has(resolved.row)) continue;
+      // Deepest first, so a reintroduction nested under this child is re-stripped
+      // before this child's own access re-runs.
+      await this.reapplyDescendantAccess(
+        resolved.row,
+        resolved.collection,
+        access,
+        state,
+        depth + 1
+      );
+      await this.applyRelatedRowReadAccess(
+        resolved.collection,
+        [resolved.row],
+        access,
+        state.redactions
+      );
+      // Secrets a hook could reintroduce, stripped for the same reason the walk
+      // strips them: unconditional, override included.
+      await this.redactNestedRow(resolved, state);
+      // Rebuild the label from what survived, as the walk does before returning to a
+      // parent: a field hook can mutate an existing child so its label field flips
+      // from allowed to denied, and this access pass removes the field but leaves the
+      // synthetic `label` built earlier — which a parent hook could copy off
+      // `child.label` before the finalize pass rebuilds labels.
+      await this.refreshRelatedRowLabel(
+        resolved.row,
+        field,
+        { collection: resolved.collection },
+        state
+      );
+    }
+  }
+
+  /**
+   * One level of {@link applyNestedFieldHooks}.
+   *
+   * Rows are claimed in {@link walkFieldValue} rather than here, so the claim
+   * covers running a row's hooks as well as descending into it. The depth cap
+   * mirrors the expansion's own maximum.
+   */
+  private async walkNestedRows(
+    entry: Record<string, unknown>,
+    collectionName: string,
+    access: RelatedRowAccess,
+    state: NestedHookState,
+    depth: number
+  ): Promise<void> {
+    if (depth > MAX_RELATIONSHIP_DEPTH) return;
+
+    const fields = await this.fieldsForNestedWalk(collectionName, state);
+    await this.walkFields(entry, fields, access, state, depth);
+  }
+
+  /** Visit each of `fields` on one level of a document or a related row. */
+  private async walkFields(
+    entry: Record<string, unknown>,
+    fields: readonly FieldDefinition[],
+    access: RelatedRowAccess,
+    state: NestedHookState,
+    depth: number
+  ): Promise<void> {
+    // The fields stored at this level, as the read's expansion reads them: a
+    // group with no name only lays fields out, so the fields inside it are
+    // held here, under their own names, and never under the group's.
+    for (const field of fieldsStoredOnRow(fields)) {
+      this.decodeJsonBackedFieldInPlace(entry, field);
+      await this.walkFieldValue(entry[field.name], field, access, state, depth);
+    }
+  }
+
+  /**
+   * The fields one row of a container holds: a group's or a repeater's own, or
+   * those of the component the field names for this row (for a zone's row, the
+   * one its type names), read as every other walk over the read reads an
+   * instance (`instanceFields`). A component's fields are declared on the
+   * component, not on the field, so a walk that read only `field.fields` never
+   * reached a relationship inside one. Empty for a component the registry does
+   * not know, whose row then holds nothing the walk can name.
+   */
+  private async containedFields(
+    field: FieldDefinition,
+    row: Record<string, unknown>,
+    state: NestedHookState
+  ): Promise<readonly FieldDefinition[]> {
+    const nested = getNestedFields(field);
+    if (nested.length > 0) return nested;
+    const references = extractFieldGroupReferences(field);
+    const known = new Map<string, FieldDefinition[]>();
+    for (const slug of [
+      ...(references.single === undefined ? [] : [references.single]),
+      ...(references.many ?? []),
+    ]) {
+      const fields = await this.fieldGroupFieldsForNestedWalk(slug, state);
+      if (fields) known.set(slug, fields);
+    }
+    return (
+      instanceFields(row, references, {
+        reach: { fieldsOf: slug => known.get(slug) },
+        // A zone's row carrying no type is read by every component the zone
+        // allows, as the read's password strip reads it.
+        untypedZoneRows: "union",
+      }) ?? []
+    );
+  }
+
+  /**
+   * A field group's fields, read once per read from the registry the read's
+   * own component population reads. A lookup that fails rejects, and the read
+   * with it, rather than answering rows whose hooks it could not find.
+   */
+  private fieldGroupFieldsForNestedWalk(
+    slug: string,
+    state: NestedHookState
+  ): Promise<FieldDefinition[] | null> {
+    let pending = state.fieldGroups.get(slug);
+    if (!pending) {
+      const source = container.has("fieldGroupDataService")
+        ? container.get<FieldGroupDataService>("fieldGroupDataService")
+        : undefined;
+      // FieldConfig and FieldDefinition are structurally compatible for the
+      // properties the walk reads: name, type, nested fields, relationTo and
+      // the field-group references.
+      pending = source
+        ? source
+            .getComponentFields(slug)
+            .then(fields => fields as unknown as FieldDefinition[] | null)
+        : Promise.resolve(null);
+      state.fieldGroups.set(slug, pending);
+    }
+    return pending;
+  }
+
+  /**
+   * Visit one field's value, whatever shape it takes.
+   *
+   * A relationship can sit directly on the collection or inside a `group`, a
+   * `repeater` or a component (a zone's included), and the read populates it
+   * in each, so a walk that only looked at top-level `relationTo` fields left
+   * the field hooks of every related row inside a container unrun.
+   */
+  private async walkFieldValue(
+    value: unknown,
+    field: FieldDefinition,
+    access: RelatedRowAccess,
+    state: NestedHookState,
+    depth: number
+  ): Promise<void> {
+    if (value === null || value === undefined) return;
+
+    const rows = (Array.isArray(value) ? value : [value]).filter(
+      (row): row is Record<string, unknown> =>
+        typeof row === "object" && row !== null
+    );
+    if (rows.length === 0) return;
+
+    if (holdsOwnRows(field)) {
+      // A container: its rows belong to THIS collection, so they carry no
+      // hooks of their own -- only the relationships inside them do.
+      for (const row of rows) {
+        await this.walkFields(
+          row,
+          await this.containedFields(field, row, state),
+          access,
+          state,
+          depth
+        );
+      }
+      return;
+    }
+
+    // An upload points at the built-in media entity, which is not a registered
+    // collection and registers no field hooks. Resolving it would spend a
+    // metadata query per row to be told so, and log the failure, on reads that
+    // are otherwise fine -- and uploads are close to universal.
+    if (isUploadField(field)) return;
+
+    for (const row of rows) {
+      // A discriminated value names its own collection, so a polymorphic
+      // relationship is knowable per value rather than unknowable per field.
+      const resolved = resolveNestedTarget(row, field);
+      if (!resolved) continue;
+
+      // Claimed before anything runs, and the claim covers the hooks as well as
+      // the descent. Guarding only the descent still let a row shared by
+      // several parents be transformed once per parent, which compounds any
+      // transform that is not idempotent.
+      if (state.visited.has(resolved.row)) continue;
+      state.visited.add(resolved.row);
+
+      await this.walkNestedRows(
+        resolved.row,
+        resolved.collection,
+        access,
+        state,
+        depth + 1
+      );
+      // Decoded with the TARGET's schema. The read path decodes using the
+      // source collection's fields, which say nothing about a related row's
+      // own JSON columns, so on SQLite a hook inspecting one would be handed
+      // the storage string.
+      decodeJsonFieldValues(
+        [resolved.row],
+        await this.fieldsForNestedWalk(resolved.collection, state)
+      );
+      // The target's OWN field access, BEFORE its own field hooks. A hook belongs
+      // to one field but is handed the whole row, so given an unredacted one a
+      // hook on an allowed field can read a denied field beside it and return it
+      // as its own value — where the pass after the hooks, which judges each field
+      // by its own rule, has no reason to remove it. A direct read of the
+      // collection applies access before its field hooks for exactly this reason,
+      // and a row reached through a relationship may be redacted more strictly
+      // than the target's own endpoint but never more loosely. What this removes
+      // is recorded in the shared `redactions`, so the pass after the hooks
+      // restores it as evidence and re-judges the row against its current content.
+      await this.applyRelatedRowReadAccess(
+        resolved.collection,
+        [resolved.row],
+        access,
+        state.redactions
+      );
+      // Deepest first, so a hook reading into its own relations sees them
+      // already transformed rather than half-processed.
+      await runFieldHooks({
+        kind: "collection",
+        slug: resolved.collection,
+        phase: "afterRead",
+        data: resolved.row,
+        operation: "read",
+        user: access.user,
+      });
+      // A field hook may have ADDED or REPLACED one of this row's own populated
+      // relationships. That child missed the descent above, so descend again:
+      // a genuinely new child is walked — its denied fields stripped and it
+      // queued — before this row returns to its parent, whose hooks (and the
+      // source collection's) run next and could otherwise read a denied value
+      // off the still-unsanitized child and copy it onto an allowed key the
+      // later pass no longer looks at. Rows already claimed in `visited` are
+      // skipped, so only new children are re-walked.
+      await this.walkNestedRows(
+        resolved.row,
+        resolved.collection,
+        access,
+        state,
+        depth + 1
+      );
+      // Re-apply access to this row's ALREADY-VISITED related descendants. A
+      // field hook above can reintroduce a denied field on an existing child in
+      // place; the re-descent skips it (visited), so without this it stays visible
+      // while this row unwinds to its PARENT, whose hooks could copy it onto an
+      // allowed key the later sanitization no longer looks at.
+      await this.reapplyDescendantAccess(
+        resolved.row,
+        resolved.collection,
+        access,
+        state,
+        depth + 1
+      );
+
+      // Apply THIS row's field access now, before returning to its parent —
+      // whose afterRead hooks run next up the stack. Deferring it (as this once
+      // did) let a parent hook read a child field the caller may not see, and
+      // copy it under an allowed parent key where it outlived the child's own
+      // redaction. The row's own hooks above already ran against its complete
+      // values, and a direct read redacts a nested row before the parent
+      // collection's field hooks for the same reason, so applying it here keeps
+      // the nested path consistent with the direct one. Under `overrideAccess`
+      // this is a no-op, leaving trusted assembly untouched. What it removes is
+      // recorded in the shared `redactions` so `finalizeRelatedRows` can restore
+      // it as evidence and re-judge the row after every hook has run.
+      await this.applyRelatedRowReadAccess(
+        resolved.collection,
+        [resolved.row],
+        access,
+        state.redactions
+      );
+
+      // Rebuild the label from what survived the access pass, NOW, before the
+      // parent's hooks run next up the stack. The fetch derives a row's `label`
+      // from a target field, so a label built from a caller-denied field still
+      // carries that value after the field itself is stripped; a parent hook
+      // reading `data.child.label` would copy the denied value under an allowed
+      // key. The finalize pass rebuilds labels again for hook mutations, but that
+      // runs after the parent hooks and cannot remove a copy they already made.
+      await this.refreshRelatedRowLabel(
+        resolved.row,
+        field,
+        { collection: resolved.collection },
+        state
+      );
+
+      // Queued for the finalize step, which re-applies access after every hook
+      // (restoring the removed evidence and re-judging the current content so a
+      // reintroduced or hook-mutated denied field is caught) and rebuilds labels
+      // last, from the values that survived.
+      state.pending.push({
+        row: resolved.row,
+        collection: resolved.collection,
+        field,
+        depth,
+        language: currentRuleLanguage(),
+      });
+
+      // Secrets are stripped from a related row when it is fetched, but a hook
+      // on a sibling field can write one back -- deliberately or by copying the
+      // row -- and the response-level defenses sanitize only the ROOT row,
+      // using the source collection's schema, so they would never look at this
+      // one. Stripped again here for the same reason a direct read strips after
+      // its own hooks.
+      await this.redactNestedRow(resolved, state);
+    }
+  }
+
+  /**
+   * Rebuild a related row's display label from the fields that survived.
+   *
+   * The label copies a field's value under another key, so one derived at fetch
+   * outlives the removal of its own source field: a caller denied `internalName`
+   * would still read it as `label`. Rebuilt here, after the hooks and the field
+   * rules, it can only be made of values this caller may see.
+   *
+   * Falls back to the id, which is what the fetch-time derivation does when the
+   * source field is absent, so a row stays identifiable rather than losing its
+   * label entirely.
+   *
+   * Only rows that carry a label are touched. Expansion attaches one; a row
+   * reached some other way has no label to keep honest.
+   */
+  private async refreshRelatedRowLabel(
+    row: Record<string, unknown>,
+    field: FieldDefinition,
+    resolved: { collection: string },
+    state: NestedHookState
+  ): Promise<void> {
+    if (!("label" in row)) return;
+
+    // Read from both shapes expansion supports, through the same reader the
+    // snapshot key uses. A relationship storing the override at the field root
+    // would otherwise have its label rebuilt from an auto-selected field, so the
+    // same row came back labelled differently only because this pass ran.
+    const declared = declaredLabelField(field);
+    const cacheKey = `${resolved.collection}:${declared}`;
+    let pending = state.labelFields.get(cacheKey);
+    if (!pending) {
+      pending = isSystemEntity(resolved.collection)
+        ? Promise.resolve(
+            resolveSystemEntityLabelField(resolved.collection, declared)
+          )
+        : this.getBestLabelField(resolved.collection, declared || undefined);
+      state.labelFields.set(cacheKey, pending);
+    }
+
+    const labelField = await pending;
+    row.label = row[labelField] || row.id;
+  }
+
+  /**
+   * Evaluate the TARGET collection's field-level `access.read` against the
+   * caller, per related row.
+   *
+   * Kept separate from secret stripping so it cannot be skipped by that pass's
+   * early exits: a target collection with no password field is the common case,
+   * and returning early on it would leave every access rule unevaluated.
+   *
+   * Rules are the target collection's own, so this is the same decision the
+   * related row would get if it were read directly.
+   */
+  private async applyRelatedRowReadAccess(
+    targetCollection: string,
+    rows: Record<string, unknown>[],
+    access: RelatedRowAccess,
+    redactions?: ReadAccessRedactions
+  ): Promise<void> {
+    if (!access.enforceFieldAccess || trustsTarget(access, targetCollection))
+      return;
+    // Share `redactions` across the passes the walk makes over one row: a later
+    // one restores what an earlier removed as evidence and re-judges the current
+    // content, so a denied field a hook reintroduced or a row it changed is
+    // caught while an unchanged verdict stays put.
+    // What an earlier field-group pass on these rows removed, which the
+    // target's own rules are judged against as the row stores it.
+    const fieldGroupEvidence = relatedFieldGroupState.get(access)?.redactions;
+    for (const row of rows) {
+      const judge = () =>
+        applyFieldReadAccess(
+          {
+            kind: "collection",
+            slug: targetCollection,
+            entry: row,
+            // The field-access identity, never the hook one: a preview judges a
+            // related row's fields as the sharer while every hook goes on
+            // seeing the anonymous bearer who is actually asking.
+            user: access.fieldAccessUser ?? access.user,
+            overrideAccess: false,
+            // A visitor is handed the Public role the row gate above read.
+            visitor: this.resolveAccessService().fieldRuleVisitor,
+          },
+          redactions
+        );
+      await (fieldGroupEvidence
+        ? withFieldGroupEvidence(row, fieldGroupEvidence, judge)
+        : judge());
+    }
+    await this.applyRelatedFieldGroupReadAccess(targetCollection, rows, access);
+  }
+
+  /**
+   * Evaluate the rules on fields inside the field groups a related row holds,
+   * by the TARGET collection's schema, so a populated row withholds what a
+   * direct read of it would. Its store, kept for the read, lets a later pass
+   * restore what an earlier one removed as evidence.
+   */
+  private async applyRelatedFieldGroupReadAccess(
+    targetCollection: string,
+    rows: Record<string, unknown>[],
+    access: RelatedRowAccess
+  ): Promise<void> {
+    if (!anyFieldGroupHasAccessRule("read")) return;
+    const user = access.fieldAccessUser ?? access.user;
+    let state = relatedFieldGroupState.get(access);
+    if (!state) {
+      // A scoped API key's own grants, never its owner's.
+      state = {
+        passes: new Map(),
+        grants: callerAccessGrants(
+          user,
+          access.authenticatedScope,
+          undefined,
+          this.resolveAccessService().fieldRuleVisitor
+        ),
+        redactions: new WeakMap(),
+      };
+      relatedFieldGroupState.set(access, state);
+    }
+    let pending = state.passes.get(targetCollection);
+    if (!pending) {
+      pending = this.relatedFieldGroupPass(targetCollection);
+      state.passes.set(targetCollection, pending);
+    }
+    const pass = await pending;
+    if (!pass) return;
+    const caller = {
+      user,
+      authenticatedScope: access.authenticatedScope,
+      grants: state.grants,
+      redactions: state.redactions,
+    };
+    for (const row of rows) await pass(row, caller);
+  }
+
+  /** The field-group read pass for one target collection's related rows. */
+  private async relatedFieldGroupPass(
+    targetCollection: string
+  ): Promise<LiveFieldGroupReadPass | undefined> {
+    const target = await this.getRedactionTarget(targetCollection);
+    // The schema resolved when the row was loaded, but this read of it failed:
+    // what the row's field groups hold cannot be judged, so the row is
+    // withheld to its identity, as a row whose schema never resolved is.
+    if (target === null) {
+      return row => {
+        stripToIdentity(row);
+        return Promise.resolve();
+      };
+    }
+    const source = container.has("fieldGroupDataService")
+      ? container.get<FieldGroupDataService>("fieldGroupDataService")
+      : undefined;
+    return liveFieldGroupReadPass(target.fields as FieldConfig[], source);
+  }
+
+  /**
+   * Where the password strip follows the field groups a target's fields hold
+   * inline, once per field list: a walk caches each target's fields for the
+   * batch, so a target read many times resolves them once.
+   */
+  private readonly passwordReaches = new WeakMap<
+    readonly unknown[],
+    Promise<FieldGroupReach>
+  >();
+
+  private passwordReach(fields: readonly unknown[]): Promise<FieldGroupReach> {
+    let reach = this.passwordReaches.get(fields);
+    if (!reach) {
+      reach = passwordReachOf(
+        fields,
+        container.has("fieldGroupDataService")
+          ? container.get<FieldGroupDataService>("fieldGroupDataService")
+          : undefined
+      );
+      this.passwordReaches.set(fields, reach);
+    }
+    return reach;
+  }
+
+  /**
+   * Resolve a collection's fields and physical table for redaction. Uses the same
+   * `schemaDefinition.fields` (API shape) OR `collection.fields` (raw DB row)
+   * fallback the rest of this service uses — `getCollection` returns the raw
+   * row, whose fields live at the top level, so a `schemaDefinition`-only
+   * lookup silently resolves to nothing and skips stripping. Returns null
+   * when the schema cannot be resolved so the caller fails closed.
+   */
+  private async getRedactionTarget(
+    collectionName: string
+  ): Promise<{ fields: FieldDefinition[]; tableName: string } | null> {
+    try {
+      const collection =
+        await this.collectionService.getCollection(collectionName);
+      const fields =
+        (
+          (collection as Record<string, unknown>).schemaDefinition as
+            | Record<string, unknown>
+            | undefined
+        )?.fields || (collection as Record<string, unknown>).fields;
+      // The physical table from the same record the fields came from, so the
+      // hidden-column strip and the password strip describe one collection.
+      return Array.isArray(fields)
+        ? {
+            fields: fields as FieldDefinition[],
+            tableName: collectionTableName(collection, collectionName),
+          }
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Fetch a single related entry from a collection or system entity.
+   * Supports both dynamic collections and system entities (like "users").
+   *
+   * @param collectionName - Name of the collection or system entity
+   * @param entryId - ID of the entry to fetch
+   * @returns The entry or null if not found
+   */
+  async fetchRelatedEntry(
+    collectionName: string,
+    entryId: string,
+    access: RelatedRowAccess = { trusted: TRUSTS_EVERY_COLLECTION }
+  ): Promise<Record<string, unknown> | null> {
+    try {
+      const [readable] = await this.readTargetRows(
+        collectionName,
+        [entryId],
+        access
+      );
+      // Reads as absent rather than as an error: one unreadable reference must
+      // not refuse the whole parent read, and the caller learns no more than a
+      // reference pointing at nothing would tell them.
+      return readable ?? null;
+    } catch (error) {
+      // A rule that could not run never answered: the request ends with
+      // that, not with a reference that reads as pointing at nothing.
+      rethrowIfRuleCouldNotRun(error);
+      return null;
+    }
+  }
+
+  /**
+   * Read ONLY the related target ids from the junction table, on the supplied
+   * executor. Unlike {@link fetchManyToManyRelations}, it does not materialize
+   * the target rows through the pool — so a caller building a snapshot inside a
+   * write transaction sees a target created earlier in that same transaction
+   * (whose row is not yet visible on a pooled connection), and a single-
+   * connection pool never stalls waiting for a second connection. The ids are
+   * exactly what the junction stores, so nothing about the targets is needed.
+   *
+   * @param sourceCollectionName - Name of the source collection
+   * @param sourceEntryId - ID of the source entry
+   * @param field - Field definition
+   * @param executor - Transaction-bound executor to read the junction on
+   * @returns The related target ids. A failed read throws, so a caller that
+   *   requires completeness never mistakes it for an empty relationship.
+   */
+  async fetchManyToManyTargetIds(
+    sourceCollectionName: string,
+    sourceEntryId: string,
+    field: FieldDefinition,
+    executor?: RelationshipDbExecutor
+  ): Promise<string[]> {
+    const byEntry = await this.fetchManyToManyTargetIdsOf(
+      sourceCollectionName,
+      [sourceEntryId],
+      field,
+      executor
+    );
+    return byEntry.get(sourceEntryId) ?? [];
+  }
+
+  /**
+   * {@link fetchManyToManyTargetIds} for many source entries in one junction
+   * query, keyed by source id: every stored id, whatever its target's status or
+   * whether the target is still there, and an entry with none keyed to `[]`.
+   * A failed read throws rather than reading as empty.
+   *
+   * @param sourceCollectionName - Name of the source collection
+   * @param sourceEntryIds - IDs of the source entries
+   * @param field - Field definition
+   * @param executor - Transaction-bound executor to read the junction on
+   */
+  async fetchManyToManyTargetIdsOf(
+    sourceCollectionName: string,
+    sourceEntryIds: readonly string[],
+    field: FieldDefinition,
+    executor?: RelationshipDbExecutor
+  ): Promise<Map<string, string[]>> {
+    return this.fetchManyToManyTargetIdsFrom(
+      getTableName(sourceCollectionName),
+      sourceEntryIds,
+      field,
+      executor
+    );
+  }
+
+  /**
+   * {@link fetchManyToManyTargetIdsOf} for source entries in `sourceTable`,
+   * which names the junction: a Single's table, as well as a collection's.
+   * @internal
+   */
+  async fetchManyToManyTargetIdsFrom(
+    sourceTable: string,
+    sourceEntryIds: readonly string[],
+    field: FieldDefinition,
+    executor?: RelationshipDbExecutor
+  ): Promise<Map<string, string[]>> {
+    const byEntry = new Map<string, string[]>(
+      sourceEntryIds.map(id => [id, []])
+    );
+    if (sourceEntryIds.length === 0) return byEntry;
+    const targetCollectionName = getTargetCollection(field);
+    if (!targetCollectionName) {
+      this.logger.error(
+        `[CollectionRelationshipService] fetchManyToManyTargetIds: cannot determine target for field "${field.name}".`
+      );
+      return byEntry;
+    }
+    const {
+      table: junctionTableName,
+      sourceColumn,
+      targetColumn,
+    } = junctionFrom(sourceTable, targetCollectionName, field);
+    const sourceIdCol = sql.identifier(sourceColumn);
+    const targetIdCol = sql.identifier(targetColumn);
+    const junctionQuery = sql`
+      SELECT ${sourceIdCol} as source_id, ${targetIdCol} as target_id
+      FROM ${sql.identifier(junctionTableName)}
+      WHERE ${sourceIdCol} IN (${sql.join(
+        sourceEntryIds.map(id => sql`${id}`),
+        sql.raw(", ")
+      )})
+    `;
+    const junctionResults = (await this.selectRawSql(
+      junctionQuery,
+      executor
+    )) as { rows: Array<{ source_id: string; target_id: string }> };
+    for (const row of junctionResults.rows) {
+      byEntry.get(String(row.source_id))?.push(row.target_id);
+    }
+    return byEntry;
+  }
+
+  /**
+   * Gives each junction-backed many-to-many field on `entries` the ids its
+   * junction stores. That is what a read that populates nothing answers for
+   * every other relationship: the references as stored, not judged against the
+   * caller, and whether or not each target still exists. Such a field has no
+   * column, so without this a read at depth 0 has no value for it at all.
+   *
+   * One junction query per field for all the entries. A failed read throws
+   * rather than giving an empty list, which an editor saving the document back
+   * would store, removing every link. A junction keeps no order, so the ids
+   * come in the order the database returns them.
+   */
+  async withStoredManyToManyIds(
+    entries: Record<string, unknown>[],
+    collectionName: string,
+    fields: FieldDefinition[]
+  ): Promise<Record<string, unknown>[]> {
+    return this.withStoredManyToManyIdsFrom(
+      entries,
+      getTableName(collectionName),
+      fields
+    );
+  }
+
+  /**
+   * {@link withStoredManyToManyIds} for entries in `sourceTable`, which names
+   * the junctions: a Single's table, as well as a collection's.
+   * @internal
+   */
+  async withStoredManyToManyIdsFrom(
+    entries: Record<string, unknown>[],
+    sourceTable: string,
+    fields: FieldDefinition[]
+  ): Promise<Record<string, unknown>[]> {
+    const junctionFields = fields.filter(field => usesJunctionTable(field));
+    if (junctionFields.length === 0 || entries.length === 0) return entries;
+    const ids = entries.map(entry => String(entry.id));
+    const withIds = entries.map(entry => ({ ...entry }));
+    for (const field of junctionFields) {
+      const stored = await this.fetchManyToManyTargetIdsFrom(
+        sourceTable,
+        ids,
+        field
+      );
+      withIds.forEach((entry, index) => {
+        entry[field.name] = stored.get(ids[index]) ?? [];
+      });
+    }
+    return withIds;
+  }
+
+  /**
+   * Fetch many-to-many related entries.
+   * Optimized with MySQL-compatible IN clause.
+   *
+   * @param sourceCollectionName - Name of the source collection
+   * @param sourceEntryId - ID of the source entry
+   * @param field - Field definition
+   * @returns Array of related entries
+   */
+  // Public: reached from outside through `CollectionsHandler.getRelationshipService()`, which the
+  // package's root entry exports. Its own reads go through `fetchManyToManyRelationsFrom`.
+  // fallow-ignore-next-line unused-class-member
+  async fetchManyToManyRelations(
+    sourceCollectionName: string,
+    sourceEntryId: string,
+    field: FieldDefinition,
+    // Optional transaction-bound executor. When supplied, the junction lookup
+    // runs on the transaction's connection (read-your-writes, #226) so a version
+    // snapshot captured inside the write transaction sees the junction rows just
+    // written in it. The target-entry fetch stays on the pool: related rows live
+    // in another (already-committed) collection, so they need no tx visibility.
+    executor?: RelationshipDbExecutor,
+    access: RelatedRowAccess = { trusted: TRUSTS_EVERY_COLLECTION }
+  ): Promise<Record<string, unknown>[]> {
+    return this.fetchManyToManyRelationsFrom(
+      getTableName(sourceCollectionName),
+      sourceEntryId,
+      field,
+      executor,
+      access
+    );
+  }
+
+  /**
+   * {@link fetchManyToManyRelations} for a source entry in `sourceTable`,
+   * which names the junction: a Single's table, as well as a collection's.
+   * @internal
+   */
+  async fetchManyToManyRelationsFrom(
+    sourceTable: string,
+    sourceEntryId: string,
+    field: FieldDefinition,
+    executor?: RelationshipDbExecutor,
+    access: RelatedRowAccess = { trusted: TRUSTS_EVERY_COLLECTION }
+  ): Promise<Record<string, unknown>[]> {
+    // Same dual-aware target lookup as fetchManyToManyRelationsBatch above.
+    // See that comment for the code-first vs UI-built shape rationale.
+    const targetCollectionName = getTargetCollection(field);
+    if (!targetCollectionName) {
+      this.logger.error(
+        `[CollectionRelationshipService] fetchManyToManyRelations: cannot determine target for field "${field.name}".`
+      );
+      return [];
+    }
+    const {
+      table: junctionTableName,
+      sourceColumn,
+      targetColumn,
+    } = junctionFrom(sourceTable, targetCollectionName, field);
+
+    try {
+      // Query junction table to get related IDs using sql tagged template
+      const sourceIdCol = sql.identifier(sourceColumn);
+      const targetIdCol = sql.identifier(targetColumn);
+
+      const junctionQuery = sql`
+        SELECT ${targetIdCol} as target_id
+        FROM ${sql.identifier(junctionTableName)}
+        WHERE ${sourceIdCol} = ${sourceEntryId}
+      `;
+
+      const junctionResults = (await this.selectRawSql(
+        junctionQuery,
+        executor
+      )) as {
+        rows: Array<{ target_id: string }>;
+      };
+      const relatedIds = junctionResults.rows.map(row => row.target_id);
+
+      if (relatedIds.length === 0) {
+        return [];
+      }
+
+      // Through the shared reader, which binds the id list with Drizzle's
+      // `inArray` rather than assembling the IN clause by hand. The sibling
+      // many-to-many batch path has always used `inArray` and passes on MySQL,
+      // so the hand-built list this replaces was not buying compatibility.
+      return await this.readTargetRows(
+        targetCollectionName,
+        relatedIds,
+        access
+      );
+    } catch (error) {
+      // A rule that could not run never answered: the request ends with
+      // that, not with a relationship that reads as empty.
+      rethrowIfRuleCouldNotRun(error);
+      this.logger.error("Failed to fetch many-to-many relations", {
+        error: error,
+      });
+      return [];
+    }
+  }
+
+  /**
+   * Insert many-to-many relationships into junction table.
+   * Uses individual inserts for reliability (still fast with proper indexing).
+   *
+   * @param sourceCollectionName - Name of the source collection
+   * @param sourceEntryId - ID of the source entry
+   * @param field - Field definition
+   * @param relatedIds - Array of related entry IDs to link
+   * @param executor - Optional transaction-scoped Drizzle handle (from
+   *   `tx.getDrizzle()`); when provided, the junction existence check and
+   *   inserts run inside the caller's transaction so they commit atomically
+   *   with the entry write instead of always hitting the pool.
+   */
+  async insertManyToManyRelations(
+    sourceCollectionName: string,
+    sourceEntryId: string,
+    field: FieldDefinition,
+    relatedIds: string[],
+    executor?: RelationshipDbExecutor
+  ): Promise<void> {
+    return this.insertManyToManyLinks(
+      getTableName(sourceCollectionName),
+      sourceEntryId,
+      field,
+      relatedIds,
+      executor
+    );
+  }
+
+  /**
+   * {@link insertManyToManyRelations} for a source entry in `sourceTable`,
+   * which names the junction: a Single's table, as well as a collection's.
+   * @internal
+   */
+  async insertManyToManyLinks(
+    sourceTable: string,
+    sourceEntryId: string,
+    field: FieldDefinition,
+    relatedIds: string[],
+    executor?: RelationshipDbExecutor
+  ): Promise<void> {
+    if (relatedIds.length === 0) return;
+
+    // Same dual-aware target lookup as fetchManyToManyRelationsBatch above.
+    // See that comment for the code-first vs UI-built shape rationale.
+    const targetCollectionName = getTargetCollection(field);
+    if (!targetCollectionName) {
+      this.logger.error(
+        `[CollectionRelationshipService] insertManyToManyRelations: cannot determine target for field "${field.name}".`
+      );
+      return;
+    }
+    const {
+      table: junctionTableName,
+      sourceColumn,
+      targetColumn,
+    } = junctionFrom(sourceTable, targetCollectionName, field);
+
+    this.logger.info(
+      `[ManyToMany] Inserting into junction table: ${junctionTableName}`
+    );
+    this.logger.info(
+      `[ManyToMany] Source: ${sourceTable}, Target: ${targetCollectionName}`
+    );
+    this.logger.info(
+      `[ManyToMany] Field: ${field.name}, IDs: ${relatedIds.join(", ")}`
+    );
+
+    // Check if junction table exists. Each dialect has its own catalog
+    // table for this: `information_schema` is PG/MySQL only, SQLite uses
+    // `sqlite_master`. Skipping the dialect branching here would fail on
+    // SQLite with `near "FROM": syntax error`.
+    try {
+      let checkQuery;
+      if (this.dialect === "sqlite") {
+        checkQuery = sql`
+          SELECT EXISTS (
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = ${junctionTableName}
+          ) as table_exists
+        `;
+      } else if (this.dialect === "mysql") {
+        checkQuery = sql`
+          SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = DATABASE()
+            AND table_name = ${junctionTableName}
+          ) as table_exists
+        `;
+      } else {
+        // `current_schema()`, not `public`: the connection's `search_path` is
+        // the installation's configured schema, where the junction table is.
+        checkQuery = sql`
+          SELECT EXISTS (
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = current_schema()
+            AND table_name = ${junctionTableName}
+          ) as table_exists
+        `;
+      }
+      const result = (await this.selectRawSql(checkQuery, executor)) as {
+        rows: Array<{ table_exists: boolean | number }>;
+      };
+      const exists = Boolean(result.rows[0]?.table_exists);
+
+      if (!exists) {
+        throw new Error(
+          `Junction table "${junctionTableName}" does not exist. ` +
+            `Did you restart the app after creating the manyToMany field? ` +
+            `Check migration files in src/db/migrations/dynamic/`
+        );
+      }
+      this.logger.info(
+        `[ManyToMany] ✓ Junction table exists: ${junctionTableName}`
+      );
+    } catch (error: unknown) {
+      this.logger.error(`[ManyToMany] Junction table check failed`, {
+        error: error,
+      });
+      throw error;
+    }
+
+    const sourceIdCol = sql.identifier(sourceColumn);
+    const targetIdCol = sql.identifier(targetColumn);
+
+    // Insert each relationship. A genuine failure (for example a foreign-key
+    // violation from a bad target id) is allowed to propagate: junction writes
+    // run inside the caller's transaction via `executor`, so throwing rolls the
+    // whole write back instead of committing a partial set of junction rows.
+    // Duplicate (source,target) pairs never throw here (the dialect conflict
+    // clause below ignores them).
+    for (const targetId of relatedIds) {
+      const id = this.collectionService.generateId();
+      // This raw sql`` template binds straight to the driver, bypassing
+      // Drizzle's per-column serialization. better-sqlite3 only accepts
+      // numbers/strings/bigints/buffers/null, so a Date throws; the junction
+      // created_at column is `integer` epoch-seconds on SQLite (see
+      // generateJunctionTable), so bind that. PG/MySQL drivers accept a Date.
+      const createdAt =
+        this.dialect === "sqlite" ? Math.floor(Date.now() / 1000) : new Date();
+
+      // "Insert, ignore an existing (source,target) pair" is spelled
+      // differently per dialect: MySQL has no ON CONFLICT (it errors with
+      // ER_PARSE_ERROR). Use ON DUPLICATE KEY UPDATE with a no-op assignment
+      // rather than INSERT IGNORE, so only a duplicate-key conflict is
+      // swallowed while other errors (e.g. a foreign-key violation from a
+      // bad target id) still surface, matching the Postgres/SQLite
+      // ON CONFLICT DO NOTHING behaviour against the unique pair index.
+      const idCol = sql.identifier("id");
+      const conflictClause =
+        this.dialect === "mysql"
+          ? sql`ON DUPLICATE KEY UPDATE ${idCol} = ${idCol}`
+          : sql`ON CONFLICT DO NOTHING`;
+
+      const query = sql`
+        INSERT INTO ${sql.identifier(junctionTableName)}
+        (id, ${sourceIdCol}, ${targetIdCol}, created_at)
+        VALUES (${id}, ${sourceEntryId}, ${targetId}, ${createdAt})
+        ${conflictClause}
+      `;
+
+      await this.mutateRawSql(query, executor);
+    }
+  }
+
+  /**
+   * Delete many-to-many relationships from junction table.
+   * Uses Drizzle's sql tagged template for type safety and MySQL compatibility.
+   *
+   * @param sourceCollectionName - Name of the source collection
+   * @param sourceEntryId - ID of the source entry
+   * @param field - Field definition
+   * @param executor - Optional transaction-scoped Drizzle handle; when
+   *   provided, the delete runs inside the caller's transaction instead of the
+   *   pool (see `insertManyToManyRelations` for the rationale).
+   */
+  async deleteManyToManyRelations(
+    sourceCollectionName: string,
+    sourceEntryId: string,
+    field: FieldDefinition,
+    executor?: RelationshipDbExecutor
+  ): Promise<void> {
+    return this.deleteManyToManyLinks(
+      getTableName(sourceCollectionName),
+      sourceEntryId,
+      field,
+      executor
+    );
+  }
+
+  /**
+   * {@link deleteManyToManyRelations} for a source entry in `sourceTable`,
+   * which names the junction: a Single's table, as well as a collection's.
+   * @internal
+   */
+  async deleteManyToManyLinks(
+    sourceTable: string,
+    sourceEntryId: string,
+    field: FieldDefinition,
+    executor?: RelationshipDbExecutor
+  ): Promise<void> {
+    // Same dual-aware target lookup as fetchManyToManyRelationsBatch above.
+    // See that comment for the code-first vs UI-built shape rationale.
+    const targetCollectionName = getTargetCollection(field);
+    if (!targetCollectionName) {
+      this.logger.error(
+        `[CollectionRelationshipService] deleteManyToManyRelations: cannot determine target for field "${field.name}".`
+      );
+      return;
+    }
+    const { table: junctionTableName, sourceColumn } = junctionFrom(
+      sourceTable,
+      targetCollectionName,
+      field
+    );
+
+    const sourceIdCol = sql.identifier(sourceColumn);
+    const query = sql`
+      DELETE FROM ${sql.identifier(junctionTableName)}
+      WHERE ${sourceIdCol} = ${sourceEntryId}
+    `;
+
+    await this.mutateRawSql(query, executor);
+  }
+
+  /**
+   * Get junction table name for many-to-many relationship.
+   *
+   * @param sourceCollectionName - Name of the source collection
+   * @param targetCollectionName - Name of the target collection
+   * @param field - Field definition
+   * @returns Junction table name
+   */
+  // Public: reached from outside through `CollectionsHandler.getRelationshipService()`, which the
+  // package's root entry exports. Its own reads and writes name junctions through `junctionFrom`.
+  // fallow-ignore-next-line unused-class-member
+  getJunctionTableName(
+    sourceCollectionName: string,
+    targetCollectionName: string,
+    field: FieldDefinition
+  ): string {
+    // Named as the DDL names it, from the source's TABLE, where a hyphen in
+    // the slug is an underscore; the target is spelled `dc_<target slug>` as
+    // written.
+    return junctionTableTo(
+      getTableName(sourceCollectionName),
+      targetCollectionName,
+      field
+    );
+  }
+}
+
+/**
+ * The junction a many-to-many field of an entry in `sourceTable` keeps its
+ * links to `targetSlug` in, and its two link columns, named as the junction's
+ * SQL names them: a collection's table and a Single's alike.
+ */
+function junctionFrom(
+  sourceTable: string,
+  targetSlug: string,
+  field: FieldDefinition
+): { table: string; sourceColumn: string; targetColumn: string } {
+  return {
+    table: junctionTableTo(sourceTable, targetSlug, field),
+    ...junctionLinkColumnsOf(sourceTable, targetSlug),
+  };
+}
+
+/**
+ * The fields whose references an entry holds at this level: those at the top, and those inside a
+ * group with no name, whose columns are on the same row (`fieldsStoredOnRow`). A many-to-many is
+ * taken at the top alone, where the creating SQL gives it the junction table it is read from.
+ */
+function rowReferenceFields(fields: FieldDefinition[]): FieldDefinition[] {
+  const topLevel = new Set(fields);
+  return fieldsStoredOnRow(fields).filter(
+    field => topLevel.has(field) || !usesJunctionTable(field)
+  );
+}

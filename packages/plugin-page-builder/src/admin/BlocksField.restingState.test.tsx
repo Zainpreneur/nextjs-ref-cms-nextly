@@ -1,0 +1,601 @@
+// @vitest-environment jsdom
+
+/**
+ * What the entry form draws BEFORE the editor is opened.
+ *
+ * The state a page's edit screen spends nearly all of its time in, and the one
+ * nothing asserted: on the shipped `pages` collection the blocks field IS the
+ * editable body — `title` and `slug` are system fields the header draws — so
+ * this is what an author sees when they open a page.
+ *
+ * Two of the cases below cover failures that pass a careless test.
+ *
+ * The COLD REGISTRY. `ensureEditorBlocksRegistered()` runs inside `BlocksEditor`
+ * and nowhere else, deliberately, so nothing is registered while the form is at
+ * rest. Registration is global module state that is never torn down, so a test
+ * that opened the editor first would leave every later render able to resolve
+ * blocks — and the page would draw here for a reason a real cold page load does
+ * not have. The case below therefore observes the empty registry in the
+ * assertion rather than trusting the file's ordering.
+ *
+ * The PENDING SHEET. Omitting `siteStyles` does not draw nothing; the renderer
+ * still emits its default tokens, so a page rendered before the site's own
+ * sheet arrives looks entirely plausible while missing that site's named
+ * classes and block-type defaults. A test asserting only "something rendered"
+ * passes on exactly that wrong picture.
+ *
+ * @module admin/BlocksField.restingState.test
+ */
+import {
+  COMPONENT_INSTANCE_TYPE,
+  DOCUMENT_FORMAT_VERSION,
+  getBlock,
+  type BlockDocument,
+} from "@nextlyhq/blocks-engine";
+import { coreBlocks } from "@nextlyhq/blocks-react/blocks";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import * as React from "react";
+import { useForm } from "react-hook-form";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  OPEN_BUILDER_LABEL,
+  SAVE_AND_OPEN_LABEL,
+  SAVE_DRAFT_AND_OPEN_LABEL,
+} from "./PageBuilderCard";
+
+/** Where the builder opens for this file's field: a saved page's `body`. */
+const BUILDER_HREF = "/admin/collections/pages/p1/builder?field=body";
+
+/** Each address the card moved to through the admin's own navigation. */
+const navigated: string[] = [];
+
+/** A saved page around the field, as most cases draw it. */
+const SAVED_PAGE = {
+  kind: "collection" as const,
+  slug: "pages",
+  documentId: "p1",
+};
+/** The document the form holds; a case drawing a new entry drops its id. */
+let identity: {
+  kind: "collection";
+  slug: string;
+  documentId?: string;
+} = SAVED_PAGE;
+
+/** What a document's actions answer a field; none outside a form. */
+interface ActionsStub {
+  actions: { id: string }[];
+  run: (id: string) => Promise<unknown>;
+  saveWithoutPublishing?: () => Promise<unknown>;
+}
+let documentActions: ActionsStub | null = null;
+
+/** What the stored-style read answers with for the test in hand. */
+let siteStyleRead: { data: unknown; isPending: boolean; error: Error | null } =
+  { data: undefined, isPending: false, error: null };
+
+/**
+ * What the component route answers with for the test in hand.
+ *
+ * `undefined` — a site with no components — is what every case not about
+ * instances was written against; the one that is puts a definition here.
+ */
+let componentAnswer: { items: unknown[]; meta: unknown } | undefined;
+
+/** Every plugin route a render actually asked for, in order. */
+const fetched: string[] = [];
+
+/** Asking the stored style again, as the editor does after a save. */
+const refetchStoredStyle = async () => ({ isError: false });
+// The stored site style arrives through the editor's one read, the plugin's
+// route; that read's request is asserted in `site-style-read.test`.
+vi.mock("./site-style-read", () => ({
+  useStoredSiteStyle: () => ({ ...siteStyleRead, refetch: refetchStoredStyle }),
+}));
+
+vi.mock("@nextlyhq/plugin-sdk/admin", () => ({
+  // The canvas's media read, answering nothing: these cases draw no image.
+  // One function for every call, as the admin's own hook keeps it.
+  useMediaResolver: (
+    read => () =>
+      read
+  )(() => Promise.resolve(null)),
+  // The Fallback picker's library search, finding nothing: no case here
+  // opens it. One function for every call, as the admin's own hook keeps it.
+  useMediaSearcher: (
+    search => () =>
+      search
+  )(() => Promise.resolve([])),
+  // Present because the mock REPLACES the module wholesale: an export the
+  // subject imports and this omits is a missing-export error rather than an
+  // unused stub.
+  // The media library, drawn as nothing: these cases never open it.
+  MediaPickerDialog: () => null,
+  loadInlineRichTextEditor: () => new Promise<never>(() => {}),
+  // No preview here: the surrounding editor offers none.
+  useDocumentPreview: () => null,
+  // No one signed in: the editor keeps no preferences.
+  useCurrentUserId: () => null,
+  usePluginClientConfig: () => undefined,
+  // A saved page around the field, so the card has the builder's address to
+  // link to; outside a document, or before a first save, it has none.
+  useDocumentIdentity: () => identity,
+  // The field's address as the admin gives it outside repeaters: its form
+  // path. No case here draws a field inside a repeater's row.
+  useFieldAddress: (_control: unknown, path: string) => ({ address: path }),
+  // Recorded, so a case can tell a plain click handled within the admin from
+  // one left to the browser.
+  navigateTo: (href: string) => {
+    navigated.push(href);
+  },
+  // Nor a language the field could know: the component read asks for the
+  // app default.
+  useDocumentLocale: () => null,
+  /*
+   * The plugin's reads. The component route is the one the resting card makes,
+   * and it is discriminated by PATH so the answer meant for it cannot reach a
+   * read of something else. Everything else answers nothing: `pending: false`
+   * says the read ANSWERED with nothing, which is the site with an empty
+   * library — the state every one of these cases was written against.
+   */
+  usePluginRoute: (args: { path: string; enabled?: boolean }) => {
+    // Modelled the way TanStack treats a disabled query: nothing is requested,
+    // and it stays `pending` because it never ran. A stub that answered anyway
+    // could not tell a read that was made from one that was not.
+    const enabled = args.enabled !== false;
+    if (enabled) fetched.push(args.path);
+    return {
+      data:
+        enabled && args.path === "/library/components"
+          ? componentAnswer
+          : undefined,
+      pending: !enabled,
+      error: null,
+      refetch: () => {},
+    };
+  },
+  useDocumentCheckpoint: () => ({ record: () => {}, clear: () => {} }),
+  useEntryFieldsPanel: () => null,
+  useReportUnsavedWork: () => {},
+  useSuppressAdminChrome: () => {},
+  useBeforeDocumentAction: () => {},
+  // The header's controls the bar places; drawn by the admin, not here.
+  DocumentSaveAndPublish: () => null,
+  useDocumentLifeStage: () => null,
+  useDocumentActions: () => documentActions,
+  useDocumentStatus: () => null,
+  useUpdateSingleDocument: () => ({
+    mutateAsync: async () => ({ success: true }),
+    isPending: false,
+  }),
+}));
+
+// Imported after the mock, which is what makes it take effect.
+const { BlocksField } = await import("./BlocksField");
+
+/*
+ * The block's OWN version rather than a literal: the renderer drops a node
+ * whose version it cannot reconcile, and it drops it SILENTLY — so a pinned
+ * number becomes an empty page the day the block is revised, with this fixture
+ * still reading as correct.
+ */
+const TEXT = coreBlocks.find(block => block.name === "core/text");
+if (!TEXT) throw new Error("core/text is missing from coreBlocks");
+
+const PAGE_TEXT = "The words on this page";
+
+const DOCUMENT = {
+  formatVersion: DOCUMENT_FORMAT_VERSION,
+  kind: "page",
+  nodes: [
+    {
+      id: "a",
+      type: TEXT.name,
+      version: TEXT.version,
+      props: { text: PAGE_TEXT },
+    },
+  ],
+} as unknown as BlockDocument;
+
+const MINIATURE = '[data-slot="page-miniature-surface"]';
+// The preview's part of the entry view. The section list beneath it names each
+// section by its first line, so "is the page's text on screen" has to be asked
+// of the preview alone to say anything about whether the page was drawn.
+const PREVIEW = '[data-slot="page-builder-card"]';
+
+/**
+ * What the card shows: its text, leaving out the folded section list, which
+ * names each section by its first line and is in the page, hidden, until the
+ * fold is opened.
+ */
+function shownText(card: Element | null): string {
+  if (card === null) return "";
+  const shown = card.cloneNode(true) as Element;
+  for (const hidden of shown.querySelectorAll("[hidden]")) hidden.remove();
+  return shown.textContent ?? "";
+}
+
+function drawn(container: HTMLElement): string {
+  return container.querySelector(MINIATURE)?.textContent ?? "";
+}
+
+const DEFINITION_TEXT = "The words inside the component";
+
+/** A page holding ONE instance, and nothing of what the instance draws. */
+const PAGE_WITH_INSTANCE = {
+  formatVersion: DOCUMENT_FORMAT_VERSION,
+  kind: "page",
+  nodes: [
+    {
+      id: "i1",
+      type: COMPONENT_INSTANCE_TYPE,
+      version: 1,
+      props: { componentId: "header" },
+    },
+  ],
+} as unknown as BlockDocument;
+
+/** The definition that instance points at, as the component route answers it. */
+const HEADER_DEFINITION = {
+  formatVersion: DOCUMENT_FORMAT_VERSION,
+  kind: "component",
+  nodes: [
+    {
+      id: "d1",
+      type: TEXT.name,
+      version: TEXT.version,
+      props: { text: DEFINITION_TEXT },
+    },
+  ],
+};
+
+/** A form around the field, since it reads its value through a form control. */
+function Host({
+  readOnly = false,
+  document = DOCUMENT,
+}: {
+  readOnly?: boolean;
+  document?: BlockDocument;
+}): React.JSX.Element {
+  const { control } = useForm({ defaultValues: { body: document } });
+  return <BlocksField name="body" control={control} readOnly={readOnly} />;
+}
+
+beforeEach(() => {
+  siteStyleRead = { data: undefined, isPending: false, error: null };
+  componentAnswer = undefined;
+  fetched.length = 0;
+  navigated.length = 0;
+});
+
+afterEach(() => {
+  cleanup();
+});
+
+describe("the entry form at rest", () => {
+  it("draws the page itself, with nothing registered", () => {
+    // The precondition, OBSERVED rather than assumed. This is the state a cold
+    // page load renders in, and the one a test that opened the editor first
+    // would silently stop testing.
+    expect(getBlock(TEXT.name)).toBeUndefined();
+
+    const { container } = render(<Host />);
+
+    expect(drawn(container)).toContain(PAGE_TEXT);
+  });
+
+  it("draws a placed component from the definition the component route answered", () => {
+    // The card draws the page with the SAME renderer the canvas does, and that
+    // renderer inlines an instance from a map it is handed — with no map, every
+    // instance is the could-not-be-loaded marker. Measured before this read
+    // reached the card: a component placed in the editor drew on the canvas
+    // and became that marker the moment the author pressed Done.
+    componentAnswer = {
+      items: [{ id: "header", title: "Header", document: HEADER_DEFINITION }],
+      meta: { count: 1, truncated: false },
+    };
+
+    const { container } = render(<Host document={PAGE_WITH_INSTANCE} />);
+
+    expect(drawn(container)).toContain(DEFINITION_TEXT);
+  });
+
+  it("draws nothing of a component the route did not answer with", () => {
+    // The control for the case above: the definition's words reach the card
+    // through the read and through nothing else.
+    const { container } = render(<Host document={PAGE_WITH_INSTANCE} />);
+
+    expect(container.querySelector(MINIATURE)).not.toBeNull();
+    expect(drawn(container)).not.toContain(DEFINITION_TEXT);
+  });
+
+  it("does not read the component library for a page that places no component", () => {
+    /*
+     * This surface is EVERY entry form holding a blocks field, and the read is
+     * the whole component tier: one listing over every row, a read of its own
+     * per row to reach the working draft, bounded at sixteen mebibytes. A page
+     * that places no instance resolves nothing against any of it, so the
+     * miniature is identical without it.
+     *
+     * The card must not sit waiting on it either — a read that never runs
+     * never stops pending, and a surface keyed on that would wait forever.
+     */
+    const { container } = render(<Host />);
+
+    expect(fetched).not.toContain("/library/components");
+    expect(drawn(container)).toContain(PAGE_TEXT);
+  });
+
+  it("reads it for a page that places one", () => {
+    // The control: the rule is what the DOCUMENT holds, not a read this
+    // surface never makes.
+    render(<Host document={PAGE_WITH_INSTANCE} />);
+
+    expect(fetched).toContain("/library/components");
+  });
+
+  it("does not put the block's type name on the screen", () => {
+    const { container } = render(<Host />);
+
+    // What stood here before was `core/text` in a mono chip — machinery, where
+    // the author needed the page.
+    expect(container.textContent).not.toContain(TEXT.name);
+  });
+
+  it("draws no page while the site's own style is still arriving", () => {
+    siteStyleRead = { data: undefined, isPending: true, error: null };
+
+    const { container } = render(<Host />);
+
+    expect(container.querySelector(MINIATURE)).toBeNull();
+    expect(shownText(container.querySelector(PREVIEW))).not.toContain(
+      PAGE_TEXT
+    );
+  });
+
+  it("still says what the page holds while the style is arriving", () => {
+    siteStyleRead = { data: undefined, isPending: true, error: null };
+
+    const { container } = render(<Host />);
+
+    expect(container.textContent).toContain("Sections (1)");
+  });
+
+  /*
+   * The failed read, end to end.
+   *
+   * `useSiteStyle` reports the failure and ALSO resolves a style — the config
+   * defaults — with `pending` false. So the field must read the error, or it
+   * draws a page missing this site's stored classes, tokens and block defaults
+   * and looks entirely correct doing it.
+   */
+  it("draws no page when the site-style read failed", () => {
+    siteStyleRead = {
+      data: undefined,
+      isPending: false,
+      error: new Error("site style unavailable"),
+    };
+
+    const { container } = render(<Host />);
+
+    expect(container.querySelector(MINIATURE)).toBeNull();
+    expect(shownText(container.querySelector(PREVIEW))).not.toContain(
+      PAGE_TEXT
+    );
+  });
+
+  it("still offers the way into the builder when that read failed", () => {
+    siteStyleRead = {
+      data: undefined,
+      isPending: false,
+      error: new Error("site style unavailable"),
+    };
+
+    render(<Host />);
+
+    // A link to the builder's own address, not merely something clickable: a
+    // disabled action with a reason beside it is also a control on the card.
+    expect(
+      screen
+        .getByRole("link", { name: OPEN_BUILDER_LABEL })
+        .getAttribute("href")
+    ).toBe(BUILDER_HREF);
+  });
+
+  it("moves to the builder within the admin on a plain click", () => {
+    render(<Host />);
+
+    fireEvent.click(screen.getByRole("link", { name: OPEN_BUILDER_LABEL }), {
+      button: 0,
+    });
+
+    // Through the admin's navigation, which keeps the form and its unsaved
+    // work mounted; a full page load would drop both.
+    expect(navigated).toEqual([BUILDER_HREF]);
+  });
+
+  it("offers no way in when the field cannot be edited", () => {
+    render(<Host readOnly />);
+
+    // Neither the link nor a disabled stand-in for it: there is nothing for
+    // this author to open.
+    expect(screen.queryByRole("link", { name: OPEN_BUILDER_LABEL })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: OPEN_BUILDER_LABEL })
+    ).toBeNull();
+  });
+
+  it("still draws the page when the field cannot be edited", () => {
+    const { container } = render(<Host readOnly />);
+
+    expect(container.querySelector(MINIATURE)).not.toBeNull();
+  });
+});
+
+describe("the entry form on an entry never saved", () => {
+  const NEW_PAGE = { kind: "collection" as const, slug: "pages" };
+
+  beforeEach(() => {
+    identity = NEW_PAGE;
+  });
+
+  afterEach(() => {
+    identity = SAVED_PAGE;
+    documentActions = null;
+  });
+
+  /** The form drawn again at the saved entry's own address. */
+  function drawnAgainAt(documentId: string): void {
+    cleanup();
+    identity = { ...NEW_PAGE, documentId };
+    render(<Host />);
+  }
+
+  it("saves the draft with the form's own save, then opens the builder at the new entry", async () => {
+    const save = vi.fn(async () => ({ ok: true, item: { id: "p9" } }));
+    documentActions = {
+      actions: [{ id: "save" }],
+      run: vi.fn(),
+      saveWithoutPublishing: save,
+    };
+    render(<Host />);
+
+    const action = screen.getByRole("button", {
+      name: SAVE_DRAFT_AND_OPEN_LABEL,
+    }) as HTMLButtonElement;
+    expect(action.disabled).toBe(false);
+    fireEvent.click(action);
+    await waitFor(() => expect(action.disabled).toBe(false));
+
+    expect(save).toHaveBeenCalledTimes(1);
+    // Not from the create screen, which moves to the entry's address itself.
+    expect(navigated).toEqual([]);
+
+    drawnAgainAt("p9");
+    expect(navigated).toEqual([
+      "/admin/collections/pages/p9/builder?field=body",
+    ]);
+  });
+
+  it("leaves the author on the form when the form's rules refuse the save", async () => {
+    const save = vi.fn(async () => ({
+      ok: false,
+      reason: "invalid",
+      message: "Title is required.",
+    }));
+    documentActions = {
+      actions: [{ id: "save" }],
+      run: vi.fn(),
+      saveWithoutPublishing: save,
+    };
+    render(<Host />);
+
+    const action = screen.getByRole("button", {
+      name: SAVE_DRAFT_AND_OPEN_LABEL,
+    }) as HTMLButtonElement;
+    fireEvent.click(action);
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(action.disabled).toBe(false));
+
+    // Still offered, and nothing waits to open: a later save of some other
+    // entry does not carry the author off to the builder.
+    expect(navigated).toEqual([]);
+    drawnAgainAt("p9");
+    expect(navigated).toEqual([]);
+  });
+
+  it("runs the one Save where the collection keeps no drafts, worded for it", async () => {
+    const run = vi.fn(async () => ({ ok: true, item: { id: "t3" } }));
+    documentActions = { actions: [{ id: "save" }], run };
+    render(<Host />);
+
+    const action = screen.getByRole("button", {
+      name: SAVE_AND_OPEN_LABEL,
+    }) as HTMLButtonElement;
+    fireEvent.click(action);
+    await waitFor(() => expect(run).toHaveBeenCalledWith("save"));
+    await waitFor(() => expect(action.disabled).toBe(false));
+
+    drawnAgainAt("t3");
+    expect(navigated).toEqual([
+      "/admin/collections/pages/t3/builder?field=body",
+    ]);
+  });
+
+  it.each([
+    ["a form that offers no save", { actions: [], run: vi.fn() }],
+    // A quick create inside another document's form: that document's actions
+    // are not this one's, and the editor answers none.
+    ["an editor with no actions of its own", null],
+  ])("offers no save in %s, and says when it opens", (_, actions) => {
+    documentActions = actions;
+    render(<Host />);
+
+    expect(
+      screen.queryByRole("button", { name: SAVE_DRAFT_AND_OPEN_LABEL })
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: SAVE_AND_OPEN_LABEL })
+    ).toBeNull();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: OPEN_BUILDER_LABEL,
+        }) as HTMLButtonElement
+      ).disabled
+    ).toBe(true);
+    expect(
+      screen.getByText("Opens in the builder once this entry is saved.")
+    ).toBeDefined();
+  });
+
+  it("says why a save was refused where nothing else on screen does", async () => {
+    const save = vi.fn(async () => ({
+      ok: false,
+      reason: "busy",
+      message: "Another save is still running.",
+    }));
+    documentActions = {
+      actions: [{ id: "save" }],
+      run: vi.fn(),
+      saveWithoutPublishing: save,
+    };
+    render(<Host />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: SAVE_DRAFT_AND_OPEN_LABEL })
+    );
+    expect(
+      await screen.findByText("Another save is still running.")
+    ).toBeDefined();
+  });
+
+  it("leaves the form's own validation errors to the form", async () => {
+    const save = vi.fn(async () => ({
+      ok: false,
+      reason: "invalid",
+      message: "Please fix the errors.",
+    }));
+    documentActions = {
+      actions: [{ id: "save" }],
+      run: vi.fn(),
+      saveWithoutPublishing: save,
+    };
+    render(<Host />);
+
+    const action = screen.getByRole("button", {
+      name: SAVE_DRAFT_AND_OPEN_LABEL,
+    }) as HTMLButtonElement;
+    fireEvent.click(action);
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(action.disabled).toBe(false));
+    expect(screen.queryByText("Please fix the errors.")).toBeNull();
+  });
+});

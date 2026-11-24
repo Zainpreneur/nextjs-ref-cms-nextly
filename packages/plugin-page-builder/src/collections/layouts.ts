@@ -1,0 +1,178 @@
+/**
+ * Named bundles saying which component fills each area around a page.
+ *
+ * A Layout is the only place the header/footer ROLE is stated. The components
+ * it names are ordinary component definitions, so "Landing" pointing at the
+ * same header as "Default" — under a different variant — is one row rather
+ * than a second copy of the header.
+ *
+ * ## Areas are rows, not columns
+ *
+ * `areas` is a repeater of `{ area, component, variant }` rather than a
+ * `header` column beside a `footer` column. Both shapes hold today's two
+ * areas; they differ on the third. An announcement bar or a sidebar is a new
+ * entry in the shared area list under the repeater, and a new column under the
+ * other — so the shape that costs a migration per area is the one that makes
+ * adding an area look expensive, which is the opposite of what this feature is
+ * supposed to make cheap.
+ *
+ * A repeater also gives each row a real component picker in the admin, which a
+ * single JSON column does not, and a relationship the database can see: a
+ * component named by a Layout is a reference rather than an id inside a blob
+ * nothing checks.
+ *
+ * ## There is no `variant` field here yet
+ *
+ * A Layout row says WHICH component fills an area, not which of its variants,
+ * because a component has no variants to name. Nothing declares them, no
+ * registry lists them and the components collection carries no such field, so
+ * a free-text `variant` would accept every string and validate against none —
+ * and a resolver reading one back could not tell a variant that was never
+ * built from a typo. It lands with the declarations it selects from.
+ *
+ * ## A component reference here is enforced by the plugin, not the database
+ *
+ * `areas` is a repeater, and a repeater is stored as ONE JSON column, so the
+ * `relationship` nested in it never becomes a column of its own and emits no
+ * foreign key and no delete policy. The plugin keeps the reference whole from
+ * both ends instead:
+ *
+ * - a component a Layout names can be neither deleted nor unpublished
+ *   (`layout-component-guard.ts`); the refusal names the Layout;
+ * - a Layout write naming a component that does not exist, or one being
+ *   deleted, is refused, naming the area, and judged again inside the write's
+ *   transaction so a delete running at the same moment can't slip between the
+ *   two (`layout-area-guard.ts`);
+ * - an id a Layout already held, left by a delete no check saw, is dropped by
+ *   the Layout's next save of its areas, and until then a reader draws nothing
+ *   in that area.
+ *
+ * ## The site's default is not stored here
+ *
+ * There is no `isDefault` field. The site's default Layout is one reference in
+ * the `page-builder-settings` Single, written only by the make-default route
+ * (and by the repair that seeds a default when none is usable), so exactly one
+ * Layout is the default by construction. A page names its own Layout, or none
+ * for the default; there is no per-collection default.
+ *
+ * @module collections/layouts
+ */
+import type { CollectionConfig, RepeaterFieldValue } from "nextly/config";
+import {
+  defineCollection,
+  relationship,
+  repeater,
+  select,
+  text,
+  textarea,
+} from "nextly/config";
+
+import { LAYOUT_LIST_TOOLS_COMPONENT } from "../builder-view";
+
+import { layoutAreaOptions } from "./areas";
+import { COMPONENTS_SLUG } from "./components";
+
+/** The slug layouts are stored under. */
+export const LAYOUTS_SLUG = "layouts";
+
+/**
+ * Refuse a Layout that fills one area twice.
+ *
+ * Reads the rows rather than counting them: a row whose `area` is still empty
+ * is the author mid-edit, and the `required` on that select is what speaks to
+ * it. Only values actually chosen can collide.
+ */
+function rejectRepeatedAreas(value: RepeaterFieldValue): string | true {
+  const chosen: string[] = [];
+  for (const row of value ?? []) {
+    const area = (row as { area?: unknown }).area;
+    if (typeof area === "string" && area !== "") chosen.push(area);
+  }
+
+  const seen = new Set<string>();
+  for (const area of chosen) {
+    // Names the offending area rather than reporting that "an area" repeats.
+    // The rows carry no visible index, so a message without the name leaves
+    // the author scanning a list to find which two they have to reconcile.
+    if (seen.has(area)) return `Two rows both fill the ${area} area`;
+    seen.add(area);
+  }
+  return true;
+}
+
+/**
+ * The plugin-owned `layouts` collection.
+ *
+ * Holds no blocks field. A Layout is a set of REFERENCES rather than a
+ * document — nothing about it is authored on a canvas — so giving it a tree
+ * would offer an editor for content it does not have.
+ */
+export function layoutsCollection(): CollectionConfig {
+  return defineCollection({
+    slug: LAYOUTS_SLUG,
+    labels: { singular: "Header & footer set", plural: "Header & footer" },
+    fields: [
+      text({ name: "title", required: true }),
+      // Kept once for every language: an identifier the set's write routes
+      // and other documents name, unique on the set's own table.
+      text({ name: "slug", localized: false, required: true, unique: true }),
+      textarea({ name: "description" }),
+      repeater({
+        name: "areas",
+        // An area is a POSITION, so two rows claiming one is not a richer
+        // layout — it is a question with two answers. Without this the write
+        // succeeds and the ambiguity is handed to the resolver, which will
+        // pick whichever row it happens to reach first and render a second
+        // header on every page carrying the Layout. Refused at the write
+        // instead, where the author is still looking at the two rows.
+        validate: rejectRepeatedAreas,
+        fields: [
+          select({
+            name: "area",
+            required: true,
+            options: layoutAreaOptions(),
+          }),
+          relationship({
+            name: "component",
+            required: true,
+            relationTo: COMPONENTS_SLUG,
+          }),
+        ],
+      }),
+    ],
+    // A Layout decides what wraps every page assigned to it, so publishing one
+    // is a site-wide act and gets the same draft-then-publish step a component
+    // does.
+    status: true,
+    versions: { drafts: true },
+    // Opted out of AUTOMATIC navigation, because this plugin declares its own
+    // menu entry for the store and two sources listing one screen is the
+    // problem rather than the belt-and-braces it looks like.
+    //
+    // ONE automatic source reaches this collection, and `hidden` is what
+    // excludes it: `isInCollectionsSection` (admin `lib/sidebar-landing`)
+    // admits every collection that is not hidden and claims no sidebar group.
+    //
+    // The other automatic source, `DynamicPluginNav`, lists only collections
+    // marked `admin.isPlugin`, which is a presentation flag this package never
+    // sets — so it never reaches these at all. That flag is also what an
+    // earlier note here conflated with PLACEMENT: a plugin declaring
+    // `placement` does move its collections out of the Plugins panel, through
+    // `isCollectionPlacedElsewhere`, but only for collections that opted into
+    // being listed there in the first place. Ownership and placement are
+    // separate questions, which is the distinction `collection-placement.ts`
+    // exists to draw.
+    //
+    // Hidden costs nothing else: the collection keeps its URL, its API and its
+    // permissions, and only stops being offered by navigation nobody asked
+    // for — this plugin's own menu links to it explicitly.
+    admin: {
+      useAsTitle: "title",
+      hidden: true,
+      // Above the list: "Import from file", where a file exported from
+      // another site is brought in after its preview, and the rows' "Make
+      // site default", the one place the site default is chosen.
+      components: { BeforeListTable: LAYOUT_LIST_TOOLS_COMPONENT },
+    },
+  });
+}

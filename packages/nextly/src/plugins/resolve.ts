@@ -1,0 +1,431 @@
+import { MUST_CHANGE_PASSWORD_CHALLENGE } from "../auth/pipeline/pending-token";
+import { collectPluginAuditKinds } from "../domains/audit/plugin-audit-kinds";
+import {
+  assertModuleKeysFit,
+  assertModuleNames,
+  assertModulesInNameOrder,
+  assertModuleSchemaVersions,
+  assertUniqueModuleNames,
+  orderedMigrations,
+} from "../domains/schema/migrate/plugin/plugin-migration";
+import { assertSchemaVersionDeclarable } from "../domains/schema/ownership/schema-version-check";
+import {
+  collectPluginWebhookEventTypes,
+  publishWebhookEventTypes,
+} from "../domains/webhooks/event-type-registry";
+import type { NextlyError } from "../errors/nextly-error";
+import { isReservedEventName } from "../events/event-bus";
+
+import { contributedListFilters } from "./admin-filters";
+import { contributedAdminContributions } from "./admin-place-contributions";
+import { collectAdminPlaces } from "./admin-places-registry";
+import { validateCapabilities, validateRequires } from "./capabilities";
+import { assertDocumentSurfaces } from "./document-surfaces";
+import { collectHookPoints, publishHookPoints } from "./hook-points";
+import { assertLimitRules } from "./limits/limit-rules";
+import {
+  assertConsentDeclaredBeforeSetup,
+  assertPluginConsent,
+  copyPluginDefinitions,
+  decidePluginGrants,
+  NO_PLUGIN_CONSENT,
+  type PluginConsent,
+  type PluginGrants,
+  type PreSetupPlugin,
+  recordBootName,
+  recordPreSetupPlugins,
+} from "./plugin-consent";
+import type { PluginDefinition } from "./plugin-context";
+import { isInPluginNamespace, pluginAdminSlug } from "./plugin-slug";
+import { collectPluginTranslations } from "./plugin-translations";
+import {
+  collectPrincipalKinds,
+  publishPrincipalKinds,
+} from "./principals/registry";
+import { assertNoRemovedWidgetKeys } from "./removed-widget-keys";
+import { resolutionError } from "./resolution-error";
+import { assertSettingsPermissionsGuardSettings } from "./settings-permission";
+import { topoSortPlugins } from "./topo-sort";
+import { assertClientConfigs } from "./validate-client-config";
+import { assertDocumentViews } from "./validate-document-views";
+import { assertEmailTemplates } from "./validate-email-templates";
+import { validatePluginMenus } from "./validate-menus";
+import { validatePluginNames } from "./validate-names";
+import { validatePluginSlugs } from "./validate-slugs";
+import { validatePluginStartupReads } from "./validate-startup-reads";
+import { validatePluginVersions } from "./validate-versions";
+
+export interface ResolvePluginsOptions {
+  /**
+   * Concrete running core version, e.g. "0.0.2-alpha.21". Supplied by the caller;
+   * P1 wires the runtime source (CLI + register).
+   */
+  coreVersion: string;
+  /**
+   * What the app lists plugins for (`pluginConsentFromConfig`). Read from the
+   * config as the app wrote it, never from one a `setup` transformer
+   * returned. Absent, nothing is listed, so a plugin declaring a capability
+   * that needs the app's consent is refused.
+   */
+  consent?: PluginConsent;
+}
+
+export interface ResolveTransformedPluginsOptions
+  extends ResolvePluginsOptions {
+  /**
+   * The plugin list as configured, recorded before any `setup` transformer
+   * ran (`resolveDeclaredPlugins`). A capability that needs the app's consent
+   * is held on the transformed list only by a plugin that declared it here
+   * under the same name.
+   */
+  declared: readonly PreSetupPlugin[];
+}
+
+/**
+ * Every check that must hold for the plugin list a boot actually USES.
+ *
+ * Separated from `resolvePlugins` because the list can change after it runs: a
+ * `setup` transformer may add, rename or replace entries, and everything from
+ * that point on consumes the transformed list. Re-running this against it is
+ * what stops a transformer-introduced declaration going unchecked —
+ * `assertSecretPaths` most of all, since a secret path that never matches
+ * means the credential it names is stored as ordinary text, with nothing at
+ * runtime to say so.
+ *
+ * Idempotent, so calling it twice costs a second pass and changes nothing.
+ * Version compatibility and the topological sort are NOT here because they
+ * live in `resolvePlugins`, which is what a caller holding a TRANSFORMED
+ * list should re-run: a replacement or addition can change its declared
+ * version and dependencies, so those checks travel with the list that will
+ * actually initialize.
+ */
+export function assertPluginManifests(plugins: PluginDefinition[]): void {
+  // Before any surface reads the manifest. A capability that is misspelled or
+  // an outbound host that is not a hostname would otherwise be discovered as a
+  // runtime surface quietly not existing, which reads as a bug in the plugin's
+  // own code rather than in its declaration.
+  validateCapabilities(plugins);
+  validateRequires(plugins);
+  // Names and collisions, before anything can register a handler at a seam
+  // that two plugins both believe they own — and PUBLISHED, so the seams can
+  // consult what was declared. Discarding it left every declared payload
+  // schema checking nothing.
+  publishHookPoints(collectHookPoints(plugins));
+  // Kinds of signed-in person, checked and published for the same reasons:
+  // a kind with no usable resolver, or one two plugins both name, would
+  // otherwise surface as a route that refuses everyone, and recognition runs
+  // long after this with only the kind's name to go on.
+  publishPrincipalKinds(collectPrincipalKinds(plugins));
+  // Limit rules, for the same reason: a rule outside its bounds would
+  // otherwise surface as an error inside the work it was meant to guard.
+  assertLimitRules(plugins);
+  // Audit kinds, for the reason hook point names are checked above: a kind
+  // outside the plugin's prefix used to be dropped where it was collected, so
+  // the application booted with `ctx.audit` present and every write of that
+  // kind discarded at runtime. The operator is then missing the trail the
+  // manifest said it would keep, and nothing says so until it is needed.
+  // The SAME call the provider makes, so resolution cannot accept a
+  // declaration the provider would refuse.
+  for (const plugin of plugins) {
+    // Disabled plugins are skipped, as `collectHookPoints` skips them: a
+    // plugin that is off contributes no `ctx.audit`, so there is no trail for
+    // a bad declaration to be missing from. Refusing it would let something
+    // nobody is running stop the application from starting at all.
+    if (plugin.enabled === false) continue;
+    const declared = plugin.contributes?.audit?.kinds;
+    if (!declared) continue;
+    collectPluginAuditKinds(
+      pluginAdminSlug(plugin.name),
+      declared,
+      plugin.name
+    );
+  }
+  // Before anything reads it. A `clientConfig` that cannot be delivered is a
+  // configuration error like an incompatible version, so it belongs with the
+  // other fail-fast checks rather than surfacing when the admin first asks for
+  // its metadata and losing the whole branding response with it.
+  assertClientConfigs(plugins);
+  // Beside it: a plugin still adding widgets or widget sources through a key
+  // Nextly no longer reads is refused here, by name, rather than having its
+  // cards silently absent.
+  assertNoRemovedWidgetKeys(plugins);
+  // And the document views: two screens on one address would leave the admin
+  // drawing whichever it reached first, and a transformer can add either.
+  assertDocumentViews(plugins);
+  // And the overrides of a document's actions and the sections added to its
+  // panel: an action two plugins override would be drawn one of their ways,
+  // silently.
+  assertDocumentSurfaces(plugins);
+  // Two plugins sharing an admin slug share an address, and nothing downstream
+  // can detect it: every lookup along that address returns a plugin, which is
+  // what a correct lookup returns. Registration is where the ambiguity is still
+  // observable.
+  validatePluginSlugs(plugins);
+  // A menu item naming a collection its plugin does not contribute is the same
+  // kind of mistake, and is equally unobservable downstream: the sidebar hides
+  // the item from everyone without the never-seeded permission, which is what
+  // a role legitimately lacking access looks like.
+  validatePluginMenus(plugins);
+  // And a page's startup reads: one the startup request cannot carry is left
+  // out of the prebuilt admin page, and the page is only slower, with nothing
+  // to say why.
+  validatePluginStartupReads(plugins);
+  // A challenge under core's own password-change id would be offered in
+  // place of that step, and two under one id leave the registry unable to say
+  // which one a pending token names. The registry refuses both too, but only
+  // when the auth dependencies are built — on every `/auth/*` request, each of
+  // which then failed. Refused here, they fail the boot instead.
+  assertChallengeIds(plugins);
+  // A declared event under a core prefix, or outside the plugin's own
+  // namespace, boots, appears in the generated types, and is then refused on
+  // every emit — the per-plugin bus lets a plugin speak neither for core nor
+  // for another plugin. Refused here, the mistake is named at boot.
+  assertPluginEventNames(plugins);
+  // Webhook event types, checked and published as hook points are: a type
+  // outside the plugin's namespace, one of core's or one declared twice would
+  // otherwise be offered to subscribers as an event nothing may send. The
+  // published list is the one every subscription and the admin's form read.
+  publishWebhookEventTypes(collectPluginWebhookEventTypes(plugins));
+  // Translations, checked here and read again by the admin metadata: a key
+  // outside the plugin's namespace, or one another plugin declares, would
+  // otherwise show one plugin's text in another's screen, or none at all.
+  collectPluginTranslations(plugins);
+  // A settings permission with no settings behind it guards nothing, and
+  // reads as though the plugin's credentials were kept to a narrower role.
+  // Whether the permission is the plugin's own is asked once the entities
+  // are known: `assertSettingsPermissionsOwned`, at boot.
+  assertSettingsPermissionsGuardSettings(plugins);
+  // An email template with both HTML and blocks, or neither, would be refused
+  // by the owner registry with only a log line, and its sends would fail
+  // later. Refused here, the boot names the plugin and the template.
+  assertEmailTemplates(plugins);
+  // Admin places, checked as hook points are: a place in another plugin's
+  // namespace or core's, or one declared twice, would otherwise surface as a
+  // contribution rendered in the wrong place or nowhere. Last, so two plugins
+  // sharing a slug are refused for the slug before their places collide on
+  // it. Checked only: nothing keeps the result, and a reader computes the
+  // places from the plugin list the app committed.
+  collectAdminPlaces(plugins);
+  // Entry-list filters, for the same reason: a malformed one would
+  // otherwise be offered in the toolbar and fail when chosen. Checked only;
+  // the admin meta is built from the same reduction.
+  contributedListFilters(plugins);
+  // Each place's contributions: checked whole and ordered, so one that cannot
+  // be ordered stops the app here rather than drawing in no order.
+  contributedAdminContributions(plugins);
+}
+
+/**
+ * Refuse a plugin event declared under a prefix core reserves, or outside the
+ * plugin's own namespace — the two names the per-plugin bus refuses to emit —
+ * and one whose `durable` flag is not a boolean.
+ */
+function assertPluginEventNames(plugins: PluginDefinition[]): void {
+  for (const plugin of plugins) {
+    if (plugin.enabled === false) continue;
+    for (const event of plugin.contributes?.events ?? []) {
+      assertPluginEvent(plugin.name, event);
+    }
+  }
+}
+
+/** One declared event's checks, for `assertPluginEventNames`. */
+function assertPluginEvent(
+  pluginName: string,
+  event: { name: string; durable?: unknown }
+): void {
+  if (isReservedEventName(event.name)) {
+    throw resolutionError(
+      "plugin-event-name-reserved",
+      `Plugin "${pluginName}" declares the event "${event.name}", whose prefix core reserves for its own events.`,
+      { plugin: pluginName, event: event.name }
+    );
+  }
+  if (!isInPluginNamespace(pluginName, event.name)) {
+    const prefix = `${pluginAdminSlug(pluginName)}.`;
+    throw resolutionError(
+      "plugin-event-outside-namespace",
+      `Plugin "${pluginName}" declares the event "${event.name}", which must start with "${prefix}".`,
+      { plugin: pluginName, event: event.name, expectedPrefix: prefix }
+    );
+  }
+  // `true` or `false` only: anything else reads as durable to one check and
+  // not to another, and whether an event survives a restart is not a question
+  // two readers may answer differently.
+  if (event.durable !== undefined && typeof event.durable !== "boolean") {
+    throw resolutionError(
+      "plugin-event-durable-invalid",
+      `Plugin "${pluginName}" declares the event "${event.name}" with durable set to something other than true or false.`,
+      { plugin: pluginName, event: event.name }
+    );
+  }
+}
+
+/**
+ * Refuse a plugin challenge declared under an id core reserves, or under an
+ * id another enabled challenge already declares. Enabled plugins only, the
+ * set the auth registry is built from.
+ */
+function assertChallengeIds(plugins: PluginDefinition[]): void {
+  const owners = new Map<string, string>();
+  for (const plugin of plugins) {
+    if (plugin.enabled === false) continue;
+    for (const challenge of plugin.contributes?.auth?.challenges ?? []) {
+      if (challenge.id === MUST_CHANGE_PASSWORD_CHALLENGE) {
+        throw resolutionError(
+          "plugin-challenge-id-reserved",
+          `Plugin "${plugin.name}" declares the challenge id "${challenge.id}", which core reserves for its forced password change.`,
+          { plugin: plugin.name, challengeId: challenge.id }
+        );
+      }
+      const owner = owners.get(challenge.id);
+      if (owner !== undefined) {
+        throw duplicateChallengeIdError(challenge.id, owner, plugin.name);
+      }
+      owners.set(challenge.id, plugin.name);
+    }
+  }
+}
+
+/** The refusal for a challenge id declared twice, naming both declarers. */
+function duplicateChallengeIdError(
+  challengeId: string,
+  first: string,
+  second: string
+): NextlyError {
+  return resolutionError(
+    "plugin-challenge-id-duplicate",
+    first === second
+      ? `Plugin "${first}" declares the challenge id "${challengeId}" more than once.`
+      : `Plugins "${first}" and "${second}" both declare the challenge id "${challengeId}".`,
+    { plugins: [first, second], challengeId }
+  );
+}
+
+/**
+ * The single shared plugin resolver used by both the CLI and the runtime.
+ * Validates compatibility, then returns dependency order. Fail-fast.
+ *
+ * Pure, so the boot (`register.ts`) and the CLI (`config-loader.ts`) resolve a
+ * plugin list the same way.
+ */
+export function resolvePlugins(
+  plugins: PluginDefinition[],
+  opts: ResolvePluginsOptions
+): PluginDefinition[] {
+  // First, because a name is the key every later record of the plugin is
+  // stored under, and one that is the site's own permission owner (`app`)
+  // must never get as far as being stored. A `setup` transformer's list is
+  // resolved here again, so a plugin it adds or renames is refused the same.
+  validatePluginNames(plugins);
+  validatePluginVersions(plugins, opts.coreVersion);
+  assertPluginManifests(plugins);
+  // After the manifests' shape is known good, so a capability is read from a
+  // declaration that parsed. Here rather than in `assertPluginManifests`
+  // because it judges the manifest against the app's config, which that
+  // check never sees.
+  assertPluginConsent(plugins, opts.consent ?? NO_PLUGIN_CONSENT);
+  // Last, because it reads what the earlier validators already accepted: a
+  // declared schemaVersion must be one the plugin's own migrations reach.
+  validatePluginMigrations(plugins);
+  return topoSortPlugins(plugins);
+}
+
+/**
+ * The configured plugins, resolved, and the record of them the checks after
+ * the `setup` transformers judge against.
+ *
+ * Resolved from copies (`copyPluginDefinitions`), so the list the boot or CLI
+ * goes on to use shares no object with the app's config, and recorded
+ * (`recordPreSetupPlugins`) before any transformer can run. The boot and the
+ * CLI both start from this.
+ */
+export function resolveDeclaredPlugins(
+  plugins: readonly PluginDefinition[],
+  opts: ResolvePluginsOptions
+): { plugins: PluginDefinition[]; preSetup: readonly PreSetupPlugin[] } {
+  const resolved = resolvePlugins(copyPluginDefinitions(plugins), opts);
+  return { plugins: resolved, preSetup: recordPreSetupPlugins(resolved) };
+}
+
+/**
+ * A config whose `setup` transformers have run, with its plugin list resolved
+ * again in full.
+ *
+ * A transformer may add, rename or replace entries in `plugins`, and
+ * everything after it consumes the transformed config. Resolving the whole
+ * list again — versions, dependencies, cycles, every manifest assertion and
+ * the topological sort — makes a transformer-added plugin as checked as a
+ * declared one. The boot and the CLI both call this, so a configuration one
+ * of them accepts is one the other accepts too. The grants the resolved list
+ * holds (`decidePluginGrants`) are returned beside it.
+ */
+export function resolveTransformedPlugins<
+  C extends { plugins?: PluginDefinition[] },
+>(
+  config: C,
+  opts: ResolveTransformedPluginsOptions
+): { config: C & { plugins: PluginDefinition[] }; grants: PluginGrants } {
+  // Copied first, so every check below and everything after it reads one
+  // snapshot of what the transformers returned, and an accessor on a
+  // transformer-built definition is read once rather than at each check.
+  const plugins = resolvePlugins(
+    copyPluginDefinitions(config.plugins ?? []),
+    opts
+  );
+  assertConsentDeclaredBeforeSetup(opts.declared, plugins);
+  // The name is part of the verdict, so it is recorded with it: `init` runs
+  // as a method on the definition, and a plugin could rename itself onto a
+  // listed one there — including from a context built after `init`, such as
+  // the auth bridge's hook contexts. Recording the boot-time name (rather
+  // than freezing the property) means every later grant check answers for
+  // the plugin the boot resolved while an `init` assigning its own name —
+  // even idempotently — touches its own definition harmlessly, as any
+  // lifecycle method may. `bootNameOf` reads the record.
+  for (const plugin of plugins) {
+    recordBootName(plugin);
+  }
+  // Decided here, once, from the copies every check above read: the grants
+  // travel beside the config to whatever builds a plugin context, and a
+  // manifest changed after this point grants nothing.
+  return {
+    config: { ...config, plugins },
+    grants: decidePluginGrants(plugins),
+  };
+}
+
+/**
+ * A plugin's migration modules must have names the ledger can attribute to
+ * it, and a declared `schemaVersion` must be one its own migrations reach,
+ * or the boot check could never pass — caught where the manifest is read so
+ * the failure names the declaration rather than arriving later as a
+ * production boot refusal nothing explains.
+ */
+function validatePluginMigrations(plugins: PluginDefinition[]): void {
+  for (const plugin of plugins) {
+    // Before the versions are read in name order: the name is also the
+    // module's ledger key, and one the ledger cannot attribute to its plugin,
+    // cannot store, or that another of its modules shares, is refused before
+    // anything runs: wherever the configuration loads, at boot and in every
+    // CLI command, and not only when `nextly migrate` reaches the modules.
+    // Each module's version is checked the same way, before anything
+    // compares versions.
+    const migrations = plugin.contributes?.schema?.migrations ?? [];
+    assertModuleNames(plugin.name, migrations);
+    assertModuleKeysFit(plugin.name, migrations);
+    assertUniqueModuleNames(plugin.name, migrations);
+    // In the order of their names, the order they run in: a list declared
+    // otherwise is refused here rather than re-sorted in silence.
+    assertModulesInNameOrder(plugin.name, migrations);
+    assertModuleSchemaVersions(plugin.name, migrations);
+    assertSchemaVersionDeclarable({
+      pluginName: plugin.name,
+      declaredVersion: plugin.schemaVersion,
+      // In run order: the version the last module to run carries is the one
+      // the database ends at.
+      migrationVersions: orderedMigrations(migrations).map(
+        m => m.schemaVersion
+      ),
+    });
+  }
+}

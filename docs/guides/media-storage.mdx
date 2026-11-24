@@ -1,0 +1,777 @@
+---
+title: Media & Storage
+description: Configure storage adapters (local disk, S3, Vercel Blob, Uploadthing), and how uploaded images, their thumbnails and their focus points are stored.
+---
+
+Nextly's media system is plugin-based. The default is local disk storage -- zero configuration, files written to `./public/uploads/` and served at `/uploads/...` by your app. For production deployments where the filesystem isn't durable (Vercel, container runtimes), opt into S3, Vercel Blob, or Uploadthing.
+
+## Storage adapters at a glance
+
+| Adapter                          | Services                                                           | When to use                          |
+|----------------------------------|--------------------------------------------------------------------|--------------------------------------|
+| Built-in (local disk)            | Local filesystem under `./public/uploads/`                          | Development, single-server self-host with a persistent disk |
+| `@nextlyhq/storage-s3`           | AWS S3, Cloudflare R2, MinIO, DigitalOcean Spaces, Supabase Storage | Most production deployments          |
+| `@nextlyhq/storage-vercel-blob`  | Vercel Blob                                                         | Vercel deployments                    |
+| `@nextlyhq/storage-uploadthing`  | Uploadthing                                                         | Uploadthing users                     |
+
+Storage adapters are plugins added to the `storage` array in `defineConfig()`. Each plugin declares which collections it handles, and the `MediaStorage` manager routes uploads accordingly:
+
+```
+Upload Request -> MediaStorage -> resolve collection -> plugin adapter -> storage backend
+```
+
+## Default: local disk
+
+When no `storage` plugin is configured, Nextly uses the built-in local-disk adapter. Files are stored under `./public/uploads/{year}/{month}/` and served at `/uploads/...`. On first upload, Nextly auto-adds `public/uploads/` to your `.gitignore`.
+
+This is what makes local development work without setting up any cloud credentials.
+
+### How local uploads are served
+
+Next.js serves files in `public/` as static assets, but `next start` reads that folder once, when it starts, and serves only the files that were there. A file uploaded after a production server started is not among them. So a new project ships a route at `src/app/uploads/[...path]/route.ts`:
+
+```typescript title="src/app/uploads/[...path]/route.ts"
+import { createUploadsHandlers } from "nextly/api/uploads";
+
+import config from "@nextly-config";
+
+const handlers = createUploadsHandlers({ config });
+
+export const GET = handlers.GET;
+export const HEAD = handlers.HEAD;
+```
+
+Next.js checks `public/` before any route, so it still serves every file it has, and the route serves the rest, at the same URL. Under `next dev` Next.js reads `public/` on every request and serves them all. Either way an upload's URL works the moment the upload finishes, and it doesn't change.
+
+The route:
+
+- serves only from the local adapter's folder, and only below its `baseUrl`. It answers 404 for a path that leaves the folder, for a link inside it that points outside, and for a name starting with `.`. With S3, Vercel Blob or UploadThing holding media it answers 404 for everything, and their URLs don't change.
+- sets each file's type from its extension, with `X-Content-Type-Options: nosniff`. An SVG gets a `Content-Security-Policy` that blocks scripts, and a type Nextly doesn't accept by default downloads as `application/octet-stream`.
+- streams the file rather than reading it into memory, and answers `Range` requests, so video and audio can seek.
+- sends an `ETag` and `Last-Modified`, and answers `304` to a client whose copy is current. Uploaded files get unique names that are never rewritten, so those are cached as `public, max-age=31536000, immutable`. A file you put in the folder yourself is revalidated on each use.
+- needs no sign-in: uploads are public, as they are when Next.js serves them. It lives outside `/admin`, so the admin's session cookie and the admin API's rate limits don't apply to it.
+
+Files Next.js serves itself, under `next dev` or once a production server restarts, get Next.js's static headers instead: `Cache-Control: public, max-age=0` and no `Content-Security-Policy`. An uploaded SVG is sanitized when it's uploaded, either way.
+
+If you change `baseUrl`, move the route folder to match: for `baseUrl: "/media"`, put it at `src/app/media/[...path]/route.ts`. With an absolute `baseUrl` on another host, the route has nothing to serve.
+
+> **Note:** A project created before this route existed doesn't have it. Add the file above (in an app without a `src/` folder, at `app/uploads/[...path]/route.ts`, importing your `nextly.config` by a relative path if you have no `@nextly-config` alias). Until you do, a production server answers 404 for an upload until it restarts, and logs a warning naming the file the first time it happens.
+
+> **Warning:** Local disk storage needs a disk that persists, on one server. It doesn't survive serverless restarts. If you deploy to Vercel, AWS Lambda, Cloudflare Workers, or any platform with ephemeral filesystems, switch to a cloud adapter before going to production.
+
+### Explicit configuration
+
+If you want to customise the local paths (e.g. write to `./public/media/` instead), import `localStorage` and add it explicitly:
+
+```typescript
+// nextly.config.ts
+import { defineConfig } from "nextly/config";
+import { localStorage } from "nextly/storage";
+
+export default defineConfig({
+  storage: [
+    localStorage({
+      basePath: "./public/media", // default: "./public/uploads"
+      baseUrl: "/media",          // default: "/uploads"
+      collections: { media: true },
+    }),
+  ],
+});
+```
+
+## Auto-detection (zero config)
+
+Use `getStorageFromEnv()` to let Nextly pick a storage adapter based on environment variables. Useful for moving between dev (no env vars -> local disk) and production (set the env vars and the right adapter is loaded automatically).
+
+```typescript
+// nextly.config.ts
+import { defineConfig } from "nextly/config";
+import { getStorageFromEnv } from "nextly/storage";
+
+export default defineConfig({
+  storage: await getStorageFromEnv(),
+});
+```
+
+Detection cascade (first match wins):
+
+1. `BLOB_READ_WRITE_TOKEN` set -> **Vercel Blob**.
+2. `S3_BUCKET` (+ `S3_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) set -> **S3** (also covers R2, MinIO, Supabase Storage, DigitalOcean Spaces).
+3. `UPLOADTHING_TOKEN` set -> **Uploadthing**.
+4. None of the above -> **Local disk** (`./public/uploads/`).
+
+If an env var is set but the matching adapter package isn't installed, Nextly logs a warning and falls back to the next cascade tier.
+
+## S3 adapter
+
+Works with any S3-compatible service. Install:
+
+<Tabs items={["pnpm", "npm", "yarn", "bun"]}>
+<Tab value="pnpm">
+```bash
+pnpm add @nextlyhq/storage-s3
+```
+</Tab>
+<Tab value="npm">
+```bash
+npm install @nextlyhq/storage-s3
+```
+</Tab>
+<Tab value="yarn">
+```bash
+yarn add @nextlyhq/storage-s3
+```
+</Tab>
+<Tab value="bun">
+```bash
+bun add @nextlyhq/storage-s3
+```
+</Tab>
+</Tabs>
+
+### AWS S3
+
+```typescript
+// nextly.config.ts
+import { defineConfig } from "nextly/config";
+import { s3Storage } from "@nextlyhq/storage-s3";
+
+export default defineConfig({
+  storage: [
+    s3Storage({
+      bucket: process.env.S3_BUCKET!,
+      region: process.env.S3_REGION!,
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+      collections: { media: true },
+    }),
+  ],
+});
+```
+
+### Cloudflare R2
+
+R2 needs a custom endpoint and a public URL (R2 buckets don't have default public URLs):
+
+```typescript
+s3Storage({
+  bucket: process.env.R2_BUCKET!,
+  region: "auto",
+  accessKeyId: process.env.R2_ACCESS_KEY_ID!,
+  secretAccessKey: process.env.R2_SECRET_ACCESS_KEY!,
+  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  publicUrl: process.env.R2_PUBLIC_URL,
+  collections: { media: true },
+})
+```
+
+### MinIO (self-hosted)
+
+MinIO requires path-style URLs:
+
+```typescript
+s3Storage({
+  bucket: "my-bucket",
+  region: "us-east-1",
+  accessKeyId: process.env.MINIO_ACCESS_KEY!,
+  secretAccessKey: process.env.MINIO_SECRET_KEY!,
+  endpoint: "http://localhost:9000",
+  forcePathStyle: true,
+  collections: { media: true },
+})
+```
+
+### DigitalOcean Spaces
+
+Spaces is S3-compatible. Use the regional endpoint:
+
+```typescript
+s3Storage({
+  bucket: process.env.SPACES_BUCKET!,
+  region: process.env.SPACES_REGION!,
+  accessKeyId: process.env.SPACES_KEY!,
+  secretAccessKey: process.env.SPACES_SECRET!,
+  endpoint: `https://${process.env.SPACES_REGION}.digitaloceanspaces.com`,
+  collections: { media: true },
+})
+```
+
+### Supabase Storage
+
+Supabase Storage exposes an S3-compatible endpoint. No separate adapter needed:
+
+```typescript
+s3Storage({
+  bucket: "my-bucket",
+  region: "us-east-1",
+  accessKeyId: process.env.SUPABASE_S3_ACCESS_KEY!,
+  secretAccessKey: process.env.SUPABASE_S3_SECRET_KEY!,
+  endpoint: `https://${process.env.SUPABASE_PROJECT_ID}.supabase.co/storage/v1/s3`,
+  forcePathStyle: true,
+  collections: { media: true },
+})
+```
+
+### S3 configuration reference
+
+| Option              | Type      | Default                          | Description                                                            |
+|---------------------|-----------|----------------------------------|------------------------------------------------------------------------|
+| `bucket`            | `string`  | required                         | S3 bucket name.                                                        |
+| `region`            | `string`  | required                         | AWS region (use `"auto"` for R2).                                      |
+| `accessKeyId`       | `string`  | optional                         | Access key. Falls back to `AWS_ACCESS_KEY_ID` env var.                 |
+| `secretAccessKey`   | `string`  | optional                         | Secret key. Falls back to `AWS_SECRET_ACCESS_KEY` env var.             |
+| `endpoint`          | `string`  | --                               | Custom endpoint for S3-compatible services (R2, MinIO, Spaces, etc.).  |
+| `publicUrl`         | `string`  | --                               | Public CDN / custom domain URL for serving files.                      |
+| `forcePathStyle`    | `boolean` | `false`                          | Use path-style URLs (`https://endpoint/bucket/key`). Required for MinIO and Supabase. |
+| `acl`               | `string`  | `"private"`                      | Object ACL: `"private"`, `"public-read"`, `"bucket-owner-full-control"`, etc. |
+| `signedDownloads`   | `boolean` | `false`                          | Issue signed URLs for downloads of private objects.                     |
+| `signedUrlExpiresIn`| `number`  | `3600`                           | Signed URL expiry in seconds.                                          |
+| `cacheControl`      | `string`  | `"public, max-age=31536000"`     | Cache-Control header on uploaded objects.                              |
+| `contentDisposition`| `string`  | --                               | `"inline"` or `"attachment"`. Sets the Content-Disposition header.     |
+
+> **Note:** Default ACL is `"private"`. If you want objects to be world-readable directly from S3 (rather than via signed URLs), set `acl: "public-read"` and verify your bucket policy permits it. R2 ignores ACL settings -- configure public access in the R2 dashboard instead.
+
+## Vercel Blob adapter
+
+Optimised for Vercel deployments with built-in CDN. Install:
+
+<Tabs items={["pnpm", "npm", "yarn", "bun"]}>
+<Tab value="pnpm">
+```bash
+pnpm add @nextlyhq/storage-vercel-blob
+```
+</Tab>
+<Tab value="npm">
+```bash
+npm install @nextlyhq/storage-vercel-blob
+```
+</Tab>
+<Tab value="yarn">
+```bash
+yarn add @nextlyhq/storage-vercel-blob
+```
+</Tab>
+<Tab value="bun">
+```bash
+bun add @nextlyhq/storage-vercel-blob
+```
+</Tab>
+</Tabs>
+
+```typescript
+// nextly.config.ts
+import { defineConfig } from "nextly/config";
+import { vercelBlobStorage } from "@nextlyhq/storage-vercel-blob";
+
+export default defineConfig({
+  storage: [
+    vercelBlobStorage({
+      token: process.env.BLOB_READ_WRITE_TOKEN,
+      collections: { media: true },
+    }),
+  ],
+});
+```
+
+If `token` is omitted, the adapter reads `BLOB_READ_WRITE_TOKEN` from the environment automatically.
+
+## Uploadthing adapter
+
+Install:
+
+<Tabs items={["pnpm", "npm", "yarn", "bun"]}>
+<Tab value="pnpm">
+```bash
+pnpm add @nextlyhq/storage-uploadthing
+```
+</Tab>
+<Tab value="npm">
+```bash
+npm install @nextlyhq/storage-uploadthing
+```
+</Tab>
+<Tab value="yarn">
+```bash
+yarn add @nextlyhq/storage-uploadthing
+```
+</Tab>
+<Tab value="bun">
+```bash
+bun add @nextlyhq/storage-uploadthing
+```
+</Tab>
+</Tabs>
+
+```typescript
+// nextly.config.ts
+import { defineConfig } from "nextly/config";
+import { uploadthingStorage } from "@nextlyhq/storage-uploadthing";
+
+export default defineConfig({
+  storage: [
+    uploadthingStorage({
+      token: process.env.UPLOADTHING_TOKEN,
+      collections: { media: true },
+    }),
+  ],
+});
+```
+
+Files are served via Uploadthing's CDN (`utfs.io`).
+
+## Per-collection routing and overrides
+
+Each plugin's `collections` map controls which collection slugs it handles. Pass `true` to enable with defaults, or an object to customise per-collection behaviour:
+
+```typescript
+s3Storage({
+  bucket: process.env.S3_BUCKET!,
+  region: process.env.S3_REGION!,
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID!,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY!,
+  collections: {
+    // Public media -- defaults
+    media: true,
+
+    // Private docs -- signed downloads, custom prefix, client-side uploads
+    "private-docs": {
+      prefix: "private/",
+      signedDownloads: true,
+      signedUrlExpiresIn: 900,
+      clientUploads: true,
+    },
+  },
+})
+```
+
+| Option               | Type      | Default | Description                                              |
+|----------------------|-----------|---------|----------------------------------------------------------|
+| `prefix`             | `string`  | --      | Folder prefix for this collection's uploads. `private` and `private/` name the same folder. |
+| `clientUploads`      | `boolean` | `false` | Enable client-side direct uploads (bypasses serverless body limits). S3 only. The file's name, type and size are checked before the URL is signed, and the URL binds the type, the exact size and the configured `cacheControl`; SVGs always go through the standard upload. Send every header the upload URL comes with, as it is: a bucket CORS rule that lists its allowed headers must allow `content-type` and `cache-control`. See [Media upload security](/docs/configuration/media-upload-security). |
+| `signedDownloads`    | `boolean` | `false` | Issue signed URLs for download.                          |
+| `signedUrlExpiresIn` | `number`  | `3600`  | Signed-URL expiry in seconds.                            |
+
+You can also register **multiple plugins** in the `storage` array if different collections need different backends -- for instance, public media on Vercel Blob and private documents on S3.
+
+## Images and thumbnails
+
+An uploaded image is stored as two files: the original, and one thumbnail for
+the admin. The thumbnail is the whole image fitted inside 480 by 480 pixels,
+keeping its proportions and never enlarged, so a wide or tall picture keeps its
+edges. Both are made with `sharp`, which your app installs (see [Limits](#limits)).
+Nothing else is cut from an upload.
+
+A media file carries both URLs, however you read it: populated as a relationship
+on an entry or a single, fetched on its own with `media.findByID()`, or returned
+by `GET /api/media/:id`.
+
+```json
+{
+  "id": "abc-123",
+  "url": "/uploads/2026/04/photo.jpg",
+  "thumbnailUrl": "/uploads/2026/04/thumb_photo.jpg",
+  "width": 3000,
+  "height": 2000,
+  "focalX": 50,
+  "focalY": 50
+}
+```
+
+Each URL is as your storage adapter wrote it: on local disk a path on the
+adapter's own base (`/uploads/...` by default), and on S3, Vercel Blob or
+UploadThing an absolute URL. See [Media URLs](#media-urls) for how they are formed,
+and how to get an absolute one.
+
+- **For a page, use `url` with `next/image`.** It resizes the original on request
+  to the width each screen needs, and a [custom loader](https://nextjs.org/docs/app/api-reference/config/next-config-js/images)
+  can send that to an image CDN.
+- **For a small preview, use `thumbnailUrl`.** It is a light copy, sized for a
+  list or a grid.
+- **To keep the subject in frame, use the focus point** (below) with
+  `object-position`.
+
+An image uploaded by an earlier release keeps the square thumbnail it was given
+then; the admin draws it whole, beside the fitted ones.
+
+Reading a media record on its own is still a `findByID`, and it still needs a runtime:
+
+```tsx
+// app/(site)/photo/page.tsx
+import Image from "next/image";
+import { getNextly } from "nextly";
+
+import config from "../../../nextly.config";
+
+export default async function Photo() {
+  const nextly = await getNextly({ config });
+  const media = await nextly.media.findByID({ id: "abc-123" });
+  if (!media) return null;
+
+  return (
+    <Image
+      src={media.url}
+      width={media.width ?? 1200}
+      height={media.height ?? 800}
+      alt={media.altText ?? ""}
+    />
+  );
+}
+```
+
+`getNextly({ config })` initialises the runtime if nothing has yet, so this page works
+wherever it renders. The synchronous proxy from `nextly/runtime` assumes an already
+initialised process and throws `Nextly services not initialized` when it is the first
+Nextly code a worker runs, which a blank scaffold makes likely because it ships no
+`instrumentation.ts`.
+
+## Resized copies
+
+A page that shows a 2,200-pixel photo in a 385-pixel slot sends the visitor far
+more bytes than it draws. Nextly can serve a resized copy of any stored JPEG,
+PNG, WebP or AVIF image instead, made the first time it is asked for and kept
+beside the original.
+
+<Callout type="warn">
+  Resized copies are experimental: the route, `media.copyOf()` and the widths
+  may change before they are stable.
+</Callout>
+
+Ask for a copy at the media route, with the width it is shown at:
+
+```
+GET /api/media/:id/copy/:width
+```
+
+- **Widths are fixed.** Copies come at 96, 160, 240, 320, 640, 960, 1280 and
+  1920 pixels wide, and any other width is served the nearest one: ask for 700
+  and you get 640. A copy is never wider than its original: past its width the
+  route redirects to the original, and `media.copyOf()` answers `null` so you
+  use the original. The fixed list is what stops anyone making the
+  server resize an image to every width there is.
+- **The format follows the browser.** A JPEG or PNG is sent as AVIF to a browser
+  that accepts it, otherwise as WebP, otherwise in its own format. A WebP or AVIF
+  original keeps its format. The answer says `Vary: Accept`, so a cache can keep
+  each format apart. Some CDNs ignore `Vary` unless set up for it, and would
+  then hand one browser a format meant for another: set yours to vary on
+  `Accept` for these addresses.
+- **It is read as the item is.** The route answers a copy to exactly whoever may
+  read the media item, and refuses it the same way otherwise. On the public
+  `/api/media` route that means a visitor gets copies only while the Public role
+  may read media (`read-media`).
+- **It is kept with its original.** A copy is stored by the same storage, under
+  the original's key with the width and format added
+  (`photo.jpg.w640.webp`), and deleted with the original, or when its file is
+  replaced. Nothing is cut at upload.
+
+Rather than building the address yourself, ask for it. `media.copyOf()` takes a
+media item's `id`, or an address, and the width; it answers the copy's `url` and
+the width it snapped to, or `null` when there is no copy to be had and the
+original is to be used as it is:
+
+```ts
+const copy = await nextly.media.copyOf({ id: "abc-123", width: 700 });
+// { url: "/api/media/abc-123/copy/640?v=3f9a2c71b0de", width: 640 }
+const src = copy?.url ?? media.url;
+```
+
+An address names a media item only as a path on your site, such as
+`/api/media/<id>/raw`. It answers `null` for an address that is not one of your
+media items (an image on another site, any full address with a host, or an item
+since deleted), for a width past the original's, for an image whose width was
+never recorded, while visitors may not read media (the copy's address is on the
+public route), for a type that is not resized (GIF, SVG, any file that is not
+an image), when the image library `sharp` is not installed, and when the
+storage cannot keep copies.
+
+The `v` in the address is the original file's version. While it is current the
+copy is cached for a year; once the file is replaced, an old address still
+answers, with the new picture, and is checked again rather than kept.
+
+| Storage           | Keeps copies                                               |
+| ----------------- | ---------------------------------------------------------- |
+| Local disk        | Yes                                                        |
+| S3 and compatible | Yes                                                        |
+| Vercel Blob       | Yes, for files in the store its token writes to            |
+| Uploadthing       | No: it chooses every file's key, so the original is served |
+
+When a copy cannot be made at the moment it is asked for (an original too large
+to resize or to read, an animated WebP or PNG, which is sent whole rather than
+as its first frame, a file missing from storage, storage not answering or not
+keeping the copy, or more copies asked for at once than the server makes), the
+route redirects to the original, so the image still shows. Each server makes
+two copies at a time and keeps up to 16 more waiting; past that, an ask gets the
+original. A copy that could not be kept, or an original that cannot be resized,
+is not tried again for a minute.
+
+A photo's `width` and `height` are recorded as it is shown: one its camera marked
+as turned a quarter is stored on its side, and recorded turned upright, as every
+browser and copy shows it. An image uploaded before this release keeps the size
+it was recorded with.
+
+## Upgrading from a release with image sizes
+
+Earlier releases cut a set of image sizes from every upload and stored each as a file of its own, recorded in the media table's `sizes` column, with the size definitions in an `image_sizes` table. This release no longer makes or reads them, but it leaves what is stored until you remove it, and your site keeps working meanwhile. Startup says so while the column or the table is still there.
+
+Removing them takes one command, run twice, after this release is deployed: `nextly media remove-sizes --apply` deletes the size files while the `sizes` column still says where they are, then `nextly media remove-sizes --apply --drop` drops the column and the table. Dropping the column first would leave every size file in storage, still publicly served, with nothing pointing at it, so the drop refuses while any item still names a size file. `nextly migrate` never drops either one, at startup or from the command line: it runs before a new release takes traffic, while the release before it still reads and writes them.
+
+What is deleted, and nothing else:
+
+- **Files:** each file an item's `sizes` names. Never an original, never a thumbnail: where an item's thumbnail is one of its sizes, that file stays, and so does any size file another item uses as its original or thumbnail, including one an upload starts using while the command runs.
+- **Database:** each item's `sizes` value, then the `media.sizes` column and the `image_sizes` table with its rows (the size definitions you set at Settings › Image sizes).
+
+### 1. Deploy this release
+
+Upgrade and deploy as you normally would, `nextly migrate` included. It leaves the `sizes` column and the `image_sizes` table in place, and `nextly migrate --dry-run` says so. Wait until the new release is serving every request, so no process of the release before it still reads or writes them.
+
+### 2. List what would be deleted
+
+```bash
+npx nextly media remove-sizes
+```
+
+This is a dry run: it changes nothing. It names every item that holds sizes, each size file it would remove, each it would keep and why, and what `--drop` will drop afterwards:
+
+```text
+Dry run: nothing is changed.
+media 4f2a9c1e-7b3d-4c55-9a1e-0d6f2b8c3a10 (2025/03/1a2b-photo.png)
+  remove 2025/03/1a2b-photo-medium.webp (size "medium")
+  remove 2025/03/1a2b-photo-large.webp (size "large")
+  keep   2025/03/1a2b-photo-thumbnail.webp (size "thumbnail": the item's thumbnail)
+  clear  its stored sizes
+Would remove 2 files from storage, keep 1, and clear the stored sizes of 1 of 1 item.
+Once no item holds sizes, `nextly media remove-sizes --apply --drop` drops the `sizes` column of the `media` table and the `image_sizes` table (3 rows, the size definitions).
+Back up the database and the media storage first, then run again with --apply.
+```
+
+The command removes files only from the media storage configured now. An item whose sizes were uploaded to another storage, bucket or host, before you moved media, is listed as `leave its stored sizes as they are`, with where its files are. A size recorded under a URL relative to your site was written by local disk, so with S3, Vercel Blob or UploadThing configured it is listed the same way. Run the command for those items with the storage they were uploaded to configured; until then they keep their `sizes`, and the drop waits for them.
+
+A size recorded by its path alone, with no URL, shows no storage at all: a Replace may since have stored the item's original elsewhere. The command never deletes such a file. It lists the item as `leave its stored sizes as they are`, naming the path, and exits non-zero. Clean these up by hand: delete the file at that path from the storage it was uploaded to, then clear that item's sizes (`UPDATE media SET sizes = NULL WHERE id = '<the item's id>'`). The drop waits until you have.
+
+### 3. Back up the database and the media storage
+
+Take both backups at the same time, so they match each other. For the database:
+
+```bash
+pg_dump "$DATABASE_URL" > nextly-before-sizes.sql      # PostgreSQL
+mysqldump --single-transaction --host=your-host --port=3306 --user=your-user --password your-database > nextly-before-sizes.sql   # MySQL
+cp nextly.db nextly-before-sizes.db                   # SQLite: copy your database file, with the app stopped
+```
+
+`mysqldump` does not read a connection URL, so take the host, port, user and database name from your `DATABASE_URL` (`mysql://your-user:password@your-host:3306/your-database`); it asks for the password.
+
+For the media storage, copy the folder or bucket the media collection uploads to:
+
+```bash
+cp -R public/uploads uploads-before-sizes                  # local disk
+aws s3 sync s3://your-bucket ./bucket-before-sizes        # S3 and S3-compatible services
+```
+
+On Vercel Blob or UploadThing, download the files from the provider's dashboard or API. Only the size files are deleted, so a copy of those is enough; the dry run lists them.
+
+### 4. Remove the size files
+
+```bash
+npx nextly media remove-sizes --apply
+```
+
+It works item by item: it removes the item's size files, then clears its `sizes`. Just before removing each batch of files, it checks again that no media item has started using one as its original or thumbnail, and keeps any that one has. An item is left as it is, keeping its `sizes`, when the storage refuses one of its files, when its files are on another storage, or when that check cannot be made; the item is named, the run goes on with the next one, and the command exits non-zero. Fix the cause and run it again: a file already gone counts as removed, so a second run picks up where the first stopped. A delete that fails counts as removed only when the storage says that file is not there; a bare 404, which a missing bucket or a wrong address also answers, leaves the item. Like `nextly media orphans`, it removes files only when run from the project's own directory.
+
+### 5. Drop the column and the table
+
+```bash
+npx nextly media remove-sizes --apply --drop
+```
+
+Once no item names a size file, this drops `image_sizes` and then `media.sizes`. While any item still does, it drops nothing, says how many, and exits non-zero. It also drops nothing while another table has a foreign key to `image_sizes`: it names each key, and you drop or change those first. The drop never cascades. It drops each only when the database shows it is what image sizes left: the column with the type Nextly gave it, and the table with exactly the columns Nextly created it with, beside that column, with neither recorded as your app's or a plugin's. A table named `image_sizes` that is not shown to be Nextly's is kept and named; check it, and drop it yourself if it is the one image sizes left.
+
+### 6. Check
+
+- `npx nextly media remove-sizes --apply --drop` says there is no `sizes` column left and nothing to drop.
+- Startup no longer names image sizes.
+- Pages and the media library still show every image, and each item's thumbnail.
+
+### Restoring
+
+To undo the removal, restore both backups from step 3 together: the database dump (`psql "$DATABASE_URL" < nextly-before-sizes.sql`, `mysql --host=your-host --port=3306 --user=your-user --password your-database < nextly-before-sizes.sql`, or the copied SQLite file, with the app stopped), and the storage copy (`cp -R uploads-before-sizes/. public/uploads/`, or `aws s3 sync ./bucket-before-sizes s3://your-bucket`, or upload the files again to Vercel Blob or UploadThing under the same paths). Restoring one without the other leaves records and files that disagree.
+
+## Focus point
+
+Each media record can carry a focus point: the part of the image to keep in frame when a layout crops it. Set it from the admin media library: open an item, choose **Set focus point**, click or drag on the image (or use the arrow keys), then **Done**. The values are stored as `focalX` (0-100, left to right) and `focalY` (0-100, top to bottom). Saving a point changes no stored file: your site, or an image loader, reads it.
+
+Use them with CSS `object-position` for responsive cropping:
+
+```tsx
+// app/(site)/cover.tsx
+import Image from "next/image";
+
+export function Cover({
+  url,
+  focalX,
+  focalY,
+  alt,
+}: {
+  url: string;
+  focalX: number;
+  focalY: number;
+  alt: string;
+}) {
+  return (
+    <Image
+      src={url}
+      alt={alt}
+      fill
+      style={{
+        objectFit: "cover",
+        objectPosition: `${focalX}% ${focalY}%`,
+      }}
+    />
+  );
+}
+```
+
+`media.findByID()` returns both values on the media record, and server code can set
+them with `media.update({ id, data: { focalX, focalY } })`: whole numbers from 0 to 100.
+
+## Media URLs
+
+A media URL is where the storage adapter that holds the file serves it.
+
+- **Local disk** builds it from its `baseUrl` and the file's path. The default
+  `baseUrl` is `/uploads`, so the URL is a path, `/uploads/2026/04/photo.jpg`.
+  Your app's pages resolve it on whatever host and port serve them: `next dev` on
+  any port, a LAN address, a tunnel or a preview deployment, with nothing to
+  configure. To serve uploads from another origin, give the adapter an absolute
+  `baseUrl`, and every URL is on it:
+
+  ```ts
+  // nextly.config.ts
+  import { defineConfig } from "nextly/config";
+  import { localStorage } from "nextly/storage";
+
+  export default defineConfig({
+    storage: [
+      localStorage({
+        basePath: "./public/uploads",
+        baseUrl: process.env.MEDIA_BASE_URL ?? "/uploads",
+        collections: { media: true },
+      }),
+    ],
+  });
+  ```
+
+- **S3, Vercel Blob and UploadThing** return absolute URLs on their own hosts,
+  unchanged.
+
+A URL is never rewritten onto `NEXT_PUBLIC_APP_URL` when it is read, so a project
+whose `.env` still says `http://localhost:3000` shows its images on any other port.
+
+### An absolute URL, for somewhere outside your app
+
+An email, a feed or JSON-LD is read somewhere a path cannot resolve. Make the URL
+absolute with `toPublicMediaUrl`:
+
+```ts
+import { toPublicMediaUrl } from "nextly";
+
+declare const media: { url: string };
+const imageUrl = toPublicMediaUrl(media.url, { baseUrl: "https://example.com" });
+```
+
+It leaves an absolute URL as it is. A relative one is resolved against the
+`baseUrl` you pass (an email's settings, or your site's own origin), else
+`NEXT_PUBLIC_APP_URL`. It never guesses a host: with neither set, in development
+it returns the path and logs a warning naming both, and in production it logs an
+error and returns `null`, so leave that image out rather than send a path that
+cannot resolve. `toPublicMediaUrl` is experimental: its shape may still change
+before Nextly's first stable release.
+
+Open Graph and Twitter images from `buildMetadata` (`nextly/runtime`) stay
+relative, as its canonical links do: Next.js resolves them against your root
+layout's `metadataBase`, which the starter templates set from your site's URL.
+
+## Environment variables
+
+### Auto-detection cascade
+
+| Variable                | Triggers           |
+|-------------------------|--------------------|
+| `BLOB_READ_WRITE_TOKEN` | Vercel Blob       |
+| `S3_BUCKET`             | S3 adapter        |
+| `UPLOADTHING_TOKEN`     | Uploadthing       |
+| (none of the above)     | Local disk         |
+
+### S3 / R2 / MinIO / Spaces / Supabase
+
+| Variable                | Description                                              |
+|-------------------------|----------------------------------------------------------|
+| `S3_BUCKET`             | Bucket name.                                              |
+| `S3_REGION`             | Region (`"auto"` for R2).                                |
+| `AWS_ACCESS_KEY_ID`     | Access key ID.                                           |
+| `AWS_SECRET_ACCESS_KEY` | Secret access key.                                       |
+| `S3_ENDPOINT`           | Custom endpoint (R2, MinIO, Supabase, Spaces).            |
+| `S3_PUBLIC_URL`         | Public URL for serving files.                             |
+| `S3_FORCE_PATH_STYLE`   | Set to `"true"` for MinIO and Supabase.                   |
+
+### Vercel Blob
+
+| Variable                  | Description                       |
+|---------------------------|-----------------------------------|
+| `BLOB_READ_WRITE_TOKEN`   | Vercel Blob read-write token.     |
+
+### Uploadthing
+
+| Variable             | Description                       |
+|----------------------|-----------------------------------|
+| `UPLOADTHING_TOKEN`  | Uploadthing v7+ API token.        |
+
+## Deleting media, and thumbnails left behind
+
+Deleting a media item, singly or in bulk, removes every file stored for it: the original, the thumbnail made at upload, and any resized copy an earlier release stored for it. A file the storage refuses to remove is logged with its path and the item, so it can be found.
+
+Earlier releases left the thumbnail behind when an item was deleted. On local disk that file stays under `public/uploads`, and on a public S3 bucket or Vercel Blob store it stays publicly reachable. UploadThing was not affected: there the delete found the thumbnail by its key. To find those thumbnails, run:
+
+```bash
+npx nextly media orphans
+```
+
+It lists the upload-time thumbnails no media item refers to, by stored path, and changes nothing. To remove them, run it again with `--apply`: it asks about each batch of files just before removing it, and names each file it removed, each it kept because an item came to refer to it, and each it could not remove. If it cannot check a file, it stops and removes no more.
+
+`--apply` removes a file only under a `prefix` the media collection has to itself: one no other collection uses, on any storage, or nests inside or around, or begins (a prefix and an upload's folder are joined as written, so `med` with the folder `ia` stores under `media`). A collection with no prefix shares every place, since an upload to it can name any folder, and on local disk, collections with no storage plugin upload to the same uploads folder. Anywhere else, as by default, media shares the storage with other uploads, any of which can store a file of the same form: the command lists what it finds there as files nothing shows are media's, for you to check and remove by hand, removes none of it, and names any collection that shares media's place. To have the command remove them, give media its own prefix in its storage config (`collections: { media: { prefix: "media" } }`) before you upload, and give each collection the command names a `prefix` of its own. Files stored before you set media's prefix stay where they were, outside it, and once it is set the command looks only under it: run it once before you set the prefix. If media's prefix held other files before, another collection's or files you put there yourself, the command cannot tell those apart.
+
+Run it from the project's own directory to remove files: with `--cwd` naming another directory, `--apply` refuses, since the database settings were read before `--cwd`, from wherever the command was run. Run it again after a delete whose log names a file it could not remove, or whose process stopped before it finished.
+
+What it looks at:
+
+- Only files where media uploads put a thumbnail, in the form they give it: under the media collection's `prefix`, if you set one. Another collection's folder is never touched. On UploadThing, which keeps no folders, a thumbnail is known only by the name it was uploaded under, which anything else uploading to the same app can give a file too. So there the command lists what it finds, by file key and uploaded name, as files nothing shows are media's, and removes none of it, even with `--apply`: remove the ones that are media's from the UploadThing dashboard.
+- Only thumbnails stored more than an hour ago. A newer one may belong to an upload still in progress. If, before upgrading, you deleted an item uploaded less than an hour before you run the command, run it again an hour later.
+- Only the storage the media collection uses now. If you moved to another adapter, bucket or folder, point the media storage at the old one and run it there to clean that up.
+
+A storage adapter that cannot list its files is reported as such, and nothing is changed.
+
+## Migrating between adapters
+
+When switching adapters (e.g. local disk -> S3 for production):
+
+1. Existing files stay in the old storage. New uploads go to the new adapter.
+2. URLs stored in the database still point to the old storage.
+3. For a full migration you'll need to copy the files and rewrite the URLs in the `media` table.
+
+A common pattern is to switch automatically based on env vars:
+
+- Development -> no cloud env vars -> local disk.
+- Staging / Production -> set `S3_BUCKET` etc. -> S3.
+
+`getStorageFromEnv()` makes this a one-liner in `nextly.config.ts`.
+
+## Limits
+
+- **Image processing needs `sharp` in your app.** `sharp` is an optional peer dependency of `nextly`, so Nextly does not install it: add it to your app's dependencies (`npm install sharp`) rather than relying on another package to bring it. Without it, uploads are still stored, but images get no thumbnail and no width or height.
+- **Four places to store files.** The built-in local disk, or one of three adapter packages: `@nextlyhq/storage-s3` for S3 and S3-compatible services, `@nextlyhq/storage-vercel-blob` and `@nextlyhq/storage-uploadthing`.
+- **Local disk is for one long-lived server.** Files written to `./public/uploads/` do not survive a restart on a serverless or ephemeral host.
+- **Switching adapters moves nothing.** Existing files and their stored URLs stay where they were; see [Migrating between adapters](#migrating-between-adapters).
+
+## Next steps
+
+- [Deployment](/docs/guides/deployment) -- deploy to Vercel or self-host with the right storage choice.
+- [Configuration reference](/docs/configuration/nextly-config) -- full `defineConfig()` options.
+- [Collections](/docs/configuration/collections) -- define collections with upload fields.

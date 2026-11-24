@@ -1,0 +1,835 @@
+/**
+ * Base Validator
+ *
+ * Shared validation helpers used by the Collection, Single, and Component
+ * config validators. Extracts duplicated logic for slug/field-name checks,
+ * select-option validation, relationship target validation, component
+ * reference validation, and recursive field walking.
+ *
+ * Each of the three domain validators (validate-config, validate-single,
+ * validate-component) used to carry its own copy of this logic. They now
+ * orchestrate validation by calling into these shared helpers and only
+ * keep their domain-specific rules (access rules, indexes, nesting depth).
+ *
+ * The helpers are intentionally agnostic about the exact error-code union
+ * used by each domain — they push errors using the shared
+ * {@link BaseValidationError} shape, which domain error types structurally
+ * extend. Callers may pass their own typed error array via a narrow cast.
+ *
+ * @module shared/base-validator
+ * @since 1.0.0
+ */
+
+import type { FieldAccess } from "../collections/fields/types/base";
+import { isIconIdShape } from "../collections/fields/types/icon";
+import { MAX_FIELD_NAME_LENGTH } from "../domains/dynamic-collections/field-name-rule";
+import { MIGRATION_TARGET } from "../domains/field-groups/migration/target";
+import { neverTranslatable } from "../domains/i18n/classify-fields";
+import {
+  configuredSiblingClashes,
+  siblingClashMessage,
+  type SiblingEntityKind,
+} from "../domains/schema/sibling-fields";
+import { STORAGE_FORMAT } from "../schemas/storage-format";
+
+import {
+  type AddressKind,
+  judgeConfiguredAddress,
+  MAX_SLUG_LENGTH,
+} from "./address-rule";
+import { MAX_DECIMAL_PRECISION, MAX_DECIMAL_SCALE } from "./decimal-bounds";
+import { pluginFieldOptionIssues } from "./lib/plugin-field-options";
+import { SLUG_PATTERN } from "./slug-pattern";
+import { RESERVED_SLUGS, SQL_RESERVED_KEYWORDS } from "./sql-reserved";
+import type {
+  CollectionAccessControl,
+  SingleAccessControl,
+} from "./types/access";
+
+// ============================================================
+// Shared Types
+// ============================================================
+
+/**
+ * Base shape of a validation error. Domain validators extend this shape
+ * with a narrower `code` union (e.g., `SingleValidationErrorCode`).
+ * Helpers in this module push errors using this base shape; domain call
+ * sites cast their typed array to `BaseValidationError[]` when invoking.
+ */
+export interface BaseValidationError {
+  /** Dot-notation path to the invalid property (e.g., "fields[0].name"). */
+  path: string;
+
+  /** Human-readable error message. */
+  message: string;
+
+  /** Machine-readable error code. */
+  code: string;
+}
+
+// ============================================================
+// Shared Constants
+// ============================================================
+
+// The slug rule, kept in a module that imports nothing so browser code can
+// read the same one; re-exported here for this module's existing importers.
+export { SLUG_PATTERN };
+
+/**
+ * Regex pattern for valid field names.
+ * Must start with a letter (upper or lower), contain only letters,
+ * numbers, and underscores. Supports camelCase.
+ */
+export const FIELD_NAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9_]*$/;
+
+/**
+ * All valid field types in Nextly.
+ * Shared across every domain validator — extending this list requires a
+ * coordinated change in the schema generator.
+ */
+export const VALID_FIELD_TYPES = [
+  // Text types
+  "text",
+  "textarea",
+  "richText",
+  "email",
+  "password",
+  "code",
+  "icon",
+  // Numeric types
+  "number",
+  // Selection types
+  "checkbox",
+  "date",
+  "select",
+  "radio",
+  // Media types
+  "upload",
+  // Relational types
+  "relationship",
+  // Structured types
+  "repeater",
+  "group",
+  "json",
+  // Selection / tag types
+  "chips",
+  // Component type
+  "component",
+  // The migrated spelling of "component": stored definitions rewritten by the
+  // storage migration carry it, and a token this list omits falls through the
+  // shared validator's deferred branch with the reference checks never run.
+  "fieldGroup",
+] as const;
+
+/** Set form of {@link VALID_FIELD_TYPES} for O(1) membership checks. */
+export const VALID_FIELD_TYPES_SET: Set<string> = new Set(VALID_FIELD_TYPES);
+
+/** Re-export of the shared base SQL keyword list for domain validators. */
+export { RESERVED_SLUGS, SQL_RESERVED_KEYWORDS };
+
+/** Default Set of SQL keywords (lowercased) for O(1) lookup. */
+const DEFAULT_SQL_KEYWORDS_SET: Set<string> = new Set<string>(
+  SQL_RESERVED_KEYWORDS
+);
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+/**
+ * Checks if a string is a SQL reserved keyword.
+ * Case-insensitive. Use with the pre-built {@link DEFAULT_SQL_KEYWORDS_SET}
+ * or a domain-specific extension if the domain has additional reserved
+ * keywords beyond the core list.
+ */
+export function isSQLKeyword(
+  name: string,
+  keywordsSet: Set<string> = DEFAULT_SQL_KEYWORDS_SET
+): boolean {
+  return keywordsSet.has(name.toLowerCase());
+}
+
+// ============================================================
+// Slug Validation
+// ============================================================
+
+/**
+ * Longest slug the product accepts, stated by the one address rule and
+ * re-exported here for this module's existing importers.
+ */
+export { MAX_SLUG_LENGTH };
+
+/**
+ * Validate a configured slug by the one address rule, as configuration in code
+ * is judged at import (`judgeConfiguredAddress`): the refusals configuration
+ * made before the rule, with the rest left to the start and the migrate
+ * commands, which can tell a new address from one an entity already holds.
+ *
+ * Pushes the rule's refusal onto `errors` under its code. Domain validators
+ * cast their typed error array to {@link BaseValidationError}[] at the call
+ * site — every domain's error code union includes the codes pushed here.
+ */
+export function validateSlugShared(
+  slug: unknown,
+  errors: BaseValidationError[],
+  kind: AddressKind
+): void {
+  const refusal = judgeConfiguredAddress(kind, slug);
+  if (refusal) {
+    errors.push({ path: "slug", message: refusal.message, code: refusal.code });
+  }
+}
+
+// ============================================================
+// Field Name Validation
+// ============================================================
+
+/**
+ * Validate a single field name against the standard Nextly rules:
+ * required, string, pattern-conformant, no longer than any field name may be
+ * (`MAX_FIELD_NAME_LENGTH`, the field-name rule's own cap), not a SQL keyword. Whether it clashes
+ * with a sibling's is the sibling rule's question, asked once for the whole
+ * entity (`validateSiblingFieldsShared`).
+ */
+export function validateFieldNameShared(
+  name: unknown,
+  path: string,
+  errors: BaseValidationError[],
+  sqlKeywordsSet: Set<string> = DEFAULT_SQL_KEYWORDS_SET
+): void {
+  if (!name) {
+    errors.push({
+      path: `${path}.name`,
+      message: "Field name is required",
+      code: "FIELD_NAME_REQUIRED",
+    });
+    return;
+  }
+
+  if (typeof name !== "string") {
+    errors.push({
+      path: `${path}.name`,
+      message: "Field name must be a string",
+      code: "FIELD_NAME_REQUIRED",
+    });
+    return;
+  }
+
+  if (!FIELD_NAME_PATTERN.test(name)) {
+    errors.push({
+      path: `${path}.name`,
+      message: `Field name '${name}' must start with a letter and contain only letters, numbers, and underscores`,
+      code: "FIELD_NAME_INVALID_FORMAT",
+    });
+  }
+
+  // The cap the field-name rule holds every name to, column or not: a field group's rows point
+  // back to their field by its name, in a parent-pointer column of that width.
+  if (name.length > MAX_FIELD_NAME_LENGTH) {
+    errors.push({
+      path: `${path}.name`,
+      message: `Field name is longer than ${MAX_FIELD_NAME_LENGTH} characters, the longest a field group's rows can point back to`,
+      code: "FIELD_NAME_TOO_LONG",
+    });
+  }
+
+  if (isSQLKeyword(name, sqlKeywordsSet)) {
+    errors.push({
+      path: `${path}.name`,
+      message: `Field name '${name}' is a SQL reserved keyword. Consider using a different name like '${name}Field' or '${name}Value'`,
+      code: "FIELD_NAME_SQL_KEYWORD",
+    });
+  }
+}
+
+/**
+ * Refuse, for a `define*` call, the pairs of sibling fields the one sibling
+ * rule refuses wherever they are found (`configuredSiblingClashes`): every pair
+ * sharing a stored value, and those configuration refused before the rule. The
+ * rest wait for the start and the migrate commands, which know the definition
+ * the entity last had, so an existing pair sharing nothing keeps working.
+ */
+export function validateSiblingFieldsShared(
+  kind: SiblingEntityKind,
+  slug: unknown,
+  fields: unknown,
+  errors: BaseValidationError[]
+): void {
+  const entity = { kind, slug: typeof slug === "string" ? slug : "" };
+  for (const clash of configuredSiblingClashes(fields)) {
+    errors.push({
+      path: "fields",
+      message: siblingClashMessage(entity, clash),
+      code: "FIELD_NAME_DUPLICATE",
+    });
+  }
+}
+
+// ============================================================
+// Field Type Validation
+// ============================================================
+
+/**
+ * Validate that a field's `type` value is one of the Nextly-supported
+ * field types. Returns `true` when the type is valid and pushes the
+ * appropriate errors otherwise.
+ */
+export function validateFieldTypeShared(
+  fieldType: unknown,
+  path: string,
+  errors: BaseValidationError[],
+  /**
+   * Accept a non-built-in type when this predicate returns true — used to allow
+   * plugin-registered custom field types (C7/D16). Callers pass the field-type
+   * registry's `hasFieldType`; for the registry to know a type, the plugin must
+   * be registered (boot) before the config is validated.
+   */
+  isCustomType?: (type: string) => boolean
+): fieldType is (typeof VALID_FIELD_TYPES)[number] {
+  if (!fieldType) {
+    errors.push({
+      path: `${path}.type`,
+      message: "Field type is required",
+      code: "FIELD_TYPE_REQUIRED",
+    });
+    return false;
+  }
+
+  const isKnown =
+    typeof fieldType === "string" &&
+    (VALID_FIELD_TYPES_SET.has(fieldType) ||
+      (isCustomType?.(fieldType) ?? false));
+
+  if (!isKnown) {
+    // Deferred, not accepted. A plugin contributes its field types when the app
+    // boots, which is after every `define*` call has already run — the config
+    // bundle is evaluated first. Refusing an unrecognised token here therefore
+    // refuses every contributed type, so a plugin field could only be declared
+    // by bypassing these validators entirely.
+    //
+    // A typo is indistinguishable from a not-yet-registered type at this point,
+    // so the answer is not knowable here and the question is asked again at
+    // boot, once `contributes.fieldTypes` has run: see
+    // `assertPluginFieldDeclarations`, which refuses a token no plugin claimed.
+    // `false` still skips the per-type checks below, which have nothing to say
+    // about a type they do not know.
+    return false;
+  }
+
+  return true;
+}
+
+// ============================================================
+// Select / Radio Options Validation
+// ============================================================
+
+/**
+ * Validate the `options` array on a select or radio field: it must be
+ * present, an array, and non-empty. Error codes are suffixed with
+ * `SELECT_` or `RADIO_` so domain validators surface the correct tag.
+ */
+/**
+ * Report a plugin type's own declaration checks through the shared error shape.
+ *
+ * The checks themselves live in `pluginFieldOptionIssues`, which the Schema
+ * Builder's zod schema also consumes; this only renders their result, turning
+ * an option-relative path into the absolute one the config validators report.
+ */
+export function validatePluginFieldOptionsShared(
+  field: { type?: unknown; name?: unknown },
+  path: string,
+  errors: BaseValidationError[]
+): void {
+  for (const issue of pluginFieldOptionIssues(field)) {
+    errors.push({
+      // A returned path names an option, so it is read relative to the field:
+      // the plugin knows its options by name and cannot know its own index.
+      path: issue.path ? `${path}.${issue.path}` : path,
+      message: issue.message,
+      // Always the canonical member. Each domain's error-code union is closed
+      // and public, so emitting a plugin-defined string here would hand a
+      // consumer exhaustively handling those members a value none of them
+      // covers — and the cast at every call site would hide it.
+      code: "FIELD_TYPE_INVALID",
+    });
+  }
+}
+export function validateSelectOptionsShared(
+  field: Record<string, unknown>,
+  path: string,
+  errors: BaseValidationError[],
+  fieldType: "select" | "radio"
+): void {
+  const options = field.options;
+  const requiredCode =
+    fieldType === "select"
+      ? "SELECT_OPTIONS_REQUIRED"
+      : "RADIO_OPTIONS_REQUIRED";
+  const emptyCode =
+    fieldType === "select" ? "SELECT_OPTIONS_EMPTY" : "RADIO_OPTIONS_EMPTY";
+
+  if (!options) {
+    errors.push({
+      path: `${path}.options`,
+      message: `${fieldType} field must have an 'options' array`,
+      code: requiredCode,
+    });
+    return;
+  }
+
+  if (!Array.isArray(options)) {
+    errors.push({
+      path: `${path}.options`,
+      message: `${fieldType} field 'options' must be an array`,
+      code: requiredCode,
+    });
+    return;
+  }
+
+  if (options.length === 0) {
+    errors.push({
+      path: `${path}.options`,
+      message: `${fieldType} field must have at least one option`,
+      code: emptyCode,
+    });
+  }
+}
+
+/**
+ * Validate the `precision`/`scale` of a `dbType: "decimal"` number field. They
+ * render straight into DDL (`numeric(p,s)` / `decimal(p,s)`), so invalid
+ * dimensions must be rejected at config time rather than failing at the database
+ * on first apply. Shared across collections, singles, and components since all
+ * three expose the same number field. Non-number/non-decimal fields are ignored.
+ */
+export function validateNumberDecimalDimensionsShared(
+  field: Record<string, unknown>,
+  path: string,
+  errors: BaseValidationError[]
+): void {
+  if (field.type !== "number" || field.dbType !== "decimal") return;
+  const { precision, scale } = field;
+  const inIntRange = (v: unknown, min: number, max: number): v is number =>
+    typeof v === "number" && Number.isInteger(v) && v >= min && v <= max;
+
+  if (
+    precision !== undefined &&
+    !inIntRange(precision, 1, MAX_DECIMAL_PRECISION)
+  ) {
+    errors.push({
+      path: `${path}.precision`,
+      message: `Decimal 'precision' must be an integer between 1 and ${MAX_DECIMAL_PRECISION}`,
+      code: "DECIMAL_PRECISION_INVALID",
+    });
+  }
+  if (scale !== undefined && !inIntRange(scale, 0, MAX_DECIMAL_SCALE)) {
+    errors.push({
+      path: `${path}.scale`,
+      message: `Decimal 'scale' must be an integer between 0 and ${MAX_DECIMAL_SCALE}`,
+      code: "DECIMAL_SCALE_INVALID",
+    });
+  }
+  // Cross-check the effective values (unset defaults mirror the column
+  // descriptor's DECIMAL(10, 2)); scale must not exceed precision.
+  const effPrecision = typeof precision === "number" ? precision : 10;
+  const effScale = typeof scale === "number" ? scale : 2;
+  if (
+    Number.isInteger(effPrecision) &&
+    Number.isInteger(effScale) &&
+    effScale > effPrecision
+  ) {
+    errors.push({
+      path: `${path}.scale`,
+      message: "Decimal 'scale' cannot exceed 'precision'",
+      code: "DECIMAL_SCALE_EXCEEDS_PRECISION",
+    });
+  }
+}
+
+/**
+ * Validate an icon field's `defaultValue`. The default is written into the
+ * column's DDL and onto every new entry, so a value that is not an icon id
+ * (`<set>:<name>`, see {@link isIconIdShape}) is refused at config time.
+ * Only the shape is checked: whether the set and the icon exist is answered
+ * at runtime, once icon sets are registered. Non-icon fields are ignored.
+ */
+export function validateIconDefaultShared(
+  field: Record<string, unknown>,
+  path: string,
+  errors: BaseValidationError[]
+): void {
+  if (field.type !== "icon" || field.defaultValue === undefined) return;
+  if (!isIconIdShape(field.defaultValue)) {
+    errors.push({
+      path: `${path}.defaultValue`,
+      message:
+        "Icon 'defaultValue' must be an icon id of the form '<set>:<name>', for example 'lucide:star'",
+      code: "ICON_DEFAULT_INVALID",
+    });
+  }
+}
+
+// ============================================================
+// Relationship Target Validation
+// ============================================================
+
+/**
+ * Validate a relationship field's `relationTo` property.
+ *
+ * Accepts either a single slug string or an array of slug strings. When
+ * `validCollectionSlugs` is provided (collections pass it, singles and
+ * components leave it undefined), each target is also checked for
+ * existence against that whitelist and an additional
+ * `RELATIONSHIP_TARGET_UNKNOWN` error is pushed for unknown targets.
+ */
+export function validateRelationshipTargetShared(
+  field: Record<string, unknown>,
+  path: string,
+  errors: BaseValidationError[],
+  validCollectionSlugs?: string[]
+): void {
+  const relationTo = field.relationTo;
+
+  if (!relationTo) {
+    errors.push({
+      path: `${path}.relationTo`,
+      message: "Relationship field must specify 'relationTo'",
+      code: "RELATIONSHIP_TARGET_REQUIRED",
+    });
+    return;
+  }
+
+  const knownSet = validCollectionSlugs
+    ? new Set(validCollectionSlugs)
+    : undefined;
+  const knownList = validCollectionSlugs?.join(", ") ?? "";
+
+  if (typeof relationTo === "string") {
+    if (!SLUG_PATTERN.test(relationTo)) {
+      errors.push({
+        path: `${path}.relationTo`,
+        message: `Invalid relationTo value '${relationTo}'. Must be a valid collection slug`,
+        code: "RELATIONSHIP_TARGET_INVALID",
+      });
+    } else if (knownSet && !knownSet.has(relationTo)) {
+      errors.push({
+        path: `${path}.relationTo`,
+        message: `Unknown collection '${relationTo}' in relationTo. Available collections: ${knownList}`,
+        code: "RELATIONSHIP_TARGET_UNKNOWN",
+      });
+    }
+    return;
+  }
+
+  if (Array.isArray(relationTo)) {
+    if (relationTo.length === 0) {
+      errors.push({
+        path: `${path}.relationTo`,
+        message: "Relationship field 'relationTo' array cannot be empty",
+        code: "RELATIONSHIP_TARGET_REQUIRED",
+      });
+      return;
+    }
+
+    relationTo.forEach((target, index) => {
+      if (typeof target !== "string") {
+        errors.push({
+          path: `${path}.relationTo[${index}]`,
+          message: "Each relationTo value must be a string",
+          code: "RELATIONSHIP_TARGET_INVALID",
+        });
+      } else if (!SLUG_PATTERN.test(target)) {
+        errors.push({
+          path: `${path}.relationTo[${index}]`,
+          message: `Invalid relationTo value '${target}'. Must be a valid collection slug`,
+          code: "RELATIONSHIP_TARGET_INVALID",
+        });
+      } else if (knownSet && !knownSet.has(target)) {
+        errors.push({
+          path: `${path}.relationTo[${index}]`,
+          message: `Unknown collection '${target}' in relationTo. Available collections: ${knownList}`,
+          code: "RELATIONSHIP_TARGET_UNKNOWN",
+        });
+      }
+    });
+    return;
+  }
+
+  errors.push({
+    path: `${path}.relationTo`,
+    message: "'relationTo' must be a string or array of strings",
+    code: "RELATIONSHIP_TARGET_INVALID",
+  });
+}
+
+// ============================================================
+// Component Field Reference Validation
+// ============================================================
+
+/**
+ * The reference keys a component field may declare, from the two storage
+ * catalogs and one pinned historical spelling per shape.
+ *
+ * `"component"` / `"components"` are pinned literals, not derived from the
+ * catalog: the day `STORAGE_FORMAT.refKeys` flips to the migration targets, a
+ * list built from the two catalogs collapses to duplicate copies of the
+ * migrated keys — `declared()` would then count every migrated reference
+ * twice and reject it as a conflict, while the historical spellings vanished
+ * from validation entirely. Deduplicated, because the pairs are the same
+ * string today and again after the flip.
+ */
+const uniqueKeys = (keys: readonly string[]): string[] =>
+  keys.filter((key, i, all) => all.indexOf(key) === i);
+
+const COMPONENT_REF_SINGLE_KEYS = uniqueKeys([
+  "component",
+  STORAGE_FORMAT.refKeys.single,
+  MIGRATION_TARGET.refKeys.single,
+]);
+
+const COMPONENT_REF_MULTI_KEYS = uniqueKeys([
+  "components",
+  STORAGE_FORMAT.refKeys.many,
+  MIGRATION_TARGET.refKeys.many,
+]);
+
+/**
+ * Validate a component-typed field's reference shape.
+ *
+ * A component field must specify exactly one reference key, under either
+ * spelling:
+ * - single: `component` / `fieldGroup` — one component slug
+ * - multi: `components` / `fieldGroups` — dynamic-zone list of component slugs
+ *
+ * The shapes are judged once across all four keys rather than once per key —
+ * a per-key copy is how the migrated spellings reached production
+ * unvalidated, since a definition carrying only the migrated keys passed
+ * every legacy check without one ever looking at it.
+ *
+ * Pushes errors for missing, conflicting, invalid-type, or empty refs,
+ * reported against the key that was declared.
+ */
+export function validateComponentFieldRefShared(
+  field: Record<string, unknown>,
+  path: string,
+  errors: BaseValidationError[]
+): void {
+  const declared = (keys: readonly string[]): string[] =>
+    keys.filter(key => field[key] !== undefined && field[key] !== null);
+
+  const declaredSingle = declared(COMPONENT_REF_SINGLE_KEYS);
+  const declaredMulti = declared(COMPONENT_REF_MULTI_KEYS);
+
+  if (declaredSingle.length === 0 && declaredMulti.length === 0) {
+    errors.push({
+      path,
+      message:
+        "Component field must specify either 'component' or 'fieldGroup' (single), or 'components' or 'fieldGroups' (multi/dynamic zone)",
+      code: "COMPONENT_REF_REQUIRED",
+    });
+    return;
+  }
+
+  if (declaredSingle.length + declaredMulti.length > 1) {
+    const found = [...declaredSingle, ...declaredMulti]
+      .map(key => `'${key}'`)
+      .join(", ");
+    errors.push({
+      path,
+      message:
+        `Component field cannot specify more than one reference key (found ${found}). ` +
+        "Use 'component' or 'fieldGroup' for single component, or 'components' or 'fieldGroups' for dynamic zone",
+      code: "COMPONENT_REF_CONFLICT",
+    });
+    return;
+  }
+
+  if (declaredSingle.length > 0) {
+    const key = declaredSingle[0];
+    const value = field[key];
+    // Judged trimmed, matching the extractor: a blank reference resolves to
+    // nothing downstream, so accepting it here would boot a component field
+    // with no reference at all.
+    if (typeof value !== "string" || value.trim().length === 0) {
+      errors.push({
+        path: `${path}.${key}`,
+        message: `'${key}' must be a string (component slug)`,
+        code: "COMPONENT_REF_INVALID",
+      });
+    }
+    return;
+  }
+
+  const key = declaredMulti[0];
+  const list = field[key];
+
+  if (!Array.isArray(list)) {
+    errors.push({
+      path: `${path}.${key}`,
+      message: `'${key}' must be an array of component slugs`,
+      code: "COMPONENT_REF_INVALID",
+    });
+    return;
+  }
+
+  if (list.length === 0) {
+    errors.push({
+      path: `${path}.${key}`,
+      message: `'${key}' array must have at least one component slug`,
+      code: "COMPONENT_REF_EMPTY",
+    });
+    return;
+  }
+
+  list.forEach((slug: unknown, index: number) => {
+    // Trimmed like the singular check: a blank entry resolves to nothing.
+    if (typeof slug !== "string" || slug.trim().length === 0) {
+      errors.push({
+        path: `${path}.${key}[${index}]`,
+        message: "Each component slug must be a string",
+        code: "COMPONENT_REF_INVALID",
+      });
+    }
+  });
+}
+
+/**
+ * Validate a container field's inline `fields` list - the body the repeater
+ * and group cases share across every domain validator.
+ *
+ * The container's own label and error code are parameters because the three
+ * domains name the same missing-children failure differently; the children
+ * themselves validate through the caller's field walker, which owns the
+ * domain-specific rules.
+ */
+export function validateContainerFieldsShared(
+  field: Record<string, unknown>,
+  path: string,
+  errors: BaseValidationError[],
+  container: { label: string; code: string },
+  validateChildren: (fields: unknown[], basePath: string) => void
+): void {
+  const childFields = field.fields;
+  if (!childFields) {
+    errors.push({
+      path: `${path}.fields`,
+      message: `${container.label} must have a 'fields' array`,
+      code: container.code,
+    });
+  } else if (Array.isArray(childFields)) {
+    validateChildren(childFields, `${path}.fields`);
+  }
+}
+
+/**
+ * The access rules each kind of entity declares, as its access type does:
+ * `CollectionAccessControl`, `SingleAccessControl` and `FieldAccess`. Held
+ * to those types by `access-rule-values.test.ts`, so a rule added to a type
+ * and not here is refused at startup only until that test fails.
+ */
+export const COLLECTION_ACCESS_KEYS = [
+  "create",
+  "read",
+  "update",
+  "delete",
+  "publish",
+  "unpublish",
+] as const satisfies readonly (keyof CollectionAccessControl)[];
+export const SINGLE_ACCESS_KEYS = [
+  "read",
+  "update",
+  "publish",
+  "unpublish",
+] as const satisfies readonly (keyof SingleAccessControl)[];
+export const FIELD_ACCESS_KEYS = [
+  "create",
+  "read",
+  "update",
+] as const satisfies readonly (keyof FieldAccess)[];
+
+/**
+ * What every field is checked for, whatever its type and whichever entity it
+ * belongs to: a usable name, and its own access rules, each a function
+ * or a boolean with no key a field does not have.
+ *
+ * Checked before the type, because a contributed type defers its own checks
+ * to boot and returns early: left behind the type check, neither would run
+ * for a plugin field.
+ */
+export function validateFieldBasicsShared(
+  field: Record<string, unknown>,
+  path: string,
+  errors: BaseValidationError[],
+  sqlKeywordsSet: Set<string> = DEFAULT_SQL_KEYWORDS_SET
+): void {
+  validateFieldNameShared(field.name, path, errors, sqlKeywordsSet);
+  // Refused rather than quietly stored as shared: a field the author marked translatable that
+  // can never be would otherwise read as translated in the configuration and be shared in fact.
+  if (
+    field.localized === true &&
+    typeof field.type === "string" &&
+    neverTranslatable(field as { type: string })
+  ) {
+    errors.push({
+      path: `${path}.localized`,
+      message: `Field "${String(field.name)}" cannot be translatable: a password or a virtual field is the same in every language. Remove \`localized: true\`.`,
+      code: "FIELD_NEVER_TRANSLATABLE",
+    });
+  }
+  validateAccessShared(
+    field.access,
+    FIELD_ACCESS_KEYS,
+    errors,
+    `${path}.access`
+  );
+}
+
+/**
+ * Validate an `access` object at `path`: optional, an object when present,
+ * each rule a function or a boolean, and no key the entity does not have.
+ *
+ * A key the entity does not have is refused, naming it, rather than ignored:
+ * a misspelt `reed` would otherwise leave `read` undeclared, and the
+ * operation it meant to govern would fall back to stored permissions without
+ * a word. Collections, Singles and fields declare different keys, so the
+ * caller names them; the rule applied to each is the same.
+ */
+export function validateAccessShared(
+  access: unknown,
+  accessKeys: readonly string[],
+  errors: BaseValidationError[],
+  path = "access"
+): void {
+  if (!access) return;
+
+  if (typeof access !== "object" || Array.isArray(access)) {
+    errors.push({
+      path,
+      message: "Access control must be an object",
+      code: "ACCESS_INVALID_TYPE",
+    });
+    return;
+  }
+
+  for (const [key, rule] of Object.entries(access)) {
+    if (!accessKeys.includes(key)) {
+      errors.push({
+        path: `${path}.${key}`,
+        message: `Unknown access rule '${key}'; the rules here are ${accessKeys.join(", ")}`,
+        code: "ACCESS_KEY_UNKNOWN",
+      });
+      continue;
+    }
+    if (
+      rule !== undefined &&
+      typeof rule !== "function" &&
+      typeof rule !== "boolean"
+    ) {
+      errors.push({
+        path: `${path}.${key}`,
+        message: `Access rule '${key}' must be a function or a boolean`,
+        code: "ACCESS_FUNCTION_INVALID",
+      });
+    }
+  }
+}

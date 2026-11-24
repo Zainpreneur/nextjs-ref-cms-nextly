@@ -1,0 +1,1710 @@
+// Release-pipeline test (0.0.136): verifies the consolidated v0.0.X
+// GitHub Release workflow introduced in #1243. No runtime impact.
+
+// of nextly. Anything that statically imports `next/navigation`,
+// `next/cache`, `next/headers`, etc. lives behind the
+// `nextly/runtime` subpath instead. Keeping the root clean is
+// what lets the CLI, plugin authors, and config loaders import from
+// the package without dragging Next.js into a Node-only context.
+//
+// If you find yourself wanting to add a re-export here that pulls
+// `routeHandler.ts`, `api/with-error-handler.ts`, `actions/with-action.ts`,
+// `actions/upload-media.ts`, or anything reachable from those files —
+// move it under `runtime.ts` (which is exported from the
+// `nextly/runtime` subpath) and update consumers there.
+export {
+  ServiceDispatcher,
+  type ServiceType,
+  type OperationType,
+  type DispatchRequest,
+  type DispatchResult,
+} from "./services/dispatcher";
+export { ServiceContainer } from "./services/index";
+
+// Export dynamic collections services and types
+export {
+  DynamicCollectionService,
+  CollectionFileManager,
+  CollectionsHandler,
+  type CollectionArtifacts,
+  type CreateCollectionInput,
+  type UpdateCollectionInput,
+} from "./services/index";
+export type {
+  FieldDefinition,
+  CollectionSchemaDefinition,
+  DynamicCollection,
+  NewDynamicCollection,
+} from "./schemas/dynamic-collections";
+
+// Export pagination types
+export type {
+  PaginatedResponse,
+  BuildPaginatedResponseOptions,
+} from "./types/pagination";
+export {
+  buildPaginatedResponse,
+  clampLimit,
+  calculateOffset,
+  PAGINATION_DEFAULTS,
+} from "./types/pagination";
+
+// Export Zod schemas for validation
+export * from "./schemas/index";
+
+// Export database engine exports (adapters, migrations, etc.)
+export * from "./database/index";
+
+// ============================================================
+// DATABASE ADAPTER TYPES
+// ============================================================
+
+// Re-export common types from @nextlyhq/adapter-drizzle for convenience.
+// Users can import these directly from 'nextly' instead of separate packages.
+
+// DrizzleAdapter class (for extending or type checking)
+export { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+
+// Common adapter types
+export type {
+  DatabaseCapabilities,
+  TransactionContext,
+  WhereClause,
+  SelectOptions,
+} from "@nextlyhq/adapter-drizzle/types";
+
+// Export database lifecycle hooks API
+export * from "./hooks";
+
+// Explicit hook exports to prevent tree-shaking from removing them
+export {
+  getHookRegistry,
+  resetHookRegistry,
+  HookRegistry,
+} from "./hooks/hook-registry";
+
+export {
+  registerCollectionHooks,
+  clearCollectionHooks,
+  reregisterCollectionHooks,
+  type RegisterCollectionHooksResult,
+} from "./hooks/register-collection-hooks";
+
+export {
+  registerSingleHooks,
+  clearSingleHooks,
+  reregisterSingleHooks,
+  type RegisterSingleHooksResult,
+} from "./hooks/register-single-hooks";
+
+// The advisory channel a post-commit hook reports through. Exported because a
+// PLUGIN is the caller: raising is how a hook says a side effect broke, and a
+// plugin that learns something true about the state a write leaves behind has
+// no other way to tell the caller without dressing it as a failure.
+export {
+  recordAdvisoryNotice,
+  type AdvisoryNotice,
+  type HookWarning,
+} from "./hooks/side-effect-warnings";
+
+// ============================================================
+// INITIALIZATION API
+// ============================================================
+
+// Main initialization API - recommended for most applications
+// `registerNextlyStart` is how an app's `cached-read.ts` says how to start
+// Nextly for a read that finds it not started (a root layout's read on
+// `/_not-found` during `next build`), without starting it eagerly.
+export {
+  getNextly,
+  getCachedNextly,
+  registerNextlyStart,
+  shutdownNextly,
+  createRegister,
+  type Nextly,
+  type NextlyServiceConfig as NextlyConfig,
+  type GetNextlyOptions,
+} from "./init";
+
+// ============================================================
+// DIRECT API
+// ============================================================
+
+// Convenience object - lazily delegates to the Direct API singleton.
+// Import and use directly: `import { nextly } from 'nextly'`
+export { nextly } from "./direct-api";
+
+// Canonical NextlyError — re-exported here for ergonomic catch-block use.
+// For richer surface (codes, public-data types, etc.) import from
+// `nextly/errors`. Use the static type guards on `NextlyError`
+// (e.g. `NextlyError.isNotFound(err)`) — the legacy `is*Error` helpers
+// were removed in PR 12 (final unified-error-system cleanup).
+export { NextlyError } from "./errors";
+
+// Whether a failure means Nextly is unavailable, and the render policy that
+// follows from it: in production a page render fails rather than being
+// served without what Nextly gives it. On the root as well as
+// `nextly/runtime`, so `@nextlyhq/plugin-sdk` re-exports it without pulling
+// the runtime barrel into every plugin. `@experimental`.
+export {
+  failRenderWhenUnavailable,
+  isNextlyUnavailable,
+} from "./errors/unavailable";
+
+// The canonical mutation builder, published so a CONTRIBUTED route can answer
+// in the same envelope every first-party write answers in.
+//
+// A plugin route is the one HTTP surface here that could not reach it, and the
+// consequence is not stylistic: `respondMutation` reads the request's own
+// side-effect warning scope, so a hand-built mutation body silently drops a
+// post-commit hook failure that every other write reports. A route rebuilding
+// the shape by hand also gains whatever the builder gains next only if somebody
+// remembers to copy it — the same defect the plugin error path already had, one
+// level along.
+// The read and action shapes go with it, for the same reason and one step
+// further: a plugin that takes over an endpoint core used to serve has to
+// answer in the body core answered in, or the URL is preserved while the
+// contract silently changes underneath every client already calling it.
+// `respondAction` reads the same warning scope `respondMutation` does, and a
+// plugin route runs inside it, so these behave identically wherever they are
+// called from. `PaginationMeta`, which `respondList` takes, is exported below.
+export {
+  respondAction,
+  respondDoc,
+  respondList,
+  respondMutation,
+} from "./api/response-shapes";
+
+// The slug rule, published because it was already documented as though it were.
+// `prebuilt`'s own auto-slug docblock shows `slugify(context.data.title)` as the
+// way to derive one, and the name does not survive to this entry: two modules in
+// this package export a `slugify`, so the star re-export that would have carried
+// it drops the ambiguous name and the advertised call does not resolve. Named
+// explicitly here, which is also what decides WHICH of the two is the public
+// one — the unicode-normalising rule the hook uses, not the filename helper the
+// migration writer uses.
+export { slugify } from "./hooks/prebuilt";
+
+// A slug as a collection stores it: one part, or a path where the collection
+// sets `db.slugPaths`. Core's writes store by it, so a plugin that says where
+// an entry will land before it writes says what core will store.
+// @experimental
+export { slugAsStored } from "./domains/collections/services/slug-as-stored";
+
+// Direct API types - type-safe slug resolution (for generated types integration)
+export type {
+  GeneratedTypes,
+  CollectionSlug,
+  SingleSlug,
+  FieldGroupSlug,
+  DataFromCollectionSlug,
+  DataFromSingleSlug,
+  InProcessRow,
+  RowFromCollectionSlug,
+  RowFromSingleSlug,
+  DataFromFieldGroupSlug,
+} from "./direct-api/types";
+
+// The site's languages as generated types know them: what a read's `locale` and
+// `fallbackLocale` take, for a caller annotating its own values with them.
+export type {
+  FallbackLocaleOption,
+  Locale,
+  LocaleOption,
+} from "./direct-api/types/locales";
+
+// Direct API types - the `nextly.fieldGroups.*` namespace. Exported from the
+// root because they are the argument and result types of a public namespace:
+// without them a caller cannot annotate a variable holding what it returns.
+export type {
+  FieldGroupDefinition,
+  FindFieldGroupsArgs,
+  FindFieldGroupBySlugArgs,
+  CreateFieldGroupArgs,
+  UpdateFieldGroupArgs,
+  DeleteFieldGroupArgs,
+} from "./direct-api/types";
+
+// The vocabulary a caller needs to answer `DirectAPIConfig.trusted`. Exported
+// as a VALUE, not only a type: the escape hatch is a constant a caller has to
+// be able to write, and a bound it cannot name is a bound it will not draw.
+export {
+  TRUSTS_EVERY_COLLECTION,
+  type TrustBound,
+} from "./services/collections/trust-grant";
+
+// Direct API types - core operation argument types
+export type {
+  DirectAPIConfig,
+  RunAsPrincipal,
+  FindArgs,
+  FindByIDArgs,
+  CreateArgs,
+  UpdateArgs,
+  DeleteArgs,
+  CountArgs,
+  GroupArgs,
+  TimeseriesArgs,
+  BulkDeleteArgs,
+  DuplicateArgs,
+  FindSingleArgs,
+  // What `findSingle` resolves to, `null` included only for a call that may
+  // pass `createIfMissing: false`.
+  FoundSingle,
+  UpdateSingleArgs,
+  CountResult,
+  GroupResult,
+  TimeseriesResult,
+  DeleteResult,
+  BulkOperationResult as DirectAPIBulkOperationResult,
+  // Templates and downstream consumers import these to type Direct API
+  // results without reaching into internal modules. The deprecated
+  // migrated every in-tree consumer to `ListResult<T>`.
+  ListResult,
+  MutationResult,
+  PaginationMeta,
+  // Auth types
+  LoginArgs,
+  RegisterArgs,
+  ChangePasswordArgs,
+  ForgotPasswordArgs,
+  ResetPasswordArgs,
+  VerifyEmailArgs,
+  LoginResult,
+  AuthResult,
+  UserContext,
+  // User types
+  FindUsersArgs,
+  FindUserByIDArgs,
+  CreateUserArgs,
+  UpdateUserArgs,
+  DeleteUserArgs,
+  ListUserIdentitiesArgs,
+  UnlinkIdentityArgs,
+  // Media types
+  UploadFileData,
+  UploadMediaArgs,
+  FindMediaArgs,
+  FindMediaByIDArgs,
+  FindMediaByIDsArgs,
+  MediaCopyArgs,
+  MediaCopiesArgs,
+  UpdateMediaArgs,
+  DeleteMediaArgs,
+  BulkDeleteMediaArgs,
+  ListFoldersArgs,
+  CreateFolderArgs,
+  // Form types
+  FormsConfig,
+  FindFormsArgs,
+  FindFormBySlugArgs,
+  SubmitFormArgs,
+  SubmitFormResult,
+  FormSubmissionsArgs,
+  // Query types
+  PopulateOptions,
+  RequestContext as DirectAPIRequestContext,
+  WhereFilter,
+  QueryOperator,
+  FieldCondition,
+  // Email Provider types
+  FindEmailProvidersArgs,
+  FindEmailProviderByIDArgs,
+  CreateEmailProviderArgs,
+  UpdateEmailProviderArgs,
+  DeleteEmailProviderArgs,
+  SetDefaultProviderArgs,
+  TestEmailProviderArgs,
+  // Email Template types
+  FindEmailTemplatesArgs,
+  FindEmailTemplateByIDArgs,
+  FindEmailTemplateBySlugArgs,
+  CreateEmailTemplateArgs,
+  UpdateEmailTemplateArgs,
+  DeleteEmailTemplateArgs,
+  PreviewEmailTemplateArgs,
+  // @experimental Template ownership: what `override`, `reset`, `compare`,
+  // `applyUpdate` and `undoUpdate` take and return.
+  OverrideEmailTemplateArgs,
+  ResetEmailTemplateArgs,
+  CompareEmailTemplateArgs,
+  ApplyEmailTemplateUpdateArgs,
+  UndoEmailTemplateUpdateArgs,
+  EmailTemplateComparison,
+  EmailTemplateVersion,
+  OwnerChange,
+  OwnerChangeChoice,
+  OwnerUpdateUndo,
+  // User Field types
+  FindUserFieldsArgs,
+  FindUserFieldByIDArgs,
+  CreateUserFieldArgs,
+  UpdateUserFieldArgs,
+  DeleteUserFieldArgs,
+  ReorderUserFieldsArgs,
+  // Email Send types
+  SendEmailArgs,
+  SendTemplateEmailArgs,
+  SendEmailResult,
+  // Queued email (experimental)
+  QueueEmailArgs,
+  QueueTemplateEmailArgs,
+  QueuedEmail,
+  QueuedEmailState,
+  CancelQueuedEmailArgs,
+  RetryQueuedEmailArgs,
+  // The Email hub's Activity reads, `nextly.emailDeliveries.*`
+  // (experimental).
+  FindEmailActivityArgs,
+  FindEmailDeliveriesArgs,
+  FindQueuedEmailsArgs,
+  EmailLastSentArgs,
+  EmailOverdueArgs,
+  FindEmailDeliveryByIDArgs,
+  SearchEmailActivityArgs,
+  ActivityEntry,
+  ActivityPage,
+  AddressSearchPage,
+  DeliveryActivity,
+  DeliveryDetail,
+  QueuedEmailActivity,
+  QueuedEmailDetail,
+  QueuedEmailOverdue,
+  TemplatesLastSent,
+} from "./direct-api/types";
+
+// What `users.listIdentities` lists: one linked identity, as the account's
+// listing answers it.
+export type { ListedExternalIdentity } from "./domains/auth/services/identity-service";
+
+// Email templates (experimental). Template data takes lists and objects;
+// a template escapes every value it writes, except pre-rendered HTML that
+// code marks with `markHtml`. Only code marks HTML, and only markup it built
+// itself: never a value from a request, a form, a stored row or another
+// plugin.
+export { markHtml, TrustedHtml } from "./domains/email/services/liquid-engine";
+export type { EmailTemplateData } from "./direct-api/types/email";
+
+// TypeGenerator types - for advanced type generation use cases
+export type {
+  TypeGeneratorOptions,
+  GeneratedTypeInterface,
+  GeneratedSingleTypeInterface,
+  GeneratedUserInterface,
+  GeneratedTypesFile,
+} from "./domains/schema/services/type-generator";
+
+// ============================================================
+// ADVANCED DI API (for power users)
+// ============================================================
+
+// Schema apply pipeline — used by seed scripts and template authors
+// who register collections/singles via the registry services and then
+// need the physical `dc_*` / `single_*` tables to be created in the
+// same boot. Mirrors what the visual admin UI's applySchemaChanges
+// dispatcher does internally.
+export {
+  applyDesiredSchema,
+  buildDesiredSchemaFromRegistry,
+  buildDesiredSchemaFromRegistryAsync,
+  type ApplyResult,
+  type DesiredSchema,
+  type DesiredCollection,
+  type DesiredSingle,
+  type DesiredFieldGroup,
+  type DesiredSchemaOverrides,
+  type SchemaApplyErrorCode,
+} from "./domains/schema/pipeline";
+
+// DI Container - for advanced use cases
+export { Container, container, type Factory } from "./di";
+
+// Service Registration. The `./di` barrel leaves registration out, so the
+// registration functions come from `./di/register` itself.
+export {
+  registerServices,
+  shutdownServices,
+  clearServices,
+} from "./di/register";
+export {
+  getService,
+  isServicesRegistered,
+  type NextlyServiceConfig,
+  type ServiceMap,
+} from "./di";
+// Named by `NextlyServiceConfig.pluginConsent`.
+export type { PluginConsent } from "./plugins/plugin-consent";
+
+// Validation Types and Utilities
+export type {
+  ValidationErrorCode,
+  ValidationError,
+  ValidationResult,
+  ValidationErrorResponse,
+} from "./validation";
+export {
+  VALIDATION_ERROR_CODES,
+  isValidationErrorCode,
+  isValidationError,
+  isValidationResult,
+  createValidationError,
+  validResult,
+  invalidResult,
+  createValidationErrorResponse,
+  // Error Formatting Utilities
+  formatZodError,
+  mergeValidationResults,
+  toApiResponse,
+} from "./validation";
+
+// ============================================================
+// NEW SERVICE LAYER EXPORTS
+// ============================================================
+
+// Core Services - New unified services with ServiceError pattern
+export { CollectionService } from "./services/collections/collection-service";
+export type {
+  Collection,
+  CollectionEntry as CollectionDocument,
+  ListCollectionsOptions,
+} from "./services/collections/collection-service";
+
+export { UserService } from "./services/users/user-service";
+export type {
+  User,
+  CreateUserInput as CreateUserServiceInput,
+  UpdateUserInput as UpdateUserServiceInput,
+  ListUsersQueryOptions,
+  PasswordHasher,
+} from "./services/users/user-service";
+
+export { MediaService } from "./services/media/media-service";
+/**
+ * Resized copies of stored images: the widths a copy can have, the allowed
+ * width nearest any other, and what `copyOf` answers.
+ * @experimental
+ */
+export {
+  MEDIA_COPY_WIDTHS,
+  nearestMediaCopyWidth,
+  type MediaCopyWidth,
+} from "./domains/media/copies/copy-rules";
+export type {
+  MediaCopy,
+  MediaCopySource,
+} from "./domains/media/copies/media-copies";
+export type {
+  MediaFile,
+  MediaType,
+  UploadMediaInput,
+  UpdateMediaInput,
+  ListMediaOptions,
+  MediaFolder,
+  CreateFolderInput,
+  UpdateFolderInput,
+  FolderContents,
+  BulkOperationResult,
+} from "./services/media/media-service";
+
+// Re-export StorageProvider as type alias for IStorageAdapter
+export type { IStorageAdapter as StorageProvider } from "./storage/types";
+
+// Shared Types - Common types used across services
+export type {
+  DrizzleDB,
+  RequestContext,
+  PaginationOptions,
+  PaginatedResult,
+  SortOptions,
+  QueryOptions,
+  ServiceDeps,
+  Logger,
+} from "./services/shared";
+export { SYSTEM_CONTEXT, consoleLogger } from "./services/shared";
+
+// Validating loose values against field declarations, for plugins that store
+// structured content of their own and must apply the same rules a write does.
+export {
+  validateFieldValues,
+  type ValidateFieldValuesOptions,
+  type FieldValueDeclaration,
+  type FieldValueDeclarationInput,
+  type ValidationIssue,
+} from "./plugins/validate-field-values";
+
+// The block manifest's published contract. Exported from the package root
+// because a schema nothing can import promises nothing: the file is read by an
+// editor build, a docs page or an agent, and none of them can reach an internal
+// module through the export map.
+export {
+  BLOCK_MANIFEST_FILENAME,
+  BLOCK_MANIFEST_VERSION,
+  blockManifestJsonSchema,
+  blockManifestSchema,
+  blockManifestEntrySchema,
+  type BlockManifest,
+  type BlockManifestEntry,
+} from "./plugins/codegen/block-manifest";
+
+// The block document format's published contract, exported for the same reason
+// as the manifest above: the things that most need to check a document against
+// the format — a generator, an editor build, an agent writing a page — are the
+// ones with no way to reach an internal module.
+export {
+  blockDocumentJsonSchema,
+  parseBlockDocument,
+  type BlockDocumentParseResult,
+} from "./plugins/codegen/block-document";
+// The success shape's `data` IS a `BlockDocument`, so a consumer that parses a
+// document cannot name what it got back without reaching past this barrel into
+// the engine. Re-exported from the engine, which owns the type, so the parser
+// and the shape it returns arrive together.
+export type { BlockDocument } from "@nextlyhq/blocks-engine";
+
+// Plugin System - Types and helpers for creating plugins
+// One implementation of "is this a safe place to send a finished login". A
+// plugin keeping its own copy is a second answer to a question with one right
+// answer, and the copy is the one that gets it wrong.
+export {
+  DEFAULT_ADMIN_PATH,
+  sanitizeAdminPath,
+} from "./auth/redirect/sanitize-admin-path";
+
+export {
+  AdminPlacement,
+  collectDeclarations,
+  definePlugin,
+  createPluginContext,
+  // Runtime companions to `PluginCategory`, so a plugin author can enumerate
+  // the vocabulary and narrow a free-form value rather than restating either.
+  PLUGIN_CATEGORIES,
+  isPluginCategory,
+  pluginAdminSlug,
+  type PluginAdminAppearance,
+  type PluginAdminConfig,
+  type PluginCategory,
+  type PluginAuditApi,
+  type PluginAuditDeclaration,
+  // The helpers a plugin receives on `ctx.security`: passwords, opaque
+  // secrets, one-purpose secrets and verifying the webhooks it receives.
+  type PluginSecurityApi,
+  standardWebhooks,
+  type InboundWebhookDelivery,
+  type InboundWebhookReading,
+  type InboundWebhookScheme,
+  type ClaimDeliveryOptions,
+  type DeliveryClaim,
+  type DeliveryClaimResult,
+  type PluginReceivedWebhooks,
+  type VerifiedWebhook,
+  type VerifyWebhookOptions,
+  type WebhookRefusal,
+  type WebhookVerification,
+  PasswordTooLongError,
+  type PasswordCheck,
+  type PasswordHelper,
+  type PasswordRules,
+  type OpaqueSecrets,
+  type KeyedDigests,
+  type OneTimeSecrets,
+  type SecretData,
+  type TxOption,
+  type PluginAuthApi,
+  type PluginCapabilities,
+  type CompleteLoginOptions,
+  // `ctx.config` and what it lists, so a plugin can type a helper that reads
+  // the application's configuration.
+  type PluginConfig,
+  type PluginSummary,
+  // The types `ctx.config` is built from, so a plugin's emitted declarations
+  // can name them rather than spell their structure out.
+  type FrozenCopy,
+  type FrozenValue,
+  type PluginEmailSettings,
+  type PluginContext,
+  type PluginDurableEvents,
+  type PluginEmitOptions,
+  type PluginEvents,
+  type PluginContributions,
+  type PluginDatabase,
+  type PluginRawDatabase,
+  // What each core service in `ctx.services` exposes to a plugin.
+  type PluginUserService,
+  type PluginMediaService,
+  type PluginEmailService,
+  type PluginVersionsService,
+  // `ctx.services.versions.pins`: version pins on the plugin's own transaction.
+  type PluginVersionPins,
+  type PluginVersionPinHolder,
+  type PluginVersionPin,
+  type PluginPinOptions,
+  type PluginPinTransaction,
+  type PluginInsert,
+  type PluginTransaction,
+  type PluginTransactionBounds,
+  type PluginHookPointDeclaration,
+  type PluginSettingsApi,
+  type PluginCacheApi,
+  pluginCacheTag,
+  type PluginDeclaration,
+  type PluginDefinition,
+  type PluginPermission,
+  type PluginRole,
+  type PluginEmailProvider,
+  type PluginEmailTemplate,
+  type PluginFieldType,
+  type PluginFieldValidateArgs,
+  type PluginFieldWrite,
+  type PluginFieldWriteCaller,
+  type PluginStoredValue,
+  type PluginStoredValueTarget,
+  type PluginStoredValuesTarget,
+  type PluginFieldInstance,
+  type PluginFieldIssue,
+  type PluginFieldValidationResult,
+  type PluginFieldCodegen,
+  type PluginFieldCodegenImport,
+  type FieldSurface,
+  type PluginSchedule,
+  type ScheduledTask,
+  type PluginWebhookEventType,
+  type PluginTranslations,
+  type PermissionSlug,
+  type PluginHookRegistry,
+  // `ctx.hooks.onInTransaction`'s handler and what it is handed.
+  type InTransactionContext,
+  type InTransactionHandler,
+  type PluginFilterRegistry,
+  type PluginActionRegistry,
+  type HookPointContext,
+  type HookPointNameOf,
+  type HookPointPayload,
+  type HookPointPayloads,
+  type HookPointValue,
+  type PluginRoute,
+  type PluginRouteCaller,
+  type PluginRouteCanOptions,
+  type PluginRouteIdentity,
+  type PluginRouteContext,
+  type PluginRouteHandler,
+  type PluginRouteMount,
+  type PluginRouteRateLimit,
+  type PluginRouteLimitKey,
+  type Middleware,
+  type RouteMethod,
+  type PluginProxyHandler,
+  type ProxyAnswer,
+  type NextlyPrincipals,
+  type PluginPrincipalsApi,
+  type PluginRoutePrincipal,
+  type Principal,
+  type PrincipalAnswer,
+  type PrincipalAttributeDescriptors,
+  type PrincipalAttributes,
+  type PrincipalAttributesOf,
+  type PrincipalAttributeType,
+  type PrincipalAttributeTypeOf,
+  type PrincipalAttributeValue,
+  type PrincipalKindContribution,
+  type PrincipalKindDefinition,
+  type PrincipalRecord,
+  type PrincipalRef,
+  type PrincipalReportOptions,
+  type ComponentPath,
+  type JsonObject,
+  type JsonValue,
+  type PluginAdminContributions,
+  type PluginAdminPage,
+  type PluginPageStartupRead,
+  type PluginCollectionView,
+  type OverridableDocumentAction,
+  type PluginDocumentActionOverride,
+  type PluginDocumentActionOverrides,
+  type PluginDocumentView,
+  type PluginFieldTypeDocumentView,
+  type PluginPanelSection,
+  type PluginAdminPlaceDeclaration,
+  type AdminBlockContribution,
+  type AdminBulkActionContribution,
+  type AdminColumnContribution,
+  type AdminContribution,
+  type AdminContributionAction,
+  type AdminRowActionContribution,
+  type AdminSidebarSectionContribution,
+  type AdminTabContribution,
+  type AdminContributionKind,
+  type RowPredicate,
+  type RowPredicateValue,
+  type PluginListFilterDeclaration,
+  type PluginListFilterOption,
+  type PluginMenuItem,
+  type PluginMenuItemFields,
+  type PluginNavSection,
+  type PluginAdminPanel,
+  type PluginPanelGroup,
+  type PluginItemCount,
+  type PluginHeaderContributions,
+  type PluginHeaderSlotContributions,
+  type PluginHeaderUserMenuContributions,
+  type PluginItemPlace,
+  type PluginUserMenuAction,
+  type PluginUserMenuItem,
+  type PluginUserMenuLink,
+  CORE_ADMIN_PLACES,
+  type AdminPlaceId,
+  type AdminPlaces,
+  type CoreAdminPlaceId,
+} from "./plugins";
+export type { ForgetSendsInput } from "./domains/email/plugin-send-forgetting";
+// What a plugin is told of its queued emails' changes, and reads of them.
+export type {
+  QueuedEmailCancelCause,
+  QueuedEmailChange,
+  QueuedEmailRecipient,
+  QueuedRecipientOutcome,
+} from "./domains/email/queued-send-changes";
+export type {
+  QueuedEmailStanding,
+  QueuedEmailStatus,
+} from "./domains/email/queued-send-read";
+export type { QueuedEmailChangeHandler } from "./plugins/plugin-context";
+
+// "Every content type except these", one answer for each reader of a scope.
+// @experimental
+export {
+  isContentTypeScope,
+  typesReachedBy,
+  type ContentTypeCandidate,
+  type ContentTypeKind,
+  type ContentTypeScope,
+} from "./plugins/content-type-scope";
+// Which types a plugin's `extend` added each field to, as the start resolved
+// them. @experimental
+export { typesExtendedBy, type ExtendedType } from "./plugins/extended-types";
+// A plugin's switch for the fields its `extend` added. @experimental
+export {
+  EXTENSION_SWITCH_SERVICE,
+  type ExtensionSwitch,
+} from "./plugins/extension-switch";
+
+// The later pages of a paginated list's address (`/news/page/2`): one
+// spelling per page, read the way the content routes read them.
+// @experimental
+export { listPageNumber, listPageOf } from "./runtime/routing/slug-param";
+
+// The cache tags a read of a collection, or of one entry in it, carries:
+// what a write to it expires. For code that caches an answer built from
+// those reads, such as a plugin's page metadata.
+// @experimental
+export { nextlyTags } from "./runtime/cache/nextly-tags";
+
+// The paths every robots.txt of a Nextly site keeps crawlers out of, read
+// by `nextlyRobots` and by a plugin that serves the file.
+// @experimental
+export { FRAMEWORK_CRAWL_EXCLUSIONS } from "./shared/crawl-exclusions";
+
+// Where an entry is served, as the site declares it: one answer for every
+// reader of a page's public address.
+// @experimental
+export {
+  publicAddressOf,
+  typesWithoutAddress,
+  type PublicAddress,
+  type PublicAddressType,
+} from "./domains/public-addresses/public-address";
+
+// How each language's address is formed, by prefix or by domain, as the site
+// declares it: the address a path kept in one language is opened at.
+// @experimental
+export {
+  addressOfRequest,
+  languageAddressOf,
+  type KeptAddress,
+  type LanguageAddress,
+  type LanguageAddressRule,
+} from "./domains/i18n/language-addresses";
+
+// Keeping every public address to one page: the record a plugin keeps, as
+// core asks it on each save (`ctx.publicAddresses`).
+// @experimental
+export type {
+  AddressHolder,
+  HeldAddress,
+  HeldAddressUpdate,
+} from "./domains/public-addresses/participants";
+export type { HeldDocument } from "./domains/public-addresses/held-listing";
+export type {
+  ParticipantTransaction,
+  PluginPublicAddresses,
+  PublicAddressParticipant,
+  RefusedAddressUpdate,
+} from "./plugins/plugin-public-addresses";
+
+// The plugin limiter: `contributes.limits` rules and `ctx.limits`.
+// @experimental
+export type { LimitRule } from "./domains/limits/limit-rules";
+export type {
+  AdmittedReservation,
+  EntryVerdict,
+  LimitCheck,
+  LimitEntry,
+  LimitOutcome,
+  LimitReservation,
+  LimitTarget,
+  PluginLimiter,
+} from "./domains/limits/plugin-limiter";
+
+// @experimental Widgets declared once with `defineWidget()`, which a plugin
+// contributes under `contributes.dashboard`: the declaration, its setting
+// builders (`setting`, the collections' field builders as a card's settings
+// take them, with the collections' own `option` for a select's choices), and
+// the types a widget's component is written against. Startup checks every declaration and reports each fault; the data
+// code stays on the server, and the admin is sent data only.
+export {
+  defineAttentionItem,
+  defineWidget,
+  MAX_ATTENTION_ITEMS_PER_PLUGIN,
+  setting,
+  type AnyWidget,
+  type AttentionCount,
+  type AttentionItem,
+  type CoreView,
+  type AdminDashboardConfig,
+  type CoreWidgetId,
+  type DashboardContribution,
+  type DateRange,
+  type DefaultLayoutCard,
+  type WidgetOverride,
+  type WidgetRef,
+  type ChartStyle,
+  type WidgetAccess,
+  // The permission gate `access` takes.
+  type WidgetAccessGate,
+  // What `describe` answers, and a count's window.
+  type WidgetCollectionDescription,
+  type WidgetCollectionField,
+  type WidgetComponentMap,
+  type WidgetCountWindow,
+  type WidgetData,
+  type WidgetDataInput,
+  type WidgetEmpty,
+  type WidgetFilter,
+  // A series' interval and range.
+  type WidgetInterval,
+  // The size a card's `load` is handed.
+  type WidgetLoadSize,
+  type WidgetPreviewCase,
+  type WidgetProps,
+  type WidgetRange,
+  type WidgetReadServices,
+  type WidgetRenderSize,
+  // A card's loading shape and add-panel sketch.
+  type WidgetSkeleton,
+  type WidgetSummary,
+  type WidgetSummaryCount,
+  type WidgetView,
+} from "./domains/widgets/declaration/public";
+// @experimental The list rows a card of a given height draws at a density: what a widget's `load`
+// reads its `size` by to ask for no more rows than the card shows, by the formula core's own list
+// cards are drawn with. From the module the admin draws the frame by, which imports nothing more.
+export { rowsThatFit } from "./domains/widgets/card-geometry";
+// @experimental The rows a list card loads and shows for its "Number of entries" setting, and the
+// most that setting offers: what a widget's `load` reads its setting by, the rule core's own list
+// cards and the admin read alike. From `query-limits.ts`, which imports nothing.
+export { listEntries, MAX_WIDGET_ROWS } from "./domains/widgets/query-limits";
+// A setting's own editor component's props (experimental).
+export type { SettingEditorProps } from "./domains/widgets/result";
+// @experimental The check a site's generated admin component map applies, and what it reads:
+// the widgets a config declares, kept as types from `definePlugin` through `defineConfig`.
+export type {
+  DeclaredComponentMap,
+  WidgetsOf,
+} from "./plugins/declared-widgets";
+
+// The widget domain's public surface: the grid's size vocabulary, the
+// source registry a query names, and the validated query shape itself.
+// Nothing here adds, changes or removes a widget or a source. A widget reaches
+// the registry only from a plugin's `contributes.dashboard.widgets`, the site
+// config's `admin.dashboard.widgets`, or core's own list, all through one
+// internal call; the registry and its writers stay internal to the widgets
+// domain. Every contract a published shape NAMES is published beside it.
+// There is no `nextly/widgets` subpath, so this is the only place a plugin
+// author can reach them, and a public property whose type has no public name
+// can be inferred but never annotated: a declaration's `size` is a
+// `WidgetSizeDeclaration` of `GridSize`s, and `WidgetSource` is built out of
+// `WidgetSourceField`, `WidgetSourceKind` and `WidgetOp`.
+export {
+  GRID_COLUMNS,
+  WIDGET_SOURCE_KINDS,
+  WIDGET_SOURCE_FIELD_TYPES,
+  WIDGET_OPS,
+  WIDGET_LIFECYCLES,
+  WIDGET_CONDITIONS,
+  TIMESERIES_INTERVALS,
+  isTimeseriesInterval,
+  listSources,
+  validateWidgetQuery,
+  MAX_WIDGET_LIMIT,
+  type WidgetSetting,
+  type WidgetQuery,
+  type WidgetQuerySpec,
+  type GridSize,
+  type WidgetSizeDeclaration,
+  type WidgetSizeBounds,
+  type WidgetSource,
+  type WidgetSourceField,
+  type WidgetFieldChoice,
+  type WidgetSourceFieldType,
+  type WidgetSourceKind,
+  type WidgetOp,
+  type TimeseriesInterval,
+  type WidgetLifecycle,
+  type WidgetCondition,
+  callerReadOptions,
+  type WidgetSourceResolver,
+  type ResolverOptions,
+  type WidgetScope,
+  type ReadCaller,
+} from "./domains/widgets";
+
+// Value exports for the email provider contract. A plugin calls
+// defineEmailProvider so its own config type is checked where the definition is
+// written, and erased only at the boundary the registry stores it behind.
+export {
+  defineEmailProvider,
+  MAX_EMAIL_PROVIDER_TYPE_LENGTH,
+} from "./domains/email/provider-definition";
+export type {
+  EmailProviderDefinition,
+  EmailProviderConfigField,
+  EmailProviderCapabilities,
+  EmailProviderDescriptor,
+  ProviderAvailability,
+  RegisteredEmailProvider,
+} from "./domains/email/provider-definition";
+
+// Field-type registry lookup (C7/D16) — lets a plugin/host ask whether a
+// contributed field type may appear on a given admin surface, so surfaces
+// (e.g. the form builder) can validate a plugin field type the same way core
+// does. Built-ins return false; each caller keeps its own built-in handling.
+export {
+  isPluginFieldTypeOnSurface,
+  getFieldType as getPluginFieldType,
+} from "./domains/schema/field-types/field-type-registry";
+
+// Block props on the field system — a block's prop declarations become
+// ordinary field configs, so block values validate through the same pass
+// entries do instead of a parallel rule set.
+export {
+  blockPropsToFieldConfigs,
+  validateBlockPropValues,
+  type BlockPropDeclaration,
+  type BlockPropsSource,
+} from "./collections/fields/block-props";
+
+// The block-prop surface: which field types a block prop may declare, and
+// which data fields may be bound into one. Both derive from the prop's type,
+// never from a per-block opt-in.
+export {
+  BLOCK_FIELD_TYPES,
+  BLOCK_FIELD_TYPE_CATALOG,
+  BINDABLE_KINDS,
+  FIELD_TYPE_BINDING_KIND,
+  STORAGE_PRIMITIVE_AS_FIELD_TYPE,
+  isBlockFieldType,
+  isBindablePropType,
+  bindingKindOf,
+  canBindFieldToProp,
+  type BlockFieldCatalogType,
+  type BindingEndpoint,
+  type BindingValueKind,
+  type FieldStoragePrimitive,
+} from "./collections/fields/catalog";
+
+// Managed-services elevation (D35) — `ctx.services` ServiceOpts + the auth user.
+export type {
+  ServiceOpts,
+  PluginCollectionService,
+  PluginCollectionTransaction,
+} from "./plugins/service-opts";
+// Exported alongside `PluginCollectionService` because a plugin typing its own
+// helper against `ctx.services.singles` needs to name the type, and an
+// unexported one leaves it reaching into a deep path or widening to `unknown`.
+export type {
+  PluginSinglesService,
+  PluginSinglesResult,
+  PluginSingleRecord,
+  SerializedFieldConfig,
+} from "./plugins/plugin-singles";
+export type { AuthUser } from "./types/auth";
+// Exported for the same reason as `AuthUser` beside it: `PluginRouteContext`
+// carries an `authenticatedScope`, and a plugin typing a helper against it
+// otherwise has to reach into a deep path or widen to `unknown`.
+export type {
+  AuthenticatedScope,
+  GrantedPermission,
+} from "./auth/authenticated-scope";
+// `narrowScope` is a VALUE, not a type: a route restricting itself before a
+// sensitive call has no other correct way to do it. The scope's arrays are
+// frozen, and editing one in place would leave the spelling the field gate
+// reads still holding the surrendered grant.
+export { narrowScope } from "./auth/authenticated-scope";
+export type {
+  PluginRoutePermissionResolver,
+  PluginRoutePermissionScope,
+} from "./plugins/routes/route-permission";
+// The matcher's own grammar, for a plugin that has to judge a path BEFORE a
+// request arrives. Exported rather than left internal because the alternative
+// is every such plugin restating the rule, and a restatement that is stricter
+// than the matcher refuses paths that would have routed.
+export { routePathIsLiteral } from "./plugins/routes/route-pattern";
+// What a caller may read, for a surface that DESCRIBES an install rather than
+// reading one document. Published because the alternative is each such surface
+// composing the registry, the caller conversion and the per-entity decision
+// itself, and that composition is where the dashboard's own version went wrong.
+export { readableContent } from "./auth/readable-content";
+export type {
+  ReadableContent,
+  ReadableContentCaller,
+  ReadableContentEntity,
+} from "./auth/readable-content";
+// A plugin's read of a document's stored field values with no read hook, and
+// its write of a field only if the stored value is still the one it read,
+// judged under the write's own row lock. Here for `@nextlyhq/plugin-sdk` to
+// publish; it is the surface a plugin is promised. The hash is the one both
+// sides of the comparison use, so a plugin never computes its own.
+export { readStoredFields, updateIfUnchanged } from "./plugins/stored-fields";
+export type {
+  PluginConditionalUpdate,
+  PluginConditionalWriteIdentity,
+  PluginStoredDocument,
+  PluginStoredFields,
+  PluginStoredFieldsRequest,
+  PluginStoredIdentity,
+  PluginStoredLifecycle,
+  PluginSystemCheckedWrite,
+  PluginSystemIdentity,
+  PluginWriteExpectation,
+} from "./plugins/stored-fields";
+export { storedValueHash } from "./domains/collections/services/stored-field-read";
+// A field rewrite: one field of an entry or a Single changed on its live copy
+// and on every pending draft that holds it, without publishing, from the
+// version the caller read (`ctx.services.collections.rewriteField`,
+// `nextly.rewriteField`). Its types, here for `@nextlyhq/plugin-sdk` to
+// publish.
+export type {
+  DocumentFieldRewriteRequest,
+  FieldRewriteCopy,
+  FieldRewriteRequest,
+  FieldRewriteResult,
+  FieldRewriteValue,
+  SingleFieldRewriteRequest,
+} from "./domains/versions/field-rewrite";
+// A plugin's question "may this person delete this entry", asked of the
+// delete's own gate (its grant and a rule's row filter for the entry) with no
+// hook run and nothing written. Here for `@nextlyhq/plugin-sdk` to publish.
+export { mayDeleteEntry } from "./plugins/entry-delete-access";
+export type { PluginDeleteCheck } from "./plugins/entry-delete-access";
+// The same question for a write: the update gate, the publish gate where it
+// puts the document live, and each named field's update rule.
+export { mayWriteEntry } from "./plugins/entry-write-access";
+export type { PluginWriteCheck } from "./plugins/entry-write-access";
+
+// Auth extensibility (D71/D57) — pluggable strategies + auth-flow hooks +
+// challenge protocol. @experimental until a first-party plugin exercises it (D55).
+export type {
+  AuthInput,
+  AuthLimitAnswer,
+  AuthOutcome,
+  AuthStrategy,
+  Challenge,
+  ChallengeDefinition,
+  AuthHooks,
+  AuthHookName,
+} from "./auth/pipeline/types";
+
+// Managed data access (D56) — bulk-create result for
+// `ctx.services.collections.createMany`. Rich-query options (`QueryOptions`
+// with where/sort/depth/select) + `PaginatedResult` are exported with the other
+// shared service types above.
+export type {
+  BatchOperationResult,
+  // The input half of the batch update, beside the result half: a plugin
+  // typing an array it builds before calling `updateMany` has to be able to
+  // name the contract rather than restate its shape.
+  BulkUpdateEntry,
+} from "./domains/collections/services/collection-types";
+
+// Whether a collection stores a working draft beside its published row.
+//
+// Exported because a plugin cannot answer it and cannot safely guess. The split
+// resolves from five conditions together — versioning resolving
+// `drafts.enabled`, `status: true`, no reachable password field, every
+// reachable component schema resolving, and no component carrying one — and
+// `status: true` alone, the obvious flag, is true for collections that store no
+// draft at all. A plugin keying data by published/draft therefore writes rows
+// against a document that does not exist, and nothing downstream can tell those
+// rows from real ones.
+//
+// The reason travels with the verdict rather than being reduced to a boolean,
+// so a caller can say WHY a collection it expected to draft does not.
+//
+// `collectionDraftSplit` takes the collection AS AUTHORED. The two functions
+// beside it do not: one wants component schemas already resolved, the other
+// wants `versions` in the `{ drafts: { enabled } }` shape that only exists
+// after config load. An author writes `versions: true`, and handing that to
+// either is rejected by the checker — or, from untyped code, silently answers
+// `false` for a collection whose drafts are on.
+//
+// Root entry, not `nextly/config`: this reaches the component registry through
+// the DI container, and `config` is a CLIENT entry — publishing it there would
+// pull the server graph into a browser bundle.
+export { collectionDraftSplit } from "./domains/versions/draft-split-eligibility";
+
+// Editorial workflows (@experimental): a workflow defined in code, attached
+// to collections and Singles with their `workflow` option. The same exports as
+// `nextly/config`, which a collection file can import them from.
+export {
+  allowsSelfApproval,
+  defineWorkflow,
+  entersReview,
+  isReviewStage,
+  MAX_WORKFLOW_NAME_LENGTH,
+  primaryStep,
+} from "./domains/workflows/define-workflow";
+export {
+  reviewWorkflow,
+  type ReviewWorkflowOptions,
+} from "./domains/workflows/preset";
+export {
+  WORKFLOW_STEP_KINDS,
+  type ResolvedWorkflowStep,
+  type Workflow,
+  type WorkflowInput,
+  type WorkflowStage,
+  type WorkflowStageName,
+  type WorkflowStep,
+  type WorkflowStepKind,
+  type WorkflowStepName,
+} from "./domains/workflows/types";
+export type {
+  AuthoredDraftSplitCollection,
+  DraftSplitEligibility,
+  DraftSplitDisabledReason,
+} from "./domains/versions/draft-split-eligibility";
+
+// Version pins: a feature registers itself as a holder once, then points named
+// slots at a document's versions, and retention never removes a version a slot
+// points at. Pins run on the caller's core transaction.
+export {
+  registerVersionPinHolder,
+  versionPins,
+  type VersionPin,
+  type RegisteredVersionPinHolder,
+  type VersionPinHolder,
+  type VersionPinHolderDefinition,
+  type VersionPinSlot,
+} from "./domains/versions/version-pins";
+export type {
+  VersionRef,
+  // What `ctx.services.versions` takes and returns: a plugin names these from
+  // the SDK, which forwards them, rather than reaching into core's files.
+  AutosaveSupersession,
+  AutosaveWriteResult,
+  PendingEditCursor,
+  PendingEditOrder,
+  VersionMeta,
+  VersionRow,
+} from "./domains/versions/versions-repository";
+export type { VersionListOptions } from "./domains/versions/versions-service";
+export type { RestoreVersionResult } from "./domains/versions/restore-version";
+export type { VersionStatus } from "./schemas/versions/types";
+export type { ContentEventSubject } from "./domains/content-events/record";
+export type { ContentEventRecord } from "./domains/content-events/repository";
+export type { SubjectEventsQuery } from "./api/subject-events";
+
+// Which fields a level addresses, with presentational groups flattened.
+// Exported because a plugin that walks a collection's fields was otherwise
+// reaching into core's file layout, and a second copy of this walk is a second
+// answer to one question.
+export { addressableFields } from "./shared/addressable-fields";
+export type {
+  AddressableFieldsOptions,
+  AddressableField,
+  UnvalidatedAddressableField,
+} from "./shared/addressable-fields";
+
+// The dates every entry holds by itself (created, last saved, first published),
+// by the names responses publish them under. Exported because a plugin reading
+// an entry's own dates would otherwise keep a second list of core's system
+// columns, which drifts the day a column is added.
+export { entryDateFieldNames } from "./lib/system-columns";
+
+// Which `locale` values are selectors rather than languages. Exported because
+// a plugin route that forwards `?locale=` has to tell a visitor's language
+// from a wildcard, and the boundary that refuses the wildcards decides with
+// this same function — a second list would agree with it only until one of
+// them gained an entry.
+export {
+  EVERY_LOCALE,
+  EVERY_TRANSLATION,
+  isLocaleSelector,
+} from "./domains/i18n/locale-selector";
+
+// What a form answers a visitor who reaches it. Exported because the plugin
+// that contributes the forms collection refuses submissions too, and a second
+// implementation of this is how the four public paths came to disagree.
+export {
+  formAvailability,
+  GENERIC_REFUSAL,
+  NO_SUCH_FORM,
+  type FormAvailability,
+  type FormAvailabilityInput,
+} from "./domains/forms/form-availability";
+
+// The same question asked of a collection the SCHEMA BUILDER created, whose
+// record is not authored config.
+//
+// A Builder collection lives in the dynamic registry, and that registry stores
+// `versions` already RESOLVED — `dynamic_collections.versions` holds a
+// `ResolvedVersionsConfig`. So the authored form above is the one shape it can
+// never take: the checker rejects it, and untyped code gets `false` for a
+// collection whose drafts are on, because nothing named `drafts.enabled` is
+// read. A caller holding a registry record needs this one.
+//
+// Two functions rather than one accepting either, because the two inputs
+// overlap in neither direction and a single function would have to GUESS which
+// it was handed. `versions: true` and `{ drafts: { enabled: true } }` are both
+// objects-or-booleans that a runtime check can misread, and guessing wrong
+// fails silently in the direction that disables drafts.
+//
+// Renamed at this boundary. `schemaDraftSplit` is named for the caller it was
+// written for — the schema-read path — and a public name has to say what it
+// TAKES, because that is the only thing a plugin author choosing between the
+// two can see.
+export { schemaDraftSplit as resolvedCollectionDraftSplit } from "./domains/versions/draft-split-eligibility";
+
+// Background jobs. Exported from the root entry rather than only from the
+// domain barrel: a barrel that no published entry re-exports is unreachable
+// from an installed application, so the feature would exist for this
+// repository's own tests and for nobody else.
+export {
+  DEFAULT_MAX_ATTEMPTS,
+  MAX_JOB_SLUG_LENGTH,
+  defineJob,
+  JobRegistry,
+} from "./domains/jobs/job-registry";
+export type {
+  JobContext,
+  JobDefinition,
+  JobDefinitionInput,
+  JobRetryPolicy,
+} from "./domains/jobs/job-registry";
+export { JobsRepository } from "./domains/jobs/jobs-repository";
+export type {
+  EnqueueResult,
+  JobRow,
+  NewJob,
+} from "./domains/jobs/jobs-repository";
+export { runJobsPass } from "./domains/jobs/jobs-runner";
+export type { RunJobsPassOptions } from "./domains/jobs/jobs-runner";
+export type { RunJobsResult } from "./domains/jobs/run-jobs";
+// The QUEUE side. `nextly.jobs.queue` is the call almost every application
+// makes; everything above it is the machinery that then runs the work, and only
+// an application assembling its own runner needs those.
+export type {
+  JobInputFor,
+  JobSlug,
+  QueueJobArgs,
+  QueueJobResult,
+} from "./direct-api/types/jobs";
+// A plugin's `ctx.services.jobs`: the queue, and running one of its own
+// sweeps now. Named so a plugin can annotate what it hands that service to.
+export type { PluginJobsNamespace } from "./plugins/jobs/plugin-jobs";
+
+// The release materialiser, as a job definition. Exported so an application can
+// register it with the runner today: the periodic trigger that would register it
+// automatically is separate work, and until it lands a definition nobody can
+// reach is a definition that never runs.
+export {
+  RELEASES_DRAIN_JOB,
+  createReleasesDrainJob,
+} from "./domains/releases/releases-drain-job";
+export { applyDueReleases } from "./domains/releases/apply-due-releases";
+export type {
+  ApplyDueReleasesResult,
+  MaterialisationFailure,
+} from "./domains/releases/apply-due-releases";
+
+export type { SchemaEligibilityCollection as ResolvedDraftSplitCollection } from "./domains/versions/draft-split-eligibility";
+
+// The projection that makes the line above USABLE from its documented
+// producer. `getCollection()` is declared to return `Collection`, which has no
+// root-level `fields`, `status` or `versions`, so its result is not assignable
+// to `ResolvedDraftSplitCollection` however faithfully the record carries them.
+export { resolvedCollectionView } from "./domains/versions/resolved-collection-view";
+
+// A plugin's durable events (`ctx.events.emitDurable` / `onDurable`): what a
+// subscriber receives, and the handler that receives it.
+export type {
+  DurableEvent,
+  DurableHandler,
+} from "./domains/plugin-events/subscribers";
+
+// Plugin event bus (D8/D51) — `ctx.events` surface + types.
+export {
+  EventBus,
+  getEventBus,
+  resetEventBus,
+  type EventEnvelope,
+  type EventHandler,
+  type EventName,
+  DocumentEvents,
+  AuthEvents,
+  MediaEvents,
+  UserEvents,
+  type DocumentEventName,
+  type AuthEventName,
+  type MediaEventName,
+  type UserEventName,
+  type UserCreatedPayload,
+  type UserDeletedPayload,
+} from "./events";
+
+// Plugin filter/action registry (D63) — ctx.filters / ctx.actions surface + seam types.
+export {
+  FilterRegistry,
+  getFilterRegistry,
+  resetFilterRegistry,
+  FilterSeams,
+  type Decision,
+  type Filter,
+  type Action,
+  type FilterName,
+  type CoreFilterSeam,
+  type EmailPayloadFilterValue,
+  type EmailFilterContext,
+  type EmailAfterSendValue,
+  type NavCollectionItem,
+  type NavFilterContext,
+  type ListQueryWhere,
+  type ListQueryFilterContext,
+  type PublicAddressTemplateContext,
+  type EmailTemplateReference,
+  type EmailTemplateReferencesContext,
+} from "./filters";
+
+// ============================================================
+// COLLECTIONS & FIELD TYPES
+// ============================================================
+
+// Field types, guards, and helpers
+export * from "./collections/fields";
+
+// Collection configuration (defineCollection, CollectionConfig, etc.)
+export {
+  defineCollection,
+  type CollectionConfig,
+  type CollectionLabels,
+  type CollectionAdminOptions,
+  type CollectionPagination,
+  type CollectionAccessControl,
+  type CollectionHooks,
+  type CustomEndpoint,
+  type HttpMethod,
+  // Access control types (shared by collections, singles, and Direct API).
+  // `AccessRuleContext` is the one context every rule is handed, collection,
+  // Single and field alike; `AccessControlContext` is the same type.
+  type AccessControlContext,
+  type AccessControlFunction,
+  type AccessRuleContext,
+  type AccessRuleOperation,
+  type AccessRuleTarget,
+  type MinimalUser,
+  // A read rule may answer a filter, typed by the collection's fields.
+  type CollectionFilterRule,
+  type CollectionFilterRuleInput,
+  type CollectionRuleAnswer,
+  type CollectionRuleFilter,
+  type UntypedRuleFilter,
+} from "./collections/config";
+
+// Collection configuration validation
+export {
+  validateCollectionConfig,
+  assertValidCollectionConfig,
+  type ValidationError as CollectionValidationError,
+  type ValidationResult as CollectionValidationResult,
+  type ValidationErrorCode as CollectionValidationErrorCode,
+  RESERVED_SLUGS,
+  SQL_RESERVED_KEYWORDS,
+} from "./collections/config";
+
+// Nextly config (defineConfig for nextly.config.ts)
+export {
+  defineConfig,
+  type NextlyConfig as NextlyUserConfig,
+  type SanitizedNextlyConfig,
+  type TypeScriptConfig,
+  type DatabaseConfig,
+  type RateLimitingConfig,
+  type SanitizedRateLimitingConfig,
+  type SecurityConfig,
+  type AdminConfig,
+  type AdminBrandingConfig,
+  type AdminBrandingColors,
+  type PluginOverride,
+} from "./collections/config";
+
+// The breached-password source a plugin's password check asks, in
+// `security.breachedPasswords`.
+export type { BreachedPasswordsConfig } from "./shared/types/config";
+
+// ============================================================
+// MIDDLEWARE
+// ============================================================
+
+// Rate limiting middleware. `defaultSkipAdminApi` is deprecated: kept for an
+// app that passes it as `rateLimit.skip`, and no longer the default.
+export {
+  createRateLimiter,
+  createRateLimitHeaders,
+  defaultSkipAdminApi,
+  InMemoryRateLimitStore,
+  resolveRateLimitStore,
+  type RateLimitConfig,
+  type RateLimitStore,
+  type RateLimitResult,
+  type RateLimitRecord,
+} from "./middleware";
+
+// The contract an app's own limit store implements, selected by
+// `rateLimit.store`. Types only: a store is plain code of the app's.
+// @experimental
+export type {
+  LimitStore,
+  LimitUpdate,
+  StoredLimit,
+} from "./domains/limits/limit-store";
+export type { RateLimitStoreSetting } from "./domains/limits/limit-store-setting";
+
+// The limiter a caller drives directly, over the same store the middleware
+// uses. Exported so a plugin limiting something of its own counts in the same
+// window as the REST and auth limiters rather than in one of its own.
+export {
+  RateLimiter,
+  type RateLimitCheckResult,
+} from "./auth/middleware/rate-limiter";
+
+// Security middleware types
+export { type SecurityHeadersConfig, type CorsConfig } from "./middleware";
+
+// ============================================================
+// SINGLES
+// ============================================================
+
+// Single configuration (defineSingle, SingleConfig, etc.)
+export {
+  defineSingle,
+  type SingleConfig,
+  type SingleLabel,
+  type SingleAdminOptions,
+  type SingleAccessControl,
+  type SingleHooks,
+} from "./singles/config";
+
+// Single configuration validation
+export {
+  validateSingleConfig,
+  assertValidSingleConfig,
+  type SingleValidationResult,
+  type SingleValidationError,
+  type SingleValidationErrorCode,
+  RESERVED_SINGLE_SLUGS,
+} from "./singles/config";
+
+// ============================================================
+// COMPONENTS
+// ============================================================
+
+// Component configuration (defineFieldGroup, FieldGroupConfig, etc.)
+export {
+  defineFieldGroup,
+  type FieldGroupConfig,
+  type FieldGroupLabel,
+  type FieldGroupAdminOptions,
+} from "./field-groups";
+
+// Component configuration validation
+export {
+  validateFieldGroupConfig,
+  assertValidFieldGroupConfig,
+  type FieldGroupValidationResult,
+  type FieldGroupValidationError,
+  type FieldGroupValidationErrorCode,
+  RESERVED_FIELD_GROUP_SLUGS,
+  MAX_FIELD_GROUP_NESTING_DEPTH,
+} from "./field-groups";
+
+// Component field type (also exported from ./collections/fields via barrel export)
+export type { FieldGroupFieldConfig } from "./collections/fields/types/component";
+
+// The field-group storage vocabulary: which type tokens and reference keys a
+// stored definition may carry. Renderers that dispatch on a field's type — the
+// admin entry form among them — ask the predicate rather than compare either
+// literal, so a migrated definition renders as what it is.
+export {
+  extractFieldGroupReferences,
+  isFieldGroupFieldType,
+} from "./domains/field-groups/storage/field-group-field-type";
+
+// Declares an entry field whose type a plugin contributed. `FieldConfig` is a
+// closed union whose arms carry each built-in type's own errors, so it cannot
+// admit a contributed type without losing them; the brand opens the authoring
+// surfaces alone. The users surface solves the same problem the same way with
+// `pluginUserField` below.
+export {
+  pluginField,
+  pluginFieldBrand,
+} from "./collections/fields/types/plugin-field";
+export type {
+  AuthorableFieldConfig,
+  PluginDataFieldConfig,
+  PluginFieldInput,
+} from "./collections/fields/types/plugin-field";
+
+// ============================================================
+// USER MANAGEMENT
+// ============================================================
+
+// User configuration
+export type {
+  UserConfig,
+  UserFieldConfig,
+  UserPluginFieldConfig,
+  UserPluginFieldInput,
+  UserFieldType,
+  UserAdminOptions,
+} from "./users";
+
+// Declares a user field whose type a plugin contributed, which the built-in
+// arms of `UserFieldConfig` cannot be widened to admit without losing their
+// own errors.
+export { pluginUserField, pluginUserFieldBrand } from "./users";
+
+// User config validation
+export {
+  validateUserConfig,
+  assertValidUserConfig,
+  RESERVED_USER_FIELD_NAMES,
+  ALLOWED_USER_FIELD_TYPES,
+} from "./users";
+
+// Email configuration
+export type {
+  EmailConfig,
+  SmtpConfig,
+  ResendConfig,
+  SendLayerConfig,
+  EmailTemplateFn,
+  EmailProviderAdapter,
+} from "./services/email";
+
+// Email provider & template record types (used by Direct API namespace return types)
+export type { EmailProviderRecord } from "./schemas/email-providers/types";
+export type { EmailTemplateRecord } from "./schemas/email-templates/types";
+
+// User field definition record type (used by Direct API namespace return types)
+export type { UserFieldDefinitionRecord } from "./schemas/user-field-definitions/types";
+
+// ============================================================
+// RBAC & ACCESS CONTROL
+// ============================================================
+
+// RBAC entity types (used as return types from roles/permissions namespaces)
+// Note: SYSTEM_RESOURCES, isSystemResource(), isValidResource() are already
+// exported via `export * from "./schemas/index"` → `export * from "./rbac"` above.
+export type {
+  Role,
+  Permission,
+  // Roles namespace args
+  FindRolesArgs,
+  FindRoleByIDArgs,
+  CreateRoleArgs,
+  UpdateRoleArgs,
+  DeleteRoleArgs,
+  GetRolePermissionsArgs,
+  SetRolePermissionsArgs,
+  // Permissions namespace args
+  FindPermissionsArgs,
+  FindPermissionByIDArgs,
+  CreatePermissionArgs,
+  DeletePermissionArgs,
+  // Access namespace args
+  CheckAccessArgs,
+} from "./direct-api/types";
+
+// ============================================================
+// API KEY AUTHENTICATION
+// ============================================================
+
+// API key entity & token type
+export type {
+  ApiKeyTokenType,
+  ApiKeyMeta,
+  ExpiresIn,
+  ApiKeyResult,
+  // apiKeys namespace args
+  ListApiKeysArgs,
+  FindApiKeyByIDArgs,
+  CreateApiKeyArgs,
+  UpdateApiKeyArgs,
+  RevokeApiKeyArgs,
+  // access.checkApiKey() args & result
+  CheckApiKeyArgs,
+  CheckApiKeyResult,
+} from "./direct-api/types";
+
+// ============================================================
+// SECURITY UTILITIES
+// ============================================================
+
+export {
+  getTrustedClientIp,
+  parseTrustedProxyIpsEnv,
+  type TrustedClientIpOptions,
+} from "./utils/get-trusted-client-ip";
+
+// The same resolution with the settings already read, which is the only form a
+// plugin can call: the options above come from the running configuration
+// through the container, so exporting the resolver alone left it reachable and
+// unusable, and a plugin needing an address was left reading `x-forwarded-for`
+// itself -- the forgeable read the resolver exists to replace.
+export { trustedClientIp } from "./hooks/request-facts";
+
+// Published because a plugin storing text a visitor typed has to strip markup
+// the way core does, and the absence of this export is why a second copy grew
+// in `@nextlyhq/plugin-form-builder` and then drifted from this one. Sits with
+// the security utilities a plugin already reaches for.
+export { stripHtmlTags } from "./services/security/sanitization-service";
+
+export {
+  validateExternalUrl,
+  safeFetch,
+  ExternalUrlError,
+  SafeFetchError,
+  type ValidateExternalUrlOptions,
+  type ValidatedUrl,
+  type SafeFetchOptions,
+} from "./utils/validate-external-url";
+
+// ============================================================
+// MEDIA URL HELPERS
+// ============================================================
+
+// Image sizes are no longer made, so no helper picks one: an item's `url`
+// goes to `next/image`, and its `thumbnailUrl` serves a small preview.
+export {
+  // @experimental: an absolute media URL for a consumer outside the app.
+  toPublicMediaUrl,
+} from "./lib/media-variant";

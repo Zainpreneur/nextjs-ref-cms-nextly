@@ -1,0 +1,208 @@
+/**
+ * Email Templates Detail API Route Handlers for Next.js
+ *
+ * These route handlers can be re-exported in your Next.js application to provide
+ * individual email template management endpoints at /api/email-templates/[id].
+ *
+ * Services are auto-initialized on first request using environment variables:
+ * - DB_DIALECT: Database dialect ("postgresql" | "mysql" | "sqlite")
+ * - DATABASE_URL: Database connection string
+ *
+ * @example
+ * ```typescript
+ * // In your Next.js app: app/api/email-templates/[id]/route.ts
+ * export { GET, PATCH, DELETE } from 'nextly/api/email-templates-detail';
+ * ```
+ *
+ * @module api/email-templates-detail
+ */
+
+import { z } from "zod";
+
+import { actorFromAuthContext } from "../auth/request-actor";
+import { container } from "../di";
+import {
+  SYSTEM_READ_POLICY,
+  SYSTEM_WRITE_POLICY,
+} from "../domains/auth/system-write-policy";
+import { templateVariablesSchema } from "../domains/email/template-variables";
+import { getCachedNextly } from "../init";
+import type { EmailTemplateService } from "../services/email/email-template-service";
+
+import { readJsonBody } from "./read-json-body";
+import { respondAction, respondDoc, respondMutation } from "./response-shapes";
+import { requireRouteAnyPermission } from "./route-auth";
+import { withErrorHandler } from "./with-error-handler";
+import { nextlyValidationFromZod } from "./zod-to-nextly-error";
+
+/**
+ * A template's description on update: text, or null to clear it. Parsed as
+ * a field of an object so a refusal names `description` as its path.
+ */
+const descriptionSchema = z.object({ description: z.string().nullable() });
+
+/**
+ * A template's copies on update: a list of addresses, or null to clear them.
+ * The service checks each address, and refuses copies on a template that
+ * carries a secret.
+ */
+const copiesSchema = z.object({
+  cc: z.array(z.string()).nullable().optional(),
+  bcc: z.array(z.string()).nullable().optional(),
+});
+
+/** The copies an update body gives, parsed; an absent one is left out. */
+function copiesFrom(body: Record<string, unknown>): Record<string, unknown> {
+  if (body.cc === undefined && body.bcc === undefined) return {};
+  const parsed = copiesSchema.safeParse({ cc: body.cc, bcc: body.bcc });
+  if (!parsed.success) throw nextlyValidationFromZod(parsed.error);
+  const { cc, bcc } = parsed.data;
+  return {
+    ...(cc !== undefined ? { cc } : {}),
+    ...(bcc !== undefined ? { bcc } : {}),
+  };
+}
+
+interface RouteContext {
+  params: Promise<{ id: string }>;
+}
+
+async function getEmailTemplateService(): Promise<EmailTemplateService> {
+  await getCachedNextly();
+  return container.get<EmailTemplateService>("emailTemplateService");
+}
+
+/**
+ * GET handler for retrieving a single email template by ID.
+ *
+ * Requires authentication.
+ *
+ * Response Codes:
+ * - 200 OK: Template retrieved successfully
+ * - 401 Unauthorized: Authentication required
+ * - 404 Not Found: Template with ID does not exist
+ * - 500 Internal Server Error: Failed to fetch template
+ *
+ * Response: `{ "data": EmailTemplate }`
+ */
+export const GET = withErrorHandler(
+  async (request: Request, context: RouteContext): Promise<Response> => {
+    await requireRouteAnyPermission(request, [
+      ...SYSTEM_READ_POLICY.emailTemplates.read.anyOf,
+    ]);
+
+    const { id } = await context.params;
+    const service = await getEmailTemplateService();
+    const template = await service.getTemplate(id);
+
+    return respondDoc(template);
+  }
+);
+
+/**
+ * PATCH handler for updating an email template.
+ *
+ * Requires authentication. Template `slug` cannot be changed after creation.
+ *
+ * Request Body (all fields optional):
+ * - name, subject, htmlContent, plainTextContent, variables, useLayout,
+ *   isActive, providerId, description (a string, or null to clear it), cc
+ *   and bcc (lists of addresses, or null to clear them), and for a written
+ *   template its blocks (`@experimental`).
+ *
+ * Response Codes:
+ * - 200 OK: Template updated successfully
+ * - 400 Bad Request: Invalid JSON body, a description that is neither
+ *   a string nor null, or copies that are not a list of addresses
+ * - 401 Unauthorized: Authentication required
+ * - 404 Not Found: Template with ID does not exist
+ * - 500 Internal Server Error: Update failed
+ *
+ * Response: `{ "data": EmailTemplate }`
+ */
+export const PATCH = withErrorHandler(
+  async (request: Request, context: RouteContext): Promise<Response> => {
+    const auth = await requireRouteAnyPermission(request, [
+      ...SYSTEM_WRITE_POLICY.emailTemplates.update.anyOf,
+    ]);
+
+    const { id } = await context.params;
+    const body = await readJsonBody<Record<string, unknown>>(request);
+
+    // Selective copy: only forward fields the legacy handler accepted, so
+    // unknown keys are silently ignored (matches the pre-migration contract).
+    const updateData: Record<string, unknown> = {};
+    if (body.name !== undefined) updateData.name = body.name;
+    if (body.subject !== undefined) updateData.subject = body.subject;
+    if (body.htmlContent !== undefined)
+      updateData.htmlContent = body.htmlContent;
+    if (body.plainTextContent !== undefined)
+      updateData.plainTextContent = body.plainTextContent;
+    if (body.variables !== undefined) {
+      const parsed = templateVariablesSchema.safeParse(body.variables);
+      if (!parsed.success) throw nextlyValidationFromZod(parsed.error);
+      updateData.variables = parsed.data;
+    }
+    if (body.useLayout !== undefined) updateData.useLayout = body.useLayout;
+    if (body.isActive !== undefined) updateData.isActive = body.isActive;
+    if (body.providerId !== undefined) updateData.providerId = body.providerId;
+    // A description is new to this handler, so it is parsed rather than
+    // copied: a string sets it, null clears it, anything else is refused
+    // instead of being written to the column.
+    if (body.description !== undefined) {
+      const parsed = descriptionSchema.safeParse({
+        description: body.description,
+      });
+      if (!parsed.success) throw nextlyValidationFromZod(parsed.error);
+      updateData.description = parsed.data.description;
+    }
+    // Copies are new to this handler too, and parsed the same way.
+    Object.assign(updateData, copiesFrom(body));
+    // A written template's format and blocks, checked by the service as every
+    // transport's are.
+    if (body.format !== undefined) updateData.format = body.format;
+    if (body.blocks !== undefined) updateData.blocks = body.blocks;
+
+    const service = await getEmailTemplateService();
+    const template = await service.updateTemplate(
+      id,
+      updateData,
+      actorFromAuthContext(auth)
+    );
+
+    return respondMutation("Email template updated.", template);
+  }
+);
+
+/**
+ * DELETE handler for removing an email template.
+ *
+ * Requires authentication. Cannot delete layout templates (`_email-header`,
+ * `_email-footer`); use the layout endpoint to modify them.
+ *
+ * Response Codes:
+ * - 200 OK: Template deleted successfully
+ * - 401 Unauthorized: Authentication required
+ * - 403 Forbidden: Cannot delete layout templates
+ * - 404 Not Found: Template with ID does not exist
+ * - 500 Internal Server Error: Deletion failed
+ *
+ * Response: `{ "data": { "success": true } }`
+ */
+export const DELETE = withErrorHandler(
+  async (request: Request, context: RouteContext): Promise<Response> => {
+    const auth = await requireRouteAnyPermission(request, [
+      ...SYSTEM_WRITE_POLICY.emailTemplates.delete.anyOf,
+    ]);
+
+    const { id } = await context.params;
+    const service = await getEmailTemplateService();
+
+    await service.deleteTemplate(id, actorFromAuthContext(auth));
+
+    // Service returns void. Echo the deleted id (named `templateId` to
+    // match the dispatcher route's wire shape) so the admin can prune
+    // its local list without a follow-up fetch.
+    return respondAction("Email template deleted.", { templateId: id });
+  }
+);

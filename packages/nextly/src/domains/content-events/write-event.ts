@@ -1,0 +1,324 @@
+/**
+ * Record a core content event from a write path, in that write's own
+ * transaction.
+ *
+ * The one way core's write paths record their events: the actor is taken from
+ * the request's acting identity, an API key is named by its own name, and a
+ * plugin-defined person already reported deleted is written erased. A write
+ * path names what happened; how the event is assembled lives here.
+ *
+ * @module domains/content-events/write-event
+ */
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+import type { TransactionContext } from "@nextlyhq/adapter-drizzle/types";
+
+import type { RequestActor } from "../../auth/request-actor";
+import { getDialectTables } from "../../database/index";
+import { env } from "../../lib/env";
+import { rowLockServer } from "../audit/audit-log-writer";
+import {
+  principalDigestTablesOf,
+  readPrincipalDigests,
+  type PrincipalDigestDb,
+} from "../audit/principal-digest";
+import { pluginSettingsSecrets } from "../plugins/settings-service";
+import type { ChangedParts } from "../versions/changed-parts";
+import { statusEventsFor } from "../webhooks/status-events";
+
+import { contentEventActor } from "./actor";
+import {
+  CORE_CONTENT_EVENT_KINDS,
+  ensureCoreContentEventKinds,
+  type CoreContentEventKind,
+} from "./core-kinds";
+import type { ContentEventKind } from "./kinds";
+import {
+  recordContentEvent,
+  type ContentEventInput,
+  type ContentEventSubject,
+} from "./record";
+
+/**
+ * One event a write path records.
+ */
+export interface WriteEventInput {
+  subject: ContentEventSubject;
+  /**
+   * A core kind by its key, or a kind another core feature registered
+   * itself (the document lock's takeover), so that feature's events take
+   * their actor from this one assembly too.
+   */
+  kind: CoreContentEventKind | Readonly<ContentEventKind>;
+  /** Who made the write, as the write path resolved it. */
+  actor: RequestActor;
+  /**
+   * The plugin a write made as the system was made by, by the name it booted
+   * under: the event names the plugin rather than a nameless system. Taken
+   * from the plugin's own identity by the write path, never from a request.
+   * Ignored for any other actor, who is named as they are.
+   */
+  plugin?: string;
+  /** Why the change was made, in the caller's words, where it gave a reason. */
+  note?: string | null;
+  /**
+   * The person's display name, when the write path has it. An API key is
+   * named by its own name, read here; the system is named by nothing.
+   */
+  personName?: string | null;
+  /** The languages the event involved, and whether the shared fields were. */
+  parts?: ContentEventInput["parts"];
+  fromState?: string | null;
+  toState?: string | null;
+  /** The version the write produced or points at. */
+  versionNo?: number | null;
+  payload?: Record<string, unknown> | null;
+  /**
+   * The hash of the definition a feature acted under, where it has one: a workflow's, for the
+   * withdrawal of an approval a save caused.
+   */
+  definitionHash?: string | null;
+}
+
+/**
+ * What the writer needs besides the transaction.
+ */
+export interface WriteEventDeps {
+  /** The adapter the transaction belongs to: its dialect and locking. */
+  adapter: Pick<DrizzleAdapter, "getCapabilities">;
+  /** The install's secrets, current first. Defaults to the environment's. */
+  secrets?: () => readonly string[];
+}
+
+/**
+ * One status move a write made: one language's, or the document's own.
+ */
+export interface StatusMove {
+  /** The language that moved; absent for the document's own status. */
+  locale?: string;
+  from: string | null | undefined;
+  to: unknown;
+}
+
+/** An API key's own name, read on the write's transaction. */
+async function apiKeyName(
+  tx: TransactionContext,
+  id: string
+): Promise<string | null> {
+  const [row] = await tx.select<{ name: string }>("api_keys", {
+    columns: ["name"],
+    where: { and: [{ column: "id", op: "=", value: id }] },
+    limit: 1,
+  });
+  return row?.name ?? null;
+}
+
+/** The name kept with the event, by the kind of actor. */
+async function actorName(
+  tx: TransactionContext,
+  input: WriteEventInput
+): Promise<string | null> {
+  if (input.actor.type === "apiKey" && input.actor.id) {
+    return apiKeyName(tx, input.actor.id);
+  }
+  if (input.actor.type === "system") return null;
+  return input.personName ?? null;
+}
+
+/**
+ * Record `input` on `tx`, the transaction of the write it records.
+ */
+export async function recordWriteEvent(
+  tx: TransactionContext,
+  deps: WriteEventDeps,
+  input: WriteEventInput
+): Promise<{ id: string }> {
+  ensureCoreContentEventKinds();
+  const actor =
+    input.plugin !== undefined && input.actor.type === "system"
+      ? { kind: "plugin" as const, id: input.plugin, name: input.plugin }
+      : contentEventActor(input.actor, await actorName(tx, input));
+  const dialect = deps.adapter.getCapabilities().dialect;
+  // Read under the shared deleted-people lock only for a plugin-defined
+  // person: no other actor can have been reported deleted.
+  const principals =
+    actor.kind === "principal"
+      ? await readPrincipalDigests(
+          tx.getDrizzle<PrincipalDigestDb>(),
+          rowLockServer(deps.adapter, dialect),
+          principalDigestTablesOf(getDialectTables(dialect)),
+          "shared",
+          (deps.secrets ?? (() => pluginSettingsSecrets(env)))()
+        )
+      : undefined;
+  return recordContentEvent(
+    tx,
+    {
+      subject: input.subject,
+      kind:
+        typeof input.kind === "string"
+          ? CORE_CONTENT_EVENT_KINDS[input.kind].name
+          : input.kind.name,
+      actor,
+      parts: input.parts,
+      fromState: input.fromState ?? null,
+      toState: input.toState ?? null,
+      versionNo: input.versionNo ?? null,
+      payload: input.payload ?? null,
+      note: input.note ?? null,
+      // Passed through as given: only a feature with a definition names one.
+      definitionHash: input.definitionHash ?? null,
+    },
+    { principals }
+  );
+}
+
+/**
+ * The moves a write's history records as `kind`: those the rule that decides
+ * the webhook events calls a publish, or an unpublish. A move between equal
+ * states is neither, and is recorded as nothing.
+ */
+function movesRecordedAs(
+  kind: "published" | "unpublished",
+  moves: readonly StatusMove[],
+  isCreate: boolean
+): StatusMove[] {
+  return moves.filter(
+    m =>
+      typeof m.to === "string" &&
+      statusEventsFor({ from: m.from ?? null, to: m.to, isCreate }).includes(
+        `entry.${kind}`
+      )
+  );
+}
+
+/**
+ * The parts a write's status moves change, as its history records them: each
+ * language a recorded move names, and the shared part where one names none
+ * (the document's own status). Read from the same list of moves
+ * `recordTransitionEvents` is handed, so the version a publish records and
+ * the event it writes cannot name different parts. For the moves of a write
+ * that is not a create, as a publish of existing content is.
+ *
+ * @experimental
+ */
+export function partsMovesRecord(moves: readonly StatusMove[]): ChangedParts {
+  const recorded = (["published", "unpublished"] as const).flatMap(kind =>
+    movesRecordedAs(kind, moves, false)
+  );
+  return {
+    locales: [...new Set(recorded.flatMap(m => (m.locale ? [m.locale] : [])))],
+    shared: recorded.some(m => !m.locale),
+  };
+}
+
+/**
+ * Record a write's status moves in the document's history: one "published"
+ * event naming the parts it published, and one "unpublished" for those it
+ * unpublished. Decided by the rule that decides the webhook events, so the
+ * two never disagree on what was a publish, and written whatever the
+ * document's webhook settings.
+ */
+export async function recordTransitionEvents(
+  tx: TransactionContext,
+  deps: WriteEventDeps,
+  write: Pick<
+    WriteEventInput,
+    "subject" | "actor" | "personName" | "versionNo"
+  > & {
+    isCreate?: boolean;
+  },
+  moves: readonly StatusMove[]
+): Promise<void> {
+  for (const kind of ["published", "unpublished"] as const) {
+    const moved = movesRecordedAs(kind, moves, write.isCreate === true);
+    const first = moved[0];
+    if (!first) continue;
+    const locales = moved.flatMap(m => (m.locale ? [m.locale] : []));
+    await recordWriteEvent(tx, deps, {
+      subject: write.subject,
+      kind,
+      actor: write.actor,
+      personName: write.personName,
+      ...(locales.length > 0 ? { parts: { locales } } : {}),
+      fromState: moved.length === 1 ? (first.from ?? null) : null,
+      toState: typeof first.to === "string" ? first.to : null,
+      versionNo: write.versionNo ?? null,
+    });
+  }
+}
+
+/**
+ * How an overwrite stood against the document, and who made the changes it
+ * replaced, as the `overwritten` event keeps them.
+ *
+ * @experimental
+ */
+export interface OverwriteRecord {
+  given: "none" | "current" | "stale";
+  replaced: {
+    kind: string;
+    id: string | null;
+    principalKind: string | null;
+  } | null;
+}
+
+/**
+ * Record an overwrite in the document's history. Always, whether or not the
+ * document keeps versions: an update applied whatever the current version is
+ * accountable only through this record, so a write that cannot record it
+ * fails with it.
+ *
+ * @experimental
+ */
+export async function recordOverwriteEvent(
+  tx: TransactionContext,
+  deps: WriteEventDeps,
+  overwrite: Pick<WriteEventInput, "subject" | "actor" | "personName"> & {
+    locale?: string | null;
+  } & OverwriteRecord
+): Promise<void> {
+  await recordWriteEvent(tx, deps, {
+    subject: overwrite.subject,
+    kind: "overwritten",
+    actor: overwrite.actor,
+    personName: overwrite.personName,
+    ...(overwrite.locale ? { parts: { locales: [overwrite.locale] } } : {}),
+    // Only "stale" names anyone: no version, or the current one, replaced
+    // nobody this record can name.
+    payload: {
+      given: overwrite.given,
+      replaced: overwrite.given === "stale" ? overwrite.replaced : null,
+    },
+  });
+}
+
+/**
+ * Record a save in the document's history: a restore always, naming the
+ * version it came from, and any other save only when it recorded a version,
+ * so a save that changed nothing adds no event either.
+ */
+export async function recordSaveEvent(
+  tx: TransactionContext,
+  deps: WriteEventDeps,
+  save: Pick<WriteEventInput, "subject" | "actor" | "personName"> & {
+    locale?: string | null;
+    toState?: string | null;
+    versionNo: number | null;
+    sourceVersionNo?: number | null;
+  }
+): Promise<void> {
+  const from = save.sourceVersionNo;
+  if (typeof from !== "number" && save.versionNo === null) return;
+  await recordWriteEvent(tx, deps, {
+    subject: save.subject,
+    actor: save.actor,
+    personName: save.personName,
+    ...(save.locale ? { parts: { locales: [save.locale] } } : {}),
+    toState: save.toState ?? null,
+    versionNo: save.versionNo,
+    ...(typeof from === "number"
+      ? { kind: "restored" as const, payload: { from } }
+      : { kind: "saved" as const }),
+  });
+}

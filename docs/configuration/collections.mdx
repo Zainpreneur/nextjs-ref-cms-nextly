@@ -1,0 +1,667 @@
+---
+title: Collections
+description: Define content types with multiple entries using collections.
+---
+
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+
+A collection is a content type that stores multiple entries - blog posts, products, users, media files. Each collection maps to a database table, gets automatic REST endpoints under `/admin/api/collections/[slug]/entries`, and appears in the admin panel with list and edit views.
+
+> **Source of truth:** the `CollectionConfig` interface and `defineCollection()` helper live in `packages/nextly/src/collections/config/define-collection.ts`. Hooks and access-control types are imported from `packages/nextly/src/shared/types/access.ts` and `packages/nextly/src/hooks/types.ts`.
+
+<Tabs items={["Code-first", "Visual Schema Builder"]}>
+<Tab value="Code-first">
+
+## Defining a collection
+
+Use `defineCollection()` from `nextly`:
+
+```typescript title="src/collections/posts.ts"
+import {
+  defineCollection,
+  text,
+  richText,
+  relationship,
+  date,
+} from "nextly";
+
+export default defineCollection({
+  slug: "posts",
+  labels: {
+    singular: "Post",
+    plural: "Posts",
+  },
+  fields: [
+    text({ name: "title", required: true }),
+    text({ name: "slug", unique: true }),
+    richText({ name: "content" }),
+    relationship({ name: "author", relationTo: "users" }),
+    date({ name: "publishedAt" }),
+  ],
+  // Built-in Draft/Published lifecycle (replaces the user-defined
+  // `select({ name: "status" })` pattern). See the dedicated guide:
+  // /docs/guides/draft-published-status.
+  status: true,
+  timestamps: true,
+  admin: {
+    group: "Content",
+    icon: "FileText",
+    useAsTitle: "title",
+    pagination: { defaultLimit: 25 },
+    description: "Blog posts and articles",
+  },
+  access: {
+    // Visitors can read, and signed-in callers holding read-posts. Create,
+    // update and delete declare no rule, so the role's permission decides.
+    read: true,
+  },
+  hooks: {
+    beforeChange: [
+      async ({ data, operation }) => {
+        if (operation === "create" && data?.title && !data.slug) {
+          return {
+            ...data,
+            slug: data.title.toLowerCase().replace(/\s+/g, "-"),
+          };
+        }
+        return data;
+      },
+    ],
+  },
+});
+```
+
+Then register it in your config:
+
+```typescript title="nextly.config.ts"
+import { defineConfig } from "nextly";
+import Posts from "./src/collections/posts";
+
+export default defineConfig({
+  collections: [Posts],
+});
+```
+
+</Tab>
+<Tab value="Visual Schema Builder">
+
+## Creating a collection in the Visual Schema Builder
+
+The Nextly admin panel ships with a Visual Schema Builder for creating collections without writing code. (In subsequent prose we'll just call it the Schema Builder.)
+
+1. Open the admin panel and navigate to **Builder > Collections**.
+2. Click **Create Collection**.
+3. Enter a slug (e.g. `posts`) and display labels.
+4. Add fields using the drag-and-drop field editor.
+5. Configure admin options, access control, and hooks through the UI.
+6. Click **Save** to generate the collection.
+
+The Schema Builder produces the same `CollectionConfig` that code-first collections use. To move a builder-created collection into code, run `nextly db:sync --promote <slug>`. It appends the collection's slug and fields to `nextly.config.ts` as a commented-out snippet, and removes the builder's record; the table and its content stay. Nothing else is carried over: add the labels, admin options, access rules, hooks and options such as `status` back in code before you move the snippet into your `collections` array. There is no supported way back: once a code-first collection has been synced, the Schema Builder shows it read-only, and its structure is edited in code.
+
+</Tab>
+</Tabs>
+
+## System fields
+
+Collections have three categories of fields. Knowing which is which avoids redundant declarations and column-shape surprises.
+
+### Always auto-injected (you cannot opt out)
+
+Every collection row has these. Never declare them yourself.
+
+- `id` - primary key, auto-generated
+- `createdAt` - set on insert (when `timestamps: true`, the default)
+- `updatedAt` - refreshed on every save (when `timestamps: true`)
+
+### Conditionally auto-injected (declared definition wins)
+
+`defineCollection()` adds these as `text NOT NULL` columns *only if you don't declare them yourself*:
+
+- `title`
+- `slug`
+
+If your `fields` array includes a field named `title` or `slug`, your definition replaces the auto-inject - same column, your shape. If you don't declare them, Nextly adds bare-bones columns with no validation, no uniqueness, no admin form input.
+
+### Should you redeclare `title` and `slug`?
+
+Almost always **yes**, even though Nextly will inject them anyway. Five reasons:
+
+1. **Uniqueness on `slug`** - the auto-injected `slug` is a plain `text NOT NULL` column with no unique constraint. To require unique slugs (the typical case for URL-routed content), declare your own field with `unique: true`.
+2. **Admin form visibility** - Nextly's admin builds the create/edit form from your `fields` array. The auto-injected columns are database-only and don't appear in the form. If you don't declare `title`, the admin shows no title input.
+3. **Validation and hooks** - auto-injected columns have no field config. Declared fields can attach `required`, `minLength`, `beforeChange` hooks (e.g. `auto-slug` to derive slug from title), defaults, and so on.
+4. **Custom UI** - placeholders, descriptions, field ordering, `admin: { readOnly: true }` all live on the field declaration.
+5. **Self-documentation** - a contributor reading the collection file sees the full surface in one place, without having to know Nextly's reserved-column behavior.
+
+You can legitimately skip declaring them when the collection is internal-only (e.g. an `audit-log`) and you don't need form visibility, validation, or unique slugs.
+
+```ts
+// Good: declared explicitly so slug can be unique and the admin shows inputs.
+import { defineCollection, text, textarea } from "nextly/config";
+
+export const Categories = defineCollection({
+  slug: "categories",
+  fields: [
+    text({ name: "title", required: true }),
+    text({ name: "slug", required: true, unique: true }),
+    textarea({ name: "description" }),
+  ],
+});
+```
+
+> **Don't mix conventions.** If you declare a field named `name` for the user-facing label and don't declare `title`, the auto-injected `title` column still exists alongside `name` - you'll have a redundant database column you have to populate via API on every create. Pick `title` (matches the auto-inject and is what most callers expect) or be intentional about why you're using `name`.
+
+## Collection options
+
+Only `slug` and `fields` are required.
+
+### `slug`
+
+| | |
+|---|---|
+| **Type** | `string` |
+| **Required** | Yes |
+
+Unique identifier used as the database table name (with a `dc_` prefix, unless `dbName` is set), the REST path (`/admin/api/collections/[slug]/entries`), and the internal reference. Must be lowercase, URL-friendly, and not a reserved SQL keyword.
+
+#### The address rule
+
+A collection's, Single's or field group's slug is its address, and one rule judges a new address
+the same way wherever it is set: in `nextly.config.ts`, in the Visual Schema Builder, through the
+REST schema endpoints, through `nextly.fieldGroups.create()`, and by `nextly migrate:check` and
+`nextly migrate:create`. An address:
+
+- starts with a lowercase letter and holds only lowercase letters, numbers, hyphens and
+  underscores (`team-updates` and `team_updates` are both valid);
+- is not a route or system table Nextly uses (`admin`, `api`, `users`, `accounts`, `media` and
+  others), nor, for a collection or Single, a system resource such as `settings`, nor, for a field
+  group, `field-groups`;
+- is not a reserved SQL word (`select`, `order`, `cascade` and others) and does not end in
+  `_locales`;
+- is at most 50 characters, and short enough that every table it leads to fits the 63 characters
+  PostgreSQL allows: 48 for a Single (`single_<slug>_locales`) and 47 for a field group
+  (`idx_comp_<slug>_parent`).
+
+The table is named from the address's snake_case form, each hyphen written as an underscore:
+`team-updates` is stored in `dc_team_updates`. So two addresses that differ only by `-` and `_`
+are refused: a collection or Single cannot take `team_updates` beside a collection or Single
+`team-updates`, and a field group cannot take it beside another field group `team-updates`. A
+field group may share that form with a collection, since field groups have their own addresses.
+
+A refusal names the address and the reason. The rule applies only when an address is created:
+an entity that already exists under an address the rule now refuses keeps working, and
+`nextly migrate:check` warns about it once.
+
+### `fields`
+
+| | |
+|---|---|
+| **Type** | `FieldConfig[]` |
+| **Required** | Yes |
+
+Array of field definitions. See [Fields](/docs/configuration/fields) for the full inventory.
+
+### `labels`
+
+| | |
+|---|---|
+| **Type** | `{ singular?: string; plural?: string }` |
+| **Default** | Auto-generated from slug |
+
+Display names in the admin UI. If omitted, the singular label is derived from the slug (`blog-posts` → `Blog Posts`) and the plural is generated from the singular.
+
+### `timestamps`
+
+| | |
+|---|---|
+| **Type** | `boolean` |
+| **Default** | `true` |
+
+When `true`, every entry gets `createdAt` (set on insert) and `updatedAt` (refreshed on every save) columns.
+
+### `dbName`
+
+| | |
+|---|---|
+| **Type** | `string` |
+| **Default** | `dc_<slug>`, with hyphens in the slug replaced by underscores |
+
+Custom database table name. Useful for legacy schemas or when the slug doesn't match your naming convention.
+
+Collection tables carry a `dc_` prefix. By default the table is `dc_` plus the slug, with hyphens turned into underscores, so the slug `blog-posts` gives `dc_blog_posts`. A `dbName` you supply is used as written, including any hyphens, and gets the `dc_` prefix added unless it already starts with `dc_`: `dbName: "articles"` gives `dc_articles`, while `dbName: "dc_articles"` is used as is.
+
+### `description`
+
+| | |
+|---|---|
+| **Type** | `string` |
+| **Default** | `undefined` |
+
+Description displayed in the admin UI. Falls back to `admin.description` when reading from the type.
+
+### `sanitize`
+
+| | |
+|---|---|
+| **Type** | `boolean` |
+| **Default** | `true` |
+
+When enabled, the global sanitization hook strips HTML tags from plain-text fields (`text`, `textarea`, `email`) before storage. Set to `false` only if the collection intentionally stores HTML in those fields.
+
+### `search`
+
+| | |
+|---|---|
+| **Type** | `SearchConfig` |
+| **Default** | Auto-detects `text`/`textarea`/`email` fields |
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `searchableFields` | `string[]` | All `text`/`textarea`/`email` fields | Fields included in search queries. |
+| `minSearchLength` | `number` | `2` | Minimum query length before search runs. |
+
+### `indexes`
+
+| | |
+|---|---|
+| **Type** | `IndexConfig[]` |
+| **Default** | `undefined` |
+
+Compound database indexes. For single-field indexes, use `index: true` directly on the field. `id` is the primary key and `createdAt` is indexed on its own automatically.
+
+An index names top-level fields, and may also name `id`, `createdAt` and `updatedAt`. A field nested in a group or repeater cannot be indexed: its parent stores all its children in one JSON column, so the child has no column of its own, and naming one (`"seo.title"`) is refused when the collection is defined.
+
+```typescript
+indexes: [
+  { fields: ["authorId", "createdAt"] },
+  { fields: ["slug", "locale"], unique: true, name: "uq_slug_locale" },
+]
+```
+
+A `name` is optional, and must start with `idx_` (or `uq_` for a unique index):
+those are the names schema changes manage, so an index you remove from the
+config is dropped from the database. Without one, a name is derived from the
+table and columns.
+
+Development push creates the indexes a collection declares, whether the change
+arrives through a hot reload, `nextly db:sync`, or the boot that creates the
+collection's table, and `migrate:create` writes them into a migration for
+production. `migrate:check` and the drift warning at boot count a declared
+index the database lacks as a pending change. Collections made in the Schema
+Builder cannot declare compound indexes.
+
+Every index is checked against PostgreSQL, MySQL and SQLite when the schema
+is built from the config (development push, `db:sync`, `migrate:create`),
+whichever one you run. A JSON field, or a text field with no bounded width
+such as a textarea, cannot be part of one. MySQL also limits a whole index key
+to 3,072 bytes, where a text field counts 4 bytes for each character of its
+width (1,020 at the default 255), so an index over four text fields is
+refused; index fewer, or narrower, fields. An explicit `name` may be at most
+63 characters, the longest PostgreSQL keeps.
+
+### `endpoints`
+
+| | |
+|---|---|
+| **Type** | `CustomEndpoint[]` |
+| **Default** | `undefined` |
+
+`defineCollection()` accepts and type-checks `endpoints`, each `{ path, method, handler }`, but no route serves them: neither the REST handler nor any other route calls these handlers, so a request to their path is answered as if they were not there. For logic of your own, add a Next.js route handler in your app and read and write through the [Direct API](/docs/api-reference/direct-api).
+
+### `custom`
+
+| | |
+|---|---|
+| **Type** | `Record<string, unknown>` |
+| **Default** | `undefined` |
+
+Arbitrary metadata for hooks, plugins, or custom code. Not persisted to the database.
+
+### `publicAddress`
+
+| | |
+|---|---|
+| **Type** | `string` |
+| **Default** | `undefined` |
+
+Where each entry is served on your site, as a path with placeholders: `"/blog/{slug}"`. [`publicAddressOf`](/docs/configuration/public-addresses) reads it, and answers that a collection without one has no address rather than guessing. Experimental. With the [SEO plugin](/docs/plugins/seo) installed, the sitemap lists each published entry at this address and each page's canonical link is this address; a collection without one is left out of the sitemap.
+
+```ts
+defineCollection({
+  slug: "posts",
+  fields: [text({ name: "title" }), text({ name: "slug" })],
+  publicAddress: "/blog/{slug}",
+});
+```
+
+- It starts with `/`, has no trailing `/`, and no query or fragment.
+- Each placeholder is a whole segment naming one of the collection's fields, or `id`. A collection needs at least one, since each entry has its own address. With `db.slugPaths`, one `{slug}` stands for a slug of several segments.
+- It can't sit under a path Nextly keeps for itself, such as `/admin` or `/api`.
+
+An address that breaks a rule stops the configuration from loading, naming what to fix. See [Public addresses](/docs/configuration/public-addresses).
+
+### `publicAddressField`
+
+| | |
+|---|---|
+| **Type** | `string` |
+| **Default** | `undefined` |
+
+Experimental. A text field whose value, where an entry has one, is that entry's own public address, for a collection whose entries are not all served under one pattern. An entry whose field is empty is served at `publicAddress`, which this needs.
+
+```ts
+defineCollection({
+  slug: "features",
+  fields: [
+    text({ name: "title" }),
+    text({ name: "slug" }),
+    text({ name: "address", admin: { description: "Leave empty for /features/{slug}" } }),
+  ],
+  publicAddress: "/features/{slug}",
+  publicAddressField: "address",
+});
+```
+
+Here an entry with `address` set to `/brand-voice` is served at `/brand-voice`, and the others at `/features/{slug}`.
+
+- The value is judged as a template's result is: an address on this site from its root, with no other host, query, fragment or trailing `/`, and nothing under a path Nextly keeps. A save with any other value is refused on the field.
+- Two pages can't share an address, so a value another page holds is refused like any other clash.
+- Changing the value moves the entry's address, as changing its slug does. With the [SEO plugin](/docs/plugins/seo), the old address redirects to the new one.
+
+A field that is not a text field of the collection, or a collection without `publicAddress`, stops the configuration from loading.
+
+## Admin options
+
+Configure how the collection appears in the admin panel via the `admin` property.
+
+| Property | Type | Default | Description |
+|---|---|---|---|
+| `group` | `string` | None | Sidebar group name; collections sharing a group appear together. |
+| `icon` | `string` | None | Lucide icon name (e.g. `"FileText"`, `"Users"`). |
+| `hidden` | `boolean` | `false` | Hide from sidebar navigation (still reachable via direct URL and API). |
+| `order` | `number` | `100` | Sort order within sidebar group (lower = higher). |
+| `sidebarGroup` | `string` | None | Custom sidebar group slug; moves the entry from its default section to a custom group. |
+| `isPlugin` | `boolean` | `false` | Render under the "Plugins" sidebar section instead of "Collections". |
+| `useAsTitle` | `string` | Document ID | Field name used as the entry title in lists and breadcrumbs. |
+| `opensIn` | `string` | By its main field | Experimental. Where the admin opens this collection's entries: `"form"`, or the path of a document view the collection has. See [Where an entry opens](/docs/plugins/admin-ui#where-an-entry-opens). |
+| `pagination.defaultLimit` | `number` | `10` | Default entries per page. |
+| `pagination.limits` | `number[]` | `[10, 25, 50, 100]` | Available page-size options. |
+| `description` | `string` | None | Help text below the collection title. |
+| `preview` | `CollectionPreviewConfig` | None | Adds a "Preview" button to the entry form. See below. |
+| `components` | `CollectionAdminComponents` | None | Override default views and inject custom React components. See below. |
+
+### Preview URLs
+
+```typescript
+admin: {
+  preview: {
+    url: (entry) => `/preview/posts/${entry.slug}`,
+    openInNewTab: true,         // default true
+    label: "Preview Post",      // default "Preview"
+  },
+}
+```
+
+The `url` function receives the current entry data (which may include unsaved changes) and returns either a URL string or `null` to hide the button for that entry.
+
+### Custom admin components
+
+Override default admin views or inject components at specific positions. Each entry uses the `"package-name/path#ExportName"` component-path format.
+
+```typescript
+admin: {
+  components: {
+    views: {
+      Edit: { Component: "@nextlyhq/plugin-form-builder/admin#FormBuilderView" },
+      List: { Component: "@nextlyhq/plugin-form-builder/admin#FormsListView" },
+    },
+    BeforeListTable: "@nextlyhq/plugin-form-builder/admin#CreateFormButton",
+    AfterListTable: "@nextlyhq/plugin-form-builder/admin#FormsFooter",
+    BeforeEdit: "@nextlyhq/plugin-form-builder/admin#FormBuilderHeader",
+    AfterEdit: "@nextlyhq/plugin-form-builder/admin#FormBuilderFooter",
+  },
+}
+```
+
+Available view overrides: `Edit`, `List`. Available injection points: `BeforeListTable`, `AfterListTable`, `BeforeEdit`, `AfterEdit`.
+
+## Access control
+
+Each CRUD operation accepts a function (returning `boolean | Promise<boolean>`), a literal `boolean`, or can be omitted to fall back to the database role/permission system.
+
+A collection's `read`, `update`, `delete`, `publish` and `unpublish` rules may also return a filter, which allows only the entries it matches, such as an author's own posts (experimental). See [Only their own entries](/docs/permissions#only-their-own-entries).
+
+A declared rule only narrows the role's permission. A signed-in user or an API key needs the permission for the operation first (`update-posts`), and the rule then lets them through only by returning `true`, so a rule adds your own condition and never admits someone whose role lacks the permission. A plugin-defined person, who holds no permissions, is judged by the rule alone. Don't decide by a role's name: a custom role holding the permission, and an API key whose roles carry none of the names, would be refused. See [Roles and Permissions](/docs/permissions#collection-access).
+
+```typescript
+access: {
+  read: true,
+  // On top of the role's update-posts: not while a content freeze is on.
+  update: () => process.env.CONTENT_FREEZE !== "on",
+  delete: false,
+}
+```
+
+Every access rule — a collection's, a Single's and a field's — is handed one context, `AccessRuleContext` (`AccessControlContext` is the same type):
+
+| Property | Type | Description |
+|---|---|---|
+| `user` | `MinimalUser \| null` | The authenticated user (or `null` for unauthenticated requests). For an API key, the user who made it. |
+| `req` | `RequestContext` | The request. For a field rule, `req.user` is the user object the request carries; for any other rule, the caller's `id`, `email` where known, and `roles`. |
+| `roles` | `string[]` | The user's role slugs (resolved from DB, includes inherited roles). Don't decide by these: check `permissions`. |
+| `permissions` | `string[]` | Effective permissions, spelled as the Roles screen spells them: `update-posts`. |
+| `principal` | `Principal \| null` | A plugin-defined signed-in person, or `null`. |
+| `operation` | `"create" \| "read" \| "update" \| "delete" \| "publish" \| "unpublish"` | The operation being checked. |
+| `target` | `{ kind, slug }` | What is being checked: a `"collection"`, a `"single"`, or, for a field rule, the `"component"` the field belongs to. |
+| `collection` | `string` | The target's slug, the same as `target.slug`. |
+| `id`, `data` | optional | The entry, where the rule judges a known one. A collection's rule is asked before any entry is read, so it has none. |
+| `locale` | `string \| undefined` | The one language the operation is in, where it is in one. See [Localization](/docs/localization#access-rules-and-languages). |
+| `locales` | `string[]` | Every language the operation involves; every configured language for an operation on the whole entry, such as a delete. |
+
+Rules were once handed permissions as `posts:update`. That spelling is no longer in the list, so a rule checking it does not allow; check `update-posts`, as the Roles screen spells it.
+
+**Rules:**
+
+- Code-defined access only narrows the permission: a signed-in user or an API key needs the permission first, and a declared rule lets them through only by returning `true`.
+- Omitting an operation falls back to the database role/permission system.
+- Super-admin always bypasses all access checks.
+
+## Hooks
+
+Hooks let you run custom logic at specific points in a document's lifecycle. Every hook property is an array of handlers - they run in array order and can modify the data flowing through (for `before*` hooks).
+
+### Eight available hooks
+
+| Hook | Triggers on | Can modify |
+|---|---|---|
+| `beforeOperation` | Before any operation begins. | Yes (operation arguments) |
+| `beforeValidate` | Before validation during create/update. | Yes (data) |
+| `beforeChange` | After validation passes, before the database write during create/update. | Yes (data) |
+| `afterChange` | After the database write during create/update. | No (side effects) |
+| `beforeRead` | Before reading from the database. | Yes (query parameters) |
+| `afterRead` | After reading from the database. | Yes (transform output) |
+| `beforeDelete` | Before deletion. Throw to prevent. | No |
+| `afterDelete` | After deletion. | No (side effects) |
+
+### Execution order
+
+Collection-level and [field-level](/docs/configuration/fields#hooks) hooks
+interleave. On a write:
+
+1. `beforeOperation`
+2. `beforeValidate` (collection)
+3. `beforeValidate` (each field that declares one)
+4. **Validation** - the schema's declared rules are enforced
+5. `beforeChange` (collection)
+6. `beforeChange` (each field that declares one)
+7. **Database write**
+8. `afterChange` (collection), then `afterChange` (fields). On a **Single** this
+   pair is reversed: the field hooks run first, then the entity hook.
+
+A direct read runs `beforeOperation`, `beforeRead`, the query, then `afterRead`
+at the collection level and then per field. A row reached through relationship
+expansion is different: only the target collection's field-level `afterRead`
+runs on it, not its collection-level one, and it runs before the source
+collection's own `afterRead`. A delete runs `beforeOperation`, `beforeDelete`,
+the delete, then `afterDelete`.
+
+### A delete's hooks and outside effects
+
+A delete's `beforeOperation` and `beforeDelete` hooks run before its final check.
+Before any hook runs, Nextly checks the caller's permission and, where the
+collection's `delete` rule answers a filter, that the entry matches it. Then it
+runs the hooks, locks the entry's row, and matches the filter again on the
+locked row, so the entry it removes is the one it judged. If a concurrent change
+moved the entry out of the filter in between, that last check refuses the
+delete, after the hooks have run.
+
+For example, an author deletes one of their own posts just as an editor gives
+it to another author. If the editor's change lands after the hooks ran, the
+delete is refused, and a `beforeDelete` hook that emailed the post's
+subscribers has told them about a deletion that never happened.
+
+So keep `beforeOperation` and `beforeDelete` to checks, and throw to refuse the
+delete. Put effects outside Nextly, such as an email, a webhook call or a write
+to another service, in `afterDelete`, which runs only after the delete commits.
+
+`beforeDelete` and `afterDelete` are handed the entry as it was read before the
+hooks ran, not as the locked row the delete removes (`beforeOperation` is given
+only the entry's id, in `args`). A concurrent change that leaves the entry inside the
+filter still lets the delete go ahead, and `data` then shows the values from
+before that change. An effect that must describe the row exactly as deleted
+can take it from the delete's webhook event, which is written from the locked
+row in the delete's own transaction (see
+[Delivery, retries and the outbox](/docs/webhooks#delivery-retries-and-the-outbox)).
+The event is recorded only while recording is on: an enabled webhook endpoint
+exists or `webhooks.audit` is on, and the collection hasn't set `webhooks: false`
+or `webhooks: { record: false }` (see [Retention](/docs/webhooks/retention)).
+
+A delete made with `deleteEntryInTransaction` inside a plugin's
+[`collections.withTransaction`](/docs/plugins/services#collection-transactions)
+runs differently: its hooks run inside that transaction (after the row is
+locked and matched, where the `delete` rule answers a filter), and `afterDelete`
+runs before the transaction commits. An
+effect made there still happens if the transaction then rolls back, so make it
+once `withTransaction` has resolved. The delete's `collection.<slug>.deleted`
+event waits for the transaction to commit, and is never sent if it rolls back.
+
+### Publishing or unpublishing every language
+
+`POST /api/collections/{slug}/entries/{id}/publish-all` and `.../unpublish-all`
+move the status of every language of an entry in one write, on a localized
+collection or not. They run the hooks a status change of one language runs,
+once for the whole write: `beforeOperation`, `beforeValidate`, `beforeChange`,
+then `afterChange` once the change is saved, with the collection's field hooks
+in their usual places. Each is handed `operation: "update"`. A `before*` hook
+gets `data` holding only the new `status` (`"published"` or `"draft"`) and
+`originalData`, the entry as stored, so it tells this write apart from an edit
+the same way it tells a status change of one language apart; `afterChange`
+gets the entry as the move left it.
+
+A `before*` hook that throws refuses the whole write: no language changes, and
+the caller gets the hook's error, with its status and message, as a status
+change of one language would. A guard that refuses to take an entry down, such
+as one that keeps a Layout pages still use published, refuses `unpublish-all`
+too. `afterChange` runs once every language's status is saved, so one that
+throws does not undo the move.
+
+Three things differ from an ordinary save. The write moves statuses and
+nothing else, so other values a `before*` hook puts in `data` are not saved,
+and a hook that removes `status` or sets another one has the write refused with
+a `409` rather than ignored. Because no field changes, a field's own
+`afterChange` hook does not run: the entry's row is handed to the collection's
+`afterChange`, but a field hook that mails or re-indexes on a change is not
+told about a value that did not change. And where a publish puts pending
+changes live (a collection with `versions: { drafts: true }`), `afterChange`
+runs once for each language whose change went live, with that language's
+document, instead of once for the write.
+
+The validation gate is what separates the two write hooks. Use `beforeValidate`
+to supply or repair a value you want the rules applied to; use `beforeChange` to
+derive the value that gets stored, knowing the document has already passed them.
+What a `beforeChange` handler returns is written without being re-validated.
+
+<Callout type="warn">
+  **The field-level `beforeChange` is the last hook before the write.** A
+  top-level field hook is handed `data` alongside its own `value`, so it can
+  change other fields, not only its own. That means a collection-level
+  `beforeChange` is not the final word: a field hook registered later, by a
+  plugin or by the application, runs after it and can overwrite what it set.
+  There is no collection-level phase after the field hooks. This matches
+  Payload's ordering, so hooks written against that model behave the same here.
+
+  Four things bound what a field hook can guarantee:
+
+  - **It is the last phase, not the last step.** After every hook has run, core
+    still normalises the record before the write. On a collection, a `slug` is
+    re-sanitised, so a hook returning `"Changed By Hook"` stores
+    `changed-by-hook`; on a Single it is not, and that value is stored as
+    written. On both, password fields are hashed and relationship and upload
+    values are reduced to ids. A hook whose output must survive exactly cannot
+    rely on being last.
+  - **A later field hook can still change a sibling.** Field hooks run in
+    registration order over one shared `data` object, so a hook on an earlier
+    field that sets a sibling can be overwritten by that sibling's own hook.
+    What no longer follows is a collection-level phase.
+  - **It runs only when its field is in the data.** An update whose patch omits
+    the field, or an earlier hook that deleted the key, skips that field's hooks
+    entirely. A field hook is not a point that runs on every write.
+  - **`data` is the record so far, at the field's own level.** On an ordinary
+    create it is the submitted document with defaults, `slug` and
+    title already applied (a bulk or transactional create applies no defaults);
+    on an update it is the submitted patch, not the stored row, so an unchanged
+    sibling reads as `undefined`. For a field inside a group or a repeater it is
+    the containing row, not the top-level document. The
+    [field hooks](/docs/configuration/fields#hooks) section says what each
+    write path adds and when.
+</Callout>
+
+### Hook handler signature
+
+Every handler receives a `HookContext` object:
+
+```typescript
+hooks: {
+  beforeChange: [
+    async ({ data, operation, collection, user, context, req }) => {
+      if (operation === "create" && !data.slug) {
+        return { ...data, slug: slugify(data.title) };
+      }
+      return data;
+    },
+  ],
+  afterChange: [
+    async ({ data, req }) => {
+      // Use req.nextly for the Direct API inside hooks
+      await req?.nextly?.create({
+        collection: "activity-logs",
+        data: { action: "post_updated", postId: data.id },
+      });
+    },
+  ],
+}
+```
+
+**Return-value behavior:**
+
+- `before*` hooks: return modified data to pass to the next hook (or the DB).
+- `after*` hooks: return value is ignored; use these for side effects.
+- Throwing in a `before*` hook aborts the operation and rolls back the transaction. An `after*` hook runs once the change is saved, so throwing there does not undo it.
+
+### When to use which hook
+
+- `beforeOperation` - validate the request, short-circuit before reading args (rate-limit metadata, audit logging entry).
+- `beforeValidate` - coerce inputs (trim strings, normalize emails, derive slugs).
+- `beforeChange` - final mutations before the row is persisted (hash passwords, stamp metadata).
+- `afterChange` - outbound side effects (cache busting, webhooks, queue jobs).
+- `beforeRead` - modify query filters (multi-tenant scoping, soft-delete filtering).
+- `afterRead` - shape the response (compute virtual fields, redact sensitive properties).
+- `beforeDelete` - block deletes when there are dependents. Checks only: it can run for a delete that is then refused (see [A delete's hooks and outside effects](#a-deletes-hooks-and-outside-effects)).
+- `afterDelete` - cascade cleanup (delete files, revoke tokens, audit log), and effects outside Nextly such as an email or a call to another service. Inside a plugin's `collections.withTransaction` it runs before that transaction commits, so make such effects once `withTransaction` resolves (see [A delete's hooks and outside effects](#a-deletes-hooks-and-outside-effects)).
+
+## Next steps
+
+- [Fields](/docs/configuration/fields) - every field type and validation option
+- [Singles](/docs/configuration/singles) - single-document content like site settings
+- [Field Groups](/docs/configuration/field-groups) - reusable field groups for collections and singles
+- [Visual Schema Builder](/docs/schema-builder) - create collections visually with drag-and-drop
+- [Direct API](/docs/api-reference/direct-api) - query collections from server-side code

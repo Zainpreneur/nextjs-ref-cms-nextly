@@ -1,0 +1,1225 @@
+/**
+ * Turning the releases whose instant has arrived into real published content.
+ *
+ * The read path can only make a due release LOOK applied. This is what actually
+ * applies it, and the two are deliberately built on the same pure rule so a
+ * read taken either side of this pass gives the same answer.
+ *
+ * ## Every write runs as the member's author
+ *
+ * A release is somebody's decision to publish something later, and the write
+ * that carries it out is theirs. Running it as a trusted system principal would
+ * let a release publish content its author could not have published by hand,
+ * turning "schedule this" into a privilege escalation with a delay on it.
+ *
+ * So each action is applied as the winning member's `createdBy`, resolved
+ * through the same fail-closed rule background jobs use. Three refusals follow
+ * from that, and none of them is a skip:
+ *
+ * - **No recorded author.** There is nobody to act as, and the only available
+ *   fallback is the principal this module refuses. Recorded as a failure.
+ * - **Author deleted or deactivated.** Authority that was withdrawn stays
+ *   withdrawn; a release does not resurrect it.
+ * - **The identity lookup itself failed.** A transient database error is not
+ *   evidence that anybody is gone, so this is recorded and retried next pass
+ *   rather than treated as a verdict.
+ *
+ * ## Why a failed member holds its release open
+ *
+ * A release is marked `published` only when every action attributed to it
+ * succeeded. Marking it otherwise would discharge a release that did not fully
+ * happen: the read path stops consulting a non-scheduled release, so the
+ * unapplied members would vanish from both the content and the schedule at
+ * once, and the only trace would be a log line. Leaving it `scheduled` keeps it
+ * visible and lets the next pass retry.
+ *
+ * ## Why one bad member does not abort the pass
+ *
+ * Every action is attempted. Aborting on the first failure would let one
+ * unresolvable author stop every other release on the site, which is the
+ * failure mode a scheduled publish can least afford — nobody is watching at
+ * 03:00, and "nothing was published" reads exactly like "nothing was due".
+ *
+ * It is a real guarantee only while EVERY fallible step in {@link applyOne} is
+ * wrapped. One was not: the per-action schedule check — an ordinary database
+ * read, on the ordinary path — took the whole pass down with it whenever the
+ * connection blipped, skipping every later action and every unrelated due
+ * release. One blip then looked exactly like a quiet night.
+ *
+ * ## Why a pass ended part-way is continued rather than replayed
+ *
+ * A component is settled only once every action in it is applied, and a host
+ * may end a pass part-way (a serverless time limit) with some of its writes
+ * committed. Each write therefore marks its member, in the write's own
+ * transaction, with the release revision it was applied for; the next pass
+ * counts a member marked for its release's current revision as applied and
+ * does not write it again. Nothing is inferred from the document: the mark is
+ * the write's receipt, and permissions, field rules, drafts and languages were
+ * judged by that write when it ran. Any move of a release raises its revision,
+ * so the marks of a release rescheduled, cancelled or edited since are stale
+ * and its documents are written again.
+ *
+ * @module domains/releases/apply-due-releases
+ */
+
+import { NextlyError } from "../../errors";
+import { getNextlyLogger } from "../../observability/logger";
+import { resolveRunAs, type RunAsDeps } from "../../shared/lib/resolve-run-as";
+import type { UserContext } from "../collections/services/collection-types";
+
+import {
+  actionsByComponent,
+  begunReleases,
+  componentHold,
+  type ComponentHold,
+} from "./component-hold";
+import { asReleaseRun } from "./early-stop";
+import { goingLiveHold, type GoingLiveDocument } from "./going-live-hold";
+import {
+  componentsToStop,
+  planReleaseMaterialisation,
+} from "./plan-release-materialisation";
+import type { MaterialisationAction } from "./plan-release-materialisation";
+import type {
+  DocumentRef,
+  DrainMemberRow,
+  ReleaseRow,
+} from "./releases-repository";
+
+/**
+ * The ordinary content mutations, as this pass needs them.
+ *
+ * Injected rather than reached for, so the decisions here are testable without
+ * booting a runtime — and so it stays impossible for this module to acquire a
+ * cheaper write path than the one an editor uses.
+ */
+export interface ReleaseMutations {
+  /**
+   * Publish the document, promoting its pending working draft if it has one.
+   *
+   * The promotion is the whole point for a draft-split document: the pending
+   * edit lives in a snapshot and the live row is untouched, so publishing
+   * without it would set a status the reader already saw and change nothing.
+   */
+  publish(input: ReleaseWrite): Promise<void>;
+  /** Withdraw the document from published reads. */
+  unpublish(input: ReleaseWrite): Promise<void>;
+}
+
+/** One member's write, and the mark it leaves when it lands. */
+export interface ReleaseWrite {
+  ref: DocumentRef;
+  user: UserContext;
+  /**
+   * The member to mark applied, and the release revision to mark it with.
+   *
+   * The write marks it in its OWN transaction, and only when it stored the
+   * action's status on the live row (`recordMemberApplied`), so the mark
+   * commits exactly when the write does. That is what lets this pass ask
+   * afterwards whether the write counted: the promise cannot say,
+   * because a write commits before its `afterUpdate` hooks run and one whose
+   * hook threw rejects having landed.
+   */
+  receipt: { memberId: string; revision: number };
+}
+
+export interface ApplyDueReleasesDeps {
+  repository: {
+    findDueReleases(now: Date): Promise<ReleaseRow[]>;
+    /**
+     * Members of EVERY due release, in one query.
+     *
+     * Batched rather than asked per release because this is the last thing that
+     * happens before the first content mutation: one round trip per due release
+     * made the drain's time-to-first-write — and the job lease it holds — grow
+     * directly with the size of the due set, which is largest exactly when a
+     * deployment or an imported schedule has left many releases due at once.
+     *
+     * Safe to flatten because the winner rule is a TOTAL order (instant, then
+     * creation time, then member id), so no answer depends on the order rows
+     * come back in.
+     */
+    listMembersOf(releaseIds: string[]): Promise<DrainMemberRow[]>;
+    isStillDueAt(releaseId: string, scheduledAt: Date): Promise<boolean>;
+    /** Whether the member's own write marked it applied for `revision`. */
+    isMemberApplied(memberId: string, revision: number): Promise<boolean>;
+    /**
+     * Settle a COMPONENT of releases, all or none, each fenced on the revision
+     * and instant this pass planned against: a release moved since the plan
+     * (postponed or renamed, say) leaves the whole component unsettled.
+     *
+     * @returns the ids settled: every entry, or none.
+     */
+    markReleasesPublished(
+      entries: readonly { id: string; revision: number; scheduledAt: Date }[],
+      at: Date
+    ): Promise<readonly string[]>;
+    /**
+     * Stop a COMPONENT of releases nothing about retrying could fix, atomically.
+     *
+     * Takes the whole set rather than one release, because the set sharing a
+     * document is the unit that has to move together — see the repository's own
+     * note on why no ordering of individual writes can substitute for that.
+     *
+     * Each entry carries the instant the pass planned against, and the
+     * repository fences on it as well as on the state — the same pair
+     * `isStillDueAt` judges by. A release someone postponed between the plan
+     * and this call fails its fence, and the whole component is then left
+     * alone rather than half-transitioned.
+     *
+     * @returns the ids actually blocked: every entry, or none.
+     */
+    blockReleases(
+      entries: readonly { id: string; scheduledAt: Date }[],
+      /**
+       * `unlessBegun`: refuse the stop when a member of the component holds a
+       * receipt for its release's current revision, asked inside the stop's
+       * own transaction. Asked for a component stopped for holds alone.
+       */
+      options?: { unlessBegun?: boolean }
+    ): Promise<readonly string[]>;
+    /**
+     * Flush these releases' documents without moving them: for a component
+     * kept scheduled on a hold, which a reader is shown nothing more of. Never
+     * throws. Optional: a caller's own repository need not provide it, and
+     * without it the documents' cached reads expire on their own.
+     */
+    revalidateReleases?(ids: readonly string[]): Promise<void>;
+  };
+  mutations: ReleaseMutations;
+  /** The identity reads, so a member's author can be resolved. */
+  runAs: RunAsDeps;
+  /**
+   * Which of these documents going live are held back now, by id: asked again for each member
+   * the pass publishes, after the schedule check and before the write, since what the checks
+   * passed before the moment may have changed without anything telling the release. A member
+   * coming down is never asked. The registered hold (`goingLiveHold`) when left out, the one the
+   * read's projection of a due release asks, so the run and a reader agree.
+   */
+  notApproved?: (
+    documents: readonly GoingLiveDocument[]
+  ) => Promise<ReadonlySet<string>>;
+  now?: () => Date;
+  /**
+   * Where the pass's fairness rotation comes from.
+   *
+   * Injected so a pass stays deterministic under test, and RANDOM by default
+   * because every deterministic source available here is either constant or
+   * cadence-coupled. Deriving it from the clock looked right and is not: a cron
+   * whose period divides the component count produces the same rotation every
+   * time, and 30s, 60s and 300s all do for two or three components. Deriving it
+   * from the due set is worse — that set is exactly what does not change while a
+   * component keeps failing.
+   *
+   * Expected fairness rather than a guaranteed round-robin, which is the honest
+   * trade for holding no state: the chance a given component is missed decays
+   * geometrically, and this domain has nowhere to persist a cursor.
+   */
+  random?: () => number;
+  /**
+   * When this pass must stop starting new actions.
+   *
+   * A drain runs behind a serverless cron tick as often as on a long-lived
+   * process, and a platform kills a tick at a fixed limit. The jobs runner
+   * cannot bound this for us and says so: `maxDurationMs` is checked before
+   * each CLAIM, so it bounds how many JOBS a pass starts, not how long one
+   * already-running handler takes. It names the handler being written to fit a
+   * tick as what bounds this instead. This is that.
+   *
+   * Absent means unbounded, which is right for a CLI or a test and wrong for a
+   * tick.
+   */
+  deadline?: Date;
+}
+
+/** Why one action did not happen. Recorded, never swallowed. */
+export type MaterialisationFailure =
+  /** The member carries no author, so there is nobody to act as. */
+  | "NO_RECORDED_AUTHOR"
+  /** The author no longer exists, or has been deactivated. */
+  | "AUTHOR_UNAVAILABLE"
+  /** The identity lookup failed; not evidence that anybody is gone. */
+  | "IDENTITY_LOOKUP_FAILED"
+  /** The content mutation itself was refused or errored. */
+  | "WRITE_FAILED"
+  /**
+   * The "is this release still scheduled?" read failed.
+   *
+   * Distinct from {@link MaterialisationFailure} `RELEASE_NO_LONGER_SCHEDULED`
+   * on purpose: a read that ERRORED is not evidence the release was cancelled,
+   * so this is recorded as a failure, holds the release open, and is retried on
+   * the next pass — where cancellation is a verdict that discharges nothing but
+   * is final for this action.
+   */
+  | "SCHEDULE_CHECK_FAILED"
+  /**
+   * The member names a single locale. Per-locale release visibility is not
+   * built: see the refusal in `applyOne` for why performing it would be worse
+   * than declining it.
+   */
+  | "LOCALE_SCOPE_UNSUPPORTED"
+  /**
+   * The release was cancelled OR RESCHEDULED between this pass reading it and
+   * acting on it, so the plan describes a schedule that no longer exists.
+   */
+  | "RELEASE_NO_LONGER_SCHEDULED"
+  /**
+   * The document going live is held back now (`notApproved`): a workflow
+   * holds a part it would publish that is not approved.
+   */
+  | "NOT_APPROVED"
+  /**
+   * Asking whether the document is held back failed; not evidence either
+   * way, so nothing is written and the next pass asks again.
+   */
+  | "APPROVAL_CHECK_FAILED";
+
+/**
+ * Whether retrying could ever change this outcome.
+ *
+ * An exhaustive `Record` rather than a set of the permanent ones, so a failure
+ * kind added later cannot default into either answer: the compiler demands it
+ * be classified, and both defaults are bad. Defaulting to permanent lets a new
+ * transient error permanently stop launches; defaulting to transient puts a
+ * hopeless release back into the retry loop this exists to end.
+ */
+const RETRY_COULD_HELP: Record<MaterialisationFailure, boolean> = {
+  // Nothing about waiting supplies an author, restores a deleted one, or
+  // teaches the engine per-locale releases. These are the ones that leave a
+  // release retrying every tick forever while looking healthy.
+  NO_RECORDED_AUTHOR: false,
+  AUTHOR_UNAVAILABLE: false,
+  LOCALE_SCOPE_UNSUPPORTED: false,
+  // A withdrawn approval comes back only through a person's step, and a
+  // release retried each tick meanwhile would hold silently, looking healthy.
+  // Stopped, so its owner is told and schedules it again once it is approved.
+  NOT_APPROVED: false,
+
+  // Documented at their declarations as evidence of nothing: a lookup that
+  // errored does not mean the user is gone, and a re-read that errored does not
+  // mean the release was cancelled. Blocking on either would let a momentary
+  // database blip permanently halt a launch the next pass would have completed.
+  IDENTITY_LOOKUP_FAILED: true,
+  SCHEDULE_CHECK_FAILED: true,
+  APPROVAL_CHECK_FAILED: true,
+
+  // Ambiguous, and resolved toward retrying deliberately. "Refused or errored"
+  // covers both a permission the caller will never gain and a connection that
+  // dropped, and the two are indistinguishable here. Retrying a hopeless write
+  // wastes a tick; blocking a recoverable one loses a launch.
+  WRITE_FAILED: true,
+
+  // Not a failure of this release at all — somebody cancelled or rescheduled it
+  // while the pass was running. Blocking would overwrite their decision with a
+  // state they did not ask for.
+  RELEASE_NO_LONGER_SCHEDULED: true,
+};
+
+/**
+ * Stop every release this pass proved can never run, and say how many moved.
+ *
+ * Expanded over the overlapping components for the same reason holding open is:
+ * a release sharing a document with a permanently broken one can never settle
+ * either, because the pair is only ever discharged together. Blocking one and
+ * not the other would leave the second retrying forever, which is the condition
+ * this exists to end.
+ *
+ * Each component is handed over WHOLE, so the transition is all-or-nothing. An
+ * earlier version issued one write per release and ordered them earliest-first
+ * so that any surviving prefix was safe; that argument does not survive two
+ * releases sharing an instant, because the engine breaks such a tie per
+ * document on the member's creation time, and each release can therefore win a
+ * different document of the same component.
+ */
+async function stopHopelessReleases(
+  deps: ApplyDueReleasesDeps,
+  plan: ReturnType<typeof planReleaseMaterialisation>,
+  outcomes: readonly MaterialisationOutcome[],
+  plannedInstants: ReadonlyMap<string, Date>,
+  begun: ReadonlySet<string>
+): Promise<number> {
+  const permanent = permanentlyBrokenReleases(outcomes, begun);
+  if (permanent.size === 0) return 0;
+
+  // ONE CALL PER COMPONENT, and the component is the unit of atomicity. The
+  // groups are a partition — union-find over shared documents — so no release
+  // is offered twice and a release sharing nothing appears in a set of one.
+  //
+  // Per component rather than one transaction over all of them: components are
+  // independent by construction, so a single wide transaction would hold locks
+  // across releases that have nothing to do with each other, and one bad
+  // component would roll back every good one beside it.
+  //
+  // A release with no planned instant was not part of this pass's plan, so
+  // there is nothing to fence against, and its WHOLE component is left for the
+  // next pass, which re-plans against a set it can fence completely.
+  let blocked = 0;
+  for (const entries of componentsToStop(plan, permanent, id => {
+    const at = plannedInstants.get(id);
+    return at === undefined ? undefined : { id, scheduledAt: at };
+  })) {
+    // A component stopped for holds alone stays scheduled once part of it is written. Asked
+    // again inside the stop's transaction (`unlessBegun`), for a receipt this pass committed
+    // but could not read back, which neither the receipts read before the pass nor its
+    // outcomes show. Any other permanent failure stops the component as before.
+    const ids = new Set(entries.map(entry => entry.id));
+    const holdsOnly = outcomes.every(
+      o =>
+        !ids.has(o.releaseId) ||
+        !permanentFailure(o, begun) ||
+        COMPONENT_HOLD_FAILURES.has(o.failure)
+    );
+    blocked +=
+      (await withinComponent("stop", entries, () =>
+        deps.repository.blockReleases(entries, { unlessBegun: holdsOnly })
+      )) ?? 0;
+  }
+  return blocked;
+}
+
+/**
+ * The releases of each component begun: `before`, from the receipts read before this pass, and
+ * every release of a component one of whose actions this pass wrote. An approval withdrawn after
+ * the component's question meets a later write's own gate; the component has then begun all the
+ * same, and is kept scheduled for its approval rather than stopped with part of it live.
+ */
+function begunComponents(
+  plan: ReturnType<typeof planReleaseMaterialisation>,
+  outcomes: readonly MaterialisationOutcome[],
+  before: ReadonlySet<string>
+): Set<string> {
+  const wrote = new Set(
+    outcomes.filter(o => o.failure === null).map(o => o.releaseId)
+  );
+  const begun = new Set(before);
+  for (const group of plan.overlappingReleases) {
+    if (group.some(id => wrote.has(id))) {
+      for (const id of group) begun.add(id);
+    }
+  }
+  return begun;
+}
+
+/**
+ * Flush the pages of each component an earlier pass began that a hold now keeps scheduled
+ * (`permanentlyBrokenReleases` leaves it so rather than stopping it). A reader is shown nothing
+ * more of it from now on, as of a component `blockReleases` stops and flushes, so a page cached
+ * with what it projected must not outlive the hold. The flush never throws.
+ */
+async function flushHeldBegunComponents(
+  deps: ApplyDueReleasesDeps,
+  plan: ReturnType<typeof planReleaseMaterialisation>,
+  outcomes: readonly MaterialisationOutcome[],
+  begun: ReadonlySet<string>
+): Promise<void> {
+  const held = new Set(
+    outcomes.filter(o => heldBegun(o, begun)).map(o => o.releaseId)
+  );
+  if (held.size === 0) return;
+  await deps.repository.revalidateReleases?.(
+    plan.overlappingReleases
+      .filter(group => group.some(id => held.has(id)))
+      .flat()
+  );
+}
+
+/**
+ * One component's stop or settle, with a failure kept to that component.
+ *
+ * Each component moves in a transaction of its own, with its owners' notices
+ * and their email jobs, so a write that fails rolls back that component
+ * alone. It stays scheduled, and the next pass retries it; the documents it
+ * already wrote are marked applied, so that pass writes only what is left.
+ * Letting the failure escape would end the pass there instead, and every
+ * component after it, applied or not, would wait with it.
+ *
+ * @returns how many releases moved, or `null` when the move failed
+ */
+async function withinComponent(
+  transition: "stop" | "settle",
+  entries: readonly { id: string }[],
+  move: () => Promise<readonly string[] | number>
+): Promise<number | null> {
+  try {
+    const moved = await move();
+    return typeof moved === "number" ? moved : moved.length;
+  } catch (error) {
+    getNextlyLogger().warn({
+      kind: "release-component-transition-failed",
+      message:
+        transition === "stop"
+          ? "Releases that cannot run could not be stopped; the next pass tries again"
+          : "Releases that ran could not be marked published; the next pass tries again",
+      releaseIds: entries.map(entry => entry.id),
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+/**
+ * The releases this pass proved can never be applied as they stand.
+ *
+ * A hold (`NOT_APPROVED`) on a component an earlier pass already began is the
+ * exception: that pass was cut off after writing some of it, those documents
+ * are live, and stopping the release would leave it so for good. Retried
+ * instead, the release stays scheduled, a read projects nothing more of it, and
+ * the next pass after the approval returns writes the rest.
+ */
+function permanentlyBrokenReleases(
+  outcomes: readonly MaterialisationOutcome[],
+  begun: ReadonlySet<string>
+): Set<string> {
+  return new Set(
+    outcomes.filter(o => permanentFailure(o, begun)).map(o => o.releaseId)
+  );
+}
+
+/** Whether this outcome is a failure no retry could fix, which stops its release. */
+function permanentFailure(
+  outcome: MaterialisationOutcome,
+  begun: ReadonlySet<string>
+): boolean {
+  return (
+    outcome.failure !== null &&
+    !RETRY_COULD_HELP[outcome.failure] &&
+    !heldBegun(outcome, begun)
+  );
+}
+
+/**
+ * The failures a component's hold records (`componentHold`): its documents held back, or the
+ * question about them failing. Named once, so stopping and flushing judge a hold alike.
+ */
+const COMPONENT_HOLD_FAILURES: ReadonlySet<MaterialisationFailure | null> =
+  new Set<ComponentHold["failure"]>(["NOT_APPROVED", "APPROVAL_CHECK_FAILED"]);
+
+/** Whether this outcome is a hold on a component an earlier pass, or this one, began. */
+function heldBegun(
+  outcome: MaterialisationOutcome,
+  begun: ReadonlySet<string>
+): boolean {
+  return (
+    COMPONENT_HOLD_FAILURES.has(outcome.failure) && begun.has(outcome.releaseId)
+  );
+}
+
+export interface MaterialisationOutcome {
+  ref: DocumentRef;
+  memberId: string;
+  releaseId: string;
+  effect: "publish" | "unpublish";
+  failure: MaterialisationFailure | null;
+  /** The underlying message, when there was one. */
+  detail?: string;
+}
+
+export interface ApplyDueReleasesResult {
+  /** Releases whose instant had arrived when this pass looked. */
+  due: number;
+  /** Releases moved to `published` by THIS pass. */
+  published: number;
+  /**
+   * Releases moved to `blocked` by THIS pass, because nothing about retrying
+   * them could succeed.
+   */
+  blocked: number;
+  applied: number;
+  failed: number;
+  /**
+   * Releases left SCHEDULED because finalization ran out of time.
+   *
+   * Counted separately from `deferred`, which counts actions never started. A
+   * truncated pass over a backlog of empty releases omits no action at all, so
+   * `deferred` is zero and the only sign that work was left behind is this.
+   */
+  undischarged: number;
+  /**
+   * Actions this pass did not start, because it ran out of time.
+   *
+   * Reported rather than implied. A pass that stopped early and one that had
+   * less to do return the same counts otherwise, so a caller could not tell a
+   * completed drain from a truncated one — and "success" on a partial pass is
+   * the reading that turns a backlog into a silent stall.
+   */
+  deferred: number;
+  outcomes: MaterialisationOutcome[];
+}
+
+/**
+ * Apply every release whose instant has arrived; see the module note.
+ *
+ * A caller passing its own `repository` provides `isMemberApplied`, returns
+ * `appliedRevision` from `listMembersOf`, and settles a whole component in
+ * `markReleasesPublished`; the built-in drain job (`createReleasesDrainJob`)
+ * needs nothing.
+ */
+export async function applyDueReleases(
+  deps: ApplyDueReleasesDeps
+): Promise<ApplyDueReleasesResult> {
+  const now = deps.now ?? (() => new Date());
+  const at = now();
+
+  const releases = await deps.repository.findDueReleases(at);
+  if (releases.length === 0) {
+    return {
+      due: 0,
+      published: 0,
+      blocked: 0,
+      applied: 0,
+      failed: 0,
+      deferred: 0,
+      undischarged: 0,
+      outcomes: [],
+    };
+  }
+
+  const members = await deps.repository.listMembersOf(releases.map(r => r.id));
+
+  const plan = planReleaseMaterialisation({
+    releases: releases.map(r => ({
+      id: r.id,
+      // `findDueReleases` returns only releases with an instant, so this is
+      // never the epoch in practice; narrowing here rather than asserting keeps
+      // a repository that ever changed its mind from publishing 1970.
+      scheduledAt: r.scheduledAt ?? at,
+      revision: r.revision,
+    })),
+    members,
+    now: at,
+  });
+
+  const { outcomes, unfinished, applied } = await applyWithinBudget(
+    deps,
+    plan,
+    now,
+    deps.random ?? Math.random
+  );
+
+  // A release is discharged only when nothing attributed to it failed — AND
+  // nothing failed in any release it shares a document with. Holding the whole
+  // overlapping set open keeps every member of that argument present until all
+  // of them can be settled together.
+  const brokenReleases = new Set([
+    ...outcomes.filter(o => o.failure !== null).map(o => o.releaseId),
+    // Not started is not succeeded. Folded in here rather than checked
+    // separately so the overlapping-set expansion below covers it too: a
+    // release sharing a document with an unfinished one must stay open for the
+    // same reason a failed one does, or the pair reverses itself.
+    ...unfinished,
+  ]);
+  const heldOpen = new Set<string>();
+  for (const group of plan.overlappingReleases) {
+    if (group.some(id => brokenReleases.has(id))) {
+      for (const id of group) heldOpen.add(id);
+    }
+  }
+
+  // A release that can NEVER be applied is stopped rather than left scheduled.
+  // Left alone it is replanned every tick forever, and it reads as healthy the
+  // whole time — the operator learns nothing until the launch does not happen.
+  //
+  // Expanded over the overlapping components for the same reason holding open
+  // is: a release sharing a document with a permanently broken one can never
+  // settle either, because the pair is only ever discharged together. Blocking
+  // one and not the other would leave the second retrying forever, which is the
+  // condition this exists to end.
+  // From every member's receipt, the losing actions' included (`begunReleases`), and from this
+  // pass's own writes, which those receipts, read before it wrote, cannot show.
+  const begun = begunComponents(
+    plan,
+    outcomes,
+    begunReleases(plan, members, releases)
+  );
+  const blocked = await stopHopelessReleases(
+    deps,
+    plan,
+    outcomes,
+    // The instants THIS pass planned against, so blocking fences on the same
+    // schedule the plan was built from.
+    new Map(
+      releases.flatMap(r => (r.scheduledAt ? [[r.id, r.scheduledAt]] : []))
+    ),
+    begun
+  );
+  await flushHeldBegunComponents(deps, plan, outcomes, begun);
+
+  const { published, undischarged } = await dischargeSettledComponents(
+    deps,
+    plan,
+    heldOpen,
+    applied,
+    now,
+    // The revision and instant each release was planned against, so settling
+    // refuses one that moved since.
+    new Map(
+      releases.flatMap(r =>
+        r.scheduledAt
+          ? [[r.id, { revision: r.revision, scheduledAt: r.scheduledAt }]]
+          : []
+      )
+    )
+  );
+
+  const deferred = plan.actions.length - outcomes.length;
+  const failed = outcomes.filter(o => o.failure !== null).length;
+  return {
+    due: releases.length,
+    published,
+    applied: outcomes.length - failed,
+    failed,
+    deferred,
+    undischarged,
+    blocked,
+    outcomes,
+  };
+}
+
+/**
+ * One action's outcome — and never a rejection.
+ *
+ * That is an INVARIANT, not an observation: the pass's "every action is
+ * attempted" promise is only as good as it. Every fallible step below is
+ * wrapped individually, which is why there is no catch-all here — a boundary
+ * `try` would be a branch no test could reach, and an unreachable guard is a
+ * worse record of the rule than this sentence. **A bare `await` added to this
+ * function breaks the guarantee**, silently, for every release due that minute.
+ */
+async function applyOne(
+  deps: ApplyDueReleasesDeps,
+  action: MaterialisationAction
+): Promise<MaterialisationOutcome> {
+  const base = {
+    ref: action.ref,
+    memberId: action.memberId,
+    releaseId: action.releaseId,
+    effect: action.effect,
+  };
+
+  // Applied by its own write on an earlier pass, for the release as it now
+  // stands: that write already judged its author, its permissions and the
+  // document, and writing it again would only replay its hooks and events.
+  // The schedule is still asked first: the mark matched the revision this pass
+  // PLANNED against, and a release postponed or cancelled since must not be
+  // reported applied on the strength of it.
+  if (action.applied) {
+    return (
+      (await scheduleRefusal(deps, action, base)) ?? {
+        ...base,
+        failure: null,
+      }
+    );
+  }
+
+  // The read seam answers DOCUMENT-WIDE members only. `findDueDecisions`
+  // filters `locale IS NULL` because per-locale lifecycle lives on the
+  // companion's `_status`, which the main row it filters cannot express — so
+  // per-locale release visibility is not built yet.
+  //
+  // Writing one locale here would therefore apply an effect the read path
+  // refuses to project, and the mark below cannot record it either: the write
+  // marks a member from the MAIN row's stored status, so a per-locale
+  // unpublish that COMMITTED leaves no mark, reports WRITE_FAILED, and replays
+  // its hooks and outbox events on every drain forever.
+  //
+  // Declined rather than half-performed. Nothing can reach this today — there
+  // is no write surface, so no locale member can exist — and when one is built
+  // the schedule-time gate is where a locale member should be refused, with
+  // this as the backstop that keeps the two seams from ever disagreeing.
+  if (action.ref.locale !== null && action.ref.locale !== undefined) {
+    return { ...base, failure: "LOCALE_SCOPE_UNSUPPORTED" };
+  }
+
+  const identity = await resolveActionAuthor(deps, action.createdBy);
+  if ("failure" in identity) {
+    return { ...base, failure: identity.failure, ...identity.detail };
+  }
+
+  const refused = await scheduleRefusal(deps, action, base);
+  if (refused !== null) return refused;
+
+  return writeAndConfirm(deps, action, identity.user, base);
+}
+
+/**
+ * What the run asks of the documents a component would publish (`notApproved`): the registered
+ * hold when left out, the one a read's projection of a due release asks too.
+ */
+function askHeld(
+  deps: ApplyDueReleasesDeps
+): (documents: readonly GoingLiveDocument[]) => Promise<ReadonlySet<string>> {
+  return deps.notApproved ?? (documents => goingLiveHold().held(documents));
+}
+
+/**
+ * The outcome of each action a component's hold refuses, written nowhere. The held documents are
+ * reported as held; every other one says which held documents it waits for, so a release stopped
+ * for one document is not read as stopped for each. Made once per component, so that detail is
+ * written once for the component rather than again for each of its actions.
+ */
+function heldOutcomeOf(
+  hold: ComponentHold
+): (action: MaterialisationAction) => MaterialisationOutcome {
+  const waitsFor =
+    hold.failure === "NOT_APPROVED"
+      ? `Waits for ${[...hold.held].join(", ")}, held back in a release it goes live with.`
+      : hold.detail;
+  return action => {
+    const base = {
+      ref: action.ref,
+      memberId: action.memberId,
+      releaseId: action.releaseId,
+      effect: action.effect,
+    };
+    if (hold.failure === "APPROVAL_CHECK_FAILED") {
+      return { ...base, failure: hold.failure, detail: waitsFor };
+    }
+    if (hold.held.has(action.memberId)) {
+      return { ...base, failure: "NOT_APPROVED" };
+    }
+    return { ...base, failure: "NOT_APPROVED", detail: waitsFor };
+  };
+}
+
+/**
+ * Why this action may no longer go ahead on its release's schedule, or null
+ * while the release is still due at the instant this pass planned against.
+ *
+ * Cancelling or postponing is the one thing a person does to a release between
+ * a drain reading it and the drain acting on it, and the fence on
+ * `markReleasesPublished` comes too late: it stops the row being marked
+ * published and cannot un-publish the documents. Checked per ACTION rather
+ * than once per pass, so a cancel is honoured for every document not yet
+ * written rather than only for releases the pass had not started.
+ *
+ * Never a rejection: it is a database read on the ordinary path, and an
+ * unwrapped one aborted the entire pass, so a transient connection failure on
+ * the FIRST action skipped every later action and every unrelated due release,
+ * and one blip looked exactly like a quiet night.
+ */
+async function scheduleRefusal(
+  deps: ApplyDueReleasesDeps,
+  action: MaterialisationAction,
+  base: Omit<MaterialisationOutcome, "failure">
+): Promise<MaterialisationOutcome | null> {
+  let stillDue: boolean;
+  try {
+    stillDue = await deps.repository.isStillDueAt(
+      action.releaseId,
+      action.scheduledAt
+    );
+  } catch (error) {
+    return {
+      ...base,
+      failure: "SCHEDULE_CHECK_FAILED",
+      detail: messageOf(error),
+    };
+  }
+  return stillDue ? null : { ...base, failure: "RELEASE_NO_LONGER_SCHEDULED" };
+}
+
+/**
+ * The write, and the read of its mark that decides whether it counted.
+ *
+ * Extracted from {@link applyOne} because it is a different question: that one
+ * decides whether this action may be attempted at all, this one decides what
+ * actually happened when it was. Keeping them together also put the access
+ * refusals, the cancel fence and two rounds of confirmation in one function of
+ * a dozen branches, which no reader can hold at once.
+ */
+async function writeAndConfirm(
+  deps: ApplyDueReleasesDeps,
+  action: MaterialisationAction,
+  user: UserContext,
+  base: Omit<MaterialisationOutcome, "failure">
+): Promise<MaterialisationOutcome> {
+  try {
+    // Called ON the object rather than through an extracted reference: a
+    // mutations implementation that is a class method would lose `this` and
+    // fail at a point that looks like the write being refused.
+    //
+    // As the release's own run, so the write is not taken for an event that
+    // stops this release between two of its documents (`asReleaseRun`).
+    const input: ReleaseWrite = {
+      ref: action.ref,
+      user,
+      receipt: { memberId: action.memberId, revision: action.revision },
+    };
+    await asReleaseRun(action.ref, () =>
+      action.effect === "publish"
+        ? deps.mutations.publish(input)
+        : deps.mutations.unpublish(input)
+    );
+  } catch (error) {
+    // A rejection is not proof the write did not land. Ask the member's mark,
+    // which only a committed write leaves — and if THAT cannot be answered,
+    // report the failure, which is the safe direction: a retry of an applied
+    // action rewrites one document, while treating an unapplied one as done
+    // loses it silently.
+    const landed = await confirmApplied(deps, action, false);
+    if (landed) return { ...base, failure: null, detail: messageOf(error) };
+    return {
+      ...base,
+      failure: refusedForApproval(error) ? "NOT_APPROVED" : "WRITE_FAILED",
+      detail: messageOf(error),
+    };
+  }
+
+  // A resolved promise is not proof the action was APPLIED. A
+  // `beforeUpdate`/`beforeChange` hook may remove or rewrite `status`, and the
+  // ordinary mutation then succeeds without performing the publish or the
+  // withdrawal. Reporting that as complete discharges the release, removes its
+  // read-time projection, and loses the scheduled action permanently — the one
+  // failure here that leaves no trace at all. Such a write stored another
+  // status, so it left no mark.
+  //
+  // So success is confirmed the same way a rejection is. An unanswerable
+  // read is treated as applied here, because the write did resolve;
+  // inventing a failure for it would be the direction that loses nothing but
+  // replays the hooks and outbox events of a write that already happened.
+  if (!(await confirmApplied(deps, action, true))) {
+    return {
+      ...base,
+      failure: "WRITE_FAILED",
+      detail: "the mutation resolved without applying the intended status",
+    };
+  }
+
+  return { ...base, failure: null };
+}
+
+/**
+ * Whether a write was refused by the publish gate for approval alone: a validation refusal every
+ * issue of which is `NOT_APPROVED`, as the gate words a part held back. An approval withdrawn
+ * after the component's question and before this write is met by the write's own gate; that is
+ * the hold the question asks about, recorded as one rather than retried as a failed write.
+ */
+function refusedForApproval(error: unknown): boolean {
+  if (!NextlyError.isCode(error, "VALIDATION_ERROR")) return false;
+  const data: unknown = error.publicData;
+  const issues =
+    typeof data === "object" && data !== null && "errors" in data
+      ? data.errors
+      : undefined;
+  return (
+    Array.isArray(issues) &&
+    issues.length > 0 &&
+    issues.every(
+      (issue: unknown) =>
+        typeof issue === "object" &&
+        issue !== null &&
+        "code" in issue &&
+        issue.code === "NOT_APPROVED"
+    )
+  );
+}
+
+/**
+ * Whether the member's own write marked it applied, for the revision this
+ * pass planned against.
+ *
+ * @param whenUnverifiable what to answer when the read of the mark ITSELF fails, which
+ *   says nothing either way. Both callers need that answer and they need
+ *   opposite ones — a caller whose write rejected must not assume it landed, and
+ *   a caller whose write resolved must not invent a failure for it — so it is a
+ *   parameter rather than a policy this function picks.
+ */
+async function confirmApplied(
+  deps: ApplyDueReleasesDeps,
+  action: MaterialisationAction,
+  whenUnverifiable: boolean
+): Promise<boolean> {
+  try {
+    return await deps.repository.isMemberApplied(
+      action.memberId,
+      action.revision
+    );
+  } catch {
+    return whenUnverifiable;
+  }
+}
+
+/**
+ * The person a release action runs as, or why there is nobody to run it as.
+ *
+ * Separated from the action itself because it is the ACCESS decision, and it
+ * has three distinct refusals that a reader should be able to take in without
+ * also holding the write, the cancel check and the mark in mind.
+ */
+async function resolveActionAuthor(
+  deps: ApplyDueReleasesDeps,
+  createdBy: string | null
+): Promise<
+  | { user: UserContext }
+  | { failure: MaterialisationFailure; detail?: { detail: string } }
+> {
+  // Nobody to act as, and the only fallback available is the privileged
+  // principal this module refuses.
+  if (createdBy === null) return { failure: "NO_RECORDED_AUTHOR" };
+
+  let resolved: Awaited<ReturnType<typeof resolveRunAs>>;
+  try {
+    resolved = await resolveRunAs(deps.runAs, createdBy);
+  } catch (error) {
+    // A transient database error is not evidence that anybody is gone.
+    return {
+      failure: "IDENTITY_LOOKUP_FAILED",
+      detail: { detail: messageOf(error) },
+    };
+  }
+
+  // `resolveRunAs` reports an ANONYMOUS caller as `{ ok: true, user: null }`.
+  // That is a legitimate answer for a background job queued by nobody; it is
+  // not one here, because a member always names an author and a null user
+  // would apply no field rules at all.
+  if (!resolved.ok || resolved.user === null) {
+    return { failure: "AUTHOR_UNAVAILABLE" };
+  }
+  return { user: resolved.user };
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Perform the plan's actions until the budget runs out, a COMPONENT at a time.
+ *
+ * Extracted because it is a separate decision from what the pass then does with
+ * the outcomes: this one answers "how much of the plan can this tick afford",
+ * and the caller answers "what may now be discharged". Holding both at once is
+ * what pushed `applyDueReleases` past what a reader can follow.
+ */
+async function applyWithinBudget(
+  deps: ApplyDueReleasesDeps,
+  plan: ReturnType<typeof planReleaseMaterialisation>,
+  now: () => Date,
+  random: () => number
+): Promise<{
+  outcomes: MaterialisationOutcome[];
+  unfinished: Set<string>;
+  /** Releases this pass performed at least one action for. */
+  applied: Set<string>;
+}> {
+  const outcomes: MaterialisationOutcome[] = [];
+  // Releases this pass could not finish. Kept separately from the failures the
+  // caller reads, because an unattempted action leaves NO outcome — so a release
+  // whose remaining members were never started would otherwise look like one
+  // whose members all succeeded, be marked published, lose its read-time
+  // projection, and lose those members permanently.
+  const unfinished = new Set<string>();
+  const componentOf = new Map<string, number>();
+  plan.overlappingReleases.forEach((group, index) => {
+    for (const id of group) componentOf.set(id, index);
+  });
+  // Ordered so a component's actions are contiguous. The planner's own order is
+  // by document and provides no such grouping; without this the guard has
+  // nothing left to defer by the time it first fires.
+  // ROTATED, so no component is permanently first.
+  //
+  // The first component is exempt from the deadline — something must run, or a
+  // budget too small for one stalls everything. With a stable order that
+  // exemption becomes head-of-line blocking: a component that is slow, or whose
+  // action FAILS and holds it open, consumes the budget on every tick, and the
+  // healthy releases behind it are deferred forever. No process kill is needed;
+  // a cleanly returning failure is enough, and each tick reports success.
+  //
+  // The rotation is RANDOM, and the obvious alternative is a trap. Deriving it
+  // from the pass instant reads as deterministic and fair, and is neither: a
+  // cron whose period divides the component count repeats the same rotation
+  // forever, and 30s, 60s and 300s all do for two or three components — so the
+  // failing component keeps the exempt position under every realistic cadence.
+  // Deriving it from the due set is worse still, because that set is precisely
+  // what does not change while a component keeps failing.
+  //
+  // A component that keeps failing still retries, which is the at-least-once
+  // contract; what it no longer does is starve the others while it fails.
+  const componentCount = Math.max(plan.overlappingReleases.length, 1);
+  const rotation = Math.floor(random() * componentCount) % componentCount;
+  const rank = (releaseId: string): number =>
+    ((componentOf.get(releaseId) ?? 0) - rotation + componentCount) %
+    componentCount;
+  const ordered = [...plan.actions].sort(
+    (a, b) => rank(a.releaseId) - rank(b.releaseId)
+  );
+  const startedComponents = new Set<number>();
+  const byComponent = actionsByComponent(plan);
+  // Each started component's hold, asked before its first write (`componentHold`), as the
+  // outcome of each action it refuses; null when nothing holds it.
+  const holds = new Map<
+    number,
+    ((action: MaterialisationAction) => MaterialisationOutcome) | null
+  >();
+  const applied = new Set<string>();
+  for (const action of ordered) {
+    const component = componentOf.get(action.releaseId) ?? -1;
+    // Checked only when entering a NEW component, and never mid-component:
+    // nothing here can interrupt a content mutation, and a half-applied
+    // component is the reversal this module already refuses. At least one
+    // component always runs, or a budget too small for one stalls a backlog
+    // forever while every pass reports success.
+    if (
+      deps.deadline !== undefined &&
+      !startedComponents.has(component) &&
+      startedComponents.size > 0 &&
+      now().getTime() >= deps.deadline.getTime()
+    ) {
+      unfinished.add(action.releaseId);
+      continue;
+    }
+    if (!startedComponents.has(component)) {
+      startedComponents.add(component);
+      const hold = await componentHold(
+        askHeld(deps),
+        byComponent[component] ?? []
+      );
+      holds.set(component, hold === null ? null : heldOutcomeOf(hold));
+    }
+    applied.add(action.releaseId);
+    // A held component writes nothing more: what an earlier pass applied still goes through
+    // `applyOne`, which writes nothing again, so it is reported as it stands.
+    const held = holds.get(component) ?? null;
+    outcomes.push(
+      held !== null && !action.applied
+        ? held(action)
+        : await applyOne(deps, action)
+    );
+  }
+
+  // A release is discharged only when nothing attributed to it failed — AND
+  // nothing failed in any release it shares a document with.
+  //
+  // The second half is what stops a partial pass from reversing itself.
+  // Discharging the winner of an overlapping pair while the loser stays
+  // scheduled removes the winner from the next pass entirely, so the loser
+  // becomes the winner for their shared document and undoes it. Holding the
+  // whole overlapping set open keeps every member of that argument present
+  return { outcomes, unfinished, applied };
+}
+
+/**
+ * Each component's releases that a pass may settle, in the planner's order:
+ * those of the pass's due releases that are not held open.
+ *
+ * The due releases are looked up in a set built once, so the decision grows
+ * with the backlog, not its square. A scan of the due list for each release
+ * took seconds at twenty thousand due releases, an imported schedule's size,
+ * and every second of it came out of the pass's deadline.
+ */
+export function settleableComponents(
+  plan: Pick<
+    ReturnType<typeof planReleaseMaterialisation>,
+    "releaseIds" | "overlappingReleases"
+  >,
+  heldOpen: ReadonlySet<string>
+): string[][] {
+  const due = new Set(plan.releaseIds);
+  return plan.overlappingReleases.map(group =>
+    group.filter(id => !heldOpen.has(id) && due.has(id))
+  );
+}
+
+/**
+ * Mark every settleable component published, until the budget runs out.
+ *
+ * Separate from the loop above because it is bounded for a different reason:
+ * that one is bounded by content mutations, this one by one write per due
+ * release — and a plan can finish its actions well inside budget while leaving
+ * hundreds of these.
+ */
+async function dischargeSettledComponents(
+  deps: ApplyDueReleasesDeps,
+  plan: ReturnType<typeof planReleaseMaterialisation>,
+  heldOpen: ReadonlySet<string>,
+  applied: ReadonlySet<string>,
+  now: () => Date,
+  planned: ReadonlyMap<string, { revision: number; scheduledAt: Date }>
+): Promise<{ published: number; undischarged: number }> {
+  let published = 0;
+  // Discharged by COMPONENT, for the reason the planner states: splitting one
+  // reverses work. If the deadline fell between two members of a component, the
+  // later winner could be marked published while the earlier stayed scheduled —
+  // and the next tick, seeing only the earlier, would make it the winner and
+  // republish what was correctly withdrawn.
+  //
+  // Counted by ATTEMPT, not by success: `markReleasesPublished` settles none of
+  // a component an overlapping drain already settled, so gating on successes
+  // leaves the counter at zero and every row gets a serial write with the budget
+  // long gone.
+  let finalizedComponents = 0;
+  let undischarged = 0;
+  const settleableOf = settleableComponents(plan, heldOpen);
+  for (const [index, group] of plan.overlappingReleases.entries()) {
+    const settleable = settleableOf[index];
+    if (settleable.length === 0) continue;
+    // A component this pass APPLIED is always discharged, whatever the clock
+    // says. Its content mutations already happened; leaving it scheduled makes
+    // the next tick plan and perform them AGAIN — rerunning hooks and appending
+    // outbox events for writes that already landed — and `deferred` reports
+    // zero, because nothing was skipped. A truncated pass would look clean
+    // while doing the expensive half twice.
+    //
+    // Discharging is one write per release. Finishing what was applied can only
+    // overrun by that much, and it is the cheaper half by a wide margin; the
+    // budget therefore bounds components this pass did NOT touch, which is the
+    // backlog-of-empty-releases case it was added for.
+    const wasApplied = group.some(id => applied.has(id));
+    if (
+      !wasApplied &&
+      deps.deadline !== undefined &&
+      finalizedComponents > 0 &&
+      now().getTime() >= deps.deadline.getTime()
+    ) {
+      // SKIPPED, not broken out of. The exemption above is only reached when a
+      // group is, so breaking here strands every applied component that happens
+      // to sit behind an untouched one — and a stranded applied component is the
+      // replay this exemption exists to prevent: its mutations, hooks and outbox
+      // writes all run again next tick.
+      //
+      // Continuing costs one comparison per remaining group and guarantees every
+      // applied component is reached. Only untouched ones are deferred, which is
+      // what the bound is for.
+      undischarged += settleable.length;
+      continue;
+    }
+    finalizedComponents += 1;
+    published +=
+      (await withinComponent(
+        "settle",
+        settleable.map(id => ({ id })),
+        () => settleComponent(deps, settleable, now, planned)
+      )) ?? 0;
+  }
+  return { published, undischarged };
+}
+
+/**
+ * Mark one component's releases published, whole or not at all, each fenced
+ * on the revision and instant this pass planned against, and say how many
+ * moved.
+ *
+ * One call for the component, for the reason the planner gives for settling by
+ * component: a release of it moved since the plan (renamed, say, with its
+ * schedule unchanged) cannot be settled, and settling the rest without it
+ * leaves it the winner on their shared documents, so the next pass would
+ * reverse what the component did.
+ */
+async function settleComponent(
+  deps: ApplyDueReleasesDeps,
+  ids: readonly string[],
+  now: () => Date,
+  planned: ReadonlyMap<string, { revision: number; scheduledAt: Date }>
+): Promise<number> {
+  const entries = ids.flatMap(id => {
+    const fence = planned.get(id);
+    return fence === undefined ? [] : [{ id, ...fence }];
+  });
+  // Every due release has an instant (`findDueReleases`); a component holding
+  // one without is not settled rather than settled in part.
+  if (entries.length !== ids.length) return 0;
+  // A FRESH clock, not the pass's start. `publishedAt` is defined as the
+  // moment materialisation completed, and the pass's start was captured before
+  // members were loaded, identities resolved and every content mutation run —
+  // on a slow pass or a large due set that difference is substantial.
+  return (await deps.repository.markReleasesPublished(entries, now())).length;
+}

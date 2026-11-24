@@ -1,0 +1,400 @@
+import { promises as fs } from "node:fs";
+import * as path from "node:path";
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+
+import {
+  publishesPerLanguage,
+  storesPerLanguage,
+} from "../domains/i18n/per-language-storage";
+import {
+  type CompanionSchema,
+  localizedFieldRefs,
+  markNonTextFields,
+} from "../domains/i18n/runtime/companion-io";
+import { buildCompanionRuntimeTable } from "../domains/i18n/runtime/companion-registration";
+import { applyMigrationWhole } from "../domains/schema/services/apply-migration-statements";
+import { generateRuntimeSchema } from "../domains/schema/services/runtime-schema-generator";
+import { NextlyError } from "../errors/nextly-error";
+import type { FieldDefinition } from "../schemas/dynamic-collections";
+import { consoleLogger } from "../shared/types";
+import type { DatabaseInstance } from "../types/database-operations";
+
+export interface FileManagerConfig {
+  schemasDir: string;
+  migrationsDir: string;
+}
+
+/**
+ * Function type for fetching collection metadata from the registry service.
+ * This allows the FileManager to load collection fields without circular dependencies.
+ *
+ * Why `status?: boolean`: the runtime schema generator only
+ * adds the `status` column when `{ status: true }` is passed in. Without
+ * the flag here, UI-created status-enabled collections went through the
+ * FileManager fallback path and produced a Drizzle descriptor without a
+ * status column — so `select()` left status out of GET responses and the
+ * admin's published-edit branch could never fire. The fetcher now reads
+ * the column from `dynamic_collections` / `dynamic_singles` and forwards
+ * a coerced boolean to FileManager's runtime generation.
+ */
+export type CollectionMetadataFetcher = (
+  collectionName: string,
+  // Optional transaction-bound executor so the metadata read runs on the
+  // caller's transaction connection instead of taking a second pooled one when
+  // schema loading happens inside a caller-owned transaction.
+  executor?: unknown
+) => Promise<{
+  fields: FieldDefinition[];
+  tableName: string;
+  status?: boolean;
+  /**
+   * Whether content-localization is enabled for this collection (i18n M4). When true, the
+   * companion `<tableName>_locales` table holds the translatable columns and
+   * {@link CollectionFileManager.loadCompanionSchema} can build its queryable Drizzle table.
+   */
+  localized?: boolean;
+} | null>;
+
+/** The companion `_locales` runtime schema for a localized collection. */
+/**
+ * The companion `_locales` runtime schema, re-exported from the module that OWNS it.
+ *
+ * 🔴 This was a verbatim second declaration of the same four fields until `_updated_at` arrived, and that is
+ * exactly the drift event a duplicated shape invites: `_updated_at` was added to the i18n
+ * definition, this copy silently did not have it, and the reader here went on compiling while
+ * describing a companion that no longer matched the one being created. The two never disagreed
+ * for as long as neither changed, which is what makes this shape of duplication expensive rather
+ * than merely untidy.
+ *
+ * A type-only re-export, so nothing about the module graph changes at runtime: importers of this
+ * path keep their import, and there is one definition to keep correct.
+ */
+export type { CompanionSchema };
+
+export class CollectionFileManager {
+  private migrationsDir: string;
+  private db: DatabaseInstance;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private schemaRegistry: Map<string, any> = new Map();
+  // The keys a caller registered a schema of its own under
+  // (`registerSchema(s)`), which `forgetBuiltSchemas` keeps: there may be no
+  // registry row to build them again from.
+  private callerSchemas = new Set<string>();
+  private adapter?: DrizzleAdapter;
+  private metadataFetcher?: CollectionMetadataFetcher;
+
+  constructor(db: DatabaseInstance, config: FileManagerConfig) {
+    this.db = db;
+    this.migrationsDir = config.migrationsDir;
+  }
+
+  /**
+   * Set the adapter for runtime schema generation.
+   * Called during service initialization.
+   */
+  setAdapter(adapter: DrizzleAdapter): void {
+    this.adapter = adapter;
+  }
+
+  /**
+   * Set the metadata fetcher for loading collection fields from the database.
+   * This is used for runtime schema generation for UI collections.
+   */
+  setMetadataFetcher(fetcher: CollectionMetadataFetcher): void {
+    this.metadataFetcher = fetcher;
+  }
+
+  registerSchema(collectionName: string, schema: unknown): void {
+    const key = `dc_${collectionName.replace(/-/g, "_")}`;
+    this.schemaRegistry.set(key, schema);
+    this.callerSchemas.add(key);
+  }
+
+  registerSchemas(schemas: Record<string, unknown>): void {
+    consoleLogger.info("[FileManager] registerSchemas called with keys", {
+      detail: Object.keys(schemas),
+    });
+    Object.entries(schemas).forEach(([key, schema]) => {
+      this.schemaRegistry.set(key, schema);
+      this.callerSchemas.add(key);
+      consoleLogger.info("[FileManager] Registered schema", { key });
+    });
+    consoleLogger.info("[FileManager] Registry now has", {
+      detail: Array.from(this.schemaRegistry.keys()),
+    });
+  }
+
+  // Replace the cached runtime Drizzle schema for one collection with a
+  // freshly-generated table object. Called after an admin-UI schema apply
+  // so that the very next entry-list / entry-get query uses the correct
+  // column names without a DB roundtrip or server restart.
+  //
+  // Replaces the old `invalidateSchema` (delete + lazy rebuild) approach.
+  // That approach had a race: the rebuild read `dynamic_collections.fields`
+  // from the DB, so if that write was still in flight the rebuild would
+  // produce the stale schema again. Pushing the fresh table in directly
+  // eliminates the race — the caller already has the correct table object
+  // (built from the apply payload's `fields` list).
+  refreshSchema(tableName: string, freshTable: unknown): void {
+    this.schemaRegistry.set(tableName, freshTable);
+    // Built from the registry's fields now, so a later reload may build it again.
+    this.callerSchemas.delete(tableName);
+  }
+
+  /**
+   * Drop every table this cache built from registry rows (or was handed by a
+   * save), so each is built again from the rows as they now are on its next
+   * read. Called when the registry changed somewhere this process did not see:
+   * another server copy's save, a migration, the CLI. Schemas a caller
+   * registered itself are kept, since no registry row may describe them.
+   */
+  forgetBuiltSchemas(): void {
+    for (const key of [...this.schemaRegistry.keys()]) {
+      if (!this.callerSchemas.has(key)) this.schemaRegistry.delete(key);
+    }
+  }
+
+  /**
+   * Drop the slug-keyed cache entry so the lazy fetcher rebuilds the Drizzle
+   * table from current `dynamic_collections` state. See `refreshSchema` for
+   * the tableName-keyed variant used when the new table is already built.
+   */
+  invalidateSchemaForSlug(collectionName: string): void {
+    const schemaKey = `dc_${collectionName.replace(/-/g, "_")}`;
+    this.schemaRegistry.delete(schemaKey);
+  }
+
+  // Persist only the SQL migration for a created/updated collection. The
+  // Drizzle `.ts` schema is no longer generated: nothing at runtime imports
+  // it (the runtime builds its Drizzle table from `dynamic_collections`
+  // metadata via generateRuntimeSchema), so writing it produced orphan files
+  // that drift from the database. This matches how singles and components
+  // already work — they persist no schema file at all, only run their DDL.
+  async saveMigration(
+    migrationSQL: string,
+    migrationFileName: string
+  ): Promise<void> {
+    await fs.mkdir(this.migrationsDir, { recursive: true });
+    const migrationPath = path.join(this.migrationsDir, migrationFileName);
+    await fs.writeFile(migrationPath, migrationSQL);
+  }
+
+  /**
+   * Write a delete's drop migration, refusing a name already taken: two
+   * deletes of the same collections in the same millisecond name the same
+   * file, and the second overwriting it would let its withdrawal, should it
+   * fail, remove the file the first delete still needs.
+   */
+  async saveDropMigration(
+    migrationSQL: string,
+    migrationFileName: string
+  ): Promise<void> {
+    await fs.mkdir(this.migrationsDir, { recursive: true });
+    const migrationPath = path.join(this.migrationsDir, migrationFileName);
+    try {
+      await fs.writeFile(migrationPath, migrationSQL, { flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      throw NextlyError.conflict({
+        reason: "state",
+        message: `The drop migration ${migrationFileName} already exists: another delete of the same collections wrote it. Nothing was removed; try the delete again.`,
+        cause: error as Error,
+        logContext: { migrationFileName },
+      });
+    }
+  }
+
+  /**
+   * Remove a drop migration `saveDropMigration` wrote, for a delete that then
+   * failed: left behind, the next `nextly migrate` would drop the tables of
+   * collections that are still registered. Gone already is the same as removed.
+   */
+  async removeDropMigration(migrationFileName: string): Promise<void> {
+    await fs.rm(path.join(this.migrationsDir, migrationFileName), {
+      force: true,
+    });
+  }
+
+  /**
+   * Runs a collection's migration against this database, whole or not at all where the dialect
+   * allows it.
+   *
+   * PostgreSQL and SQLite change their schema inside a transaction, so every statement runs in one
+   * and a refusal part-way leaves the table as it was. MySQL commits each schema statement as it
+   * runs, so there a refusal says which statement it stopped at and how many ran before it, for
+   * the caller to report and for the next save to finish from the table as it now is.
+   *
+   * @throws NextlyError `NEXTLY_MIGRATION_APPLY_FAILED` when the database refuses a statement
+   */
+  async runMigration(migrationSQL: string): Promise<void> {
+    // The runner the Single save uses too, so the two saves apply a migration the same way.
+    await applyMigrationWhole({
+      db: this.db,
+      dialect: this.adapter?.dialect,
+      migrationSQL,
+      entity: "collection",
+    });
+  }
+
+  async loadDynamicSchema(
+    collectionName: string,
+    // Optional transaction-bound executor forwarded to the metadata fetcher when
+    // the runtime schema is not cached and must be read from the database inside
+    // a caller-owned transaction (see CollectionMetadataFetcher).
+    executor?: unknown
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  ): Promise<any> {
+    const schemaKey = `dc_${collectionName.replace(/-/g, "_")}`;
+
+    // First check registry (for code-first collections with pre-compiled schemas).
+    // A hit is the common case, reached on every query against a collection, so
+    // it logs nothing: a line per call, with the registry's whole key list, was
+    // thousands of lines per request burst and an array copy each time. The
+    // rarer paths below (a schema generated, or none found) still log.
+    if (this.schemaRegistry.has(schemaKey)) {
+      return this.schemaRegistry.get(schemaKey);
+    }
+
+    // If not in registry, try to generate a runtime schema for UI collections
+    // This allows UI-created collections to work without pre-compiled TypeScript schemas
+    if (this.adapter && this.metadataFetcher) {
+      consoleLogger.info(
+        "[FileManager] Schema not in registry, attempting runtime generation..."
+      );
+
+      try {
+        const metadata = await this.metadataFetcher(collectionName, executor);
+        if (metadata && metadata.fields) {
+          const dialect = this.adapter.dialect;
+          const tableName =
+            metadata.tableName || `dc_${collectionName.replace(/-/g, "_")}`;
+
+          consoleLogger.info("[FileManager] Generating runtime schema", {
+            collectionName,
+            dialect,
+            tableName,
+          });
+
+          const runtimeSchema = generateRuntimeSchema(
+            tableName,
+            metadata.fields,
+            dialect,
+            // Why: forward the Draft/Published flag so the generated
+            // descriptor includes the `status` column when the
+            // collection / single has the lifecycle enabled. Boot path
+            // in di/register.ts already does this; FileManager's lazy
+            // fallback used to drop the option silently.
+            //
+            // Forward `localized` too: on a localized collection, migrations
+            // move translatable fields into `<table>_locales`, so the main-table
+            // schema must omit those columns. Without this, a lazy schema built
+            // after a restart/cache-miss would still declare the moved columns and
+            // `select().from(schema)` would reference columns that no longer exist.
+            {
+              status: metadata.status === true,
+              localized: storesPerLanguage(metadata),
+            }
+          );
+
+          this.schemaRegistry.set(schemaKey, runtimeSchema.table);
+          consoleLogger.info(
+            "[FileManager] Runtime schema generated and cached"
+          );
+
+          return runtimeSchema.table;
+        }
+      } catch (error) {
+        consoleLogger.error("[FileManager] Failed to generate runtime schema", {
+          error: error,
+        });
+      }
+    }
+
+    const availableSchemas = Array.from(this.schemaRegistry.keys()).join(", ");
+    consoleLogger.info("[FileManager] Schema NOT found! Available", {
+      availableSchemas,
+    });
+    // Most common cause when "Available: none" is that getNextly() was
+    // called without `{ config: nextlyConfig }`. The cached singleton
+    // then bootstraps with an empty collections list, no rows land in
+    // dynamic_collections, and runtime schema generation can't find
+    // metadata for any code-first collection. The fix is to forward
+    // the config — see templates/blog/src/lib/nextly.ts for the
+    // canonical project-local wrapper pattern. Fix-up note added in
+    const noneRegistered = availableSchemas.length === 0;
+    const guidance = noneRegistered
+      ? `Available schemas: none. The collections registry is empty — most likely getNextly() was called without { config: nextlyConfig } and the cached singleton bootstrapped without your code-first collections. Fix: import nextly.config and pass it through, e.g. \`getNextly({ config: nextlyConfig })\`, or use a project-local wrapper at src/lib/nextly.ts.`
+      : `Available schemas: ${availableSchemas}. Did you spell the collection slug right and call registerSchemas() during initialization?`;
+    throw new Error(
+      `Schema for collection "${collectionName}" not found in registry. ${guidance}`
+    );
+  }
+
+  /**
+   * Load (and cache) the companion `<table>_locales` runtime Drizzle schema for a localized
+   * collection (i18n M4). Returns `null` when the collection is not localized / has no localized
+   * fields — callers use that to take the unchanged non-localized read path.
+   *
+   * Built on-demand from the collection's field metadata (mirrors {@link loadDynamicSchema}'s
+   * fallback path) so the read path can JOIN the companion without a second table registry.
+   * The result is cached under the companion's SQL name so repeated reads reuse one table object.
+   */
+  async loadCompanionSchema(
+    collectionName: string,
+    // Optional transaction-bound executor so the metadata read runs on the
+    // caller's transaction connection instead of taking a second pooled one when
+    // a localized write/delete loads the companion schema inside a transaction.
+    executor?: unknown
+  ): Promise<CompanionSchema | null> {
+    if (!this.adapter || !this.metadataFetcher) return null;
+    const metadata = await this.metadataFetcher(collectionName, executor);
+    // Only a collection whose translatable values live in a companion has one to load.
+    if (!metadata || !storesPerLanguage(metadata)) return null;
+
+    const tableName =
+      metadata.tableName || `dc_${collectionName.replace(/-/g, "_")}`;
+    const companionTableName = `${tableName}_locales`;
+
+    const cached = this.schemaRegistry.get(companionTableName);
+    // Pair each translatable field's API name (camelCase row key) with its physical companion
+    // column (snake_case) — the same conversion the column descriptor applies to main columns.
+    const localizedFields = localizedFieldRefs(metadata.fields);
+    if (localizedFields.length === 0) return null;
+    // A per-language `_status` only where the collection publishes each language on its own.
+    const hasStatus = publishesPerLanguage(metadata);
+    // `_updated_at`: unconditional, unlike `_status` -- every companion's declared shape carries
+    // `_updated_at`, so there is no metadata flag to read it from. Stated at each
+    // construction rather than defaulted in the type, so adding a further structural column
+    // stops these compiling instead of leaving them describing a companion that has moved on.
+    const hasUpdatedAt = true;
+    if (cached) {
+      return {
+        table: cached,
+        companionTableName,
+        localizedFields: markNonTextFields(localizedFields, cached),
+        hasStatus,
+        hasUpdatedAt,
+      };
+    }
+
+    const companion = buildCompanionRuntimeTable({
+      slug: collectionName,
+      tableName,
+      fields: metadata.fields,
+      dialect: this.adapter.dialect,
+      localized: true,
+      status: hasStatus,
+    });
+    if (!companion) return null;
+
+    this.schemaRegistry.set(companionTableName, companion.table);
+    return {
+      table: companion.table,
+      companionTableName,
+      localizedFields: markNonTextFields(localizedFields, companion.table),
+      hasStatus,
+      hasUpdatedAt,
+    };
+  }
+}

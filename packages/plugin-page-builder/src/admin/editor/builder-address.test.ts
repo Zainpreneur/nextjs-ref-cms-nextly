@@ -1,0 +1,367 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  bindingSourcePath,
+  builderAddress,
+  claimOpenAfterSave,
+  fieldBuilderAddress,
+  openBuilderAfterSave,
+  openAtFromSearch,
+  sectionAddress,
+  sectionFromSearch,
+} from "./builder-address";
+
+describe("builderAddress", () => {
+  it("is the entry's builder, naming the field", () => {
+    expect(
+      builderAddress(
+        { kind: "collection", slug: "pages", documentId: "p1" },
+        "body"
+      )
+    ).toEqual({ href: "/admin/collections/pages/p1/builder?field=body" });
+  });
+
+  it("is the Single's builder, naming the field", () => {
+    expect(
+      builderAddress({ kind: "single", slug: "homepage" }, "layout")
+    ).toEqual({ href: "/admin/singles/homepage/builder?field=layout" });
+  });
+
+  it("is withheld from an entry never saved, which has no address", () => {
+    expect(
+      builderAddress({ kind: "collection", slug: "pages" }, "body")
+    ).toEqual({ unsaved: true });
+  });
+
+  it("names a field inside a named group by its path", () => {
+    expect(
+      builderAddress(
+        { kind: "collection", slug: "pages", documentId: "p1" },
+        "hero.body"
+      )
+    ).toEqual({
+      href: "/admin/collections/pages/p1/builder?field=hero.body",
+    });
+  });
+
+  it("names a field inside a repeater's row by the row's saved id", () => {
+    // The address the form gives the field (`useFieldAddress`), carried as
+    // it is: the view finds the row by this id wherever the row has moved.
+    expect(
+      fieldBuilderAddress(
+        { kind: "collection", slug: "pages", documentId: "p1" },
+        { address: "sections.row-b.body", throughRow: true }
+      )
+    ).toEqual({
+      href: "/admin/collections/pages/p1/builder?field=sections.row-b.body",
+    });
+  });
+
+  it("withholds a row's way in while another language is on screen", () => {
+    // The builder edits the default language's rows; this language's row id
+    // may name a row the default language does not have, or another one.
+    const another = { documentLocalized: true, isDefaultLocale: false };
+    const page = {
+      kind: "collection",
+      slug: "pages",
+      documentId: "p1",
+    } as const;
+    const refusal = {
+      unavailable:
+        "Switch to the default language to design this row: the Page Builder edits the default language's rows.",
+    };
+    expect(
+      fieldBuilderAddress(
+        page,
+        { address: "sections.row-b.body", throughRow: true },
+        another
+      )
+    ).toEqual(refusal);
+    // A row whose saved id is its position spells its address like its form
+    // path: still a row, which the form says outright.
+    expect(
+      fieldBuilderAddress(
+        page,
+        { address: "sections.0.body", throughRow: true },
+        another
+      )
+    ).toEqual(refusal);
+    // A field outside any row still opens, saying it opens the default.
+    expect(
+      fieldBuilderAddress(page, { address: "hero.body" }, another)
+    ).toMatchObject({
+      href: "/admin/collections/pages/p1/builder?field=hero.body",
+    });
+    // In the default language the row opens as usual.
+    expect(
+      fieldBuilderAddress(
+        page,
+        { address: "sections.row-b.body", throughRow: true },
+        { documentLocalized: true, isDefaultLocale: true }
+      )
+    ).toEqual({
+      href: "/admin/collections/pages/p1/builder?field=sections.row-b.body",
+    });
+  });
+
+  it("says to save once for a row that has no saved id yet, on the same button", () => {
+    // `unavailable` is drawn beneath the card's way in, which is then
+    // disabled: the same control, never a different-looking one.
+    expect(
+      fieldBuilderAddress(
+        { kind: "collection", slug: "pages", documentId: "p1" },
+        { unavailable: "unsavedRow" }
+      )
+    ).toEqual({ unavailable: "Save the entry once to design this row." });
+  });
+
+  it("says why a repeater whose rows set their own id has no way in", () => {
+    const address = fieldBuilderAddress(
+      { kind: "collection", slug: "pages", documentId: "p1" },
+      { unavailable: "ownIds" }
+    );
+    expect("unavailable" in address ? address.unavailable : "").toContain(
+      "set their own id field"
+    );
+  });
+
+  it("asks for the page to be saved first on an entry never saved, before the row", () => {
+    // Every row of an unsaved entry is unsaved too; saving the page is the
+    // one step that answers both.
+    expect(
+      fieldBuilderAddress(
+        { kind: "collection", slug: "pages" },
+        { unavailable: "unsavedRow" }
+      )
+    ).toEqual({ unsaved: true });
+  });
+
+  it("says it opens the default language when another one is on screen", () => {
+    // The builder edits the default language only, so a link followed from the
+    // Spanish edit screen opens the default one, and the card has to say so
+    // beside a preview that is showing the Spanish page.
+    expect(
+      builderAddress(
+        { kind: "collection", slug: "pages", documentId: "p1" },
+        "body",
+        { documentLocalized: true, isDefaultLocale: false }
+      )
+    ).toEqual({
+      href: "/admin/collections/pages/p1/builder?field=body",
+      note: "Opens the default language, the one the Page Builder edits.",
+    });
+  });
+
+  it.each([
+    [
+      "the default language",
+      { documentLocalized: true, isDefaultLocale: true },
+    ],
+    [
+      "a document that is not localized",
+      { documentLocalized: false, isDefaultLocale: false },
+    ],
+  ])("says nothing about language on %s", (_case, locale) => {
+    expect(
+      builderAddress({ kind: "single", slug: "homepage" }, "layout", locale)
+    ).toEqual({ href: "/admin/singles/homepage/builder?field=layout" });
+  });
+
+  it("is withheld outside a document", () => {
+    expect(builderAddress(null, "body")).toEqual({
+      unavailable: "The Page Builder opens from a saved page.",
+    });
+  });
+
+  it("encodes the parts it puts in the address", () => {
+    expect(
+      builderAddress(
+        { kind: "collection", slug: "pages", documentId: "a/b c" },
+        "body"
+      )
+    ).toEqual({
+      href: "/admin/collections/pages/a%2Fb%20c/builder?field=body",
+    });
+  });
+});
+
+describe("sectionAddress", () => {
+  it("names the section after the field, so the address still opens that field", () => {
+    expect(
+      sectionAddress("/admin/collections/pages/p1/builder?field=body", "hero")
+    ).toBe("/admin/collections/pages/p1/builder?field=body&section=hero");
+  });
+
+  it("encodes an id the query would otherwise split or end", () => {
+    const href = sectionAddress(
+      "/admin/singles/home/builder?field=layout",
+      "a&b=c#d"
+    );
+    expect(sectionFromSearch(new URL(href, "http://x").search)).toBe("a&b=c#d");
+  });
+
+  it("replaces a section already named rather than naming two", () => {
+    expect(
+      sectionAddress(
+        "/admin/collections/pages/p1/builder?field=body&section=old",
+        "new"
+      )
+    ).toBe("/admin/collections/pages/p1/builder?field=body&section=new");
+  });
+});
+
+describe("sectionFromSearch", () => {
+  it("reads the section the address names", () => {
+    expect(sectionFromSearch("?field=body&section=hero")).toBe("hero");
+  });
+
+  it("reads none from an address that names none, or names it empty", () => {
+    expect(sectionFromSearch("?field=body")).toBeUndefined();
+    expect(sectionFromSearch("?field=body&section=")).toBeUndefined();
+    expect(sectionFromSearch("")).toBeUndefined();
+  });
+});
+
+describe("openAtFromSearch", () => {
+  it("opens at the section an address names, before any block", () => {
+    expect(openAtFromSearch("?section=plans&block=nested")).toEqual({
+      sectionId: "plans",
+    });
+  });
+
+  it("opens at a block when the address names no section", () => {
+    expect(openAtFromSearch("?block=nested")).toEqual({ blockId: "nested" });
+  });
+
+  it("opens at neither when the address names neither, or names them empty", () => {
+    expect(openAtFromSearch("")).toEqual({});
+    expect(openAtFromSearch("?section=&block=")).toEqual({});
+  });
+});
+
+describe("bindingSourcePath", () => {
+  const post = { kind: "collection", slug: "posts", documentId: "p1" } as const;
+
+  it("is the entry's edit screen for a binding to the entry, named or not", () => {
+    expect(bindingSourcePath({ $bind: "title" }, post)).toBe(
+      "/admin/collections/posts/p1"
+    );
+    expect(bindingSourcePath({ $bind: "title", source: "entry" }, post)).toBe(
+      "/admin/collections/posts/p1"
+    );
+  });
+
+  it("is the Single's screen for a binding to a Single, whatever the entry", () => {
+    expect(
+      bindingSourcePath(
+        { $bind: "phone", source: "single", sourceKey: "contact details" },
+        post
+      )
+    ).toBe("/admin/singles/contact%20details");
+  });
+
+  it("is the Single's own screen for an entry binding on a Single's page", () => {
+    expect(
+      bindingSourcePath({ $bind: "headline" }, { kind: "single", slug: "home" })
+    ).toBe("/admin/singles/home");
+  });
+
+  it("is the settings screen for a binding to the site", () => {
+    expect(bindingSourcePath({ $bind: "siteUrl", source: "site" }, null)).toBe(
+      "/admin/settings"
+    );
+  });
+
+  it("opens an entry's and a Single's screen in the language being edited", () => {
+    expect(bindingSourcePath({ $bind: "title" }, post, "ar")).toBe(
+      "/admin/collections/posts/p1?locale=ar"
+    );
+    expect(
+      bindingSourcePath(
+        { $bind: "phone", source: "single", sourceKey: "contact" },
+        post,
+        "pt-BR"
+      )
+    ).toBe("/admin/singles/contact?locale=pt-BR");
+    // The site settings have one language, so none is named.
+    expect(
+      bindingSourcePath({ $bind: "siteUrl", source: "site" }, post, "ar")
+    ).toBe("/admin/settings");
+  });
+
+  it("names no language for the default one", () => {
+    // The control: the same entry, no language given, no query.
+    expect(bindingSourcePath({ $bind: "title" }, post)).toBe(
+      "/admin/collections/posts/p1"
+    );
+    expect(bindingSourcePath({ $bind: "title" }, post, undefined)).not.toMatch(
+      /\?/
+    );
+  });
+
+  it("is nothing where no one screen edits the source", () => {
+    // A list's item is a different entry for every row; an unsaved entry,
+    // or none read, has no edit screen yet.
+    expect(
+      bindingSourcePath({ $bind: "title", source: "item" }, post)
+    ).toBeUndefined();
+    expect(
+      bindingSourcePath(
+        { $bind: "title" },
+        { kind: "collection", slug: "posts" }
+      )
+    ).toBeUndefined();
+    expect(bindingSourcePath({ $bind: "title" }, null)).toBeUndefined();
+  });
+});
+
+describe("opening the builder after an entry's first save", () => {
+  const saved = {
+    kind: "collection" as const,
+    slug: "posts",
+    documentId: "p1",
+  };
+
+  it("is claimed once, by the field asked for on the entry just saved", () => {
+    openBuilderAfterSave("posts", "p1", "sections", 1_000);
+    expect(claimOpenAfterSave(saved, "sections", 2_000)).toBe(true);
+    // Once: a form drawn again later does not open the builder again.
+    expect(claimOpenAfterSave(saved, "sections", 3_000)).toBe(false);
+  });
+
+  it("is not claimed by another field, entry or collection, which leave it waiting", () => {
+    openBuilderAfterSave("posts", "p1", "sections", 1_000);
+    expect(claimOpenAfterSave(saved, "body", 2_000)).toBe(false);
+    expect(
+      claimOpenAfterSave({ ...saved, documentId: "p2" }, "sections", 2_000)
+    ).toBe(false);
+    expect(
+      claimOpenAfterSave({ ...saved, slug: "pages" }, "sections", 2_000)
+    ).toBe(false);
+    // Nor by the entry before it has an id, the create form itself.
+    expect(
+      claimOpenAfterSave(
+        { kind: "collection", slug: "posts" },
+        "sections",
+        2_000
+      )
+    ).toBe(false);
+    expect(claimOpenAfterSave(null, "sections", 2_000)).toBe(false);
+    expect(claimOpenAfterSave(saved, "sections", 2_000)).toBe(true);
+  });
+
+  it("lapses, so a form opened much later never moves on its own", () => {
+    openBuilderAfterSave("posts", "p1", "sections", 1_000);
+    expect(claimOpenAfterSave(saved, "sections", 1_000 + 60_001)).toBe(false);
+    expect(claimOpenAfterSave(saved, "sections", 1_000 + 60_002)).toBe(false);
+  });
+
+  it("keeps only the latest request", () => {
+    openBuilderAfterSave("posts", "p1", "sections", 1_000);
+    openBuilderAfterSave("posts", "p2", "sections", 1_500);
+    expect(claimOpenAfterSave(saved, "sections", 2_000)).toBe(false);
+    expect(
+      claimOpenAfterSave({ ...saved, documentId: "p2" }, "sections", 2_000)
+    ).toBe(true);
+  });
+});

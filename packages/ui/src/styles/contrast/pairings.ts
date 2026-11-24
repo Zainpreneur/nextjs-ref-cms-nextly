@@ -1,0 +1,724 @@
+/**
+ * The token pairings the contrast check asserts, and the ones it deliberately
+ * excludes.
+ *
+ * The rule is: assert the pairings the design system actually renders, not the
+ * cartesian product of every token against every other (which is noise). A
+ * `text` pair is foreground text on a surface; a `ui` pair is a boundary or
+ * indicator (border, focus ring) against its surface that is required to
+ * identify a component or its state, which is the scope WCAG 1.4.11 sets —
+ * decorative separators and container edges are excluded rather than asserted,
+ * since holding them to 3:1 makes the whole interface heavier than designed
+ * without making anything easier to identify. Coverage spans the base
+ * `--nx-*` tokens, the `@theme` `--color-*` shades (evaluated through
+ * `color-mix()`), and the intentional alpha-utility tints (`bg-primary/10`).
+ * Exclusions are listed with a reason: a silent omission would read as
+ * "covered" when it is not.
+ */
+
+/** WCAG minimums: 4.5:1 for normal text, 3:1 for large text, UI, and graphics. */
+export type PairKind = "text" | "ui";
+
+export const THRESHOLDS: Record<PairKind, number> = {
+  // Normal text. Large text also passes at 3:1, but tokens carry no font size,
+  // so every text pair is held to the stricter normal-text minimum (a superset).
+  text: 4.5,
+  // Borders, focus rings, and other non-text UI boundaries / graphical objects.
+  ui: 3,
+};
+
+export interface Pairing {
+  /** Foreground / boundary custom property, with the `--` prefix. */
+  fg: string;
+  /** Surface custom property the foreground sits on. */
+  bg: string;
+  kind: PairKind;
+  /** Human description used in the (passing or failing) test name. */
+  label: string;
+  /** Restrict to one mode when the rendered pair is mode-specific (badge/alert
+   * shades flip between light and dark). Omitted means assert in both. */
+  mode?: "light" | "dark";
+  /** Alpha applied to the foreground before compositing (`text-primary/50`). */
+  fgAlpha?: number;
+  /** Alpha applied to the surface before it is composited onto {@link bgOver}
+   * (`bg-primary/10`). */
+  bgAlpha?: number;
+  /** The base surface a translucent `bg` is painted over (defaults to page). */
+  bgOver?: string;
+}
+
+const STATUSES = ["destructive", "success", "warning"] as const;
+
+// Body + surface text, filled on-colors, sidebar, and code (the base --nx-*
+// contract). Borders and focus are further down.
+const BASE_TEXT: Pairing[] = [
+  {
+    fg: "--nx-foreground",
+    bg: "--nx-background",
+    kind: "text",
+    label: "body text on page",
+  },
+  {
+    fg: "--nx-foreground",
+    bg: "--nx-card",
+    kind: "text",
+    label: "body text on card",
+  },
+  {
+    fg: "--nx-card-foreground",
+    bg: "--nx-card",
+    kind: "text",
+    label: "card text",
+  },
+  {
+    fg: "--nx-popover-foreground",
+    bg: "--nx-popover",
+    kind: "text",
+    label: "popover text",
+  },
+  {
+    fg: "--nx-muted-foreground",
+    bg: "--nx-background",
+    kind: "text",
+    label: "muted text on page",
+  },
+  {
+    fg: "--nx-muted-foreground",
+    bg: "--nx-card",
+    kind: "text",
+    label: "muted text on card",
+  },
+  {
+    fg: "--nx-muted-foreground",
+    bg: "--nx-muted",
+    kind: "text",
+    label: "muted text on muted surface",
+  },
+  {
+    fg: "--nx-muted-foreground",
+    bg: "--nx-popover",
+    kind: "text",
+    label: "muted text on popover",
+  },
+
+  {
+    fg: "--nx-primary-foreground",
+    bg: "--nx-primary",
+    kind: "text",
+    label: "primary on-color",
+  },
+  {
+    fg: "--nx-secondary-foreground",
+    bg: "--nx-secondary",
+    kind: "text",
+    label: "secondary on-color",
+  },
+  {
+    fg: "--nx-accent-foreground",
+    bg: "--nx-accent",
+    kind: "text",
+    label: "accent on-color",
+  },
+  {
+    fg: "--nx-highlight-foreground",
+    bg: "--nx-highlight",
+    kind: "text",
+    label: "highlight on-color",
+  },
+
+  {
+    fg: "--nx-sidebar-foreground",
+    bg: "--nx-sidebar-background",
+    kind: "text",
+    label: "sidebar text",
+  },
+  {
+    fg: "--nx-sidebar-primary-foreground",
+    bg: "--nx-sidebar-primary",
+    kind: "text",
+    label: "sidebar primary on-color",
+  },
+  {
+    fg: "--nx-sidebar-accent-foreground",
+    bg: "--nx-sidebar-accent",
+    kind: "text",
+    label: "sidebar accent on-color",
+  },
+];
+
+const CODE_SYNTAX = [
+  "comment",
+  "keyword",
+  "string",
+  "number",
+  "function",
+  "operator",
+  "punctuation",
+  "variable",
+  "tag",
+  "deleted",
+  "inserted",
+];
+const CODE_TEXT: Pairing[] = [
+  { fg: "--nx-code-fg", bg: "--nx-code-bg", kind: "text", label: "code text" },
+  ...CODE_SYNTAX.map(
+    (name): Pairing => ({
+      fg: `--nx-code-${name}`,
+      bg: "--nx-code-bg",
+      kind: "text",
+      label: `code ${name}`,
+    })
+  ),
+];
+
+// Status colors carry two roles (Radix/Primer split): the base token is the
+// readable TEXT color, and `-solid` is the button fill under the status's
+// `-foreground` ink -- white in light mode, and black for destructive in dark.
+// Both are asserted so neither role drifts below AA.
+const STATUS_TEXT: Pairing[] = STATUSES.flatMap((s): Pairing[] => [
+  {
+    fg: `--color-${s}`,
+    bg: "--color-background",
+    kind: "text",
+    label: `${s} text on page`,
+  },
+  {
+    fg: `--color-${s}`,
+    bg: "--color-card",
+    kind: "text",
+    label: `${s} text on card`,
+  },
+  {
+    fg: `--color-${s}`,
+    bg: "--color-popover",
+    kind: "text",
+    label: `${s} text on popover`,
+  },
+  // Status ink also lands on the muted and sidebar surfaces -- dashboard
+  // widgets, stat tiles and quick-link rows paint it there. Neither is covered
+  // by page, card or popover: muted is the darkest of the light surfaces and
+  // the tightest of the set, and the sidebar carries its own background token
+  // that a palette change can move independently.
+  //
+  // Both were found by the scan over real component source rather than by
+  // enumerating surfaces here, which is the usual direction. The utility scan
+  // sees what is PAINTED, this list says what is ASSERTED, and the gap between
+  // them is the thing worth closing -- three surfaces were listed while five
+  // were rendered.
+  {
+    fg: `--color-${s}`,
+    bg: "--nx-muted",
+    kind: "text",
+    label: `${s} text on muted`,
+  },
+  {
+    fg: `--color-${s}`,
+    bg: "--nx-sidebar-background",
+    kind: "text",
+    label: `${s} text on sidebar`,
+  },
+  // The page CONTAINER, which is what `.admin-page-container` actually paints
+  // and is a separate token from `--nx-background`. The boundary list already
+  // treats it as independently movable -- a control measured only against
+  // `background` read 3.80:1 while the screen rendered 3.05:1 -- and status ink
+  // rendered directly in a page has the same exposure.
+  {
+    fg: `--color-${s}`,
+    bg: "--nx-page-background",
+    kind: "text",
+    label: `${s} text on page container`,
+  },
+]);
+const STATUS_ON_SOLID: Pairing[] = [
+  ...["destructive", "success"].map(
+    (s): Pairing => ({
+      fg: `--color-${s}-foreground`,
+      bg: `--color-${s}-solid`,
+      kind: "text",
+      label: `${s} on-color (solid fill)`,
+    })
+  ),
+  {
+    fg: "--color-destructive-foreground",
+    bg: "--color-destructive-hover",
+    kind: "text",
+    label: "destructive on-color (hovered solid fill)",
+  },
+];
+
+// A success or warning toast: its text on its own surface, both handed to the
+// toast library by the Toaster in place of the library's own colours.
+const TOAST: Pairing[] = [
+  {
+    fg: "--nx-toast-success-text",
+    bg: "--nx-toast-success-bg",
+    kind: "text",
+    label: "success toast text on its surface",
+  },
+  {
+    fg: "--nx-toast-warning-text",
+    bg: "--nx-toast-warning-bg",
+    kind: "text",
+    label: "warning toast text on its surface",
+  },
+];
+
+// The 600 shade is also painted directly on the muted surface, in the entry
+// meta strip, rather than only on its own tint. It is a `color-mix()` step
+// rather than the base token, so the base pairing above does not cover it: it
+// is darker, and passing or failing at a different ratio.
+const STATUS_SHADE_ON_SURFACE: Pairing[] = STATUSES.flatMap((s): Pairing[] =>
+  (
+    [
+      ["--nx-muted", "muted"],
+      ["--nx-background", "page"],
+    ] as const
+  ).map(([bg, name]) => ({
+    fg: `--color-${s}-600`,
+    bg,
+    kind: "text" as const,
+    mode: "light" as const,
+    label: `${s} 600 on ${name} (light)`,
+  }))
+);
+
+// Destructive words on a plain surface where the base red reads under 4.5:1
+// in light mode (contrast/accepted.ts): the media details' Delete, failed-save
+// and focus point messages take the 700 shade in light mode and the base token
+// in dark, which the status text pairs above already assert. These are the
+// light surfaces they sit on: the panel's card, the viewer's page and the
+// muted backdrop around the viewer's image.
+const DESTRUCTIVE_TEXT_ON_LIGHT_SURFACE: Pairing[] = (
+  [
+    ["--nx-card", "card"],
+    ["--nx-background", "page"],
+    ["--nx-muted", "muted"],
+  ] as const
+).map(([bg, name]) => ({
+  fg: "--color-destructive-700",
+  bg,
+  kind: "text" as const,
+  mode: "light" as const,
+  label: `destructive 700 on ${name} (light)`,
+}));
+
+// Tinted status surfaces (badges, alerts, chips). These are `color-mix()`
+// shades, and the light/dark shade choices flip, so each is mode-specific. The
+// pairs asserted are the tightest that render (darkest text on the lightest
+// tint), so passing them covers the looser combinations too.
+const STATUS_SHADES: Pairing[] = STATUSES.flatMap((s): Pairing[] => [
+  {
+    fg: `--color-${s}-700`,
+    bg: `--color-${s}-100`,
+    kind: "text",
+    mode: "light",
+    label: `${s} badge text (light)`,
+  },
+  {
+    fg: `--color-${s}-600`,
+    bg: `--color-${s}-50`,
+    kind: "text",
+    mode: "light",
+    label: `${s} chip text 600/50 (light)`,
+  },
+  {
+    fg: `--color-${s}-800`,
+    bg: `--color-${s}-100`,
+    kind: "text",
+    mode: "light",
+    label: `${s} chip text 800/100 (light)`,
+  },
+  {
+    fg: `--color-${s}-900`,
+    bg: `--color-${s}-50`,
+    kind: "text",
+    mode: "light",
+    label: `${s} alert text (light)`,
+  },
+  {
+    fg: `--color-${s}-100`,
+    bg: `--color-${s}-900`,
+    kind: "text",
+    mode: "dark",
+    label: `${s} badge text (dark)`,
+  },
+  {
+    fg: `--color-${s}-100`,
+    bg: `--color-${s}-950`,
+    kind: "text",
+    mode: "dark",
+    label: `${s} alert text (dark)`,
+  },
+]);
+
+// The alert's meaningful boundary is its thick left accent (`border-l-status`),
+// held to the 3:1 UI minimum on the alert's own tinted surface.
+const ALERT_ACCENT: Pairing[] = STATUSES.flatMap((s): Pairing[] => [
+  {
+    fg: `--color-${s}`,
+    bg: `--color-${s}-50`,
+    kind: "ui",
+    mode: "light",
+    label: `${s} alert accent (light)`,
+  },
+  {
+    fg: `--color-${s}`,
+    bg: `--color-${s}-950`,
+    kind: "ui",
+    mode: "dark",
+    label: `${s} alert accent (dark)`,
+  },
+]);
+
+// The one intentional alpha-utility tint that carries text: the primary badge
+// (`bg-primary/10 text-primary`, `dark:bg-primary/20`). Its surface is the
+// translucent primary painted over the page.
+const PRIMARY_BADGE: Pairing[] = [
+  {
+    fg: "--color-primary",
+    bg: "--color-primary",
+    bgAlpha: 0.1,
+    bgOver: "--color-background",
+    kind: "text",
+    mode: "light",
+    label: "primary badge text (light)",
+  },
+  {
+    fg: "--color-primary",
+    bg: "--color-primary",
+    bgAlpha: 0.2,
+    bgOver: "--color-background",
+    kind: "text",
+    mode: "dark",
+    label: "primary badge text (dark)",
+  },
+];
+
+// The default/info alert: text-primary on a bg-primary/5 tint, in both modes.
+// text-primary is mode-correct, so it reads on the tint over either surface.
+const INFO_ALERT: Pairing[] = ["--color-background", "--color-card"].map(
+  (over): Pairing => ({
+    fg: "--color-primary",
+    bg: "--color-primary",
+    bgAlpha: 0.05,
+    bgOver: over,
+    kind: "text",
+    label: `info alert text on ${over === "--color-card" ? "card" : "page"}`,
+  })
+);
+
+// Boundaries + focus (3:1). Alpha borders are composited over their surface.
+//
+// Scope: only boundaries WCAG 1.4.11 actually reaches — those required to
+// identify a user interface component or its state. A decorative container edge
+// or row divider is excluded below with the normative reasoning, so the tokens
+// listed here can be held to 3:1 without that floor leaking onto the whole
+// border scale.
+//
+// Listed here means ASSERTED, not necessarily passing: some of these are
+// recorded in accepted.ts as knowingly below the minimum. That is the point of
+// keeping them in this list rather than moving them to EXCLUSIONS — an excluded
+// pairing is out of scope, an accepted one is in scope and measured every run.
+const BOUNDARIES: Pairing[] = [
+  {
+    fg: "--nx-border-strong",
+    bg: "--nx-background",
+    kind: "ui",
+    label: "strong border on page",
+  },
+  {
+    fg: "--nx-input",
+    bg: "--nx-background",
+    kind: "ui",
+    label: "input border on page",
+  },
+  {
+    fg: "--nx-input",
+    bg: "--nx-card",
+    kind: "ui",
+    label: "input border on card",
+  },
+  {
+    fg: "--nx-input",
+    bg: "--nx-popover",
+    kind: "ui",
+    label: "input border on popover",
+  },
+  // `--nx-background` is not what a page-level control is drawn on:
+  // `.admin-page-container` paints `--nx-page-background`, and in dark mode the
+  // two are 0.23 apart in lightness. Asserting only against `background`
+  // measured a control at 3.80:1 that the screen renders at 3.05:1 -- a
+  // near-threshold boundary that could not fail the suite because the suite was
+  // not looking at it. `muted` is the same story on a tinted row.
+  {
+    fg: "--nx-input",
+    bg: "--nx-page-background",
+    kind: "ui",
+    label: "input border on page container",
+  },
+  {
+    fg: "--nx-input",
+    bg: "--nx-muted",
+    kind: "ui",
+    label: "input border on muted",
+  },
+  // The unchecked switch, asserted as it RENDERS rather than as a token in
+  // isolation. Its track against the page is already covered by the control
+  // boundary pairings below -- same role pair, and the uniqueness check rejects
+  // stating it twice. What those do NOT cover is the thumb against the track,
+  // and the thumb's position is the entire on/off signal: a thumb that merges
+  // into its track leaves a control with no readable state.
+  {
+    fg: "--nx-background",
+    bg: "--nx-control-border",
+    kind: "ui",
+    mode: "light",
+    label: "switch thumb on its unchecked track (light)",
+  },
+  // The dark thumb is a different token -- `bg-foreground`, not `bg-background`
+  // -- so the light pairing above says nothing about it, and a mode-blind
+  // reading of "the thumb is covered" was how the dark track went unmeasured.
+  {
+    fg: "--nx-foreground",
+    bg: "--nx-control-border",
+    kind: "ui",
+    mode: "dark",
+    label: "switch thumb on its unchecked track (dark)",
+  },
+  // The checkbox and radio boundary, held to 3:1 on every surface with no
+  // acceptance. `--nx-input` is knowingly below the minimum; this token exists
+  // precisely because those two controls cannot follow it there. A field is
+  // identifiable without its edge -- label, placeholder, value, focus ring --
+  // and an unchecked box is not, so the same weight cannot serve both.
+  ...(
+    [
+      ["--nx-background", "page"],
+      ["--nx-card", "card"],
+      ["--nx-popover", "popover"],
+      ["--nx-page-background", "page container"],
+      ["--nx-muted", "muted"],
+    ] as const
+  ).map(
+    ([bg, name]): Pairing => ({
+      fg: "--nx-control-border",
+      bg,
+      kind: "ui",
+      label: `control border on ${name}`,
+    })
+  ),
+  {
+    fg: "--nx-border-strong",
+    bg: "--nx-page-background",
+    kind: "ui",
+    label: "strong border on page container",
+  },
+  {
+    fg: "--nx-ring",
+    bg: "--nx-background",
+    kind: "ui",
+    label: "focus ring on page",
+  },
+  {
+    fg: "--nx-focus-ring",
+    bg: "--nx-background",
+    kind: "ui",
+    label: "focus-ring token on page",
+  },
+  {
+    fg: "--nx-sidebar-border",
+    bg: "--nx-sidebar-background",
+    kind: "ui",
+    label: "sidebar border",
+  },
+  {
+    fg: "--nx-sidebar-ring",
+    bg: "--nx-sidebar-background",
+    kind: "ui",
+    label: "sidebar focus ring",
+  },
+];
+
+/**
+ * The marks a chart paints, against the surface it paints them on.
+ *
+ * A chart mark is a graphical object required to read the chart, which is the
+ * scope WCAG 1.4.11 sets, so each is held to 3:1. The surface is `--nx-card`
+ * throughout: a widget draws inside a card, and that is the only surface these
+ * marks meet. Deliberately not asserted against the page or the container tint
+ * — a pairing that never renders is noise, and the light ramp is close enough
+ * to the minimum that a surface nobody draws on would fail for no one.
+ *
+ * The whole slot range is asserted rather than only the slots something reads
+ * today. A palette is a menu: the next chart takes slot 3 without touching this
+ * file, and a slot that fails the day it is first used is a defect shipped by
+ * whoever adds the chart rather than by whoever chose the colour.
+ *
+ * Slot 1 is `var(--nx-primary)` and is asserted through "chart series 1"
+ * rather than separately, so a rebrand moving primary is caught here too.
+ */
+const CHART_MARKS: Pairing[] = [
+  ...[1, 2, 3, 4, 5].map(
+    (n): Pairing => ({
+      fg: `--nx-chart-${n}`,
+      bg: "--nx-card",
+      kind: "ui",
+      label: `chart series ${n} on card`,
+    })
+  ),
+  // A bar is painted over its own track, `--nx-muted`, not over the card, so the track is the
+  // surface that decides whether a bar is visible; a bar takes any slot, by its group's value.
+  // The same surface is the builder's style inspector (`--nx-builder-surface` aliases it), whose
+  // provenance dots use slots 2 and 4.
+  ...[1, 2, 3, 4, 5].map(
+    (n): Pairing => ({
+      fg: `--nx-chart-${n}`,
+      bg: "--nx-muted",
+      kind: "ui",
+      label: `chart series ${n} on a bar's track`,
+    })
+  ),
+  // A chart's tooltip shows the mark's colour beside its value, on the popover surface.
+  ...[1, 2, 3, 4, 5].map(
+    (n): Pairing => ({
+      fg: `--nx-chart-${n}`,
+      bg: "--nx-popover",
+      kind: "ui",
+      label: `chart series ${n} on the tooltip`,
+    })
+  ),
+];
+
+// The status tokens: each status's text on its own surface, on a card and on
+// the page (a chip is neutral, so its words sit on the card), and its solid
+// (the chip's dot, an alert's icon) as a 3:1 graphical object on the page and
+// on a card. Borders on a surface are container edges, not asserted (see the
+// exclusions).
+const STATUS_TOKENS = ["success", "warning", "danger", "info"] as const;
+const STATUS_TOKEN_PAIRS: Pairing[] = STATUS_TOKENS.flatMap((s): Pairing[] => [
+  {
+    fg: `--nx-${s}-text`,
+    bg: `--nx-${s}-surface`,
+    kind: "text",
+    label: `${s} text on its surface`,
+  },
+  {
+    fg: `--nx-${s}-text`,
+    bg: "--nx-card",
+    kind: "text",
+    label: `${s} text on a card`,
+  },
+  {
+    fg: `--nx-${s}-text`,
+    bg: "--nx-background",
+    kind: "text",
+    label: `${s} text on the page`,
+  },
+  {
+    fg: "--nx-foreground",
+    bg: `--nx-${s}-surface`,
+    kind: "text",
+    label: `alert text on the ${s} surface`,
+  },
+  {
+    fg: `--nx-${s}-solid`,
+    bg: "--nx-background",
+    kind: "ui",
+    label: `${s} solid (dot, icon) on the page`,
+  },
+  {
+    fg: `--nx-${s}-solid`,
+    bg: "--nx-card",
+    kind: "ui",
+    label: `${s} solid (dot, icon) on a card`,
+  },
+]);
+
+export const PAIRINGS: Pairing[] = [
+  ...STATUS_TOKEN_PAIRS,
+  ...CHART_MARKS,
+  ...BASE_TEXT,
+  ...CODE_TEXT,
+  ...STATUS_TEXT,
+  ...STATUS_ON_SOLID,
+  ...TOAST,
+  ...STATUS_SHADE_ON_SURFACE,
+  ...DESTRUCTIVE_TEXT_ON_LIGHT_SURFACE,
+  ...STATUS_SHADES,
+  ...ALERT_ACCENT,
+  ...PRIMARY_BADGE,
+  ...INFO_ALERT,
+  ...BOUNDARIES,
+];
+
+export interface Exclusion {
+  token: string;
+  reason: string;
+}
+
+/**
+ * Tokens (or token families) intentionally not asserted. Reviewers can see the
+ * exact coverage boundary instead of inferring it from silence.
+ */
+export const EXCLUSIONS: Exclusion[] = [
+  {
+    token: "--nx-{success,warning,danger,info}-border",
+    reason:
+      "The edge of an alert drawn on its status surface. The alert is identified by its icon and its words, so the edge is a container boundary, which WCAG 1.4.11 leaves out; holding it to 3:1 would make every alert heavier without making one easier to recognise.",
+  },
+  {
+    token: "--nx-border-subtle",
+    reason:
+      "A deliberately faint decorative divider (0.08 alpha). WCAG 1.4.11 exempts separators that are not required to identify or operate a component; holding it to 3:1 would defeat its purpose.",
+  },
+  {
+    token: "--nx-border on card / page / popover",
+    reason:
+      "The generic container edge: card and panel outlines, group boxes, the resting edge of a labelled control. 1.4.11 scopes its 3:1 minimum to visual information required to IDENTIFY components and states, and Understanding 1.4.11 adds that where a control has visible content (text or a sufficiently contrasting icon) which helps users identify its presence, an indication of the overall boundary is not required. Cards are identified by their own surface and heading, outline buttons by their label, so this edge carries no identifying information. It is excluded on every surface rather than only on card: it is one token painted by the same decorative role wherever it lands, and asserting any one surface would re-impose the 3:1 floor on all of them. Boundaries that DO identify a control (--nx-input, --nx-border-strong, the focus rings, --nx-sidebar-border) stay asserted above.",
+  },
+  {
+    token: "--nx-table-border on card / page",
+    reason:
+      "A row divider, the same 1.4.11 separator case as --nx-border-subtle: nothing about it is required to identify or operate the table, whose rows are identified by their content and spacing and whose header is identified by its labels. It also aliases --nx-border, so asserting it would reimpose the container-edge floor excluded above.",
+  },
+  {
+    token: "alert thin container border (--color-*-200 on -50 / -900 on -950)",
+    reason:
+      "The faint full border around an Alert is decorative: the alert is identified by its tinted fill, its thick left accent (asserted above), and its icon. Like --nx-border-subtle this is a 1.4.11 separator, not a required boundary.",
+  },
+  {
+    token: "--nx-warning-foreground on --nx-warning",
+    reason:
+      "Not rendered. Warning has no solid button; its base token is the text color and nothing paints warning-foreground on a warning fill. Asserting it would test a pair that never reaches the screen.",
+  },
+  {
+    token: "--nx-focus-ring-offset",
+    reason:
+      "The solid gap between a focus ring and the content it surrounds, not a foreground/background pair; its job is separation, which the ring's own contrast already covers.",
+  },
+  {
+    token: "--nx-chart-1..5 against the page and the page container tint",
+    reason:
+      "Every slot IS asserted against --nx-card, and slots 2 and 4 against --nx-muted as well, which are the two surfaces charts are actually painted on: a widget draws inside a card, and the builder's style inspector draws its provenance dots on --nx-builder-surface, an alias of --nx-muted. What is left here is --nx-background and --nx-page-background, where no chart is drawn. Holding the palette to a surface nothing paints on would cost real headroom in the light ramp for nobody's benefit.",
+  },
+  {
+    token: "adjacent-series contrast (one chart series against its neighbour)",
+    reason:
+      "Not a foreground/surface pair, so this table cannot express it: both sides are marks. The requirement is real -- WCAG 1.4.11 asks for 3:1 against adjacent colours, and two arcs of a ring are adjacent colours -- and it is met by SEPARATION rather than by constraining the palette. RingChart draws a surface-coloured separator under each segment (see SEGMENT_SEPARATION and its tests), so the boundary is not a colour boundary. That is deliberate: the ring's own pair is the primary against a chart slot, and no palette choice fixes it while one segment is the primary -- a colour 3:1 from both white and a near-black card exists, but picking the amber for every chart to settle one boundary is the wrong trade. Nothing here checks a chart that puts two slots side by side WITHOUT a separator; such a chart has to bring its own.",
+  },
+  {
+    token: "--nx-chart-1 and --nx-chart-2 after a tenant branding override",
+    reason:
+      "This suite resolves theme.css, so it asserts the DEFAULTS. BrandingProvider writes --nx-chart-1 and --nx-chart-2 from a tenant's primary and accent at runtime, in both modes, and a light brand primary can put those two below the minimum with every assertion here still green. Not closed by this table, which cannot see a runtime value: closing it needs the branding pipeline to constrain what it emits, which is a change to that pipeline rather than an entry here. Stated so the green is not read as covering it -- the same limit applies to every primary-coloured control, not only to charts.",
+  },
+  {
+    token:
+      "--nx-page-background / --nx-table-row-hover / --nx-table-row-selected",
+    reason:
+      "Surface tints, not foreground colors. Text on them resolves to foreground / primary-foreground, which are already asserted against the base surfaces; the selected row is a --nx-primary fill covered by the primary on-color pair.",
+  },
+  {
+    token: "ad-hoc alpha-opacity utilities (text-*/NN, border-*/NN)",
+    reason:
+      "Opacity utilities applied per call site (e.g. text-primary/50) are usage-level, not tokens, so a token check cannot see their surface. The failing ones are fixed at the source and guarded by alpha-utilities.test.ts; the one intentional text tint (the primary badge) is asserted above.",
+  },
+];

@@ -1,0 +1,1267 @@
+/**
+ * Nextly Instance Type Definition
+ *
+ * Defines the public `Nextly` interface exposed by `getNextly()`.
+ * Extracted from `init.ts` to keep the initialization orchestration file
+ * focused on lifecycle/cache concerns.
+ *
+ * The interface is re-exported from `../init.ts` so all existing imports
+ * like `import type { Nextly } from "nextly"` continue to work.
+ *
+ * @module init/nextly-instance
+ */
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+
+import type { ServiceMap } from "../di/register";
+import type { ContentEventsNamespace } from "../direct-api/namespaces/content-events";
+import type { EmailDeliveriesNamespace } from "../direct-api/namespaces/email";
+import type { FilesNamespace } from "../direct-api/namespaces/files";
+import type { FieldGroupsNamespace } from "../direct-api/namespaces/index";
+import type { JobsNamespace } from "../direct-api/namespaces/jobs";
+import type { NoticesNamespace } from "../direct-api/namespaces/notices";
+import type {
+  AccessNamespace,
+  ApiKeysNamespace,
+} from "../direct-api/namespaces/rbac";
+import type { ReleasesNamespace } from "../direct-api/namespaces/releases";
+import type { WorkflowsNamespace } from "../direct-api/namespaces/workflows";
+import type {
+  AuthResult,
+  BulkDeleteArgs,
+  BulkDeleteMediaArgs,
+  PublishArgs,
+  PublishResult,
+  RewriteFieldArgs,
+  RewriteSingleFieldArgs,
+  BulkOperationResult,
+  ChangePasswordArgs,
+  CollectionSlug,
+  CountArgs,
+  CountResult,
+  GroupArgs,
+  GroupResult,
+  TimeseriesArgs,
+  TimeseriesResult,
+  CreateArgs,
+  CreateEmailProviderArgs,
+  CreateEmailTemplateArgs,
+  CreateFolderArgs,
+  CreatePermissionArgs,
+  CreateRoleArgs,
+  CreateUserArgs,
+  CreateUserFieldArgs,
+  CreateFromSourceArgs,
+  RowFromCollectionSlug,
+  RowFromSingleSlug,
+  DeleteArgs,
+  DeleteEmailProviderArgs,
+  DeleteEmailTemplateArgs,
+  DeleteMediaArgs,
+  DeletePermissionArgs,
+  DeleteResult,
+  DeleteRoleArgs,
+  DeleteUserArgs,
+  DeleteUserFieldArgs,
+  DuplicateArgs,
+  FindArgs,
+  FindByIDArgs,
+  FindEmailProviderByIDArgs,
+  FindEmailProvidersArgs,
+  FindEmailTemplateByIDArgs,
+  FindEmailTemplateBySlugArgs,
+  FindEmailTemplatesArgs,
+  FindFormBySlugArgs,
+  FindFormsArgs,
+  FindSingleArgs,
+  FoundSingle,
+  FindSinglesArgs,
+  FindMediaArgs,
+  FindMediaByIDArgs,
+  FindMediaByIDsArgs,
+  MediaCopyArgs,
+  MediaCopiesArgs,
+  FindPermissionByIDArgs,
+  FindPermissionsArgs,
+  FindRoleByIDArgs,
+  FindRolesArgs,
+  FindUserByIDArgs,
+  FindUserFieldByIDArgs,
+  FindUserFieldsArgs,
+  FindUsersArgs,
+  ForgotPasswordArgs,
+  FormSubmissionsArgs,
+  GetRolePermissionsArgs,
+  ListFoldersArgs,
+  ListResult,
+  LoginArgs,
+  LoginResult,
+  MutationResult,
+  Permission,
+  PreviewEmailTemplateArgs,
+  RegisterArgs,
+  ReorderUserFieldsArgs,
+  ResetPasswordArgs,
+  Role,
+  SendEmailArgs,
+  SendEmailResult,
+  SendTemplateEmailArgs,
+  QueueEmailArgs,
+  QueueTemplateEmailArgs,
+  QueuedEmail,
+  SetDefaultProviderArgs,
+  SetRolePermissionsArgs,
+  SingleListResult,
+  SingleSlug,
+  SubmitFormArgs,
+  SubmitFormResult,
+  TestEmailProviderArgs,
+  UpdateArgs,
+  UpdateEmailProviderArgs,
+  UpdateEmailTemplateArgs,
+  UpdateSingleArgs,
+  UpdateMediaArgs,
+  UpdateRoleArgs,
+  UpdateUserArgs,
+  UpdateUserFieldArgs,
+  UploadMediaArgs,
+  UserContext,
+  VerifyEmailArgs,
+} from "../direct-api/types";
+import type {
+  ApplyEmailTemplateUpdateArgs,
+  CompareEmailTemplateArgs,
+  OverrideEmailTemplateArgs,
+  ResetEmailTemplateArgs,
+  UndoEmailTemplateUpdateArgs,
+} from "../direct-api/types/email";
+import type {
+  EmailTemplateComparison,
+  OwnerUpdateUndo,
+} from "../domains/email/services/email-template-service";
+import type { MediaCopy } from "../domains/media/copies/media-copies";
+import type { FieldRewriteResult } from "../domains/versions/field-rewrite";
+import type { NextlyPrincipals } from "../plugins/principals/types";
+import type { PublicSiteSettings } from "../runtime/site-settings-read";
+import type { EmailProviderRecord } from "../schemas/email-providers/types";
+import type { EmailTemplateRecord } from "../schemas/email-templates/types";
+import type { UserFieldDefinitionRecord } from "../schemas/user-field-definitions/types";
+import type { MediaFile, MediaFolder } from "../services/media/media-service";
+import type { User } from "../services/users/user-service";
+/**
+ * Nextly instance - provides access to all services and APIs.
+ *
+ * This is the main interface for interacting with Nextly. It provides
+ * direct access to all core services and the database adapter.
+ *
+ * The instance is cached as a singleton, so multiple calls to `getNextly()`
+ * will return the same instance.
+ *
+ * **Direct API Methods:**
+ * - `find()`, `findByID()`, `create()`, `update()`, `delete()`
+ * - `count()`, `bulkDelete()`, `duplicate()`
+ * - `findSingle()`, `updateSingle()`
+ *
+ * **Service Accessors:**
+ * - `collections`, `users`, `media`, `storage`, `adapter`
+ */
+export interface Nextly {
+  // ==========================================================================
+  // Direct API Methods
+  // ==========================================================================
+
+  /**
+   * Find multiple documents in a collection.
+   *
+   * @example
+   * ```typescript
+   * const posts = await nextly.find({
+   *   collection: 'posts',
+   *   where: { status: { equals: 'published' } },
+   *   limit: 10,
+   *   sort: '-createdAt',
+   * });
+   * ```
+   */
+  find: <TSlug extends CollectionSlug>(
+    args: FindArgs<TSlug>
+  ) => Promise<ListResult<RowFromCollectionSlug<TSlug>>>;
+
+  /**
+   * Find a single document by ID.
+   *
+   * @example
+   * ```typescript
+   * const post = await nextly.findByID({
+   *   collection: 'posts',
+   *   id: 'post-123',
+   * });
+   * ```
+   */
+  findByID: <TSlug extends CollectionSlug>(
+    args: FindByIDArgs<TSlug>
+  ) => Promise<RowFromCollectionSlug<TSlug> | null>;
+
+  /**
+   * Create a new document.
+   *
+   * @example
+   * ```typescript
+   * const post = await nextly.create({
+   *   collection: 'posts',
+   *   data: { title: 'Hello', content: 'World' },
+   * });
+   * ```
+   */
+  create: <TSlug extends CollectionSlug>(
+    args: CreateArgs<TSlug>
+  ) => Promise<MutationResult<RowFromCollectionSlug<TSlug>>>;
+
+  /**
+   * Update a document by ID.
+   *
+   * @example
+   * ```typescript
+   * const updated = await nextly.update({
+   *   collection: 'posts',
+   *   id: 'post-123',
+   *   data: { status: 'published' },
+   * });
+   * ```
+   */
+  update: <TSlug extends CollectionSlug>(
+    args: UpdateArgs<TSlug>
+  ) => Promise<MutationResult<RowFromCollectionSlug<TSlug>>>;
+
+  /**
+   * @experimental Rewrite one field of an entry or a Single on its live copy
+   * and on every pending draft that holds it, without publishing, from the
+   * version the caller read. See `RewriteFieldArgs`.
+   */
+  rewriteField: (
+    args: RewriteFieldArgs | RewriteSingleFieldArgs
+  ) => Promise<MutationResult<FieldRewriteResult>>;
+
+  /**
+   * Delete a document by ID or by where clause.
+   *
+   * the by-id path returns `{ message, item: { id } }`;
+   * the by-where path keeps the legacy `DeleteResult` because it can
+   * affect multiple rows.
+   *
+   * @example
+   * ```typescript
+   * const result = await nextly.delete({
+   *   collection: 'posts',
+   *   id: 'post-123',
+   * });
+   * ```
+   */
+  delete: <TSlug extends CollectionSlug = CollectionSlug>(
+    args: DeleteArgs<TSlug>
+  ) => Promise<MutationResult<{ id: string }> | DeleteResult>;
+
+  /**
+   * Publish the chosen languages of one entry, and its shared part, together.
+   *
+   * @experimental
+   */
+  publish: (args: PublishArgs) => Promise<MutationResult<PublishResult>>;
+
+  /**
+   * Unpublish the chosen languages of one entry, and its shared part, together.
+   *
+   * @experimental
+   */
+  unpublish: (args: PublishArgs) => Promise<MutationResult<PublishResult>>;
+
+  /**
+   * Count documents matching a query.
+   *
+   * @example
+   * ```typescript
+   * //returns { total } (was { totalDocs }).
+   * const { total } = await nextly.count({
+   *   collection: 'posts',
+   *   where: { status: { equals: 'published' } },
+   * });
+   * ```
+   */
+  count: (args: CountArgs) => Promise<CountResult>;
+
+  /**
+   * Count documents per distinct value of one field.
+   *
+   * @example
+   * ```typescript
+   * const { buckets } = await nextly.group({
+   *   collection: 'orders',
+   *   groupBy: 'region',
+   * });
+   * ```
+   */
+  group: (args: GroupArgs) => Promise<GroupResult>;
+
+  /**
+   * Count documents per interval of a recent window.
+   *
+   * @example
+   * ```typescript
+   * const { points } = await nextly.timeseries({
+   *   collection: 'orders',
+   *   dateField: 'createdAt',
+   *   interval: 'day',
+   * });
+   * ```
+   */
+  timeseries: (args: TimeseriesArgs) => Promise<TimeseriesResult>;
+
+  /**
+   * Bulk delete multiple documents by IDs.
+   *
+   * @example
+   * ```typescript
+   * const result = await nextly.bulkDelete({
+   *   collection: 'posts',
+   *   ids: ['post-1', 'post-2'],
+   * });
+   * ```
+   */
+  bulkDelete: (args: BulkDeleteArgs) => Promise<BulkOperationResult>;
+
+  /**
+   * Duplicate a document.
+   *
+   * @example
+   * ```typescript
+   * const copy = await nextly.duplicate({
+   *   collection: 'posts',
+   *   id: 'post-123',
+   * });
+   * ```
+   */
+  duplicate: <TSlug extends CollectionSlug>(
+    args: DuplicateArgs<TSlug>
+  ) => Promise<MutationResult<RowFromCollectionSlug<TSlug>>>;
+
+  /**
+   * @experimental Create a document that copies a stored one: the source is
+   * read as the caller first, and nothing is created where that read is
+   * refused. The new document's field validators are told what it copies.
+   * Intended to become stable, since plugins call it.
+   *
+   * @example
+   * ```typescript
+   * const section = await nextly.createFromSource({
+   *   collection: 'patterns',
+   *   data: { title: 'Hero', content },
+   *   source: { collection: 'pages', id: 'page-1', field: 'content' },
+   *   user: { id: userId },
+   *   overrideAccess: false,
+   * });
+   * ```
+   */
+  createFromSource: <TSlug extends CollectionSlug>(
+    args: CreateFromSourceArgs<TSlug>
+  ) => Promise<MutationResult<RowFromCollectionSlug<TSlug>>>;
+
+  /**
+   * Get a Single document.
+   *
+   * @example
+   * ```typescript
+   * const settings = await nextly.findSingle({
+   *   slug: 'site-settings',
+   * });
+   * ```
+   */
+  findSingle: <
+    TSlug extends SingleSlug,
+    TCreate extends boolean | undefined = undefined,
+  >(
+    // `createIfMissing: false` reads without creating, and only then does
+    // the answer include `null`; see `FoundSingle`.
+    args: FindSingleArgs<TSlug> & { createIfMissing?: TCreate }
+  ) => Promise<FoundSingle<TSlug, TCreate>>;
+
+  /**
+   * Update a Single document.
+   *
+   * Returns the same `{ message, item }` envelope the collection mutations do.
+   * `warnings` is present only when a hook failed after the write committed:
+   * the document is saved either way, so this reports a side effect that did
+   * not run rather than a failed write.
+   *
+   * @example
+   * ```typescript
+   * const { item, warnings } = await nextly.updateSingle({
+   *   slug: 'site-settings',
+   *   data: { siteName: 'My Site' },
+   * });
+   * item.siteName;
+   * if (warnings) {
+   *   // saved, but a post-commit hook threw
+   * }
+   * ```
+   */
+  updateSingle: <TSlug extends SingleSlug>(
+    args: UpdateSingleArgs<TSlug>
+  ) => Promise<MutationResult<RowFromSingleSlug<TSlug>>>;
+
+  /**
+   * List all registered Single type definitions.
+   */
+  findSingles: (args?: FindSinglesArgs) => Promise<SingleListResult>;
+
+  /**
+   * The site's general settings a published page may show: its name, its
+   * address, its logo and its time zone, each `null` until the site sets it,
+   * and nothing else the settings hold.
+   *
+   * The block page routes read a page's site settings through the instance
+   * they are given, so a reader of one's own forwards this as it forwards
+   * `find`, or its pages show no site settings.
+   *
+   * @experimental
+   */
+  publicSiteSettings: () => Promise<PublicSiteSettings>;
+
+  // ==========================================================================
+  // Authentication Methods
+  // ==========================================================================
+
+  /**
+   * Verify user credentials and return the user with a signed session token
+   * and its expiry, as the Direct API's `login` returns them. Typed by the
+   * Direct API's own result type, so the two cannot describe different shapes.
+   *
+   * @example
+   * ```typescript
+   * const result = await nextly.login({
+   *   email: 'user@example.com',
+   *   password: 'password123',
+   * });
+   * console.log('Logged in as:', result.user.email);
+   * ```
+   */
+  login: (args: LoginArgs) => Promise<LoginResult>;
+
+  /**
+   * Logout operation (no-op for Direct API).
+   *
+   * Since Direct API operates server-side without sessions,
+   * logout is a no-op. Session management should be handled
+   * at the application level.
+   */
+  logout: () => Promise<void>;
+
+  /**
+   * Get the current user's profile.
+   *
+   * Requires `user.id` to be provided since Direct API
+   * doesn't have implicit session state.
+   *
+   * @example
+   * ```typescript
+   * const profile = await nextly.me({
+   *   user: { id: session.user.id },
+   * });
+   * ```
+   */
+  me: (args: { user: UserContext }) => Promise<AuthResult>;
+
+  /**
+   * Update the current user's profile (name and image only).
+   *
+   * @example
+   * ```typescript
+   * const updated = await nextly.updateMe({
+   *   user: { id: session.user.id },
+   *   data: { name: 'New Name' },
+   * });
+   * ```
+   */
+  updateMe: (args: {
+    user: UserContext;
+    data: { name?: string; image?: string };
+  }) => Promise<AuthResult>;
+
+  /**
+   * Register a new user.
+   *
+   * @example
+   * ```typescript
+   * const result = await nextly.register({
+   *   email: 'newuser@example.com',
+   *   password: 'securePassword123!',
+   *   name: 'New User',
+   * });
+   * ```
+   */
+  register: (args: RegisterArgs) => Promise<{ user: Record<string, unknown> }>;
+
+  /**
+   * Change the current user's password.
+   *
+   * Requires `user.id` and current password for verification.
+   *
+   * @example
+   * ```typescript
+   * await nextly.changePassword({
+   *   user: { id: session.user.id },
+   *   currentPassword: 'oldPassword123',
+   *   newPassword: 'newSecurePassword456!',
+   * });
+   * ```
+   */
+  changePassword: (
+    args: ChangePasswordArgs & { user: UserContext }
+  ) => Promise<{ success: true }>;
+
+  /**
+   * Initiate password reset by generating a reset token.
+   *
+   * Returns the raw token which should be sent to the user via email.
+   *
+   * @example
+   * ```typescript
+   * const result = await nextly.forgotPassword({
+   *   email: 'user@example.com',
+   * });
+   * if (result.token) {
+   *   await sendResetEmail(args.email, result.token);
+   * }
+   * ```
+   */
+  forgotPassword: (
+    args: ForgotPasswordArgs
+  ) => Promise<{ success: true; token?: string }>;
+
+  /**
+   * Reset password using a reset token.
+   *
+   * @example
+   * ```typescript
+   * const result = await nextly.resetPassword({
+   *   token: 'reset-token-from-email',
+   *   password: 'newSecurePassword456!',
+   * });
+   * ```
+   */
+  resetPassword: (
+    args: ResetPasswordArgs
+  ) => Promise<{ success: true; email?: string }>;
+
+  /**
+   * Verify user email using a verification token.
+   *
+   * @example
+   * ```typescript
+   * const result = await nextly.verifyEmail({
+   *   token: 'verification-token-from-email',
+   * });
+   * ```
+   */
+  verifyEmail: (
+    args: VerifyEmailArgs
+  ) => Promise<{ success: true; email?: string }>;
+
+  // ==========================================================================
+  // Service Accessors
+  // ==========================================================================
+
+  /**
+   * Collection service - manage collections and their entries.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly(config);
+   *
+   * // Find documents
+   * const posts = await nextly.collections.find('posts', {
+   *   where: { status: 'published' }
+   * }, context);
+   *
+   * // Create document
+   * const newPost = await nextly.collections.create('posts', {
+   *   data: { title: 'Hello World' }
+   * }, context);
+   * ```
+   */
+  collections: ServiceMap["collectionService"];
+
+  /**
+   * Users API namespace - CRUD operations for users.
+   *
+   * Provides direct database operations for user management without HTTP overhead.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly(config);
+   *
+   * // Find users
+   * const users = await nextly.users.find({
+   *   where: { role: { equals: 'admin' } },
+   *   limit: 10,
+   * });
+   *
+   * // Get user by ID
+   * const user = await nextly.users.findByID({ id: 'user-123' });
+   *
+   * // Create user
+   * const newUser = await nextly.users.create({
+   *   email: 'user@example.com',
+   *   password: 'secure123',
+   *   data: { name: 'John Doe' },
+   * });
+   *
+   * // Update user
+   * await nextly.users.update({
+   *   id: 'user-123',
+   *   data: { name: 'Jane Doe' },
+   * });
+   *
+   * // Delete user
+   * await nextly.users.delete({ id: 'user-123' });
+   * ```
+   */
+  users: {
+    find: (args?: FindUsersArgs) => Promise<ListResult<User>>;
+    findByID: (args: FindUserByIDArgs) => Promise<User | null>;
+    create: (args: CreateUserArgs) => Promise<MutationResult<User>>;
+    update: (args: UpdateUserArgs) => Promise<MutationResult<User>>;
+    delete: (args: DeleteUserArgs) => Promise<MutationResult<{ id: string }>>;
+  };
+
+  /**
+   * User service - direct access to UserService for advanced operations.
+   *
+   * For most use cases, prefer the `users` namespace above which provides
+   * a simplified CRUD API. Use this for advanced operations like
+   * authentication, password management, etc.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly(config);
+   *
+   * // Authenticate user
+   * const user = await nextly.userService.authenticate('user@example.com', 'password');
+   *
+   * // Change password
+   * await nextly.userService.changePassword(userId, oldPass, newPass);
+   * ```
+   */
+  userService: ServiceMap["userService"];
+
+  /**
+   * Runtime key/value flags accessor.
+   *
+   * Backed by the `nextly_meta` table — a small KV store for runtime
+   * state that doesn't belong in collection schemas. First consumers
+   * are the dashboard `SeedDemoContentCard` flags
+   * (`seed.completedAt`, `seed.skippedAt`).
+   *
+   * Values are JSON round-tripped: callers pass and receive JS values;
+   * the service handles serialisation per-dialect.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly({ config });
+   *
+   * await nextly.meta.set("seed.completedAt", new Date().toISOString());
+   * const ts = await nextly.meta.get<string>("seed.completedAt");
+   * await nextly.meta.delete("seed.skippedAt");
+   * const all = await nextly.meta.getAll();
+   * ```
+   */
+  meta: ServiceMap["metaService"];
+
+  /**
+   * Media API namespace - operations for media files and folders.
+   *
+   * Provides direct database operations for media management without HTTP overhead.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly(config);
+   *
+   * // Upload media
+   * const media = await nextly.media.upload({
+   *   file: { data: buffer, name: 'image.jpg', mimetype: 'image/jpeg', size: buffer.length },
+   *   altText: 'My image',
+   * });
+   *
+   * // List media
+   * const files = await nextly.media.find({ folder: 'uploads', limit: 20 });
+   *
+   * // Get by ID
+   * const file = await nextly.media.findByID({ id: 'media-123' });
+   *
+   * // Update metadata
+   * await nextly.media.update({ id: 'media-123', data: { altText: 'Updated' } });
+   *
+   * // Delete
+   * await nextly.media.delete({ id: 'media-123' });
+   *
+   * // Folders
+   * const folder = await nextly.media.folders.create({ name: 'Photos' });
+   * const folders = await nextly.media.folders.list();
+   * ```
+   */
+  media: {
+    upload: (args: UploadMediaArgs) => Promise<MediaFile>;
+    find: (args?: FindMediaArgs) => Promise<ListResult<MediaFile>>;
+    findByID: (args: FindMediaByIDArgs) => Promise<MediaFile | null>;
+    /**
+     * Up to 100 files by id in one read, judged as `findByID` judges one.
+     *
+     * @experimental
+     */
+    findByIDs: (args: FindMediaByIDsArgs) => Promise<MediaFile[]>;
+    /**
+     * A resized copy of an image at the allowed width nearest `width`, or
+     * `null` where the image is used as it is.
+     *
+     * @experimental
+     */
+    copyOf: (args: MediaCopyArgs) => Promise<MediaCopy | null>;
+    /**
+     * Every resized copy of an image up to `upTo` wide, narrowest first, or
+     * `[]` where no copy can be had. The item is read and checked once.
+     *
+     * @experimental
+     */
+    copiesOf: (args: MediaCopiesArgs) => Promise<MediaCopy[]>;
+    update: (args: UpdateMediaArgs) => Promise<MutationResult<MediaFile>>;
+    delete: (args: DeleteMediaArgs) => Promise<MutationResult<{ id: string }>>;
+    bulkDelete: (args: BulkDeleteMediaArgs) => Promise<BulkOperationResult>;
+    folders: {
+      list: (args?: ListFoldersArgs) => Promise<MediaFolder[]>;
+      create: (args: CreateFolderArgs) => Promise<MediaFolder>;
+    };
+  };
+
+  /**
+   * Forms API namespace - operations for forms and form submissions.
+   *
+   * Provides direct database operations for form management without HTTP overhead.
+   * Requires the `@nextlyhq/plugin-form-builder` plugin to be installed.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly(config);
+   *
+   * // List published forms
+   * const forms = await nextly.forms.find({ status: 'published' });
+   *
+   * // Get form by slug
+   * const form = await nextly.forms.findBySlug({ slug: 'contact-form' });
+   *
+   * // Submit form data
+   * const result = await nextly.forms.submit({
+   *   form: 'contact-form',
+   *   data: { name: 'John', email: 'john@example.com', message: 'Hello!' },
+   * });
+   *
+   * // Get submissions
+   * const submissions = await nextly.forms.submissions({
+   *   form: 'contact-form',
+   *   limit: 20,
+   * });
+   * ```
+   */
+  forms: {
+    find: (
+      args?: FindFormsArgs
+    ) => Promise<ListResult<Record<string, unknown>>>;
+    findBySlug: (
+      args: FindFormBySlugArgs
+    ) => Promise<Record<string, unknown> | null>;
+    submit: (args: SubmitFormArgs) => Promise<SubmitFormResult>;
+    submissions: (
+      args: FormSubmissionsArgs
+    ) => Promise<ListResult<Record<string, unknown>>>;
+  };
+
+  /**
+   * Field groups namespace - reusable field structures shared by collections
+   * and singles.
+   *
+   * Typed as the namespace the Direct API actually builds, so this surface
+   * cannot drift from the implementation the instance delegates to.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly(config);
+   *
+   * const fieldGroups = await nextly.fieldGroups.find();
+   * const seo = await nextly.fieldGroups.findBySlug({ slug: 'seo' });
+   * ```
+   */
+  fieldGroups: FieldGroupsNamespace;
+
+  /**
+   * Media service - direct access to MediaService for advanced operations.
+   *
+   * For most use cases, prefer the `media` namespace above which provides
+   * a simplified CRUD API. Use this for advanced operations like
+   * image processing, storage checks, etc.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly(config);
+   *
+   * // Check storage type
+   * const storageType = nextly.mediaService.getStorageType();
+   *
+   * // Move media to folder
+   * await nextly.mediaService.moveToFolder('media-id', 'folder-id', context);
+   * ```
+   */
+  mediaService: ServiceMap["mediaService"];
+
+  /**
+   * Storage manager - manage file storage with collection-specific routing.
+   *
+   * Provides access to storage operations with support for:
+   * - Collection-specific storage backends (S3, Vercel Blob, local)
+   * - Client-side upload URL generation
+   * - Signed download URLs for private files
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly(config);
+   *
+   * // Upload with collection routing
+   * const result = await nextly.storage.upload(buffer, {
+   *   filename: 'photo.jpg',
+   *   mimeType: 'image/jpeg',
+   *   collection: 'media'
+   * });
+   *
+   * // Get client upload URL (bypasses server for large files)
+   * const uploadData = await nextly.storage.getClientUploadUrl(
+   *   'video.mp4',
+   *   'video/mp4',
+   *   'media',
+   *   { size: file.size }
+   * );
+   *
+   * // Get signed URL for private file access
+   * const signedUrl = await nextly.storage.getSignedDownloadUrl(
+   *   'private/doc.pdf',
+   *   'private-docs',
+   *   3600 // expires in 1 hour
+   * );
+   * ```
+   */
+  storage: ServiceMap["mediaStorage"];
+
+  /**
+   * Database adapter - direct access to the database layer.
+   *
+   * Provides low-level database operations for advanced use cases.
+   * Most applications should use the service APIs instead.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly(config);
+   *
+   * // Check capabilities
+   * const caps = nextly.adapter.getCapabilities();
+   * console.log('JSONB support:', caps.supportsJsonb);
+   *
+   * // Run raw query (advanced)
+   * const results = await nextly.adapter.select('custom_table', {
+   *   where: { status: 'active' }
+   * });
+   * ```
+   */
+  adapter: DrizzleAdapter;
+
+  // ==========================================================================
+  // Email Provider Namespace
+  // ==========================================================================
+
+  emailProviders: {
+    find: (
+      args?: FindEmailProvidersArgs
+    ) => Promise<ListResult<EmailProviderRecord>>;
+    findByID: (
+      args: FindEmailProviderByIDArgs
+    ) => Promise<EmailProviderRecord | null>;
+    create: (
+      args: CreateEmailProviderArgs
+    ) => Promise<MutationResult<EmailProviderRecord>>;
+    update: (
+      args: UpdateEmailProviderArgs
+    ) => Promise<MutationResult<EmailProviderRecord>>;
+    delete: (
+      args: DeleteEmailProviderArgs
+    ) => Promise<MutationResult<{ id: string }>>;
+    setDefault: (
+      args: SetDefaultProviderArgs
+    ) => Promise<MutationResult<EmailProviderRecord>>;
+    test: (
+      args: TestEmailProviderArgs
+    ) => Promise<{ success: boolean; error?: string }>;
+  };
+
+  // ==========================================================================
+  // Email Template Namespace
+  // ==========================================================================
+
+  emailTemplates: {
+    find: (
+      args?: FindEmailTemplatesArgs
+    ) => Promise<ListResult<EmailTemplateRecord>>;
+    findByID: (
+      args: FindEmailTemplateByIDArgs
+    ) => Promise<EmailTemplateRecord | null>;
+    findBySlug: (
+      args: FindEmailTemplateBySlugArgs
+    ) => Promise<EmailTemplateRecord | null>;
+    create: (
+      args: CreateEmailTemplateArgs
+    ) => Promise<MutationResult<EmailTemplateRecord>>;
+    update: (
+      args: UpdateEmailTemplateArgs
+    ) => Promise<MutationResult<EmailTemplateRecord>>;
+    delete: (
+      args: DeleteEmailTemplateArgs
+    ) => Promise<MutationResult<{ id: string }>>;
+    preview: (
+      args: PreviewEmailTemplateArgs
+    ) => Promise<{ subject: string; html: string }>;
+    /** @experimental Override a core or plugin template with the site's version. */
+    override: (
+      args: OverrideEmailTemplateArgs
+    ) => Promise<MutationResult<EmailTemplateRecord>>;
+    /** @experimental Return an overridden template to its owner's version. */
+    reset: (
+      args: ResetEmailTemplateArgs
+    ) => Promise<MutationResult<EmailTemplateRecord>>;
+    /** @experimental An overridden template beside its owner's current version, change by change. */
+    compare: (
+      args: CompareEmailTemplateArgs
+    ) => Promise<EmailTemplateComparison>;
+    /** @experimental Apply a review of the owner's update. */
+    applyUpdate: (
+      args: ApplyEmailTemplateUpdateArgs
+    ) => Promise<
+      MutationResult<EmailTemplateRecord> & { undo: OwnerUpdateUndo }
+    >;
+    /** @experimental Undo an applied review. */
+    undoUpdate: (
+      args: UndoEmailTemplateUpdateArgs
+    ) => Promise<MutationResult<EmailTemplateRecord>>;
+  };
+
+  // ==========================================================================
+  // User Field Definition Namespace
+  // ==========================================================================
+
+  userFields: {
+    find: (
+      args?: FindUserFieldsArgs
+    ) => Promise<ListResult<UserFieldDefinitionRecord>>;
+    findByID: (
+      args: FindUserFieldByIDArgs
+    ) => Promise<UserFieldDefinitionRecord | null>;
+    create: (
+      args: CreateUserFieldArgs
+    ) => Promise<MutationResult<UserFieldDefinitionRecord>>;
+    update: (
+      args: UpdateUserFieldArgs
+    ) => Promise<MutationResult<UserFieldDefinitionRecord>>;
+    delete: (
+      args: DeleteUserFieldArgs
+    ) => Promise<MutationResult<{ id: string }>>;
+    reorder: (
+      args: ReorderUserFieldsArgs
+    ) => Promise<UserFieldDefinitionRecord[]>;
+  };
+
+  // ==========================================================================
+  // Email Send Namespace
+  // ==========================================================================
+
+  email: {
+    send: (args: SendEmailArgs) => Promise<SendEmailResult>;
+    sendWithTemplate: (args: SendTemplateEmailArgs) => Promise<SendEmailResult>;
+    /** @experimental Queue an email: stored, sent right after, retried on a temporary failure. */
+    queue: (args: QueueEmailArgs) => Promise<QueuedEmail>;
+    /** @experimental Queue an email made from a template, rendered at each attempt. */
+    queueWithTemplate: (args: QueueTemplateEmailArgs) => Promise<QueuedEmail>;
+  };
+
+  // ==========================================================================
+  // Roles Namespace
+  // ==========================================================================
+
+  /**
+   * Roles API namespace - CRUD operations for RBAC roles.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly(config);
+   *
+   * // List roles
+   * const roles = await nextly.roles.find({ limit: 20 });
+   *
+   * // Get role by ID
+   * const role = await nextly.roles.findByID({ id: 'role-123' });
+   *
+   * // Create a role
+   * const editor = await nextly.roles.create({
+   *   data: { name: 'Editor', slug: 'editor', level: 10 },
+   * });
+   *
+   * // Assign permissions to a role
+   * await nextly.roles.setPermissions({
+   *   id: editor.id,
+   *   permissionIds: ['perm-1', 'perm-2'],
+   * });
+   * ```
+   */
+  /**
+   * Background jobs — ask for work to happen later.
+   *
+   * Declared as the namespace's OWN type rather than restated method by method
+   * like its neighbours. Everything around it is a second, hand-written
+   * description of what the `Nextly` class already declares, and a second
+   * description is what let this member be forgotten entirely: the namespace was
+   * added to the class, wired into the module facade, exported, documented and
+   * tested, and was still absent from the instance every application actually
+   * receives from `getNextly()`. Referring to the type means that cannot recur
+   * here — a method added to the namespace arrives without anyone remembering.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly({ config });
+   * await nextly.jobs.queue({
+   *   task: "email:welcome",
+   *   input: { userId: user.id },
+   *   runAs: user.id,
+   * });
+   * ```
+   */
+  jobs: JobsNamespace;
+
+  /**
+   * @experimental Recognising a plugin's kind of signed-in person on a
+   * request: a shop's customer, a site's member.
+   *
+   * Declared as the namespace's own type, as `jobs` is, so a method added to
+   * it cannot be missing here. Calls the kind's resolver at most once per
+   * request, and answers nobody for a write from another site.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly({ config });
+   * const member = await nextly.principals.fromRequest(request, "accounts:account");
+   * ```
+   */
+  principals: NextlyPrincipals;
+
+  /**
+   * @experimental In-process access to plugin-contributed services, keyed by
+   * plugin name then service name: the same registry plugins reach as
+   * `ctx.services.plugins`, and the same member the `Nextly` class declares.
+   * Lazily resolved; cast to the service's type, or import it from the
+   * providing plugin.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly({ config });
+   * const service = nextly.plugins["@acme/plugin-x"]?.["reader"];
+   * ```
+   */
+  plugins: Record<string, Record<string, unknown>>;
+
+  /**
+   * Content releases — batch documents and put them live at one instant.
+   *
+   * Every operation authorizes: pass `overrideAccess: false` with the acting
+   * `userId` for a call made on a person's behalf. Left at its default the call
+   * is trusted, like the rest of the Direct API.
+   *
+   * @example
+   * ```typescript
+   * // `userId` is REQUIRED for a member even on a trusted call: the drain
+   * // performs each member as its recorded author, and a member with none can
+   * // never be materialised.
+   * const release = await nextly.releases.create({ title: "Spring launch" });
+   * await nextly.releases.addMember({
+   *   releaseId: release.id,
+   *   userId: editor.id,
+   *   scopeKind: "collection",
+   *   scopeSlug: "posts",
+   *   entryId: post.id,
+   *   locale: null,
+   *   action: "publish",
+   * });
+   * await nextly.releases.schedule({
+   *   id: release.id,
+   *   at: new Date("2026-09-01T09:00:00Z"),
+   *   timezone: "Europe/Berlin",
+   * });
+   * ```
+   */
+  releases: ReleasesNamespace;
+
+  /**
+   * @experimental Review state under a workflow: read it, take steps, assign,
+   * and list what waits, refused exactly where REST would refuse the caller.
+   */
+  workflows: WorkflowsNamespace;
+
+  /**
+   * @experimental The delivery log and queued email, read as the Email hub's
+   * Activity reads them.
+   */
+  emailDeliveries: EmailDeliveriesNamespace;
+
+  /**
+   * A subject's content events — a document's or a release's — newest first,
+   * page by page, refused exactly where REST would refuse the caller.
+   *
+   * @example
+   * ```typescript
+   * const { items, meta } = await nextly.contentEvents.list({
+   *   subject: { kind: "collection", slug: "posts", id: post.id },
+   *   kinds: ["published"],
+   * });
+   * ```
+   */
+  contentEvents: ContentEventsNamespace;
+
+  /**
+   * @experimental A collection's private files: the checked download, for
+   * the caller named, refused exactly where REST would refuse them.
+   */
+  files: FilesNamespace;
+
+  /**
+   * A person's own notices — read, count and mark read, for the person named.
+   *
+   * @example
+   * ```typescript
+   * const { items } = await nextly.notices.find({ userId, unread: true });
+   * await nextly.notices.markRead({ userId, all: true });
+   * ```
+   */
+  notices: NoticesNamespace;
+
+  roles: {
+    find: (args?: FindRolesArgs) => Promise<ListResult<Role>>;
+    findByID: (args: FindRoleByIDArgs) => Promise<Role>;
+    create: (args: CreateRoleArgs) => Promise<MutationResult<Role>>;
+    update: (args: UpdateRoleArgs) => Promise<MutationResult<Role>>;
+    delete: (args: DeleteRoleArgs) => Promise<MutationResult<{ id: string }>>;
+    getPermissions: (args: GetRolePermissionsArgs) => Promise<Permission[]>;
+    setPermissions: (args: SetRolePermissionsArgs) => Promise<Permission[]>;
+  };
+
+  // ==========================================================================
+  // Permissions Namespace
+  // ==========================================================================
+
+  /**
+   * Permissions API namespace - CRUD operations for RBAC permissions.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly(config);
+   *
+   * // List all permissions
+   * const perms = await nextly.permissions.find({ resource: 'posts' });
+   *
+   * // Create a permission
+   * const perm = await nextly.permissions.create({
+   *   data: { name: 'Publish Posts', slug: 'publish-posts', action: 'update', resource: 'posts' },
+   * });
+   * ```
+   */
+  permissions: {
+    find: (args?: FindPermissionsArgs) => Promise<ListResult<Permission>>;
+    findByID: (args: FindPermissionByIDArgs) => Promise<Permission | null>;
+    create: (args: CreatePermissionArgs) => Promise<MutationResult<Permission>>;
+    delete: (
+      args: DeletePermissionArgs
+    ) => Promise<MutationResult<{ id: string }>>;
+  };
+
+  // ==========================================================================
+  // Access Namespace
+  // ==========================================================================
+
+  /**
+   * Access namespace - programmatic access control evaluation.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly(config);
+   *
+   * // Check if a user can read posts
+   * const canRead = await nextly.access.check({
+   *   userId: 'user-123',
+   *   resource: 'posts',
+   *   operation: 'read',
+   * });
+   *
+   * // Authenticate an API key, with the permissions and roles it holds
+   * const key = await nextly.access.checkApiKey({ rawKey });
+   * ```
+   *
+   * The namespace's own type, so every method the runtime namespace offers is
+   * declared here too.
+   */
+  access: AccessNamespace;
+
+  /**
+   * API keys: list, read, create, rename and revoke.
+   *
+   * Trusted by default, like the rest of the Direct API. A call with
+   * `overrideAccess: false` and a `user` is judged as the admin's key routes
+   * judge that user: the matching `api-keys` permission, which reaches every
+   * key; a key made only for that user; owners shown only to someone who may
+   * read users; and no making or changing keys as an API key. Declared as the
+   * namespace's own type, so a method added to it cannot be missing here.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly({ config });
+   * const { doc, key } = await nextly.apiKeys.create({
+   *   userId: user.id,
+   *   name: "Build server",
+   *   tokenType: "read-only",
+   *   expiresIn: "90d",
+   *   overrideAccess: false,
+   *   user: { id: user.id },
+   * });
+   * ```
+   */
+  apiKeys: ApiKeysNamespace;
+
+  /**
+   * Shutdown the Nextly instance and clean up resources.
+   *
+   * This will:
+   * - Disconnect the database adapter
+   * - Clear the service container
+   * - Reset the cached instance
+   *
+   * After calling this, the next call to `getNextly()` will create
+   * a new instance.
+   *
+   * @example
+   * ```typescript
+   * const nextly = await getNextly(config);
+   *
+   * // When shutting down
+   * await nextly.shutdown();
+   * ```
+   */
+  shutdown: () => Promise<void>;
+}

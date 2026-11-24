@@ -1,0 +1,132 @@
+{
+  "name": "@nextlyhq/plugin-page-builder",
+  "version": "0.0.2-alpha.80",
+  "description": "Visual page builder plugin for Nextly (blocks, drag-and-drop, server-first rendering)",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": [
+    "**/*.css",
+    "./dist/admin/index.js",
+    "./src/admin/index.ts",
+    "./src/render/blocks/index.ts",
+    "./src/render/blocks/*.tsx",
+    "./src/admin/controls/registerDefaultControls.tsx"
+  ],
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./blocks": {
+      "types": "./dist/blocks/index.d.ts",
+      "import": "./dist/blocks/index.js",
+      "default": "./dist/blocks/index.js"
+    },
+    "./admin": {
+      "types": "./dist/admin/index.d.ts",
+      "import": "./dist/admin/index.js",
+      "default": "./dist/admin/index.js"
+    },
+    "./canvas": {
+      "types": "./dist/canvas/index.d.ts",
+      "import": "./dist/canvas/index.js",
+      "default": "./dist/canvas/index.js"
+    },
+    "./site": {
+      "types": "./dist/site/index.d.ts",
+      "import": "./dist/site/index.js",
+      "default": "./dist/site/index.js"
+    },
+    "./styles/editor.css": "./dist/styles/editor.css"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "check-types": "node ../../scripts/tsc.mjs --noEmit && node ../../scripts/tsc.mjs --noEmit -p tsconfig.tests.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
+  },
+  "dependencies": {
+    "@nextlyhq/blocks-engine": "workspace:*",
+    "@nextlyhq/blocks-react": "workspace:*",
+    "css-tree": "^2.3.1",
+    "parse5": "^8.0.0"
+  },
+  "peerDependencies": {
+    "@nextlyhq/admin": "workspace:*",
+    "@nextlyhq/builder": "workspace:*",
+    "@nextlyhq/plugin-sdk": "workspace:*",
+    "@nextlyhq/ui": "workspace:^",
+    "@tanstack/react-query": ">=5.0.0",
+    "lucide-react": ">=0.400.0",
+    "next": "^16.4.1",
+    "nextly": "workspace:*",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "react-hook-form": ">=7.0.0"
+  },
+  "devDependencies": {
+    "@nextlyhq/admin": "workspace:*",
+    "@nextlyhq/builder": "workspace:*",
+    "@nextlyhq/module-specifiers": "workspace:*",
+    "@nextlyhq/plugin-sdk": "workspace:*",
+    "@nextlyhq/tsconfig": "workspace:*",
+    "@nextlyhq/ui": "workspace:*",
+    "@playwright/test": "^1.64.1",
+    "@tanstack/react-query": "^5.62.0",
+    "@testing-library/react": "^16.3.0",
+    "@types/css-tree": "^2.3.4",
+    "@types/node": "^22.20.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/semver": "^7.5.8",
+    "jsdom": "^27.1.0",
+    "lucide-react": "^0.544.0",
+    "nextly": "workspace:*",
+    "oxc-parser": "^0.155.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "react-hook-form": "^7.66.0",
+    "semver": "^7.6.0",
+    "tsdown": "^0.23.1",
+    "typescript": "7.0.2",
+    "vitest": "^5.0.5"
+  },
+  "engines": {
+    "node": "^22.12.0 || >=24.0.0"
+  },
+  "keywords": [
+    "nextly",
+    "nextly-plugin",
+    "plugin",
+    "page-builder",
+    "blocks",
+    "visual-editor",
+    "cms",
+    "headless-cms"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nextlyhq/nextly.git",
+    "directory": "packages/plugin-page-builder"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
+  },
+  "homepage": "https://nextlyhq.com",
+  "bugs": {
+    "url": "https://github.com/nextlyhq/nextly/issues"
+  },
+  "author": "Nextly <contact@nextlyhq.com> (https://nextlyhq.com)"
+}

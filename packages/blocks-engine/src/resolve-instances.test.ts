@@ -1,0 +1,4431 @@
+/**
+ * What a page holds after its linked components have been inlined.
+ *
+ * The properties under test are the ones a consumer cannot re-derive: that an
+ * untouched page is the SAME object, that the ids are the same on every render,
+ * that an instance's own values beat the variant's, and that a component which
+ * cannot be inlined costs its own region rather than the page.
+ */
+import { describe, expect, it } from "vitest";
+
+import {
+  COMPONENT_INSTANCE_TYPE,
+  DOCUMENT_FORMAT_VERSION,
+  type BlockDocument,
+  type BlockNode,
+  type ComponentDocument,
+  type Variant,
+} from "./document";
+import {
+  DEFAULT_LIMITS,
+  MAX_COMPOSED_DEPTH,
+  MAX_ENVELOPE_ENTRIES,
+} from "./limits";
+import { isConditionGated } from "./visibility";
+import {
+  componentIdsIn,
+  componentReferencesFrom,
+  componentReachIn,
+  componentReferencesIn,
+  componentUsageIn,
+  composedRootTypes,
+  variantNamesIn,
+  variantReferencesIn,
+  instanceExposure,
+  readableDefinition,
+  resolveComponentInstances,
+  type DefinitionsById,
+  type ResolvedBlockNode,
+  type ResolvedDocument,
+} from "./resolve-instances";
+
+const node = (id: string, extra: Partial<BlockNode> = {}): BlockNode => ({
+  id,
+  type: "core/text",
+  version: 1,
+  props: {},
+  ...extra,
+});
+
+const box = (
+  id: string,
+  children: BlockNode[],
+  visibility?: BlockNode["visibility"]
+): BlockNode =>
+  node(id, {
+    type: "core/box",
+    slots: { children },
+    ...(visibility === undefined ? {} : { visibility }),
+  });
+
+const instance = (
+  id: string,
+  componentId: string,
+  props: Record<string, unknown> = {},
+  extra: Partial<BlockNode> = {}
+): BlockNode => ({
+  id,
+  type: COMPONENT_INSTANCE_TYPE,
+  version: 1,
+  props: { componentId, ...props },
+  ...extra,
+});
+
+const page = (nodes: BlockNode[]): BlockDocument => ({
+  formatVersion: DOCUMENT_FORMAT_VERSION,
+  kind: "page",
+  nodes,
+});
+
+const component = (
+  nodes: BlockNode[],
+  envelope: Partial<ComponentDocument> = {}
+): ComponentDocument => ({
+  formatVersion: DOCUMENT_FORMAT_VERSION,
+  kind: "component",
+  nodes,
+  ...envelope,
+});
+
+const defs = (entries: Record<string, BlockDocument>): DefinitionsById =>
+  new Map(Object.entries(entries));
+
+/**
+ * A node carrying a stored shape the published type forbids.
+ *
+ * Documents arrive from a database, an import or an older writer, so the
+ * resolver's contract is to survive shapes `BlockNode` cannot express — and a
+ * test that can only build well-typed nodes cannot reach the branches that
+ * exist for them. The hop through `unknown` is the assertion that this value
+ * came from storage rather than from a caller.
+ */
+const stored = (base: ResolvedBlockNode, extra: Record<string, unknown>) =>
+  ({ ...base, ...extra }) as unknown as ResolvedBlockNode;
+
+/** Every node of a resolved forest, in document order. */
+function flatten(nodes: readonly ResolvedBlockNode[]): ResolvedBlockNode[] {
+  const out: ResolvedBlockNode[] = [];
+  for (const entry of nodes) {
+    out.push(entry);
+    for (const children of Object.values(entry.slots ?? {})) {
+      out.push(...flatten(children));
+    }
+  }
+  return out;
+}
+
+const idsOf = (doc: ResolvedDocument): string[] =>
+  flatten(doc.nodes).map(entry => entry.id);
+
+const byInstanceOf = (
+  doc: ResolvedDocument,
+  instanceId: string
+): ResolvedBlockNode[] =>
+  flatten(doc.nodes).filter(entry => entry.instanceOf === instanceId);
+
+describe("resolveComponentInstances", () => {
+  it("strips a stored claim without INVOKING it, so a hostile accessor cannot abort the page", () => {
+    // `resolveComponentInstances` is public and takes a tree, so it is handed
+    // objects a host assembled in memory as well as JSON from the database.
+    // Destructuring or spreading to drop a property READS it, so an enumerable
+    // `instanceOf` accessor that throws took the whole resolution down from the
+    // strip — before any per-block boundary could contain the failure and draw
+    // a placeholder. Measured: it aborted the render outright.
+    const hostile = { id: "a", type: "core/box", version: 1, props: {} };
+    Object.defineProperty(hostile, "instanceOf", {
+      enumerable: true,
+      get() {
+        throw new Error("provenance getter invoked");
+      },
+    });
+
+    const doc = page([hostile as unknown as BlockNode]);
+
+    // The control on the control: this must not throw, and the node must
+    // survive — a resolver that dropped the node entirely would also not throw.
+    const result = resolveComponentInstances(doc, defs({}));
+
+    expect(result.document.nodes).toHaveLength(1);
+    expect(result.document.nodes[0]?.id).toBe("a");
+    expect(result.document.nodes[0]?.instanceOf).toBeUndefined();
+  });
+
+  it("strips a STORED provenance claim from an instance it cannot resolve", () => {
+    // The refusal path is the one route a stored claim survives. A host node
+    // carrying `instanceOf` is stripped on the way through, but an INSTANCE
+    // node branches to expansion before that, and a refusal spreads the
+    // original node — so a page node hand-edited to claim membership of a
+    // component keeps the claim exactly when the component is missing.
+    //
+    // `sanitizeDocument` preserves unknown node keys deliberately, so this
+    // arrives from an export replayed, a tree a host assembled, or content
+    // edited in storage. An editor reading the marker sends a click, an edit
+    // or a delete to an instance the author never placed.
+    const doc = page([
+      instance("i1", "missing", {}, {
+        instanceOf: "forged",
+      } as Partial<BlockNode>),
+    ]);
+
+    const result = resolveComponentInstances(doc, defs({}));
+
+    const refused = flatten(result.document.nodes).find(
+      entry => entry.id === "i1"
+    );
+    // Present first: an absent node is trivially unmarked, which would let a
+    // resolver that dropped the refused instance satisfy the real assertion.
+    expect(refused).toBeDefined();
+    expect(refused?.unresolvedComponent).toBeDefined();
+    expect(refused?.instanceOf).toBeUndefined();
+  });
+
+  it("returns the same document object when the page holds no instance", () => {
+    const doc = page([node("a"), box("b", [node("c")])]);
+
+    const result = resolveComponentInstances(doc, defs({}));
+
+    expect(result.document).toBe(doc);
+    expect(result.referenced).toEqual([]);
+    expect(result.unresolved).toEqual([]);
+  });
+
+  it("composes nothing in a document that is already past the node budget", () => {
+    const doc = page([node("a"), node("b"), instance("i1", "hero")]);
+    const definitions = defs({ hero: component([node("d1")]) });
+
+    const result = resolveComponentInstances(doc, definitions, {
+      limits: { ...DEFAULT_LIMITS, maxNodes: 2 },
+    });
+
+    expect(result.document).toBe(doc);
+    expect(result.unresolved).toEqual([]);
+  });
+
+  it("replaces one instance with every root of its definition", () => {
+    const doc = page([instance("i1", "hero")]);
+    const definitions = defs({
+      hero: component([node("d1"), node("d2")]),
+    });
+
+    const result = resolveComponentInstances(doc, definitions);
+
+    expect(result.document.nodes).toHaveLength(2);
+    expect(result.document.nodes.map(entry => entry.type)).toEqual([
+      "core/text",
+      "core/text",
+    ]);
+    expect(idsOf(result.document)).not.toContain("d1");
+  });
+
+  it("gives two instances of one definition different ids", () => {
+    const doc = page([instance("i1", "hero"), instance("i2", "hero")]);
+    const definitions = defs({ hero: component([node("d1")]) });
+
+    const ids = idsOf(resolveComponentInstances(doc, definitions).document);
+
+    expect(ids).toHaveLength(2);
+    expect(ids[0]).not.toBe(ids[1]);
+  });
+
+  it("mints the same ids on every resolution of one page", () => {
+    const doc = page([instance("i1", "hero"), instance("i2", "hero")]);
+    const definitions = defs({
+      hero: component([box("d1", [node("d2"), node("d3")])]),
+    });
+
+    const first = resolveComponentInstances(doc, definitions).document;
+    const second = resolveComponentInstances(doc, definitions).document;
+
+    expect(idsOf(first)).toEqual(idsOf(second));
+    expect(idsOf(first)).toHaveLength(6);
+  });
+
+  it("never mints an id a node of the host page already carries", () => {
+    // The digest the resolver would mint for this pair, taken from a run whose
+    // host holds nothing that could collide, and then planted in the host.
+    const probe = page([instance("i1", "hero")]);
+    const definitions = defs({ hero: component([node("d1")]) });
+    const minted = idsOf(
+      resolveComponentInstances(probe, definitions).document
+    )[0]!;
+
+    const doc = page([node(minted), instance("i1", "hero")]);
+    const ids = idsOf(resolveComponentInstances(doc, definitions).document);
+
+    expect(ids[0]).toBe(minted);
+    expect(ids[1]).not.toBe(minted);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("marks every inlined node with its instance, not only the roots", () => {
+    const doc = page([instance("i1", "hero")]);
+    const definitions = defs({
+      hero: component([box("d1", [node("d2")])]),
+    });
+
+    const result = resolveComponentInstances(doc, definitions);
+
+    expect(byInstanceOf(result.document, "i1")).toHaveLength(2);
+  });
+
+  it("reports every definition it read, in first-reached order", () => {
+    const doc = page([
+      instance("i1", "hero"),
+      instance("i2", "gone"),
+      instance("i3", "hero"),
+    ]);
+    const definitions = defs({ hero: component([node("d1")]) });
+
+    const result = resolveComponentInstances(doc, definitions);
+
+    expect(result.referenced).toEqual(["hero", "gone"]);
+  });
+});
+
+describe("resolveComponentInstances overrides", () => {
+  const heroWithHeadline = component(
+    [node("d1", { props: { text: "base" } })],
+    {
+      exposed: [
+        {
+          id: "headline",
+          label: "Headline",
+          nodeId: "d1",
+          propPath: "text",
+          type: "text",
+        },
+      ],
+      variants: {
+        loud: { label: "Loud", overrides: { headline: "VARIANT" } },
+      },
+    }
+  );
+
+  it("applies a variant's value when the instance overrides nothing", () => {
+    const doc = page([instance("i1", "hero", { variant: "loud" })]);
+
+    const result = resolveComponentInstances(
+      doc,
+      defs({ hero: heroWithHeadline })
+    );
+
+    expect(result.document.nodes[0]!.props.text).toBe("VARIANT");
+  });
+
+  it("prefers the instance's own value over the variant's", () => {
+    const doc = page([
+      instance("i1", "hero", {
+        variant: "loud",
+        overrides: { headline: "INSTANCE" },
+      }),
+    ]);
+
+    const result = resolveComponentInstances(
+      doc,
+      defs({ hero: heroWithHeadline })
+    );
+
+    expect(result.document.nodes[0]!.props.text).toBe("INSTANCE");
+  });
+
+  it("inherits the definition's value when the id is absent from overrides", () => {
+    const doc = page([instance("i1", "hero", { overrides: { other: "x" } })]);
+
+    const result = resolveComponentInstances(
+      doc,
+      defs({ hero: heroWithHeadline })
+    );
+
+    expect(result.document.nodes[0]!.props.text).toBe("base");
+  });
+
+  it("clears the prop for an unset override rather than inheriting it", () => {
+    const doc = page([
+      instance("i1", "hero", { overrides: { headline: { $unset: true } } }),
+    ]);
+
+    const result = resolveComponentInstances(
+      doc,
+      defs({ hero: heroWithHeadline })
+    );
+
+    expect(result.document.nodes[0]!.props).not.toHaveProperty("text");
+  });
+
+  it("treats a structured value carrying $unset as a value to apply", () => {
+    const doc = page([
+      instance("i1", "hero", {
+        overrides: { headline: { href: "/docs", $unset: true } },
+      }),
+    ]);
+
+    const result = resolveComponentInstances(
+      doc,
+      defs({ hero: heroWithHeadline })
+    );
+
+    expect(result.document.nodes[0]!.props.text).toEqual({
+      href: "/docs",
+      $unset: true,
+    });
+  });
+
+  it("writes a nested prop path without altering the shared definition", () => {
+    const definition = component(
+      [node("d1", { props: { seo: { title: "base", keep: "yes" } } })],
+      {
+        exposed: [
+          {
+            id: "title",
+            label: "Title",
+            nodeId: "d1",
+            propPath: "seo.title",
+            type: "text",
+          },
+        ],
+      }
+    );
+    const doc = page([
+      instance("i1", "hero", { overrides: { title: "one" } }),
+      instance("i2", "hero", { overrides: { title: "two" } }),
+    ]);
+
+    const result = resolveComponentInstances(doc, defs({ hero: definition }));
+
+    expect(result.document.nodes[0]!.props.seo).toEqual({
+      title: "one",
+      keep: "yes",
+    });
+    expect(result.document.nodes[1]!.props.seo).toEqual({
+      title: "two",
+      keep: "yes",
+    });
+    expect(definition.nodes[0]!.props.seo).toEqual({
+      title: "base",
+      keep: "yes",
+    });
+  });
+
+  it("writes a __proto__ path as an own key rather than a prototype", () => {
+    const definition = component([node("d1")], {
+      exposed: [
+        {
+          id: "bad",
+          label: "Bad",
+          nodeId: "d1",
+          propPath: "__proto__",
+          type: "text",
+        },
+      ],
+    });
+    const doc = page([instance("i1", "hero", { overrides: { bad: "x" } })]);
+
+    const props = resolveComponentInstances(doc, defs({ hero: definition }))
+      .document.nodes[0]!.props;
+
+    expect(Object.getPrototypeOf(props)).toBe(Object.prototype);
+    expect(Object.keys(props)).toContain("__proto__");
+  });
+});
+
+describe("resolveComponentInstances visibility", () => {
+  const definition = component([box("d1", [node("d2")]), node("d3")], {
+    exposed: [
+      {
+        id: "showBanner",
+        label: "Banner",
+        nodeId: "d1",
+        propPath: "hidden",
+        type: "visibility",
+      },
+    ],
+  });
+
+  it("drops a node and its subtree when the override hides it", () => {
+    const doc = page([
+      instance("i1", "hero", { overrides: { showBanner: false } }),
+    ]);
+
+    const result = resolveComponentInstances(doc, defs({ hero: definition }));
+
+    expect(flatten(result.document.nodes)).toHaveLength(1);
+  });
+
+  it("removes the definition's own gate when the override shows it", () => {
+    const gated = component(
+      [
+        node("d1", {
+          visibility: { conditions: [[{ field: "tier", op: "eq" }]] },
+        }),
+      ],
+      {
+        exposed: [
+          {
+            id: "showBanner",
+            label: "Banner",
+            nodeId: "d1",
+            propPath: "hidden",
+            type: "visibility",
+          },
+        ],
+      }
+    );
+    const doc = page([
+      instance("i1", "hero", { overrides: { showBanner: true } }),
+    ]);
+
+    const result = resolveComponentInstances(doc, defs({ hero: gated }));
+
+    expect(result.document.nodes[0]).not.toHaveProperty("visibility");
+  });
+
+  it("ignores a visibility override that is not a boolean, either way", () => {
+    const own = { conditions: [[{ field: "tier", op: "eq" }]] };
+    const gated = component([box("d1", [node("d2")], own), node("d3")], {
+      exposed: [
+        {
+          id: "showBanner",
+          label: "Banner",
+          nodeId: "d1",
+          propPath: "hidden",
+          type: "visibility",
+        },
+      ],
+    });
+
+    const truthy = resolveComponentInstances(
+      page([instance("i1", "hero", { overrides: { showBanner: "false" } })]),
+      defs({ hero: gated })
+    );
+    const falsy = resolveComponentInstances(
+      page([instance("i1", "hero", { overrides: { showBanner: 0 } })]),
+      defs({ hero: gated })
+    );
+
+    expect(truthy.document.nodes[0]!.visibility).toEqual(own);
+    expect(flatten(falsy.document.nodes)).toHaveLength(3);
+  });
+});
+
+describe("a stored node claiming to belong to a component", () => {
+  it("loses the claim, because only this pass may make it", () => {
+    // `instanceOf` means "the resolver inlined this from a definition", and
+    // documents arrive from places that never ran it: an export replayed, a
+    // tree a host assembled, content hand-edited in storage. `sanitizeDocument`
+    // preserves unknown node keys deliberately, so the claim survives storage.
+    //
+    // Left standing, an editor reads it as provenance and sends a click, an
+    // edit or a delete to an instance the author never placed — while the node
+    // they were pointing at is one of their own.
+    const doc = page([
+      { ...node("mine"), instanceOf: "not-a-real-instance" } as never,
+    ]);
+
+    const result = resolveComponentInstances(doc, defs({}));
+
+    expect(result.document.nodes[0]).not.toHaveProperty("instanceOf");
+  });
+
+  it("keeps the node itself, and everything else about it", () => {
+    // The control: stripping the claim must not be a licence to drop or reshape
+    // the node. A pass that returned nothing here would satisfy the assertion
+    // above while destroying the author's content.
+    const doc = page([{ ...node("mine"), instanceOf: "stored" } as never]);
+
+    const result = resolveComponentInstances(doc, defs({}));
+
+    expect(result.document.nodes.map(n => n.id)).toEqual(["mine"]);
+    expect(result.document.nodes[0]!.type).toBe(node("mine").type);
+  });
+});
+
+describe("resolveComponentInstances slots", () => {
+  const definition = component([box("d1", [node("fallback")])], {
+    slots: { body: { label: "Body", nodeId: "d1", slot: "children" } },
+  });
+
+  it("substitutes the instance's slot content for the definition's children", () => {
+    const doc = page([
+      instance("i1", "hero", {}, { slots: { body: [node("mine")] } }),
+    ]);
+
+    const result = resolveComponentInstances(doc, defs({ hero: definition }));
+
+    const children = result.document.nodes[0]!.slots!.children!;
+    expect(children.map(entry => entry.id)).toEqual(["mine"]);
+  });
+
+  it("keeps the definition's children when the instance supplies none", () => {
+    const doc = page([instance("i1", "hero")]);
+
+    const result = resolveComponentInstances(doc, defs({ hero: definition }));
+
+    const children = result.document.nodes[0]!.slots!.children!;
+    expect(children).toHaveLength(1);
+    expect(children[0]!.instanceOf).toBe("i1");
+  });
+
+  it("fills a slot the definition's node stored no entry for", () => {
+    const empty = component([node("d1", { type: "core/box" })], {
+      slots: { body: { label: "Body", nodeId: "d1", slot: "children" } },
+    });
+    const doc = page([
+      instance("i1", "hero", {}, { slots: { body: [node("mine")] } }),
+    ]);
+
+    const result = resolveComponentInstances(doc, defs({ hero: empty }));
+
+    expect(result.document.nodes[0]!.slots!.children!.map(e => e.id)).toEqual([
+      "mine",
+    ]);
+  });
+
+  it("leaves instance slot content unmarked, so the page still owns it", () => {
+    const doc = page([
+      instance("i1", "hero", {}, { slots: { body: [node("mine")] } }),
+    ]);
+
+    const result = resolveComponentInstances(doc, defs({ hero: definition }));
+
+    const mine = flatten(result.document.nodes).find(e => e.id === "mine")!;
+    expect(mine.instanceOf).toBeUndefined();
+  });
+});
+
+describe("resolveComponentInstances refusals", () => {
+  it("keeps an instance whose definition is missing, marked and reported", () => {
+    const doc = page([node("a"), instance("i1", "gone")]);
+
+    const result = resolveComponentInstances(doc, defs({}));
+
+    expect(result.document.nodes[1]!.unresolvedComponent).toBe("missing");
+    expect(result.unresolved).toEqual([
+      { instanceId: "i1", componentId: "gone", reason: "missing" },
+    ]);
+    expect(result.document.nodes[0]!.id).toBe("a");
+  });
+
+  it("marks an instance that names no component as malformed", () => {
+    const doc = page([
+      { id: "i1", type: COMPONENT_INSTANCE_TYPE, version: 1, props: {} },
+    ]);
+
+    const result = resolveComponentInstances(doc, defs({}));
+
+    expect(result.unresolved[0]!.reason).toBe("malformed");
+    expect(result.referenced).toEqual([]);
+  });
+
+  it("refuses a component that reaches itself, and renders the rest", () => {
+    const doc = page([node("a"), instance("i1", "loop")]);
+    const definitions = defs({
+      loop: component([node("d1"), instance("d2", "loop")]),
+    });
+
+    const result = resolveComponentInstances(doc, definitions);
+
+    const flat = flatten(result.document.nodes);
+    expect(flat.map(e => e.unresolvedComponent)).toEqual([
+      undefined,
+      undefined,
+      "cycle",
+    ]);
+    expect(result.unresolved.map(e => e.reason)).toEqual(["cycle"]);
+  });
+
+  it("refuses the instance that would pass the composed-depth cap", () => {
+    const doc = page([instance("i1", "outer")]);
+    const definitions = defs({
+      outer: component([instance("d1", "inner")]),
+      inner: component([node("leaf")]),
+    });
+
+    const atCap = resolveComponentInstances(doc, definitions, {
+      maxComposedDepth: 2,
+    });
+    const belowCap = resolveComponentInstances(doc, definitions, {
+      maxComposedDepth: 1,
+    });
+
+    expect(atCap.unresolved).toEqual([]);
+    expect(flatten(atCap.document.nodes)).toHaveLength(1);
+    expect(belowCap.unresolved.map(e => e.reason)).toEqual(["composed-depth"]);
+  });
+
+  it("refuses a whole instance rather than inlining part of it", () => {
+    const doc = page([instance("i1", "big"), instance("i2", "small")]);
+    const definitions = defs({
+      big: component([node("b1"), node("b2"), node("b3")]),
+      small: component([node("s1")]),
+    });
+
+    const result = resolveComponentInstances(doc, definitions, {
+      limits: { ...DEFAULT_LIMITS, maxNodes: 2 },
+    });
+
+    expect(result.unresolved).toEqual([
+      { instanceId: "i1", componentId: "big", reason: "budget" },
+    ]);
+    expect(result.document.nodes[0]!.unresolvedComponent).toBe("budget");
+    expect(result.document.nodes[1]!.id).not.toBe("i2");
+  });
+
+  it.each(["kind", "nodes"])(
+    "classifies a definition whose %s computes itself, rather than throwing",
+    field => {
+      // The lookup is an object this module was handed, and the document it
+      // returns came from an import, a script or a database. A field that
+      // computes itself and throws took the caller's error out of a function
+      // that promises a classification and a closed list of reasons — and out
+      // of every planner built on it.
+      //
+      // `unreadable` is what this already calls a supplied document it cannot
+      // read; the reason existed and was simply unreachable.
+      const definition: Record<string, unknown> = {
+        formatVersion: DOCUMENT_FORMAT_VERSION,
+        kind: "component",
+        nodes: [node("d1")],
+      };
+      Object.defineProperty(definition, field, {
+        enumerable: true,
+        configurable: true,
+        get() {
+          throw new Error("boom");
+        },
+      });
+      const doc = page([instance("i1", "card")]);
+
+      let escaped: unknown;
+      let result: ReturnType<typeof resolveComponentInstances> | undefined;
+      try {
+        result = resolveComponentInstances(
+          doc,
+          defs({ card: definition as unknown as BlockDocument })
+        );
+      } catch (error) {
+        escaped = error;
+      }
+
+      expect(escaped).toBeUndefined();
+      expect(result?.unresolved).toEqual([
+        { instanceId: "i1", componentId: "card", reason: "unreadable" },
+      ]);
+    }
+  );
+
+  it("gives back the rename records of an abandoned expansion", () => {
+    // The claim and the record of what it came from are released together. An
+    // expansion that scopes a DOM id and then runs out of budget leaves the
+    // ORIGINAL instance standing, so a rename it had begun to make describes
+    // nothing in the returned document — and a consumer reversing the map to
+    // recover authored ids would rewrite a reference using a mapping for an id
+    // nothing renders.
+    const doc = page([instance("i1", "big")]);
+    const definitions = defs({
+      big: component([node("b1", { cssId: "anchor" }), node("b2"), node("b3")]),
+    });
+
+    const result = resolveComponentInstances(doc, definitions, {
+      limits: { ...DEFAULT_LIMITS, maxNodes: 2 },
+    });
+
+    // The control: it really did abandon the expansion, so the assertion below
+    // is about the record being released rather than never made.
+    expect(result.unresolved).toEqual([
+      { instanceId: "i1", componentId: "big", reason: "budget" },
+    ]);
+    expect([...result.renamedDomIds.values()]).not.toContain("anchor");
+    expect(result.renamedDomIds.size).toBe(0);
+  });
+
+  it("keeps a refused instance's own slot content untouched", () => {
+    const doc = page([
+      instance("i1", "gone", {}, { slots: { body: [node("mine")] } }),
+    ]);
+
+    const result = resolveComponentInstances(doc, defs({}));
+
+    expect(result.document.nodes[0]!.slots!.body!.map(e => e.id)).toEqual([
+      "mine",
+    ]);
+  });
+});
+
+describe("resolveComponentInstances nesting", () => {
+  it("inlines a component the definition itself references", () => {
+    const doc = page([instance("i1", "outer")]);
+    const definitions = defs({
+      outer: component([box("o1", [instance("o2", "inner")])]),
+      inner: component([node("leaf")]),
+    });
+
+    const result = resolveComponentInstances(doc, definitions);
+
+    const flat = flatten(result.document.nodes);
+    expect(flat).toHaveLength(2);
+    expect(result.referenced).toEqual(["outer", "inner"]);
+    // The HOST's instance at both depths, not the inner one, which is not a
+    // node of the resolved document at all.
+    expect(flat.map(e => e.instanceOf)).toEqual(["i1", "i1"]);
+  });
+
+  it("resolves an instance inside supplied slot content in the host's scope", () => {
+    const doc = page([
+      instance(
+        "i1",
+        "shell",
+        {},
+        { slots: { body: [instance("i2", "leafy")] } }
+      ),
+    ]);
+    const definitions = defs({
+      shell: component([box("s1", [])], {
+        slots: { body: { label: "Body", nodeId: "s1", slot: "children" } },
+      }),
+      leafy: component([node("l1")]),
+    });
+
+    // One composed level is all the host content is allowed, and the nested
+    // instance sits in the PAGE rather than inside `shell`, so it resolves.
+    const result = resolveComponentInstances(doc, definitions, {
+      maxComposedDepth: 1,
+    });
+
+    expect(result.unresolved).toEqual([]);
+    expect(flatten(result.document.nodes)).toHaveLength(2);
+  });
+});
+
+describe("resolveComponentInstances limits and speculative work", () => {
+  const nestedDefs = defs({
+    outer: component(
+      [instance("o1", "inner", {}, { slots: { body: [node("shared")] } })],
+      { slots: { outerBody: { label: "Body", nodeId: "o1", slot: "body" } } }
+    ),
+    inner: component([box("l1", [])], {
+      slots: { body: { label: "Body", nodeId: "l1", slot: "children" } },
+    }),
+  });
+
+  it("re-identifies the slot children of an instance the definition holds", () => {
+    const doc = page([instance("i1", "outer"), instance("i2", "outer")]);
+
+    const result = resolveComponentInstances(doc, nestedDefs);
+    const ids = idsOf(result.document);
+
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(idsOf(result.document)).not.toContain("shared");
+  });
+
+  it("marks a nested instance's default children with the outer instance", () => {
+    const doc = page([instance("i1", "outer")]);
+
+    const result = resolveComponentInstances(doc, nestedDefs);
+
+    expect(byInstanceOf(result.document, "i1")).toHaveLength(2);
+  });
+
+  it("routes page content through a slot exposed on a nested instance", () => {
+    const doc = page([
+      instance("i1", "outer", {}, { slots: { outerBody: [node("fromPage")] } }),
+    ]);
+
+    const result = resolveComponentInstances(doc, nestedDefs);
+
+    const children = result.document.nodes[0]!.slots!.children!;
+    expect(children.map(e => e.id)).toEqual(["fromPage"]);
+  });
+
+  it("composes nothing when the host survey stopped at the node budget", () => {
+    const doc = page([instance("i1", "hero"), node("a"), node("b")]);
+    const definitions = defs({ hero: component([node("d1")]) });
+
+    const result = resolveComponentInstances(doc, definitions, {
+      limits: { ...DEFAULT_LIMITS, maxNodes: 2 },
+    });
+
+    expect(result.document).toBe(doc);
+  });
+
+  it("discards the diagnostics of an instance it then refuses", () => {
+    const doc = page([instance("i1", "outer")]);
+    const definitions = defs({
+      outer: component([instance("o1", "gone"), node("d2"), node("d3")]),
+    });
+
+    const result = resolveComponentInstances(doc, definitions, {
+      limits: { ...DEFAULT_LIMITS, maxNodes: 2 },
+    });
+
+    expect(result.unresolved).toEqual([
+      { instanceId: "i1", componentId: "outer", reason: "budget" },
+    ]);
+  });
+
+  it("gives back the budget an instance's slot content spent before it failed", () => {
+    const definitions = defs({
+      // `big` must EXPOSE the slot, or its content is never resolved at all
+      // and there is no spend to give back.
+      big: component([box("b1", []), node("b2"), node("b3")], {
+        slots: { any: { label: "Any", nodeId: "b1", slot: "children" } },
+      }),
+      small: component([node("s1"), node("s2"), node("s3"), node("s4")]),
+    });
+    const doc = page([
+      instance("i1", "big", {}, { slots: { any: [instance("i2", "small")] } }),
+      instance("i3", "small"),
+    ]);
+
+    // Sized so the sibling fits ONLY if the slot content's spend comes back:
+    // the host holds three nodes, so composition starts with three left, `i1`
+    // spends four of them on slot content that is then thrown away with it,
+    // and `i3` needs four.
+    const result = resolveComponentInstances(doc, definitions, {
+      limits: { ...DEFAULT_LIMITS, maxNodes: 6 },
+    });
+
+    expect(result.unresolved.map(e => e.instanceId)).toEqual(["i1"]);
+    expect(byInstanceOf(result.document, "i3")).toHaveLength(4);
+  });
+
+  it("keeps an inlined id stable when an unrelated node joins its definition", () => {
+    const inner = component([node("n")]);
+    const nested = () => instance("a", "inner");
+    const doc = page([instance("i1", "outer")]);
+
+    // The composed id must be a function of the instances above a node and of
+    // the definition node itself. Deriving it from the HOST instance instead
+    // makes `n` collide with the outer definition's own `n`, and the collision
+    // suffix then lands on whichever was minted second — so adding one node to
+    // the outer component silently rewrites ids inside a component it merely
+    // contains, detaching every rule and overlay keyed to them.
+    const without = resolveComponentInstances(
+      doc,
+      defs({ outer: component([nested(), instance("b", "inner")]), inner })
+    );
+    const with_ = resolveComponentInstances(
+      doc,
+      defs({
+        outer: component([node("n"), nested(), instance("b", "inner")]),
+        inner,
+      })
+    );
+
+    expect(idsOf(without.document)[0]).toBe(idsOf(with_.document)[1]);
+  });
+
+  it("refuses an instance whose definition is deeper than the limits allow", () => {
+    const doc = page([instance("i1", "deep")]);
+    const definitions = defs({
+      deep: component([box("d1", [box("d2", [node("d3")])])]),
+    });
+
+    const result = resolveComponentInstances(doc, definitions, {
+      limits: { ...DEFAULT_LIMITS, maxDepth: 2 },
+    });
+
+    expect(result.unresolved.map(e => e.reason)).toEqual(["node-depth"]);
+    expect(result.document.nodes[0]!.unresolvedComponent).toBe("node-depth");
+  });
+
+  it("counts every entry of a definition against the node budget", () => {
+    const doc = page([instance("i1", "junk")]);
+    const definitions = defs({
+      junk: component([
+        null,
+        null,
+        null,
+        node("d1"),
+      ] as unknown as ResolvedBlockNode[]),
+    });
+
+    const result = resolveComponentInstances(doc, definitions, {
+      limits: { ...DEFAULT_LIMITS, maxNodes: 2 },
+    });
+
+    expect(result.unresolved.map(e => e.reason)).toEqual(["budget"]);
+  });
+});
+
+describe("resolveComponentInstances what an instance carries", () => {
+  it("leaves a condition-gated instance standing rather than expanding it", () => {
+    const gate = { conditions: [[{ field: "tier", op: "eq", value: "vip" }]] };
+    const doc = page([
+      { ...instance("i1", "hero"), visibility: gate },
+      node("plain"),
+    ]);
+    const definitions = defs({ hero: component([node("d1"), node("d2")]) });
+
+    const result = resolveComponentInstances(doc, definitions);
+
+    // The gate has to survive INTO the tree the later pass prunes. Expanding
+    // and dropping it serves restricted content to everyone.
+    expect(result.document.nodes.map(e => e.id)).toEqual(["i1", "plain"]);
+    expect(result.document.nodes[0]!.visibility).toEqual(gate);
+    expect(result.unresolved).toEqual([]);
+    expect(result.referenced).toEqual([]);
+  });
+
+  it("leaves an instance standing under a gated ANCESTOR too", () => {
+    // Gating is inherited: `pruneHiddenNodes` drops a gated node with its whole
+    // subtree, so an instance under one reaches no reader either way. Reading
+    // its definition here reports a component nobody receives — a publish check
+    // rejects on it and a cache tag tracks it — and reports it differently from
+    // the identical instance gated directly.
+    const gate = { conditions: [[{ field: "tier", op: "eq", value: "vip" }]] };
+    const doc = page([box("wrap", [instance("i1", "hero")], gate)]);
+    const definitions = defs({ hero: component([node("d1"), node("d2")]) });
+
+    const result = resolveComponentInstances(doc, definitions);
+
+    expect(result.unresolved).toEqual([]);
+    expect(result.referenced).toEqual([]);
+    expect(result.document).toBe(doc);
+  });
+
+  it("leaves an instance standing under a gated ancestor INSIDE a definition", () => {
+    // Gating is inherited the same way wherever the container sits. A
+    // definition's own gated box is dropped with its subtree by the same pass,
+    // so an instance inside it reaches no reader — and the host walk's rule
+    // means nothing if the definition walk descends anyway.
+    const gate = { conditions: [[{ field: "tier", op: "eq", value: "vip" }]] };
+    const doc = page([instance("i1", "outer")]);
+    const definitions = defs({
+      outer: component([box("d1", [instance("d2", "gone")], gate)]),
+    });
+
+    const result = resolveComponentInstances(doc, definitions);
+
+    expect(result.unresolved).toEqual([]);
+    expect(result.referenced).toEqual(["outer"]);
+  });
+
+  it("does not resolve slot content aimed at a gated target", () => {
+    // The instance's own content, handed to a region the definition gates. The
+    // node it was placed in is dropped with its subtree, so the content reaches
+    // no reader — and resolving it first records the components inside it as
+    // read and as unresolvable, which is the same publish rejection and the
+    // same cache tag, arrived at from the page's side instead of the
+    // definition's.
+    const gate = { conditions: [[{ field: "tier", op: "eq", value: "vip" }]] };
+    const definition = component([box("d1", [node("fallback")], gate)], {
+      slots: { body: { label: "Body", nodeId: "d1", slot: "children" } },
+    });
+    const doc = page([
+      instance("i1", "hero", {}, { slots: { body: [instance("s1", "gone")] } }),
+    ]);
+
+    const result = resolveComponentInstances(doc, defs({ hero: definition }));
+
+    expect(result.unresolved).toEqual([]);
+    expect(result.referenced).toEqual(["hero"]);
+  });
+
+  it("still resolves slot content aimed at a target that survives", () => {
+    // The control. Without it the rule above passes on an implementation that
+    // drops instance slot content altogether, which is the whole feature.
+    const definition = component([box("d1", [node("fallback")])], {
+      slots: { body: { label: "Body", nodeId: "d1", slot: "children" } },
+    });
+    const doc = page([
+      instance(
+        "i1",
+        "hero",
+        {},
+        { slots: { body: [instance("s1", "inner")] } }
+      ),
+    ]);
+
+    const result = resolveComponentInstances(
+      doc,
+      defs({ hero: definition, inner: component([node("d9")]) })
+    );
+
+    expect(result.unresolved).toEqual([]);
+    expect(result.referenced).toEqual(["hero", "inner"]);
+    // Composed, and recorded as belonging to the page's own instance node —
+    // the content is the PAGE's, so `instanceOf` names `s1` rather than the
+    // component that received it.
+    expect(
+      result.document.nodes[0]!.slots!.children!.map(e => e.instanceOf)
+    ).toEqual(["s1"]);
+  });
+
+  it("fits a composition whose slot content releases the room it needs", () => {
+    // Two nodes stored — the instance and the content it supplies — and two
+    // nodes composed. The supplied instance resolves to an empty component, so
+    // replacing it FREES the slot it occupied, and the definition's own two
+    // nodes fit exactly. Whether that room arrives before or after the
+    // definition's siblings are cloned is an ordering detail of this module,
+    // and a page must not be refused over it.
+    const outer = component([node("sib"), box("d1", [])], {
+      slots: { body: { label: "Body", nodeId: "d1", slot: "children" } },
+    });
+    const doc = page([
+      instance(
+        "i1",
+        "outer",
+        {},
+        { slots: { body: [instance("s1", "inner")] } }
+      ),
+    ]);
+
+    const result = resolveComponentInstances(
+      doc,
+      defs({ outer, inner: component([]) }),
+      { limits: { ...DEFAULT_LIMITS, maxNodes: 2 } }
+    );
+
+    expect(result.unresolved).toEqual([]);
+    expect(flatten(result.document.nodes)).toHaveLength(2);
+    // An empty component contributes nothing either way, so the node count
+    // alone cannot tell composition from DISCARDING the supplied content —
+    // which is the plausible wrong implementation, and the one that costs a
+    // page its content. Only a record of having read `inner` separates them.
+    expect(result.referenced).toEqual(["outer", "inner"]);
+  });
+
+  it("composes the page's slot content ONCE, however deep it is placed", () => {
+    // The page supplies content to a slot that `outer` forwards into a nested
+    // component. Composing where it is placed means it passes through two
+    // expansions, and the second must leave it alone: content already composed
+    // still holds any instance that could not be resolved, so composing it
+    // again refuses that instance a second time and reports it twice.
+    const inner = component([box("d2", [node("fb")])], {
+      slots: { region: { label: "Region", nodeId: "d2", slot: "children" } },
+    });
+    const outer = component([instance("n1", "inner")], {
+      slots: { body: { label: "Body", nodeId: "n1", slot: "region" } },
+    });
+    const doc = page([
+      instance(
+        "i1",
+        "outer",
+        {},
+        { slots: { body: [instance("s1", "gone")] } }
+      ),
+    ]);
+
+    const result = resolveComponentInstances(doc, defs({ outer, inner }));
+
+    expect(result.unresolved).toEqual([
+      { instanceId: "s1", componentId: "gone", reason: "missing" },
+    ]);
+  });
+
+  it("stops the slot prepass at the cap the clone will refuse at", () => {
+    // A definition wider than the page's whole node allowance, with the slot
+    // target last. The depth bound says nothing about BREADTH, so without a
+    // work bound the prepass walks every sibling — hundreds of thousands of
+    // them in a definition nothing validated — to prepare content the clone
+    // refuses a moment later for `budget`.
+    const definition = component(
+      [node("a"), node("b"), node("c"), node("d"), box("target", [])],
+      { slots: { tail: { label: "Tail", nodeId: "target", slot: "children" } } }
+    );
+    const doc = page([
+      instance("i1", "hero", {}, { slots: { tail: [instance("s1", "deep")] } }),
+    ]);
+
+    const result = resolveComponentInstances(
+      doc,
+      defs({ hero: definition, deep: component([]) }),
+      { limits: { ...DEFAULT_LIMITS, maxNodes: 4 } }
+    );
+
+    // The instance is refused either way — the definition cannot fit. What is
+    // asserted is that `deep` was never READ to find that out.
+    expect(result.unresolved.map(e => e.reason)).toEqual(["budget"]);
+    expect(result.referenced).toEqual(["hero"]);
+  });
+
+  it("keeps condition-gated nodes charged against the prepass cap", () => {
+    // A gate and an override both stop a node being served, and the clone
+    // treats them differently: it emits NOTHING for an override that hides,
+    // and gives the charge back — but it emits the node itself, still gated,
+    // for a condition, and keeps the charge. A prepass that refunds both reads
+    // an arbitrarily wide definition for free.
+    const gate = { conditions: [[{ field: "tier", op: "eq", value: "vip" }]] };
+    const definition = component(
+      [
+        node("g1", { visibility: gate }),
+        node("g2", { visibility: gate }),
+        node("g3", { visibility: gate }),
+        node("g4", { visibility: gate }),
+        node("sib"),
+        box("target", []),
+      ],
+      { slots: { tail: { label: "Tail", nodeId: "target", slot: "children" } } }
+    );
+    const doc = page([
+      instance("i1", "hero", {}, { slots: { tail: [instance("s1", "deep")] } }),
+    ]);
+
+    const result = resolveComponentInstances(
+      doc,
+      defs({ hero: definition, deep: component([]) }),
+      { limits: { ...DEFAULT_LIMITS, maxNodes: 2 } }
+    );
+
+    expect(result.unresolved.map(e => e.reason)).toEqual(["budget"]);
+    expect(result.referenced).toEqual(["hero"]);
+  });
+
+  it("crosses nodes an override removed to reach a later slot target", () => {
+    // The clone gives back the charge for a node that emits nothing, so four
+    // overridden-away roots cost the composed document nothing and the result
+    // fits. A prepass counter that charges them anyway stops before the slot
+    // target, the content is composed at placement instead, and the ordering
+    // this pass exists to fix comes back — as a refusal.
+    const definition = component(
+      [
+        node("h1"),
+        node("h2"),
+        node("h3"),
+        node("h4"),
+        node("sib"),
+        box("target", []),
+      ],
+      {
+        exposed: ["h1", "h2", "h3", "h4"].map((nodeId, index) => ({
+          id: `x${String(index + 1)}`,
+          label: `Show ${nodeId}`,
+          nodeId,
+          // Carried because the published type requires it of every exposure;
+          // a `visibility` one decides whether the node is served at all, so
+          // `applyExposure` answers before it reads a path.
+          propPath: "hidden",
+          type: "visibility" as const,
+        })),
+        slots: { tail: { label: "Tail", nodeId: "target", slot: "children" } },
+      }
+    );
+    const doc = page([
+      instance(
+        "i1",
+        "hero",
+        { overrides: { x1: false, x2: false, x3: false, x4: false } },
+        { slots: { tail: [instance("s1", "empty")] } }
+      ),
+    ]);
+
+    const result = resolveComponentInstances(
+      doc,
+      defs({ hero: definition, empty: component([]) }),
+      { limits: { ...DEFAULT_LIMITS, maxNodes: 2 } }
+    );
+
+    expect(result.unresolved).toEqual([]);
+    expect(result.referenced).toEqual(["hero", "empty"]);
+  });
+
+  const twoSlotDefinition = () =>
+    component([box("t", [])], {
+      slots: {
+        grow: { label: "Grow", nodeId: "t", slot: "a" },
+        shrink: { label: "Shrink", nodeId: "t", slot: "b" },
+      },
+    });
+
+  const twoSlotPage = () =>
+    page([
+      instance(
+        "i1",
+        "hero",
+        {},
+        {
+          slots: {
+            grow: [instance("g", "big")],
+            shrink: [
+              instance("e1", "empty"),
+              instance("e2", "empty"),
+              instance("e3", "empty"),
+            ],
+          },
+        }
+      ),
+    ]);
+
+  it("retries a slot a sibling has since made room for", () => {
+    // The growing slot is declared first, so it is composed while the three
+    // empty components that will free its room have not been reached yet. It
+    // is refused, they compose, and the retry finds it fits after all — so the
+    // order two independent slots were declared in stops deciding whether the
+    // page renders.
+    const result = resolveComponentInstances(
+      twoSlotPage(),
+      defs({
+        hero: twoSlotDefinition(),
+        big: component([node("b1"), node("b2"), node("b3"), node("b4")]),
+        empty: component([]),
+      }),
+      { limits: { ...DEFAULT_LIMITS, maxNodes: 6 } }
+    );
+
+    expect(result.unresolved).toEqual([]);
+  });
+
+  it("CONTROL: still refuses a page whose composed tree cannot fit", () => {
+    // Twice the definition, so no amount of retrying pays for it. Without this
+    // the rule above passes on an implementation that simply stops refusing.
+    const result = resolveComponentInstances(
+      twoSlotPage(),
+      defs({
+        hero: twoSlotDefinition(),
+        big: component([
+          node("b1"),
+          node("b2"),
+          node("b3"),
+          node("b4"),
+          node("b5"),
+          node("b6"),
+          node("b7"),
+          node("b8"),
+        ]),
+        empty: component([]),
+      }),
+      { limits: { ...DEFAULT_LIMITS, maxNodes: 6 } }
+    );
+
+    expect(result.unresolved.map(e => e.reason)).toEqual(["budget"]);
+  });
+
+  it("reports a starved instance ONCE when the retry fails too", () => {
+    // The retry re-walks the same content, so a second refusal records a
+    // second entry saying what the first already said. A publish check reading
+    // the list would count one problem twice.
+    const result = resolveComponentInstances(
+      twoSlotPage(),
+      defs({
+        hero: twoSlotDefinition(),
+        big: component([
+          node("b1"),
+          node("b2"),
+          node("b3"),
+          node("b4"),
+          node("b5"),
+          node("b6"),
+          node("b7"),
+          node("b8"),
+        ]),
+        empty: component([]),
+      }),
+      { limits: { ...DEFAULT_LIMITS, maxNodes: 6 } }
+    );
+
+    expect(result.unresolved).toHaveLength(1);
+  });
+
+  it("does not let one starved child take its owner down with it", () => {
+    // Slot content holding a growing instance and then a MISSING one. Each
+    // child fails for its own reason and neither reason is the owner's: a
+    // component that cannot fit and a component nobody published are both
+    // facts about the children, and promoting either into a refusal of the
+    // node that holds them costs a reader the whole component instead of the
+    // two blocks that could not be drawn.
+    const definition = component([box("t", [])], {
+      slots: { hole: { label: "Hole", nodeId: "t", slot: "a" } },
+    });
+    const doc = page([
+      instance(
+        "i1",
+        "hero",
+        {},
+        { slots: { hole: [instance("g", "big"), instance("m", "gone")] } }
+      ),
+    ]);
+
+    const result = resolveComponentInstances(
+      doc,
+      defs({
+        hero: definition,
+        big: component([node("b1"), node("b2"), node("b3")]),
+      }),
+      { limits: { ...DEFAULT_LIMITS, maxNodes: 3 } }
+    );
+
+    // The owner renders. Each child reports its own cause, and neither is
+    // promoted into a refusal of the component that holds them.
+    expect(result.unresolved).toEqual([
+      { instanceId: "g", componentId: "big", reason: "budget" },
+      { instanceId: "m", componentId: "gone", reason: "missing" },
+    ]);
+  });
+
+  it("retries across slots exposed on DIFFERENT definition nodes", () => {
+    // The two regions sit on two different nodes, so the walk reaches them one
+    // after the other. Retrying the first the moment it is composed asks again
+    // before the second has released anything, and the declaration order still
+    // decides — the retry has to wait for the whole prepass.
+    const definition = component([box("t1", []), box("t2", [])], {
+      slots: {
+        grow: { label: "Grow", nodeId: "t1", slot: "a" },
+        shrink: { label: "Shrink", nodeId: "t2", slot: "b" },
+      },
+    });
+    const doc = page([
+      instance(
+        "i1",
+        "hero",
+        {},
+        {
+          slots: {
+            grow: [instance("g", "big")],
+            shrink: [
+              instance("e1", "empty"),
+              instance("e2", "empty"),
+              instance("e3", "empty"),
+            ],
+          },
+        }
+      ),
+    ]);
+
+    const result = resolveComponentInstances(
+      doc,
+      defs({
+        hero: definition,
+        big: component([node("b1"), node("b2"), node("b3"), node("b4")]),
+        empty: component([]),
+      }),
+      { limits: { ...DEFAULT_LIMITS, maxNodes: 7 } }
+    );
+
+    expect(result.unresolved).toEqual([]);
+  });
+
+  it("does not compose content bound for a default subtree the page replaced", () => {
+    // Two exposed slots: one on a container, one on a node sitting inside that
+    // container's DEFAULT children. Filling the outer slot replaces those
+    // children wholesale, so the inner target is never placed — and the clone
+    // knows that, because it stops copying a stored slot the plan replaces.
+    const definition = component(
+      [box("outer-box", [box("inner-box", [node("fb")])])],
+      {
+        slots: {
+          shell: { label: "Shell", nodeId: "outer-box", slot: "children" },
+          buried: { label: "Buried", nodeId: "inner-box", slot: "children" },
+        },
+      }
+    );
+    const doc = page([
+      instance(
+        "i1",
+        "hero",
+        {},
+        {
+          slots: {
+            shell: [node("mine")],
+            buried: [instance("s1", "gone")],
+          },
+        }
+      ),
+    ]);
+
+    const result = resolveComponentInstances(doc, defs({ hero: definition }));
+
+    expect(result.unresolved).toEqual([]);
+    expect(result.referenced).toEqual(["hero"]);
+  });
+
+  it("still composes an instance under an UNGATED container inside a definition", () => {
+    // The control for the rule above, on the definition side.
+    const doc = page([instance("i1", "outer")]);
+    const definitions = defs({
+      outer: component([box("d1", [instance("d2", "inner")])]),
+      inner: component([node("d3")]),
+    });
+
+    const result = resolveComponentInstances(doc, definitions);
+
+    expect(result.unresolved).toEqual([]);
+    expect(result.referenced).toEqual(["outer", "inner"]);
+  });
+
+  it("still composes an instance under an ancestor that is NOT gated", () => {
+    // The control. Without it the rule above passes on an implementation that
+    // refuses to descend into any container at all, which costs every page
+    // every component it holds below the top level.
+    const doc = page([box("wrap", [instance("i1", "hero")])]);
+    const definitions = defs({ hero: component([node("d1"), node("d2")]) });
+
+    const result = resolveComponentInstances(doc, definitions);
+
+    expect(result.referenced).toEqual(["hero"]);
+    expect(flatten(result.document.nodes)).toHaveLength(3);
+  });
+
+  it("carries an instance's per-breakpoint hiding onto every root", () => {
+    const doc = page([
+      {
+        ...instance("i1", "hero"),
+        visibility: { devices: { mobile: false, desktop: true } },
+      },
+    ]);
+    const definitions = defs({ hero: component([node("d1"), node("d2")]) });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    expect(nodes).toHaveLength(2);
+    // The whole setting travels, both values. Hiding inherits to narrower
+    // breakpoints until a `true` ends the band, so copying only the `false`
+    // would hide the component further than the author asked. What an instance
+    // may NOT do is re-show a breakpoint the definition explicitly hid, which
+    // the case below pins.
+    expect(nodes.map(e => e.visibility?.devices)).toEqual([
+      { mobile: false, desktop: true },
+      { mobile: false, desktop: true },
+    ]);
+  });
+
+  it("does not let an instance re-show a root its definition hid", () => {
+    const doc = page([
+      {
+        ...instance("i1", "hero"),
+        visibility: { devices: { mobile: true } },
+      },
+    ]);
+    const definitions = defs({
+      hero: component([
+        node("d1", { visibility: { devices: { mobile: false } } }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    expect(nodes[0]!.visibility?.devices?.mobile).toBe(false);
+  });
+
+  it("gives each instance its own DOM ids for one definition", () => {
+    const doc = page([instance("i1", "hero"), instance("i2", "hero")]);
+    const definitions = defs({
+      hero: component([
+        node("d1", { cssId: "signup", attributes: { ID: "signup" } }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    expect(nodes[0]!.cssId).not.toBe(nodes[1]!.cssId);
+    expect(nodes[0]!.attributes!.ID).not.toBe(nodes[1]!.attributes!.ID);
+    // Derived from the original, so it stays recognisable in a URL fragment.
+    expect(nodes[0]!.cssId).toContain("signup");
+  });
+
+  it("maps one definition's repeated DOM id to a single replacement", () => {
+    const doc = page([instance("i1", "hero")]);
+    const definitions = defs({
+      hero: component([
+        node("d1", { cssId: "dup" }),
+        node("d2", { cssId: "dup" }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    // The pair addressed one target before composition and must after.
+    expect(nodes[0]!.cssId).toBe(nodes[1]!.cssId);
+  });
+});
+
+describe("resolveComponentInstances bounds", () => {
+  it("counts the host's surviving nodes against the composition budget", () => {
+    const doc = page([node("keep"), instance("i1", "hero")]);
+    const definitions = defs({
+      hero: component([node("d1"), node("d2"), node("d3")]),
+    });
+
+    const result = resolveComponentInstances(doc, definitions, {
+      limits: { ...DEFAULT_LIMITS, maxNodes: 3 },
+    });
+
+    expect(flatten(result.document.nodes)).toHaveLength(2);
+    expect(result.unresolved.map(e => e.reason)).toEqual(["budget"]);
+  });
+
+  it("spends the slot the replaced instance itself gives up", () => {
+    const doc = page([node("keep"), instance("i1", "hero")]);
+    const definitions = defs({ hero: component([node("d1"), node("d2")]) });
+
+    // Two host nodes and a two-node definition under a cap of three: it fits
+    // only because the instance node is replaced rather than added to.
+    const result = resolveComponentInstances(doc, definitions, {
+      limits: { ...DEFAULT_LIMITS, maxNodes: 3 },
+    });
+
+    expect(flatten(result.document.nodes)).toHaveLength(3);
+    expect(result.unresolved).toEqual([]);
+  });
+
+  it("never resolves slot content the definition no longer exposes", () => {
+    const doc = page([
+      instance(
+        "i1",
+        "hero",
+        {},
+        { slots: { gone: [instance("i2", "absent")] } }
+      ),
+    ]);
+    const definitions = defs({ hero: component([node("d1")]) });
+
+    const result = resolveComponentInstances(doc, definitions);
+
+    expect(result.unresolved).toEqual([]);
+    expect(result.referenced).toEqual(["hero"]);
+  });
+
+  it("refuses an oversized overrides record rather than applying part of it", () => {
+    const overrides: Record<string, unknown> = { headline: "APPLIED" };
+    for (let i = 0; i < MAX_ENVELOPE_ENTRIES + 1; i += 1) {
+      overrides[`k${i}`] = i;
+    }
+    const definition = component([node("d1", { props: { text: "base" } })], {
+      exposed: [
+        {
+          id: "headline",
+          label: "H",
+          nodeId: "d1",
+          propPath: "text",
+          type: "text",
+        },
+      ],
+    });
+    const doc = page([instance("i1", "hero", { overrides })]);
+
+    const result = resolveComponentInstances(doc, defs({ hero: definition }));
+
+    // Applying a prefix would make which overrides an author gets depend on
+    // key enumeration order.
+    expect(result.document.nodes[0]!.props.text).toBe("base");
+  });
+
+  it("calls a definition that is not a component document unreadable", () => {
+    const doc = page([instance("i1", "hero")]);
+    const definitions = defs({ hero: page([node("d1")]) });
+
+    const result = resolveComponentInstances(doc, definitions);
+
+    // A page filed under a component's id is a fault in THAT document, not in
+    // the instance naming it — the discrimination `malformed` cannot make.
+    expect(result.unresolved.map(e => e.reason)).toEqual(["unreadable"]);
+    expect(idsOf(result.document)).toEqual(["i1"]);
+  });
+
+  describe("what a supplied definition has to be, published for the surfaces that read one", () => {
+    // ONE rule, read by the resolver and by whoever draws an inspector from
+    // the same lookup: a surface accepting what the resolver refuses would
+    // offer editable rows for a component the page shows as a placeholder.
+    // Each refusal below is also what the resolver reports as `unreadable`,
+    // asserted beside it so the two cannot drift.
+    const unreadable = (supplied: unknown) => {
+      const doc = page([instance("i1", "hero")]);
+      const result = resolveComponentInstances(
+        doc,
+        defs({ hero: supplied as BlockDocument })
+      );
+      return result.unresolved.map(e => e.reason);
+    };
+
+    it("reads a component document in this build's format", () => {
+      const definition = component([node("d1")]);
+
+      expect(readableDefinition(definition)).toBe(definition);
+      expect(unreadable(definition)).toEqual([]);
+    });
+
+    it("refuses a document of another kind", () => {
+      const supplied = page([node("d1")]);
+
+      expect(readableDefinition(supplied)).toBeUndefined();
+      expect(unreadable(supplied)).toEqual(["unreadable"]);
+    });
+
+    it("refuses a component in a format this build does not read", () => {
+      // Spelled as what arrives from storage: a record, not this build's type.
+      const supplied = {
+        ...component([node("d1")]),
+        formatVersion: DOCUMENT_FORMAT_VERSION + 1,
+      } as unknown as BlockDocument;
+
+      expect(readableDefinition(supplied)).toBeUndefined();
+      expect(unreadable(supplied)).toEqual(["unreadable"]);
+    });
+
+    it("refuses a value whose nodes are not a list, and nothing at all", () => {
+      const supplied = {
+        ...component([]),
+        nodes: "oops",
+      } as unknown as BlockDocument;
+
+      expect(readableDefinition(supplied)).toBeUndefined();
+      expect(unreadable(supplied)).toEqual(["unreadable"]);
+      expect(readableDefinition(undefined)).toBeUndefined();
+    });
+  });
+});
+
+describe("a node that spells a DOM id twice and renders one", () => {
+  it("leaves a SHADOWED attribute id alone, and every reference to it", () => {
+    // The measured reproduction. `cssId` shadows the bag, so this node renders
+    // `actual` and never `hero` — and `hero` was therefore a reference to an
+    // element in the HOST, which resolved before composition. Scoping it points
+    // it at an id nothing renders, which is strictly worse than leaving it.
+    const doc = page([instance("i1", "hero")]);
+    const definitions = defs({
+      hero: component([
+        node("d1", {
+          cssId: "actual",
+          attributes: { id: "hero", "aria-describedby": "hero" },
+        }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    expect(nodes[0]!.cssId).toContain("actual");
+    expect(nodes[0]!.cssId).not.toBe("actual");
+    expect(nodes[0]!.attributes!.id).toBe("hero");
+    expect(nodes[0]!.attributes!["aria-describedby"]).toBe("hero");
+  });
+
+  it("moves both spellings together when they carry one value", () => {
+    // Nothing is shadowed here: the two spell the SAME id, so the node renders
+    // it and both have to arrive at one replacement, or the copy answers to two
+    // addresses where the original answered to one.
+    const doc = page([instance("i1", "hero")]);
+    const definitions = defs({
+      hero: component([
+        node("d1", { cssId: "signup", attributes: { id: "signup" } }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    expect(nodes[0]!.attributes!.id).toBe(nodes[0]!.cssId);
+    expect(nodes[0]!.cssId).not.toBe("signup");
+  });
+
+  it("scopes an id the node carries ONLY in its attribute bag", () => {
+    // Nothing shadows it, so this bag id is what the node renders — and two
+    // instances of one definition would otherwise both put it on the page.
+    const doc = page([instance("i1", "hero"), instance("i2", "hero")]);
+    const definitions = defs({
+      hero: component([
+        node("d1", { attributes: { id: "hero", "aria-describedby": "hero" } }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    expect(nodes[0]!.attributes!.id).not.toBe("hero");
+    expect(nodes[0]!.attributes!.id).toContain("hero");
+    expect(nodes[0]!.attributes!.id).not.toBe(nodes[1]!.attributes!.id);
+    // And the reference inside the definition follows it, since the id it named
+    // IS the one this node renders.
+    expect(nodes[0]!.attributes!["aria-describedby"]).toBe(
+      nodes[0]!.attributes!.id
+    );
+  });
+
+  it("publishes no mapping for a bag it cannot rewrite", () => {
+    // `renderedDomId` mirrors the RENDERER, which emits an own `id` off any
+    // non-array object — including one with a custom prototype. The rewrite
+    // below is narrower. Asking the wide rule first published `hero -> minted`
+    // while the element kept `hero`, so a sibling reference was retargeted at
+    // an id nothing renders: strictly worse than leaving it.
+    const bag = Object.create({ inherited: true }) as Record<string, unknown>;
+    bag.id = "hero";
+    const doc = page([instance("i1", "hero")]);
+    const definitions = defs({
+      hero: component([
+        stored(node("d1") as ResolvedBlockNode, { attributes: bag }),
+        node("d2", { attributes: { "aria-describedby": "hero" } }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    expect(nodes[1]!.attributes!["aria-describedby"]).toBe("hero");
+  });
+
+  it("publishes no mapping for a bag past the envelope cap", () => {
+    // Same failure by the other route, and it is also where the unbounded read
+    // was: deriving the rendered id walked every key of a bag the resolver had
+    // not measured, once per instance.
+    const wide: Record<string, unknown> = { id: "hero" };
+    for (let i = 0; i <= MAX_ENVELOPE_ENTRIES; i++)
+      wide[`data-${String(i)}`] = "x";
+    const doc = page([instance("i1", "hero")]);
+    const definitions = defs({
+      hero: component([
+        stored(node("d1") as ResolvedBlockNode, { attributes: wide }),
+        node("d2", { attributes: { "aria-describedby": "hero" } }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    expect(nodes[1]!.attributes!["aria-describedby"]).toBe("hero");
+  });
+
+  it("reads the bag once, so a value that changes cannot split the two", () => {
+    // A bag entry can be a getter or a Proxy trap that answers differently each
+    // time. Deriving the rendered id from one reading and rewriting from a
+    // second let them disagree: `hero` reached the reference table while
+    // `other` stayed on the element. Survives a prototype of exactly
+    // `Object.prototype`, so neither earlier guard catches it.
+    let reads = 0;
+    const shifting: Record<string, unknown> = {};
+    Object.defineProperty(shifting, "id", {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return reads === 1 ? "hero" : "other";
+      },
+    });
+    const doc = page([instance("i1", "hero")]);
+    const definitions = defs({
+      hero: component([
+        stored(node("d1") as ResolvedBlockNode, { attributes: shifting }),
+        node("d2", { attributes: { "aria-describedby": "hero" } }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    // The invariant, whichever value won: no reference names an id that is not
+    // on the element it points at.
+    expect(nodes[1]!.attributes!["aria-describedby"]).toBe(
+      nodes[0]!.attributes!.id
+    );
+  });
+
+  it("still scopes a cssId when the bag beside it is unreadable", () => {
+    // The boundary: a string `cssId` shadows the bag, so the rendered id does
+    // not depend on reading it. Refusing to scope here would leave two
+    // instances answering to one address.
+    const bag = Object.create({ inherited: true }) as Record<string, unknown>;
+    bag.id = "hero";
+    const doc = page([instance("i1", "hero"), instance("i2", "hero")]);
+    const definitions = defs({
+      hero: component([
+        stored(node("d1") as ResolvedBlockNode, {
+          cssId: "actual",
+          attributes: bag,
+        }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    expect(nodes[0]!.cssId).toContain("actual");
+    expect(nodes[0]!.cssId).not.toBe(nodes[1]!.cssId);
+  });
+
+  it("scopes nothing for a node that renders no id at all", () => {
+    // An empty `cssId` still SHADOWS, so this node emits no usable id — and a
+    // bag value nothing renders must not reach the memo that rewrites
+    // references, for the reason the shadowed case above gives.
+    const doc = page([instance("i1", "hero")]);
+    const definitions = defs({
+      hero: component([
+        stored(node("d1") as ResolvedBlockNode, {
+          cssId: "",
+          attributes: { id: "hero", "aria-describedby": "hero" },
+        }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    expect(nodes[0]!.attributes!.id).toBe("hero");
+    expect(nodes[0]!.attributes!["aria-describedby"]).toBe("hero");
+  });
+});
+
+describe("resolveComponentInstances defensive reads and references", () => {
+  it("rewrites an IDREF attribute to the id it now points at", () => {
+    const doc = page([instance("i1", "hero"), instance("i2", "hero")]);
+    const definitions = defs({
+      hero: component([
+        node("d1", { cssId: "help" }),
+        node("d2", { attributes: { "aria-describedby": "help" } }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    // The reference must resolve to its target INSIDE the same instance.
+    expect(nodes[1]!.attributes!["aria-describedby"]).toBe(nodes[0]!.cssId);
+    expect(nodes[3]!.attributes!["aria-describedby"]).toBe(nodes[2]!.cssId);
+    // And the two instances must not both point at one target.
+    expect(nodes[1]!.attributes!["aria-describedby"]).not.toBe(
+      nodes[3]!.attributes!["aria-describedby"]
+    );
+    // A reference pointing at the ORIGINAL is the silent failure: it resolves
+    // to nothing and the element simply loses its accessible description.
+    expect(nodes[1]!.attributes!["aria-describedby"]).not.toBe("help");
+  });
+
+  it("survives an instance whose stored visibility is null", () => {
+    const doc = page([stored(instance("i1", "hero"), { visibility: null })]);
+    const definitions = defs({ hero: component([node("d1")]) });
+
+    expect(() => resolveComponentInstances(doc, definitions)).not.toThrow();
+  });
+
+  it("keeps a malformed root envelope fail-closed while merging devices", () => {
+    const doc = page([
+      {
+        ...instance("i1", "hero"),
+        visibility: { devices: { mobile: false } },
+      },
+    ]);
+    const definitions = defs({
+      hero: component([stored(node("d1"), { visibility: "restricted" })]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    // `isConditionGated` reads an unreadable envelope as GATED. Normalising it
+    // into a plain object with no `conditions` makes the later pass serve what
+    // was withheld.
+    expect(isConditionGated(nodes[0]!)).toBe(true);
+  });
+
+  it("refunds nodes discarded with an unexposed slot", () => {
+    const doc = page([
+      instance("i1", "hero", {}, { slots: { gone: [node("x"), node("y")] } }),
+    ]);
+    const definitions = defs({ hero: component([node("d1"), node("d2")]) });
+
+    // Host holds three nodes; two of them are discarded with the unexposed
+    // slot, so a two-node definition fits under a cap of three.
+    const result = resolveComponentInstances(doc, definitions, {
+      limits: { ...DEFAULT_LIMITS, maxNodes: 3 },
+    });
+
+    expect(result.unresolved).toEqual([]);
+    expect(flatten(result.document.nodes)).toHaveLength(2);
+  });
+
+  it("never mints a DOM id the host page already carries", () => {
+    const definitions = defs({
+      hero: component([node("d1", { cssId: "signup" })]),
+    });
+    const minted = resolveComponentInstances(
+      page([instance("i1", "hero")]),
+      definitions
+    ).document.nodes[0]!.cssId!;
+
+    const doc = page([node("host", { cssId: minted }), instance("i1", "hero")]);
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    expect(nodes[0]!.cssId).toBe(minted);
+    expect(nodes[1]!.cssId).not.toBe(minted);
+  });
+
+  it("rewrites an id reference nested inside a slot", () => {
+    const doc = page([instance("i1", "hero")]);
+    const definitions = defs({
+      hero: component([
+        box("c1", [
+          node("d1", { cssId: "help" }),
+          node("d2", { attributes: { "aria-describedby": "help" } }),
+        ]),
+      ]),
+    });
+
+    const kids = resolveComponentInstances(doc, definitions).document.nodes[0]!
+      .slots!.children!;
+
+    // A rewrite that only walks the roots leaves every nested reference
+    // dangling, which is most of them: a component's markup is a tree.
+    expect(kids[1]!.attributes!["aria-describedby"]).toBe(kids[0]!.cssId);
+  });
+
+  it("refunds only the slots it discards, never the ones it uses", () => {
+    const doc = page([
+      instance("i1", "hero", {}, { slots: { body: [node("x"), node("y")] } }),
+    ]);
+    const definitions = defs({
+      hero: component([box("c1", []), node("d2")], {
+        slots: { body: { label: "Body", nodeId: "c1", slot: "children" } },
+      }),
+    });
+
+    // The instance's two slot nodes ARE in the result, so refunding them would
+    // buy room the document then spends twice and overrun the cap.
+    const result = resolveComponentInstances(doc, definitions, {
+      limits: { ...DEFAULT_LIMITS, maxNodes: 3 },
+    });
+
+    expect(flatten(result.document.nodes).length).toBeLessThanOrEqual(3);
+  });
+
+  it("leaves an id reference the definition does not own alone", () => {
+    const doc = page([
+      node("outside", { cssId: "app-status" }),
+      instance("i1", "hero"),
+    ]);
+    const definitions = defs({
+      hero: component([
+        node("d1", {
+          cssId: "own",
+          attributes: { "aria-controls": "own app-status" },
+        }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    // The first token addresses the definition's own node and moves; the
+    // second addresses the host page and must not, or a working relationship
+    // is broken by a copy that had nothing to do with it.
+    expect(nodes[1]!.attributes!["aria-controls"]).toBe(
+      `${nodes[1]!.cssId} app-status`
+    );
+  });
+});
+
+describe("resolveComponentInstances ownership and cost", () => {
+  it("leaves a host slot child's reference pointing at the host", () => {
+    const doc = page([
+      node("h", { cssId: "shared" }),
+      instance(
+        "i1",
+        "hero",
+        {},
+        {
+          slots: {
+            body: [
+              node("mine", { attributes: { "aria-describedby": "shared" } }),
+            ],
+          },
+        }
+      ),
+    ]);
+    const definitions = defs({
+      hero: component([box("c1", []), node("d2", { cssId: "shared" })], {
+        slots: { body: { label: "B", nodeId: "c1", slot: "children" } },
+      }),
+    });
+
+    const flat = flatten(
+      resolveComponentInstances(doc, definitions).document.nodes
+    );
+    const mine = flat.find(e => e.id === "mine")!;
+
+    // Host content is the page's own. Rewriting it against the DEFINITION's
+    // map redirects a working reference at a node the host never named.
+    expect(mine.attributes!["aria-describedby"]).toBe("shared");
+  });
+
+  it("does not charge the budget for a node an override hides", () => {
+    const doc = page([
+      node("keep"),
+      instance("i1", "hero", { overrides: { gone: false } }),
+    ]);
+    const definitions = defs({
+      hero: component([node("d1"), node("d2")], {
+        exposed: [
+          {
+            id: "gone",
+            label: "G",
+            nodeId: "d1",
+            propPath: "x",
+            type: "visibility",
+          },
+        ],
+      }),
+    });
+
+    const result = resolveComponentInstances(doc, definitions, {
+      limits: { ...DEFAULT_LIMITS, maxNodes: 2 },
+    });
+
+    // The composed document holds the host node and one definition node.
+    expect(result.unresolved).toEqual([]);
+    expect(flatten(result.document.nodes)).toHaveLength(2);
+  });
+
+  it("merges devices onto a root whose visibility is stored null", () => {
+    const doc = page([
+      stored(instance("i1", "hero"), {
+        visibility: { devices: { mobile: false } },
+      }),
+    ]);
+    const definitions = defs({
+      hero: component([stored(node("d1"), { visibility: null })]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    // `isConditionGated` reads null exactly like an absent envelope, so the
+    // merge must too — refusing it silently drops the author's hiding.
+    expect(nodes[0]!.visibility?.devices?.mobile).toBe(false);
+  });
+});
+
+describe("resolveComponentInstances references, bands and cost", () => {
+  it("points a fragment link at the id it now names", () => {
+    const doc = page([instance("i1", "hero"), instance("i2", "hero")]);
+    const definitions = defs({
+      hero: component([
+        node("d1", { cssId: "pricing" }),
+        node("d2", { props: { href: "#pricing", label: "See" } }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    expect(nodes[1]!.props.href).toBe(`#${String(nodes[0]!.cssId)}`);
+    expect(nodes[3]!.props.href).toBe(`#${String(nodes[2]!.cssId)}`);
+  });
+
+  it("leaves a fragment that names nothing in the component alone", () => {
+    const doc = page([instance("i1", "hero")]);
+    const definitions = defs({
+      hero: component([
+        node("d1", { cssId: "own" }),
+        node("d2", { props: { href: "#elsewhere", text: "#1 seller" } }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    expect(nodes[1]!.props.href).toBe("#elsewhere");
+    expect(nodes[1]!.props.text).toBe("#1 seller");
+  });
+
+  it("rewrites a fragment nested inside a prop", () => {
+    const doc = page([instance("i1", "hero")]);
+    const definitions = defs({
+      hero: component([
+        node("d1", { cssId: "pricing" }),
+        node("d2", {
+          props: { cta: { links: [{ href: "#pricing" }] } },
+        }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+    const cta = nodes[1]!.props.cta as { links: { href: string }[] };
+
+    // A block's props are a tree, not a flat record — a fragment reached only
+    // through a record and an array is the ordinary shape, not the exotic one.
+    expect(cta.links[0]!.href).toBe(`#${String(nodes[0]!.cssId)}`);
+  });
+
+  it("calls a definition supplied as null unreadable, not missing", () => {
+    const doc = page([instance("i1", "hero")]);
+    const definitions = new Map<string, BlockDocument>([
+      ["hero", null as unknown as BlockDocument],
+    ]);
+
+    const result = resolveComponentInstances(doc, definitions);
+
+    // Present-and-unreadable, so the key's PRESENCE is what separates it from
+    // absent — a falsy value would read as absent to anything asking the map
+    // for the value instead.
+    expect(result.unresolved.map(e => e.reason)).toEqual(["unreadable"]);
+  });
+
+  it("keeps the true that ends an instance's hidden band", () => {
+    const doc = page([
+      stored(instance("i1", "hero"), {
+        visibility: { devices: { tablet: false, mobile: true } },
+      }),
+    ]);
+    const definitions = defs({ hero: component([node("d1")]) });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    // Hiding inherits to narrower breakpoints until a `true` ends the band, so
+    // dropping the `true` hides the component further than the author asked.
+    expect(nodes[0]!.visibility?.devices).toEqual({
+      tablet: false,
+      mobile: true,
+    });
+  });
+
+  it("will not let an instance re-show a breakpoint the definition hid", () => {
+    const doc = page([
+      stored(instance("i1", "hero"), {
+        visibility: { devices: { mobile: true } },
+      }),
+    ]);
+    const definitions = defs({
+      hero: component([
+        node("d1", { visibility: { devices: { mobile: false } } }),
+      ]),
+    });
+
+    const nodes = resolveComponentInstances(doc, definitions).document.nodes;
+
+    expect(nodes[0]!.visibility?.devices?.mobile).toBe(false);
+  });
+
+  it("refunds slot content dropped with a hidden slot target", () => {
+    const doc = page([
+      instance(
+        "i1",
+        "hero",
+        { overrides: { hide: false } },
+        { slots: { body: [node("x"), node("y")] } }
+      ),
+    ]);
+    const definitions = defs({
+      hero: component([box("c1", []), node("r1"), node("r2")], {
+        slots: { body: { label: "B", nodeId: "c1", slot: "children" } },
+        exposed: [
+          {
+            id: "hide",
+            label: "H",
+            nodeId: "c1",
+            propPath: "p",
+            type: "visibility",
+          },
+        ],
+      }),
+    });
+
+    const result = resolveComponentInstances(doc, definitions, {
+      limits: { ...DEFAULT_LIMITS, maxNodes: 3 },
+    });
+
+    // The two supplied children go with the hidden target, so their charge has
+    // to come back or the two visible roots are refused for room they freed.
+    expect(result.unresolved).toEqual([]);
+    expect(flatten(result.document.nodes)).toHaveLength(2);
+  });
+
+  it("calls a supplied-but-unreadable definition unreadable", () => {
+    const doc = page([instance("i1", "hero")]);
+    const definitions = new Map<string, BlockDocument>([
+      [
+        "hero",
+        { formatVersion: 1, kind: "component" } as unknown as BlockDocument,
+      ],
+    ]);
+
+    const result = resolveComponentInstances(doc, definitions);
+
+    // `missing` asks somebody to publish or restore a component; a supplied
+    // record that cannot be read is a document fault, and offering the wrong
+    // remedy is the whole reason the reasons are a closed list.
+    expect(result.unresolved.map(e => e.reason)).toEqual(["unreadable"]);
+  });
+});
+
+describe("how a resolution reaches a definition", () => {
+  it("asks a lookup for a definition only when it is about to read one", () => {
+    // A caller that prepares its definitions cannot predict which ones a
+    // resolution will read — an override may name a different component than
+    // the definition stored, and the composition cap stops a chain long before
+    // a catalog does. Asking here is what makes preparation and reachability
+    // one answer instead of two that disagree.
+    const asked: string[] = [];
+    const stored = new Map<string, BlockDocument>([
+      ["a", component([instance("n1", "b")])],
+      ["b", component([node("d1")])],
+      ["unused", component([node("d2")])],
+    ]);
+
+    const result = resolveComponentInstances(page([instance("i1", "a")]), {
+      has: id => stored.has(id),
+      get: id => {
+        asked.push(id);
+        return stored.get(id);
+      },
+    });
+
+    // Once each, and only for what is reached: `unused` is in the map and is
+    // never asked for.
+    expect(asked).toEqual(["a", "b"]);
+    expect(result.unresolved).toEqual([]);
+  });
+
+  it("reads a definition once, so a lookup cannot change under the run", () => {
+    // Nothing in the contract makes a lookup pure, and the source that fetches
+    // is the one most likely not to be: validating one read and expanding a
+    // second means the value that was checked is not the value that is used.
+    let reads = 0;
+    const definition = component([node("d1")]);
+
+    const result = resolveComponentInstances(page([instance("i1", "hero")]), {
+      has: () => true,
+      get: () => {
+        reads += 1;
+        return reads === 1 ? definition : undefined;
+      },
+    });
+
+    expect(result.unresolved).toEqual([]);
+    expect(flatten(result.document.nodes)).toHaveLength(1);
+  });
+
+  it("gives two instances of one component the SAME answer", () => {
+    // Reading once per instance rather than once per run lets a stateful
+    // lookup contradict itself inside one page: the first instance draws the
+    // component and the second reports it unreadable. Whatever a lookup
+    // answers, a resolution has to answer one thing about one component.
+    const definition = component([node("d1")]);
+    let reads = 0;
+
+    const result = resolveComponentInstances(
+      page([instance("i1", "hero"), instance("i2", "hero")]),
+      {
+        has: () => true,
+        get: () => {
+          reads += 1;
+          return reads === 1 ? definition : undefined;
+        },
+      }
+    );
+
+    expect(result.unresolved).toEqual([]);
+    expect(flatten(result.document.nodes)).toHaveLength(2);
+  });
+
+  it("takes `has` as the answer even when `get` produces nothing", () => {
+    // The two are different questions. A lookup that answered presence from
+    // whether a document came back would report a corrupt definition as one
+    // nobody supplied, and send whoever is debugging to publish a component
+    // that is already there.
+    const result = resolveComponentInstances(page([instance("i1", "hero")]), {
+      has: () => true,
+      get: () => undefined,
+    });
+
+    expect(result.unresolved.map(e => e.reason)).toEqual(["unreadable"]);
+  });
+});
+
+describe("componentIdsIn", () => {
+  it("lists each referenced id once, in first-reached order", () => {
+    const nodes = [
+      instance("i1", "b"),
+      box("x", [instance("i2", "a"), instance("i3", "b")]),
+    ];
+
+    expect(componentIdsIn(nodes)).toEqual(["b", "a"]);
+  });
+
+  it("ignores an instance that names no component", () => {
+    const nodes = [
+      { id: "i1", type: COMPONENT_INSTANCE_TYPE, version: 1, props: {} },
+      instance("i2", "a"),
+    ];
+
+    expect(componentIdsIn(nodes)).toEqual(["a"]);
+  });
+
+  it("stops at the node budget rather than walking a whole document", () => {
+    const nodes = [node("a"), node("b"), instance("i1", "late")];
+
+    expect(componentIdsIn(nodes, 2)).toEqual([]);
+    expect(componentIdsIn(nodes, 3)).toEqual(["late"]);
+  });
+});
+
+describe("resolveComponentInstances under an unusable cap", () => {
+  // A host states `limits` in its own config, so a computed one — a cap read
+  // from an environment variable that is not set, say — arrives as `NaN`. That
+  // is not a loose bound but NO bound: `budget <= 0` is false against it, the
+  // survey never records that it stopped, and the refusal below it never
+  // fires. The document is then composed from a survey that read only part of
+  // it, which is the state that refusal exists to prevent.
+  const oversized = () => {
+    const nodes: BlockNode[] = [
+      ...Array.from({ length: DEFAULT_LIMITS.maxNodes + 10 }, (_, i) =>
+        node(`n${i}`)
+      ),
+      instance("i1", "def-1"),
+    ];
+    return { formatVersion: DOCUMENT_FORMAT_VERSION, kind: "page", nodes };
+  };
+  const definitions = {
+    get: () => ({
+      formatVersion: DOCUMENT_FORMAT_VERSION,
+      kind: "component" as const,
+      nodes: [node("d1")],
+    }),
+  };
+
+  it("refuses an oversized document under an ordinary cap", () => {
+    // The control. Without it the refusal below could be read as this function
+    // simply never composing anything in this fixture.
+    const doc = oversized() as BlockDocument;
+    const out = resolveComponentInstances(doc, definitions as never, {
+      limits: DEFAULT_LIMITS,
+    });
+
+    expect({
+      referenced: out.referenced,
+      composed: out.document !== doc,
+    }).toEqual({ referenced: [], composed: false });
+  });
+
+  it("refuses a cap that would remove the bound rather than set one", () => {
+    // Asserted through the helper's own message, which names both the subject
+    // and the field: a bare `toThrow()` would pass on any error this function
+    // might raise for another reason.
+    expect(() =>
+      resolveComponentInstances(
+        oversized() as BlockDocument,
+        definitions as never,
+        {
+          limits: { ...DEFAULT_LIMITS, maxNodes: Number.NaN },
+        }
+      )
+    ).toThrow(/resolveComponentInstances: maxNodes/);
+  });
+
+  it("reads each cap it uses exactly once", () => {
+    // The caller owns this object, so a member that answers differently
+    // between reads lets the survey validate under one cap and the composition
+    // run under another. One read cannot disagree with itself.
+    let reads = 0;
+    const counting = {
+      ...DEFAULT_LIMITS,
+      get maxNodes() {
+        reads += 1;
+        return DEFAULT_LIMITS.maxNodes;
+      },
+    };
+
+    resolveComponentInstances(
+      page([instance("i1", "def-1")]),
+      definitions as never,
+      { limits: counting }
+    );
+
+    expect(reads).toBe(1);
+  });
+});
+
+describe("componentUsageIn", () => {
+  // Three entries exactly, so the budget can be set above, at and below the
+  // size of the forest. The reference is the LAST of them, which is what makes
+  // a prefix distinguishable from the whole answer at all: a truncated walk
+  // returns `[]` here, and `[]` is also what a document referencing nothing
+  // returns — the pair the `complete` flag exists to separate.
+  const nodes = [node("a"), node("b"), instance("i1", "late")];
+
+  it("reports a whole read, with what it found", () => {
+    expect(componentUsageIn(nodes, 10)).toEqual({
+      ids: ["late"],
+      complete: true,
+    });
+  });
+
+  it("reports a truncated read, and the prefix it managed", () => {
+    // Both halves asserted together. `ids: []` alone is the answer a document
+    // holding no instances gives, so an assertion on it cannot tell the two
+    // apart — which is the whole defect this function exists to close.
+    expect(componentUsageIn(nodes, 2)).toEqual({ ids: [], complete: false });
+  });
+
+  it("calls a forest of exactly the budget COMPLETE, not truncated", () => {
+    // The boundary, and the reason `complete` is set on the branch that ends
+    // the walk rather than derived from the budget afterwards. Three entries
+    // under a budget of three spends the last of it on the last entry and
+    // reads the forest WHOLE; a check on the remaining budget would report
+    // this as unreadable, at exactly the size the rest of the engine accepts.
+    expect(componentUsageIn(nodes, 3)).toEqual({
+      ids: ["late"],
+      complete: true,
+    });
+  });
+
+  it("gives an empty forest a complete answer, not an unread one", () => {
+    // "Nothing to read" and "could not be read" are the two states this
+    // separates, and the empty forest is the one a caller meets first.
+    expect(componentUsageIn([], 10)).toEqual({ ids: [], complete: true });
+  });
+
+  it("refuses a budget that would remove the bound rather than set one", () => {
+    // `NaN` is not a loose bound, it is NO bound: every `budget <= 0` test
+    // against it is false, so the walk never stops and reads a stored document
+    // of any size whole. Asserted through the published helper's own message,
+    // which names both the subject and the field — a bare `toThrow()` would
+    // pass on any error this function might raise for another reason.
+    expect(() => componentUsageIn(nodes, Number.NaN)).toThrow(
+      /componentUsageIn: maxNodes/
+    );
+
+    // The derived function inherits the refusal, which is the point of it
+    // being derived. Its previous behaviour was to walk unbounded in silence.
+    expect(() => componentIdsIn(nodes, Number.NaN)).toThrow(
+      /componentUsageIn: maxNodes/
+    );
+
+    // The control: an ordinary budget is untouched by the guard, so what the
+    // test above measures is the refusal rather than the function being broken.
+    expect(componentUsageIn(nodes, 10).complete).toBe(true);
+  });
+
+  it("keeps the answer truthful under a fractional budget", () => {
+    // A fractional budget is accepted — that is `boundedLimit`'s decision, and
+    // refusing it here alone would make this walk disagree with the helper
+    // that exists to stop walks disagreeing. It costs at most one node beyond
+    // the cap.
+    //
+    // What must hold either way is that `complete` describes what the walk
+    // REACHED rather than what the budget permitted. Both cases are asserted,
+    // because a rule that only ever reports `true` would satisfy the first.
+    expect(componentUsageIn(nodes, 2.5)).toEqual({
+      ids: ["late"],
+      complete: true,
+    });
+    expect(componentUsageIn(nodes, 1.5)).toEqual({ ids: [], complete: false });
+  });
+
+  it("answers what componentIdsIn answers, truncation included", () => {
+    // `componentIdsIn` is derived from this, and the case where a
+    // reimplementation would diverge is the bounded one: a second walk with
+    // its own budget arithmetic returns a different prefix here while both
+    // agree on every document small enough to be read whole.
+    for (const budget of [1, 2, 3, 10]) {
+      expect({ budget, ids: componentIdsIn(nodes, budget) }).toEqual({
+        budget,
+        ids: componentUsageIn(nodes, budget).ids,
+      });
+    }
+  });
+});
+
+/**
+ * What each variant installs.
+ *
+ * Three cases here previously covered an `affecting` set — a prediction of which
+ * variants could change a composition, by prop path and by whether a visibility
+ * write revealed. That prediction is gone: the write guard composes every
+ * selection under a work budget instead, because three rounds of refining it were
+ * each correct about the case that prompted them and wrong about a new one.
+ * There is no remaining behaviour those cases described.
+ */
+describe("variantReferencesIn", () => {
+  /** One node placing `c`, exposing its componentId and its text separately. */
+  const doc = (variants: Record<string, Variant>) =>
+    component([instance("n1", "c")], {
+      exposed: [
+        {
+          id: "swap",
+          label: "Which",
+          nodeId: "n1",
+          propPath: "componentId",
+          type: "select",
+        },
+      ],
+      variants,
+    });
+
+  it("reports what each variant installs, and omits the ones installing nothing", () => {
+    const out = variantReferencesIn(
+      doc({
+        toA: { label: "A", overrides: { swap: "a" } },
+        toB: { label: "B", overrides: { swap: "b" } },
+        untouched: { label: "None", overrides: {} },
+      })
+    );
+
+    expect(out.complete).toBe(true);
+    expect([...out.byVariant]).toEqual([
+      ["toA", ["a"]],
+      ["toB", ["b"]],
+    ]);
+    // ORACLE: the union the other reader gives is these, plus the stored id.
+    expect(
+      componentReferencesIn(
+        doc({ toA: { label: "A", overrides: { swap: "a" } } })
+      ).ids
+    ).toEqual(["c", "a"]);
+  });
+
+  it("answers NULL where the variants cannot be enumerated", () => {
+    const many: Record<string, Variant> = {};
+    for (let i = 0; i <= MAX_ENVELOPE_ENTRIES; i += 1) {
+      many[`v${String(i)}`] = { label: "V", overrides: {} };
+    }
+    const out = variantReferencesIn(doc(many));
+
+    expect(out.complete).toBe(false);
+    expect(out.byVariant.size).toBe(0);
+  });
+
+  it("reports a forest too large to index as UNREAD", () => {
+    // A published entry point takes its own bound. That its internal callers
+    // happen to survey the forest first is a property of today's call graph, not
+    // a guarantee this function offers a caller holding an imported document.
+    const big = component(
+      [
+        instance("n1", "c"),
+        ...Array.from({ length: 11 }, (_, i) => node(`t${String(i)}`)),
+      ],
+      {
+        exposed: [
+          {
+            id: "swap",
+            label: "Which",
+            nodeId: "n1",
+            propPath: "componentId",
+            type: "select",
+          },
+        ],
+        variants: { toA: { label: "A", overrides: { swap: "a" } } },
+      }
+    );
+
+    expect(variantReferencesIn(big, 4).complete).toBe(false);
+
+    // CONTROL: under a bound that fits, the same document reads completely AND
+    // reports the variant — so the case above is the bound, not the fixture.
+    const fits = variantReferencesIn(big, 5000);
+    expect(fits.complete).toBe(true);
+    expect([...fits.byVariant]).toEqual([["toA", ["a"]]]);
+  });
+
+  it("is EMPTY for a document offering no variants or no exposures", () => {
+    expect(variantReferencesIn(doc({})).byVariant.size).toBe(0);
+    expect(
+      variantReferencesIn(component([instance("n1", "c")])).byVariant.size
+    ).toBe(0);
+    expect(variantReferencesIn(null).complete).toBe(true);
+  });
+});
+
+/**
+ * The selections `componentReferencesIn` unions, listed separately.
+ *
+ * A caller confirming against the RENDER composes one selection at a time, so
+ * what matters here is that an unenumerable envelope is distinguishable from an
+ * empty one — `[]` and `null` mean opposite things to such a caller, and folding
+ * them together is what lets an unread document read as offering no variants.
+ */
+describe("variantNamesIn", () => {
+  it("names each variant a placement can select", () => {
+    const doc = component([node("t")], {
+      variants: {
+        wide: { label: "Wide", overrides: {} },
+        tall: { label: "Tall", overrides: {} },
+      },
+    });
+
+    expect(variantNamesIn(doc)).toEqual(["wide", "tall"]);
+  });
+
+  it("answers EMPTY for a document offering none, and for a non-document", () => {
+    // Empty rather than `null`: there is nothing to enumerate, which is a
+    // complete answer. A caller adds the no-variant placement itself.
+    expect(variantNamesIn(component([node("t")]))).toEqual([]);
+    expect(variantNamesIn({ variants: "not a record" })).toEqual([]);
+    expect(variantNamesIn(null)).toEqual([]);
+  });
+
+  it("answers NULL where the envelope admits fewer than the document holds", () => {
+    /*
+     * The distinction the empty case above cannot express. `componentReferencesIn`
+     * reports this same document as unread for the same reason — a prefix of the
+     * variants is a prefix of the answer — so a caller cannot treat a short list
+     * as the whole set.
+     */
+    const many: Record<string, Variant> = {};
+    for (let i = 0; i <= MAX_ENVELOPE_ENTRIES; i += 1) {
+      many[`v${String(i)}`] = { label: "V", overrides: {} };
+    }
+
+    expect(
+      variantNamesIn(component([node("t")], { variants: many }))
+    ).toBeNull();
+
+    // CONTROL: exactly at the bound it enumerates, so the case above is about
+    // exceeding it rather than about a document with many variants.
+    const atBound: Record<string, Variant> = {};
+    for (let i = 0; i < MAX_ENVELOPE_ENTRIES; i += 1) {
+      atBound[`v${String(i)}`] = { label: "V", overrides: {} };
+    }
+    expect(
+      variantNamesIn(component([node("t")], { variants: atBound }))
+    ).toHaveLength(MAX_ENVELOPE_ENTRIES);
+  });
+});
+
+/**
+ * What a document can reference once its VARIANTS are taken into account.
+ *
+ * The resolver is the oracle throughout: each case asserts that this answers
+ * with the ids the resolver actually expands to, so the two cannot drift into
+ * disagreeing about which reference is live. The interesting shape is a
+ * component that exposes one of its own instance nodes' `componentId` — a
+ * supported thing to expose — whose variant then re-points it, because the
+ * stored id is never read at all in that case.
+ */
+describe("the caller's node cap reaches the variant pass", () => {
+  it("does not report a document the DIRECT survey read as unread", () => {
+    /*
+     * The variant pass is derived, so it has to run under the bound the caller
+     * asked for. Defaulting it made a forest larger than the default — read
+     * completely by the direct survey under a larger cap — come back
+     * `complete: false` from the derived half, which every consumer reads as
+     * unreadable and the write guard turns into a refusal.
+     */
+    const big = component(
+      [
+        instance("n1", "c"),
+        ...Array.from({ length: DEFAULT_LIMITS.maxNodes }, (_, i) =>
+          node(`t${String(i)}`)
+        ),
+      ],
+      {
+        exposed: [
+          {
+            id: "swap",
+            label: "Which",
+            nodeId: "n1",
+            propPath: "componentId",
+            type: "select",
+          },
+        ],
+        variants: { toA: { label: "A", overrides: { swap: "a" } } },
+      }
+    );
+
+    const over = componentReachIn(big, DEFAULT_LIMITS.maxNodes + 1000);
+    expect(over.complete).toBe(true);
+    expect(over.ids).toContain("a");
+
+    // CONTROL: under the DEFAULT cap the same forest genuinely does not fit, so
+    // the case above is the cap being honoured rather than the fixture being small.
+    expect(componentReachIn(big).complete).toBe(false);
+  });
+});
+
+describe("componentReferencesIn", () => {
+  /** A places B, exposes that node's componentId, and offers a variant naming A. */
+  const swappable = component([instance("n1", "b")], {
+    exposed: [
+      {
+        id: "swap",
+        label: "Which",
+        nodeId: "n1",
+        propPath: "componentId",
+        type: "select",
+      },
+    ],
+    variants: { loop: { label: "Loop", overrides: { swap: "a" } } },
+  });
+
+  // Deliberately NOT an instance node: a component whose only node places "b"
+  // would be placing itself, and the control below would report a cycle of its
+  // own making.
+  const plain = component([node("t")]);
+
+  it("finds the id only a variant installs, which the raw scan cannot see", () => {
+    // The two answers differ, and that difference is the point: `b` is what the node
+    // stores and `a` is what resolves when the variant is picked.
+    expect(componentUsageIn(swappable.nodes).ids).toEqual(["b"]);
+    expect(componentReferencesIn(swappable).ids).toEqual(["b", "a"]);
+  });
+
+  it("ORACLE: the resolver expands the variant's id and never reads the stored one", () => {
+    const lookup = defs({ a: swappable, b: plain });
+    // With the variant selected the loop closes through A, and B — the id the
+    // node actually stores — is never referenced at all.
+    const picked = resolveComponentInstances(
+      page([instance("p", "a", { variant: "loop" })]),
+      lookup
+    );
+    expect(picked.unresolved).toEqual([
+      expect.objectContaining({ componentId: "a", reason: "cycle" }),
+    ]);
+    expect(picked.referenced).toEqual(["a"]);
+
+    // CONTROL: no variant selected, so the stored id is the live one and
+    // nothing loops. Without this the case above proves only that SOMETHING
+    // went wrong with that fixture.
+    const bare = resolveComponentInstances(page([instance("p", "a")]), lookup);
+    expect(bare.unresolved).toEqual([]);
+    expect(bare.referenced).toEqual(["a", "b"]);
+  });
+
+  it("agrees with the raw scan on a document offering no variants", () => {
+    expect(componentReferencesIn(plain)).toEqual(componentUsageIn(plain.nodes));
+  });
+
+  it("ignores a variant override that reaches no exposure", () => {
+    const orphaned = component([instance("n1", "b")], {
+      variants: { loop: { label: "Loop", overrides: { swap: "a" } } },
+    });
+    expect(componentReferencesIn(orphaned).ids).toEqual(["b"]);
+  });
+
+  it("ignores an exposure that writes componentId onto a node that is not an instance", () => {
+    // `componentIdOf` reads the field only on a component-instance node, so
+    // writing it onto a text node installs nothing a reader would follow.
+    const wrongTarget = component([node("t1"), instance("n1", "b")], {
+      exposed: [
+        {
+          id: "swap",
+          label: "Which",
+          nodeId: "t1",
+          propPath: "componentId",
+          type: "select",
+        },
+      ],
+      variants: { loop: { label: "Loop", overrides: { swap: "a" } } },
+    });
+    expect(componentReferencesIn(wrongTarget).ids).toEqual(["b"]);
+  });
+
+  it("does not treat a non-string or empty override as a reference", () => {
+    const junk = component([instance("n1", "b")], {
+      exposed: [
+        {
+          id: "s1",
+          label: "Which",
+          nodeId: "n1",
+          propPath: "componentId",
+          type: "select",
+        },
+      ],
+      variants: {
+        empty: { label: "E", overrides: { s1: "" } },
+        numeric: { label: "N", overrides: { s1: 7 } },
+      },
+    } as unknown as Partial<ComponentDocument>);
+    expect(componentReferencesIn(junk).ids).toEqual(["b"]);
+  });
+
+  it("reports a truncated forest as unread rather than scanning the variants", () => {
+    const big = component([instance("n1", "b"), instance("n2", "c")], {
+      exposed: [
+        {
+          id: "swap",
+          label: "Which",
+          nodeId: "n1",
+          propPath: "componentId",
+          type: "select",
+        },
+      ],
+      variants: { loop: { label: "Loop", overrides: { swap: "a" } } },
+    });
+    expect(componentReferencesIn(big, 1)).toEqual({
+      ids: ["b"],
+      complete: false,
+    });
+  });
+
+  it("answers about a value that is not a document at all", () => {
+    expect(componentReferencesIn(undefined)).toEqual({
+      ids: [],
+      complete: true,
+    });
+    expect(componentReferencesIn({ nodes: "not-an-array" })).toEqual({
+      ids: [],
+      complete: true,
+    });
+  });
+});
+
+/**
+ * The edge that belongs to the PLACEMENT rather than to either document.
+ *
+ * A places B and carries overrides aimed at B's exposures. If B exposes one of
+ * its own nested instances' `componentId`, that override re-points it — so A
+ * resolves to A -> B -> A while A's document names only B and B's names only C.
+ * Neither single-document scan can see it, which is why this takes both.
+ */
+describe("componentReferencesFrom", () => {
+  /** B places C, and exposes that node's componentId under the id `swap`. */
+  const B = component([instance("n1", "c")], {
+    exposed: [
+      {
+        id: "swap",
+        label: "Which",
+        nodeId: "n1",
+        propPath: "componentId",
+        type: "select",
+      },
+    ],
+  });
+
+  const C = component([node("t")]);
+
+  it("finds the id a placing node's own overrides install", () => {
+    const placing = instance("p", "b", { overrides: { swap: "a" } });
+
+    expect(componentReferencesFrom(B, placing).ids).toEqual(["a"]);
+  });
+
+  it("ORACLE: the resolver expands that id, and never reads the stored one", () => {
+    const A = component([instance("p", "b", { overrides: { swap: "a" } })]);
+    const out = resolveComponentInstances(
+      page([instance("host", "a")]),
+      defs({ a: A, b: B, c: C })
+    );
+
+    // The loop closes through A, and `c` — what B's node actually stores — is
+    // never referenced at all.
+    expect(out.unresolved).toEqual([
+      expect.objectContaining({ componentId: "a", reason: "cycle" }),
+    ]);
+    expect(out.referenced).not.toContain("c");
+
+    // CONTROL: the same placement without the override resolves cleanly and
+    // does reach `c`, so the case above is about the override and not the
+    // fixture.
+    const bare = resolveComponentInstances(
+      page([instance("host", "a")]),
+      defs({ a: component([instance("p", "b")]), b: B, c: C })
+    );
+    expect(bare.unresolved).toEqual([]);
+    expect(bare.referenced).toContain("c");
+  });
+
+  it("neither document's own scan can see it", () => {
+    // Which is the whole reason this function takes two arguments.
+    const A = component([instance("p", "b", { overrides: { swap: "a" } })]);
+
+    expect(componentReferencesIn(A).ids).toEqual(["b"]);
+    expect(componentReferencesIn(B).ids).toEqual(["c"]);
+  });
+
+  it("answers nothing for a placement carrying no overrides", () => {
+    expect(componentReferencesFrom(B, instance("p", "b")).ids).toEqual([]);
+  });
+
+  it("answers nothing when the definition exposes nothing", () => {
+    expect(
+      componentReferencesFrom(C, instance("p", "c", { overrides: { x: "a" } }))
+        .ids
+    ).toEqual([]);
+  });
+
+  it("ignores an override that does not name a declared exposure", () => {
+    expect(
+      componentReferencesFrom(
+        B,
+        instance("p", "b", { overrides: { nope: "a" } })
+      ).ids
+    ).toEqual([]);
+  });
+
+  it("folds the placement's VARIANT in under its own overrides", () => {
+    // `effectiveOverrides` applies variant then instance, which is the order the
+    // renderer uses, so a preset the placement did not override still counts.
+    const withVariant = component([instance("n1", "c")], {
+      exposed: [
+        {
+          id: "swap",
+          label: "Which",
+          nodeId: "n1",
+          propPath: "componentId",
+          type: "select",
+        },
+      ],
+      variants: { loop: { label: "Loop", overrides: { swap: "a" } } },
+    });
+
+    expect(
+      componentReferencesFrom(
+        withVariant,
+        instance("p", "b", { variant: "loop" })
+      ).ids
+    ).toEqual(["a"]);
+  });
+
+  it("reports a definition too large to index as UNREAD, not as empty", () => {
+    /*
+     * The bound matters because this is asked once per PLACEMENT: the caller
+     * resolves each placing node against the definition it places, so an
+     * uncapped index over an oversized definition is walked again for every
+     * placement of it, and a read cache hides none of that work.
+     *
+     * Reported unread rather than truncated: the ids found so far are a prefix,
+     * and a prefix is exactly what "installs nothing" looks like here.
+     */
+    // `n1` is an INSTANCE node, because `componentIdOf` reads a componentId only
+    // off one — writing the override onto a text node installs nothing, and the
+    // control below would then pass while proving nothing.
+    const many = component(
+      [
+        instance("n1", "c"),
+        ...Array.from({ length: 11 }, (_, i) => node(`t${String(i)}`)),
+      ],
+      {
+        exposed: [
+          {
+            id: "swap",
+            label: "Which",
+            nodeId: "n1",
+            propPath: "componentId",
+            type: "select",
+          },
+        ],
+      }
+    );
+    const placing = instance("p", "b", { overrides: { swap: "a" } });
+
+    expect(componentReferencesFrom(many, placing, 4)).toEqual({
+      ids: [],
+      complete: false,
+    });
+
+    // CONTROL: the same definition and placement under a bound that fits DOES
+    // install the id, so the case above is about the bound rather than about a
+    // fixture that installs nothing either way.
+    expect(componentReferencesFrom(many, placing, 5000)).toEqual({
+      ids: ["a"],
+      complete: true,
+    });
+  });
+
+  it("answers nothing for values that are not documents or nodes", () => {
+    expect(componentReferencesFrom(undefined, instance("p", "b")).ids).toEqual(
+      []
+    );
+    expect(componentReferencesFrom(B, undefined).ids).toEqual([]);
+  });
+});
+
+/**
+ * What the editor's instance panel reads.
+ *
+ * The cases below are the ones where a panel can be wrong while looking right:
+ * a value that is inherited rendering as blank, a variant's preset reported as
+ * the author's own edit, and a deliberate blank indistinguishable from a
+ * definition that holds nothing. Each of those draws a plausible panel.
+ */
+describe("instanceExposure", () => {
+  const headline = {
+    id: "headline",
+    label: "Headline",
+    nodeId: "d1",
+    propPath: "text",
+    type: "text",
+  } as const;
+
+  const hero = component([node("d1", { props: { text: "base" } })], {
+    exposed: [headline],
+    variants: { loud: { label: "Loud", overrides: { headline: "VARIANT" } } },
+  });
+
+  it("reads the DEFINITION's own value when nothing overrides it", () => {
+    // The case a panel gets wrong by assuming "no override" means "no value":
+    // it would draw an empty box over a heading the component author wrote.
+    const [state] = instanceExposure(hero, instance("i1", "hero")).properties;
+
+    expect(state?.source).toBe("definition");
+    expect(state?.value).toBe("base");
+    expect(state?.cleared).toBe(false);
+  });
+
+  it("reports a visibility exposure's INHERITED gate, so a panel does not call a gated node shown", () => {
+    /*
+     * The resolver is the oracle. A definition node carrying entry-field
+     * conditions is not served — `survivesGating` with no plan says so, and
+     * the composed forest keeps the gate for the renderer's hidden-node pass
+     * to act on. Read as "no override, so nothing in force", an inspector drew
+     * the row checked and said the node was shown on this page while the
+     * canvas withheld it.
+     */
+    const gate = { conditions: [[{ field: "tier", op: "eq", value: "pro" }]] };
+    const showGated = {
+      id: "showGated",
+      label: "Banner",
+      nodeId: "d1",
+      propPath: "hidden",
+      type: "visibility",
+    } as const;
+    const showPlain = { ...showGated, id: "showPlain", nodeId: "d2" } as const;
+    const definition = component(
+      [node("d1", { visibility: gate as BlockNode["visibility"] }), node("d2")],
+      { exposed: [showGated, showPlain] }
+    );
+
+    const [gated, plain] = instanceExposure(
+      definition,
+      instance("i1", "hero")
+    ).properties;
+
+    expect(gated?.value).toBe(false);
+    // Where it came from, so a surface can tell an inherited gate from an
+    // author's own hiding without a vocabulary of its own.
+    expect(gated?.source).toBe("definition");
+    expect(gated?.cleared).toBe(false);
+    // The control: a node with no gate has nothing in force, and is served.
+    expect(plain?.value).toBeUndefined();
+
+    // And the oracle itself: one root keeps its gate, the other does not.
+    const resolved = resolveComponentInstances(
+      page([instance("i1", "hero")]),
+      defs({ hero: definition })
+    );
+    expect(
+      resolved.document.nodes.map(root => root.visibility !== undefined)
+    ).toEqual([true, false]);
+  });
+
+  it("lets the instance's own override win over the inherited gate, either way", () => {
+    const gate = { conditions: [[{ field: "tier", op: "eq", value: "pro" }]] };
+    const showGated = {
+      id: "showGated",
+      label: "Banner",
+      nodeId: "d1",
+      propPath: "hidden",
+      type: "visibility",
+    } as const;
+    const definition = component(
+      [node("d1", { visibility: gate as BlockNode["visibility"] })],
+      { exposed: [showGated] }
+    );
+
+    const on = instanceExposure(
+      definition,
+      instance("i1", "hero", { overrides: { showGated: true } })
+    ).properties[0];
+    expect(on?.value).toBe(true);
+    expect(on?.source).toBe("instance");
+
+    const off = instanceExposure(
+      definition,
+      instance("i1", "hero", { overrides: { showGated: false } })
+    ).properties[0];
+    expect(off?.value).toBe(false);
+    expect(off?.source).toBe("instance");
+  });
+
+  it("attributes a variant's value to the VARIANT, not to the author", () => {
+    const node = instance("i1", "hero", { variant: "loud" });
+    const [state] = instanceExposure(hero, node).properties;
+
+    // Not "instance": offering to reset this would offer to undo something the
+    // author never set.
+    expect(state?.source).toBe("variant");
+    expect(state?.value).toBe("VARIANT");
+  });
+
+  it("prefers the instance's own value over the variant's, and says so", () => {
+    const node = instance("i1", "hero", {
+      variant: "loud",
+      overrides: { headline: "MINE" },
+    });
+    const [state] = instanceExposure(hero, node).properties;
+
+    expect(state?.source).toBe("instance");
+    expect(state?.value).toBe("MINE");
+  });
+
+  it("reports a cleared property as cleared, not as inherited", () => {
+    const node = instance("i1", "hero", {
+      overrides: { headline: { $unset: true } },
+    });
+    const [state] = instanceExposure(hero, node).properties;
+
+    expect(state?.cleared).toBe(true);
+    expect(state?.value).toBeUndefined();
+    // The source still matters: an author cleared this and can put it back.
+    expect(state?.source).toBe("instance");
+  });
+
+  it("separates a deliberate blank from a definition that holds nothing", () => {
+    // Both render as an empty control, and only `cleared` tells them apart —
+    // which is the whole reason the value is tri-state rather than optional.
+    const empty = component([node("d1", { props: {} })], {
+      exposed: [headline],
+    });
+
+    const inherited = instanceExposure(empty, instance("i1", "hero"))
+      .properties[0];
+    const blanked = instanceExposure(
+      empty,
+      instance("i1", "hero", { overrides: { headline: { $unset: true } } })
+    ).properties[0];
+
+    expect(inherited?.value).toBeUndefined();
+    expect(blanked?.value).toBeUndefined();
+    expect(inherited?.cleared).toBe(false);
+    expect(blanked?.cleared).toBe(true);
+  });
+
+  it("surfaces an override the definition no longer exposes", () => {
+    const node = instance("i1", "hero", {
+      overrides: { headline: "MINE", subtitle: "STRANDED" },
+    });
+
+    const exposure = instanceExposure(hero, node);
+
+    expect(exposure.orphanedOverrideIds).toEqual(["subtitle"]);
+    // And it is not silently folded into the drawn rows.
+    expect(exposure.properties.map(p => p.property.id)).toEqual(["headline"]);
+  });
+
+  it("keeps the definition's declared order", () => {
+    // Declaration order, not alphabetical: a component author writes a heading
+    // before its subtitle, and sorting rearranges a form somebody designed.
+    const two = component([node("d1", { props: { a: "1", b: "2" } })], {
+      exposed: [
+        { ...headline, id: "zeta", propPath: "a" },
+        { ...headline, id: "alpha", propPath: "b" },
+      ],
+    });
+
+    const ids = instanceExposure(two, instance("i1", "hero")).properties.map(
+      p => p.property.id
+    );
+
+    expect(ids).toEqual(["zeta", "alpha"]);
+  });
+
+  it("reads a nested path", () => {
+    const nested = component(
+      [node("d1", { props: { link: { href: "/a" } } })],
+      {
+        exposed: [{ ...headline, propPath: "link.href", type: "link" }],
+      }
+    );
+
+    const [state] = instanceExposure(nested, instance("i1", "hero")).properties;
+
+    expect(state?.value).toBe("/a");
+  });
+
+  it("never reads a path off the prototype", () => {
+    // The segments come from a stored definition, and `constructor` reads a
+    // function off a record that never had the key.
+    const hostile = component([node("d1", { props: {} })], {
+      exposed: [{ ...headline, propPath: "constructor" }],
+    });
+
+    const [state] = instanceExposure(
+      hostile,
+      instance("i1", "hero")
+    ).properties;
+
+    expect(state?.value).toBeUndefined();
+  });
+
+  it("answers for a pointer whose node is gone, rather than throwing", () => {
+    const dangling = component([node("d1", { props: { text: "base" } })], {
+      exposed: [{ ...headline, nodeId: "vanished" }],
+    });
+
+    const [state] = instanceExposure(
+      dangling,
+      instance("i1", "hero")
+    ).properties;
+
+    expect(state?.value).toBeUndefined();
+    expect(state?.source).toBe("definition");
+  });
+
+  it("skips a malformed member instead of throwing on it", () => {
+    // `exposed` reaches here unvalidated — a stored or imported definition may
+    // hold `null` in that array, and the resolver skips such a member rather
+    // than failing. An editor asking the same document a question must not
+    // crash where the renderer draws the page.
+    const malformed = component([node("d1", { props: { text: "base" } })], {
+      exposed: [null, headline, 7] as unknown as ComponentDocument["exposed"],
+    });
+
+    const exposure = instanceExposure(malformed, instance("i1", "hero"));
+
+    expect(exposure.properties.map(p => p.property.id)).toEqual(["headline"]);
+  });
+
+  it("ignores a visibility override the RENDERER would ignore", () => {
+    // A string left behind when an exposure changed type. `visibilityDecision`
+    // reads only booleans and the clear sentinel, so the definition's own
+    // visibility stays in force — and reporting the stale string as the value
+    // would tell the editor something the page does not render.
+    const gated = component([node("d1")], {
+      exposed: [{ ...headline, propPath: "", type: "visibility" }],
+    });
+    const node1 = instance("i1", "hero", {
+      overrides: { headline: "not-a-boolean" },
+    });
+
+    const [state] = instanceExposure(gated, node1).properties;
+
+    expect(state?.source).toBe("definition");
+    expect(state?.value).toBeUndefined();
+
+    // The RESOLVER is the oracle: the node is still served, so "in force" here
+    // has to mean the definition, exactly as this reports.
+    const rendered = resolveComponentInstances(
+      page([node1]),
+      defs({ hero: gated })
+    );
+    expect(rendered.document.nodes).toHaveLength(1);
+  });
+
+  it("honours a visibility override the renderer DOES act on", () => {
+    // The other direction, so the case above cannot pass by ignoring every
+    // visibility override.
+    const gated = component([node("d1")], {
+      exposed: [{ ...headline, propPath: "", type: "visibility" }],
+    });
+    const node1 = instance("i1", "hero", { overrides: { headline: false } });
+
+    const [state] = instanceExposure(gated, node1).properties;
+
+    expect(state?.source).toBe("instance");
+    expect(state?.value).toBe(false);
+  });
+
+  it("marks an exposure the resolver writes over as shadowed", () => {
+    // Two ids, one target. `planExposed` walks in declaration order and both
+    // land on `d1.text`, so the page shows the LAST one — and a panel drawing
+    // both as live controls would show a value the page does not render.
+    const twoPointers = component([node("d1", { props: { text: "base" } })], {
+      exposed: [
+        { ...headline, id: "first" },
+        { ...headline, id: "second" },
+      ],
+    });
+    const node1 = instance("i1", "hero", {
+      overrides: { first: "one", second: "two" },
+    });
+
+    const [first, second] = instanceExposure(twoPointers, node1).properties;
+
+    expect(first?.shadowedBy).toBe("second");
+    expect(second?.shadowedBy).toBeUndefined();
+
+    // And the oracle agrees about which one the page shows.
+    const rendered = resolveComponentInstances(
+      page([node1]),
+      defs({ hero: twoPointers })
+    );
+    expect(rendered.document.nodes[0]!.props.text).toBe("two");
+  });
+
+  it("marks the INHERITING row when its neighbour's override is in force", () => {
+    // The other direction, and the one that is easy to get backwards. Only
+    // `first` is overridden, so the page shows "one" — while `second`, which
+    // points at the same prop and inherits, reports the definition's "base".
+    // That row is the stale one here, even though it was never edited.
+    const twoPointers = component([node("d1", { props: { text: "base" } })], {
+      exposed: [
+        { ...headline, id: "first" },
+        { ...headline, id: "second" },
+      ],
+    });
+    const node1 = instance("i1", "hero", { overrides: { first: "one" } });
+
+    const [first, second] = instanceExposure(twoPointers, node1).properties;
+
+    expect(first?.shadowedBy).toBeUndefined();
+    expect(second?.shadowedBy).toBe("first");
+
+    // The oracle: "base" is not what the page renders, which is what makes the
+    // second row stale rather than merely different.
+    const rendered = resolveComponentInstances(
+      page([node1]),
+      defs({ hero: twoPointers })
+    );
+    expect(rendered.document.nodes[0]!.props.text).toBe("one");
+  });
+
+  it("marks nothing shadowed when no exposure is overridden at all", () => {
+    // Sharing a target is not itself a conflict. With no override in play every
+    // row reports the definition's own value, which is exactly what renders.
+    const twoPointers = component([node("d1", { props: { text: "base" } })], {
+      exposed: [
+        { ...headline, id: "first" },
+        { ...headline, id: "second" },
+      ],
+    });
+
+    const rows = instanceExposure(
+      twoPointers,
+      instance("i1", "hero")
+    ).properties;
+
+    expect(rows.map(r => r.shadowedBy)).toEqual([undefined, undefined]);
+  });
+
+  it("skips an exposure whose propPath is not a string, rather than throwing", () => {
+    // The null-member guard is not enough: a RECORD with a string id and a
+    // numeric propPath passes an id-only check, and `readPath` then calls
+    // `.split` on a number. The resolver skips that member; so must this.
+    const malformed = component([node("d1", { props: { text: "base" } })], {
+      exposed: [
+        headline,
+        { ...headline, id: "broken", propPath: 7 },
+      ] as unknown as ComponentDocument["exposed"],
+    });
+
+    const rows = instanceExposure(malformed, instance("i1", "hero")).properties;
+
+    expect(rows.map(r => r.property.id)).toEqual(["headline"]);
+  });
+
+  it("lets a valid visibility override win over a later STALE one", () => {
+    // Two visibility exposures on one node. The later carries a string, which
+    // the resolver ignores; the earlier carries `false`, which it applies. A
+    // winner chosen by "has an override" would crown the later one and report
+    // the earlier — the one actually deciding the page — as superseded.
+    const gated = component([node("d1")], {
+      exposed: [
+        { ...headline, id: "early", propPath: "", type: "visibility" },
+        { ...headline, id: "late", propPath: "", type: "visibility" },
+      ],
+    });
+    const node1 = instance("i1", "hero", {
+      overrides: { early: false, late: "not-a-boolean" },
+    });
+
+    const [early, late] = instanceExposure(gated, node1).properties;
+
+    expect(early?.shadowedBy).toBeUndefined();
+    expect(early?.value).toBe(false);
+    // The stale row is the one that is not in force.
+    expect(late?.shadowedBy).toBe("early");
+
+    // The oracle: `false` is applied, so the node is dropped.
+    const rendered = resolveComponentInstances(
+      page([node1]),
+      defs({ hero: gated })
+    );
+    expect(rendered.document.nodes).toHaveLength(0);
+  });
+
+  it("reports a parent path as written over when a child inside it is overridden", () => {
+    // `a = "scalar"` then `a.b = "nested"`: the writer descends through `a`,
+    // replacing the scalar with a record. Exact-key comparison calls both rows
+    // independent and reports `a` as still "scalar", which the page does not
+    // hold. Reading back from the final props answers it without a case.
+    const nested = component([node("d1", { props: { a: "base" } })], {
+      exposed: [
+        { ...headline, id: "parent", propPath: "a" },
+        { ...headline, id: "child", propPath: "a.b" },
+      ],
+    });
+    const node1 = instance("i1", "hero", {
+      overrides: { parent: "scalar", child: "nested" },
+    });
+
+    const [parent, child] = instanceExposure(nested, node1).properties;
+
+    expect(parent?.value).toEqual({ b: "nested" });
+    expect(parent?.shadowedBy).toBe("child");
+    expect(child?.value).toBe("nested");
+    expect(child?.shadowedBy).toBeUndefined();
+
+    const rendered = resolveComponentInstances(
+      page([node1]),
+      defs({ hero: nested })
+    );
+    expect(rendered.document.nodes[0]!.props.a).toEqual({ b: "nested" });
+  });
+
+  it("reports a child path as written over when its parent is overridden after it", () => {
+    // The other direction: `a.b` first, then `a` replaced wholesale. The child
+    // row's path no longer resolves inside a string.
+    const nested = component([node("d1", { props: { a: { b: "base" } } })], {
+      exposed: [
+        { ...headline, id: "child", propPath: "a.b" },
+        { ...headline, id: "parent", propPath: "a" },
+      ],
+    });
+    const node1 = instance("i1", "hero", {
+      overrides: { child: "nested", parent: "scalar" },
+    });
+
+    const [child, parent] = instanceExposure(nested, node1).properties;
+
+    expect(child?.value).toBeUndefined();
+    expect(child?.shadowedBy).toBe("parent");
+    expect(parent?.value).toBe("scalar");
+
+    const rendered = resolveComponentInstances(
+      page([node1]),
+      defs({ hero: nested })
+    );
+    expect(rendered.document.nodes[0]!.props.a).toBe("scalar");
+  });
+
+  it("does not treat a sibling path as a collision", () => {
+    // `a.b` and `a.c` share a parent and touch different values. Reading
+    // prefixes as collisions would report each as superseded by the other.
+    const siblings = component([node("d1", { props: { a: {} } })], {
+      exposed: [
+        { ...headline, id: "b", propPath: "a.b" },
+        { ...headline, id: "c", propPath: "a.c" },
+      ],
+    });
+    const node1 = instance("i1", "hero", { overrides: { b: "B", c: "C" } });
+
+    const [b, c] = instanceExposure(siblings, node1).properties;
+
+    expect(b?.value).toBe("B");
+    expect(c?.value).toBe("C");
+    expect(b?.shadowedBy).toBeUndefined();
+    expect(c?.shadowedBy).toBeUndefined();
+  });
+
+  it("does not treat a path that merely STARTS WITH another as inside it", () => {
+    // `a` and `ab` share three characters and nothing else. A prefix test on
+    // the raw string would call `ab` a descendant of `a` and report each as
+    // superseded by the other; the writer's grammar is segment-wise.
+    const lookalike = component([node("d1", { props: {} })], {
+      exposed: [
+        { ...headline, id: "a", propPath: "a" },
+        { ...headline, id: "ab", propPath: "ab" },
+      ],
+    });
+    const node1 = instance("i1", "hero", { overrides: { a: "A", ab: "AB" } });
+
+    const [a, ab] = instanceExposure(lookalike, node1).properties;
+
+    expect(a?.value).toBe("A");
+    expect(ab?.value).toBe("AB");
+    expect(a?.shadowedBy).toBeUndefined();
+    expect(ab?.shadowedBy).toBeUndefined();
+  });
+
+  it("keeps an ancestor's remaining value when a descendant is cleared", () => {
+    // `a.b` cleared deletes only `b`; the page keeps `{ a: { c: "keep" } }`.
+    // Reading the ancestor's winning write as "the sentinel, so cleared"
+    // would report `a` as gone while the page still renders its other key.
+    const nested = component(
+      [node("d1", { props: { a: { b: "base", c: "keep" } } })],
+      {
+        exposed: [
+          { ...headline, id: "parent", propPath: "a" },
+          { ...headline, id: "child", propPath: "a.b" },
+        ],
+      }
+    );
+    const node1 = instance("i1", "hero", {
+      overrides: { child: { $unset: true } },
+    });
+
+    const [parent, child] = instanceExposure(nested, node1).properties;
+
+    expect(parent?.value).toEqual({ c: "keep" });
+    expect(parent?.cleared).toBe(false);
+    expect(parent?.shadowedBy).toBe("child");
+    expect(child?.cleared).toBe(true);
+    expect(child?.value).toBeUndefined();
+
+    const rendered = resolveComponentInstances(
+      page([node1]),
+      defs({ hero: nested })
+    );
+    expect(rendered.document.nodes[0]!.props.a).toEqual({ c: "keep" });
+  });
+
+  it("does not count an override on a path the resolver refuses as in force", () => {
+    // An empty path, a doubled dot, or one over the segment limit is one the
+    // resolver declines to write. Treating its override as applied would
+    // attribute an unrendered value to the instance — and let it win a
+    // collision over a write that did land.
+    const broken = component([node("d1", { props: { text: "base" } })], {
+      exposed: [
+        { ...headline, id: "good", propPath: "text" },
+        { ...headline, id: "bad", propPath: "a..b" },
+      ],
+    });
+    const node1 = instance("i1", "hero", {
+      overrides: { good: "GOOD", bad: "BAD" },
+    });
+
+    const [good, bad] = instanceExposure(broken, node1).properties;
+
+    expect(good?.value).toBe("GOOD");
+    expect(good?.source).toBe("instance");
+    expect(bad?.source).toBe("definition");
+    expect(bad?.value).toBeUndefined();
+
+    const rendered = resolveComponentInstances(
+      page([node1]),
+      defs({ hero: broken })
+    );
+    expect(rendered.document.nodes[0]!.props).toEqual({ text: "GOOD" });
+  });
+
+  it("reports a cleared visibility as cleared with NO value, not the sentinel", () => {
+    // The winning write on a visibility row IS the `$unset` object. Handing
+    // that back as `value` breaks the promise that a cleared row has none —
+    // and a control drawn from it would show an object where it expects blank.
+    const gated = component([node("d1")], {
+      exposed: [{ ...headline, propPath: "", type: "visibility" }],
+    });
+    const node1 = instance("i1", "hero", {
+      overrides: { headline: { $unset: true } },
+    });
+
+    const [state] = instanceExposure(gated, node1).properties;
+
+    expect(state?.cleared).toBe(true);
+    expect(state?.value).toBeUndefined();
+  });
+
+  it("marks a row cleared when an ANCESTOR path was cleared by another exposure", () => {
+    // Clearing `a` removes `a.b` with it. The child row's value is gone
+    // because somebody deliberately removed it, and reporting that as merely
+    // superseded would make the removal indistinguishable from a definition
+    // that never held `a.b` at all.
+    const nested = component([node("d1", { props: { a: { b: "base" } } })], {
+      exposed: [
+        { ...headline, id: "parent", propPath: "a" },
+        { ...headline, id: "child", propPath: "a.b" },
+      ],
+    });
+    const node1 = instance("i1", "hero", {
+      overrides: { parent: { $unset: true } },
+    });
+
+    const [parent, child] = instanceExposure(nested, node1).properties;
+
+    expect(parent?.cleared).toBe(true);
+    expect(child?.cleared).toBe(true);
+    expect(child?.value).toBeUndefined();
+    expect(child?.shadowedBy).toBe("parent");
+
+    const rendered = resolveComponentInstances(
+      page([node1]),
+      defs({ hero: nested })
+    );
+    expect(rendered.document.nodes[0]!.props).toEqual({});
+  });
+
+  it("marks a row cleared when the SAME path was cleared by another exposure", () => {
+    const twoPointers = component([node("d1", { props: { text: "base" } })], {
+      exposed: [
+        { ...headline, id: "first" },
+        { ...headline, id: "second" },
+      ],
+    });
+    const node1 = instance("i1", "hero", {
+      overrides: { first: "MINE", second: { $unset: true } },
+    });
+
+    const [first, second] = instanceExposure(twoPointers, node1).properties;
+
+    expect(second?.cleared).toBe(true);
+    // The earlier row's target was erased by the later clear.
+    expect(first?.cleared).toBe(true);
+    expect(first?.value).toBeUndefined();
+    expect(first?.shadowedBy).toBe("second");
+  });
+
+  it("has no path value for a visibility exposure", () => {
+    // `visibility` decides whether the node is served at all; it names no prop,
+    // so reading `propPath` off the definition would report an unrelated value.
+    const gated = component(
+      [node("d1", { props: { visibility: "nonsense" } })],
+      {
+        exposed: [{ ...headline, propPath: "visibility", type: "visibility" }],
+      }
+    );
+
+    const [state] = instanceExposure(gated, instance("i1", "hero")).properties;
+
+    expect(state?.value).toBeUndefined();
+  });
+});
+
+describe("composedRootTypes", () => {
+  // The types at the roots of a document AS THE RESOLVER WOULD COMPOSE IT,
+  // read without composing it. The resolver is the oracle in every case: the
+  // query must answer the TYPES the composed forest's roots would have — each
+  // once, in the order first met, because its one consumer asks whether every
+  // type may sit somewhere and reads each type once — or nothing where the
+  // resolver would leave a root standing.
+  const resolvedRoots = (doc: BlockDocument, definitions: DefinitionsById) =>
+    resolveComponentInstances(doc, definitions).document.nodes.map(
+      root => root.type
+    );
+  const resolvedRootTypes = (
+    doc: BlockDocument,
+    definitions: DefinitionsById
+  ) => [...new Set(resolvedRoots(doc, definitions))];
+
+  it("answers a block's own type, and a root instance's definition's roots, nested — each type once, in the order first met", () => {
+    const definitions = defs({
+      header: component([node("d1"), box("d2", [node("d3")])]),
+      wrapper: component([instance("w1", "header"), node("w2")]),
+    });
+    const doc = component([instance("i1", "wrapper"), node("n1")]);
+
+    expect(composedRootTypes(doc, definitions)).toEqual([
+      "core/text",
+      "core/box",
+    ]);
+    expect(composedRootTypes(doc, definitions)).toEqual(
+      resolvedRootTypes(doc, definitions)
+    );
+    // The composed forest's roots are four; the answer names two types. A
+    // placement verdict reads each type once, so the repeats would only make
+    // the answer as long as the forest.
+    expect(resolvedRoots(doc, definitions)).toHaveLength(4);
+  });
+
+  it("leaves out a root a nested instance's OWN override hides", () => {
+    // The gate the query already knew about is the node's own `conditions`,
+    // which the resolver leaves standing for a later pass. An override is a
+    // different mechanism and the resolver acts on it here: the node and its
+    // subtree are gone from the composed forest, so the type it would have
+    // contributed is not a type anything places.
+    const definitions = defs({
+      inner: component([node("d1", { type: "core/column" }), node("d2")], {
+        exposed: [
+          {
+            id: "showCol",
+            label: "Column",
+            nodeId: "d1",
+            propPath: "hidden",
+            type: "visibility",
+          },
+        ],
+      }),
+    });
+    const doc = component([
+      instance("n1", "inner", { overrides: { showCol: false } }),
+    ]);
+
+    expect(composedRootTypes(doc, definitions)).toEqual(["core/text"]);
+    expect(composedRootTypes(doc, definitions)).toEqual(
+      resolvedRootTypes(doc, definitions)
+    );
+    // The control: the same definition placed by an instance that decides
+    // nothing still answers both types.
+    const plain = component([instance("n1", "inner")]);
+    expect(composedRootTypes(plain, definitions)).toEqual([
+      "core/column",
+      "core/text",
+    ]);
+  });
+
+  it("answers NOTHING at all for a component whose every root an override hides", () => {
+    // Offered, it would be a tile placing a component that draws nothing.
+    const definitions = defs({
+      inner: component([node("d1", { type: "core/column" })], {
+        exposed: [
+          {
+            id: "showCol",
+            label: "Column",
+            nodeId: "d1",
+            propPath: "hidden",
+            type: "visibility",
+          },
+        ],
+      }),
+    });
+    const doc = component([
+      instance("n1", "inner", { overrides: { showCol: false } }),
+    ]);
+
+    expect(composedRootTypes(doc, definitions)).toEqual([]);
+    expect(resolvedRoots(doc, definitions)).toEqual([]);
+  });
+
+  it("counts a gated root the instance's override turns ON", () => {
+    // The other half of the same rule: `visible === true` deletes the node's
+    // own gate before the instance branch is reached, so a gated root the
+    // author explicitly turned on is expanded rather than left standing.
+    const gate = { conditions: [[{ field: "tier", op: "eq", value: "pro" }]] };
+    const definitions = defs({
+      leaf: component([node("l1", { type: "core/column" })]),
+      inner: component(
+        [instance("d1", "leaf") as BlockNode, node("d2")].map((n, i) =>
+          i === 0 ? { ...n, visibility: gate } : n
+        ) as BlockNode[],
+        {
+          exposed: [
+            {
+              id: "showLeaf",
+              label: "Leaf",
+              nodeId: "d1",
+              propPath: "hidden",
+              type: "visibility",
+            },
+          ],
+        }
+      ),
+    });
+    const off = component([instance("n1", "inner")]);
+    const on = component([
+      instance("n1", "inner", { overrides: { showLeaf: true } }),
+    ]);
+
+    // Gated and untouched: the resolver leaves that root standing, so the
+    // query answers nothing rather than a type.
+    expect(composedRootTypes(off, definitions)).toBeUndefined();
+    // Turned on: it is expanded, and its definition's root is what it draws.
+    expect(composedRootTypes(on, definitions)).toEqual([
+      "core/column",
+      "core/text",
+    ]);
+    expect(composedRootTypes(on, definitions)).toEqual(
+      resolvedRootTypes(on, definitions)
+    );
+  });
+
+  it("does not let one instance's decision answer for another's", () => {
+    // A definition's roots are remembered per query; an instance that hides a
+    // root is asking a question of its own, and the memo must not carry its
+    // answer to the next instance of the same component.
+    const definitions = defs({
+      inner: component([node("d1", { type: "core/column" }), node("d2")], {
+        exposed: [
+          {
+            id: "showCol",
+            label: "Column",
+            nodeId: "d1",
+            propPath: "hidden",
+            type: "visibility",
+          },
+        ],
+      }),
+    });
+    const hiddenFirst = component([
+      instance("n1", "inner", { overrides: { showCol: false } }),
+      instance("n2", "inner"),
+    ]);
+    const plainFirst = component([
+      instance("n1", "inner"),
+      instance("n2", "inner", { overrides: { showCol: false } }),
+    ]);
+
+    // Both types either way — the plain instance still contributes the column
+    // the hidden one did not — and in the order the composed forest first
+    // meets them, which the hidden root moves.
+    expect(composedRootTypes(hiddenFirst, definitions)).toEqual([
+      "core/text",
+      "core/column",
+    ]);
+    expect(composedRootTypes(plainFirst, definitions)).toEqual([
+      "core/column",
+      "core/text",
+    ]);
+    for (const doc of [hiddenFirst, plainFirst]) {
+      expect(composedRootTypes(doc, definitions)).toEqual(
+        resolvedRootTypes(doc, definitions)
+      );
+    }
+  });
+
+  it("answers nothing for a root the resolver would leave standing: missing, another kind, a cycle, the composition cap", () => {
+    const missing = component([instance("i1", "nobody")]);
+    const wrongKind = component([instance("i1", "page")]);
+    const loop = component([instance("i1", "loop")]);
+    const definitions = defs({
+      page: page([node("p1")]),
+      loop: component([instance("l1", "loop")]),
+    });
+
+    for (const doc of [missing, wrongKind, loop]) {
+      expect(composedRootTypes(doc, definitions)).toBeUndefined();
+      expect(resolvedRoots(doc, definitions)).toEqual([
+        COMPONENT_INSTANCE_TYPE,
+      ]);
+    }
+
+    // A chain one longer than the cap: the resolver refuses the deepest
+    // instance for composed depth, so the outermost root cannot be answered.
+    const chain: Record<string, BlockDocument> = {};
+    for (let level = 0; level <= MAX_COMPOSED_DEPTH; level += 1) {
+      chain[`c${String(level)}`] = component([
+        level === MAX_COMPOSED_DEPTH
+          ? node("leaf")
+          : instance(`i${String(level)}`, `c${String(level + 1)}`),
+      ]);
+    }
+    const deep = component([instance("top", "c0")]);
+    expect(composedRootTypes(deep, defs(chain))).toBeUndefined();
+    expect(
+      resolvedRoots(deep, defs(chain)).includes(COMPONENT_INSTANCE_TYPE)
+    ).toBe(true);
+  });
+
+  it("answers nothing for a gated root instance, which the resolver leaves standing, and keeps a gated block", () => {
+    const gate = { conditions: [[{ field: "tier", op: "eq", value: "pro" }]] };
+    const definitions = defs({ header: component([node("d1")]) });
+    const gatedInstance = component([
+      instance("i1", "header", {}, { visibility: gate } as Partial<BlockNode>),
+    ]);
+    const gatedBlock = component([
+      node("n1", { visibility: gate } as Partial<BlockNode>),
+    ]);
+
+    expect(composedRootTypes(gatedInstance, definitions)).toBeUndefined();
+    expect(resolvedRoots(gatedInstance, definitions)).toEqual([
+      COMPONENT_INSTANCE_TYPE,
+    ]);
+    expect(composedRootTypes(gatedBlock, definitions)).toEqual(["core/text"]);
+    expect(resolvedRoots(gatedBlock, definitions)).toEqual(["core/text"]);
+  });
+
+  it("passes over a root the resolver DROPS, and keeps the roots beside it", () => {
+    /*
+     * `cloneDefinitionForest` skips a node it cannot clone — one that is not a
+     * record, or whose id is not a string — so such a root never lands on the
+     * page. Counted here, a component would be offered, and refused, by the
+     * type of a root the page never gets; and one whose every root is dropped
+     * would be offered as placing something and place nothing.
+     */
+    const idless = {
+      type: "core/box",
+      version: 1,
+      props: {},
+    } as unknown as BlockNode;
+    const definitions = defs({
+      partial: component([idless, node("ok")]),
+      allDropped: component([idless, null as unknown as BlockNode]),
+    });
+    const doc = component([instance("i1", "partial")]);
+
+    expect(composedRootTypes(doc, definitions)).toEqual(["core/text"]);
+    expect(composedRootTypes(doc, definitions)).toEqual(
+      resolvedRootTypes(doc, definitions)
+    );
+
+    const nothing = component([instance("i2", "allDropped")]);
+    expect(composedRootTypes(nothing, definitions)).toEqual([]);
+    expect(resolvedRoots(nothing, definitions)).toEqual([]);
+  });
+
+  it("answers an empty list for a definition whose roots compose to nothing", () => {
+    const definitions = defs({ empty: component([]) });
+
+    expect(
+      composedRootTypes(component([instance("i1", "empty")]), definitions)
+    ).toEqual([]);
+  });
+
+  it("walks the definition again for an instance that decides, rather than taking the answer given for another", () => {
+    // Counted rather than compared, because the query answers a UNION over
+    // the roots: the plain instance that filled the memo contributes the very
+    // types the memo holds, so a deciding instance wrongly served from it
+    // still lands inside the same set. The invariant is that it is not served
+    // from it at all — one instance's decision is not an answer about the
+    // definition, and the next caller to ask a narrower question would get
+    // the first instance's.
+    let walks = 0;
+    const roots = [node("d1", { type: "core/column" }), node("d2")];
+    const inner = {
+      formatVersion: DOCUMENT_FORMAT_VERSION,
+      kind: "component",
+      exposed: [
+        {
+          id: "showCol",
+          label: "Column",
+          nodeId: "d1",
+          propPath: "hidden",
+          type: "visibility",
+        },
+      ],
+      get nodes() {
+        walks += 1;
+        return roots;
+      },
+    } as unknown as ComponentDocument;
+    const lookup = defs({ inner });
+
+    // Two plain instances: the second takes the first's remembered answer.
+    composedRootTypes(
+      component([instance("n1", "inner"), instance("n2", "inner")]),
+      lookup
+    );
+    const plain = walks;
+
+    // The same pair, with the second deciding: one more read of the roots,
+    // because it answers for itself.
+    walks = 0;
+    composedRootTypes(
+      component([
+        instance("n1", "inner"),
+        instance("n2", "inner", { overrides: { showCol: false } }),
+      ]),
+      lookup
+    );
+
+    expect(walks).toBe(plain + 1);
+  });
+
+  it("answers nothing, rather than throwing, for a stored node whose own fields throw", () => {
+    // The resolver is the oracle here too, and it SURVIVES this: a definition
+    // carrying a throwing accessor — which an in-process host can supply, as
+    // the neighbouring test's counting getter shows — composes without
+    // raising. This query read the same fields with no boundary, so the one
+    // caller that cannot afford to raise, the palette building its catalogue,
+    // took the whole panel down over a definition the canvas draws.
+    const throwing = (): BlockNode => {
+      const bad: Record<string, unknown> = { id: "d1", version: 1, props: {} };
+      Object.defineProperty(bad, "type", {
+        enumerable: true,
+        get: () => {
+          throw new Error("unreadable");
+        },
+      });
+      return bad as unknown as BlockNode;
+    };
+    const definitions = defs({ bad: component([throwing()]) });
+
+    // In a definition the query follows into.
+    const viaInstance = component([instance("i1", "bad")]);
+    expect(() =>
+      resolveComponentInstances(page([instance("p1", "bad")]), definitions)
+    ).not.toThrow();
+    expect(composedRootTypes(viaInstance, definitions)).toBeUndefined();
+
+    // And at the document's own root, which no per-definition boundary covers.
+    const atRoot = component([throwing()]);
+    expect(composedRootTypes(atRoot, definitions)).toBeUndefined();
+  });
+
+  it("reads each definition once, however many roots point at it", () => {
+    // What makes the query cheap where the resolver is not: a definition is
+    // read once per query rather than cloned once per instance, so a library
+    // of wrappers around one large definition costs its roots, not its size.
+    let reads = 0;
+    const big = component([
+      box(
+        "b1",
+        Array.from({ length: 200 }, (_, i) => node(`n${String(i)}`))
+      ),
+    ]);
+    const lookup: DefinitionsById = new Map([["big", big]]);
+    const counting = {
+      has: (id: string) => lookup.has(id),
+      get: (id: string) => {
+        reads += 1;
+        return lookup.get(id);
+      },
+    };
+    const doc = component([
+      instance("i1", "big"),
+      instance("i2", "big"),
+      instance("i3", "big"),
+    ]);
+
+    expect(composedRootTypes(doc, counting)).toEqual(["core/box"]);
+    expect(reads).toBe(1);
+  });
+
+  it("walks each definition's roots once per query, however many instances point at it, at any depth", () => {
+    /*
+     * Reading a definition once is not enough: a definition read once and
+     * WALKED once per instance costs its roots per instance, and a definition
+     * whose roots are instances of another multiplies — three levels of two
+     * hundred is eight million root visits, and the answer was as long. The
+     * roots of a definition, once answered, are remembered for the query.
+     *
+     * Observed on the leaf's root node: its `type` is read by the walk and by
+     * nothing else, so the count is the number of times the leaf was walked.
+     */
+    const WIDTH = 200;
+    let leafWalks = 0;
+    const leafRoot = { id: "leaf", version: 1, props: {} };
+    Object.defineProperty(leafRoot, "type", {
+      enumerable: true,
+      get: () => {
+        leafWalks += 1;
+        return "core/text";
+      },
+    });
+    const many = (id: string, of: string) =>
+      Array.from({ length: WIDTH }, (_, i) =>
+        instance(`${id}-${String(i)}`, of)
+      );
+    const definitions = defs({
+      leaf: component([leafRoot as BlockNode]),
+      mid: component(many("m", "leaf")),
+      top: component(many("t", "mid")),
+    });
+    const doc = component([instance("i1", "top")]);
+
+    expect(composedRootTypes(doc, definitions)).toEqual(["core/text"]);
+    expect(leafWalks).toBe(1);
+  });
+
+  it("does not reuse roots answered nearer the surface where the composition cap refuses them deeper down", () => {
+    /*
+     * The one thing a remembered answer depends on besides the definition is
+     * how deep the instance sits: the cap refuses an instance at the depth
+     * limit, so a definition answered at the surface can be one the resolver
+     * leaves standing five levels down. Remembered answers carry the depth
+     * they were answered at and serve only the same depth or nearer.
+     *
+     * `c4` is met first at the surface, where everything under it fits, and
+     * then at the bottom of a chain, where the instance inside it is one
+     * past the cap.
+     */
+    const chain: Record<string, BlockDocument> = {};
+    for (let level = 0; level < MAX_COMPOSED_DEPTH; level += 1) {
+      chain[`c${String(level)}`] = component([
+        instance(`i${String(level)}`, `c${String(level + 1)}`),
+      ]);
+    }
+    chain[`c${String(MAX_COMPOSED_DEPTH)}`] = component([node("leaf")]);
+    const definitions = defs(chain);
+    const deepest = `c${String(MAX_COMPOSED_DEPTH - 1)}`;
+    const doc = component([
+      instance("shallow", deepest),
+      instance("deep", "c0"),
+    ]);
+
+    expect(composedRootTypes(doc, definitions)).toBeUndefined();
+    expect(
+      resolvedRoots(doc, definitions).includes(COMPONENT_INSTANCE_TYPE)
+    ).toBe(true);
+    // The control: met at the surface alone, the same definition answers.
+    expect(
+      composedRootTypes(component([instance("shallow", deepest)]), definitions)
+    ).toEqual(["core/text"]);
+  });
+
+  it("reuses roots answered deeper down where they are met nearer the surface", () => {
+    // The other direction is safe: what fit at depth four fits at depth one.
+    // A query meeting the deep reference first must still answer the shallow
+    // one, and from the remembered walk rather than a second one.
+    let walks = 0;
+    const leafRoot = { id: "leaf", version: 1, props: {} };
+    Object.defineProperty(leafRoot, "type", {
+      enumerable: true,
+      get: () => {
+        walks += 1;
+        return "core/text";
+      },
+    });
+    const definitions = defs({
+      leaf: component([leafRoot as BlockNode]),
+      wrap: component([instance("w1", "leaf")]),
+    });
+    const doc = component([instance("deep", "wrap"), instance("near", "leaf")]);
+
+    expect(composedRootTypes(doc, definitions)).toEqual(["core/text"]);
+    expect(walks).toBe(1);
+  });
+});
+
+describe("resolveComponentInstances under a caller's work allowance", () => {
+  it("charges every definition entry it clones", () => {
+    const work = { left: 100 };
+
+    const result = resolveComponentInstances(
+      page([instance("i1", "hero")]),
+      defs({ hero: component([node("d1"), node("d2"), node("d3")]) }),
+      { work }
+    );
+
+    expect(result.unresolved).toEqual([]);
+    expect(work.left).toBe(97);
+  });
+
+  it("keeps the charge for an expansion the node budget rolls back", () => {
+    // A definition that fits neither instance. Each attempt clones up to the
+    // node budget and is rolled back, which returns the budget, so the second
+    // instance attempts it all again. The composed document holds none of that
+    // work; the allowance holds all of it.
+    const work = { left: 100 };
+
+    const result = resolveComponentInstances(
+      page([instance("i1", "hero"), instance("i2", "hero")]),
+      defs({
+        hero: component([node("d1"), node("d2"), node("d3"), node("d4")]),
+      }),
+      { limits: { ...DEFAULT_LIMITS, maxNodes: 3 }, work }
+    );
+
+    expect(result.unresolved.map(e => e.reason)).toEqual(["budget", "budget"]);
+    expect(idsOf(result.document)).toEqual(["i1", "i2"]);
+    // Three nodes less the two instances leaves one; each attempt is credited
+    // the instance it replaces, clones two entries and stops at the third.
+    expect(work.left).toBe(96);
+  });
+
+  it("charges a node an override hides, which the node budget gives back", () => {
+    const work = { left: 100 };
+
+    const result = resolveComponentInstances(
+      page([
+        node("keep"),
+        instance("i1", "hero", { overrides: { gone: false } }),
+      ]),
+      defs({
+        hero: component([node("d1"), node("d2")], {
+          exposed: [
+            {
+              id: "gone",
+              label: "G",
+              nodeId: "d1",
+              propPath: "x",
+              type: "visibility",
+            },
+          ],
+        }),
+      }),
+      { limits: { ...DEFAULT_LIMITS, maxNodes: 2 }, work }
+    );
+
+    // The hidden node costs the composed document nothing, so the page still
+    // fits its cap — and looking at it was still work.
+    expect(result.unresolved).toEqual([]);
+    expect(flatten(result.document.nodes)).toHaveLength(2);
+    expect(work.left).toBe(98);
+  });
+
+  it("charges the slot prepass as well as the clone", () => {
+    // The same instance twice, once supplying slot content and once not.
+    // Supplying content runs a prepass over the definition's five entries
+    // before the clone walks them, and that pass is charged as well.
+    const definition = component(
+      [node("a"), node("b"), node("c"), node("d"), box("target", [])],
+      { slots: { tail: { label: "Tail", nodeId: "target", slot: "children" } } }
+    );
+    const bare = { left: 100 };
+    const supplied = { left: 100 };
+
+    resolveComponentInstances(
+      page([instance("i1", "hero")]),
+      defs({ hero: definition }),
+      { work: bare }
+    );
+    resolveComponentInstances(
+      page([instance("i1", "hero", {}, { slots: { tail: [node("s1")] } })]),
+      defs({ hero: definition }),
+      { work: supplied }
+    );
+
+    expect(100 - bare.left).toBe(5);
+    expect(bare.left - supplied.left).toBeGreaterThanOrEqual(5);
+  });
+
+  it("refuses for `budget` once the allowance is spent, rather than drawing half", () => {
+    const work = { left: 3 };
+
+    const result = resolveComponentInstances(
+      page([instance("i1", "hero"), instance("i2", "hero")]),
+      defs({ hero: component([node("d1"), node("d2")]) }),
+      { work }
+    );
+
+    // The first instance takes two entries; the second gets one of its two
+    // before the allowance is gone, and is refused rather than half drawn.
+    expect(result.unresolved).toEqual([
+      { instanceId: "i2", componentId: "hero", reason: "budget" },
+    ]);
+    expect(byInstanceOf(result.document, "i1")).toHaveLength(2);
+    expect(work.left).toBe(0);
+  });
+
+  it("composes exactly as it would without one while the allowance lasts", () => {
+    const doc = page([
+      node("keep"),
+      instance("i1", "hero"),
+      instance("i2", "gone"),
+    ]);
+    const definitions = defs({
+      hero: component([node("d1"), box("d2", [node("d3")])]),
+    });
+
+    const plain = resolveComponentInstances(doc, definitions);
+    const allowed = resolveComponentInstances(doc, definitions, {
+      work: { left: Number.POSITIVE_INFINITY },
+    });
+
+    expect(allowed.document).toEqual(plain.document);
+    expect(allowed.unresolved).toEqual(plain.unresolved);
+    expect(allowed.referenced).toEqual(plain.referenced);
+  });
+
+  it("refuses an allowance that would remove the bound rather than set one", () => {
+    const doc = page([instance("i1", "hero")]);
+    const definitions = defs({ hero: component([node("d1")]) });
+
+    // `left <= 0` is false for both, so either would spend without ever stopping.
+    expect(() =>
+      resolveComponentInstances(doc, definitions, {
+        work: { left: Number.NaN },
+      })
+    ).toThrow(RangeError);
+    expect(() =>
+      resolveComponentInstances(doc, definitions, {
+        work: { left: "many" as unknown as number },
+      })
+    ).toThrow(RangeError);
+  });
+
+  it("prepares nothing for an instance once the allowance is spent", () => {
+    // The first instance spends the allowance on its only entry. Planning the
+    // second would read its overrides before the clone refused it, and that
+    // preparation is work the allowance never charges.
+    let overridesRead = 0;
+    const second = instance("i2", "hero");
+    Object.defineProperty(second.props, "overrides", {
+      enumerable: true,
+      get() {
+        overridesRead += 1;
+        return {};
+      },
+    });
+    const work = { left: 1 };
+
+    const result = resolveComponentInstances(
+      page([instance("i1", "hero"), second]),
+      defs({ hero: component([node("d1")]) }),
+      { work }
+    );
+
+    expect(result.unresolved).toEqual([
+      { instanceId: "i2", componentId: "hero", reason: "budget" },
+    ]);
+    expect(overridesRead).toBe(0);
+  });
+});
+
+describe("resolveComponentInstances and the loops it closes", () => {
+  it("reports every loop it closes, and none where there is none", () => {
+    const looping = resolveComponentInstances(
+      page([instance("i1", "hero")]),
+      defs({ hero: component([instance("c1", "hero")]) })
+    );
+    const clean = resolveComponentInstances(
+      page([instance("i1", "hero")]),
+      defs({ hero: component([node("d1")]) })
+    );
+
+    expect(looping.unresolved.map(e => e.reason)).toEqual(["cycle"]);
+    expect(looping.loopsClosed).toEqual(["hero"]);
+    expect(clean.loopsClosed).toEqual([]);
+  });
+
+  it("keeps a loop it closed inside an expansion it then abandons", () => {
+    // The loop closes on the definition's first entry and the allowance runs
+    // out two entries later. Abandoning the expansion rolls its refusals out of
+    // `unresolved`, since no reader receives that subtree; the loop is a fact
+    // about the definitions and stays reported.
+    const work = { left: 2 };
+
+    const result = resolveComponentInstances(
+      page([instance("i1", "hero")]),
+      defs({
+        hero: component([instance("c1", "hero"), node("x1"), node("x2")]),
+      }),
+      { work }
+    );
+
+    expect(result.unresolved.map(e => e.reason)).toEqual(["budget"]);
+    expect(result.loopsClosed).toEqual(["hero"]);
+  });
+
+  it("forgets a loop closed inside an expansion it could not read", () => {
+    // The loop closes on the definition's first entry, and the second throws
+    // when the clone reads it. The whole expansion is refused as unreadable and
+    // drawn as a placeholder, so no reader receives the loop and it is not
+    // reported as one.
+    const hostile = node("x1");
+    Object.defineProperty(hostile, "props", {
+      enumerable: true,
+      get() {
+        throw new Error("a field that cannot be read");
+      },
+    });
+
+    const result = resolveComponentInstances(
+      page([instance("i1", "hero")]),
+      defs({ hero: component([instance("c1", "hero"), hostile]) })
+    );
+
+    expect(result.unresolved.map(e => e.reason)).toEqual(["unreadable"]);
+    expect(result.loopsClosed).toEqual([]);
+  });
+});
+
+/** The placement gates the resolver put on a node, a render-time key. */
+const gatesOn = (node: ResolvedBlockNode | undefined): unknown =>
+  (node?.visibility as { within?: unknown } | undefined)?.within;
+
+describe("an instance carrying visibility conditions", () => {
+  const vip = [[{ field: "tier", op: "equals", value: "vip" }]];
+  const featured = [[{ field: "featured", op: "is_true" }]];
+  const card = component([
+    node("plain"),
+    node("own", { visibility: { conditions: featured } }),
+  ]);
+  const conditioned = (extra: Partial<BlockNode> = {}) =>
+    page([
+      instance("i1", "card", {}, { visibility: { conditions: vip }, ...extra }),
+    ]);
+
+  it("stands by default, for the pass that prunes hidden nodes", () => {
+    const result = resolveComponentInstances(conditioned(), defs({ card }));
+    expect(result.document.nodes.map(each => each.type)).toEqual([
+      COMPONENT_INSTANCE_TYPE,
+    ]);
+  });
+
+  it("is expanded when asked to carry, each root keeping its own conditions and gated by the instance's", () => {
+    const result = resolveComponentInstances(conditioned(), defs({ card }), {
+      conditioned: "carry",
+    });
+    const roots = result.document.nodes;
+    expect(roots.map(each => each.type)).toEqual(["core/text", "core/text"]);
+    // The instance's conditions are a gate of their own, judged apart from
+    // the root's, so neither is multiplied into the other.
+    expect(roots[0]?.visibility).toEqual({ within: [{ conditions: vip }] });
+    expect(roots[1]?.visibility).toEqual({
+      conditions: featured,
+      within: [{ conditions: vip }],
+    });
+    // Every root stays gated, so a reader deciding nothing still holds it back.
+    for (const root of roots) expect(isConditionGated(root)).toBe(true);
+  });
+
+  it("keeps the devices the instance hides on beside the conditions it carries", () => {
+    const result = resolveComponentInstances(
+      conditioned({
+        visibility: { conditions: vip, devices: { mobile: false } },
+      } as Partial<BlockNode>),
+      defs({ card }),
+      { conditioned: "carry" }
+    );
+    expect(result.document.nodes[0]?.visibility).toEqual({
+      devices: { mobile: false },
+      within: [{ conditions: vip }],
+    });
+  });
+
+  it("passes a visibility nothing can read on to every root, so each fails closed", () => {
+    const unreadable = page([
+      stored(instance("i1", "card") as ResolvedBlockNode, {
+        visibility: "hidden",
+      }) as BlockNode,
+    ]);
+    const result = resolveComponentInstances(unreadable, defs({ card }), {
+      conditioned: "carry",
+    });
+    const roots = result.document.nodes;
+    // CONTROL: the instance was expanded rather than left standing.
+    expect(roots.map(each => each.type)).toEqual(["core/text", "core/text"]);
+    for (const root of roots) {
+      expect(isConditionGated(root)).toBe(true);
+      expect(gatesOn(root)).toContain("hidden");
+    }
+  });
+
+  it("keeps each placement's gate apart through nested components", () => {
+    const outer = component([
+      instance("inner", "card", {}, { visibility: { conditions: featured } }),
+    ]);
+    const result = resolveComponentInstances(
+      page([instance("i1", "outer", {}, { visibility: { conditions: vip } })]),
+      defs({ card: component([node("plain")]), outer }),
+      { conditioned: "carry" }
+    );
+    const [root] = result.document.nodes;
+    expect(root?.type).toBe("core/text");
+    expect(root?.visibility?.conditions).toBeUndefined();
+    expect(gatesOn(root)).toHaveLength(2);
+    expect(gatesOn(root)).toEqual(
+      expect.arrayContaining([{ conditions: vip }, { conditions: featured }])
+    );
+  });
+});

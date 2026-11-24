@@ -1,0 +1,271 @@
+"use client";
+
+import * as React from "react";
+
+import { Loader2, Search, X } from "@admin/components/icons";
+import { Input } from "@admin/components/ui";
+import { useT } from "@admin/lib/i18n/I18nProvider";
+import { cn } from "@admin/lib/utils";
+
+import {
+  WRAPPER_BASE,
+  inertClassMessage,
+  inertClassesIn,
+} from "./inert-classes";
+import type { SearchBarProps } from "./types";
+
+/**
+ * SearchBar Component
+ *
+ * A reusable search bar component with debounced input, clear button, and loading indicator.
+ * Designed for data tables, lists, and any component that requires search functionality.
+ *
+ * ## Design Specifications
+ * - **Height**: 40px (h-10) - matches Input default size
+ * - **Icon Size**: 16px (h-4 w-4) - lucide-react icons
+ * - **Debounce**: Configurable delay (default: 300ms)
+ * - **Border Radius**: `rounded-md`, the same `--radius` step as Input
+ * - **Spacing**: Icons have 12px padding from edges
+ *
+ * ## Features
+ * - **Debounced input**: Reduces API calls by delaying onChange until user stops typing
+ * - **Clear button**: X icon appears when value is not empty, clears input on click
+ * - **Loading indicator**: Animated spinner shows during data fetching
+ * - **Keyboard support**: Focus management, Enter key support
+ * - **Accessibility**: Proper ARIA attributes, aria-busy during loading
+ *
+ * ## Accessibility
+ * - `aria-busy` attribute indicates loading state to screen readers
+ * - Clear button has `aria-label` for screen readers
+ * - Input maintains focus after clear action
+ * - Loading spinner has `aria-hidden` (visual indicator only)
+ *
+ * ## Usage Examples
+ *
+ * ### Basic Usage
+ * ```tsx
+ * import { SearchBar } from "@nextly/admin";
+ *
+ * function UserList() {
+ *   const [search, setSearch] = useState("");
+ *
+ *   return (
+ *     <SearchBar
+ *       value={search}
+ *       onChange={setSearch}
+ *       placeholder="Search users..."
+ *     />
+ *   );
+ * }
+ * ```
+ *
+ * ### With Loading State
+ * ```tsx
+ * function UserList() {
+ *   const [search, setSearch] = useState("");
+ *   const { data, isLoading } = useUsers({ filters: { search } });
+ *
+ *   return (
+ *     <SearchBar
+ *       value={search}
+ *       onChange={setSearch}
+ *       placeholder="Search users..."
+ *       isLoading={isLoading}
+ *     />
+ *   );
+ * }
+ * ```
+ *
+ * ### Custom Debounce Delay
+ * ```tsx
+ * <SearchBar
+ *   value={search}
+ *   onChange={setSearch}
+ *   placeholder="Search..."
+ *   debounceDelay={500} // Wait 500ms instead of default 300ms
+ * />
+ * ```
+ *
+ * ### With Custom Width
+ * ```tsx
+ * <SearchBar
+ *   value={search}
+ *   onChange={setSearch}
+ *   placeholder="Search..."
+ *   className="w-full md:w-96"
+ * />
+ * ```
+ *
+ * @example
+ * ```tsx
+ * <SearchBar
+ *   value={searchQuery}
+ *   onChange={setSearchQuery}
+ *   placeholder="Search users by name or email"
+ *   isLoading={isLoadingUsers}
+ * />
+ * ```
+ */
+export const SearchBar: React.ForwardRefExoticComponent<
+  {
+    value?: string;
+    onChange: (value: string) => void;
+    placeholder?: string;
+    debounceDelay?: number;
+    isLoading?: boolean;
+    className?: string;
+  } & Omit<
+    React.InputHTMLAttributes<HTMLInputElement>,
+    "onChange" | "size" | "type" | "value"
+  > &
+    React.RefAttributes<HTMLInputElement>
+> = React.forwardRef<HTMLInputElement, SearchBarProps>(
+  (
+    {
+      value = "",
+      onChange,
+      placeholder,
+      debounceDelay = 300,
+      isLoading = false,
+      className,
+      ...props
+    },
+    ref
+  ) => {
+    // The bar's own words read in the interface language; a caller's own
+    // placeholder is shown as given.
+    const t = useT();
+    // Internal state for immediate UI updates
+    const [internalValue, setInternalValue] = React.useState(value);
+
+    // Merged once and used for both the element and the warning. The prop is
+    // not what renders: `cn` drops the loser of any conflict, so a caller
+    // passing `border-input border-destructive` puts only the second on the
+    // element, and judging the prop would name a class the DOM never had.
+    const wrapperClassName = cn(WRAPPER_BASE, className);
+
+    // A class aimed at the field reaches the wrapper and does nothing there,
+    // silently. Warned from inside the component because this is the only
+    // place the FINAL class string exists: a source check has to predict it,
+    // and the ways to write one -- an aliased import, a template, a
+    // concatenation, a character reference, a helper's return value -- are the
+    // whole of JavaScript. Here it is just a string.
+    //
+    // Development only, and effectful rather than computed during render.
+    React.useEffect(() => {
+      // Opted INTO development rather than out of production. That is the
+      // polarity the rest of the admin uses, and it is the one that fails
+      // safe: if the value is ever absent, or folded to something unexpected
+      // by a bundler, an opt-in stays silent while an opt-out ships a console
+      // warning to every consumer of the published package.
+      if (process.env.NODE_ENV !== "development") return;
+      const inert = inertClassesIn(wrapperClassName);
+      if (inert.length > 0) console.warn(inertClassMessage(inert));
+    }, [wrapperClassName]);
+
+    // Sync internal value when parent value changes externally
+    React.useEffect(() => {
+      setInternalValue(value);
+    }, [value]);
+
+    // Use a timer to debounce onChange calls
+    React.useEffect(() => {
+      // Don't trigger if it matches the current parent value
+      if (internalValue === value) return;
+
+      const timer = setTimeout(() => {
+        onChange(internalValue);
+      }, debounceDelay);
+
+      return () => clearTimeout(timer);
+    }, [internalValue, value, debounceDelay, onChange]);
+
+    // Handle input change
+    const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+      setInternalValue(e.target.value);
+    };
+
+    // Handle clear button click
+    const handleClear = () => {
+      setInternalValue("");
+      onChange("");
+      // Focus input after clearing
+      if (ref && "current" in ref && ref.current) {
+        ref.current.focus();
+      }
+    };
+
+    return (
+      <div className={wrapperClassName}>
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+        {/* Composes Input rather than restating its classes. The copy this
+            replaced had drifted from the original in twelve ways that a reader
+            comparing them would not notice: no `aria-invalid` or
+            `data-[invalid=true]` handling at all, so a search field could not
+            show an error state; `focus:border-primary` without the `!` Input
+            uses, so the focus ring lost to any later border utility; and no
+            `selection:*` colours, `placeholder:opacity-50` or
+            `disabled:pointer-events-none`.
+
+            It also meant palette work reached every input EXCEPT this one,
+            because the border token was named in two places and only one of
+            them was maintained. Only the search-specific parts stay here: room
+            for the leading icon and the trailing clear button. */}
+        <Input
+          // Before the spread, not after: a caller passing its own
+          // `data-testid` must win. This is a publicly exported component whose
+          // props extend the native input's, so silently replacing a consumer's
+          // test hook with an internal one breaks their tests and gives them no
+          // way to address the field.
+          data-testid="search-input"
+          {...props}
+          ref={ref}
+          // `search`, not `text`: assistive technology announces it as a search
+          // field, and the suite has asserted this since it was written. The
+          // native WebKit cancel button is suppressed because this component
+          // renders its own clear affordance, which also handles focus return.
+          type="search"
+          placeholder={placeholder ?? t("nextly.search.placeholder")}
+          value={internalValue}
+          onChange={handleChange}
+          aria-busy={isLoading}
+          // Only what is search-specific: room for the leading icon and the
+          // trailing clear button, and no native cancel glyph beside our own.
+          // Height is deliberately absent -- Input sizes itself from
+          // `--nx-control-height`, and restating it here as `h-10` pinned this
+          // one field at 40px while every other default control followed the
+          // token. That is the same drift this component was rewritten to
+          // remove, one property further in.
+          className="pl-10 pr-10 [&::-webkit-search-cancel-button]:appearance-none"
+        />
+
+        {/* Right side icons (clear button + loading spinner) */}
+        {(internalValue || isLoading) && (
+          <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-2">
+            {/* Loading spinner */}
+            {isLoading && (
+              <Loader2
+                className="h-3.5 w-3.5 text-primary animate-spin"
+                aria-hidden="true"
+              />
+            )}
+
+            {/* Clear button */}
+            {internalValue && (
+              <button
+                type="button"
+                onClick={handleClear}
+                aria-label={t("nextly.search.clear")}
+                className="text-muted-foreground hover:text-foreground transition-colors p-0.5 rounded-md hover-unified"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+);
+
+SearchBar.displayName = "SearchBar";

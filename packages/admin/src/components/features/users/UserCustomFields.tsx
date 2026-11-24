@@ -1,0 +1,408 @@
+"use client";
+
+/**
+ * UserCustomFields Component
+ *
+ * Dynamic field renderer for custom user fields defined via `defineConfig()`
+ * or the admin Settings > User Fields UI. Fetches merged field definitions
+ * from the server and renders the appropriate input component for each field
+ * type, integrated with react-hook-form.
+ *
+ * Fields are registered under a `customFields.{name}` path prefix to avoid
+ * collisions with standard user fields (name, email, password, etc.).
+ *
+ * Reuses existing entry field input components (TextInput, SelectInput, etc.)
+ * via a `toFieldConfig()` adapter for consistent look & feel.
+ *
+ * @module components/users/UserCustomFields
+ */
+
+import { Skeleton } from "@nextlyhq/ui";
+import type {
+  CheckboxFieldConfig,
+  DateFieldConfig,
+  EmailFieldConfig,
+  FieldConfig,
+  NumberFieldConfig,
+  RadioFieldConfig,
+  SelectFieldConfig,
+  TextareaFieldConfig,
+  TextFieldConfig,
+} from "nextly/config";
+import type { JSX } from "react";
+import { useMemo } from "react";
+import type { Control, FieldErrors, FieldValues } from "react-hook-form";
+
+import { fieldAdminGates } from "@admin/components/features/entries/fields/field-admin-gates";
+import { FieldWrapper } from "@admin/components/features/entries/fields/FieldWrapper";
+import { NumberInput } from "@admin/components/features/entries/fields/number/NumberInput";
+import { CheckboxInput } from "@admin/components/features/entries/fields/selection/CheckboxInput";
+import { DateInput } from "@admin/components/features/entries/fields/selection/DateInput";
+import { RadioInput } from "@admin/components/features/entries/fields/selection/RadioInput";
+import { SelectInput } from "@admin/components/features/entries/fields/selection/SelectInput";
+import { EmailInput } from "@admin/components/features/entries/fields/text/EmailInput";
+import { TextareaInput } from "@admin/components/features/entries/fields/text/TextareaInput";
+import { TextInput } from "@admin/components/features/entries/fields/text/TextInput";
+import { PluginSlot } from "@admin/components/shared/plugin-slot";
+import { useUserFields } from "@admin/hooks/queries/useUserFields";
+import { usePluginFieldType } from "@admin/lib/plugins/plugin-field-type";
+import type { UserFieldDefinitionRecord } from "@admin/services/userFieldsApi";
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/** Prefix for custom field form paths to avoid collisions with standard fields */
+const CUSTOM_FIELD_PREFIX = "customFields";
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export interface UserCustomFieldsProps {
+  /** react-hook-form control from the parent form */
+  control: Control<FieldValues>;
+  /** react-hook-form errors from the parent form */
+  errors: FieldErrors<FieldValues>;
+  /** Whether all fields should be disabled */
+  disabled?: boolean;
+  /** Section title override (defaults to "Additional Information") */
+  groupLabel?: string;
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/**
+ * Converts a flat `UserFieldDefinitionRecord` to a `FieldConfig`-compatible
+ * object that the existing entry field input components can consume.
+ *
+ * Maps flat properties (placeholder, description, options) into the nested
+ * `admin` structure expected by collection field components.
+ */
+function toFieldConfig(def: UserFieldDefinitionRecord): FieldConfig {
+  const base = {
+    // Whatever a contributed type declared for itself, spread first so the
+    // modelled properties below always win. A type states what it needs to
+    // render — a rating's scale, a picker's source — and those keys have no
+    // column of their own, so a config rebuilt without them hands the plugin's
+    // own editor a field stripped of its declaration.
+    ...(def.pluginOptions ?? {}),
+    name: def.name,
+    label: def.label,
+    type: def.type,
+    required: def.required,
+    defaultValue: def.defaultValue ?? undefined,
+    admin: {
+      // Merged, not replaced. `admin` is one of the keys carried whole, so a
+      // declared `readOnly` or `hidden` lives inside it; assigning a fresh
+      // object here dropped everything the type declared and kept only the two
+      // values hoisted onto their own columns.
+      ...((def.pluginOptions?.admin ?? {}) as Record<string, unknown>),
+      placeholder: def.placeholder ?? undefined,
+      description: def.description ?? undefined,
+    },
+  };
+
+  // Add options for select/radio fields
+  if ((def.type === "select" || def.type === "radio") && def.options) {
+    return { ...base, options: def.options } as FieldConfig;
+  }
+
+  return base as FieldConfig;
+}
+
+/**
+ * Retrieves a nested error from React Hook Form errors object.
+ * Handles dot-notation paths like "customFields.phone".
+ */
+function getNestedError(
+  errors: FieldErrors<FieldValues>,
+  path: string
+): string | undefined {
+  const keys = path.split(".");
+  let current: unknown = errors;
+
+  for (const key of keys) {
+    if (current && typeof current === "object" && key in current) {
+      current = (current as Record<string, unknown>)[key];
+    } else {
+      return undefined;
+    }
+  }
+
+  if (
+    current &&
+    typeof current === "object" &&
+    "message" in current &&
+    typeof (current as { message?: string }).message === "string"
+  ) {
+    return (current as { message: string }).message;
+  }
+
+  return undefined;
+}
+
+// ============================================================================
+// Component
+// ============================================================================
+
+/**
+ * UserCustomFields renders dynamic form inputs for each custom user field.
+ *
+ * Features:
+ * - Fetches merged field definitions from `GET /admin/api/user-fields`
+ * - Filters to active fields only, sorted by `sortOrder`
+ * - Renders appropriate input for each field type (text, textarea, email,
+ *   number, select, radio, checkbox, date)
+ * - Integrates with react-hook-form via `control` prop
+ * - Uses `customFields.{name}` path prefix to avoid name collisions
+ * - Reuses existing entry field input components via adapter pattern
+ * - Responsive grid layout matching user form style
+ * - Loading skeleton while fetching
+ * - Graceful empty state when no custom fields configured
+ *
+ * @example
+ * ```tsx
+ * <UserCustomFields
+ *   control={control}
+ *   errors={errors}
+ *   disabled={isSubmitting}
+ * />
+ * ```
+ */
+export function UserCustomFields({
+  control,
+  errors,
+  disabled = false,
+  groupLabel = "Additional Information",
+}: UserCustomFieldsProps): JSX.Element | null {
+  const { data, isLoading, isError } = useUserFields();
+
+  // The fields this form draws: active, not declared hidden, in sortOrder.
+  // A hidden field is left out here rather than inside its input, so a form
+  // whose every active field is hidden draws no section at all — not a
+  // heading over an empty grid. Asked of the shared gates, because this form
+  // draws each field's wrapper itself rather than through the entry form's
+  // renderer, where every other field meets them. User fields evaluate no
+  // condition on this form, so hidden is the gate that applies.
+  const shownFields = useMemo(() => {
+    if (!data?.fields) return [];
+    return data.fields
+      .filter(f => f.isActive)
+      .sort((a, b) => a.sortOrder - b.sortOrder)
+      .map(def => ({ def, fieldConfig: toFieldConfig(def) }))
+      .filter(({ fieldConfig }) => !fieldAdminGates(fieldConfig).hidden);
+  }, [data]);
+
+  // Loading state — skeleton placeholder
+  if (isLoading) {
+    return (
+      <div className="space-y-4">
+        <Skeleton className="h-5 w-40" />
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <Skeleton className="h-4 w-24" />
+            <Skeleton className="h-10 w-full" />
+          </div>
+          <div className="space-y-2">
+            <Skeleton className="h-4 w-24" />
+            <Skeleton className="h-10 w-full" />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Error or no data — silently return nothing
+  if (isError || !data) {
+    return null;
+  }
+
+  // No custom field to draw — render nothing
+  if (shownFields.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="space-y-4">
+      <h3 className="text-lg font-semibold text-foreground">{groupLabel}</h3>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {shownFields.map(({ def, fieldConfig }) => {
+          const fieldPath = `${CUSTOM_FIELD_PREFIX}.${def.name}`;
+
+          return (
+            <UserFieldInput
+              key={def.id}
+              fieldConfig={fieldConfig}
+              fieldPath={fieldPath}
+              control={control}
+              error={getNestedError(errors, fieldPath)}
+              disabled={disabled}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Field Input Dispatcher
+// ============================================================================
+
+interface UserFieldInputProps {
+  /** FieldConfig-compatible object from toFieldConfig() */
+  fieldConfig: FieldConfig;
+  /** Full form path including prefix, e.g. "customFields.phone" */
+  fieldPath: string;
+  /** react-hook-form control */
+  control: Control<FieldValues>;
+  /** Error message for this field */
+  error?: string;
+  /** Whether the field is disabled */
+  disabled?: boolean;
+}
+
+/**
+ * Renders the appropriate input component for a single user custom field.
+ * Uses FieldWrapper for consistent label/error/description presentation.
+ */
+function UserFieldInput({
+  fieldConfig,
+  fieldPath,
+  control,
+  error,
+  disabled,
+}: UserFieldInputProps) {
+  const pluginFieldType = usePluginFieldType(fieldConfig.type);
+  const isCheckbox = fieldConfig.type === "checkbox";
+
+  return (
+    <FieldWrapper
+      field={fieldConfig}
+      error={error}
+      fieldPath={fieldPath}
+      horizontal={isCheckbox}
+    >
+      {renderInput()}
+    </FieldWrapper>
+  );
+
+  function renderInput() {
+    const fieldType = fieldConfig.type as string;
+    const commonProps = {
+      name: fieldPath,
+      control,
+      disabled,
+    };
+
+    switch (fieldType) {
+      case "text":
+        return (
+          <TextInput {...commonProps} field={fieldConfig as TextFieldConfig} />
+        );
+
+      case "textarea":
+        return (
+          <TextareaInput
+            {...commonProps}
+            field={fieldConfig as TextareaFieldConfig}
+          />
+        );
+
+      case "email":
+        return (
+          <EmailInput
+            {...commonProps}
+            field={fieldConfig as EmailFieldConfig}
+          />
+        );
+
+      case "number":
+        return (
+          <NumberInput
+            {...commonProps}
+            field={fieldConfig as NumberFieldConfig}
+          />
+        );
+
+      case "select":
+        return (
+          <SelectInput
+            {...commonProps}
+            field={fieldConfig as SelectFieldConfig}
+          />
+        );
+
+      case "radio":
+        return (
+          <RadioInput
+            {...commonProps}
+            field={fieldConfig as RadioFieldConfig}
+          />
+        );
+
+      case "checkbox":
+        return (
+          <CheckboxInput
+            {...commonProps}
+            field={fieldConfig as CheckboxFieldConfig}
+          />
+        );
+
+      case "date":
+        return (
+          <DateInput {...commonProps} field={fieldConfig as DateFieldConfig} />
+        );
+
+      default: {
+        // A plugin-contributed users-surface field type renders through its
+        // own admin component (PluginSlot isolates it), the same way the entry
+        // form does, so a plugin user field is editable, not just definable.
+        const unsupported = (
+          // Full-strength destructive border so the boundary is perceivable.
+          <div className="rounded-md  border border-danger-border bg-danger-surface p-3 text-center">
+            <p className="text-sm text-destructive">
+              Unsupported field type: {fieldType}
+            </p>
+          </div>
+        );
+        /*
+         * The plugin list has three states and only one supports the sentence
+         * above. Reading it directly made "Unsupported field type" the answer
+         * while the list was still in flight AND when it had failed outright,
+         * so a correctly-installed plugin field read as a broken one on every
+         * load and stayed that way whenever the request did not come back.
+         */
+        if (pluginFieldType.status === "loading") {
+          return <Skeleton className="h-10 w-full" />;
+        }
+        if (pluginFieldType.status === "unavailable") {
+          return (
+            <div className="rounded-md border border-border bg-muted/50 p-3 text-center">
+              <p className="text-sm text-muted-foreground">
+                This field could not be loaded because the list of installed
+                plugins is unavailable. Reload the page to try again.
+              </p>
+            </div>
+          );
+        }
+        const customComponent = pluginFieldType.component;
+        if (customComponent) {
+          return (
+            <PluginSlot
+              path={customComponent}
+              props={{ ...commonProps, field: fieldConfig }}
+              // If the plugin component can't be resolved, keep the visible
+              // error instead of rendering a blank field.
+              fallback={unsupported}
+            />
+          );
+        }
+        return unsupported;
+      }
+    }
+  }
+}

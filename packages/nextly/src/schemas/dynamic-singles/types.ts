@@ -1,0 +1,356 @@
+/**
+ * Dialect-Agnostic Type Definitions for Dynamic Singles
+ *
+ * These types define the structure for the `dynamic_singles` metadata table
+ * and are used by all dialect-specific schemas (PostgreSQL, MySQL, SQLite).
+ *
+ * Singles are single-document entities
+ * for storing site-wide configuration such as site settings, navigation menus,
+ * footers, and homepage configurations.
+ *
+ * Key differences from Dynamic Collections:
+ * - Only one document per Single (no list view)
+ * - No create/delete operations (auto-created on first access)
+ * - Simplified access rules (read/update only)
+ * - No stored hooks (hooks are code-only for Singles)
+ * - No pagination or list column configuration
+ *
+ * @module schemas/dynamic-singles/types
+ * @since 1.0.0
+ */
+
+import type { FieldConfig } from "../../collections/fields/types";
+import type { RevalidateConfig } from "../../revalidation/types";
+import type { SingleAdminOptions } from "../../singles/config/types";
+// Registry-facing webhook recording shape for the `webhooks` column. Declared
+// once alongside the collections registry types so both tables store the
+// identical shape and the recording policy has one thing to parse.
+import type { StoredWebhookRecording } from "../dynamic-collections/types";
+// Registry-facing resolved versioning config shape for the `versions` column.
+import type { ResolvedVersionsConfig } from "../versions/types";
+
+// Re-exported so the dialect schema files in this folder resolve the shape from
+// their sibling `./types` like every other column type, rather than reaching
+// across into the collections folder.
+export type { StoredWebhookRecording };
+
+// ============================================================
+// Single Source & Status Types
+// ============================================================
+
+/**
+ * Source of the Single definition.
+ *
+ * - `code`: Defined in code via `defineSingle()` in a config file
+ * - `ui`: Created through the Visual Single Builder in Admin UI
+ * - `built-in`: System Singles provided by Nextly core (future use)
+ *
+ * @example
+ * ```typescript
+ * const source: SingleSource = 'code';
+ * ```
+ */
+export type SingleSource = "code" | "ui" | "built-in";
+
+/**
+ * Migration status for a Single's schema.
+ *
+ * - `synced`: Schema is in sync with the database (no pending changes)
+ * - `pending`: Schema has changed but migration not yet created
+ * - `generated`: Migration file has been created but not applied
+ * - `applied`: Migration has been applied to the database (table verified to exist)
+ * - `failed`: Migration was attempted but table creation failed
+ *
+ * @example
+ * ```typescript
+ * if (single.migrationStatus === 'pending') {
+ *   console.log('Run `nextly migrate:create` to generate migration');
+ * }
+ * if (single.migrationStatus === 'failed') {
+ *   console.log('Table creation failed - check logs and retry');
+ * }
+ * ```
+ */
+export type SingleMigrationStatus =
+  | "synced"
+  | "pending"
+  | "generated"
+  | "applied"
+  | "failed";
+
+// ============================================================
+// Single Access Rules
+// ============================================================
+
+// ============================================================
+// Dynamic Single Types
+// ============================================================
+
+/**
+ * Insert type for creating a new dynamic Single.
+ *
+ * Contains all required and optional fields for inserting a Single
+ * into the `dynamic_singles` table. Fields with defaults (like
+ * `schemaVersion`, `migrationStatus`) are optional on insert.
+ *
+ * @example
+ * ```typescript
+ * const newSingle: DynamicSingleInsert = {
+ *   slug: 'site-settings',
+ *   label: 'Site Settings',
+ *   tableName: 'single_site_settings',
+ *   fields: [
+ *     { type: 'text', name: 'siteName', required: true },
+ *     { type: 'text', name: 'tagline' },
+ *   ],
+ *   source: 'code',
+ *   schemaHash: 'abc123...',
+ * };
+ * ```
+ */
+export interface DynamicSingleInsert {
+  /**
+   * Unique slug identifier for the Single.
+   * Used in URLs and API endpoints (e.g., "site-settings", "header").
+   * Must be unique across all Singles AND Collections.
+   */
+  slug: string;
+
+  /**
+   * Display label for the Admin UI.
+   * Unlike Collections, Singles only need a singular label.
+   *
+   * @example 'Site Settings', 'Header Navigation', 'Footer'
+   */
+  label: string;
+
+  /**
+   * Database table name for this Single.
+   * Must be unique across all tables.
+   * Convention: prefix with `single_` (e.g., 'single_site_settings').
+   */
+  tableName: string;
+
+  /**
+   * Optional description of the Single's purpose.
+   * Displayed in the Admin UI.
+   *
+   * `null` clears a stored description, where `undefined` means "leave the
+   * column as it is". A sync that could only say `undefined` had no way to
+   * remove one the config had dropped, so the row kept describing the Single
+   * by a sentence nothing declared any more. Matches `DynamicCollectionInsert`.
+   */
+  description?: string | null;
+
+  /**
+   * Field configurations defining the Single's document structure.
+   * Supports all 26 field types from the Collections system.
+   */
+  fields: FieldConfig[];
+
+  /**
+   * Admin UI configuration options.
+   * Controls sidebar grouping, icon, visibility, etc.
+   *
+   * `null` clears a stored block, for the reason `description` states. The
+   * write path already resolved a falsy value to `NULL`; only this type said
+   * otherwise. Matches `DynamicCollectionInsert`.
+   */
+  admin?: SingleAdminOptions | null;
+
+  /**
+   * Where the Single was defined.
+   * - 'code': defineSingle() in a config file
+   * - 'ui': Visual Single Builder
+   * - 'built-in': System Singles from Nextly core
+   */
+  source: SingleSource;
+
+  /**
+   * If true, the Single cannot be modified via the Admin UI.
+   * Code-first Singles are locked by default.
+   */
+  locked?: boolean;
+
+  /**
+   * Whether the Single carries a Draft/Published status column.
+   * When true, a `status` column ('draft' | 'published', default 'draft') is
+   * synthesized into the Single's table. Public callers see the published
+   * version by default; admin callers see drafts. See the query-layer
+   * `resolveStatusFilter` for enforcement. Default: false.
+   */
+  status?: boolean;
+
+  /** Single-level i18n master switch. Default: false. */
+  localized?: boolean;
+
+  /**
+   * Resolved content-versioning config (from `resolveVersionsConfig`), or null
+   * when unversioned. Persisted on the `versions` column; the mutation service
+   * reads it back to decide whether to capture a version snapshot on write.
+   */
+  versions?: ResolvedVersionsConfig | null;
+
+  /**
+   * Cache-revalidation config (`{ tags?, disable? }`), or null when the single
+   * sets none. Persisted on the `revalidate` column; the write path reads it
+   * back to honor `disable` and merge extra `tags`.
+   */
+  revalidate?: RevalidateConfig | null;
+
+  /**
+   * Webhook recording policy (`{ record: false }`), or null when the single
+   * uses the default of recording. Persisted on the `webhooks` column so a
+   * Builder-authored opt-out survives a restart; for `source: 'code'` singles
+   * the code-first `webhooks` option stays the source of truth.
+   */
+  webhooks?: StoredWebhookRecording | null;
+
+  /**
+   * Path to the config file (code-first Singles only).
+   * Used for syncing and displaying source location.
+   *
+   * @example "src/singles/site-settings.ts"
+   */
+  configPath?: string;
+
+  /**
+   * SHA-256 hash of the fields definition.
+   * Used for change detection during sync operations.
+   */
+  schemaHash: string;
+
+  /**
+   * Schema version number, incremented on each change.
+   * Defaults to 1 for new Singles.
+   */
+  schemaVersion?: number;
+
+  /**
+   * Current migration status.
+   * Defaults to 'pending' for new Singles.
+   */
+  migrationStatus?: SingleMigrationStatus;
+
+  /**
+   * Reference to the last applied migration ID.
+   * Null for Singles that haven't been migrated yet.
+   */
+  lastMigrationId?: string;
+
+  /**
+   * User ID who created the Single (optional).
+   * Only set for UI-created Singles.
+   */
+  createdBy?: string;
+}
+
+/**
+ * Full record type for a dynamic Single.
+ *
+ * Extends `DynamicSingleInsert` with all required fields that are
+ * set by the database (id, timestamps) or have default values.
+ *
+ * @example
+ * ```typescript
+ * const single: DynamicSingleRecord = {
+ *   id: 'uuid-123',
+ *   slug: 'site-settings',
+ *   label: 'Site Settings',
+ *   tableName: 'single_site_settings',
+ *   fields: [...],
+ *   source: 'code',
+ *   locked: true,
+ *   schemaHash: 'abc123...',
+ *   schemaVersion: 1,
+ *   migrationStatus: 'applied',
+ *   createdAt: new Date(),
+ *   updatedAt: new Date(),
+ * };
+ * ```
+ */
+export interface DynamicSingleRecord extends DynamicSingleInsert {
+  /**
+   * Unique identifier (UUID or CUID).
+   * Auto-generated by the database.
+   */
+  id: string;
+
+  /**
+   * Schema version number (required, starts at 1).
+   */
+  schemaVersion: number;
+
+  /**
+   * Current migration status (required).
+   */
+  migrationStatus: SingleMigrationStatus;
+
+  /**
+   * Whether Single is locked from UI edits (required).
+   * Code-first Singles are always locked.
+   */
+  locked: boolean;
+
+  /**
+   * Whether Draft/Published status is enabled (required, defaults to false).
+   */
+  status: boolean;
+
+  /** Whether single-level i18n is enabled (required, defaults to false). */
+  localized: boolean;
+
+  /**
+   * When the Single was created.
+   * Auto-set by the database.
+   */
+  createdAt: Date;
+
+  /**
+   * When the Single was last updated.
+   * Auto-updated on each modification.
+   */
+  updatedAt: Date;
+}
+
+// ============================================================
+// Constants
+// ============================================================
+
+/**
+ * All supported Single source types.
+ *
+ * Useful for validation and iteration.
+ *
+ * @example
+ * ```typescript
+ * if (SINGLE_SOURCE_TYPES.includes(source)) {
+ *   // Valid source type
+ * }
+ * ```
+ */
+export const SINGLE_SOURCE_TYPES: readonly SingleSource[] = [
+  "code",
+  "ui",
+  "built-in",
+] as const;
+
+/**
+ * All supported Single migration statuses.
+ *
+ * Useful for validation and iteration.
+ *
+ * @example
+ * ```typescript
+ * if (SINGLE_MIGRATION_STATUSES.includes(status)) {
+ *   // Valid migration status
+ * }
+ * ```
+ */
+export const SINGLE_MIGRATION_STATUSES: readonly SingleMigrationStatus[] = [
+  "synced",
+  "pending",
+  "generated",
+  "applied",
+  "failed",
+] as const;

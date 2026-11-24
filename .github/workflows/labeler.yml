@@ -1,0 +1,29 @@
+name: PR Labeler
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# One run per pull request at a time: a newer push or edit cancels the older
+# run, which checks a revision or text that is no longer there. Keyed by the
+# number, because under `pull_request_target` `github.ref` is the base branch,
+# which every pull request shares. Each workflow keys its own group, so the
+# workflows of one push never cancel one another, and the queue's runs are
+# keyed by commit and never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request_target' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+
+jobs:
+  label:
+    name: Apply scope labels based on changed files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
+        with:
+          configuration-path: .github/labeler.yml
+          sync-labels: true

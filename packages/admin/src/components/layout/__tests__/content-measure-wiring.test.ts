@@ -1,0 +1,190 @@
+/**
+ * Guards that the content routes read the shared measure rather than a literal.
+ *
+ * A content page renders in several states — a loading skeleton, a handful of
+ * error cards, and the loaded document — and only the last reaches
+ * `MeasuredPageFrame`. The others build their own container, so rendering the
+ * frame and comparing it against a reference built from the same constant
+ * cannot see them: both sides derive from one source, so the comparison proves
+ * the frame reads the constant and nothing about the skeleton beside it.
+ *
+ * The property that actually matters is that no state names a width of its own.
+ * A skeleton at one measure followed by a document at another moves every field
+ * sideways at the moment data arrives, and because each literal is correct on
+ * its own terms, the disagreement is visible only by comparing the sites.
+ *
+ * Reading the route source is what reaches those states. Rendering them would be
+ * stronger and is not available: the skeletons are module-private, and exporting
+ * three components so a test can see them widens the package's surface to serve
+ * the test rather than a caller.
+ */
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { describe, expect, it } from "vitest";
+
+/** Repo-relative, resolved from the package root vitest runs in. */
+const SRC = join(process.cwd(), "src");
+
+/** Every route whose page is a document rather than a settings form. */
+/** Routes whose frame hands the panel to content that bounds itself. */
+const SELF_MEASURING_ROUTES = [
+  "pages/dashboard/entries/[slug]/[id]/index.tsx",
+  "pages/dashboard/entries/[slug]/create.tsx",
+  "pages/dashboard/singles/[slug]/index.tsx",
+] as const;
+
+/** A `PluginSlot` wrapper and whatever attributes it carries. */
+const SLOT_WRAPPER = /<div\b([^>]*)>\s*<PluginSlot\b/g;
+
+/** The route that renders plugin injection slots beside the form. */
+const EDIT_ROUTE = "pages/dashboard/entries/[slug]/[id]/index.tsx";
+
+const CONTENT_ROUTES = [
+  "pages/dashboard/entries/[slug]/[id]/index.tsx",
+  "pages/dashboard/entries/[slug]/create.tsx",
+  "pages/dashboard/singles/[slug]/index.tsx",
+] as const;
+
+/**
+ * A settings route, which SHOULD carry a literal `width="form"`.
+ *
+ * The must-differ control. A scan that reported "no literal widths" everywhere
+ * — because its pattern never matched anything — would satisfy every assertion
+ * about the content routes while checking nothing at all.
+ */
+const SETTINGS_ROUTE = "pages/dashboard/settings/webhooks/create.tsx";
+
+/**
+ * Every opening `PageContainer` tag with its attributes, whatever they are.
+ *
+ * Deliberately not anchored on `width=`. A pattern that requires the prop in
+ * order to match cannot see a container that DROPPED it, and that is the
+ * change worth catching: no width is the unmeasured padded path, so a state
+ * that lost the prop reflows against the states that kept it, while the
+ * remaining matches keep any population assertion satisfied.
+ */
+const CONTAINER_TAG = /<PageContainer([^>]*)>/g;
+
+/** The attribute text of each `PageContainer` in a file, in source order. */
+function containersIn(relative: string): string[] {
+  const source = readFileSync(join(SRC, relative), "utf8");
+  return [...source.matchAll(CONTAINER_TAG)].map(m => m[1] as string);
+}
+
+describe("content routes read the shared measure", () => {
+  for (const route of CONTENT_ROUTES) {
+    it(`${route} names no measure of its own`, () => {
+      const containers = containersIn(route);
+      // The population assertion. Without it, a renamed file or a pattern that
+      // stopped matching yields an empty list, and the loop below passes over
+      // a route the test never read.
+      expect(containers.length).toBeGreaterThan(0);
+      for (const attrs of containers) {
+        // Three legal answers, and no fourth. `CONTENT_PAGE_MEASURE` is the
+        // page bounding the content (a message in place of the editor);
+        // `type="editor"` is the Editor page, whose editor bounds its own field
+        // column; `full` is a full-width page within the gutter. A raw `"form"`
+        // or `"wide"` here is a page deciding a width on its own, which is what
+        // drifts away from the frame beside it.
+        const legal =
+          attrs.includes("width={CONTENT_PAGE_MEASURE}") ||
+          attrs.includes('type="editor"') ||
+          attrs.includes('width="full"');
+        expect(legal, `illegal width in ${route}: ${attrs.trim()}`).toBe(true);
+      }
+    });
+  }
+
+  it("the loading skeleton matches the frame that replaces it", () => {
+    // The property this whole module exists for. The editor bounds its FIELD
+    // column and takes the panel, so a skeleton that bounds the PAGE is
+    // narrower — and every field slides sideways at the moment data arrives,
+    // which reads as the page loading twice.
+    //
+    // Asserted per route rather than centrally: the skeleton and the frame are
+    // in the same file but different branches, and nothing renders both, so
+    // their agreement is not observable at either one.
+    // Each route's skeleton is the shared editor outline, handed the field
+    // column's measure; the outline is what draws the Editor page.
+    for (const route of SELF_MEASURING_ROUTES) {
+      const source = readFileSync(join(SRC, route), "utf8");
+      const skeleton = source.slice(source.indexOf("PageSkeleton()"));
+      const call = skeleton.slice(0, skeleton.indexOf("/>"));
+      expect(
+        call,
+        `${route}: the skeleton is not the editor outline`
+      ).toContain("<EditorOutline");
+      expect(
+        call,
+        `${route}: the skeleton's field column is not the editor's measure`
+      ).toContain("maxWidth: CONTENT_MEASURE_LENGTH");
+    }
+    const outline = readFileSync(
+      join(SRC, "components/shared/loading-frame/outlines.tsx"),
+      "utf8"
+    );
+    const drawn = outline.slice(
+      outline.indexOf("export function EditorOutline")
+    );
+    const first = [...drawn.matchAll(CONTAINER_TAG)][0]?.[1] ?? "";
+    expect(first, "no container found in the editor outline").not.toBe("");
+    expect(
+      first.includes('type="editor"'),
+      "the editor outline is not drawn in the Editor page that replaces it"
+    ).toBe(true);
+  });
+
+  it("bounds the injection slots that the self-measuring frame renders", () => {
+    // The frame gives the panel to the form-and-rail row, so anything else it
+    // renders is uncapped unless it says so. `PluginSlot` wrappers are direct
+    // children, and one left unbounded stretches the whole width — a shape
+    // change to third-party content nobody asked for, invisible in a route
+    // that ships no plugin.
+    const source = readFileSync(join(SRC, EDIT_ROUTE), "utf8");
+    const marker = "<MeasuredPageFrame contentCarriesMeasure>";
+    expect(source).toContain(marker);
+    const selfMeasuring = source.slice(source.indexOf(marker));
+
+    const slots = [...selfMeasuring.matchAll(SLOT_WRAPPER)].map(
+      m => m[1] as string
+    );
+    // Population: a renamed component or a reshaped wrapper yields an empty
+    // list, and "every slot is bounded" would pass having found none.
+    expect(slots.length).toBeGreaterThan(0);
+    for (const attrs of slots) {
+      expect(attrs).toContain("CONTENT_MEASURE_LENGTH");
+    }
+  });
+
+  it("discriminates: a slot under the PAGE-measured frame stays unbounded", () => {
+    // The control, and it has to be capable of the other answer. The custom
+    // edit view's page sets no measure of its own and its slot carries none
+    // either: the view lays out its own width — if this ever comes back bounded,
+    // either the frames were conflated or the scan stopped telling them apart,
+    // and the assertion above is passing on the wrong region.
+    const source = readFileSync(join(SRC, EDIT_ROUTE), "utf8");
+    const pageMeasured = source.slice(
+      0,
+      source.indexOf("<MeasuredPageFrame contentCarriesMeasure>")
+    );
+    const slots = [...pageMeasured.matchAll(SLOT_WRAPPER)].map(
+      m => m[1] as string
+    );
+    expect(slots.length).toBeGreaterThan(0);
+    for (const attrs of slots) {
+      expect(attrs).not.toContain("CONTENT_MEASURE_LENGTH");
+    }
+  });
+
+  it("discriminates: a settings route still declares its own literal", () => {
+    // If this ever comes back as the constant, either settings pages were swept
+    // up by mistake or the scan has stopped seeing literals — and in the second
+    // case every assertion above is passing on nothing.
+    const containers = containersIn(SETTINGS_ROUTE);
+    expect(containers.length).toBeGreaterThan(0);
+    // Settings pages declare their page type, the literal that replaced a
+    // width there; the scan must still see it.
+    expect(containers.some(a => a.includes('type="form"'))).toBe(true);
+  });
+});

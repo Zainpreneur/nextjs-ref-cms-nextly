@@ -1,0 +1,1019 @@
+import {
+  compilePageCss,
+  escapeIdentifier,
+  MAX_SCOPE_LENGTH,
+  nodeClassName,
+  PAGE_ROOT_SELECTOR,
+  PREVIEW_VIEWPORT_CONTAINER,
+  STYLE_STATES,
+  type BlockDocument,
+  type BreakpointSet,
+  type NodeStyles,
+  type StyleState,
+} from "@nextlyhq/blocks-engine";
+import { describe, expect, it } from "vitest";
+
+import {
+  scrubCommitOp,
+  scrubCommitOps,
+  scrubPreviewCss,
+  scrubStateFragments,
+  type ScrubTarget,
+} from "./style-scrub";
+import type { StyleAddress } from "./style-values";
+
+/** Scrubbing the bottom margin of one node. */
+const TARGET: ScrubTarget = {
+  nodeId: "n1",
+  nodeClass: nodeClassName("n1"),
+  address: {
+    state: "base",
+    breakpoint: "base",
+    property: "margin",
+    path: ["blockEnd"],
+  },
+};
+
+describe("the CSS a drag shows", () => {
+  it("emits the property the catalog maps this path to", () => {
+    const preview = scrubPreviewCss(TARGET, "32px");
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.css).toContain("margin-block-end: 32px");
+  });
+
+  it("anchors to the compiler's own root selector rather than a stronger one", () => {
+    // The number of repetitions in that selector IS the override contract. A
+    // preview that outranked the committed rule would land where the stored
+    // value will not, and the difference would only appear on release.
+    const preview = scrubPreviewCss(TARGET, "32px");
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.css.startsWith(PAGE_ROOT_SELECTOR)).toBe(true);
+    expect(preview.css).toContain(`.${nodeClassName("n1")}`);
+  });
+
+  it("emits ONLY the property being scrubbed", () => {
+    // Everything else the node carries still comes from the sheet underneath,
+    // so previewing one side must not restate — or drop — the other three.
+    const preview = scrubPreviewCss(TARGET, "32px");
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.css).not.toContain("margin-block-start");
+    expect(preview.css).not.toContain("margin-inline");
+  });
+
+  it("compiles a token reference the way the published sheet does", () => {
+    // The separating property against a preview that formatted the value
+    // itself: a token is a `var()` on the page, and a hand-written preview
+    // would show the literal `[object Object]` or the raw name.
+    const preview = scrubPreviewCss(TARGET, { $token: "space.large" });
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.css).toContain("var(--site-space-large)");
+  });
+
+  it("refuses a value the compiler would not write, so it never reaches the screen", () => {
+    const preview = scrubPreviewCss(TARGET, "notalength");
+    expect(preview.ok).toBe(false);
+  });
+
+  it("accepts the values the compiler accepts", () => {
+    // The vacuity control for the refusal above: a preview that refused
+    // everything would satisfy that test while showing nothing ever.
+    for (const value of ["0", "1.5rem", "24px", "10%"]) {
+      expect(scrubPreviewCss(TARGET, value).ok).toBe(true);
+    }
+  });
+});
+
+describe("the commit that ends a drag", () => {
+  it("is exactly one op", () => {
+    const result = scrubCommitOp(TARGET, undefined, "32px");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.op).toMatchObject({ kind: "update", id: "n1" });
+  });
+
+  it("stores the value at the address, not the CSS the preview showed", () => {
+    const result = scrubCommitOp(TARGET, undefined, "32px");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const op = result.op as { patch: { styles?: unknown } };
+    expect(op.patch.styles).toEqual({
+      base: { base: { margin: { blockEnd: "32px" } } },
+    });
+  });
+
+  it("refuses exactly what the preview refuses", () => {
+    // Preview and commit agree by construction because both go through the
+    // catalog. This pins that they have not drifted apart.
+    for (const value of ["notalength", "24px", "1.5rem", "red"]) {
+      expect(scrubCommitOp(TARGET, undefined, value).ok).toBe(
+        scrubPreviewCss(TARGET, value).ok
+      );
+    }
+  });
+});
+
+describe("a document with a compile scope", () => {
+  const SCOPED: ScrubTarget = { ...TARGET, scope: "region-one" };
+
+  it("anchors the preview to the SAME root the compiled sheet uses", () => {
+    // `compilePageCss` emits `${PAGE_ROOT_SELECTOR}.${scope}`. A preview at the
+    // unscoped root carries one class fewer, so the stored rule outranks it and
+    // the drag shows nothing move.
+    const preview = scrubPreviewCss(SCOPED, "32px");
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.css.startsWith(`${PAGE_ROOT_SELECTOR}.region-one `)).toBe(
+      true
+    );
+  });
+
+  it("escapes a scope through the engine's own escaper", () => {
+    // A scope needing escapes must be spelled here exactly as the compiler
+    // spells it, or the two selectors address different elements.
+    const preview = scrubPreviewCss({ ...TARGET, scope: "a.b" }, "32px");
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.css).toContain(escapeIdentifier("a.b"));
+    expect(preview.css).not.toContain(`${PAGE_ROOT_SELECTOR}.a.b `);
+  });
+
+  it("stays unscoped when the document has no scope", () => {
+    const preview = scrubPreviewCss(TARGET, "32px");
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.css.startsWith(`${PAGE_ROOT_SELECTOR} `)).toBe(true);
+  });
+});
+
+describe("the site's URL policy", () => {
+  /** Scrubbing `background.url`, which is the catalog's only URL leaf. */
+  const IMAGE: ScrubTarget = {
+    nodeId: "n1",
+    nodeClass: nodeClassName("n1"),
+    address: {
+      state: "base",
+      breakpoint: "base",
+      property: "background",
+      path: ["url"],
+    },
+  };
+
+  it("refuses a host the site does not allow, so it never previews or fetches", () => {
+    const preview = scrubPreviewCss(
+      { ...IMAGE, policy: { mayFetchUrl: () => false } },
+      "https://elsewhere.example/x.png"
+    );
+    expect(preview.ok).toBe(false);
+  });
+
+  it("accepts the same URL when the site allows the host", () => {
+    // The pair is what makes the refusal evidence: without this, a preview that
+    // refused every URL would satisfy the assertion above.
+    const preview = scrubPreviewCss(
+      { ...IMAGE, policy: { mayFetchUrl: () => true } },
+      "https://elsewhere.example/x.png"
+    );
+    expect(preview.ok).toBe(true);
+  });
+
+  it("forwards the same policy to the commit, so preview and write agree", () => {
+    const policy = { mayFetchUrl: () => false };
+    const url = "https://elsewhere.example/x.png";
+    expect(scrubCommitOp({ ...IMAGE, policy }, undefined, url).ok).toBe(
+      scrubPreviewCss({ ...IMAGE, policy }, url).ok
+    );
+  });
+});
+
+describe("the site's token prefix", () => {
+  const TOKENED: ScrubTarget = { ...TARGET, tokenPrefix: "--acme-" };
+
+  it("emits tokens under the prefix the site publishes with", () => {
+    // A preview compiled with the default reads `var(--site-…)` while the
+    // published sheet reads `var(--acme-…)`, so the token resolves to nothing —
+    // or to something else — for exactly as long as the drag lasts.
+    const preview = scrubPreviewCss(TOKENED, { $token: "space.large" });
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.css).toContain("var(--acme-space-large)");
+    expect(preview.css).not.toContain("--site-");
+  });
+
+  it("uses the engine's default when the site configured none", () => {
+    const preview = scrubPreviewCss(TARGET, { $token: "space.large" });
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.css).toContain("var(--site-space-large)");
+  });
+});
+
+describe("preview and commit judge the same thing", () => {
+  it("is not blocked by an unrelated invalid value at the same breakpoint", () => {
+    // Validating the whole breakpoint map would let one bad value — a URL a
+    // changed site policy now refuses, say — block every other control on that
+    // breakpoint, with the preview still showing the drag as fine.
+    const withBadSibling = {
+      base: { desktop: { margin: { blockEnd: "24px" }, height: "notalength" } },
+    };
+    const preview = scrubPreviewCss(TARGET, "32px");
+    const commit = scrubCommitOp(TARGET, withBadSibling, "32px");
+    expect(preview.ok).toBe(true);
+    expect(commit.ok).toBe(true);
+  });
+
+  it("still refuses when the scrubbed value itself is invalid", () => {
+    // The negative half: scoping validation to one property must not stop it
+    // judging that property.
+    expect(scrubCommitOp(TARGET, undefined, "notalength").ok).toBe(false);
+  });
+});
+
+describe("against the selector the compiler actually emits", () => {
+  // The assertions above build the expected selector the same way the code
+  // does, so they agree with it whatever it spells. These compile a real
+  // document and compare against the rule that comes out, which is the only
+  // thing that can tell a correct construction from a plausible wrong one.
+
+  /** The selector `compilePageCss` writes for one styled node. */
+  function compiledSelector(scope?: string): string {
+    const document: BlockDocument = {
+      formatVersion: 1,
+      kind: "page",
+      nodes: [
+        {
+          id: "n1",
+          type: "core/box",
+          version: 1,
+          props: {},
+          styles: { base: { base: { margin: { blockEnd: "24px" } } } },
+        },
+      ],
+    };
+    const compiled = compilePageCss(document, {
+      breakpoints: {
+        viewport: [{ id: "base", label: "Desktop" }],
+        container: [],
+      },
+      ...(scope === undefined ? {} : { scope }),
+    });
+    expect(compiled.warnings).toEqual([]);
+    return compiled.css.split("{")[0].trim();
+  }
+
+  /** The selector the preview writes for the same node. */
+  function previewSelector(scope?: string): string {
+    const target: ScrubTarget = {
+      nodeId: "n1",
+      nodeClass: nodeClassName("n1"),
+      ...(scope === undefined ? {} : { scope }),
+      address: {
+        state: "base",
+        breakpoint: "base",
+        property: "margin",
+        path: ["blockEnd"],
+      },
+    };
+    const preview = scrubPreviewCss(target, "32px");
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) throw new Error("expected a preview");
+    return preview.css.split("{")[0].trim();
+  }
+
+  it("matches on an unscoped document", () => {
+    expect(previewSelector()).toBe(compiledSelector());
+  });
+
+  it("matches on a scoped document", () => {
+    expect(previewSelector("region-one")).toBe(compiledSelector("region-one"));
+  });
+
+  it("matches on a scope that needs escaping", () => {
+    // `a.b` would otherwise read as two classes. The preview and the compiler
+    // must escape it identically or they address different elements.
+    expect(previewSelector("a.b")).toBe(compiledSelector("a.b"));
+  });
+});
+
+describe("a compiler setting the engine recovered from", () => {
+  // An invalid `tokenPrefix` does not stop the compiler: it writes the
+  // declarations under the default prefix and says so. Measured — a plain
+  // `24px` compiles to one declaration and one `severity: "warning"` issue.
+  // Reading the issue list's LENGTH conflates that with a refusal.
+  const BAD_PREFIX: ScrubTarget = { ...TARGET, tokenPrefix: "notaprefix" };
+
+  it("still previews a literal value that has nothing to do with tokens", () => {
+    const preview = scrubPreviewCss(BAD_PREFIX, "32px");
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.css).toContain("margin-block-end: 32px");
+  });
+
+  it("carries the remark rather than dropping it", () => {
+    // A warning is the compiler explaining something about output it wrote. A
+    // preview that discarded it would present a recovered-from setting as an
+    // unremarkable one.
+    const preview = scrubPreviewCss(BAD_PREFIX, "32px");
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.warnings.length).toBeGreaterThan(0);
+    expect(preview.warnings.every(issue => issue.severity !== "error")).toBe(
+      true
+    );
+  });
+
+  it("previews a token under the prefix the compiler fell back to", () => {
+    const preview = scrubPreviewCss(BAD_PREFIX, { $token: "space.large" });
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.css).toContain("var(--site-space-large)");
+  });
+
+  it("still refuses a value the compiler wrote nothing for", () => {
+    // The other half of the pair: separating warnings from errors must not
+    // stop a real refusal being a refusal.
+    const refused = scrubPreviewCss(BAD_PREFIX, "notalength");
+    expect(refused.ok).toBe(false);
+    if (refused.ok) return;
+    expect(refused.issues.some(issue => issue.severity === "error")).toBe(true);
+  });
+
+  it("reports no warnings on a well-configured site", () => {
+    // The control that keeps the assertions above meaningful: if every preview
+    // carried warnings, "warnings.length > 0" would say nothing.
+    const preview = scrubPreviewCss(TARGET, "32px");
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.warnings).toEqual([]);
+  });
+});
+
+describe("the selector at each state the catalog supports", () => {
+  // A preview that ignored the state would match the node in ALL of them:
+  // dragging a hover value would repaint the resting appearance, and releasing
+  // would reveal behaviour the drag never showed.
+
+  /** The selector `compilePageCss` writes for one node styled at `state`. */
+  function compiledAt(state: StyleState): string {
+    const document: BlockDocument = {
+      formatVersion: 1,
+      kind: "page",
+      nodes: [
+        {
+          id: "n1",
+          type: "core/box",
+          version: 1,
+          props: {},
+          styles: { [state]: { base: { margin: { blockEnd: "24px" } } } },
+        },
+      ],
+    };
+    const compiled = compilePageCss(document, {
+      breakpoints: {
+        viewport: [{ id: "base", label: "Desktop" }],
+        container: [],
+      },
+      /*
+       * The way the EDITOR compiles, which is the sheet a preview has to sit
+       * beside. A canvas showing a state the pointer is not really in marks the
+       * node with `previewStateClass` and relies on the sheet carrying an arm
+       * for it; compiled without that, this oracle would describe a stylesheet
+       * no editing surface emits, and would hold the preview to a selector that
+       * cannot match a forced state.
+       */
+      previewStates: true,
+    });
+    expect(compiled.warnings).toEqual([]);
+    return compiled.css.split("{")[0].trim();
+  }
+
+  /** The selector the preview writes for the same node at the same state. */
+  function previewAt(state: StyleState): string {
+    const preview = scrubPreviewCss(
+      {
+        nodeId: "n1",
+        nodeClass: nodeClassName("n1"),
+        address: {
+          state,
+          breakpoint: "base",
+          property: "margin",
+          path: ["blockEnd"],
+        },
+      },
+      "32px"
+    );
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) throw new Error("expected a preview");
+    return preview.css.split("{")[0].trim();
+  }
+
+  it("matches the compiler on every state, not just base", () => {
+    // Swept over the engine's own list, so a state added there is covered here
+    // without an edit.
+    expect(STYLE_STATES.length).toBeGreaterThan(1);
+    for (const state of STYLE_STATES) {
+      expect(previewAt(state)).toBe(compiledAt(state));
+    }
+  });
+
+  /*
+   * Both arms, named. Matching the compiler is a comparison of two derivations,
+   * so it would stay true if BOTH lost the forced-state marker — and the case
+   * that needs it is exactly the one no author can see failing, since a preview
+   * matching nothing looks like a drag that does not move.
+   */
+  it("carries the real pseudo-class AND the forced-state marker", () => {
+    const fragments = scrubStateFragments();
+    for (const state of STYLE_STATES.filter(one => one !== "base")) {
+      const fragment = fragments.get(state) ?? "";
+      expect(fragment, state).toContain(`:${state}`);
+      expect(fragment, state).toContain(`.nx-pb-state-${state}`);
+    }
+  });
+
+  it("constrains a non-base state and leaves base unconstrained", () => {
+    // The control that keeps the sweep meaningful: if every fragment were
+    // empty, matching the compiler would be trivially true and the preview
+    // would still repaint the resting appearance.
+    const fragments = scrubStateFragments();
+    expect(fragments.get("base")).toBe("");
+    for (const state of STYLE_STATES.filter(s => s !== "base")) {
+      expect(fragments.get(state)).not.toBe("");
+      expect(fragments.get(state)).toContain(":where(");
+    }
+  });
+});
+
+describe("a preview that must not outrank another state", () => {
+  /*
+   * The compiler emits one rule per state at EQUAL specificity, in
+   * `STYLE_STATES` order, each constrained by a zero-specificity `:where()`.
+   * Later beats earlier on document ORDER — and a preview mounted after the
+   * whole sheet is later than all of them, so a base-state drag repainted the
+   * block's hover value for as long as the pointer was over it.
+   */
+  const HOVER_MARGIN: NodeStyles = {
+    hover: { base: { margin: { blockEnd: "24px" } } },
+  };
+
+  function previewSelector(styles: NodeStyles | undefined): string {
+    const preview = scrubPreviewCss(
+      { ...TARGET, ...(styles === undefined ? {} : { styles }) },
+      "32px"
+    );
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) throw new Error("expected a preview");
+    return preview.css.split("{")[0].trim();
+  }
+
+  it("steps aside where a later state declares the same address", () => {
+    expect(previewSelector(HOVER_MARGIN)).toContain(
+      ":not(:where(:hover, .nx-pb-state-hover))"
+    );
+  });
+
+  /*
+   * The control, and it is the half that matters. Excluding unconditionally
+   * would satisfy the assertion above while blanking the preview on every
+   * ordinary node — the drag would simply stop showing anything under the
+   * pointer, which reads as the handle being broken.
+   */
+  it("does not step aside when no later state declares it", () => {
+    expect(previewSelector(undefined)).not.toContain(":not(");
+    expect(previewSelector({})).not.toContain(":not(");
+    expect(
+      previewSelector({ hover: { base: { color: "red" } } })
+    ).not.toContain(":not(");
+  });
+
+  /*
+   * Per ADDRESS, not per property. A hover that sets a DIFFERENT side of the
+   * same box compiles to a different longhand and cannot outrank this one, so
+   * excluding on the property would blank the preview wherever an author had
+   * styled any other side.
+   */
+  it("ignores a later state that declares another side of the same box", () => {
+    expect(
+      previewSelector({ hover: { base: { margin: { blockStart: "8px" } } } })
+    ).not.toContain(":not(");
+  });
+
+  /*
+   * Earlier states lose to this rule already — the compiler put them first —
+   * so excluding them would blank the preview on elements it legitimately owns.
+   *
+   * Asked of FOCUS with HOVER declared, deliberately. Hover is emitted before
+   * focus and carries a real selector fragment, so an implementation excluding
+   * earlier states shows it. Asking base to be un-excluded cannot detect that:
+   * base's fragment is empty, so the exclusion would collapse to nothing and
+   * the assertion would pass either way.
+   */
+  it("ignores a state emitted before this one", () => {
+    const focusTarget = {
+      ...TARGET,
+      address: { ...TARGET.address, state: "focus" as StyleState },
+      styles: {
+        hover: { base: { margin: { blockEnd: "8px" } } },
+        active: { base: { margin: { blockEnd: "8px" } } },
+      } satisfies NodeStyles,
+    };
+    const preview = scrubPreviewCss(focusTarget, "32px");
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) throw new Error("expected a preview");
+    const selector = preview.css.split("{")[0].trim();
+    // `active` comes after `focus`, so it is excluded.
+    expect(selector).toContain(":not(:where(:active, .nx-pb-state-active))");
+    // `hover` comes before it, and is not.
+    expect(selector).not.toContain(":not(:where(:hover");
+  });
+
+  /*
+   * The specificity contract, which is what makes the exclusion safe at all.
+   * `:not()` takes the specificity of its most specific argument and `:where()`
+   * is always zero, so the rule still ranks exactly where the compiler put the
+   * one it previews over. A stronger selector would win the hover case and lose
+   * the contract — the preview would land where the committed value cannot.
+   */
+  it("adds no specificity, so the rule still ranks where the compiler put it", () => {
+    const plain = previewSelector(undefined);
+    const excluded = previewSelector(HOVER_MARGIN);
+    const weight = (selector: string): string =>
+      selector.replaceAll(/:not\(:where\([^)]*\)\)/g, "");
+    expect(weight(excluded)).toBe(plain);
+  });
+});
+
+describe("a commit whose writes stray from the target's tier", () => {
+  /*
+   * The breakpoint is judged once, from the target. A write naming another tier
+   * would otherwise be persisted under a breakpoint this function never checked
+   * — including one the site does not define, which `compilePageCss` emits no
+   * rule for at all: the value is stored, the page never shows it, and nothing
+   * reports either. An invariant a function documents and does not check is one
+   * its callers are free to break.
+   */
+  const at = (over: Partial<StyleAddress>) => ({ ...TARGET.address, ...over });
+
+  it("refuses a write naming another breakpoint", () => {
+    const result = scrubCommitOps(TARGET, undefined, [
+      { address: at({ breakpoint: "mobile" }), value: "4px" },
+    ]);
+    expect(result.ok).toBe(false);
+  });
+
+  it("refuses a write naming another state", () => {
+    const result = scrubCommitOps(TARGET, undefined, [
+      { address: at({ state: "hover" }), value: "4px" },
+    ]);
+    expect(result.ok).toBe(false);
+  });
+
+  it("refuses the whole group when only one write strays", () => {
+    const result = scrubCommitOps(TARGET, undefined, [
+      { address: at({ path: ["blockStart"] }), value: "4px" },
+      { address: at({ state: "hover" }), value: "4px" },
+    ]);
+    expect(result.ok).toBe(false);
+  });
+
+  /*
+   * The control: sides of the same tier are what this function is FOR, and
+   * refusing everything would satisfy the three assertions above.
+   */
+  it("accepts writes that all share the target's tier", () => {
+    const result = scrubCommitOps(TARGET, undefined, [
+      { address: at({ path: ["blockStart"] }), value: "4px" },
+      { address: at({ path: ["blockEnd"] }), value: "4px" },
+    ]);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.op).not.toBeNull();
+  });
+});
+
+describe("a later state declared at another breakpoint", () => {
+  /*
+   * A later state's rules are emitted after EVERY base-state breakpoint —
+   * measured: `hover` at the unconditional tier comes out after `base` inside
+   * `@media (max-width: 640px)`. So a hover one tier out beats a narrow base
+   * rule, and a preview keyed on its own breakpoint alone missed it: the drag
+   * appeared to work while hovered and snapped back on release.
+   */
+  const SITE: BreakpointSet = {
+    viewport: [
+      { id: "base", label: "Base" },
+      { id: "tablet", label: "Tablet", maxWidth: 1024 },
+      { id: "mobile", label: "Mobile", maxWidth: 640 },
+    ],
+    container: [{ id: "card", label: "Card", maxWidth: 500 }],
+  };
+
+  function selectorAt(breakpoint: string, styles: NodeStyles): string {
+    const preview = scrubPreviewCss(
+      {
+        ...TARGET,
+        address: { ...TARGET.address, breakpoint },
+        breakpoints: SITE,
+        styles,
+      },
+      "32px"
+    );
+    expect(preview.ok, breakpoint).toBe(true);
+    if (!preview.ok) throw new Error("expected a preview");
+    return preview.css;
+  }
+
+  const hoverAt = (breakpoint: string): NodeStyles => ({
+    hover: { [breakpoint]: { margin: { blockEnd: "24px" } } },
+  });
+
+  it("steps aside for a later state at the unconditional tier", () => {
+    expect(selectorAt("mobile", hoverAt("base"))).toContain(
+      ":not(:where(:hover, .nx-pb-state-hover))"
+    );
+  });
+
+  it("steps aside for a later state at a WIDER conditional tier", () => {
+    // `tablet` (<=1024) still matches everywhere `mobile` (<=640) does.
+    expect(selectorAt("mobile", hoverAt("tablet"))).toContain(":not(");
+  });
+
+  /*
+   * The control, and the half that keeps this from over-excluding. A NARROWER
+   * tier does not match where a wider one does, so its rule cannot compete —
+   * excluding on it would blank the preview at the widths the author is
+   * actually dragging at.
+   */
+  it("ignores a later state at a NARROWER tier", () => {
+    expect(selectorAt("tablet", hoverAt("mobile"))).not.toContain(":not(");
+    expect(selectorAt("base", hoverAt("mobile"))).not.toContain(":not(");
+  });
+
+  it("ignores a breakpoint this site does not define", () => {
+    // The compiler writes no rule for it, so it competes with nothing.
+    expect(selectorAt("mobile", hoverAt("nonesuch"))).not.toContain(":not(");
+  });
+
+  /*
+   * Two conditional tiers on different axes are not comparable by width: a
+   * `@media` and a `@container` measure different boxes. Neither is claimed to
+   * contain the other.
+   */
+  it("does not guess across the viewport and container axes", () => {
+    expect(selectorAt("mobile", hoverAt("card"))).not.toContain(":not(");
+  });
+});
+
+describe("a scope the compiler refuses", () => {
+  // `scopeSelector` refuses an empty scope and one carrying ASCII whitespace —
+  // `a b` in a class attribute is two classes, and no escaping makes it the one
+  // class the renderer attached — so it warns and emits unscoped rules.
+
+  function compiledWith(scope: string): string {
+    const document: BlockDocument = {
+      formatVersion: 1,
+      kind: "page",
+      nodes: [
+        {
+          id: "n1",
+          type: "core/box",
+          version: 1,
+          props: {},
+          styles: { base: { base: { margin: { blockEnd: "24px" } } } },
+        },
+      ],
+    };
+    return compilePageCss(document, {
+      breakpoints: {
+        viewport: [{ id: "base", label: "Desktop" }],
+        container: [],
+      },
+      scope,
+    })
+      .css.split("{")[0]
+      .trim();
+  }
+
+  it("falls back to the unscoped root exactly as the compiler does", () => {
+    // Escaping the whitespace instead would require a class the DOM cannot
+    // hold, so the preview would show nothing while the commit produced
+    // working CSS.
+    for (const scope of ["a b", " ", "one\ttwo"]) {
+      const preview = scrubPreviewCss({ ...TARGET, scope }, "32px");
+      expect(preview.ok).toBe(true);
+      if (!preview.ok) return;
+      expect(preview.css.split("{")[0].trim()).toBe(compiledWith(scope));
+    }
+  });
+
+  /*
+   * Length is the other way the compiler refuses a scope, and it is the one a
+   * preview cannot see by looking at the characters. A scope prefixes every rule
+   * the page emits, so an oversized one is dropped and the sheet is written
+   * unscoped — a preview that scoped itself anyway would sit one class below the
+   * rule it must outrank and match nothing at all.
+   *
+   * Asserted at the BOUNDARY, both sides. A test that only refused the long one
+   * would pass on an implementation that had stopped scoping altogether, which
+   * is the same defect pointing the other way.
+   */
+  it("drops an oversized scope exactly where the compiler drops it", () => {
+    const atCap = "s".repeat(MAX_SCOPE_LENGTH);
+    const overCap = "s".repeat(MAX_SCOPE_LENGTH + 1);
+
+    for (const scope of [atCap, overCap]) {
+      const preview = scrubPreviewCss({ ...TARGET, scope }, "32px");
+      expect(preview.ok, scope.length.toString()).toBe(true);
+      if (!preview.ok) return;
+      expect(preview.css.split("{")[0].trim(), scope.length.toString()).toBe(
+        compiledWith(scope)
+      );
+    }
+
+    // And the two answers genuinely differ, so the comparison above is doing
+    // work rather than agreeing about an unscoped selector twice.
+    expect(compiledWith(atCap)).not.toBe(compiledWith(overCap));
+  });
+
+  it("still scopes a scope the compiler accepts", () => {
+    // The control: falling back for everything would make the assertion above
+    // pass while the scoped case silently lost its class.
+    const preview = scrubPreviewCss({ ...TARGET, scope: "region-one" }, "32px");
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.css.split("{")[0].trim()).toBe(compiledWith("region-one"));
+    expect(preview.css).toContain(".region-one");
+  });
+});
+
+describe("a breakpoint the compiler wraps in a query", () => {
+  const BREAKPOINTS = {
+    viewport: [
+      { id: "base", label: "Desktop" },
+      { id: "mobile", label: "Mobile", maxWidth: 640 },
+    ],
+    container: [],
+  };
+
+  /** The compiled sheet for one node styled at `breakpoint`. */
+  function compiledAt(breakpoint: string): string {
+    const document: BlockDocument = {
+      formatVersion: 1,
+      kind: "page",
+      nodes: [
+        {
+          id: "n1",
+          type: "core/box",
+          version: 1,
+          props: {},
+          styles: { base: { [breakpoint]: { margin: { blockEnd: "24px" } } } },
+        },
+      ],
+    };
+    return compilePageCss(document, { breakpoints: BREAKPOINTS }).css.trim();
+  }
+
+  function previewAt(breakpoint: string) {
+    return scrubPreviewCss(
+      {
+        ...TARGET,
+        breakpoints: BREAKPOINTS,
+        address: { ...TARGET.address, breakpoint },
+      },
+      "32px"
+    );
+  }
+
+  it("wraps the preview in the same query the committed rule gets", () => {
+    // Without this the value appears at every width and vanishes on release.
+    expect(compiledAt("mobile")).toContain("@media (max-width: 640px)");
+    const preview = previewAt("mobile");
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.css).toContain("@media (max-width: 640px)");
+    expect(preview.css).toContain("margin-block-end: 32px");
+  });
+
+  it("leaves an unconditional breakpoint unwrapped", () => {
+    // The control: wrapping everything would pass the assertion above while
+    // burying base values in a query they never had.
+    expect(compiledAt("base")).not.toContain("@media");
+    const preview = previewAt("base");
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) return;
+    expect(preview.css).not.toContain("@media");
+  });
+
+  it("refuses a breakpoint this site does not define", () => {
+    // The compiler writes NO rule for an unknown id, so an unconditional
+    // preview would show a value the published page will never carry.
+    expect(compiledAt("tablet")).toBe("");
+    expect(previewAt("tablet").ok).toBe(false);
+  });
+});
+
+describe("a caller that did not say where the preview goes", () => {
+  it("refuses a non-base breakpoint when no breakpoint set was supplied", () => {
+    // Without the set this cannot know which query the committed rule lands in,
+    // and an unconditional preview would show the value at every width.
+    const preview = scrubPreviewCss(
+      { ...TARGET, address: { ...TARGET.address, breakpoint: "mobile" } },
+      "32px"
+    );
+    expect(preview.ok).toBe(false);
+  });
+
+  it("still previews the base breakpoint, which is unconditional", () => {
+    // The control: refusing everything would pass the assertion above while
+    // making the SDK unusable for the ordinary case.
+    expect(scrubPreviewCss(TARGET, "32px").ok).toBe(true);
+  });
+});
+
+describe("a breakpoint set edited in place", () => {
+  it("re-derives the query rather than answering with the old one", () => {
+    // A host that mutates a definition keeps the same object, so a cache keyed
+    // on identity alone keeps emitting the query the set no longer describes —
+    // and the preview then sits at a width where the committed value is absent.
+    const breakpoints = {
+      viewport: [
+        { id: "base", label: "Desktop" },
+        { id: "mobile", label: "Mobile", maxWidth: 640 },
+      ],
+      container: [],
+    };
+    const target: ScrubTarget = {
+      ...TARGET,
+      breakpoints,
+      address: { ...TARGET.address, breakpoint: "mobile" },
+    };
+
+    const before = scrubPreviewCss(target, "32px");
+    expect(before.ok).toBe(true);
+    if (!before.ok) return;
+    expect(before.css).toContain("@media (max-width: 640px)");
+
+    breakpoints.viewport[1].maxWidth = 320;
+
+    const after = scrubPreviewCss(target, "32px");
+    expect(after.ok).toBe(true);
+    if (!after.ok) return;
+    expect(after.css).toContain("@media (max-width: 320px)");
+    expect(after.css).not.toContain("640px");
+  });
+
+  it("derives the same query twice when nothing moved", () => {
+    // NOT a test of cache reuse. Removing the cache entirely recompiles and
+    // produces the same CSS, so this passes either way — and a spurious
+    // invalidation would also be invisible, because a re-derivation returns the
+    // same answer. What it covers is that the derivation is deterministic and
+    // the invalidation above does not change the ANSWER when nothing moved.
+    //
+    // That the second lookup avoids a compile is untested: it would need a seam
+    // through `compilePageCss` that exists only for the test.
+    const breakpoints = {
+      viewport: [
+        { id: "base", label: "Desktop" },
+        { id: "mobile", label: "Mobile", maxWidth: 640 },
+      ],
+      container: [],
+    };
+    const target: ScrubTarget = {
+      ...TARGET,
+      breakpoints,
+      address: { ...TARGET.address, breakpoint: "mobile" },
+    };
+    const first = scrubPreviewCss(target, "32px");
+    const second = scrubPreviewCss(target, "40px");
+    expect(first.ok && second.ok).toBe(true);
+    if (!first.ok || !second.ok) return;
+    expect(first.css.split("{")[0]).toBe(second.css.split("{")[0]);
+  });
+});
+
+describe("committing at a breakpoint the site no longer defines", () => {
+  const BREAKPOINTS = {
+    viewport: [{ id: "base", label: "Desktop" }],
+    container: [],
+  };
+
+  it("refuses the commit for exactly what the preview refuses", () => {
+    // A breakpoint removed while a drag was in flight: the preview refuses, and
+    // a commit that ignored the set would persist a value the compiler never
+    // emits — the drag would end by storing something the page cannot show.
+    const stale: ScrubTarget = {
+      ...TARGET,
+      breakpoints: BREAKPOINTS,
+      address: { ...TARGET.address, breakpoint: "mobile" },
+    };
+    expect(scrubPreviewCss(stale, "32px").ok).toBe(false);
+    expect(scrubCommitOp(stale, undefined, "32px").ok).toBe(false);
+  });
+
+  it("still commits at a breakpoint the site does define", () => {
+    // The control: refusing on the set's mere presence would block every write.
+    const live: ScrubTarget = { ...TARGET, breakpoints: BREAKPOINTS };
+    expect(scrubPreviewCss(live, "32px").ok).toBe(true);
+    expect(scrubCommitOp(live, undefined, "32px").ok).toBe(true);
+  });
+});
+
+describe("a scrub override under a preview compile", () => {
+  const breakpoints = {
+    viewport: [
+      { id: "base", label: "Desktop" },
+      { id: "tablet", label: "Tablet", maxWidth: 991 },
+    ],
+    container: [],
+  } as never;
+
+  const wrapperFor = (previewContainer?: string): string => {
+    const preview = scrubPreviewCss(
+      {
+        nodeId: "n1",
+        nodeClass: nodeClassName("n1"),
+        breakpoints,
+        ...(previewContainer === undefined ? {} : { previewContainer }),
+        address: {
+          state: "base",
+          breakpoint: "tablet",
+          property: "margin",
+          path: ["blockEnd"],
+        },
+      },
+      "32px"
+    );
+    expect(preview.ok).toBe(true);
+    if (!preview.ok) throw new Error("expected a preview");
+    return preview.css.split("{")[0].trim();
+  };
+
+  it("is wrapped in the SAME at-rule the page rule was compiled under", () => {
+    /*
+     * The override has to outrank a rule that lives inside the breakpoint's own
+     * query. Wrapped in `@media` while the page rule sits in a container query,
+     * it matches nothing in a narrow canvas inside a wide window — so the drag
+     * appears frozen and the value jumps into place on commit.
+     *
+     * The published half is asserted first, and it is the population: a preview
+     * wrapper containing no at-rule at all would satisfy the negative below.
+     */
+    expect(wrapperFor()).toContain("@media (max-width: 991px)");
+
+    const previewed = wrapperFor(PREVIEW_VIEWPORT_CONTAINER);
+
+    expect(previewed).toContain(
+      `@container ${PREVIEW_VIEWPORT_CONTAINER} (max-width: 991px)`
+    );
+    expect(previewed).not.toContain("@media");
+  });
+
+  it("treats a name the compiler REFUSES exactly as no name at all", () => {
+    /*
+     * A refused name — empty, reserved, malformed or over the emitted-string
+     * bound — makes the compile published, so the override must be wrapped in
+     * the same `@media` an unpreviewed scrub gets. Wrapped in a container query
+     * naming a box nothing declares, it would match nothing and the drag would
+     * appear frozen.
+     *
+     * Driven through the distinct refusal branches rather than one
+     * representative: a reserved CSS-wide keyword, a character the identifier
+     * grammar excludes, and a value over the raw-length cap.
+     *
+     * WHAT THIS TEST DOES NOT COVER, stated rather than implied. The reason the
+     * normalisation moved AHEAD of the cache identity is that `scrubPreviewCss`
+     * recomputes that identity on every pointer update, so a refused name of
+     * any size was serialised per frame. That is a property of the module's
+     * private cache and produces identical output either way, so it is not
+     * observable from here and this test would pass against the version without
+     * it. The equivalence below is a regression guard; the placement is
+     * reasoned, not asserted.
+     */
+    const published = wrapperFor();
+
+    for (const refused of ["none", "has space", "x".repeat(5_000)]) {
+      expect(wrapperFor(refused)).toBe(published);
+    }
+    // The population, so the equivalence is not satisfied by every wrapper
+    // being empty: the published form really does carry the query.
+    expect(published).toContain("@media (max-width: 991px)");
+  });
+
+  it("does not serve one mode's wrapper from the other's cache", () => {
+    /*
+     * The derived at-rule is cached per breakpoint set, and the preview name
+     * changes it for the same set. Left out of the identity, whichever mode
+     * asked first would answer for both — and the second caller would get a
+     * wrapper that looks right and matches nothing.
+     *
+     * Asked in this order deliberately: published first, so a cache keyed only
+     * on the set would already hold the `@media` answer when the preview asks.
+     */
+    expect(wrapperFor()).toContain("@media");
+    expect(wrapperFor(PREVIEW_VIEWPORT_CONTAINER)).toContain("@container");
+    expect(wrapperFor()).toContain("@media");
+  });
+});

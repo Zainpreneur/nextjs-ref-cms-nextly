@@ -1,0 +1,477 @@
+/**
+ * What `read` means when the bucket answers, and when it does not.
+ *
+ * The first tests in this package. `read` is where that matters most: it is the
+ * one method whose contract is a DISTINCTION — a key that is absent answers
+ * `null`, a backend that cannot answer throws — and a distinction is exactly
+ * what goes wrong silently, because both outcomes look like an ordinary result
+ * at the call site.
+ *
+ * @module adapter.test
+ */
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+
+import { S3Client } from "@aws-sdk/client-s3";
+
+import {
+  isStorageReadTooLarge,
+  StorageReadTooLargeError,
+} from "nextly/storage/read-errors";
+
+import { S3StorageAdapter } from "./adapter";
+import { s3Storage } from "./plugin";
+
+vi.mock("@aws-sdk/client-s3", () => {
+  class S3Client {
+    send = vi.fn();
+  }
+  /*
+   * The commands are inert carriers here: the adapter builds one and hands it
+   * to `send`, and every assertion below is about what `send` answers. Faking
+   * them as plain objects keeps the test about the adapter's branching rather
+   * than about the SDK's request shapes.
+   */
+  return {
+    S3Client,
+    GetObjectCommand: class {},
+    HeadObjectCommand: class {},
+    // Keeps what it was built with, for the cases that check the key and
+    // type a file is written under.
+    PutObjectCommand: class {
+      constructor(readonly input: unknown) {}
+    },
+    DeleteObjectCommand: class {},
+    DeleteObjectsCommand: class {},
+    ListObjectsV2Command: class {},
+  };
+});
+// An upload that completes, for the cases that store a file.
+vi.mock("@aws-sdk/lib-storage", () => ({
+  Upload: class {
+    done = async () => ({});
+  },
+}));
+vi.mock("@aws-sdk/s3-request-presigner", () => ({ getSignedUrl: vi.fn() }));
+
+/** A `send` that behaves however a case needs, reachable from the assertions. */
+function adapterWithSend(): {
+  adapter: S3StorageAdapter;
+  send: ReturnType<typeof vi.fn>;
+} {
+  const adapter = new S3StorageAdapter({
+    bucket: "test-bucket",
+    region: "us-east-1",
+  });
+  /*
+   * The client the adapter materialised for itself, through the public
+   * accessor, so the stub is the one it uses. Construction defers building
+   * the client, so it is not sitting on the instance before a use asks.
+   */
+  const send = adapter.getClient().send as unknown as ReturnType<typeof vi.fn>;
+  return { adapter, send };
+}
+
+/**
+ * A `GetObject` body in the shape the Node SDK exposes: async-iterable, and
+ * also able to buffer itself.
+ *
+ * Iterable because that is the path the adapter takes — it counts bytes as they
+ * arrive rather than trusting `ContentLength`, which compatible services may
+ * omit or misreport. `transformToByteArray` stays on it so the non-iterable
+ * fallback can be exercised by a body that omits the iterator.
+ */
+function body(
+  bytes: string,
+  chunkSize = 1024
+): {
+  transformToByteArray: () => Promise<Uint8Array>;
+  [Symbol.asyncIterator]: () => AsyncGenerator<Uint8Array>;
+} {
+  const encoded = new TextEncoder().encode(bytes);
+  return {
+    transformToByteArray: async () => encoded,
+    async *[Symbol.asyncIterator]() {
+      for (let at = 0; at < encoded.length; at += chunkSize) {
+        yield encoded.subarray(at, at + chunkSize);
+      }
+    },
+  };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+describe("S3StorageAdapter.read", () => {
+  it("returns the object's bytes", async () => {
+    const { adapter, send } = adapterWithSend();
+    send.mockResolvedValueOnce({ Body: body("hello"), ContentLength: 5 });
+    expect((await adapter.read("f.woff2"))?.toString("utf8")).toBe("hello");
+  });
+
+  it("answers null for a key that is not in the bucket", async () => {
+    /*
+     * ITS CONTROL IS "returns the object's bytes" ABOVE. On its own this case
+     * is satisfied by a `read` that answers `null` for every input, so the
+     * positive case is what makes this `null` mean "absent" rather than "this
+     * method never answers". Declared rather than left to adjacency.
+     */
+    const { adapter, send } = adapterWithSend();
+    const missing = Object.assign(new Error("Not Found"), {
+      name: "NotFound",
+      $metadata: { httpStatusCode: 404 },
+    });
+    send.mockRejectedValueOnce(missing);
+    expect(await adapter.read("gone.woff2")).toBeNull();
+  });
+
+  it("THROWS when the BUCKET is missing, rather than reporting the key absent", async () => {
+    /*
+     * The distinction the case above cannot make, and the reason `read` does
+     * not simply reuse the adapter's existing not-found predicate: that
+     * predicate treats ANY 404 as a missing object, and `NoSuchBucket` is a
+     * 404. A deleted, renamed or mistyped bucket would therefore report every
+     * key in it as absent — a configuration failure wearing the costume of an
+     * ordinary miss, which is the confusion this method exists to prevent.
+     */
+    const { adapter, send } = adapterWithSend();
+    const noBucket = Object.assign(new Error("The bucket does not exist"), {
+      name: "NoSuchBucket",
+      $metadata: { httpStatusCode: 404 },
+    });
+    send.mockRejectedValueOnce(noBucket);
+
+    const outcome = await adapter.read("f.woff2").then(
+      value => value,
+      (error: unknown) => error
+    );
+    expect(outcome).toBe(noBucket);
+    expect(outcome).not.toBeNull();
+  });
+
+  it("refuses an object larger than the caller's cap BEFORE downloading it", async () => {
+    /*
+     * Asserted on the reported length rather than on the body, because the
+     * point is that the body is never pulled: `transformToByteArray` buffers
+     * the whole object, so a cap enforced afterwards has already paid the cost
+     * it exists to avoid. The email attachment path is the caller that has a
+     * configured limit of its own.
+     */
+    const { adapter, send } = adapterWithSend();
+    const stream = body("x".repeat(50));
+    const spy = vi.spyOn(stream, "transformToByteArray");
+    send.mockResolvedValueOnce({ Body: stream, ContentLength: 50 });
+
+    /*
+     * Asserted on the REFUSAL'S IDENTITY, not merely that something threw.
+     * `rejects.toThrow()` alone is satisfied by any failure, so it cannot tell
+     * the intended over-cap refusal from a generic internal error — and the
+     * difference is load-bearing: the email attachment path answers this one
+     * with a size error the author can act on, and wraps anything else as an
+     * opaque storage failure.
+     */
+    const outcome = await adapter.read("big.woff2", { maxBytes: 10 }).then(
+      value => value,
+      (error: unknown) => error
+    );
+    expect(isStorageReadTooLarge(outcome)).toBe(true);
+    expect((outcome as StorageReadTooLargeError).maxBytes).toBe(10);
+    expect((outcome as StorageReadTooLargeError).size).toBe(50);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("reads an object that fits under the cap", async () => {
+    // The control for the case above: without it, a `read` that refused every
+    // bounded call would satisfy the refusal assertion perfectly.
+    const { adapter, send } = adapterWithSend();
+    send.mockResolvedValueOnce({ Body: body("small"), ContentLength: 5 });
+    expect(
+      (await adapter.read("ok.woff2", { maxBytes: 10 }))?.toString("utf8")
+    ).toBe("small");
+  });
+
+  it("hands the caller's deadline to the SDK rather than ignoring it", async () => {
+    /*
+     * `StorageReadOptions` promises a bound and the URL-backed adapters keep it
+     * by forwarding `timeoutMs` to `safeFetch`. Read through the SDK there is
+     * no fetch to hand it to, so without this the same option is advertised and
+     * inert — the worst kind, one that validates and then does nothing, leaving
+     * a stalled bucket holding the read past a deadline the caller was told
+     * applied.
+     *
+     * Asserted on what `send` RECEIVED, because the resolved value is identical
+     * whether or not a signal was attached, which is exactly how this regresses
+     * unnoticed.
+     */
+    const { adapter, send } = adapterWithSend();
+    send.mockResolvedValueOnce({ Body: body("x"), ContentLength: 1 });
+    await adapter.read("f.woff2", { timeoutMs: 1234 });
+    const options = send.mock.calls[0]?.[1] as
+      | { abortSignal?: AbortSignal }
+      | undefined;
+    expect(options?.abortSignal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("still bounds the read when the caller named NO deadline", async () => {
+    /*
+     * This case previously asserted the opposite and so locked the defect in.
+     * `StorageReadOptions` promises the deadline whether or not a caller names
+     * one, and the URL-backed adapters keep that promise by inheriting
+     * `safeFetch`'s — while this one, reached by the media pipeline with no
+     * options at all, had none.
+     */
+    const { adapter, send } = adapterWithSend();
+    send.mockResolvedValueOnce({ Body: body("x"), ContentLength: 1 });
+    await adapter.read("f.woff2");
+    const options = send.mock.calls[0]?.[1] as
+      | { abortSignal?: AbortSignal }
+      | undefined;
+    expect(options?.abortSignal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("REFUSES an oversized body when the store reported no length at all", async () => {
+    /*
+     * `ContentLength` is optional in the SDK response, and MinIO/R2 and other
+     * compatible services may omit it or report it wrongly — so a preflight
+     * check against metadata fails OPEN exactly where an unusual backend is
+     * involved. The cap is counted against bytes that actually arrive.
+     */
+    const { adapter, send } = adapterWithSend();
+    send.mockResolvedValueOnce({ Body: body("x".repeat(500), 100) });
+
+    const outcome = await adapter.read("big.bin", { maxBytes: 150 }).then(
+      value => value,
+      (error: unknown) => error
+    );
+    expect(isStorageReadTooLarge(outcome)).toBe(true);
+  });
+
+  it("REFUSES a body larger than a LYING ContentLength", async () => {
+    // The sharper half: metadata that is present but wrong passes the
+    // preflight, so only counting what arrives can catch it.
+    const { adapter, send } = adapterWithSend();
+    send.mockResolvedValueOnce({
+      Body: body("x".repeat(500), 100),
+      ContentLength: 5,
+    });
+
+    const outcome = await adapter.read("liar.bin", { maxBytes: 150 }).then(
+      value => value,
+      (error: unknown) => error
+    );
+    expect(isStorageReadTooLarge(outcome)).toBe(true);
+  });
+
+  it("answers an empty buffer for a zero-byte object, not null", async () => {
+    /*
+     * A stored empty file is not a missing one. Collapsing them would let a
+     * caller cleaning up "missing" keys delete a real object.
+     */
+    const { adapter, send } = adapterWithSend();
+    send.mockResolvedValueOnce({ Body: undefined, ContentLength: 0 });
+    const bytes = await adapter.read("empty.bin");
+    expect(bytes).not.toBeNull();
+    expect(bytes?.length).toBe(0);
+  });
+});
+
+// The mocked client class, referenced so the import is not flagged as unused.
+void S3Client;
+
+/*
+ * A media record keeps the original's stored path and URL but only the URL of
+ * the thumbnail made at upload, so a delete works the thumbnail's path out
+ * from them: it relies on every URL being one fixed prefix plus the stored
+ * path, with nothing encoded. This holds the adapter to that.
+ */
+describe("S3StorageAdapter — a URL is one prefix plus the stored path", () => {
+  it.each([
+    ["the bucket's own address", {}],
+    [
+      "a configured public URL",
+      { publicUrl: "https://cdn.example.com/media/" },
+    ],
+  ])("holds for %s", async (_label, extra) => {
+    const adapter = new S3StorageAdapter({
+      bucket: "test-bucket",
+      region: "us-east-1",
+      ...extra,
+    });
+    const options = { mimeType: "image/png", collection: "media" };
+
+    const original = await adapter.upload(Buffer.from("o"), {
+      ...options,
+      filename: "photo.png",
+    });
+    const thumbnail = await adapter.upload(Buffer.from("t"), {
+      ...options,
+      filename: "thumb_photo.png",
+    });
+
+    const prefixOf = (result: { url: string; path: string }) => {
+      expect(result.url.endsWith(result.path)).toBe(true);
+      return result.url.slice(0, result.url.length - result.path.length);
+    };
+    // Keys are in a date folder, as stored files are.
+    expect(original.path).toMatch(/\//);
+    expect(prefixOf(thumbnail)).toBe(prefixOf(original));
+    expect(adapter.getPublicUrl(thumbnail.path)).toBe(thumbnail.url);
+  });
+});
+
+// Searching the bucket for left-behind files reads every page of it.
+describe("S3StorageAdapter — list", () => {
+  it("names every object on every page, by key and time", async () => {
+    const { adapter, send } = adapterWithSend();
+    const time = new Date("2026-10-18T10:00:00Z");
+    send
+      .mockResolvedValueOnce({
+        Contents: [{ Key: "2026/10/b-photo.png", LastModified: time }],
+        IsTruncated: true,
+        NextContinuationToken: "next",
+      })
+      .mockResolvedValueOnce({
+        Contents: [{ Key: "2026/10/a-thumb_x.png", LastModified: time }],
+        IsTruncated: false,
+      });
+
+    const listed = [];
+    for await (const entry of adapter.list()) listed.push(entry);
+
+    expect(listed).toEqual([
+      { path: "2026/10/b-photo.png", lastModified: time },
+      { path: "2026/10/a-thumb_x.png", lastModified: time },
+    ]);
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+});
+
+/*
+ * The factory runs while the host's config file is evaluated, so construction
+ * is the config load: a throw there stops every command, including the
+ * schema-only ones that never reach storage. The documented config pattern
+ * passes `process.env` values straight in, so a missing variable arrives
+ * empty at runtime although the type says string — and the bucket and region
+ * checks belong to the first storage operation instead.
+ */
+describe("S3StorageAdapter — configuration is checked at first use", () => {
+  beforeEach(() => {
+    /*
+     * Stubbed to EMPTY rather than deleted, pinning what the environment
+     * holds so a developer's own S3_BUCKET cannot turn the refusal cases
+     * green.
+     */
+    vi.stubEnv("S3_BUCKET", "");
+    vi.stubEnv("AWS_REGION", "");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("constructs the factory and adapter with no bucket or region", () => {
+    const plugin = s3Storage({
+      bucket: process.env.S3_BUCKET!,
+      region: process.env.AWS_REGION!,
+      collections: { media: true },
+    });
+    expect(plugin.adapter).not.toBeNull();
+  });
+
+  it("refuses the first storage operation when the bucket is absent", async () => {
+    const adapter = new S3StorageAdapter({
+      bucket: process.env.S3_BUCKET!,
+      region: "us-east-1",
+      collections: { media: true },
+    });
+    const outcome = await adapter.exists("f.woff2").then(
+      value => value,
+      (error: unknown) => error
+    );
+    expect((outcome as Error).message).toContain("bucket is required");
+  });
+
+  it("refuses the first storage operation when the region is absent", async () => {
+    const adapter = new S3StorageAdapter({
+      bucket: "test-bucket",
+      region: process.env.AWS_REGION!,
+      collections: { media: true },
+    });
+    const outcome = await adapter.exists("f.woff2").then(
+      value => value,
+      (error: unknown) => error
+    );
+    expect((outcome as Error).message).toContain("region is required");
+  });
+
+  it("checks the bucket before the region, as today's refusal did", async () => {
+    /*
+     * Both absent must answer with the BUCKET message: the constructor
+     * checked in that order, and the refusal the operator sees is meant to
+     * be the one they saw before — which one an implementation that reversed
+     * the order would quietly change.
+     */
+    const adapter = new S3StorageAdapter({
+      bucket: process.env.S3_BUCKET!,
+      region: process.env.AWS_REGION!,
+      collections: { media: true },
+    });
+    const outcome = await adapter.exists("f.woff2").then(
+      value => value,
+      (error: unknown) => error
+    );
+    expect((outcome as Error).message).toContain("bucket is required");
+  });
+
+  it("refuses getPublicUrl when configuration is absent", () => {
+    const adapter = new S3StorageAdapter({
+      bucket: process.env.S3_BUCKET!,
+      region: process.env.AWS_REGION!,
+      collections: { media: true },
+    });
+    expect(() => adapter.getPublicUrl("f.woff2")).toThrow("bucket is required");
+  });
+
+  it("forms a public URL without instantiating the S3 client", () => {
+    const adapter = new S3StorageAdapter({
+      bucket: "test-bucket",
+      region: "us-east-1",
+      collections: { media: true },
+    });
+    const url = adapter.getPublicUrl("f.woff2");
+    expect(url).toBe("https://test-bucket.s3.us-east-1.amazonaws.com/f.woff2");
+    expect((adapter as unknown as { client: unknown }).client).toBeNull();
+  });
+});
+
+describe("S3StorageAdapter.uploadAt", () => {
+  it("writes the bytes at exactly the key it is given, with their type", async () => {
+    const { adapter, send } = adapterWithSend();
+    send.mockResolvedValueOnce({});
+    const key = "media/2026/11/0b6f-photo.jpg.w640.webp";
+
+    const result = await adapter.uploadAt(key, Buffer.from("copy"), {
+      mimeType: "image/webp",
+    });
+
+    expect(send).toHaveBeenCalledTimes(1);
+    const input = (send.mock.calls[0][0] as { input: Record<string, unknown> })
+      .input;
+    expect(input).toMatchObject({
+      Bucket: "test-bucket",
+      Key: key,
+      ContentType: "image/webp",
+    });
+    expect(result).toEqual({ url: adapter.getPublicUrl(key), path: key });
+  });
+
+  it("fails when the bucket refuses the write, so nothing is reported kept", async () => {
+    const { adapter, send } = adapterWithSend();
+    send.mockRejectedValueOnce(new Error("AccessDenied"));
+    await expect(
+      adapter.uploadAt("media/a.jpg.w96.jpg", Buffer.from("x"), {
+        mimeType: "image/jpeg",
+      })
+    ).rejects.toThrow("AccessDenied");
+  });
+});

@@ -1,0 +1,146 @@
+/**
+ * One submission of a document form, from validation to what the form starts
+ * from afterwards: the part the entry and Single editors share.
+ *
+ * Each editor decides who may submit and how a document is written; what
+ * happens around the write is the same question for both, so it is answered
+ * once here — validated or refused, written or failed, and the form left
+ * holding what the server stored without losing what was typed meanwhile.
+ *
+ * @module components/features/entries/EntryForm/submit-document
+ */
+import type { BaseSyntheticEvent } from "react";
+import type { UseFormReturn } from "react-hook-form";
+
+import { copiedValuesFor } from "@admin/components/features/entries/copied-values";
+import type { EditorRestore } from "@admin/components/features/versions/editor-restore";
+import { recordingsSettled } from "@admin/hooks/useSnapshotAutosave";
+
+import { adoptStoredValues } from "./adopt-stored";
+import {
+  submitFailed,
+  submitHeld,
+  submitInvalid,
+  submitMoved,
+  type SubmitOutcome,
+} from "./submit-outcome";
+
+/**
+ * The key a save names its restored fields under, which the server reads at
+ * the write's boundary and never stores.
+ */
+const RESTORED_FROM_KEY = "_restoredFrom";
+
+/**
+ * The key a save names where its translated values came from under (a copy from another
+ * language), which the server reads at the write's boundary and never stores.
+ */
+const PROVENANCE_KEY = "_provenance";
+
+/** What one write came to, for the form to start from. */
+export interface DocumentWrite {
+  /** The saved document, for the caller. */
+  item: { id: string };
+  /**
+   * The stored values in the form's shape, or null where the write reports
+   * none — then what was sent is the best starting point there is.
+   */
+  stored: Record<string, unknown> | null;
+}
+
+export async function submitDocument(args: {
+  form: UseFormReturn<Record<string, unknown>>;
+  event?: BaseSyntheticEvent;
+  /** The payload a validated form becomes, for this save's intent. */
+  toPayload: (values: Record<string, unknown>) => Record<string, unknown>;
+  /** Writes the payload. A rejection is the save failing. */
+  write: (payload: Record<string, unknown>) => Promise<DocumentWrite>;
+  /** Hears a failed write, after it is logged. */
+  onFailure?: (error: unknown) => void;
+  /**
+   * Whether the document may still be written, asked once validation is done
+   * and immediately before the write; a no stores nothing.
+   */
+  mayWrite?: () => boolean;
+  /**
+   * Whether the editor still shows the document and language the submission
+   * started in, asked with `mayWrite`: after a move the form holds another's
+   * values, so a no stores nothing.
+   */
+  stillShown?: () => boolean;
+  /**
+   * The document's recordings, as `documentRecordingKey` spells it, which the
+   * write waits for: see `recordingsSettled`. Null where there are none, as on
+   * a document not created yet.
+   */
+  recordingsFor: string | null;
+  /**
+   * The values a restore put into the form: the save names, for each field
+   * still holding one, the version it came from (`_restoredFrom`), and forgets
+   * them once the save is stored.
+   */
+  restore?: Pick<EditorRestore, "restoredFromForSave" | "saved">;
+}): Promise<SubmitOutcome> {
+  const { form, toPayload, write, onFailure, mayWrite, stillShown } = args;
+  // The values this save is made from, as the form held them, before
+  // validation's transforms: what is compared afterwards to find what the
+  // author typed while the save was in flight.
+  const submitted = structuredClone(form.getValues());
+  // Validation decides which callback runs, and only one does; the default
+  // covers neither running, which RHF does not do today.
+  let outcome: SubmitOutcome = submitInvalid;
+  await form.handleSubmit(
+    async validated => {
+      // A recovery point already on its way lands first, so this save, which
+      // deletes it, comes after it: see `recordingsSettled`.
+      await recordingsSettled(args.recordingsFor);
+      // Validation awaits, and the document can change hands meanwhile:
+      // asked with nothing awaited before the write.
+      if (mayWrite && !mayWrite()) {
+        outcome = submitHeld;
+        return;
+      }
+      if (stillShown && !stillShown()) {
+        outcome = submitMoved;
+        return;
+      }
+      const payload = toPayload(validated);
+      // Judged against what the form held when the save began, the values a
+      // restore set, before validation's transforms.
+      const sources = args.restore?.restoredFromForSave(submitted);
+      // And the fields a copy from another language filled, still as copied.
+      const copies = copiedValuesFor(form.control).beginSave(submitted);
+      const copied = copies.claims;
+      try {
+        const written = await write({
+          ...payload,
+          ...(sources ? { [RESTORED_FROM_KEY]: sources } : {}),
+          ...(copied ? { [PROVENANCE_KEY]: copied } : {}),
+        });
+        // Stored: the next save restores nothing unless another restore does,
+        // and claims no copy this save carried; one made while it was on its
+        // way is still claimed.
+        args.restore?.saved();
+        copies.saved();
+        // Only where the editor still shows what was written: after a move
+        // the form holds another document's or language's values, which
+        // these would replace for its next Save to write.
+        if (!stillShown || stillShown()) {
+          if (written.stored === null) form.reset(payload);
+          // What the server stored becomes the form's starting point,
+          // keeping anything typed while the save was in flight.
+          else adoptStoredValues(form, written.stored, submitted);
+        }
+        outcome = { ok: true, item: written.item };
+      } catch (error) {
+        console.error("Form submission error:", error);
+        onFailure?.(error);
+        outcome = submitFailed(error);
+      }
+    },
+    () => {
+      outcome = submitInvalid;
+    }
+  )(args.event);
+  return outcome;
+}

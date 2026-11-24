@@ -1,0 +1,93 @@
+import { jwtVerify, errors as joseErrors } from "jose";
+
+import {
+  PENDING_AUTH_TYP,
+  SESSION_EPOCH_CLAIM,
+  type NextlyJwtPayload,
+} from "./claims";
+import {
+  ALGORITHM,
+  EPOCH_CLAIM_HEADER,
+  EPOCH_CLAIM_HEADER_VALUE,
+  secretToKey,
+  TOKEN_TYP,
+  type TokenPurpose,
+} from "./sign";
+
+export type VerifyResult =
+  | { valid: true; payload: NextlyJwtPayload }
+  | { valid: false; reason: "expired" | "invalid" | "malformed" };
+
+/**
+ * Verify a token for ONE purpose.
+ *
+ * Every token carries a header `typ` naming what it is for, and one that
+ * names another purpose — or names no purpose at all — is refused, so a token
+ * minted for a challenge or any future single-purpose flow cannot be
+ * presented as a session. The refusal of an absent header `typ` is the named
+ * release the typed-tokens change promised: tokens signed before the header
+ * existed were accepted while they could still be in circulation, and from
+ * this release a token without the header stops verifying wherever a session
+ * or a pending challenge is read. Pending tokens are additionally refused as
+ * sessions by their claim, which still covers a forged token carrying the
+ * session header alongside a pending claim.
+ *
+ * The algorithm list is explicit: left implicit, a token declaring `alg:
+ * "none"` can talk the verifier out of checking the signature.
+ */
+export async function verifyToken(
+  token: string,
+  secret: string,
+  purpose: TokenPurpose
+): Promise<VerifyResult> {
+  try {
+    const { payload, protectedHeader } = await jwtVerify(
+      token,
+      secretToKey(secret),
+      { algorithms: [ALGORITHM] }
+    );
+    const typ = protectedHeader.typ;
+    if (typ !== TOKEN_TYP[purpose]) {
+      return { valid: false, reason: "invalid" };
+    }
+    if (purpose === "session" && payload.typ === PENDING_AUTH_TYP) {
+      return { valid: false, reason: "invalid" };
+    }
+    // The epoch claim counts only on a token Nextly signed with it. Any other
+    // token's `nx_sev` is an application's own value, read as absent.
+    const claims: Record<string, unknown> = { ...payload };
+    if (protectedHeader[EPOCH_CLAIM_HEADER] !== EPOCH_CLAIM_HEADER_VALUE) {
+      delete claims[SESSION_EPOCH_CLAIM];
+    }
+    return { valid: true, payload: claims as unknown as NextlyJwtPayload };
+  } catch (error) {
+    if (error instanceof joseErrors.JWTExpired) {
+      return { valid: false, reason: "expired" };
+    }
+    // JWTClaimValidationFailed, JWSSignatureVerificationFailed, JWSInvalid, etc.
+    return { valid: false, reason: "invalid" };
+  }
+}
+
+/**
+ * Verify and decode a JWT access token.
+ *
+ * A thin wrapper over {@link verifyToken} for the session purpose, so every
+ * existing caller gets the typed-token rules without being edited.
+ *
+ * Checks the signature and the token's purpose only: it does not ask whether
+ * the account may still use the token. A token issued before its account was
+ * deactivated, or before an administrator set its password, still verifies
+ * here. To read a session, use `getSession` or `requireAuth`, which also make
+ * that check (`auth/session/session-standing`).
+ *
+ * @param token - The JWT string from the cookie
+ * @param secret - The NEXTLY_SECRET string
+ * @returns VerifyResult with payload on success or reason on failure
+ */
+export async function verifyAccessToken(
+  token: string,
+  secret: string
+): Promise<VerifyResult> {
+  return verifyToken(token, secret, "session");
+}

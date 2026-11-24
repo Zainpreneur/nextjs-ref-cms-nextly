@@ -1,0 +1,106 @@
+name: Preview release
+
+# Publishes every PR's packages to pkg.pr.new (StackBlitz's continuous-release
+# CDN) and comments install URLs on the PR. A consumer app can then install a
+# PR's exact build — `npm i https://pkg.pr.new/nextlyhq/nextly/nextly@<sha>` —
+# and verify it against real projects before the PR merges. Nothing is
+# published to the npm registry and the URLs expire on their own, so there is
+# no version pollution and nothing to clean up.
+#
+# Requires the pkg.pr.new GitHub App (github.com/apps/pkg-pr-new) to be
+# installed on this repository; publishing authenticates through the app, not
+# through repo secrets.
+
+on:
+  pull_request:
+    branches: [main, dev]
+
+# The GITHUB_TOKEN is unused: the pkg.pr.new app authenticates the publish
+# and writes the PR comment itself.
+permissions: {}
+
+concurrency:
+  group: preview-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    name: Publish preview packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Restore pnpm store
+        uses: ./.github/actions/pnpm-store
+
+      # Scoped to the JOB, which is the part that matters. Six jobs across four
+      # workflows cache `.turbo`, they run concurrently on the same commit, and
+      # they build different filter sets — this one builds every package and app,
+      # `preview` builds only packages, `integration` builds five of them. Keyed on
+      # the commit alone they all wrote one entry, so whichever finished first
+      # decided what every later reader got.
+      #
+      # A reader then restores a `.turbo` shaped by someone else's build, reports
+      # `cache hit, replaying logs`, and lays down a `dist/` that does not contain
+      # what its own tests import. The symptom is `Cannot find module
+      # '.../dist/chunk-<hash>.mjs'` in a package the pull request never touched.
+      # Re-running cannot clear it: the key is the commit, so a second attempt
+      # scores an exact hit on the same foreign entry.
+      #
+      # `github.job` gives each job its own lineage. Nothing is lost — a job's own
+      # previous runs are what its cache was ever useful for, and turbo entries are
+      # content-addressed, so a narrower cache is a slower run and never a wrong
+      # one.
+      #
+      # The `v2-` prefix retires every entry written under the shared scheme in one
+      # step. Cache keys are immutable and `restore-keys` prefers the newest match,
+      # so the entries already written would otherwise keep being selected.
+      - name: Restore Turbo cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .turbo
+          key: turbo-v2-${{ runner.os }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            turbo-v2-${{ runner.os }}-${{ github.job }}-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build packages
+        run: pnpm turbo build --filter='./packages/*'
+        env:
+          TURBO_CACHE_DIR: .turbo
+
+      # `--pnpm` makes pkg-pr-new pack with pnpm so workspace:* protocol
+      # ranges in package.json resolve to real versions in the tarballs,
+      # exactly as `changeset publish` does for npm releases.
+      # `--commentWithSha` puts the commit sha in the comment's install
+      # links instead of the PR number: a sha URL is immutable, so a
+      # consumer app testing a preview cannot silently drift onto a newer
+      # push to the same PR.
+      - name: Publish to pkg.pr.new
+        run: pnpm dlx pkg-pr-new publish --pnpm --commentWithSha './packages/*'
+
+      # Only a job that finished its work publishes what it learned. A cancelled or
+      # failed run leaves the cache as it found it — `actions/cache` saves in a post
+      # step that runs however the job ended, and splitting restore from save is the
+      # supported way to make that conditional (`save-always` was deprecated for it).
+      - name: Save Turbo cache
+        if: success()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .turbo
+          key: turbo-v2-${{ runner.os }}-${{ github.job }}-${{ github.sha }}

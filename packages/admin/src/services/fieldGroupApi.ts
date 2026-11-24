@@ -1,0 +1,319 @@
+/**
+ * Component API Service
+ *
+ * API client for Component definition management operations.
+ * Follows the established pattern from collectionApi.ts.
+ *
+ * @see collectionApi.ts - Reference pattern
+ */
+
+import type { ListResponse, TableParams } from "@nextlyhq/ui";
+import type {
+  ReconcileFieldGroupPreview,
+  ReconcileFieldGroupResult,
+} from "nextly/field-group-reconcile";
+
+import type { FieldDefinition } from "@admin/types/collection";
+import type { ApiFieldGroup } from "@admin/types/entities";
+
+import { buildQuery as buildQueryUtil } from "../lib/api/buildQuery";
+import { fetcher } from "../lib/api/fetcher";
+import { protectedApi } from "../lib/api/protectedApi";
+import type { MutationResponse } from "../lib/api/response-types";
+
+import { withListOwner, type ListOwner } from "./list-owner";
+import {
+  applySchemaAt,
+  previewSchemaAt,
+  type FieldResolution,
+  type SchemaApplyResponse,
+  type SchemaPreviewResponse,
+  type SchemaRenameResolution,
+  type SchemaSaveHints,
+} from "./schemaApi";
+
+/**
+ * Payload for creating a new Component via API
+ */
+export interface CreateComponentPayload {
+  slug: string;
+  label: string;
+  description?: string;
+  /** The field definitions to persist, in the shape the builder produces. */
+  fields: FieldDefinition[];
+  admin?: {
+    category?: string;
+    icon?: string;
+    hidden?: boolean;
+    description?: string;
+    imageURL?: string;
+  };
+  /** i18n: whether the component is localized (translatable fields live in comp_<slug>_locales). */
+  localized?: boolean;
+}
+
+/**
+ * Payload for updating an existing Component via API
+ */
+export interface UpdateComponentPayload {
+  label?: string;
+  description?: string;
+  /** The field definitions to persist, in the shape the builder produces. */
+  fields?: FieldDefinition[];
+  admin?: {
+    category?: string;
+    icon?: string;
+    hidden?: boolean;
+    description?: string;
+    imageURL?: string;
+  };
+  /** i18n: the Internationalization toggle. Provisions/persists the companion when true. */
+  localized?: boolean;
+}
+
+/**
+ * The list filters this endpoint applies SERVER-SIDE.
+ *
+ * Named rather than forwarded wholesale: `buildQuery` would emit the whole `filters` record as one
+ * JSON parameter, and this dispatcher reads flat query params. Listing them also keeps an unknown
+ * key from being sent and silently ignored, which reads to a caller exactly like a filter that
+ * worked.
+ */
+const SERVER_FILTERS = ["source", "migrationStatus"] as const;
+
+// Build query string for pagination and search using shared utility
+const buildQuery = (params: TableParams): string => {
+  const base = buildQueryUtil(params, {
+    fieldMapping: {
+      slug: "slug",
+      label: "label",
+      source: "source",
+      createdAt: "createdAt",
+    },
+    validSortFields: ["slug", "label", "createdAt"],
+  });
+
+  // Appended as flat params, matching what the dispatcher reads. Empty and "all" are omitted rather
+  // than sent: the absence of the parameter IS "do not filter", so sending a sentinel would make
+  // the server reject a selection that means no filter at all.
+  const query = new URLSearchParams(base);
+  const filters = params.filters?.filters ?? {};
+  for (const name of SERVER_FILTERS) {
+    const value = filters[name];
+    if (typeof value === "string" && value !== "" && value !== "all") {
+      query.set(name, value);
+    }
+  }
+  return query.toString();
+};
+
+/**
+ * Fetch paginated list of Component definitions.
+ */
+export const fetchComponents = async (
+  params: TableParams,
+  // The site's field groups or the plugins'; none lists both.
+  owner?: ListOwner
+): Promise<ListResponse<ApiFieldGroup>> => {
+  const query = withListOwner(buildQuery(params), owner);
+  const url = `/field-groups${query ? `?${query}` : ""}`;
+  return fetcher<ListResponse<ApiFieldGroup>>(url, {}, true);
+};
+
+/**
+ * Delete a Component definition by slug. Caller expects void;
+ * we discard the response body (which may be MutationResponse or
+ * ActionResponse depending on the dispatcher path).
+ */
+export const deleteFieldGroup = async (
+  fieldGroupSlug: string
+): Promise<void> => {
+  await fetcher<MutationResponse<unknown>>(
+    `/field-groups/${fieldGroupSlug}`,
+    {
+      method: "DELETE",
+    },
+    true
+  );
+};
+
+/** The type of {@link fieldGroupApi}. */
+type FieldGroupApiType = {
+  readonly fetchComponents: typeof fetchComponents;
+  readonly deleteFieldGroup: typeof deleteFieldGroup;
+  readonly list: () => Promise<ApiFieldGroup[]>;
+  readonly get: (fieldGroupSlug: string) => Promise<ApiFieldGroup>;
+  readonly create: (payload: CreateComponentPayload) => Promise<ApiFieldGroup>;
+  readonly update: (
+    fieldGroupSlug: string,
+    payload: UpdateComponentPayload
+  ) => Promise<ApiFieldGroup>;
+  readonly remove: (fieldGroupSlug: string) => Promise<{ message: string }>;
+  readonly previewSchemaChanges: (
+    fieldGroupSlug: string,
+    fields: unknown[],
+    localized?: boolean,
+    hints?: SchemaSaveHints
+  ) => Promise<SchemaPreviewResponse>;
+  readonly applySchemaChanges: (
+    fieldGroupSlug: string,
+    fields: unknown[],
+    schemaVersion: number,
+    resolutions?: Record<string, FieldResolution>,
+    renameResolutions?: SchemaRenameResolution[],
+    localized?: boolean,
+    acknowledgedConversions?: readonly string[],
+    hints?: SchemaSaveHints
+  ) => Promise<SchemaApplyResponse>;
+  readonly previewReconcile: (
+    fieldGroupSlug: string
+  ) => Promise<ReconcileFieldGroupPreview>;
+  readonly reconcile: (
+    fieldGroupSlug: string,
+    expectedSchemaVersion: number
+  ) => Promise<MutationResponse<ReconcileFieldGroupResult>>;
+};
+
+/**
+ * Component API service object.
+ *
+ * Server emits canonical `respondX` shapes (spec §5.1): list ->
+ * `ListResponse<T>`; bare reads -> `T`; create/update ->
+ * `MutationResponse<T>`. We surface the bare `ApiFieldGroup` to
+ * callers so mutations match the read shape; toast text comes from
+ * `message` when needed.
+ */
+export const fieldGroupApi: FieldGroupApiType = {
+  fetchComponents,
+  deleteFieldGroup,
+
+  /**
+   * List all Component definitions (simple list, no pagination).
+   */
+  list: async (): Promise<ApiFieldGroup[]> => {
+    const result =
+      await protectedApi.get<ListResponse<ApiFieldGroup>>("/field-groups");
+    return result.items;
+  },
+
+  /**
+   * Get a single Component definition by slug.
+   */
+  get: async (fieldGroupSlug: string): Promise<ApiFieldGroup> => {
+    return protectedApi.get<ApiFieldGroup>(`/field-groups/${fieldGroupSlug}`);
+  },
+
+  /**
+   * Create a new Component definition.
+   */
+  create: async (payload: CreateComponentPayload): Promise<ApiFieldGroup> => {
+    const result = await protectedApi.post<MutationResponse<ApiFieldGroup>>(
+      "/field-groups",
+      payload
+    );
+    return result.item;
+  },
+
+  /**
+   * Update an existing Component definition.
+   */
+  update: async (
+    fieldGroupSlug: string,
+    payload: UpdateComponentPayload
+  ): Promise<ApiFieldGroup> => {
+    const result = await protectedApi.patch<MutationResponse<ApiFieldGroup>>(
+      `/field-groups/${fieldGroupSlug}`,
+      payload
+    );
+    return result.item;
+  },
+
+  /**
+   * Remove a Component definition.
+   */
+  remove: async (fieldGroupSlug: string): Promise<{ message: string }> => {
+    const result = await protectedApi.delete<MutationResponse<ApiFieldGroup>>(
+      `/field-groups/${fieldGroupSlug}`
+    );
+    return { message: result.message };
+  },
+
+  /**
+   * Preview component schema changes — dry-run diff with rename candidates.
+   * Mirrors schemaApi.preview() for collections.
+   */
+  previewSchemaChanges: async (
+    fieldGroupSlug: string,
+    fields: unknown[],
+    // i18n: mirrors schemaApi.preview and the apply below, so the preview diffs against the
+    // localization state the apply will run with, and reports fields leaving translation.
+    localized?: boolean,
+    // The fields the save moves into or out of a group, as its apply sends them.
+    hints?: SchemaSaveHints
+  ): Promise<SchemaPreviewResponse> =>
+    previewSchemaAt(`/field-groups/schema/${fieldGroupSlug}`, fields, {
+      localized,
+      hints,
+    }),
+
+  /**
+   * Apply confirmed component schema changes via PushSchemaPipeline.
+   * Mirrors schemaApi.apply() for collections.
+   */
+  applySchemaChanges: async (
+    fieldGroupSlug: string,
+    fields: unknown[],
+    schemaVersion: number,
+    resolutions?: Record<string, FieldResolution>,
+    renameResolutions?: SchemaRenameResolution[],
+    // i18n: the current Internationalization toggle, so an apply that flips i18n AND changes
+    // fields provisions the companion in the same request. Undefined leaves the persisted value.
+    localized?: boolean,
+    // The keys of the conversions the review listed and its Save confirmed.
+    acknowledgedConversions?: readonly string[],
+    // The fields the save moves into or out of a group, as its preview sent them.
+    hints?: SchemaSaveHints
+  ): Promise<SchemaApplyResponse> =>
+    applySchemaAt(
+      `/field-groups/schema/${fieldGroupSlug}`,
+      fields,
+      {
+        schemaVersion,
+        resolutions,
+        renameResolutions,
+        acknowledgedConversions,
+      },
+      { localized, hints }
+    ),
+
+  /**
+   * What repairing this field group's stored definition WOULD change.
+   *
+   * A GET on the same path the repair posts to: the verb is what separates asking from doing, and
+   * this half writes nothing. Safe to call on any field group, including a healthy one.
+   */
+  previewReconcile: async (
+    fieldGroupSlug: string
+  ): Promise<ReconcileFieldGroupPreview> => {
+    return protectedApi.get<ReconcileFieldGroupPreview>(
+      `/field-groups/schema/${fieldGroupSlug}/reconcile`
+    );
+  },
+
+  /**
+   * Repair the stored definition to describe the live tables.
+   *
+   * `expectedSchemaVersion` is the version the preview reported, and passing it is what makes the
+   * approval specific: the server refuses rather than repairing if the row has moved since, so a
+   * stale tab can never apply a plan its operator never read.
+   */
+  reconcile: async (
+    fieldGroupSlug: string,
+    expectedSchemaVersion: number
+  ): Promise<MutationResponse<ReconcileFieldGroupResult>> => {
+    return protectedApi.post<MutationResponse<ReconcileFieldGroupResult>>(
+      `/field-groups/schema/${fieldGroupSlug}/reconcile`,
+      { expectedSchemaVersion }
+    );
+  },
+} as const;

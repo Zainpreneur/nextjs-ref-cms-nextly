@@ -1,0 +1,856 @@
+/**
+ * `ui-schema.json` manifest — Zod source of truth (spec §4.12).
+ *
+ * One schema drives every validation layer (IDE `$schema`, dev-server watcher,
+ * CLI load, dev write API, migrate:check). Field `type` uses the codebase's
+ * canonical `FieldType` tokens (the builder subset) so the manifest round-trips
+ * through `getColumnDescriptor` with no translation — see `to-snapshot.ts`.
+ *
+ * NOTE (spec deviation): spec §4.12.2 lists `boolean`; the canonical token is
+ * `checkbox`. We use the canonical names.
+ *
+ * @module schemas/_zod/ui-schema
+ * @since v0.0.3-alpha (Plan D1)
+ */
+
+import { z } from "zod";
+
+import { isIconIdShape } from "../../collections/fields/types/icon";
+import { isFieldGroupFieldType } from "../../domains/field-groups/storage/field-group-field-type";
+import { reservedSystemFieldNames } from "../../lib/system-columns";
+import {
+  isPluginOptionContainer,
+  RESERVED_PLUGIN_OPTION_KEYS,
+} from "../../plugins/plugin-options";
+import { STORAGE_FORMAT } from "../../schemas/storage-format";
+import { pluginStorageFieldType } from "../../shared/lib/plugin-storage";
+import type { StoredHookConfig } from "../dynamic-collections/types";
+
+/**
+ * Canonical field-type tokens supported in ui-schema.json. Mirrors the set
+ * `field-column-descriptor.ts:classifyFieldKind` maps to a column, so the
+ * manifest round-trips through `getColumnDescriptor` with no translation.
+ */
+/** The tokens whose default shape core is able to judge. */
+export const UI_FIELD_TYPES = [
+  "text",
+  "textarea",
+  "richText",
+  "number",
+  "checkbox",
+  "date",
+  "select",
+  "relationship",
+  "upload",
+  "email",
+  "password",
+  "code",
+  "icon",
+  "radio",
+  "repeater",
+  "group",
+  "component",
+  "fieldGroup",
+  "json",
+  "chips",
+] as const;
+
+const BUILT_IN_UI_FIELD_TYPES = new Set<string>(UI_FIELD_TYPES);
+
+/**
+ * Whether a field type is one this schema names, rather than a token a plugin contributed or a
+ * token nothing has registered at all.
+ *
+ * The field schema accepts any slug-shaped token, so "not one of ours" is a state a stored field can
+ * genuinely be in, and the layers that decide storage have to tell it apart from a built-in. Asked
+ * here because this is where the list of built-ins is declared; a caller keeping its own copy would
+ * answer wrongly the first time the list grew.
+ */
+export function isBuiltInFieldType(type: string): boolean {
+  return BUILT_IN_UI_FIELD_TYPES.has(type);
+}
+
+/** Field names the framework reserves (system columns). */
+// Universal system columns present on every entity table (collection, single,
+// component). The collection-only owner column (`created_by`/`createdBy`) is
+// NOT reserved here — it would wrongly reject valid single/component fields;
+// it is enforced per-entity by assertValidFieldsPayload({ kind: "collection" }).
+const RESERVED_FIELD_NAMES: ReadonlySet<string> = new Set(
+  reservedSystemFieldNames("uiSchema")
+);
+
+const SLUG_RE = /^[a-z][a-z0-9_-]*$/;
+
+const slug = z
+  .string()
+  .regex(SLUG_RE, "slug must match ^[a-z][a-z0-9_-]*$")
+  .refine(s => !s.startsWith("_") && !s.startsWith("nextly_"), {
+    message: "slug must not use a reserved prefix (_ or nextly_)",
+  });
+
+const selectOption = z.object({
+  id: z.string().optional(),
+  label: z.string().min(1),
+  value: z.string().min(1),
+});
+
+/**
+ * A field's options as the registry stores them: a text's variant, a number's
+ * or date's format and, for a relationship, the target, how it relates, its
+ * foreign-key actions and a many-to-many's junction table. A plugin or API
+ * save sends a field this way, and the definition holds it as sent, so a
+ * deploy's registry row, written from the definition, keeps every one of them
+ * and the column mapping reads them as it reads the registry's. Keys beyond
+ * these are kept too.
+ */
+const registryOptions = z.looseObject({
+  variant: z.enum(["short", "long"]).optional(),
+  format: z.enum(["float", "integer", "datetime", "date", "time"]).optional(),
+  target: z.string().min(1).optional(),
+  relationType: z
+    .enum(["oneToOne", "oneToMany", "manyToOne", "manyToMany"])
+    .optional(),
+  onDelete: z.enum(["cascade", "set null", "restrict", "no action"]).optional(),
+  onUpdate: z.enum(["cascade", "set null", "restrict", "no action"]).optional(),
+  junctionTable: z.string().min(1).optional(),
+  targetLabelField: z.string().optional(),
+  maxDepth: z.number().optional(),
+});
+
+/** A relationship's options, as `registryOptions` reads them. */
+export type RegistryFieldOptions = z.infer<typeof registryOptions>;
+
+const validation = z
+  .object({
+    minLength: z.number().optional(),
+    maxLength: z.number().optional(),
+    min: z.number().optional(),
+    max: z.number().optional(),
+    minRows: z.number().optional(),
+    maxRows: z.number().optional(),
+    pattern: z.string().optional(),
+    message: z.string().optional(),
+  })
+  .refine(v => v.min === undefined || v.max === undefined || v.min <= v.max, {
+    message: "validation.min must be <= validation.max",
+  })
+  .refine(
+    v =>
+      v.minLength === undefined ||
+      v.maxLength === undefined ||
+      v.minLength <= v.maxLength,
+    { message: "validation.minLength must be <= validation.maxLength" }
+  )
+  .refine(
+    v => {
+      if (v.pattern === undefined) return true;
+      try {
+        new RegExp(v.pattern);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    { message: "validation.pattern must be a valid regular expression" }
+  );
+
+const fieldAdmin = z
+  .object({
+    width: z.enum(["25%", "33%", "50%", "66%", "75%", "100%"]).optional(),
+    position: z.literal("sidebar").optional(),
+    readOnly: z.boolean().optional(),
+    hidden: z.boolean().optional(),
+    description: z.string().optional(),
+    placeholder: z.string().optional(),
+    hideGutter: z.boolean().optional(),
+    allowCreate: z.boolean().optional(),
+    // condition's operator union is broad and the runtime evaluator is
+    // fail-open; store it permissively so nothing is lost.
+    condition: z.record(z.string(), z.unknown()).optional(),
+  })
+  .partial();
+
+// Recursive field shape: inline container types (repeater/group) carry
+// nested `fields`, so `field` references itself via z.lazy. The explicit
+// FieldNode type breaks the circular inference. (A component field is a
+// leaf reference by slug, not a container.)
+export type FieldNode = {
+  /**
+   * Absent only on a `group` that lays fields out: its fields are stored at the level it sits in,
+   * so it has no data and no name of its own (`uiSchemaFieldSchema` holds every other field to
+   * one).
+   */
+  name?: string;
+  // Canonical tokens, OR a plugin-contributed field type slug. Plugin types
+  // resolve to a column via the field-type registry in classifyFieldKind and
+  // keep their real type in the DB metadata so the plugin's editor still
+  // renders. `string & {}` widens the union while preserving autocomplete for
+  // the canonical tokens.
+  type: (typeof UI_FIELD_TYPES)[number] | (string & {});
+  label?: string;
+  /**
+   * Options belonging to the field's own plugin type, which core never reads.
+   *
+   * Typed loosely because the value is passed through rather than rebuilt: a
+   * schema that reconstructed it would lose an own `__proto__` or refuse an own
+   * `constructor`. Read it with `pluginOptionContainer`, which checks the shape
+   * at the point of use.
+   */
+  pluginOptions?: unknown;
+  required?: boolean;
+  unique?: boolean;
+  index?: boolean;
+  localized?: boolean;
+  hasMany?: boolean;
+  relationTo?: string | string[];
+  /**
+   * A number's storage as the registry stores it: exact `decimal` with its
+   * `precision` and `scale`, or `integer`. The column is made from these, so
+   * the definition holds them for the next save and `migrate:create` to read.
+   */
+  dbType?: "integer" | "decimal";
+  precision?: number;
+  scale?: number;
+  /**
+   * A select's or radio's choices; on any other field, its options as the
+   * registry stores them (`registryOptions`).
+   */
+  options?:
+    | { id?: string; label: string; value: string }[]
+    | RegistryFieldOptions;
+  defaultValue?: unknown;
+  validation?: {
+    minLength?: number;
+    maxLength?: number;
+    min?: number;
+    max?: number;
+    minRows?: number;
+    maxRows?: number;
+    pattern?: string;
+    message?: string;
+  };
+  admin?: {
+    width?: string;
+    position?: "sidebar";
+    readOnly?: boolean;
+    hidden?: boolean;
+    description?: string;
+    placeholder?: string;
+    hideGutter?: boolean;
+    allowCreate?: boolean;
+    condition?: Record<string, unknown>;
+  };
+  maxDepth?: number;
+  allowCreate?: boolean;
+  allowEdit?: boolean;
+  isSortable?: boolean;
+  relationshipFilter?: { field: string; equals: string };
+  mimeTypes?: string;
+  maxFileSize?: number;
+  labels?: { singular?: string; plural?: string };
+  initCollapsed?: boolean;
+  rowLabelField?: string;
+  component?: string;
+  /**
+   * The migrated spelling of `component`, on fields rewritten by the storage
+   * migration. Declared so the parser KEEPS the key — an undeclared key is
+   * stripped before any refinement runs, and the exactly-one-reference check
+   * below would then reject a valid migrated manifest.
+   */
+  fieldGroup?: string;
+  components?: string[];
+  /** The migrated spelling of `components`, kept for the same reason. */
+  fieldGroups?: string[];
+  repeatable?: boolean;
+  fields?: FieldNode[];
+};
+
+/**
+ * The single-field schema, exported so the schema-apply endpoints validate
+ * incoming field payloads with EXACTLY the rules the ui-schema.json mirror
+ * enforces. One validator for both writers is what keeps the DB and the
+ * committed manifest from ever disagreeing about what a legal field is.
+ */
+/**
+ * The name the Schema Builder gives a field: snake case. The definition file
+ * takes a camelCase name too (a plugin's or the API's collection may declare
+ * one, and the file records it as the registry does). The Builder's own
+ * payload keeps this rule for every name it creates, and takes a name the
+ * entity already holds whatever its case (`assertBuilderFieldNames`).
+ */
+export const BUILDER_FIELD_NAME_RE = /^[a-z][a-z0-9_]*$/;
+
+export const uiSchemaFieldSchema: z.ZodType<FieldNode> = z.lazy(() =>
+  z
+    .object({
+      name: z
+        .string()
+        .regex(
+          /^[A-Za-z][A-Za-z0-9_]*$/,
+          "field name must match ^[A-Za-z][A-Za-z0-9_]*$"
+        )
+        .optional(),
+      // A canonical token, OR a plugin-contributed field type slug. Plugin
+      // types aren't in the canonical enum; accept any slug-shaped token so the
+      // manifest preserves the real type through to production. The field-type
+      // registry (classifyFieldKind) maps it to a storage column; an
+      // unregistered type falls back to a text column.
+      type: z.union([z.enum(UI_FIELD_TYPES), z.string().regex(SLUG_RE)]),
+      label: z.string().optional(),
+      // Options belonging to the field's own plugin type. Held in a container
+      // because the shape above is applied to every field whatever its type,
+      // so an option sharing a name with one of these keys would be judged as
+      // that key instead. Core never looks inside, which is what lets any name
+      // be used here — including the ones declared alongside it. Passed through
+      // rather than reconstructed: `z.record` refuses a container carrying an
+      // own `constructor`, and `z.looseObject` copies by assignment, so an own
+      // `__proto__` becomes the copy's prototype and every option is lost with
+      // it. Checking an untouched value keeps both names usable, and unlike a
+      // custom type it still converts to the JSON Schema the editor reads.
+      pluginOptions: z
+        .unknown()
+        .superRefine((held, ctx) => {
+          if (held === undefined) return;
+          if (!isPluginOptionContainer(held)) {
+            ctx.addIssue({
+              code: "custom",
+              message: "pluginOptions must be an object",
+            });
+            return;
+          }
+          const reserved = Object.keys(held).filter(key =>
+            RESERVED_PLUGIN_OPTION_KEYS.has(key)
+          );
+          if (reserved.length > 0) {
+            ctx.addIssue({
+              code: "custom",
+              message:
+                `pluginOptions cannot hold ${reserved.join(" or ")}: those ` +
+                "state which field the type is looking at, so an option " +
+                "under either name would never reach it",
+            });
+          }
+        })
+        .optional(),
+      required: z.boolean().optional(),
+      unique: z.boolean().optional(),
+      index: z.boolean().optional(),
+      localized: z.boolean().optional(),
+      hasMany: z.boolean().optional(),
+      relationTo: z.union([z.string(), z.array(z.string())]).optional(),
+      // A number's storage, as `FieldDefinition` types it: kept, because the
+      // column is made from it and a key left out is stripped on the next load.
+      dbType: z.enum(["integer", "decimal"]).optional(),
+      precision: z.number().optional(),
+      scale: z.number().optional(),
+      options: z.union([z.array(selectOption), registryOptions]).optional(),
+      defaultValue: z.unknown().optional(),
+      validation: validation.optional(),
+      admin: fieldAdmin.optional(),
+      maxDepth: z.number().optional(),
+      allowCreate: z.boolean().optional(),
+      allowEdit: z.boolean().optional(),
+      isSortable: z.boolean().optional(),
+      relationshipFilter: z
+        .object({ field: z.string(), equals: z.string() })
+        .optional(),
+      mimeTypes: z.string().optional(),
+      maxFileSize: z.number().optional(),
+      labels: z
+        .object({
+          singular: z.string().optional(),
+          plural: z.string().optional(),
+        })
+        .optional(),
+      initCollapsed: z.boolean().optional(),
+      rowLabelField: z.string().optional(),
+      component: z.string().optional(),
+      // Declared rather than stripped: the refinement below judges migrated
+      // references, and a key the object shape omits never reaches it.
+      fieldGroup: z.string().optional(),
+      components: z.array(z.string()).optional(),
+      fieldGroups: z.array(z.string()).optional(),
+      repeatable: z.boolean().optional(),
+      // Nested fields for inline container types (repeater/group).
+      fields: z.array(uiSchemaFieldSchema).optional(),
+    })
+    .superRefine((f, ctx) => {
+      // Only a group may go without a name, as the config's field types allow: it then only lays
+      // its fields out, and they are stored where it sits. Every other field stores a value.
+      if (f.name === undefined && f.type !== "group") {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "expected string, received undefined",
+          path: ["name"],
+        });
+      }
+      const choices = Array.isArray(f.options) ? f.options : undefined;
+      if (
+        (f.type === "select" || f.type === "radio") &&
+        (!choices || choices.length === 0)
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `${f.type} fields require a non-empty options[] array`,
+          path: ["options"],
+        });
+      }
+      // Only relationship requires relationTo: the runtime consumes it to
+      // resolve the target collection. Upload fields always target the
+      // media library and the builder's upload editor deliberately does
+      // not collect relationTo, so requiring it here would reject every
+      // builder-authored upload field the DB path accepts.
+      const related =
+        f.options !== undefined && !Array.isArray(f.options)
+          ? f.options
+          : undefined;
+      if (
+        f.type === "relationship" &&
+        related?.target === undefined &&
+        (f.relationTo === undefined ||
+          (typeof f.relationTo === "string" && f.relationTo.length === 0) ||
+          (Array.isArray(f.relationTo) && f.relationTo.length === 0))
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `${f.type} fields require relationTo, or options.target`,
+          path: ["relationTo"],
+        });
+      }
+      // repeater/group are inline containers whose columns live in a nested
+      // fields[] array. A component field is a LEAF reference to a separately
+      // defined component schema (component / components), so it carries no
+      // fields[] of its own; requiring one here rejects every real component
+      // field the builder and code-first APIs emit.
+      if (
+        (f.type === "repeater" || f.type === "group") &&
+        (!f.fields || f.fields.length === 0)
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `${f.type} fields require a non-empty fields[] array`,
+          path: ["fields"],
+        });
+      }
+      // A component / field-group field references a schema by slug: either a
+      // single `component` / `fieldGroup`, or a `components[]` / `fieldGroups[]` whitelist
+      // for a polymorphic slot. Exactly one KEY must be declared, and every referenced slug
+      // must be a real slug — a blank or malformed reference points at no loadable
+      // definition, so runtime writes to it would be silently dropped. The keys are
+      // counted BEFORE any value is read: coalescing the two spellings of one shape
+      // first would silently prefer the legacy value and accept an ambiguous field
+      // the code-first validator rejects.
+      if (isFieldGroupFieldType(f.type)) {
+        // Both spellings are declared on the object above, so they survive
+        // parsing and are readable off the node without a cast.
+        const singleKeys = ["component", "fieldGroup"] as const;
+        const multiKeys = ["components", "fieldGroups"] as const;
+        const declaredSingle = singleKeys.filter(k => f[k] !== undefined);
+        const declaredMulti = multiKeys.filter(k => f[k] !== undefined);
+        const declaredCount = declaredSingle.length + declaredMulti.length;
+
+        if (declaredCount > 1) {
+          const found = [...declaredSingle, ...declaredMulti]
+            .map(k => `'${k}'`)
+            .join(", ");
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `component fields must declare exactly one reference key (found ${found})`,
+            path: [[...declaredSingle, ...declaredMulti][1]],
+          });
+        } else if (declaredCount === 0) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message:
+              "component fields require either a `component` slug or a `components[]` list, but not both",
+            path: ["component"],
+          });
+        } else if (declaredSingle.length > 0) {
+          const key = declaredSingle[0];
+          const singleRef = f[key];
+          if (typeof singleRef !== "string" || !SLUG_RE.test(singleRef)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: "component must be a valid component slug",
+              path: [key],
+            });
+          }
+        } else {
+          const key = declaredMulti[0];
+          const multiRef = f[key];
+          if (
+            !Array.isArray(multiRef) ||
+            multiRef.length === 0 ||
+            !multiRef.every(s => typeof s === "string" && SLUG_RE.test(s))
+          ) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message:
+                "components must be a non-empty list of valid component slugs",
+              path: [key],
+            });
+          }
+        }
+      }
+      if (f.name !== undefined && RESERVED_FIELD_NAMES.has(f.name)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `field name '${f.name}' is reserved`,
+          path: ["name"],
+        });
+      }
+      // A default is shape-checked against the token that describes the column
+      // it lands in: its own, for a built-in, and the STORAGE PRIMITIVE for a
+      // contributed type. A contributed type's own structure — which kinds a
+      // document accepts, what a record must contain — is its business and is
+      // judged by its `validate`, which is async and cannot run inside this
+      // synchronous gate. `validateOptions`, which does run here, checks the
+      // field's options and never looks at `defaultValue`, so without this a
+      // number-backed type accepted the string "five".
+      //
+      // An unregistered token resolves to nothing and is skipped: it is refused
+      // by the boot gate, and guessing a shape for it here would reject the
+      // contributed defaults this manifest exists to carry.
+      const shapeToken = BUILT_IN_UI_FIELD_TYPES.has(f.type)
+        ? f.type
+        : pluginStorageFieldType({ type: f.type });
+      if (shapeToken === "icon" && f.defaultValue !== undefined) {
+        // An icon default must be an id the write path accepts. A string of
+        // any other shape would be stored as the default and then refused
+        // on every new entry that inherits it.
+        if (!isIconIdShape(f.defaultValue)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message:
+              'defaultValue of an icon field must be an icon id such as "lucide:star"',
+            path: ["defaultValue"],
+          });
+        }
+      } else if (f.defaultValue !== undefined && shapeToken !== undefined) {
+        const dv = f.defaultValue;
+        const okType =
+          // Anything a manifest can carry is already JSON, so json storage
+          // states no shape beyond what parsing established.
+          shapeToken === "json" ||
+          (shapeToken === "number" && typeof dv === "number") ||
+          (shapeToken === "checkbox" && typeof dv === "boolean") ||
+          ([
+            "text",
+            "textarea",
+            "richText",
+            "email",
+            "password",
+            "code",
+            "date",
+            "select",
+            "radio",
+          ].includes(shapeToken) &&
+            typeof dv === "string");
+        if (!okType) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `defaultValue type does not match field type '${f.type}'`,
+            path: ["defaultValue"],
+          });
+        }
+      }
+    })
+);
+
+/**
+ * A stored hook config, validated as the executor actually requires it.
+ *
+ * 🔴 NOT a loose record. `StoredHookExecutor` reads `config` and `order` off
+ * each entry, so a manifest carrying `{ hookId, hookType, enabled }` and
+ * nothing else parses, deploys, and then throws on the next content write —
+ * an accepted manifest turning into failed writes, which is worse than a
+ * refused one.
+ *
+ * The assertion below is what keeps this in step with `StoredHookConfig`
+ * rather than drifting from it: if that interface gains a required field, this
+ * stops being assignable and the build says so.
+ */
+const storedHookConfig = z.object({
+  hookId: z.string().min(1),
+  hookType: z.enum([
+    "beforeOperation",
+    "beforeCreate",
+    "afterCreate",
+    "beforeUpdate",
+    "afterUpdate",
+    "beforeDelete",
+    "afterDelete",
+    "beforeRead",
+    "afterRead",
+    "beforeChange",
+    "afterChange",
+  ]),
+  enabled: z.boolean(),
+  config: z.record(z.string(), z.unknown()),
+  order: z.number(),
+});
+
+/**
+ * Compile-time proof that the schema and the stored shape describe each other.
+ *
+ * 🔴 BOTH directions, because each catches a different drift and neither
+ * catches the other's. Schema-to-interface fails when the schema goes wider
+ * than the runtime accepts. Interface-to-schema fails when the schema goes
+ * NARROWER — a lifecycle point added to `StoredHookType` leaves this enum short,
+ * and a one-way proof still passes while every manifest naming the new hook is
+ * silently refused. The narrow direction is the quiet one, so it is the one
+ * worth stating.
+ *
+ * `StoredHookType` is a union in a module with no runtime exports, so the enum
+ * is spelled here rather than derived from a shared array; keeping that module
+ * type-only is worth more than removing this pair of assertions.
+ */
+type SchemaAcceptsOnlyStoredHooks =
+  z.infer<typeof storedHookConfig> extends StoredHookConfig ? true : never;
+type SchemaAcceptsEveryStoredHook =
+  StoredHookConfig extends z.infer<typeof storedHookConfig> ? true : never;
+const _schemaAcceptsOnlyStoredHooks: SchemaAcceptsOnlyStoredHooks = true;
+const _schemaAcceptsEveryStoredHook: SchemaAcceptsEveryStoredHook = true;
+void _schemaAcceptsOnlyStoredHooks;
+void _schemaAcceptsEveryStoredHook;
+
+/**
+ * The admin presentation a UI-built entity carries.
+ *
+ * 🔴 WIDER than the three keys this began with, because the Schema Builder
+ * stores more than it could express here. A zod object strips what it does not
+ * declare, so a collection created hidden, with an icon, an explicit order or a
+ * sidebar group lost all four on the way into a manifest -- and a migration
+ * generated from that manifest rebuilt a visibly different collection
+ * elsewhere: shown when it was hidden, unordered, no icon.
+ *
+ * These are presentation only. Nothing here changes a table, which is why they
+ * can be added without a migration concern of their own.
+ */
+const admin = z.object({
+  useAsTitle: z.string().optional(),
+  defaultColumns: z.array(z.string()).optional(),
+  group: z.string().optional(),
+  icon: z.string().optional(),
+  hidden: z.boolean().optional(),
+  order: z.number().optional(),
+  sidebarGroup: z.string().optional(),
+});
+
+function entity(kind?: "collection" | "single" | "component") {
+  return z
+    .object({
+      slug,
+      labels: z.object({ singular: z.string(), plural: z.string() }).optional(),
+      /**
+       * The entity's own help text, distinct from a FIELD's `admin.description`
+       * declared above. The Builder collects one and stores it on the registry
+       * row; without it here the manifest could not carry it, so a migration
+       * generated from either path rebuilt the entity with no description.
+       */
+      description: z.string().optional(),
+      /**
+       * Stored hook CONFIGS, which are data rather than functions — the hook
+       * service reads them off the registry row and runs them. Declared here so
+       * a migration can carry them: without it a collection created with hooks
+       * ran them where it was authored and silently ran none where the file was
+       * replayed.
+       */
+      hooks: z.array(storedHookConfig).optional(),
+      admin: admin.optional(),
+      status: z.boolean().optional(),
+      localized: z.boolean().optional(),
+      /**
+       * Whether every save is recorded as a restorable version. Boolean rather
+       * than the code-first `boolean | VersionsConfig`: the Schema Builder
+       * offers on/off, and the options the object form carries are not enforced
+       * yet. Unknown keys are stripped here, so without this the Builder's
+       * write would vanish on the next parse.
+       */
+      versions: z.boolean().optional(),
+      /**
+       * Retention for version history: durable versions kept per document.
+       * `false` = unlimited, a non-negative integer = keep that many, absent =
+       * the default (50). Stripped like any unknown key, so it is declared here
+       * to survive a round-trip through the manifest.
+       */
+      versionsMaxPerDoc: z
+        .union([z.number().int().nonnegative(), z.literal(false)])
+        .optional(),
+      /**
+       * Whether writes to this entity bust cache tags. Boolean rather than the
+       * code-first `{ tags?, disable? }`: the Schema Builder offers on/off
+       * (custom extra tags stay a code-first control). On is the default, so an
+       * absent key means revalidation on; false persists `{ disable: true }`.
+       */
+      revalidate: z.boolean().optional(),
+      /**
+       * Whether writes to this entity are recorded to the webhook outbox.
+       * Recording is the default, so an absent key means recording on; false
+       * persists `{ record: false }`, keeping content that holds personal data
+       * out of the outbox and therefore out of every delivery.
+       */
+      webhooks: z.boolean().optional(),
+      fields: z.array(uiSchemaFieldSchema),
+    })
+    .superRefine((e, ctx) => {
+      // The owner column (`created_by`, plus the camelCase alias that
+      // snake-cases to it) is injected only on collection tables, so a manifest
+      // collection must not define it as a field — singles/components have no
+      // owner column, so it stays a legal field name there.
+      if (kind === "collection") {
+        for (const f of e.fields) {
+          if (f.name === "created_by" || f.name === "createdBy") {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: `field name '${f.name}' is reserved`,
+              path: ["fields"],
+            });
+          }
+        }
+      }
+      // Two fields of one name are the sibling rule's question
+      // (`domains/schema/sibling-fields`), asked where the definition the
+      // entity last had is known: a save against its registry row, the
+      // migrate commands against the latest snapshot. A pair the entity
+      // already holds keeps working, so the manifest alone cannot refuse one.
+      // Components have no entries of their own — they are embedded in a
+      // collection or single, whose versioning covers them. Accepting the key
+      // here would persist a setting nothing reads and the Builder never
+      // offers.
+      if (
+        kind === STORAGE_FORMAT.manifest.entityKind &&
+        e.versions !== undefined
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "'versions' is not supported on components",
+          path: ["versions"],
+        });
+      }
+      // Retention rides with version history, which components do not have, so
+      // it is rejected for the same reason as `versions` above rather than
+      // round-tripping a setting no component metadata path reads.
+      if (
+        kind === STORAGE_FORMAT.manifest.entityKind &&
+        e.versionsMaxPerDoc !== undefined
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "'versionsMaxPerDoc' is not supported on components",
+          path: ["versionsMaxPerDoc"],
+        });
+      }
+      // Components have no entries and no registry row of their own, so a
+      // revalidation switch would persist a setting nothing reads and the
+      // Builder never offers (same rationale as `versions` above).
+      if (
+        kind === STORAGE_FORMAT.manifest.entityKind &&
+        e.revalidate !== undefined
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "'revalidate' is not supported on components",
+          path: ["revalidate"],
+        });
+      }
+      // Components emit no outbox events of their own: a component's writes are
+      // recorded against the collection or single that embeds it, whose own
+      // switch already governs them. Accepting the key here would persist a
+      // setting nothing reads (same rationale as `revalidate` above).
+      if (
+        kind === STORAGE_FORMAT.manifest.entityKind &&
+        e.webhooks !== undefined
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "'webhooks' is not supported on components",
+          path: ["webhooks"],
+        });
+      }
+      // 🔴 Only `dynamic_collections` has a `hooks` column. Singles and
+      // components have none, so their upsert builders cannot emit one — and a
+      // manifest that ACCEPTED hooks there would validate, deploy, and run
+      // none of them, with nothing saying why. Refusing the key is the honest
+      // answer: a setting the deployment cannot honour should not parse.
+      if (kind !== "collection" && e.hooks !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `'hooks' is only supported on collections`,
+          path: ["hooks"],
+        });
+      }
+      // `status` reserved as a field name only when the lifecycle column is on.
+      if (e.status === true && e.fields.some(f => f.name === "status")) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "'status' is reserved when status: true",
+          path: ["fields"],
+        });
+      }
+      // admin references must point at real fields.
+      const names = new Set(e.fields.map(f => f.name));
+      if (e.admin?.useAsTitle && !names.has(e.admin.useAsTitle)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `admin.useAsTitle references unknown field '${e.admin.useAsTitle}'`,
+          path: ["admin", "useAsTitle"],
+        });
+      }
+      for (const col of e.admin?.defaultColumns ?? []) {
+        if (!names.has(col)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `admin.defaultColumns references unknown field '${col}'`,
+            path: ["admin", "defaultColumns"],
+          });
+        }
+      }
+    });
+}
+
+function uniqueSlugs(
+  entities: { slug: string }[],
+  ctx: z.RefinementCtx,
+  key: string
+) {
+  const seen = new Set<string>();
+  for (const e of entities) {
+    if (seen.has(e.slug)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `duplicate slug '${e.slug}' in ${key}`,
+        path: [key],
+      });
+    }
+    seen.add(e.slug);
+  }
+}
+
+export const uiSchemaManifest = z
+  .object({
+    $schema: z.string().optional(),
+    version: z.literal(1).default(1),
+    collections: z.array(entity("collection")).default([]),
+    singles: z.array(entity("single")).default([]),
+    components: z.array(entity("component")).default([]),
+  })
+  .superRefine((m, ctx) => {
+    uniqueSlugs(m.collections, ctx, "collections");
+    uniqueSlugs(m.singles, ctx, "singles");
+    uniqueSlugs(m.components, ctx, STORAGE_FORMAT.manifest.key);
+  });
+
+export type UiSchemaManifest = z.infer<typeof uiSchemaManifest>;
+export type UiSchemaEntity = UiSchemaManifest["collections"][number];
+export type UiSchemaField = UiSchemaEntity["fields"][number];
+
+/** Parse without throwing. Layers decide how to surface `!success`. */
+export function parseUiSchema(input: unknown) {
+  return uiSchemaManifest.safeParse(input);
+}
+
+/** JSON-schema document for the `$schema` URL (auto-generated from Zod). */
+export function uiSchemaJsonSchema(): unknown {
+  return z.toJSONSchema(uiSchemaManifest);
+}

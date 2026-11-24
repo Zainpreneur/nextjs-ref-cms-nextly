@@ -1,0 +1,261 @@
+/**
+ * Define Single Helper
+ *
+ * Provides the `defineSingle()` function for creating code-first Single
+ * configurations with full TypeScript support. This is the primary API for
+ * defining Singles in TypeScript files.
+ *
+ * Singles are single-document entities for storing site-wide configuration
+ * such as site settings, navigation menus, footers, and homepage configurations.
+ *
+ * Key differences from Collections:
+ * - Only one document per Single (no list view)
+ * - No create/delete operations (auto-created on first access)
+ * - Simplified hooks (4 vs 8 for Collections)
+ * - Simplified access control (read/update only)
+ * - No timestamps configuration (always has updatedAt)
+ * - No pagination options
+ *
+ * @module singles/config/define-single
+ * @since 1.0.0
+ *
+ * @example
+ * ```typescript
+ * import { defineSingle, text, upload, array } from 'nextly';
+ *
+ * export default defineSingle({
+ *   slug: 'site-settings',
+ *   label: { singular: 'Site Settings' },
+ *   fields: [
+ *     text({ name: 'siteName', required: true }),
+ *     text({ name: 'tagline' }),
+ *     upload({ name: 'logo', relationTo: 'media' }),
+ *   ],
+ *   access: {
+ *     read: true,
+ *     update: ({ roles }) => roles.includes('admin'),
+ *   },
+ * });
+ * ```
+ */
+
+import {
+  asDeclaredFields,
+  systemFieldsBeside,
+  toTitleCase,
+} from "../../collections/config/declared-config";
+import type { AuthorableFieldConfig } from "../../collections/fields/types";
+import type { SingleAccessControl } from "../../domains/auth/services/access-control-types";
+import { markDeclaredByDefine } from "../../shared/lib/config-problems";
+
+import type {
+  SingleConfig,
+  SingleLabel,
+  SingleAdminOptions,
+  SingleHooks,
+  SinglePreviewConfig,
+} from "./types";
+import { validateSingleConfig } from "./validate-single";
+
+// ============================================================
+// Utility Functions
+// ============================================================
+
+// ============================================================
+// defineSingle Function
+// ============================================================
+
+/**
+ * Define a code-first Single with full type safety.
+ *
+ * This is the primary API for creating Single configurations in TypeScript.
+ * It validates the configuration, applies sensible defaults, and returns a
+ * normalized `SingleConfig` object.
+ *
+ * **Defaults Applied:**
+ * - `label.singular`: Generated from slug (e.g., 'site-settings' → 'Site Settings')
+ * - `admin`: Empty object if not provided
+ *
+ * **Validation:**
+ * - Slug must be valid (lowercase, URL-friendly, not reserved)
+ * - Fields array must be non-empty
+ * - Access functions must be functions (if provided)
+ *
+ * @param config - The Single configuration
+ * @returns Normalized Single configuration with defaults applied
+ * @throws Error if configuration is invalid
+ *
+ * @example Basic Single
+ * ```typescript
+ * import { defineSingle, text } from 'nextly';
+ *
+ * export default defineSingle({
+ *   slug: 'site-settings',
+ *   fields: [
+ *     text({ name: 'siteName', required: true }),
+ *     text({ name: 'tagline' }),
+ *   ],
+ * });
+ * ```
+ *
+ * @example Single with Admin Options
+ * ```typescript
+ * import { defineSingle, text, upload, group, array } from 'nextly';
+ *
+ * export default defineSingle({
+ *   slug: 'site-settings',
+ *   label: { singular: 'Site Settings' },
+ *   admin: {
+ *     group: 'Settings',
+ *     icon: 'Settings',
+ *     description: 'Site configuration',
+ *   },
+ *   fields: [
+ *     text({ name: 'siteName', required: true, label: 'Site Name' }),
+ *     text({ name: 'tagline', label: 'Tagline' }),
+ *     upload({ name: 'logo', relationTo: 'media', label: 'Logo' }),
+ *     upload({ name: 'favicon', relationTo: 'media', label: 'Favicon' }),
+ *     group({
+ *       name: 'seo',
+ *       label: 'SEO Defaults',
+ *       fields: [
+ *         text({ name: 'metaTitle', label: 'Default Meta Title' }),
+ *         text({ name: 'metaDescription', label: 'Default Meta Description' }),
+ *       ],
+ *     }),
+ *     array({
+ *       name: 'socialLinks',
+ *       label: 'Social Links',
+ *       fields: [
+ *         text({ name: 'platform', required: true }),
+ *         text({ name: 'url', required: true }),
+ *       ],
+ *     }),
+ *   ],
+ *   access: {
+ *     read: () => true,
+ *     update: ({ req }) => req.user?.role === 'admin',
+ *   },
+ *   hooks: {
+ *     afterChange: [
+ *       async ({ doc }) => {
+ *         // Revalidate frontend cache
+ *         await fetch('/api/revalidate?tag=site-settings', { method: 'POST' });
+ *       },
+ *     ],
+ *   },
+ * });
+ * ```
+ *
+ * @example Header Navigation Single
+ * ```typescript
+ * import { defineSingle, array, text, relationship } from 'nextly';
+ *
+ * export default defineSingle({
+ *   slug: 'header',
+ *   label: { singular: 'Header Navigation' },
+ *   admin: {
+ *     group: 'Navigation',
+ *     icon: 'Menu',
+ *   },
+ *   fields: [
+ *     array({
+ *       name: 'navItems',
+ *       label: 'Navigation Items',
+ *       fields: [
+ *         text({ name: 'label', required: true }),
+ *         text({ name: 'url' }),
+ *         relationship({ name: 'page', relationTo: 'pages' }),
+ *       ],
+ *     }),
+ *   ],
+ * });
+ * ```
+ */
+/**
+ * A single as an author writes it: `SingleConfig` with a fields array that
+ * also admits a contributed type declared through `pluginField()`.
+ */
+export type SingleConfigInput = Omit<SingleConfig, "fields"> & {
+  fields: AuthorableFieldConfig[];
+};
+
+export function defineSingle(config: SingleConfigInput): SingleConfig {
+  // ============================================================
+  // Comprehensive Validation
+  // ============================================================
+
+  // Use the comprehensive validator that checks:
+  // - Slug format, reserved names, SQL keywords
+  // - Field names (format, duplicates, SQL keywords)
+  // - Field-specific validation (select options, relationship targets, etc.)
+  // - Nested field validation (array, group, blocks)
+  // - Access function type validation (read/update only)
+  // Validated as declared; narrowed to the shared union only after.
+  // Judged, not thrown: a configuration's load and the start judge every entity in it by the
+  // same rules (`configurationProblems`) and report every problem, where a throw here would stop
+  // at the first one, during the import. The entity is normalized all the same, since a plugin's
+  // setup may repair the problem and must leave what a valid declaration gives; only where the
+  // problem makes normalizing itself throw is the entry returned as declared. Either way it is
+  // marked (`markDeclaredByDefine`), which tells the start to refuse it rather than warn.
+  const accepted = validateSingleConfig({
+    ...config,
+    fields: asDeclaredFields(config.fields),
+  }).valid;
+  try {
+    // ============================================================
+    // Auto-inject system fields (title, slug)
+    // ============================================================
+    // Every Single has title and slug as system-level columns in its DB table
+    // (createDefaultDocument always writes them). If the user already defined
+    // fields with these names, their definitions take priority.
+
+    const systemFields = systemFieldsBeside(config.fields);
+
+    const fieldsWithSystem = [
+      ...systemFields,
+      ...asDeclaredFields(config.fields),
+    ];
+
+    // ============================================================
+    // Apply Defaults
+    // ============================================================
+
+    // Generate label from slug if not provided
+    const label: SingleLabel = {
+      singular: config.label?.singular ?? toTitleCase(config.slug),
+    };
+
+    // Build normalized config with defaults
+    const normalized: SingleConfig = {
+      ...config,
+      fields: fieldsWithSystem,
+      label,
+      admin: {
+        ...config.admin,
+        // `internal: true` implies hidden-from-nav (D30); explicit admin.hidden wins.
+        hidden: config.internal === true ? true : config.admin?.hidden,
+      },
+    };
+
+    // Marked as declared through this function, so a start refuses it should the configuration's
+    // load find a problem this call could not, such as a field type nothing registers.
+    return markDeclaredByDefine(normalized, systemFields);
+  } catch (error) {
+    if (accepted) throw error;
+    return markDeclaredByDefine({ ...config }) as unknown as SingleConfig;
+  }
+}
+
+// ============================================================
+// Re-exports for Convenience
+// ============================================================
+
+export type {
+  SingleConfig,
+  SingleLabel,
+  SingleAdminOptions,
+  SingleHooks,
+  SinglePreviewConfig,
+};
+export type { SingleAccessControl };

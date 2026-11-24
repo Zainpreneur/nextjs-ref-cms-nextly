@@ -1,0 +1,178 @@
+// Targeted tests for CollectionFileManager.invalidateSchemaForSlug(slug).
+//
+// The SLUG-keyed half of a pair. `refreshSchema(tableName, freshTable)` is the
+// other, and it exists because dropping the entry and rebuilding lazily raced:
+// the rebuild re-read `dynamic_collections.fields`, so an in-flight write could
+// hand back the stale schema again. This one still drops-and-rebuilds, and is
+// the post-rename/drop hook the dispatcher calls
+// to drop the cached runtime Drizzle schema so the next loadDynamicSchema
+// rebuilds against the freshly-written `dynamic_collections.fields` JSON.
+
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import type { DrizzleAdapter } from "@nextlyhq/adapter-drizzle";
+
+import { CollectionFileManager } from "../collection-file-manager";
+import type { DatabaseInstance } from "../../types/database-operations";
+
+function makeFileManager(): CollectionFileManager {
+  // The methods under test only touch the in-memory schemaRegistry,
+  // so a stub db is sufficient.
+  return new CollectionFileManager({} as DatabaseInstance, {
+    schemasDir: "/tmp/test-schemas",
+    migrationsDir: "/tmp/test-migrations",
+  });
+}
+
+describe("CollectionFileManager.loadCompanionSchema (i18n M4)", () => {
+  function localizedFm(): CollectionFileManager {
+    const fm = makeFileManager();
+    fm.setAdapter({ dialect: "sqlite" } as unknown as DrizzleAdapter);
+    fm.setMetadataFetcher(async () => ({
+      fields: [
+        { name: "body", type: "longText", localized: true },
+        { name: "price", type: "number" },
+      ] as never,
+      tableName: "dc_pages",
+      localized: true,
+    }));
+    return fm;
+  }
+
+  it("returns the companion table + localized field names for a localized collection", async () => {
+    const companion = await localizedFm().loadCompanionSchema("pages");
+    expect(companion).not.toBeNull();
+    expect(companion!.companionTableName).toBe("dc_pages_locales");
+    expect(companion!.localizedFields).toEqual([
+      { name: "body", column: "body" },
+    ]);
+    expect(companion!.table).toBeDefined();
+  });
+
+  it("caches the companion table (same object on the second call)", async () => {
+    const fm = localizedFm();
+    const first = await fm.loadCompanionSchema("pages");
+    const second = await fm.loadCompanionSchema("pages");
+    expect(first!.table).toBe(second!.table);
+  });
+
+  it("returns null for a non-localized collection", async () => {
+    const fm = makeFileManager();
+    fm.setAdapter({ dialect: "sqlite" } as unknown as DrizzleAdapter);
+    fm.setMetadataFetcher(async () => ({
+      fields: [{ name: "price", type: "number" }] as never,
+      tableName: "dc_pages",
+      localized: false,
+    }));
+    expect(await fm.loadCompanionSchema("pages")).toBeNull();
+  });
+});
+
+describe("CollectionFileManager.invalidateSchemaForSlug", () => {
+  it("removes a previously registered schema so loadDynamicSchema can no longer return it from cache", async () => {
+    const fm = makeFileManager();
+
+    fm.registerSchemas({ dc_job: { __marker: "old" } });
+
+    // Confirm cache is warm.
+    const cached = await fm.loadDynamicSchema("job");
+    expect(cached).toEqual({ __marker: "old" });
+
+    fm.invalidateSchemaForSlug("job");
+
+    // No adapter / metadataFetcher set, so a cache miss now throws
+    // the "not found in registry" guard. That is the correct signal
+    // that invalidation cleared the entry.
+    await expect(fm.loadDynamicSchema("job")).rejects.toThrow(
+      /not found in registry/
+    );
+  });
+
+  it("uses the same dc_<slug> key shape registerSchema uses (hyphens collapsed to underscores)", async () => {
+    const fm = makeFileManager();
+
+    // Register under hyphen-collapsed key the same way registerSchema does.
+    fm.registerSchemas({ dc_blog_posts: { __marker: "registered" } });
+
+    // Confirm hyphen-form slug resolves to the same key.
+    const cached = await fm.loadDynamicSchema("blog-posts");
+    expect(cached).toEqual({ __marker: "registered" });
+
+    fm.invalidateSchemaForSlug("blog-posts");
+
+    await expect(fm.loadDynamicSchema("blog-posts")).rejects.toThrow(
+      /not found in registry/
+    );
+  });
+
+  it("is a no-op when the slug was never registered (does not throw)", () => {
+    const fm = makeFileManager();
+    expect(() => fm.invalidateSchemaForSlug("never-registered")).not.toThrow();
+  });
+
+  it("only invalidates the targeted slug — unrelated entries stay cached", async () => {
+    const fm = makeFileManager();
+
+    fm.registerSchemas({
+      dc_job: { __marker: "job" },
+      dc_event: { __marker: "event" },
+    });
+
+    fm.invalidateSchemaForSlug("job");
+
+    // job evicted, event still cached.
+    await expect(fm.loadDynamicSchema("job")).rejects.toThrow(
+      /not found in registry/
+    );
+    expect(await fm.loadDynamicSchema("event")).toEqual({ __marker: "event" });
+  });
+});
+
+describe("CollectionFileManager.loadDynamicSchema on a registry hit", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // Every query against a collection resolves its schema here, so a hit has to
+  // stay silent: one line per call is thousands of lines per request burst.
+  it("returns the registered schema without writing to the console", async () => {
+    const fm = makeFileManager();
+    fm.registerSchemas({ dc_job: { __marker: "job" } });
+    const spies = (["debug", "info", "log", "warn", "error"] as const).map(
+      level => vi.spyOn(console, level).mockImplementation(() => undefined)
+    );
+
+    expect(await fm.loadDynamicSchema("job")).toEqual({ __marker: "job" });
+    expect(await fm.loadDynamicSchema("job")).toEqual({ __marker: "job" });
+
+    for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe("CollectionFileManager.saveDropMigration", () => {
+  it("refuses a name another delete already wrote, leaving that delete's file as it was", async () => {
+    const { mkdtemp, readFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const migrationsDir = await mkdtemp(join(tmpdir(), "nextly-drop-"));
+    try {
+      const fm = new CollectionFileManager({} as DatabaseInstance, {
+        schemasDir: join(migrationsDir, "schemas"),
+        migrationsDir,
+      });
+      const name = "1793164227440_drop_tags.sql";
+      await fm.saveDropMigration("DROP TABLE first;", name);
+
+      // Two deletes in the same millisecond share a name: the second must not
+      // overwrite the first's file, which its withdrawal would then remove.
+      await expect(
+        fm.saveDropMigration("DROP TABLE second;", name)
+      ).rejects.toThrow(/already exists/);
+      expect(await readFile(join(migrationsDir, name), "utf8")).toBe(
+        "DROP TABLE first;"
+      );
+    } finally {
+      await rm(migrationsDir, { recursive: true, force: true });
+    }
+  });
+});

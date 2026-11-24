@@ -1,0 +1,176 @@
+// Inverts a RESOLVED forward Operation[] (renames already collapsed by
+// applyRenameDecisions) into the DOWN Operation[]. Inverting the resolved ops
+// — rather than re-diffing snapshot[cur] vs snapshot[prev] — is what keeps
+// renames data-preserving: a forward rename_column inverts to the reverse
+// rename, not a drop+add. Object-removing ops (drop_table/drop_column) recover
+// their original spec from the previous snapshot. Inverse ops are returned in
+// reverse order of the forward ops.
+
+import type {
+  ColumnSpec,
+  NextlySchemaSnapshot,
+  Operation,
+  TableSpec,
+} from "../pipeline/diff/types";
+import { renderedType } from "../pipeline/sql-templates/create-table-body";
+
+function findTable(snap: NextlySchemaSnapshot, name: string): TableSpec {
+  const t = snap.tables.find(tbl => tbl.name === name);
+  if (!t) {
+    throw new Error(
+      `down-generator: cannot invert drop_table '${name}' — not present in the previous snapshot.`
+    );
+  }
+  return t;
+}
+
+function findColumn(
+  snap: NextlySchemaSnapshot,
+  tableName: string,
+  columnName: string
+): ColumnSpec {
+  const t = snap.tables.find(tbl => tbl.name === tableName);
+  const col = t?.columns.find(c => c.name === columnName);
+  if (!col) {
+    throw new Error(
+      `down-generator: cannot invert drop_column '${tableName}.${columnName}' — not present in the previous snapshot.`
+    );
+  }
+  return col;
+}
+
+function invertOne(op: Operation, prev: NextlySchemaSnapshot): Operation {
+  switch (op.type) {
+    case "add_table":
+      return { type: "drop_table", tableName: op.table.name };
+    case "drop_table":
+      return { type: "add_table", table: findTable(prev, op.tableName) };
+    case "add_column":
+      return {
+        type: "drop_column",
+        tableName: op.tableName,
+        columnName: op.column.name,
+        columnType: renderedType(op.column),
+      };
+    case "drop_column":
+      return {
+        type: "add_column",
+        tableName: op.tableName,
+        column: findColumn(prev, op.tableName, op.columnName),
+      };
+    case "rename_column":
+      return {
+        type: "rename_column",
+        tableName: op.tableName,
+        fromColumn: op.toColumn,
+        toColumn: op.fromColumn,
+        fromType: op.toType,
+        toType: op.fromType,
+      };
+    case "rename_table":
+      return { type: "rename_table", fromName: op.toName, toName: op.fromName };
+    case "change_column_type":
+      return {
+        type: "change_column_type",
+        tableName: op.tableName,
+        columnName: op.columnName,
+        fromType: op.toType,
+        toType: op.fromType,
+        // The definition travels with the type, in both directions. MySQL renders this as
+        // `MODIFY COLUMN`, which restates the WHOLE column — so an inverse that swapped only the
+        // types would return the column to its old type while dropping the nullability and default
+        // it originally had.
+
+        nullable: op.fromNullable,
+        columnDefault: op.fromColumnDefault,
+        fromNullable: op.nullable,
+        fromColumnDefault: op.columnDefault,
+        // A reference conversion is undone by its own way back (`INVERSE_CONVERSION`).
+        ...(op.conversion === undefined
+          ? {}
+          : { conversion: INVERSE_CONVERSION[op.conversion] }),
+      };
+    case "change_column_nullable":
+      return {
+        type: "change_column_nullable",
+        tableName: op.tableName,
+        columnName: op.columnName,
+        fromNullable: op.toNullable,
+        toNullable: op.fromNullable,
+      };
+    case "change_column_default":
+      return {
+        type: "change_column_default",
+        tableName: op.tableName,
+        columnName: op.columnName,
+        fromDefault: op.toDefault,
+        toDefault: op.fromDefault,
+      };
+    case "change_foreign_key_action":
+      // Both sides travel on the op precisely so the inverse is a swap: the
+      // constraint keeps its name, column and target, and only the actions
+      // move back.
+      return {
+        type: "change_foreign_key_action",
+        tableName: op.tableName,
+        constraintName: op.constraintName,
+        columnName: op.columnName,
+        referencesTable: op.referencesTable,
+        referencesColumn: op.referencesColumn,
+        fromOnDelete: op.toOnDelete,
+        fromOnUpdate: op.toOnUpdate,
+        toOnDelete: op.fromOnDelete,
+        toOnUpdate: op.fromOnUpdate,
+      };
+    case "add_index":
+      return { type: "drop_index", tableName: op.tableName, index: op.index };
+    case "drop_index":
+      return { type: "add_index", tableName: op.tableName, index: op.index };
+    case "add_check":
+      return { type: "drop_check", tableName: op.tableName, check: op.check };
+    case "drop_check":
+      return { type: "add_check", tableName: op.tableName, check: op.check };
+    case "add_foreign_key":
+      return {
+        type: "drop_foreign_key",
+        tableName: op.tableName,
+        foreignKey: op.foreignKey,
+      };
+    case "drop_foreign_key":
+      return {
+        type: "add_foreign_key",
+        tableName: op.tableName,
+        foreignKey: op.foreignKey,
+      };
+    default: {
+      const _exhaustive: never = op;
+      throw new Error(`down-generator: unhandled op ${String(_exhaustive)}`);
+    }
+  }
+}
+
+/**
+ * Each reference conversion's way back. A list of references cannot be cast back to the scalar
+ * type it came from (PostgreSQL has no cast from jsonb to uuid at all), so the DOWN reads each list
+ * back as the id it holds, and refuses a row holding more than one; the DOWN of a relation switched
+ * from many related entries to one makes each id a one-item list again, which no cast from the
+ * scalar type does; and switching back to or from several collections needs the column empty too.
+ */
+const INVERSE_CONVERSION = {
+  referenceList: "referenceScalar",
+  referenceScalar: "referenceList",
+  requireEmpty: "requireEmpty",
+} as const;
+
+export function buildInverseOperations(
+  ops: Operation[],
+  prev: NextlySchemaSnapshot
+): Operation[] {
+  // Reverse order: the last forward op must be undone first. A guard requiring a column empty
+  // (`requireEmpty`) is the exception: it leads the DOWN as it leads the UP, since refusing after
+  // any DDL has run would leave a dialect that commits each statement half-changed.
+  const inverse = [...ops].reverse().map(op => invertOne(op, prev));
+  const isGuard = (op: Operation) =>
+    op.type === "change_column_type" && op.conversion === "requireEmpty";
+  return [...inverse.filter(isGuard), ...inverse.filter(op => !isGuard(op))];
+}

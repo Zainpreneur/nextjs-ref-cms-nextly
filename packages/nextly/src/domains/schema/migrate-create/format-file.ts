@@ -1,0 +1,441 @@
+// F11 PR 3: SQL file body composition for `migrate:create` output.
+//
+// File header convention (parsed by migrate.ts at apply time):
+//   -- Migration: <name>
+//   -- Collections: posts, comments      (Q6=A linkage to dynamic_collections.migration_status)
+//   -- Singles: header, footer
+//   -- Field groups: hero
+//   -- UserExt: user_ext
+//   -- Settings: posts: description     (one line per entity whose settings changed)
+//   -- Generated at: <ISO timestamp>
+//   -- Dialect: PostgreSQL
+//
+//   -- UP
+//   <sql statements joined by semicolons + newlines>
+//   -- DOWN
+//   <inverse sql statements, or a placeholder comment>
+//
+// SP-2: a -- DOWN section is now emitted (auto-generated inverse, or a
+// placeholder comment when the migration has no automatic rollback).
+//
+// Per spec §6.1 Step 7: the `-- Checksum:` line in the header is
+// decorative for human readability. The canonical hash lives in the
+// paired .snapshot.json file's `migrationHash` field. This avoids the
+// circular-hash problem where editing the header changes the file's
+// own hash.
+
+import type { SupportedDialect } from "@nextlyhq/adapter-drizzle/types";
+
+import {
+  consentToCover,
+  describeDeletion,
+  type Deletion,
+} from "../migrate/data-loss-consent";
+import { BLANK_FILE_LINE } from "../migrate/history-line";
+import { NO_TRANSACTION_MARKER } from "../migrate/split-sql";
+
+import { getDialectDisplayName } from "./dialect-name";
+
+/**
+ * The field-group header written into a generated migration, and the pattern that reads it
+ * back.
+ *
+ * Both live here because a writer and a reader that each spell the format themselves are two
+ * places to change and one place to forget — which is how this header came to be written as
+ * `-- Components:` long after the concept was renamed to a field group.
+ *
+ * The pattern accepts the legacy spellings deliberately. Migration files already generated
+ * carry `-- Component(s):` and stay on disk forever; a reader that knew only the current
+ * header would report those migrations as touching no field groups, silently.
+ */
+export const FIELD_GROUP_HEADER = "-- Field groups:";
+
+/** The header line naming one entity's settings changes (`-- Settings: posts: description`). */
+const SETTINGS_HEADER = "-- Settings:";
+
+/**
+ * The header line naming one app's or plugin's added and removed permissions
+ * (`-- Permissions: @nextlyhq/plugin-form-builder: + export-submissions`).
+ */
+const PERMISSIONS_HEADER = "-- Permissions:";
+
+/**
+ * The destructive mark: the line saying a file deletes data and which consent `nextly migrate`
+ * needs for it, and the line naming each deletion. Written second in the header, under the
+ * migration's name, so a reviewer reading the file in a diff sees it first. It is for that
+ * review: `nextly migrate` judges a file by its statements, marked or not.
+ */
+export const DESTRUCTIVE_HEADER = "-- Destructive:";
+export const DELETES_HEADER = "-- Deletes:";
+
+/** The destructive mark for `deletions`, or nothing for a file that deletes nothing. */
+function destructiveLines(deletions: readonly Deletion[]): string {
+  if (deletions.length === 0) return "";
+  const consent = consentToCover(deletions);
+  const each = deletions.map(deletion => {
+    // The count belongs to one database; the file runs against others.
+    const uncounted: Deletion =
+      deletion.kind === "unnamed"
+        ? deletion
+        : { ...deletion, count: undefined };
+    return `${DELETES_HEADER} ${oneLine(describeDeletion(uncounted))}\n`;
+  });
+  return (
+    `${DESTRUCTIVE_HEADER} this migration deletes data. nextly migrate needs consent: ${oneLine(consent)}\n` +
+    each.join("")
+  );
+}
+
+/**
+ * `text` on one line. A settings or permissions header names what a config or a plugin declares,
+ * which may hold a line break; one would end the comment and leave the rest of the line as a
+ * statement `nextly migrate` runs. Each break becomes a space.
+ */
+function oneLine(text: string): string {
+  return text.replace(/[\r\n\u2028\u2029]+/g, " ");
+}
+
+/**
+ * Marks a file whose entity headers name what the migration CHANGES.
+ *
+ * 🔴 Provenance, not decoration. Migrations generated before headers were
+ * scoped list every entity in the config, so reading one as ownership makes an
+ * unrelated old migration hold a collection's row -- and its dashboard --
+ * until it runs. A reader cannot tell the two apart from the header itself:
+ * both are a comma-separated list of slugs.
+ *
+ * Absent means "this file's scope is unknown", which is the honest reading of a
+ * legacy header.
+ *
+ * A blank migration SHIPS with this line, and that is deliberate rather than a
+ * loophole: without it, an operator who follows the template and adds
+ * `-- Collections: posts` still has the slug discarded, because the file the
+ * guidance produced is not marked. The marker alone claims nothing — a file
+ * carrying it and naming no entity is still unknown scope, because "changes
+ * nothing" and "nobody said" stay different facts. It becomes an assertion only
+ * once the operator names something, which is when they make it.
+ */
+export const SCOPED_ENTITIES_MARKER = "-- Entity scope: touched";
+
+/**
+ * The one-line instruction for annotating a hand-written migration.
+ *
+ * 🔴 Exported so the CLI's remediation and the blank template say the SAME
+ * thing. They were written separately and immediately disagreed: the template
+ * listed all three headers while the warning named only `-- Collections:`, and
+ * following the warning filed a single among collections. Guidance about a
+ * format belongs beside the format.
+ *
+ * 🔴 Distinguishes hand-written from generated, because the files this is
+ * shown for are not all alike and the same edit is safe on one and destructive
+ * on the other. `writeSnapshot` records a SHA-256 of the `.sql` in its paired
+ * snapshot and `verifyMigrationHash` compares them, so annotating a GENERATED
+ * migration after the fact invalidates its own integrity record. The blank
+ * path writes no snapshot, so a hand-written file has nothing to invalidate.
+ *
+ * 🔴 Names the MARKER as well as the header, because the files this is shown
+ * for are not all alike. A new blank migration ships the marker, so naming the
+ * entity is enough; a migration generated before headers were scoped has
+ * headers and no marker, and adding another header to it changes nothing —
+ * `scoped` stays false and the names are discarded exactly as before. One
+ * remediation is shown for both, so it has to be sufficient for both.
+ */
+export const ENTITY_HEADER_GUIDANCE =
+  "In a hand-written migration, add `-- Collections:`, `-- Singles:` or " +
+  "`-- Field groups:` naming what it changes, plus " +
+  `\`${SCOPED_ENTITIES_MARKER}\` if it is not already there. ` +
+  "A generated migration's `.sql` is hashed by its paired snapshot, so leave " +
+  "that one alone — its entities keep the behaviour they had before";
+
+export interface FormatArgs {
+  /** Slug-cased migration name (without timestamp prefix or extension). */
+  name: string;
+  dialect: SupportedDialect;
+  /** SQL statements WITHOUT trailing semicolons. The formatter adds them. */
+  sqlStatements: string[];
+  /**
+   * Inverse SQL statements (WITHOUT trailing semicolons) for the `-- DOWN`
+   * section. Empty array → a placeholder comment is emitted instead, marking
+   * the migration as having no automatic rollback (e.g. data-only or blank).
+   */
+  downSqlStatements: string[];
+  /** Collection slugs covered by this migration. */
+  collections: string[];
+  singles: string[];
+  components: string[];
+  /** True if this migration includes user_ext changes. */
+  hasUserExt: boolean;
+  /**
+   * Whether the entity arrays name what this migration CHANGES.
+   *
+   * 🔴 False for a caller that does not compute them, and `migrate-baseline`
+   * is one: it passes all three arrays empty while its SQL adopts existing
+   * tables. Stamping the marker there would publish "scoped, and it changes
+   * nothing" about a migration that creates the whole schema — a false
+   * declaration, and worse than none, because a reader can tell an absent
+   * declaration from a wrong one only if wrong ones are never written.
+   */
+  entitiesAreScoped?: boolean;
+  /**
+   * Each entity whose settings changed, as `describeSettingsChange` words it
+   * (`posts: description`), one header line each.
+   *
+   * Separate from the entity headers above on purpose: those name the entities
+   * whose TABLES this file changes, and `nextly migrate` withholds a registry
+   * row while a file naming it is pending. A settings change leaves the table
+   * as it is, so naming it there would hold back a row that has nothing to
+   * wait for.
+   */
+  settingsChanges?: readonly string[];
+  /**
+   * Each app's or plugin's added and removed permissions, one line per owner,
+   * as `describePermissionChange` writes them. Kept apart from the entity
+   * headers for the same reason as the settings: no table changes with them.
+   */
+  permissionChanges?: readonly string[];
+  /**
+   * Whether the file changes no table. Its UP may still hold statements: a
+   * Builder entity's registry row travels with its settings.
+   */
+  changesNoTable?: boolean;
+  /**
+   * Whether this run's companion files make the table changes this file's snapshot records (a
+   * disable puts a table's columns back before this file runs). A file that then changes no table
+   * itself still has to let a rollback through to them.
+   */
+  tableChangesInCompanionFiles?: boolean;
+  /**
+   * What the migration deletes (`plannedDeletions`). A file with any carries
+   * the destructive mark: a `-- Destructive:` line naming the consent `nextly
+   * migrate` needs, and one `-- Deletes:` line per deletion. Counts are left
+   * out: they are of the database `migrate:create` read, and the file runs
+   * against others.
+   */
+  deletions?: readonly Deletion[];
+  /** Override generated-at timestamp for tests; default = `new Date()`. */
+  now?: Date;
+}
+
+/**
+ * The DOWN section's statements. A file that changes settings alone has no table statement to
+ * undo, which is a different fact from a table change nobody wrote the reverse of: `migrate:down`
+ * refuses a DOWN with no statement as irreversible, and this file must not stop a rollback reaching
+ * the migrations before it. So its DOWN is one statement that changes nothing, valid on every
+ * dialect. The same holds for a file whose table changes its companion files make: they undo them
+ * in their own DOWN, which runs after this one.
+ */
+function downBodyOf(args: FormatArgs): string {
+  if (args.downSqlStatements.length > 0) {
+    return args.downSqlStatements.map(s => `${s};`).join("\n\n");
+  }
+  if (args.changesNoTable !== true) {
+    return "-- (no automatic down — this migration is not reversible. Hand-write rollback SQL here)";
+  }
+  const settingsOnly =
+    (args.settingsChanges ?? []).length +
+      (args.permissionChanges ?? []).length >
+    0;
+  if (settingsOnly) {
+    return "-- No table statements to undo: this migration changes settings or permissions only.\nSELECT 1;";
+  }
+  if (args.tableChangesInCompanionFiles === true) {
+    return "-- No table statements to undo here: its companion files change the tables, and undo them in their own DOWN.\nSELECT 1;";
+  }
+  return "-- (no automatic down — this migration is not reversible. Hand-write rollback SQL here)";
+}
+
+export function formatMigrationFile(args: FormatArgs): string {
+  const now = (args.now ?? new Date()).toISOString();
+  const collectionLine =
+    args.collections.length > 0
+      ? `-- Collections: ${args.collections.join(", ")}\n`
+      : "";
+  const singleLine =
+    args.singles.length > 0 ? `-- Singles: ${args.singles.join(", ")}\n` : "";
+  const componentLine =
+    args.components.length > 0
+      ? `${FIELD_GROUP_HEADER} ${args.components.join(", ")}\n`
+      : "";
+  const userExtLine = args.hasUserExt ? "-- UserExt: user_ext\n" : "";
+  // Written whether or not any entity is NAMED: a migration that changes no
+  // entity is a different fact from one whose scope nobody recorded. Withheld
+  // when the caller says it did not compute the arrays at all.
+  const scopeLine =
+    args.entitiesAreScoped === false ? "" : `${SCOPED_ENTITIES_MARKER}\n`;
+  const settingsLines = (args.settingsChanges ?? [])
+    .map(change => `${SETTINGS_HEADER} ${oneLine(change)}\n`)
+    .join("");
+  const permissionLines = (args.permissionChanges ?? [])
+    .map(change => `${PERMISSIONS_HEADER} ${oneLine(change)}\n`)
+    .join("");
+  // Each statement gets a trailing `;`. splitSqlStatements in migrate.ts
+  // splits on `;` so statements MUST be terminated.
+  const body = args.sqlStatements.map(s => `${s};`).join("\n\n");
+  const downBody = downBodyOf(args);
+
+  return `-- Migration: ${args.name}
+${destructiveLines(args.deletions ?? [])}${collectionLine}${singleLine}${componentLine}${userExtLine}${scopeLine}${settingsLines}${permissionLines}-- Generated at: ${now}
+-- Dialect: ${getDialectDisplayName(args.dialect)}
+
+-- UP
+${body}
+
+-- DOWN
+${downBody}
+`;
+}
+
+/**
+ * The migration `nextly migrate:create --record-snapshot` writes beside its snapshot. Applying it
+ * or rolling it back changes nothing: its UP is comments only, and its DOWN a statement that reads
+ * nothing, since `nextly migrate:down` refuses a file with none as one that cannot be rolled back.
+ * It names no entity, and says so. The record itself is the snapshot's (`translatedFieldsRecorded`);
+ * nothing reads this file for it.
+ */
+export function formatSnapshotRecordFile(
+  name: string,
+  dialect: SupportedDialect,
+  now: Date
+): string {
+  return `-- Migration: ${name}
+-- Generated: snapshot record
+${SCOPED_ENTITIES_MARKER}
+-- Generated at: ${now.toISOString()}
+-- Dialect: ${getDialectDisplayName(dialect)}
+--
+-- Written by \`nextly migrate:create --record-snapshot\`. It changes nothing in
+-- the database: its snapshot records which fields are translated, which the
+-- snapshot before it did not.
+
+-- UP
+
+
+-- DOWN
+-- Nothing to undo. A rollback needs a statement to run, so this one reads nothing.
+SELECT 1;
+`;
+}
+
+/**
+ * A blank migration file for SQL the author writes.
+ *
+ * `transaction: false` writes `NO_TRANSACTION_MARKER` as the first line, the
+ * only line it counts on; otherwise the template says where the marker goes,
+ * because a statement such as `CREATE INDEX CONCURRENTLY` is refused in a
+ * file without it.
+ */
+export function formatBlankFile(
+  name: string,
+  dialect: SupportedDialect,
+  now: Date = new Date(),
+  options: {
+    transaction?: boolean;
+    /**
+     * Where the file stands in the project's line, as the header lines a
+     * reader of the history takes it from (`blankLineHeader`): a blank
+     * migration has no snapshot to say so. Omitted, it states none.
+     */
+    line?: string;
+  } = {}
+): string {
+  const outside = options.transaction === false;
+  return `${outside ? `${NO_TRANSACTION_MARKER}\n` : ""}-- Migration: ${name}
+-- Generated at: ${now.toISOString()}
+-- Dialect: ${getDialectDisplayName(dialect)}
+${options.line ?? ""}--
+${BLANK_FILE_LINE}
+-- Add your migration SQL below.
+--
+${
+  outside
+    ? `-- Its first line, ${NO_TRANSACTION_MARKER}, runs it outside a
+-- transaction, statement by statement: a statement that fails leaves the
+-- ones before it applied. Keep to the statements that need it.`
+    : `-- It runs in one transaction. A statement that cannot, such as
+-- PostgreSQL's CREATE INDEX CONCURRENTLY, needs the file to run outside one:
+-- put ${NO_TRANSACTION_MARKER} above the -- Migration: line, as the
+-- file's first line.`
+}
+--
+-- ${ENTITY_HEADER_GUIDANCE}. For example:
+--
+-- -- Collections: posts
+-- -- Singles: home
+-- -- Field groups: hero
+--
+-- \`nextly migrate\` reads those lines to know which entities are still
+-- waiting on this file. Without one it cannot tell, and will record those
+-- entities as migrated once their tables exist.
+${SCOPED_ENTITIES_MARKER}
+
+-- UP
+
+
+-- DOWN
+-- (hand-write rollback SQL here, or leave empty if irreversible)
+`;
+}
+
+/**
+ * Format the migration filename per spec §6.1 Q8=C.
+ * Pattern: `YYYYMMDD_HHMMSS_mmm_<slug>.sql`.
+ *
+ * Underscore separators around the millisecond component keep the
+ * filename readable while preserving sub-second precision for rebase
+ * conflict avoidance.
+ */
+export function formatTimestamp(d: Date): string {
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mi = String(d.getUTCMinutes()).padStart(2, "0");
+  const ss = String(d.getUTCSeconds()).padStart(2, "0");
+  const ms = String(d.getUTCMilliseconds()).padStart(3, "0");
+  return `${yyyy}${mm}${dd}_${hh}${mi}${ss}_${ms}`;
+}
+
+/**
+ * Slugify a user-provided migration name for use in filenames.
+ * Lowercases, replaces non-alphanumeric runs with single underscore,
+ * trims leading/trailing underscores.
+ */
+export function slugify(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_|_$/g, "");
+}
+
+export {
+  FIELD_GROUP_HEADER_PATTERN,
+  parseEntityHeaders,
+  type MigrationEntityHeaders,
+} from "./entity-headers";
+
+/**
+ * The header line naming ONE entity, chosen by its kind.
+ *
+ * 🔴 Here rather than at the call site because the kind decides which bucket a
+ * reader puts the slug in, and a writer that always says `-- Collections:`
+ * files a single or a field group under the wrong one. The sweep then looks in
+ * its own kind's set, finds nothing, and promotes a row whose migration has not
+ * run — the exact failure the header exists to prevent, reintroduced by the
+ * writer rather than the reader.
+ *
+ * Kept beside {@link parseEntityHeaders} and {@link formatMigrationFile} so the
+ * three spellings of this format stay in one file.
+ */
+export function entityHeaderLine(
+  kind: "collection" | "single" | "fieldGroup",
+  slug: string
+): string {
+  switch (kind) {
+    case "single":
+      return `-- Singles: ${slug}`;
+    case "fieldGroup":
+      return `${FIELD_GROUP_HEADER} ${slug}`;
+    case "collection":
+      return `-- Collections: ${slug}`;
+  }
+}

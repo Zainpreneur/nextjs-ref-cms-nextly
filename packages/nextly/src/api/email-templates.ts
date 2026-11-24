@@ -1,0 +1,167 @@
+/**
+ * Email Templates API Route Handlers for Next.js
+ *
+ * These route handlers can be re-exported in your Next.js application to provide
+ * email template management endpoints at /api/email-templates.
+ *
+ * Services are auto-initialized on first request using environment variables:
+ * - DB_DIALECT: Database dialect ("postgresql" | "mysql" | "sqlite")
+ * - DATABASE_URL: Database connection string
+ *
+ * @example
+ * ```typescript
+ * // In your Next.js app: app/api/email-templates/route.ts
+ * export { GET, POST } from 'nextly/api/email-templates';
+ * ```
+ *
+ * The list endpoint is not server-paginated; admin code reads the array
+ * length directly. There is no synthetic `meta.total`.
+ *
+ * @module api/email-templates
+ */
+
+import { z } from "zod";
+
+import { actorFromAuthContext } from "../auth/request-actor";
+import { container } from "../di";
+import {
+  SYSTEM_READ_POLICY,
+  SYSTEM_WRITE_POLICY,
+} from "../domains/auth/system-write-policy";
+import { templateVariablesSchema } from "../domains/email/template-variables";
+import type { WrittenDocument } from "../domains/email/written/document";
+import { getCachedNextly } from "../init";
+import type { EmailTemplateService } from "../services/email/email-template-service";
+
+import { readJsonBody } from "./read-json-body";
+import { respondData, respondMutation } from "./response-shapes";
+import { requireRouteAnyPermission } from "./route-auth";
+import { withErrorHandler } from "./with-error-handler";
+import { nextlyValidationFromZod } from "./zod-to-nextly-error";
+
+async function getEmailTemplateService(): Promise<EmailTemplateService> {
+  await getCachedNextly();
+  return container.get<EmailTemplateService>("emailTemplateService");
+}
+
+const createTemplateSchema = z
+  .object({
+    name: z.string().min(1, "Name is required").max(255),
+    slug: z
+      .string()
+      .min(1, "Slug is required")
+      .max(255)
+      .regex(
+        /^[a-z0-9]+(?:-[a-z0-9]+)*$/,
+        "Slug must be lowercase alphanumeric with hyphens"
+      ),
+    subject: z.string().min(1, "Subject is required").max(500),
+    // Required for a coded template; a written one's is written from its blocks.
+    htmlContent: z.string(),
+    plainTextContent: z.string().optional().nullable(),
+    variables: templateVariablesSchema.optional(),
+    useLayout: z.boolean().optional(),
+    isActive: z.boolean().optional(),
+    providerId: z.string().uuid().optional().nullable(),
+    // When the template is sent, in the site's words; stored as given and
+    // returned on every read, as the dispatcher routes and Direct API do.
+    description: z.string().optional().nullable(),
+    // Fixed addresses copied on every send; the service checks each is one
+    // address and refuses them on a template that carries a secret.
+    cc: z.array(z.string()).optional().nullable(),
+    bcc: z.array(z.string()).optional().nullable(),
+    // A written template: its blocks, checked by the service with the same
+    // rules every transport applies.
+    format: z.enum(["code", "written"]).optional(),
+    blocks: z.custom<WrittenDocument>().optional().nullable(),
+  })
+  .superRefine((template, ctx) => {
+    if (template.format !== "written" && template.htmlContent.length === 0) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["htmlContent"],
+        message: "HTML content is required",
+      });
+    }
+  });
+
+/**
+ * GET handler for listing all email templates.
+ *
+ * Requires authentication. Returns all templates except layout templates
+ * (`_email-header`, `_email-footer`). Use the layout endpoint to access those.
+ *
+ * Response Codes:
+ * - 200 OK: Templates list retrieved successfully
+ * - 401 Unauthorized: Authentication required
+ * - 500 Internal Server Error: Failed to fetch templates
+ *
+ * Response: `{ "data": EmailTemplate[] }`; non-paginated list.
+ *
+ * @example
+ * ```bash
+ * curl -H "Authorization: Bearer <token>" \
+ *   "http://localhost:3000/api/email-templates"
+ * # => {"data":[...]}
+ * ```
+ */
+export const GET = withErrorHandler(
+  async (request: Request): Promise<Response> => {
+    await requireRouteAnyPermission(request, [
+      ...SYSTEM_READ_POLICY.emailTemplates.read.anyOf,
+    ]);
+
+    const service = await getEmailTemplateService();
+    const templates = await service.listTemplates();
+
+    // Non-paginated list; wrap in a named field for the canonical
+    // respondData shape (spec §5.1 rule 3).
+    return respondData({ templates });
+  }
+);
+
+/**
+ * POST handler for creating a new email template.
+ *
+ * Requires authentication. Cannot use reserved slugs (`_email-header`,
+ * `_email-footer`); use the layout endpoint instead.
+ *
+ * Request Body: see `createTemplateSchema` above for the full shape.
+ *
+ * Response Codes:
+ * - 201 Created: Template created successfully
+ * - 400 Bad Request: Invalid input or reserved slug
+ * - 401 Unauthorized: Authentication required
+ * - 500 Internal Server Error: Creation failed
+ *
+ * Response: `{ "data": EmailTemplate }`; the created template. Status 201.
+ */
+export const POST = withErrorHandler(
+  async (request: Request): Promise<Response> => {
+    const auth = await requireRouteAnyPermission(request, [
+      ...SYSTEM_WRITE_POLICY.emailTemplates.create.anyOf,
+    ]);
+
+    const body = await readJsonBody(request);
+
+    let validated: z.infer<typeof createTemplateSchema>;
+    try {
+      validated = createTemplateSchema.parse(body);
+    } catch (err) {
+      if (err instanceof z.ZodError) throw nextlyValidationFromZod(err);
+      throw err;
+    }
+
+    const service = await getEmailTemplateService();
+    // The checked body, passed as the dispatcher passes its own: a
+    // declaration's description may be absent at the check and is stored so.
+    const template = await service.createTemplate(
+      validated as Parameters<typeof service.createTemplate>[0],
+      actorFromAuthContext(auth)
+    );
+
+    return respondMutation("Email template created.", template, {
+      status: 201,
+    });
+  }
+);

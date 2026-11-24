@@ -1,0 +1,803 @@
+"use client";
+
+/**
+ * Entry Table Component
+ *
+ * Main data table for displaying collection entries. Columns are generated from
+ * the collection schema, and the surface around them — search, the filter
+ * dropdown, column visibility, the selection bar, the skeleton and the pager —
+ * comes from the shared `ListView`, so this file supplies content and none of
+ * the geometry.
+ *
+ * @module components/entries/EntryList/EntryTable
+ * @since 1.0.0
+ */
+
+import {
+  DropdownMenuCheckboxItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+} from "@nextlyhq/ui";
+import {
+  Fragment,
+  useState,
+  useMemo,
+  useEffect,
+  useImperativeHandle,
+  forwardRef,
+  type RefAttributes,
+  type ForwardRefExoticComponent,
+} from "react";
+
+import {
+  FileText,
+  PanelsTopLeft,
+  Pencil,
+  Trash2,
+} from "@admin/components/icons";
+import { useHoldForDecidingColumns } from "@admin/components/shared/loading-frame/delayed-reveal";
+import { RangeField } from "@admin/components/shared/range-field";
+import type {
+  NextlyColumn,
+  RowAction,
+} from "@admin/components/ui/table/data-table";
+import {
+  HeldPluginColumnsPass,
+  useDataTablePluginRegistrations,
+  usePluginColumnsPass,
+} from "@admin/components/ui/table/data-table/DataTableView";
+import { pluginColumnsDeciding } from "@admin/components/ui/table/data-table/plugin-registry";
+import {
+  ListView,
+  type ListColumnsControl,
+} from "@admin/components/ui/table/list-view";
+import { navigateTo } from "@admin/lib/navigation";
+import type { WayIn } from "@admin/lib/navigation/document-address";
+
+import { BulkActionBar } from "./BulkActionBar";
+import {
+  buildEntryColumns,
+  getEntryTitleField,
+  listTitleMayBeAnotherLanguages,
+  type CollectionForColumns,
+  type TitlesShownIn,
+} from "./EntryTableColumns";
+import { EntryTableSkeleton } from "./EntryTableSkeleton";
+import { LanguageChipKey } from "./LanguageChips";
+import type { ListFilter } from "./plugin-filters";
+import {
+  chosenTitleLanguage,
+  TitleLanguageSelect,
+  type TitleLanguageChoice,
+} from "./TitleLanguageSelect";
+import type { DeclaredBulkAction } from "./useDeclaredBulkActions";
+import { useEntryBulkActions } from "./useEntryBulkActions";
+import {
+  rowId,
+  useEntrySelection,
+  type EntryRow,
+  type EntryVersions,
+} from "./useEntrySelection";
+import {
+  BulkMoveResultNote,
+  useWorkflowBulkMoves,
+} from "./useWorkflowBulkMoves";
+
+// ============================================================================
+// Types
+// ============================================================================
+
+/**
+ * A table's pagination state. Distinct from `PaginationMeta` in `@nextlyhq/ui`,
+ * which is the 1-indexed wire contract; this is the 0-indexed view model the
+ * table controls run on.
+ */
+export interface TablePaginationState {
+  /** Current page index (0-indexed) */
+  page: number;
+  /** Number of items per page */
+  limit: number;
+  /** Total number of items across all pages */
+  total: number;
+  /** Total number of pages */
+  totalPages: number;
+  /** The total is a lower bound: more entries match than were counted. */
+  totalCapped?: boolean;
+  /** How many entries the current page holds. */
+  pageItemCount?: number;
+}
+
+/**
+ * Props for the EntryTable component.
+ */
+export interface EntryTableProps {
+  /** Collection configuration with fields and admin settings */
+  collection: CollectionForColumns;
+  /** Array of entry records to display */
+  entries: EntryRow[];
+  /** Pagination state */
+  pagination: TablePaginationState;
+  /** Whether data is currently loading */
+  isLoading?: boolean;
+  /** Current sort value ('-field' for desc, 'field' for asc) */
+  currentSort?: string;
+  /** Callback when page changes (0-indexed) */
+  onPageChange: (page: number) => void;
+  /** Callback when page size changes */
+  onLimitChange: (limit: number) => void;
+  /** Callback when sort changes */
+  onSortChange: (sort: string, order: "asc" | "desc") => void;
+  /** Callback when search query changes */
+  onSearchChange: (search: string) => void;
+  /** Callback when edit action is triggered */
+  /** Open a row. `locale` opens it in that content language. */
+  onEdit: (entryId: string, locale?: string) => void;
+  /**
+   * Where a row opens, by the admin's one rule for opening a document, so a
+   * row is a real link: a middle or modified click opens the same place.
+   */
+  entryHref: (entryId: string) => string;
+  /**
+   * The other ways into an entry its row's menu offers after Edit: "Edit
+   * details" where the entries open in a view, else the views an entry may
+   * be opened in. None when not given.
+   */
+  rowWaysIn?: (entryId: string) => readonly WayIn[];
+  /** Callback when delete action is triggered */
+  onDelete: (entryId: string) => void;
+  /** Callback for bulk delete operation */
+  onBulkDelete: (entryIds: string[]) => void;
+  /** Callback for bulk update operation */
+  onBulkUpdate?: (
+    entryIds: string[],
+    data: Record<string, unknown>,
+    versions: EntryVersions
+  ) => void;
+  /**
+   * Callback for bulk publish (sets `status: "published"` on every selected
+   * entry). The bar gates the button on `collection.status === true`, so
+   * passing this for non-status collections is harmless but unused.
+   */
+  onBulkPublish?: (entryIds: string[], versions: EntryVersions) => void;
+  /** Callback for bulk unpublish (sets `status: "draft"`). Same gating. */
+  onBulkUnpublish?: (entryIds: string[], versions: EntryVersions) => void;
+  /** Whether a bulk publish/unpublish request is in flight. */
+  isBulkPublishing?: boolean;
+  /**
+   * The reader's column choice, as the control `ListView` renders.
+   *
+   * One prop rather than the three this took before — a visibility record, a
+   * change handler and a reset — which this component then recombined into
+   * exactly this shape. The owner builds it with `useListColumns`, so the
+   * choice persists the same way it does on every other list.
+   */
+  columnsControl?: ListColumnsControl<EntryRow>;
+  /** Callback when row selection changes */
+  onSelectionChange?: (selectedIds: string[]) => void;
+  /** Current status filter value */
+  status?: string;
+  /** Callback when status filter changes */
+  onStatusChange?: (status: string) => void;
+  /**
+   * The "Titles in" control and the titles it chose, where the list offers it: a site with two
+   * languages or more and a collection whose content is per language.
+   */
+  titleLanguage?: TitleLanguageChoice;
+  /**
+   * The filters the toolbar offers beside the list's own: plugins'
+   * (`contributes.admin.filters`), the workflow's review filters and the
+   * language filter.
+   */
+  pluginFilters?: readonly ListFilter[];
+  /** The option each plugin filter has chosen, by filter name. */
+  chosenPluginFilters?: ReadonlyMap<string, string>;
+  /** Choose a plugin filter's option, or `null` to clear it. */
+  onPluginFilterChange?: (name: string, value: string | null) => void;
+  /**
+   * Plugins' declared row actions, offered after the list's own, each on the
+   * rows its rule holds for.
+   */
+  declaredRowActions?: readonly RowAction<EntryRow>[];
+  /**
+   * Plugins' declared bulk actions, offered in the bulk bar on the rows
+   * selected, after the built-in ones.
+   */
+  declaredBulkActions?: readonly DeclaredBulkAction[];
+  /**
+   * Plugins' declared columns, in the order delivered, drawn after the
+   * collection's own columns.
+   */
+  declaredColumns?: readonly NextlyColumn<Record<string, unknown>>[];
+  /** Created date lower bound (YYYY-MM-DD) */
+  createdFrom?: string;
+  /** Created date upper bound (YYYY-MM-DD) */
+  createdTo?: string;
+  /** Updated date lower bound (YYYY-MM-DD) */
+  updatedFrom?: string;
+  /** Updated date upper bound (YYYY-MM-DD) */
+  updatedTo?: string;
+  /** Callback when created-from filter changes */
+  onCreatedFromChange?: (value: string) => void;
+  /** Callback when created-to filter changes */
+  onCreatedToChange?: (value: string) => void;
+  /** Callback when updated-from filter changes */
+  onUpdatedFromChange?: (value: string) => void;
+  /** Callback when updated-to filter changes */
+  onUpdatedToChange?: (value: string) => void;
+}
+
+/**
+ * Ref handle for the EntryTable component.
+ * Provides imperative methods for controlling the table.
+ */
+export interface EntryTableRef {
+  /** Select all rows on the current page */
+  selectAll: () => void;
+  /** Clear all row selections */
+  clearSelection: () => void;
+  /** Get the IDs of currently selected rows */
+  getSelectedIds: () => string[];
+}
+
+// ============================================================================
+// Component
+// ============================================================================
+
+/**
+ * Entry data table with server-side pagination, sorting, and bulk operations.
+ */
+/**
+ * The Filter menu's sections for plugins' filters: one per filter, its label
+ * then its options, the chosen one checked. Choosing the checked option again
+ * clears it, as the language filter does.
+ */
+function PluginFilterMenuSections({
+  filters,
+  chosen,
+  onChange,
+  separateFirst,
+}: {
+  filters: readonly ListFilter[];
+  chosen: ReadonlyMap<string, string> | undefined;
+  onChange: ((name: string, value: string | null) => void) | undefined;
+  /** Whether a section of the list's own comes before the first. */
+  separateFirst: boolean;
+}) {
+  return filters.map((filter, index) => (
+    <Fragment key={filter.name}>
+      {(index > 0 || separateFirst) && <DropdownMenuSeparator />}
+      <DropdownMenuLabel>{filter.label}</DropdownMenuLabel>
+      <DropdownMenuSeparator />
+      {filter.options.map(option => {
+        const active = chosen?.get(filter.name) === option.value;
+        return (
+          <DropdownMenuCheckboxItem
+            key={option.value}
+            checked={active}
+            onCheckedChange={() =>
+              onChange?.(filter.name, active ? null : option.value)
+            }
+          >
+            {option.label}
+          </DropdownMenuCheckboxItem>
+        );
+      })}
+    </Fragment>
+  ));
+}
+
+/**
+ * The table's row selection, and the bulk actions it is offered for. Rows are
+ * selectable only when some bulk action is offered on them, and a row's
+ * Delete only with the delete permission. A plugin's declared bulk action
+ * counts as one: the server sends it only to a reader who may run it, and a
+ * reader holding none of the built-in ones still needs the checkboxes to
+ * reach it.
+ */
+function useEntryTableSelection(
+  collection: EntryTableProps["collection"],
+  declaredBulkActions: readonly DeclaredBulkAction[] = []
+) {
+  const offered = useEntryBulkActions(collection);
+  return {
+    offered,
+    ...useEntrySelection(offered.any || declaredBulkActions.length > 0),
+  };
+}
+
+/** Plugins' declared bulk actions as the bulk bar draws them, judged on `selected`. */
+function declaredBarActions(
+  declaredBulkActions: readonly DeclaredBulkAction[] = [],
+  selected: readonly string[]
+) {
+  return declaredBulkActions.map(action => ({
+    id: action.id,
+    label: action.label,
+    disabled: action.isDisabled(selected),
+    note: action.heldBackNote(selected),
+    onSelect: () => action.onSelect(selected),
+  }));
+}
+
+export const EntryTable: ForwardRefExoticComponent<
+  EntryTableProps & RefAttributes<EntryTableRef>
+> = forwardRef<EntryTableRef, EntryTableProps>(function EntryTable(
+  {
+    collection,
+    entries,
+    pagination,
+    isLoading = false,
+    currentSort,
+    onPageChange,
+    onLimitChange,
+    onSortChange,
+    onSearchChange,
+    onEdit,
+    entryHref,
+    rowWaysIn,
+    onDelete,
+    onBulkDelete,
+    onBulkUpdate,
+    onBulkPublish,
+    onBulkUnpublish,
+    isBulkPublishing = false,
+    columnsControl,
+    onSelectionChange,
+    status = "all",
+    onStatusChange,
+    titleLanguage,
+    pluginFilters = [],
+    chosenPluginFilters,
+    onPluginFilterChange,
+    declaredRowActions,
+    declaredBulkActions,
+    declaredColumns,
+    createdFrom = "",
+    createdTo = "",
+    updatedFrom = "",
+    updatedTo = "",
+    onCreatedFromChange,
+    onCreatedToChange,
+    onUpdatedFromChange,
+    onUpdatedToChange,
+  },
+  ref
+) {
+  // -------------------------------------------------------------------------
+  // State
+  // -------------------------------------------------------------------------
+
+  const [globalFilter, setGlobalFilter] = useState("");
+  const { offered, selection, selected, versions, selectAll, clear } =
+    useEntryTableSelection(collection, declaredBulkActions);
+
+  // -------------------------------------------------------------------------
+  // Columns
+  // -------------------------------------------------------------------------
+
+  // The titles in the language the reader chose, where one other than the
+  // default is chosen and still configured.
+  const titlesIn = useMemo((): TitlesShownIn | undefined => {
+    const language = chosenTitleLanguage(titleLanguage);
+    if (!titleLanguage || !language) return undefined;
+    const { defaultLocale, languages, titles, defaultMayFallBack } =
+      titleLanguage;
+    const defaultLanguage = languages.find(each => each.code === defaultLocale);
+    return defaultLanguage
+      ? { language, defaultLanguage, titles, defaultMayFallBack }
+      : undefined;
+  }, [titleLanguage]);
+
+  // The collection's own columns, which the column chooser offers and hides.
+  const ownColumns = useMemo(
+    () =>
+      buildEntryColumns(collection, columnsControl?.isColumnVisible, {
+        openInLocale: (entryId, locale) => onEdit(entryId, locale),
+        ...(titlesIn ? { titlesIn } : {}),
+      }),
+    [collection, columnsControl, onEdit, titlesIn]
+  );
+  // Plugins' declared columns are drawn after them and always shown: they
+  // arrive only once the reader is known, and the chooser's stored choice is
+  // kept against a fixed set of columns, so they are not offered there.
+  const columns = useMemo(
+    () => [...ownColumns, ...(declaredColumns ?? [])],
+    [ownColumns, declaredColumns]
+  );
+
+  const titleField = useMemo(
+    () => getEntryTitleField(collection),
+    [collection]
+  );
+
+  // The workflow's moves over the selection, each refusal named by the row's title.
+  const bulkMoves = useWorkflowBulkMoves({
+    collection,
+    offered: offered.workflowMoves,
+    rows: entries,
+    titleOf: (row, id) => {
+      const title = row && titleField ? row[titleField] : undefined;
+      return typeof title === "string" && title !== "" ? title : id;
+    },
+  });
+
+  // A plugin's column decided by a read of its own (whether the collection
+  // has what the column shows) is registered once that read answers. Asked
+  // here from the list's first draw, outline included, so the read leaves
+  // with the rows' own; and once the rows are in, the outline stays a moment
+  // longer while a provider is still deciding, so the column is drawn with
+  // the rows instead of moving every cell beside it when it lands.
+  const registered = useDataTablePluginRegistrations();
+  // One ask of the providers for this list, which the table below draws its
+  // columns from too.
+  const pass = usePluginColumnsPass();
+  const columnsDeciding = useMemo(
+    () => pluginColumnsDeciding(collection.slug, registered, pass),
+    [collection.slug, registered, pass]
+  );
+  const holdForColumns = useHoldForDecidingColumns(
+    !isLoading,
+    columnsDeciding,
+    collection.slug
+  );
+
+  // -------------------------------------------------------------------------
+  // Sorting
+  // -------------------------------------------------------------------------
+
+  const sort = useMemo(():
+    | { field: string; order: "asc" | "desc" }
+    | undefined => {
+    if (!currentSort) return undefined;
+    const desc = currentSort.startsWith("-");
+    return {
+      field: desc ? currentSort.slice(1) : currentSort,
+      order: desc ? "desc" : "asc",
+    };
+  }, [currentSort]);
+
+  // -------------------------------------------------------------------------
+  // Selection
+  // -------------------------------------------------------------------------
+
+  // Notify parent when selection changes.
+  useEffect(() => {
+    onSelectionChange?.(selected);
+  }, [selected, onSelectionChange]);
+
+  // The list's select-all shortcut reaches rows through here, so it selects
+  // nothing where the checkboxes are not offered.
+  useImperativeHandle(
+    ref,
+    () => ({
+      selectAll: () => selectAll(entries),
+      clearSelection: clear,
+      getSelectedIds: () => selected,
+    }),
+    [entries, selectAll, clear, selected]
+  );
+
+  // -------------------------------------------------------------------------
+  // Row navigation + actions
+  // -------------------------------------------------------------------------
+
+  const rowActions = useMemo(
+    () =>
+      (row: EntryRow): RowAction<EntryRow>[] => {
+        const id = rowId(row);
+        return [
+          {
+            id: "edit",
+            label: "Edit",
+            icon: <Pencil className="h-4 w-4" />,
+            onSelect: () => onEdit(id),
+          },
+          // Each other way in goes where the shared rule says, as the row's
+          // own link does: the form, or a view.
+          ...(rowWaysIn?.(id) ?? []).map((way, index) => ({
+            id: `way-in-${index}`,
+            label: way.label,
+            icon:
+              way.opens === "form" ? (
+                <FileText className="h-4 w-4" />
+              ) : (
+                <PanelsTopLeft className="h-4 w-4" />
+              ),
+            onSelect: () => navigateTo(way.address),
+          })),
+          ...(offered.delete
+            ? [
+                {
+                  id: "delete",
+                  label: "Delete",
+                  icon: <Trash2 className="h-4 w-4" />,
+                  destructive: true,
+                  onSelect: () => onDelete(id),
+                },
+              ]
+            : []),
+          ...(declaredRowActions ?? []),
+        ];
+      },
+    [onEdit, rowWaysIn, onDelete, offered.delete, declaredRowActions]
+  );
+
+  // -------------------------------------------------------------------------
+  // Search + column visibility helpers
+  // -------------------------------------------------------------------------
+
+  const handleGlobalFilterChange = (value: string) => {
+    setGlobalFilter(value);
+    onSearchChange(value);
+  };
+
+  // -------------------------------------------------------------------------
+  // Filters (status + date range) rendered into the toolbar dropdown
+  // -------------------------------------------------------------------------
+
+  const hasStatusField = useMemo(() => {
+    const allFields = collection.fields || [];
+    return allFields.some(f => "name" in f && f.name === "status");
+  }, [collection]);
+
+  const hasDateFilters =
+    !!onCreatedFromChange ||
+    !!onCreatedToChange ||
+    !!onUpdatedFromChange ||
+    !!onUpdatedToChange;
+
+  const hasAnyActiveFilters =
+    status !== "all" ||
+    !!createdFrom ||
+    !!createdTo ||
+    !!updatedFrom ||
+    !!updatedTo ||
+    (chosenPluginFilters?.size ?? 0) > 0;
+
+  // Offered only where a choice can be acted on.
+  const hasPluginFilters = pluginFilters.length > 0 && !!onPluginFilterChange;
+
+  const showFilterDropdown =
+    hasStatusField || hasDateFilters || hasPluginFilters;
+
+  // The key to the Languages column's chips, above the table while the column
+  // is shown. The chips and the key render nothing below two languages.
+  const showsLanguageKey =
+    collection.localized === true &&
+    (columnsControl?.isColumnVisible("translations") ?? true);
+  const titleLanguageFailed =
+    titlesIn !== undefined && titleLanguage?.failed === true;
+  // Where the titles are when those in the chosen language couldn't be read: the default
+  // language's only where no title on the page may be another language's.
+  const titlesUnreadNote =
+    titleLanguageFailed && titlesIn
+      ? `Titles in ${titlesIn.language.label} couldn't be read, so ${
+          entries.some(row => listTitleMayBeAnotherLanguages(row, titlesIn))
+            ? "each row shows its own title"
+            : `each title is shown in ${titlesIn.defaultLanguage.label}`
+        }.`
+      : undefined;
+
+  const clearDateFilters = () => {
+    onCreatedFromChange?.("");
+    onCreatedToChange?.("");
+    onUpdatedFromChange?.("");
+    onUpdatedToChange?.("");
+  };
+
+  // -------------------------------------------------------------------------
+  // Render
+  // -------------------------------------------------------------------------
+
+  return (
+    // The table draws its columns from the ask the hold above was decided by.
+    <HeldPluginColumnsPass.Provider value={pass}>
+      {bulkMoves.dialogs}
+      {/* What the last workflow move did, each refusal named, until the next one. */}
+      {bulkMoves.result ? (
+        <BulkMoveResultNote result={bulkMoves.result} />
+      ) : null}
+      <ListView<EntryRow>
+        search={{
+          value: globalFilter,
+          onChange: handleGlobalFilterChange,
+          placeholder: `Search ${collection.label}...`,
+          inputProps: { "data-entry-search-input": true },
+        }}
+        columnsControl={
+          columnsControl && { ...columnsControl, columns: ownColumns }
+        }
+        hasActiveFilters={hasAnyActiveFilters}
+        inlineFilters={
+          titleLanguage ? (
+            <TitleLanguageSelect choice={titleLanguage} />
+          ) : undefined
+        }
+        slots={
+          showsLanguageKey || titleLanguageFailed
+            ? {
+                beforeTable: (
+                  <div className="space-y-2">
+                    {showsLanguageKey && <LanguageChipKey />}
+                    {titlesUnreadNote && (
+                      <p
+                        role="status"
+                        className="text-xs text-muted-foreground"
+                      >
+                        {titlesUnreadNote}
+                      </p>
+                    )}
+                  </div>
+                ),
+              }
+            : undefined
+        }
+        filters={
+          showFilterDropdown ? (
+            <>
+              {hasStatusField && onStatusChange && (
+                <>
+                  <DropdownMenuLabel>Filter by Status</DropdownMenuLabel>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuCheckboxItem
+                    checked={status === "all"}
+                    onCheckedChange={() => onStatusChange("all")}
+                  >
+                    All Status
+                  </DropdownMenuCheckboxItem>
+                  <DropdownMenuCheckboxItem
+                    checked={status === "published"}
+                    onCheckedChange={() => onStatusChange("published")}
+                  >
+                    Published
+                  </DropdownMenuCheckboxItem>
+                  <DropdownMenuCheckboxItem
+                    checked={status === "draft"}
+                    onCheckedChange={() => onStatusChange("draft")}
+                  >
+                    Draft
+                  </DropdownMenuCheckboxItem>
+                  <DropdownMenuCheckboxItem
+                    checked={status === "archived"}
+                    onCheckedChange={() => onStatusChange("archived")}
+                  >
+                    Archived
+                  </DropdownMenuCheckboxItem>
+                </>
+              )}
+
+              {hasPluginFilters && (
+                <PluginFilterMenuSections
+                  filters={pluginFilters}
+                  chosen={chosenPluginFilters}
+                  onChange={onPluginFilterChange}
+                  separateFirst={!!(hasStatusField && onStatusChange)}
+                />
+              )}
+
+              {hasDateFilters && (
+                <>
+                  <DropdownMenuSeparator />
+                  <div className="space-y-3 px-2 py-1.5">
+                    <p className="text-xs font-medium text-muted-foreground">
+                      Created Date
+                    </p>
+                    <RangeField
+                      label="Created date"
+                      type="date"
+                      orientation="column"
+                      from={createdFrom}
+                      to={createdTo}
+                      onFromChange={value => onCreatedFromChange?.(value)}
+                      onToChange={value => onCreatedToChange?.(value)}
+                    />
+
+                    <p className="pt-1 text-xs font-medium text-muted-foreground">
+                      Updated Date
+                    </p>
+                    <RangeField
+                      label="Updated date"
+                      type="date"
+                      orientation="column"
+                      from={updatedFrom}
+                      to={updatedTo}
+                      onFromChange={value => onUpdatedFromChange?.(value)}
+                      onToChange={value => onUpdatedToChange?.(value)}
+                    />
+
+                    {/* In the menu's text colour: the primary token is a fill
+                        a brand may set to any colour, and small text drawn in
+                        it can fall under AA. Underlined at rest, so it reads
+                        as a link in the menu's own colour. */}
+                    <button
+                      type="button"
+                      className="w-full text-left text-xs text-foreground underline underline-offset-2"
+                      onClick={clearDateFilters}
+                    >
+                      Clear date filters
+                    </button>
+                  </div>
+                </>
+              )}
+            </>
+          ) : null
+        }
+        bulkBar={
+          selected.length > 0 ? (
+            <BulkActionBar
+              selectedCount={selected.length}
+              collection={collection}
+              onDelete={() => onBulkDelete(selected)}
+              onUpdate={
+                onBulkUpdate
+                  ? data => onBulkUpdate(selected, data, versions)
+                  : undefined
+              }
+              onPublish={
+                onBulkPublish
+                  ? () => onBulkPublish(selected, versions)
+                  : undefined
+              }
+              onUnpublish={
+                onBulkUnpublish
+                  ? () => onBulkUnpublish(selected, versions)
+                  : undefined
+              }
+              isPublishing={isBulkPublishing}
+              onClear={clear}
+              declaredActions={declaredBarActions(
+                declaredBulkActions,
+                selected
+              )}
+              workflowMoves={bulkMoves.movesFor(selected)}
+            />
+          ) : undefined
+        }
+        // The real heads over the outline rows: the columns are known before
+        // the rows are.
+        skeleton={
+          <EntryTableSkeleton
+            list={collection.slug}
+            headers={columns
+              .filter(column => !column.hidden)
+              .map(column => column.header)}
+          />
+        }
+        loading={isLoading || holdForColumns}
+        columns={columns}
+        rows={entries}
+        getRowId={rowId}
+        // No selection removes the checkbox column, on every width.
+        selection={selection}
+        rowActions={rowActions}
+        sort={sort}
+        onSortChange={onSortChange}
+        rowHref={row => entryHref(rowId(row))}
+        primaryColumn={titleField}
+        registryKey={collection.slug}
+        ariaLabel="Entries table"
+        emptyMessage={
+          globalFilter
+            ? "No entries found. Try adjusting your search or filters."
+            : "No entries found."
+        }
+        // Inside the table rather than beside it, so the component that knows
+        // whether the row table or the mobile card view is showing is the one
+        // that places the pager.
+        pagination={{
+          currentPage: pagination.page,
+          totalPages: pagination.totalPages,
+          totalItems: pagination.total,
+          totalCapped: pagination.totalCapped,
+          pageItemCount: pagination.pageItemCount,
+          pageSize: pagination.limit,
+          onPageChange,
+          onPageSizeChange: onLimitChange,
+          isLoading,
+          itemLabel: "entries",
+          ariaLabel: "Entry table pagination",
+        }}
+      />
+    </HeldPluginColumnsPass.Provider>
+  );
+});

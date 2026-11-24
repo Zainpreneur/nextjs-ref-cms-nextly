@@ -1,0 +1,83 @@
+---
+title: Audit Log
+description: A durable record of who changed what, and when.
+---
+
+The audit log records mutations as they happen: which user, which action, which document,
+and which fields changed.
+
+## Availability
+
+| | |
+|---|---|
+| Built in | No plugin required, and not gated behind a paid tier |
+| Admin | Activity is surfaced on the dashboard |
+| Permission | Reading activity is an admin capability |
+
+## What a record holds
+
+| Field | Meaning |
+|---|---|
+| Actor | Who made the change |
+| Action | What happened — a create, an update, a delete |
+| Target | The collection and document |
+| Changed fields | Which fields differed, computed from the write itself |
+
+<Callout type="warn">
+**System writes are not recorded.** A mutation made by internal or system context, such as a
+seed or a migration, produces no activity entry. If you rely on this log, that gap is the
+thing to know: the absence of an entry does not mean nothing happened.
+</Callout>
+
+Recording the changed field list — rather than the whole document — keeps the log useful
+without turning it into a second copy of your content. [Version
+history](/docs/versions) is where the full before-and-after lives.
+
+## Erasing a person without erasing the record
+
+A deletion request under privacy law asks you to remove a person's data. An audit log
+exists precisely so records cannot quietly disappear. Those pull in opposite directions.
+
+Nextly resolves it by separating the actor from the act: a person's identifying details can
+be erased while the entries they produced remain, still counted, still ordered, still
+showing that a change happened and what it touched. You keep the record and lose the
+person, which is what both obligations actually require.
+
+## Signed-in people a plugin defines
+
+A plugin can sign in people who are not staff, such as a shop's customers (see
+[Signed-in people](/docs/plugins/signed-in-people)). What such a person does appears in the
+security audit trail, not in the activity log above: the activity log records staff users only.
+
+A row about such a person names them by kind and id, in fields of their own. It records which
+kind of caller acted (`staff`, `apiKey`, `core`, `anonymous`, or the person's kind, such as
+`accounts:account`), and it keeps its network address, browser and the plugin's metadata, as
+it does for a staff user who exists.
+
+When the plugin reports the person deleted, Nextly does the following in one transaction:
+
+- erases the address and browser on every row the person acted on;
+- erases the plugin's metadata on every plugin row about them;
+- replaces their id with a keyed digest of their kind and id.
+
+It then keeps only that digest and the time, never the id, so every row written about the
+person afterwards is written already erased. Rows about anyone else stay as they were, a
+staff user who happens to share the person's id included, and so does the address of a staff
+member who acted on the person.
+
+The digest's key is a random key Nextly makes once and keeps sealed under `NEXTLY_SECRET`.
+After you rotate the secret, keep the old one in `NEXTLY_SECRET_PREVIOUS` until the app has
+started once with both: the key is sealed again under the new secret at that boot, and then
+the old secret can go. If the old secret is dropped before that, the key cannot be read:
+writes naming a person and deletion reports fail, and each failure is logged.
+
+## Retention
+
+Audit entries are pruned on a schedule, so the log holds a useful window rather than
+growing forever.
+
+## Related
+
+- [Version history](/docs/versions) — the full before-and-after of one document
+- [Roles and permissions](/docs/permissions)
+- [Webhooks](/docs/webhooks) — the same events, delivered to another system

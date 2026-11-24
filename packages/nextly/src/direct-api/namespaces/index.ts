@@ -1,0 +1,69 @@
+/**
+ * Direct API Namespaces — Barrel Export
+ *
+ * Aggregates every namespace factory and their related types so the core
+ * `Nextly` class has a single import point.
+ *
+ * @packageDocumentation
+ */
+
+export type { NextlyContext } from "./context";
+
+export * as collections from "./collections";
+export * as singles from "./singles";
+export * as auth from "./auth";
+
+export { createUsersNamespace, type UsersNamespace } from "./users";
+export {
+  createMediaNamespace,
+  type MediaFoldersNamespace,
+  type MediaNamespace,
+} from "./media";
+export { createFormsNamespace, type FormsNamespace } from "./forms";
+export {
+  createFieldGroupsNamespace,
+  type FieldGroupsNamespace,
+} from "./field-groups";
+export {
+  createEmailDeliveriesNamespace,
+  createEmailNamespace,
+  createEmailProvidersNamespace,
+  createEmailTemplatesNamespace,
+  createUserFieldsNamespace,
+  type EmailDeliveriesNamespace,
+  type EmailNamespace,
+  type EmailProvidersNamespace,
+  type EmailTemplatesNamespace,
+  type UserFieldsNamespace,
+} from "./email";
+export {
+  createAccessNamespace,
+  createApiKeysNamespace,
+  createPermissionsNamespace,
+  createRolesNamespace,
+  type AccessNamespace,
+  type ApiKeysNamespace,
+  type PermissionsNamespace,
+  type RolesNamespace,
+} from "./rbac";
+export { createJobsNamespace, type JobsNamespace } from "./jobs";
+export { createNoticesNamespace, type NoticesNamespace } from "./notices";
+export { createFilesNamespace, type FilesNamespace } from "./files";
+export { createVersionsNamespace, type VersionsNamespace } from "./versions";
+export {
+  createContentEventsNamespace,
+  type ContentEventsNamespace,
+} from "./content-events";
+export {
+  createWorkflowsNamespace,
+  type WorkflowAssignmentInput,
+  type WorkflowCallArgs,
+  type WorkflowDocumentRef,
+  type WorkflowSeenPart,
+  type WorkflowsNamespace,
+} from "./workflows";
+export {
+  createReleasesNamespace,
+  type ReleaseCallerArgs,
+  type ReleasesNamespace,
+} from "./releases";

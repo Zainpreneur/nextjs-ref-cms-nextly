@@ -1,0 +1,181 @@
+/**
+ * Direct API Users Type Definitions
+ *
+ * Argument types for the `nextly.users.*` namespace.
+ *
+ * @packageDocumentation
+ */
+
+import type {
+  CreateArgs,
+  DeleteArgs,
+  FindArgs,
+  FindByIDArgs,
+  UpdateArgs,
+} from "./collections";
+import type { DirectAPIConfig } from "./shared";
+
+/**
+ * Arguments for finding users.
+ *
+ * Extends FindArgs with user-specific filter and sort options.
+ *
+ * @example
+ * ```typescript
+ * // List all verified users, newest first
+ * const result = await nextly.users.find({
+ *   emailVerified: true,
+ *   sortBy: 'createdAt',
+ *   sortOrder: 'desc',
+ *   limit: 20,
+ * });
+ *
+ * // Search by name or email
+ * const result = await nextly.users.find({ search: 'john' });
+ * ```
+ */
+/**
+ * The `FindArgs` options the users namespace actually forwards.
+ *
+ * Users are a core table with their own query service rather than a dynamic
+ * collection, and `users.find()` passes only pagination through to it. Anything
+ * else inherited from `FindArgs` was accepted and silently discarded: a `where`
+ * clause filtered nothing and returned the first arbitrary user, which reads at
+ * the call site as a successful exact lookup.
+ *
+ * Named as an ALLOW-list rather than as an omission, so the default for anything
+ * new is refusal. A deny-list re-opens itself the moment `FindArgs` gains an
+ * option — the new one would be inherited, ignored at runtime, and produce a
+ * plausible wrong row with no compile error, which is the same failure this
+ * type is here to prevent.
+ *
+ * To support one of the others, forward it in `namespaces/users.ts` and add it
+ * here in the same change.
+ */
+type ForwardedFindOptions = "limit" | "page";
+
+export interface FindUsersArgs
+  extends Pick<FindArgs, ForwardedFindOptions>,
+    DirectAPIConfig {
+  /** User collection slug (defaults to 'users') */
+  collection?: string;
+
+  /** Search query across name, email, and custom text fields */
+  search?: string;
+
+  /** Filter by email verification status */
+  emailVerified?: boolean;
+
+  /** Filter by whether user has a password set */
+  hasPassword?: boolean;
+
+  /** Sort field */
+  /** A built-in column, or a custom user field by its name. */
+  sortBy?: "createdAt" | "name" | "email" | (string & {});
+
+  /** Sort direction */
+  sortOrder?: "asc" | "desc";
+}
+
+/**
+ * Arguments for finding a single user by criteria.
+ *
+ * Returns the first user matching the provided filters, or `null` if not found.
+ * Consistent with collection `findByID` semantics — use `users.findByID` when
+ * you already have the user ID; use `findOne` when querying by other attributes.
+ *
+ * @example
+ * ```typescript
+ * // Find by email (exact match via search)
+ * const user = await nextly.users.findOne({ search: 'john@example.com' });
+ *
+ * // Find first unverified user
+ * const unverified = await nextly.users.findOne({ emailVerified: false });
+ * ```
+ */
+export interface FindOneUserArgs extends DirectAPIConfig {
+  /** User collection slug (defaults to 'users') */
+  collection?: string;
+
+  /** Search query across name, email, and custom text fields */
+  search?: string;
+
+  /** Filter by email verification status */
+  emailVerified?: boolean;
+
+  /** Filter by whether user has a password set */
+  hasPassword?: boolean;
+}
+
+/**
+ * Arguments for finding a user by ID.
+ *
+ * `draft` and `status` are omitted from the shared find-by-ID options: the
+ * working-draft overlay and the lifecycle scope apply to drafts-enabled
+ * content collections, and the users namespace forwards neither, so exposing
+ * either here would advertise an option that is silently ignored.
+ */
+/**
+ * `principal` is left out of every users argument: a user operation cannot be
+ * made as a plugin-defined person, and the instance refuses it at runtime, so
+ * a type that accepted it would advertise a call that always fails.
+ */
+type NotForUsers = "collection" | "principal";
+
+export interface FindUserByIDArgs
+  extends Omit<FindByIDArgs, NotForUsers | "draft" | "status"> {
+  /** User collection slug (defaults to 'users') */
+  collection?: string;
+}
+
+/**
+ * Arguments for creating a user.
+ */
+export interface CreateUserArgs extends Omit<CreateArgs, NotForUsers> {
+  /** User collection slug (defaults to 'users') */
+  collection?: string;
+
+  /** User email (required) */
+  email: string;
+
+  /** User password (required) */
+  password: string;
+}
+
+/**
+ * Arguments for updating a user.
+ */
+export interface UpdateUserArgs extends Omit<UpdateArgs, NotForUsers> {
+  /** User collection slug (defaults to 'users') */
+  collection?: string;
+}
+
+/**
+ * Arguments for deleting a user.
+ */
+export interface DeleteUserArgs extends Omit<DeleteArgs, NotForUsers> {
+  /** User collection slug (defaults to 'users') */
+  collection?: string;
+}
+
+/**
+ * Arguments for listing a user's external identities: the sign-in identities
+ * linked to the account, as core's own table holds them. No provider token
+ * exists to be returned.
+ */
+export interface ListUserIdentitiesArgs extends DirectAPIConfig {
+  /** The account whose identities are listed (required). */
+  userId: string;
+}
+
+/**
+ * Arguments for unlinking one external identity from a user's account. The
+ * identity must be one that account holds; another account's identity is
+ * refused as a missing one is.
+ */
+export interface UnlinkIdentityArgs extends DirectAPIConfig {
+  /** The account the identity is unlinked from (required). */
+  userId: string;
+  /** The identity row's own id (required). */
+  identityId: string;
+}

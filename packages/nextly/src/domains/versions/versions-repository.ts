@@ -1,0 +1,1795 @@
+/**
+ * Repository for `nextly_versions`, the global content-version store.
+ *
+ * Built on the adapter DB API (VersionsDbApi) so the same class can be
+ * constructed with either the adapter or a transaction context. All reads go
+ * through the Drizzle-backed adapter select (the transaction context binds its
+ * executor to the same path), so `createdAt`/`snapshot` are decoded (JSON
+ * parsed, timestamps become `Date`) whichever handle is used. Column names are
+ * the Drizzle property names (camelCase); the adapter maps them to snake_case.
+ *
+ * @module domains/versions/versions-repository
+ */
+
+import type { TransactionContext } from "@nextlyhq/adapter-drizzle/types";
+import { and, eq, isNotNull, max } from "drizzle-orm";
+
+import { toDbError } from "../../database/errors";
+import { NextlyError } from "../../errors";
+import { versionsTables } from "../../schemas/versions";
+import type {
+  VersionScopeKind,
+  VersionStatus,
+} from "../../schemas/versions/types";
+import { VERSIONS_TABLE } from "../../schemas/versions/types";
+import type { SupportedDialect } from "../../types/database";
+
+import type { ChangedParts } from "./changed-parts";
+import type {
+  VersionsDbApi,
+  VersionsWhere,
+  VersionsWhereCondition,
+} from "./db-api";
+import {
+  DOCUMENT_VERSION_KEY,
+  withoutDocumentVersionKeys,
+} from "./document-revision";
+import type { RecordedVersionStatus } from "./recorded-status";
+import type { PrunableVersion } from "./retention";
+import { workingDraftKey } from "./working-draft-key";
+
+/** A plain object: the shape a document snapshot has. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const TABLE = VERSIONS_TABLE;
+
+/**
+ * What makes a row a WORKING DRAFT, independent of which document it belongs to.
+ *
+ * 🔴 The single declaration of "pending edit", spread by both the per-document
+ * predicate and the cross-document ones. It is one value rather than one comment
+ * asking two predicates to agree: a working draft is the only non-autosave row
+ * carrying no version number (durable history rows always take a sequence
+ * number; autosave rows set `isAutosave = true`), and the day that definition
+ * changes it must change for the document read and the dashboard together. Two
+ * spellings would keep answering, and the disagreement would surface as a count
+ * that does not match the documents it points at.
+ *
+ * Never mutated -- both consumers spread it into a fresh `and` array.
+ *
+ * Exported so `nextly_versions_pending_edits_idx` can be checked against it
+ * rather than against a second list of the same column names: an index that
+ * does not cover every predicate here stops serving the query it exists for,
+ * and a copy of this shape in a test could not notice that.
+ */
+export const WORKING_DRAFT_SHAPE: readonly VersionsWhereCondition[] = [
+  { column: "isAutosave", op: "=", value: false },
+  { column: "versionNo", op: "IS NULL" },
+  { column: "status", op: "=", value: "draft" },
+];
+
+// Ids deleted per statement. Each id binds one parameter and SQLite's default
+// SQLITE_MAX_VARIABLE_NUMBER is 999 (the lowest across supported dialects), so
+// this stays well under it rather than tracking per-dialect capabilities.
+const DELETE_CHUNK_SIZE = 500;
+
+// Every column except `snapshot`, so metadata reads (history lists) can project
+// away the potentially large JSON payload instead of transferring then dropping
+// it. Keep in sync with VersionRow when adding a metadata column.
+//
+// The parts a version changed (`changed_locales`, `shared_changed`) are left
+// out: a history list hands these rows out whole, and no read of the parts is
+// offered yet, so listing them here would publish them unasked.
+const VERSION_META_COLUMNS = [
+  "id",
+  "scopeKind",
+  "scopeSlug",
+  "entryId",
+  "versionNo",
+  "status",
+  "isAutosave",
+  "label",
+  "locale",
+  "sourceVersionNo",
+  "fieldSources",
+  "createdBy",
+  "createdAt",
+  "updatedAt",
+] as const;
+
+/**
+ * A document's identity across locales.
+ *
+ * NUL-joined rather than concatenated, so a slug ending in the separator cannot
+ * spell the same key as a different slug and entry id pair -- the columns are
+ * free strings and a delimiter that can occur inside one is a collision waiting
+ * for the install that names a collection unusually.
+ *
+ * Exported because the collapse it keys now happens AFTER authorization, in the
+ * caller: a version row's identity belongs to this module, and the decision
+ * about which rows a reader may see belongs to the read path, so the two meet at
+ * the caller rather than one reimplementing the other.
+ */
+export function documentKey(row: VersionMeta): string {
+  return [row.scopeKind, row.scopeSlug, row.entryId].join("\u0000");
+}
+
+/**
+ * One row per document -- its newest -- keeping at most `limit` of them.
+ *
+ * Relies on the caller's `updatedAt DESC` ordering: the first row seen for a
+ * document IS its latest instant, so keeping the first and dropping the rest
+ * needs no comparison.
+ *
+ * 🔴 Run this AFTER authorization, never before. The key deliberately excludes
+ * `locale`, because a document is one thing to publish however many languages
+ * it is drafted in -- but a localized Single is authorized PER LANGUAGE, so
+ * collapsing first hands the visibility filter only the newest locale. Where
+ * that one is denied and an older one is readable, the document disappears from
+ * a card its reader is entitled to see, and no test that uses an unlocalized
+ * document can tell.
+ */
+export function newestPerDocument(
+  rows: readonly VersionMeta[],
+  limit: number
+): VersionMeta[] {
+  const seen = new Set<string>();
+  const newest: VersionMeta[] = [];
+  for (const row of rows) {
+    const key = documentKey(row);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    newest.push(row);
+    if (newest.length === limit) break;
+  }
+  return newest;
+}
+
+/**
+ * Where a page of pending edits left off.
+ *
+ * The ordering key in full, which is what a cursor has to be: `updatedAt` alone
+ * is not unique, so a cursor carrying only the instant cannot say WHICH of the
+ * rows sharing it was the last one read.
+ */
+export interface PendingEditCursor {
+  updatedAt: Date;
+  id: string;
+}
+
+/**
+ * How a paged pending-edit read is ordered, and why the choice is the CALLER's.
+ *
+ * - `recency` — newest first, which is what a "recently edited" card means.
+ * - `identity` — by row id, which means nothing to a reader and is STABLE.
+ *
+ * 🔴 A count pages by identity, and that is a correctness decision rather than a
+ * preference. `updatedAt` advances every time somebody types, so a draft not yet
+ * read can move AHEAD of a recency cursor and be excluded from every later page
+ * — not a race window but a guaranteed miss for the rest of the walk, which
+ * makes a total silently too small. A working-draft update rewrites `snapshot`,
+ * `createdBy` and `updatedAt` and never the id, so an identity cursor cannot be
+ * outrun by the rows it is enumerating.
+ */
+export type PendingEditOrder = "recency" | "identity";
+
+/**
+ * Strictly after `cursor` in `updatedAt DESC, id DESC` order.
+ *
+ * 🔴 A cursor rather than an OFFSET, because the rows being paged are the most
+ * MUTABLE in the system: a working draft's `updatedAt` advances every time
+ * somebody types. Under OFFSET, a row updated between two pages moves ahead of
+ * the offset, so the next page repeats a row already seen and SKIPS one that was
+ * never read — and the skipped document is lost silently, since de-duplicating
+ * what arrived cannot reveal what did not. Anchoring to the last row read makes
+ * the pages disjoint whatever moves behind them.
+ *
+ * Spelled as the two-branch disjunction rather than a row constructor, because
+ * `(a, b) < (x, y)` is not portable across the three dialects this must run on.
+ */
+function olderThan(
+  cursor: PendingEditCursor,
+  order: PendingEditOrder
+): VersionsWhere {
+  if (order === "identity") {
+    return { and: [{ column: "id", op: "<", value: cursor.id }] };
+  }
+  return {
+    or: [
+      { and: [{ column: "updatedAt", op: "<", value: cursor.updatedAt }] },
+      {
+        and: [
+          { column: "updatedAt", op: "=", value: cursor.updatedAt },
+          { column: "id", op: "<", value: cursor.id },
+        ],
+      },
+    ],
+  };
+}
+
+/**
+ * The ordering clause for `order`, unique in both cases so a cursor is exact.
+ *
+ * 🔴 No `nulls` placement, and its absence is deliberate. `updated_at` is
+ * NOT NULL on all three dialects, so no row can sit in either group and the
+ * per-dialect default has nothing to disagree about — but asking for one is not
+ * free: the adapter spells `nulls` as a LEADING `updated_at IS NULL` sort key,
+ * an expression `nextly_versions_pending_edits_idx` cannot supply, so SQLite
+ * sorted the rows in a temp B-tree rather than reading them in index order. It
+ * bought a guarantee the column's own nullability already gives, and paid for
+ * it in the one place this ordering is used.
+ */
+function orderClause(
+  order: PendingEditOrder
+): { column: string; direction: "desc" }[] {
+  if (order === "identity") return [{ column: "id", direction: "desc" }];
+  return [
+    { column: "updatedAt", direction: "desc" },
+    { column: "id", direction: "desc" },
+  ];
+}
+
+/**
+ * The parts a version changed, as their two columns store them. The language
+ * codes are pre-stringified, as `snapshot` is in `insertVersion` and for the
+ * same reason; absent parts store NULL in both, which reads as unknown.
+ */
+function storedParts(parts: ChangedParts | null | undefined): {
+  changedLocales: string | null;
+  sharedChanged: boolean | null;
+} {
+  return parts
+    ? {
+        changedLocales: JSON.stringify(parts.locales),
+        sharedChanged: parts.shared,
+      }
+    : { changedLocales: null, sharedChanged: null };
+}
+
+/**
+ * The parts a stored row names: the inverse of `storedParts`, read back as
+ * each dialect returns the two columns. The language codes come back as JSON
+ * text or as a parsed array, and the shared flag as a boolean or as 0/1
+ * (SQLite and MySQL). It is decoded here alone, so every reader of the parts
+ * sees one shape whatever the dialect.
+ *
+ * NULL in either column is a row recorded before versions named their parts,
+ * which reads as unknown (`null`), never as "changed nothing". So does a value
+ * in neither form: unknown keeps the row under the rule that predates the
+ * parts, where reading a part into it would be a guess.
+ */
+export function partsFromStorage(
+  changedLocales: unknown,
+  sharedChanged: unknown
+): ChangedParts | null {
+  const locales = storedLocales(changedLocales);
+  const shared =
+    sharedChanged === true || sharedChanged === 1
+      ? true
+      : sharedChanged === false || sharedChanged === 0
+        ? false
+        : null;
+  return locales === null || shared === null ? null : { locales, shared };
+}
+
+/** The language codes of `changed_locales`, or null when it holds none. */
+function storedLocales(value: unknown): string[] | null {
+  let decoded: unknown = value;
+  if (typeof value === "string") {
+    try {
+      decoded = JSON.parse(value);
+    } catch {
+      // Not JSON: not a list this column was written with.
+      return null;
+    }
+  }
+  return Array.isArray(decoded) &&
+    decoded.every((code): code is string => typeof code === "string")
+    ? [...decoded]
+    : null;
+}
+
+/** A durable row as `listDurableForPrune` reads it, before its parts decode. */
+type StoredPrunableVersion = Omit<PrunableVersion, "changedParts"> & {
+  changedLocales: unknown;
+  sharedChanged: unknown;
+};
+
+/** Identifies the document a version belongs to. */
+export interface VersionRef {
+  scopeKind: VersionScopeKind;
+  scopeSlug: string;
+  entryId: string;
+}
+
+/** Input to insert one version row. */
+export interface InsertVersionInput {
+  ref: VersionRef;
+  versionNo: number | null;
+  /** A lifecycle status, or a document's own where it has no lifecycle. */
+  status: RecordedVersionStatus;
+  isAutosave: boolean;
+  snapshot: unknown;
+  label?: string | null;
+  locale?: string | null;
+  sourceVersionNo?: number | null;
+  /** The version each restored field came from; see `restored-from`. */
+  fieldSources?: Readonly<Record<string, number>> | null;
+  /** The parts this version changed; see `changed-parts`. Null: unknown. */
+  changedParts?: ChangedParts | null;
+  createdBy?: string | null;
+}
+
+/** A full version row (camelCase, as the adapter returns it). */
+export interface VersionRow {
+  id: string;
+  scopeKind: VersionScopeKind;
+  scopeSlug: string;
+  entryId: string;
+  versionNo: number | null;
+  /** A lifecycle status, or a document's own where it has no lifecycle. */
+  status: RecordedVersionStatus;
+  isAutosave: boolean;
+  snapshot: unknown;
+  label: string | null;
+  locale: string | null;
+  sourceVersionNo: number | null;
+  /**
+   * The version each restored field came from, as `{ field: versionNo }`, on
+   * the version of a write that carried restored values. Null or absent on
+   * every other row, and on rows recorded before it existed.
+   */
+  fieldSources?: Readonly<Record<string, number>> | null;
+  createdBy: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  /**
+   * On an autosave row, the document as it stood when the recovery point was
+   * first recorded: its newest durable version_no (0 for none) and its
+   * working draft's revision (-1 for none). Null or absent on every other row,
+   * and on recovery points recorded before the base existed.
+   */
+  baseVersionNo?: number | null;
+  baseDraftRevision?: number | null;
+}
+
+/**
+ * Whether a recovery point is from an older version of its document, and who
+ * made the newer one, so an editor never offers one back as if it were current
+ * when restoring it would revert later work.
+ *
+ * - `by-you`: every later write was this author's own durable save or publish.
+ * - `by-another`: someone else wrote, or a write that names no one (an API key,
+ *   the system, a working-draft change, whose row records who began the draft
+ *   rather than who last changed it).
+ * - `unknown`: the point predates the base, so nothing can say.
+ */
+export type AutosaveSupersession = "by-you" | "by-another" | "unknown";
+
+/** What a rewrite reads of the point it replaces, to say what base it keeps. */
+type StoredPointBase = Pick<
+  VersionRow,
+  "locale" | "baseVersionNo" | "baseDraftRevision"
+>;
+
+/**
+ * The most later versions an autosave read looks at to say whose they are.
+ * Past it, the point is from an older version someone else may have written:
+ * opening an editor never reads a long history.
+ */
+const LATER_VERSIONS_READ = 20;
+
+/** Metadata view of a version row (everything except the snapshot). */
+export type VersionMeta = Omit<VersionRow, "snapshot">;
+
+/**
+ * What an autosave write reports back.
+ *
+ * Taken from the values the write itself used rather than re-read afterwards:
+ * autosave runs while somebody is typing, so a confirmation SELECT on every
+ * keystroke-batch would be real cost for data the write already holds.
+ */
+export interface AutosaveWriteResult {
+  updatedAt: Date;
+  locale: string | null;
+}
+
+/**
+ * A Drizzle database or transaction handle, as `getDrizzle()` answers it: the part of its query
+ * builder a grouped read uses, the same on every dialect.
+ */
+interface GroupsRows {
+  select(fields: Record<string, unknown>): {
+    from(table: unknown): {
+      where(condition: unknown): {
+        groupBy(column: unknown): PromiseLike<Record<string, unknown>[]>;
+      };
+    };
+  };
+}
+
+/**
+ * Each language's newest durable version number on a document, null keying the versions recorded
+ * without a language: one grouped statement however many languages the document has, so a reader
+ * of every part pays one round trip, not one per part. Read on `db` (a transaction's handle reads
+ * inside it) and without a lock: it decides nothing a write waits on.
+ */
+export async function newestVersionNoPerLocale(
+  db: Pick<TransactionContext, "getDrizzle">,
+  dialect: SupportedDialect,
+  ref: VersionRef
+): Promise<Map<string | null, number>> {
+  const versions = versionsTables(dialect).nextlyVersions;
+  const rows = await db
+    .getDrizzle<GroupsRows>()
+    .select({ locale: versions.locale, versionNo: max(versions.versionNo) })
+    .from(versions)
+    .where(
+      and(
+        eq(versions.scopeKind, ref.scopeKind),
+        eq(versions.scopeSlug, ref.scopeSlug),
+        eq(versions.entryId, ref.entryId),
+        // Durable versions only: an autosave and the working draft carry no number of the history.
+        eq(versions.isAutosave, false),
+        isNotNull(versions.versionNo)
+      )
+    )
+    .groupBy(versions.locale);
+  const newest = new Map<string | null, number>();
+  for (const row of rows) {
+    // A driver may answer an aggregate as a string; the number is the same.
+    if (row.versionNo === null || row.versionNo === undefined) continue;
+    newest.set(
+      typeof row.locale === "string" ? row.locale : null,
+      Number(row.versionNo)
+    );
+  }
+  return newest;
+}
+
+export class VersionsRepository {
+  private readonly db: VersionsDbApi;
+
+  constructor(db: VersionsDbApi) {
+    this.db = db;
+  }
+
+  /**
+   * The three-column filter that scopes every query to one document.
+   * Return type is explicit (`value: unknown`, per VersionsWhereCondition)
+   * so callers can push conditions with other value types (e.g. the
+   * boolean `isAutosave` filter) without TS narrowing `value` to `string`
+   * from the scope columns above.
+   */
+  private docWhere(ref: VersionRef): VersionsWhereCondition[] {
+    return [
+      { column: "scopeKind", op: "=" as const, value: ref.scopeKind },
+      { column: "scopeSlug", op: "=" as const, value: ref.scopeSlug },
+      { column: "entryId", op: "=" as const, value: ref.entryId },
+    ];
+  }
+
+  /** Insert one version row. */
+  async insertVersion(input: InsertVersionInput): Promise<void> {
+    // The transaction-context insert path does not apply Drizzle column
+    // defaults, so id and timestamps are set explicitly here (mirrors how the
+    // collection mutation service seeds dc_ rows).
+    const now = new Date();
+    // Enforce the row-shape invariant the input type cannot express: a durable
+    // version carries a sequence number, an autosave never does. Either
+    // violation would confuse the durable-sequence unique index (which treats a
+    // non-null version_no as durable) and the reads that exclude autosaves.
+    if (!input.isAutosave && input.versionNo == null) {
+      throw NextlyError.internal({
+        logContext: { reason: "durable-version-missing-version-no" },
+      });
+    }
+    if (input.isAutosave && input.versionNo != null) {
+      throw NextlyError.internal({
+        logContext: { reason: "autosave-version-has-version-no" },
+      });
+    }
+    // `snapshot` is `unknown`; serialize defensively (see serializeSnapshot).
+    const serializedSnapshot = this.serializeSnapshot(input.snapshot);
+    await this.db.insert(
+      TABLE,
+      {
+        id: crypto.randomUUID(),
+        scopeKind: input.ref.scopeKind,
+        scopeSlug: input.ref.scopeSlug,
+        entryId: input.ref.entryId,
+        versionNo: input.versionNo,
+        status: input.status,
+        isAutosave: input.isAutosave,
+        // Pre-stringify: the raw-SQL transaction insert path binds this value
+        // straight into a driver query with no column-type awareness, and
+        // mysql2 turns a plain object into invalid `key = value` SQL for a
+        // query parameter (it is not stringified for us the way SQLite
+        // stringifies a bound object). The non-transactional Drizzle path
+        // re-parses a stringified value for JSON columns before handing it to
+        // the query builder (mapDataToColumnNames), so this is correct on
+        // both paths and matches the JSON-field convention used by the
+        // collection mutation service.
+        snapshot: serializedSnapshot,
+        label: input.label ?? null,
+        locale: input.locale ?? null,
+        sourceVersionNo: input.sourceVersionNo ?? null,
+        // Pre-stringified, as `snapshot` is above and for the same reason;
+        // null where the write carried no restored values.
+        fieldSources: input.fieldSources
+          ? JSON.stringify(input.fieldSources)
+          : null,
+        ...storedParts(input.changedParts),
+        createdBy: input.createdBy ?? null,
+        createdAt: now,
+        updatedAt: now,
+      },
+      // The insert result is discarded, so request NO columns back (empty
+      // returning). This skips RETURNING on the transaction path and the
+      // select-back reread on MySQL, so a large snapshot is never transferred
+      // or re-read on a capture.
+      { returning: [] }
+    );
+  }
+
+  /**
+   * Serialize a snapshot for the NOT NULL `snapshot` column.
+   *
+   * `snapshot` is `unknown`; serialize defensively. `JSON.stringify` returns
+   * `undefined` for a top-level function/symbol/undefined and THROWS for a
+   * circular reference or a BigInt. Either way the column must not receive a
+   * bad value, so both cases surface as a NextlyError rather than a driver
+   * error or a NULL write.
+   */
+  private serializeSnapshot(snapshot: unknown): string {
+    return serializeVersionSnapshot(snapshot);
+  }
+
+  /**
+   * A locale match for the working-draft lookup. Unlocalized documents keep a
+   * single working draft under `locale IS NULL`; a localized document keeps one
+   * per language, so the lookup must match the exact write locale. An `= value`
+   * comparison never matches NULL, which is the intended distinction between
+   * the two cases.
+   */
+  private localeCondition(locale: string | null): VersionsWhereCondition {
+    return locale == null
+      ? { column: "locale", op: "IS NULL" }
+      : { column: "locale", op: "=", value: locale };
+  }
+
+  /**
+   * The predicate identifying THE working draft of a document in one locale:
+   * the sidecar draft row holding pending edits to a published document that
+   * has not been promoted to the live row. A working draft is the only
+   * non-autosave row carrying no version number (durable history rows always
+   * take a sequence number; autosave rows set `isAutosave = true`), so this
+   * shape is unambiguous and matches the partial unique index that keeps it to
+   * one per document per locale.
+   */
+  private workingDraftWhere(
+    ref: VersionRef,
+    locale: string | null
+  ): VersionsWhere {
+    return {
+      and: [
+        ...this.docWhere(ref),
+        ...WORKING_DRAFT_SHAPE,
+        this.localeCondition(locale),
+      ],
+    };
+  }
+
+  /**
+   * The working-draft predicate WITHOUT a document scope.
+   *
+   * 🔴 Derived from {@link WORKING_DRAFT_SHAPE}, the same value
+   * `workingDraftWhere` spreads, so the per-document read and the cross-document
+   * reads cannot disagree about what a pending edit IS. Two spellings of
+   * "non-autosave, no version number, draft" would answer the same question
+   * differently the first time one of them changed, and the disagreement would
+   * show as a dashboard number that does not match the document it points at.
+   */
+  private pendingEditWhere(slugs: readonly string[]): VersionsWhere {
+    return {
+      and: [
+        ...WORKING_DRAFT_SHAPE,
+        // Always applied, because this read is bounded by what its caller may
+        // see and the allowlist is enumerated for every caller -- a super admin
+        // included. An empty list therefore means exactly nothing, and the
+        // callers below short-circuit it rather than emitting `IN ()`.
+        { column: "scopeSlug", op: "IN", value: [...new Set(slugs)] },
+      ],
+    };
+  }
+
+  /**
+   * One PAGE of pending-edit rows, newest first — rows, not documents.
+   *
+   * 🔴 It returns rows and collapses nothing, and that ordering is the point. A
+   * working draft is one row per document per LOCALE, and a document is one
+   * thing to publish however many languages it is drafted in — so the two views
+   * are both needed and the collapse has to happen AFTER the caller has
+   * authorized what it may see. Collapsing here handed the visibility filter
+   * only each document's newest locale, and a localized Single is authorized per
+   * language: where its newest pending locale is denied and an older one is
+   * readable, the document vanished from a card its reader was entitled to.
+   * {@link newestPerDocument} is exported for the caller to apply on the far
+   * side of that decision.
+   *
+   * 🔴 Paged by CURSOR rather than bounded by an arithmetic guess. The bound
+   * used to be `limit * maxPerDocument`, where `maxPerDocument` was the
+   * install's CURRENT locale count — which does not bound the data: working
+   * drafts written under a locale since removed from the configuration are still
+   * rows, so the read could return too few rows to yield `limit` documents while
+   * the caller's feasibility check said its answer was exact. Paging makes the
+   * caller's real bound — how many DOCUMENTS it wants — the only one; the cursor
+   * is what keeps the pages disjoint while the rows underneath them move. See
+   * {@link olderThan}.
+   *
+   * The snapshot is projected away. It is the largest column in the table and a
+   * card that lists titles has no use for it.
+   */
+  /**
+   * 🔴 Served by `nextly_versions_pending_edits_idx`, and by nothing else on
+   * this table. Every other index leads with `scope_kind`, which this query
+   * never constrains, so before that index existed SQLite answered the count
+   * with `SCAN nextly_versions USING INDEX sqlite_autoindex_nextly_versions_1`
+   * and the list with `SCAN nextly_versions` plus a temp B-tree, per page.
+   * Proving the count had seen every pending edit therefore meant reading every
+   * version ever captured: the caller's row budget bounded the rows it RECEIVED
+   * and nothing about the work the database did to find them.
+   *
+   * The index columns are this WHERE clause in order, then the cursor's own
+   * ordering. A single-collection install reads it in order and sorts nothing;
+   * with several collections the `IN` list is several ranges no engine here can
+   * merge, and the sort that follows is over working drafts alone rather than
+   * the whole table -- proportional to the number the card reports, not to the
+   * history behind it.
+   */
+  async findPendingEditRows(input: {
+    slugs: readonly string[];
+    limit: number;
+    order: PendingEditOrder;
+    after?: PendingEditCursor;
+  }): Promise<VersionMeta[]> {
+    if (input.slugs.length === 0 || input.limit <= 0) return [];
+    const scope = this.pendingEditWhere(input.slugs);
+    return this.db.select<VersionMeta>(TABLE, {
+      columns: [...VERSION_META_COLUMNS],
+      where: input.after
+        ? { and: [scope, olderThan(input.after, input.order)] }
+        : scope,
+      // Both orderings end in a UNIQUE column, which is what lets a cursor name
+      // a position exactly: `updatedAt` alone is not total -- SQLite stores
+      // whole seconds, so drafts saved together tie -- and a cursor over a
+      // non-unique key cannot say which of the tied rows a page ended on.
+      // Neither states a `nulls` placement; `orderClause` says why.
+      orderBy: orderClause(input.order),
+      limit: input.limit,
+    });
+  }
+
+  /**
+   * Insert or update the coalesced working draft for a document in one locale.
+   *
+   * There is exactly one working draft per (document, locale): editing a
+   * published document repeatedly rewrites this row in place rather than piling
+   * up draft rows, so `updatedAt` advances and the snapshot always holds the
+   * latest pending edit. The live content row is never touched here — this is
+   * the sidecar that lets a published document be edited without changing what
+   * the public sees until publish promotes it.
+   */
+  async upsertWorkingDraft(input: {
+    ref: VersionRef;
+    locale: string | null;
+    snapshot: unknown;
+    createdBy?: string | null;
+    /**
+     * The parts this draft holds (`draftSlotParts`), recorded on its row.
+     * Absent leaves a rewritten row's as they were, and a new row's unknown.
+     */
+    parts?: ChangedParts;
+  }): Promise<void> {
+    const now = new Date();
+    const serializedSnapshot = this.serializeSnapshot(input.snapshot);
+    const where = this.workingDraftWhere(input.ref, input.locale);
+    // Project only the id: the existence check must not transfer the (possibly
+    // large) snapshot of the row it is about to overwrite.
+    const existing = await this.db.select<{ id: string; revision: number }>(
+      TABLE,
+      {
+        columns: ["id", "revision"],
+        where,
+        limit: 1,
+      }
+    );
+    if (existing[0]) {
+      await this.db.update(
+        TABLE,
+        {
+          snapshot: serializedSnapshot,
+          createdBy: input.createdBy ?? null,
+          updatedAt: now,
+          // Advanced on every rewrite, so a recovery point's base can tell the
+          // draft was written after it began.
+          revision: existing[0].revision + 1,
+          ...(input.parts ? storedParts(input.parts) : {}),
+        },
+        where
+      );
+      return;
+    }
+    const row = {
+      id: crypto.randomUUID(),
+      scopeKind: input.ref.scopeKind,
+      scopeSlug: input.ref.scopeSlug,
+      entryId: input.ref.entryId,
+      // A working draft is neither a durable history version (no sequence
+      // number) nor an autosave row; it is the sidecar draft head.
+      versionNo: null,
+      status: "draft",
+      isAutosave: false,
+      // Pre-stringified for the same cross-dialect reason as insertVersion:
+      // the transaction insert path binds this value straight into the driver
+      // query with no column-type awareness.
+      snapshot: serializedSnapshot,
+      label: null,
+      locale: input.locale ?? null,
+      // Carried only by this row class, and unique across it, so the database
+      // holds the one-per-document-per-locale rule the read above cannot.
+      draftKey: workingDraftKey(input.ref, input.locale ?? null),
+      sourceVersionNo: null,
+      ...storedParts(input.parts),
+      createdBy: input.createdBy ?? null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    // A concurrent writer that committed its own draft between the read above
+    // and this insert makes the unique index refuse this row. That refusal is
+    // the point: without it both rows land and a later read, which takes the
+    // first of an unordered match, picks between them arbitrarily. The
+    // violation is left to travel — the write path above this owns turning it
+    // into an answer the caller can act on, and a repository has no way to know
+    // whether it is inside a caller's transaction, where PostgreSQL has already
+    // marked everything after the error unusable.
+    await this.db.insert(TABLE, row, { returning: [] });
+  }
+
+  /** Fetch the working draft (snapshot included) for a document in one locale. */
+  async findWorkingDraft(
+    ref: VersionRef,
+    locale: string | null
+  ): Promise<VersionRow | undefined> {
+    const rows = await this.db.select<VersionRow>(TABLE, {
+      where: this.workingDraftWhere(ref, locale),
+      limit: 1,
+    });
+    return rows[0];
+  }
+
+  /**
+   * THE working draft in one locale of each of many documents in one scope,
+   * keyed by entry id: what {@link findWorkingDraft} answers for each, in one
+   * query rather than one per document.
+   */
+  async findWorkingDraftsOf(
+    scope: Pick<VersionRef, "scopeKind" | "scopeSlug">,
+    entryIds: readonly string[],
+    locale: string | null
+  ): Promise<Map<string, VersionRow>> {
+    const byEntry = new Map<string, VersionRow>();
+    if (entryIds.length === 0) return byEntry;
+    const rows = await this.db.select<VersionRow>(TABLE, {
+      where: {
+        and: [
+          { column: "scopeKind", op: "=", value: scope.scopeKind },
+          { column: "scopeSlug", op: "=", value: scope.scopeSlug },
+          { column: "entryId", op: "IN", value: [...new Set(entryIds)] },
+          ...WORKING_DRAFT_SHAPE,
+          this.localeCondition(locale),
+        ],
+      },
+    });
+    for (const row of rows) {
+      if (!byEntry.has(row.entryId)) byEntry.set(row.entryId, row);
+    }
+    return byEntry;
+  }
+
+  /**
+   * Which languages hold a pending change, for many documents at once.
+   *
+   * One query for a whole page of documents rather than one per document: the
+   * overview that consumes this is built for a list, and a per-row query there
+   * turns a page render into N round trips.
+   *
+   * Returns only the (document, locale) pairs that HAVE one, so a caller reads
+   * absence as absence rather than having to distinguish it from a document it
+   * never asked about.
+   */
+  async findPendingChangeLocales(
+    scopeKind: VersionScopeKind,
+    scopeSlug: string,
+    entryIds: string[]
+  ): Promise<Map<string, Set<string | null>>> {
+    const byEntry = new Map<string, Set<string | null>>();
+    if (entryIds.length === 0) return byEntry;
+    const rows = await this.db.select<{
+      entryId: string;
+      locale: string | null;
+    }>(TABLE, {
+      columns: ["entryId", "locale"],
+      where: {
+        and: [
+          { column: "scopeKind", op: "=", value: scopeKind },
+          { column: "scopeSlug", op: "=", value: scopeSlug },
+          { column: "entryId", op: "IN", value: entryIds },
+          // The shape itself, not a copy of its three conditions: the
+          // languages a list row marks as pending and the `_pendingChange`
+          // filter that keeps the row both read it, and a copy would let the
+          // badge and the filter disagree the first time the shape changed.
+          ...WORKING_DRAFT_SHAPE,
+        ],
+      },
+    });
+    for (const row of rows) {
+      const set = byEntry.get(row.entryId) ?? new Set<string | null>();
+      set.add(row.locale ?? null);
+      byEntry.set(row.entryId, set);
+    }
+    return byEntry;
+  }
+
+  /**
+   * Every working draft this document holds, one per locale.
+   *
+   * For the operations that act on the whole document at once — publishing all
+   * of its languages — rather than on the language in front of the author.
+   */
+  /**
+   * The parts (language keys, null for none) that hold a working draft,
+   * without the drafts' snapshots.
+   */
+  async listWorkingDraftLocales(ref: VersionRef): Promise<(string | null)[]> {
+    const rows = await this.db.select<{ locale: string | null }>(TABLE, {
+      columns: ["locale"],
+      where: {
+        and: [
+          ...this.docWhere(ref),
+          { column: "isAutosave", op: "=", value: false },
+          { column: "versionNo", op: "IS NULL" },
+        ],
+      },
+    });
+    return rows.map(row => row.locale);
+  }
+
+  async findAllWorkingDrafts(ref: VersionRef): Promise<VersionRow[]> {
+    return this.db.select<VersionRow>(TABLE, {
+      where: {
+        and: [
+          ...this.docWhere(ref),
+          { column: "isAutosave", op: "=", value: false },
+          { column: "versionNo", op: "IS NULL" },
+          { column: "status", op: "=", value: "draft" },
+        ],
+      },
+    });
+  }
+
+  /**
+   * Delete EVERY working draft this document has, in every locale, returning
+   * the number of rows removed. Called when the document itself goes away.
+   *
+   * Separate from {@link deleteWorkingDraft} because they answer different
+   * questions, and reaching for the wrong one is harmful in both directions:
+   * removing one locale's draft on a document delete strands the rest, pointing
+   * at a row that no longer exists, while removing all of them on a discard
+   * throws away pending work in languages the author never touched.
+   */
+  async deleteAllWorkingDrafts(ref: VersionRef): Promise<number> {
+    return this.db.delete(TABLE, {
+      and: [
+        ...this.docWhere(ref),
+        { column: "isAutosave", op: "=", value: false },
+        { column: "versionNo", op: "IS NULL" },
+        { column: "status", op: "=", value: "draft" },
+      ],
+    });
+  }
+
+  /**
+   * Whether a document holds a working draft in one locale, without reading
+   * its snapshot: the rows {@link deleteWorkingDraft} would remove, so a
+   * discard can be judged before anything is removed.
+   */
+  async hasWorkingDraft(
+    ref: VersionRef,
+    locale: string | null
+  ): Promise<boolean> {
+    const rows = await this.db.select<{ id: string }>(TABLE, {
+      columns: ["id"],
+      where: this.workingDraftWhere(ref, locale),
+      limit: 1,
+    });
+    return rows.length > 0;
+  }
+
+  /**
+   * Delete the working draft for a document in one locale, returning the number
+   * of rows removed. Called when the draft is promoted (published) or discarded.
+   */
+  async deleteWorkingDraft(
+    ref: VersionRef,
+    locale: string | null
+  ): Promise<number> {
+    return this.db.delete(TABLE, this.workingDraftWhere(ref, locale));
+  }
+
+  /**
+   * Remove recovery points for a document, returning how many were deleted.
+   *
+   * Every author's by default; one author's when `createdBy` is given.
+   *
+   * Autosave rows are excluded from history listings, from version reads and
+   * from retention pruning, so nothing else in the system will ever remove
+   * one. Without this a deleted document leaves a snapshot per author behind
+   * permanently: unreachable, since the live-document gate refuses a document
+   * that no longer exists, and never pruned. That is unpublished content
+   * outliving the document it belonged to, which is a retention problem rather
+   * than only a storage one.
+   *
+   * Locale is deliberately NOT a parameter. A recovery point is keyed by
+   * document and author alone, so there is no per-locale row to address --
+   * unlike the working draft, which keeps one per language.
+   */
+  async deleteAutosaves(
+    ref: VersionRef,
+    createdBy?: string | null
+  ): Promise<number> {
+    const and: (VersionsWhereCondition | VersionsWhere)[] = [
+      ...this.docWhere(ref),
+      { column: "isAutosave", op: "=" as const, value: true },
+    ];
+    // Only narrows when an author is named. `undefined` means every author,
+    // which is what a deleted document needs; `null` is a real author value
+    // (the unauthenticated bucket) and must still narrow, so the check is on
+    // `undefined` specifically rather than on falsiness.
+    if (createdBy !== undefined) {
+      and.push(
+        createdBy === null
+          ? { column: "createdBy", op: "IS NULL" as const }
+          : { column: "createdBy", op: "=" as const, value: createdBy }
+      );
+    }
+    return this.db.delete(TABLE, { and });
+  }
+
+  /**
+   * Highest durable (non-autosave) version_no for a document, or 0 if none.
+   * The caller allocates the next number as `getMaxVersionNo(ref) + 1`. When
+   * invoked with the transaction context this read runs inside the caller's
+   * transaction (the tx context binds its executor), so it sees the doc's own
+   * uncommitted rows. Duplicate version_no is still only DB-guarded by the
+   * partial unique index on Postgres; a MySQL/SQLite serialization or unique
+   * guard is needed before capture is wired into concurrent writes.
+   */
+  async getMaxVersionNo(
+    ref: VersionRef,
+    // A locking read, for a retry after a lost race: on MySQL a plain read
+    // answers from the transaction's snapshot, which still lacks the number a
+    // concurrent transaction committed, so it would hand out the same number
+    // again. A locking read sees the latest committed row on every dialect.
+    options: { latest?: boolean } = {}
+  ): Promise<number> {
+    // Project only version_no and take a single row (order desc, limit 1), so
+    // this never materializes a full version row (which carries the snapshot).
+    const rows = await this.db.select<VersionRow>(TABLE, {
+      ...(options.latest ? { forUpdate: true } : {}),
+      columns: ["versionNo"],
+      where: {
+        and: [
+          ...this.docWhere(ref),
+          { column: "isAutosave", op: "=", value: false },
+          // Exclude the working draft (a non-autosave row with no version
+          // number). Without this it sorts first under `versionNo DESC` (NULLS
+          // FIRST on Postgres) and this returns 0 even when durable versions
+          // exist, so the next capture allocates a colliding version number.
+          { column: "versionNo", op: "IS NOT NULL" },
+        ],
+      },
+      orderBy: [{ column: "versionNo", direction: "desc" }],
+      limit: 1,
+    });
+    const top = rows[0]?.versionNo;
+    return typeof top === "number" ? top : 0;
+  }
+
+  /**
+   * The newest durable version of a document, whatever its part (language),
+   * snapshot included. What a save is compared with to tell whether it changed
+   * anything.
+   */
+  async findNewest(
+    ref: VersionRef,
+    // `lock: false` for a check that writes nothing and is judged again under
+    // the lock of the write it leads to: the same row, read without waiting
+    // for or holding the document's lock.
+    options: { lock?: boolean } = {}
+  ): Promise<VersionRow | undefined> {
+    const rows = await this.db.select<VersionRow>(TABLE, {
+      where: {
+        and: [
+          ...this.docWhere(ref),
+          { column: "isAutosave", op: "=", value: false },
+          { column: "versionNo", op: "IS NOT NULL" },
+        ],
+      },
+      orderBy: [{ column: "versionNo", direction: "desc" }],
+      limit: 1,
+      // A locking read: on MySQL a plain one answers from the snapshot the
+      // transaction's first read took, so a write that waited for this
+      // document's lock would compare with a version older than the newest.
+      ...(options.lock === false ? {} : { forUpdate: true }),
+    });
+    return rows[0];
+  }
+
+  /**
+   * The part (language, or null for none) of one durable version, or
+   * undefined when the document has no such version. Reads that one row's
+   * language only.
+   */
+  async findPartOfVersion(
+    ref: VersionRef,
+    versionNo: number
+  ): Promise<string | null | undefined> {
+    const rows = await this.db.select<{ locale: string | null }>(TABLE, {
+      columns: ["locale"],
+      where: {
+        and: [
+          ...this.docWhere(ref),
+          { column: "isAutosave", op: "=", value: false },
+          { column: "versionNo", op: "=", value: versionNo },
+        ],
+      },
+      limit: 1,
+    });
+    return rows.length === 0 ? undefined : (rows[0]?.locale ?? null);
+  }
+
+  /**
+   * Each named language's newest durable version number on a document: the
+   * order in which those parts last saved. Version numbers rise with every
+   * write, so they order two saves made within one second, which a
+   * whole-second timestamp cannot. One indexed lookup per language, reading a
+   * single row each, however long the history is.
+   */
+  async newestVersionNoByLocale(
+    ref: VersionRef,
+    locales: readonly (string | null)[]
+  ): Promise<Map<string | null, number>> {
+    const newest = new Map<string | null, number>();
+    for (const locale of new Set(locales)) {
+      const rows = await this.db.select<{ versionNo: number }>(TABLE, {
+        columns: ["versionNo"],
+        where: {
+          and: [
+            ...this.docWhere(ref),
+            { column: "isAutosave", op: "=", value: false },
+            { column: "versionNo", op: "IS NOT NULL" },
+            locale === null
+              ? { column: "locale", op: "IS NULL" }
+              : { column: "locale", op: "=", value: locale },
+          ],
+        },
+        orderBy: [{ column: "versionNo", direction: "desc" }],
+        limit: 1,
+      });
+      if (rows[0]) newest.set(locale, rows[0].versionNo);
+    }
+    return newest;
+  }
+
+  /**
+   * The newest durable version recorded as published, snapshot included: of
+   * one language when `locale` is a string, of the part with no language when
+   * it is null, and of any part when it is undefined. Undefined when the
+   * document has none. What a review compares with when nothing was approved:
+   * the content that last went live.
+   */
+  async findNewestPublished(
+    ref: VersionRef,
+    locale: string | null | undefined
+  ): Promise<VersionRow | undefined> {
+    const rows = await this.db.select<VersionRow>(TABLE, {
+      where: {
+        and: [
+          ...this.docWhere(ref),
+          { column: "isAutosave", op: "=", value: false },
+          { column: "versionNo", op: "IS NOT NULL" },
+          { column: "status", op: "=", value: "published" },
+          ...(locale === undefined
+            ? []
+            : [
+                locale === null
+                  ? { column: "locale", op: "IS NULL" as const }
+                  : { column: "locale", op: "=" as const, value: locale },
+              ]),
+        ],
+      },
+      orderBy: [{ column: "versionNo", direction: "desc" }],
+      limit: 1,
+    });
+    return rows[0];
+  }
+
+  /** Fetch one durable version by its number, snapshot included. */
+  async findByVersionNo(
+    ref: VersionRef,
+    versionNo: number
+  ): Promise<VersionRow | undefined> {
+    const rows = await this.db.select<VersionRow>(TABLE, {
+      where: {
+        and: [
+          ...this.docWhere(ref),
+          { column: "isAutosave", op: "=", value: false },
+          { column: "versionNo", op: "=", value: versionNo },
+        ],
+      },
+    });
+    return rows[0];
+  }
+
+  /**
+   * The snapshots of several durable versions, by number, in one read. A
+   * number with no version (never recorded, or pruned) is simply absent.
+   */
+  async snapshotsByVersionNo(
+    ref: VersionRef,
+    versionNos: readonly number[]
+  ): Promise<Map<number, unknown>> {
+    const wanted = [...new Set(versionNos)];
+    if (wanted.length === 0) return new Map();
+    const rows = await this.db.select<
+      Pick<VersionRow, "versionNo" | "snapshot">
+    >(TABLE, {
+      columns: ["versionNo", "snapshot"],
+      where: {
+        and: [
+          ...this.docWhere(ref),
+          { column: "isAutosave", op: "=", value: false },
+          { column: "versionNo", op: "IN", value: wanted },
+        ],
+      },
+    });
+    return new Map(
+      rows
+        .filter(row => typeof row.versionNo === "number")
+        .map(row => [row.versionNo as number, row.snapshot])
+    );
+  }
+
+  /**
+   * Metadata list for a document, newest first. Snapshots are intentionally
+   * excluded (history lists never load them). Autosave rows are excluded unless
+   * `includeAutosave` is set.
+   */
+  async listByDoc(
+    ref: VersionRef,
+    opts: {
+      limit?: number;
+      includeAutosave?: boolean;
+      cursor?: number;
+      locale?: string;
+      locales?: readonly string[];
+    } = {}
+  ): Promise<VersionMeta[]> {
+    const and: (VersionsWhereCondition | VersionsWhere)[] = [
+      ...this.docWhere(ref),
+    ];
+    if (opts.includeAutosave) {
+      // Include autosave rows, but still exclude the working draft (a
+      // non-autosave row with no version number): it is the live pending edit
+      // surfaced via findWorkingDraft, not a history entry.
+      and.push({
+        or: [
+          { column: "versionNo", op: "IS NOT NULL" },
+          { column: "isAutosave", op: "=", value: true },
+        ],
+      });
+    } else {
+      // Durable history only: no autosave rows, and not the working draft.
+      and.push({ column: "isAutosave", op: "=", value: false });
+      and.push({ column: "versionNo", op: "IS NOT NULL" });
+    }
+    // Scope to one locale's history when asked. A localized document captures a
+    // version per locale, so the list can be narrowed to the language an editor
+    // is working in; absent, every locale's versions are returned.
+    //
+    // Shared (null-locale) snapshots are included: a write touching only fields
+    // shared across locales is recorded with `locale: null` yet still changes
+    // this locale's document, so excluding it would omit real history and could
+    // present an older locale-specific row as the latest state.
+    if (opts.locale !== undefined) {
+      and.push({
+        or: [
+          { column: "locale", op: "=", value: opts.locale },
+          { column: "locale", op: "IS NULL" },
+        ],
+      });
+    }
+    // Only the languages a caller may read, in the database so a page stays
+    // full. A version in no language belongs to the whole document, whose read
+    // the caller has passed, so it stays.
+    if (opts.locales !== undefined) {
+      and.push(
+        opts.locales.length === 0
+          ? { column: "locale", op: "IS NULL" }
+          : {
+              or: [
+                { column: "locale", op: "IN", value: [...opts.locales] },
+                { column: "locale", op: "IS NULL" },
+              ],
+            }
+      );
+    }
+    // Keyset pagination: return versions strictly older than the cursor, which
+    // is the last versionNo the caller already has. Stable under concurrent
+    // inserts in a way offset pagination is not.
+    //
+    // Autosave rows carry a NULL versionNo, so they can never satisfy a
+    // `versionNo < cursor` comparison and would silently vanish from a paged
+    // listing that asked for them. Reject the combination instead of returning
+    // a quietly incomplete page.
+    if (typeof opts.cursor === "number") {
+      if (opts.includeAutosave) {
+        throw NextlyError.validation({
+          errors: [
+            {
+              path: "cursor",
+              code: "INVALID_COMBINATION",
+              message:
+                "Autosave versions cannot be paged by cursor; they have no version number.",
+            },
+          ],
+          logContext: { reason: "versions-cursor-with-autosave" },
+        });
+      }
+      and.push({ column: "versionNo", op: "<", value: opts.cursor });
+    }
+    const rows = await this.db.select<VersionMeta>(TABLE, {
+      // Project metadata columns only, so the snapshot payload is never
+      // transferred for a history list (the adapter select honors `columns`).
+      columns: [...VERSION_META_COLUMNS],
+      where: { and },
+      // Secondary versionNo sort: seconds-precision createdAt can tie when two
+      // versions are written in the same second (the tx-path SQLite encoding).
+      orderBy: [
+        { column: "createdAt", direction: "desc" },
+        { column: "versionNo", direction: "desc" },
+      ],
+      ...(typeof opts.limit === "number" ? { limit: opts.limit } : {}),
+    });
+    return rows;
+  }
+
+  /**
+   * Durable rows for one document, newest-first, projecting only what the
+   * retention rules need: the parts each version changed (or, for a version
+   * recorded before those, its language), its name and its restore source
+   * decide what is always kept, and the snapshot is never read. Autosave rows
+   * are excluded because they never count toward the cap.
+   */
+  async listDurableForPrune(
+    ref: VersionRef,
+    // A locking read, after a lost allocation race: see `getMaxVersionNo`.
+    options: { latest?: boolean } = {}
+  ): Promise<PrunableVersion[]> {
+    const rows = await this.db.select<StoredPrunableVersion>(TABLE, {
+      ...(options.latest ? { forUpdate: true } : {}),
+      columns: [
+        "id",
+        "versionNo",
+        "status",
+        "locale",
+        "label",
+        "sourceVersionNo",
+        "fieldSources",
+        "changedLocales",
+        "sharedChanged",
+      ],
+      where: {
+        and: [
+          ...this.docWhere(ref),
+          { column: "isAutosave", op: "=", value: false },
+          // The working draft is not a durable version and must never enter the
+          // retention candidate set (it would be counted toward the cap, or
+          // pruned as if it were history).
+          { column: "versionNo", op: "IS NOT NULL" },
+        ],
+      },
+      orderBy: [
+        { column: "versionNo", direction: "desc" },
+        { column: "createdAt", direction: "desc" },
+      ],
+    });
+    // Each dialect hands the parts back in its own form; retention reads them
+    // decoded, as one shape.
+    return rows.map(({ changedLocales, sharedChanged, ...row }) => ({
+      ...row,
+      changedParts: partsFromStorage(changedLocales, sharedChanged),
+    }));
+  }
+
+  /** Where the ONE rolling autosave row for a document and author lives. */
+  private autosaveWhere(
+    ref: VersionRef,
+    createdBy: string | null
+  ): VersionsWhere {
+    return {
+      and: [
+        ...this.docWhere(ref),
+        { column: "isAutosave", op: "=", value: true },
+        createdBy === null
+          ? { column: "createdBy", op: "IS NULL" }
+          : { column: "createdBy", op: "=", value: createdBy },
+      ],
+    };
+  }
+
+  /**
+   * Insert or update the rolling autosave snapshot for one document and author.
+   *
+   * There is exactly ONE such row per (document, author). Editing rewrites it in
+   * place, so `updatedAt` advances and the snapshot always holds the newest
+   * recovery point. Nothing accumulates: an editing session costs one row, not
+   * one row per pause, so history never has to be pruned back.
+   *
+   * Keyed by AUTHOR as well as document because two people editing the same
+   * document have two different recovery points. A single row per document would
+   * let one author's snapshot overwrite the other's, and the loser would recover
+   * somebody else's work.
+   *
+   * The live row and the working draft are both untouched. An autosave is a
+   * recovery point, never a statement about what should be served or published,
+   * so it can hold a half-finished edit safely.
+   *
+   * Enforced HERE rather than left to the unique index, because that index is
+   * declared for Postgres only: it is keyed on `created_by`, which is populated,
+   * so it has no nullable column to lean on the way the durable-sequence index
+   * does, and neither MySQL nor SQLite can express a partial unique index. The
+   * index is a backstop where it exists; this is the mechanism everywhere.
+   */
+  async upsertAutosave(input: {
+    ref: VersionRef;
+    status: VersionStatus;
+    snapshot: unknown;
+    locale?: string | null;
+    createdBy?: string | null;
+  }): Promise<AutosaveWriteResult> {
+    const now = new Date();
+    // The version the point's edits began from is the editor's own, kept so
+    // a read of the point can say what changed since; see
+    // `serializeVersionSnapshot`.
+    const serializedSnapshot = serializeVersionSnapshot(input.snapshot, {
+      keepStartingVersion: true,
+    });
+    const createdBy = input.createdBy ?? null;
+    const where = this.autosaveWhere(input.ref, createdBy);
+    // Project only the id: the existence check must not transfer the (possibly
+    // large) snapshot of the row it is about to overwrite.
+    const existing = await this.db.select<
+      StoredPointBase & {
+        id: string;
+        revision: number;
+      }
+    >(TABLE, {
+      // `revision` rides along so the update can compare against the value
+      // this read OBSERVED rather than against a clock; `locale` and the base,
+      // so a point that has none for its language takes one.
+      columns: [
+        "id",
+        "revision",
+        "locale",
+        "baseVersionNo",
+        "baseDraftRevision",
+      ],
+      where,
+      limit: 1,
+    });
+    if (existing[0]) {
+      // Compare-and-set on the timestamp, not a blind overwrite. Two tabs
+      // belonging to the same author race here: A can read the row, pause, and
+      // then write after B has already stored a NEWER snapshot. An
+      // unconditional update would replace B's work with A's older values and
+      // stamp them newer, so the next recovery would offer the stale one.
+      //
+      // A losing write matches no row and is simply dropped, which is correct:
+      // the newer snapshot already describes the author's work, and this is a
+      // recovery point rather than an acknowledgement anybody is waiting on.
+      await this.db.update(
+        TABLE,
+        {
+          snapshot: serializedSnapshot,
+          status: input.status,
+          locale: input.locale ?? null,
+          updatedAt: now,
+          // Advancing the token is what makes the next writer's predicate fail.
+          // Computed from the OBSERVED value rather than read again, so the
+          // value written is the successor of the one being compared against.
+          revision: existing[0].revision + 1,
+          ...(await this.rewriteBase(input, existing[0])),
+        },
+        // Flattened into the same conjunction rather than nested, so the
+        // predicate stays one readable list of conditions.
+        {
+          and: [
+            ...(where.and ?? []),
+            // EQUALITY against the value this read observed: apply only while
+            // the row still holds it, which is what compare-and-set means. A
+            // concurrent writer advances it, this matches nothing, and the
+            // slower write is dropped rather than overwriting newer work.
+            //
+            // The token is `revision` rather than `updatedAt` because a
+            // timestamp's stored resolution differs per dialect and can run
+            // out: SQLite keeps whole epoch SECONDS, so two rewrites inside one
+            // second are indistinguishable, and the second writer's read
+            // observes exactly what the first wrote. Its predicate then matches
+            // and it overwrites newer work believing the row untouched. A
+            // counter advances on every write regardless of how close together
+            // they fall.
+            {
+              column: "revision",
+              op: "=" as const,
+              value: existing[0].revision,
+            },
+          ],
+        }
+      );
+      return { updatedAt: now, locale: input.locale ?? null };
+    }
+    try {
+      await this.db.insert(
+        TABLE,
+        {
+          id: crypto.randomUUID(),
+          scopeKind: input.ref.scopeKind,
+          scopeSlug: input.ref.scopeSlug,
+          entryId: input.ref.entryId,
+          // Null, never a number. The durable-sequence index treats a non-null
+          // value as durable, so an autosave carrying one would both consume a
+          // sequence slot and appear in history.
+          versionNo: null,
+          status: input.status,
+          isAutosave: true,
+          snapshot: serializedSnapshot,
+          // Neither applies to a recovery point: a label names a version
+          // somebody chose to keep, and a source records what a restore copied
+          // from.
+          label: null,
+          locale: input.locale ?? null,
+          sourceVersionNo: null,
+          createdBy,
+          createdAt: now,
+          updatedAt: now,
+          // Stated rather than left to the column default, so the first value
+          // the compare-and-set will read is fixed by this insert.
+          revision: 0,
+          // Read here, on the insert only: the point's rewrites keep the base
+          // it began from, or a write after it would become its base and the
+          // older work would read as current.
+          ...(await this.documentBase(input.ref, input.locale ?? null)),
+        },
+        { returning: [] }
+      );
+    } catch (error) {
+      // The existence check and this insert are two statements, so one author
+      // saving from two tabs can pass the check twice before either row lands.
+      // Where the unique index exists the loser is rejected here.
+      //
+      // The loser then DROPS its write rather than rewriting the winner's row.
+      // Losing this race is proof of ordering: this request read an empty
+      // result, the winner inserted afterwards, so the stored row is strictly
+      // newer than the snapshot in hand. Overwriting it would replace newer
+      // work with older and stamp it newer still -- the same inversion the
+      // existing-row branch guards against with its compare-and-set, arriving
+      // by a different path.
+      //
+      // Only Postgres reaches this branch at all: MySQL and SQLite cannot
+      // express a partial unique index, so there both inserts succeed and the
+      // document briefly carries two of one author's recovery points. That is
+      // bounded -- both rows are the same author's own work, and `findAutosave`
+      // reads the newest.
+      // Rethrow when the handle cannot say which engine it is: constraint
+      // codes differ per dialect, so classifying without one would be a guess,
+      // and a wrong guess here would swallow a real failure as a retry.
+      const dialect = this.db.dialect;
+      if (!dialect) throw error;
+      if (toDbError(dialect, error).kind !== "unique-violation") throw error;
+    }
+    return { updatedAt: now, locale: input.locale ?? null };
+  }
+
+  /**
+   * Remove every recovery point belonging to an ENTITY, across all of its
+   * documents and authors.
+   *
+   * For the entity itself going away, where `deleteAutosaves` cannot help
+   * because there is no single document id to name.
+   *
+   * Scoped to autosave rows on purpose. Durable history and working drafts for
+   * a deleted entity are a wider question with an archival dimension -- what a
+   * deletion owes a document's recorded past -- and answering it here would
+   * decide it by accident. A recovery point has no such dimension: it is one
+   * author's unsaved work on a document that no longer exists, so nothing can
+   * ever read it again.
+   */
+  async deleteAutosavesForEntity(
+    scopeKind: VersionScopeKind,
+    scopeSlug: string
+  ): Promise<number> {
+    return this.db.delete(TABLE, {
+      and: [
+        { column: "scopeKind", op: "=" as const, value: scopeKind },
+        { column: "scopeSlug", op: "=" as const, value: scopeSlug },
+        { column: "isAutosave", op: "=" as const, value: true },
+      ],
+    });
+  }
+
+  /**
+   * Remove every recovery point belonging to one AUTHOR, across every document.
+   *
+   * For the account going away. Deliberately a delete rather than the scrub
+   * the audit surfaces perform: an audit row is a record, and stripping the
+   * person from it keeps a trail worth keeping, whereas a recovery point is
+   * that person's unsaved draft. Scrubbing its author would leave the snapshot
+   * in the table with nobody able to claim it, which is worse than either
+   * keeping or removing it cleanly.
+   */
+  async deleteAutosavesByAuthor(createdBy: string): Promise<number> {
+    return this.db.delete(TABLE, {
+      and: [
+        { column: "isAutosave", op: "=" as const, value: true },
+        { column: "createdBy", op: "=" as const, value: createdBy },
+      ],
+    });
+  }
+
+  /**
+   * The base a rewrite of an autosave row carries: none, keeping the one it
+   * began with, unless the point moves to another language, where it is a new
+   * point and takes that language's base, or it has none: a point recorded
+   * before the base was kept takes one when its snapshot is next replaced, or
+   * it would read as from an older version for as long as it is rewritten.
+   */
+  private async rewriteBase(
+    input: { ref: VersionRef; locale?: string | null },
+    stored: StoredPointBase
+  ): Promise<
+    { baseVersionNo: number; baseDraftRevision: number } | Record<string, never>
+  > {
+    const locale = input.locale ?? null;
+    const hasBase =
+      stored.baseVersionNo != null && stored.baseDraftRevision != null;
+    if (hasBase && (stored.locale ?? null) === locale) return {};
+    return this.documentBase(input.ref, locale);
+  }
+
+  /**
+   * Where a document stands now: its newest durable version_no (0 for none)
+   * and its working draft's revision in `locale` (-1 for none). Both are
+   * counters this table keeps, so comparing two of them asks no clock.
+   */
+  private async documentBase(
+    ref: VersionRef,
+    locale: string | null
+  ): Promise<{ baseVersionNo: number; baseDraftRevision: number }> {
+    const draft = await this.db.select<{ revision: number }>(TABLE, {
+      columns: ["revision"],
+      where: this.workingDraftWhere(ref, locale),
+      limit: 1,
+    });
+    return {
+      baseVersionNo: await this.getMaxVersionNo(ref),
+      baseDraftRevision: draft[0]?.revision ?? -1,
+    };
+  }
+
+  /**
+   * Whether `point`, an autosave row, is from an older version of its
+   * document, and whose; `undefined` while the document is as it was when the
+   * point began. See {@link AutosaveSupersession}.
+   */
+  async autosaveSupersession(
+    point: VersionRow
+  ): Promise<AutosaveSupersession | undefined> {
+    if (point.baseVersionNo == null || point.baseDraftRevision == null) {
+      return "unknown";
+    }
+    const ref: VersionRef = {
+      scopeKind: point.scopeKind,
+      scopeSlug: point.scopeSlug,
+      entryId: point.entryId,
+    };
+    const now = await this.documentBase(ref, point.locale);
+    const versionsMoved = now.baseVersionNo !== point.baseVersionNo;
+    const draftMoved = now.baseDraftRevision !== point.baseDraftRevision;
+    if (!versionsMoved && !draftMoved) return undefined;
+    // A working-draft change is no one's in particular here: when in doubt,
+    // offer the point.
+    if (draftMoved) return "by-another";
+    const written = now.baseVersionNo - point.baseVersionNo;
+    // Too many to read on an open, or a sequence gone backwards: someone else.
+    if (written <= 0 || written > LATER_VERSIONS_READ) return "by-another";
+    const later = await this.db.select<{ createdBy: string | null }>(TABLE, {
+      columns: ["createdBy"],
+      where: {
+        and: [
+          ...this.docWhere(ref),
+          { column: "isAutosave", op: "=", value: false },
+          // Every version after the base; the query has no `>`.
+          { column: "versionNo", op: ">=", value: point.baseVersionNo + 1 },
+        ],
+      },
+      limit: written,
+    });
+    const author = point.createdBy;
+    // Every one of them must still be here: retention prunes versions, and a
+    // pruned one could be anyone's, so a gap counts as someone else's.
+    return author !== null &&
+      later.length === written &&
+      later.every(row => row.createdBy === author)
+      ? "by-you"
+      : "by-another";
+  }
+
+  /**
+   * One author's current recovery point for a document, or null when they have
+   * none.
+   *
+   * Newest first rather than arbitrary: on MySQL and SQLite the insert race
+   * above can leave two rows for one author, and the later snapshot is the one
+   * that describes their work. Ordering makes that harmless instead of a
+   * coin toss.
+   */
+  async findAutosave(
+    ref: VersionRef,
+    createdBy: string | null
+  ): Promise<VersionRow | undefined> {
+    const rows = await this.db.select<VersionRow>(TABLE, {
+      where: this.autosaveWhere(ref, createdBy),
+      // `id` breaks the tie, and it is not decoration. SQLite stores
+      // `updatedAt` as integer epoch SECONDS, so two rows written in the same
+      // second compare equal and `LIMIT 1` would return either -- which on the
+      // dialects with no autosave uniqueness constraint is exactly when two
+      // rows can exist. A deterministic order makes the read repeatable even
+      // where the write race is not yet closed.
+      orderBy: [
+        { column: "updatedAt", direction: "desc" },
+        { column: "id", direction: "desc" },
+      ],
+      limit: 1,
+    });
+    return rows[0];
+  }
+
+  /**
+   * Delete the given version rows. No-op for an empty list.
+   *
+   * Deletes in chunks because each id binds one query parameter and SQLite caps
+   * a statement at 999 (the lowest limit across supported dialects). A document
+   * can legitimately present far more stale rows than that on the first save
+   * after the retention cap starts being enforced, and an over-large statement
+   * would fail the whole write transaction rather than trimming.
+   */
+  /**
+   * Set or clear a durable version's label.
+   *
+   * Scoped by the document as well as the version number, so a caller
+   * authorized for one document cannot rename a version of another by number
+   * alone. Autosave rows are excluded on the same terms as every other durable
+   * read: they are not addressable in history, so they are not nameable either.
+   */
+  async updateLabel(
+    ref: VersionRef,
+    versionNo: number,
+    label: string | null
+  ): Promise<void> {
+    await this.db.update(
+      TABLE,
+      { label },
+      {
+        and: [
+          ...this.docWhere(ref),
+          { column: "isAutosave", op: "=", value: false },
+          { column: "versionNo", op: "=", value: versionNo },
+        ],
+      }
+    );
+  }
+
+  /**
+   * Delete the versions a retention pass selected, except any that has been
+   * named since the pass read it.
+   *
+   * Naming a version does not take the document's write lock, so a name can be
+   * committed between the pass's read and this delete. Testing the name in the
+   * delete itself, rather than trusting the earlier read, means a version
+   * someone has just chosen to keep is never removed after they were told it
+   * was kept. The other protections are decided by writes to the same
+   * document, which that lock already serializes with the pass.
+   */
+  async deletePrunedVersions(ids: string[]): Promise<number> {
+    if (ids.length === 0) return 0;
+    let deleted = 0;
+    for (let i = 0; i < ids.length; i += DELETE_CHUNK_SIZE) {
+      const chunk = ids.slice(i, i + DELETE_CHUNK_SIZE);
+      deleted += await this.db.delete(TABLE, {
+        and: [
+          { column: "id", op: "IN", value: chunk },
+          // Unnamed exactly as retention judges it: no label, or an empty one.
+          {
+            or: [
+              { column: "label", op: "IS NULL" },
+              { column: "label", op: "=", value: "" },
+            ],
+          },
+        ],
+      });
+    }
+    return deleted;
+  }
+}
+
+/**
+ * A snapshot as the versions table stores it: its JSON text, or a refusal when
+ * it has none. Exported so a caller that must copy a snapshot before storing
+ * it copies exactly what the store would keep, rather than by rules of its own.
+ */
+export function serializeVersionSnapshot(
+  snapshot: unknown,
+  options: {
+    /**
+     * Keep the published version (`_rev`) a recovery point's editor sent: the
+     * version its edits began from, which the point's read compares with the
+     * document's current one. Every other version key is still dropped.
+     */
+    keepStartingVersion?: boolean;
+  } = {}
+): string {
+  try {
+    // A document's version and last changer are the row's, never its
+    // content: a snapshot holding them would hand a changer's id to every
+    // history reader and write a stale counter back on restore. A recovery
+    // point is never restored by the server, and its `_rev` is the version
+    // its editor read, not the row's counter.
+    const kept =
+      options.keepStartingVersion && isRecord(snapshot)
+        ? snapshot[DOCUMENT_VERSION_KEY]
+        : undefined;
+    const serialized = JSON.stringify(
+      isRecord(snapshot)
+        ? {
+            ...withoutDocumentVersionKeys(snapshot),
+            ...(typeof kept === "string"
+              ? { [DOCUMENT_VERSION_KEY]: kept }
+              : {}),
+          }
+        : snapshot
+    );
+    if (typeof serialized !== "string") {
+      throw new TypeError("snapshot did not serialize to a JSON string");
+    }
+    return serialized;
+  } catch (cause) {
+    throw NextlyError.internal({
+      cause: cause instanceof Error ? cause : undefined,
+      logContext: { reason: "version-snapshot-not-serializable" },
+    });
+  }
+}

@@ -1,0 +1,258 @@
+import { appPasswordDigester } from "../../di/password-digester";
+import { auditReason } from "../../domains/audit/audit-reasons";
+import { NextlyError } from "../../errors/nextly-error";
+import type { PasswordDigester, PasswordVerdict } from "../password/digester";
+import { assertAccountUsable } from "../session/account-state";
+
+export interface CredentialVerifyInput {
+  email: string;
+  password: string;
+}
+
+export interface VerifiedUser {
+  id: string;
+  email: string;
+  name: string;
+  image: string | null;
+  emailVerified: Date | null;
+  isActive: boolean;
+  /** True when the account still holds an admin-set password to replace. */
+  mustChangePassword: boolean;
+  /**
+   * When the password just proven was set, read in the same row as its hash.
+   * A session issued for this proof is refused if the account's password has
+   * been set again by the time its refresh row is written.
+   */
+  passwordUpdatedAt: Date | null;
+  /** The account's session epoch, read with the hash the password matched. */
+  sessionEpoch: number;
+}
+
+/**
+ * @experimental The user row a password sign-in reads: the widest shape any
+ * auth handler needs from a lookup by email, so the router's lookup is typed
+ * by it too.
+ */
+export interface CredentialUserRow {
+  id: string;
+  email: string;
+  name: string;
+  image: string | null;
+  /**
+   * NULLABLE, because an account can exist without one: a user created
+   * through an external identity provider is stored with no password at all.
+   * Typed non-null, the passwordless case reaches the comparison unexamined.
+   */
+  passwordHash: string | null;
+  emailVerified: Date | null;
+  isActive: boolean;
+  mustChangePassword: boolean | null;
+  failedLoginAttempts: number;
+  lockedUntil: Date | null;
+  /** When an administrator deactivated the account; null when none has. */
+  deactivatedAt: Date | null;
+  /** When the password was last set; null when it never has been. */
+  passwordUpdatedAt: Date | null;
+  /**
+   * How many times the account's sessions have been ended; null on a row
+   * from before the column existed, which is epoch zero. Required, and read
+   * with the hash: a sign-in is judged against the epoch its proof was made
+   * at, and no later read can stand in for it.
+   */
+  sessionEpoch: number | null;
+}
+
+/**
+ * The session epoch read with the hash the password matched.
+ *
+ * A lookup that did not read the column gives no epoch to judge the proof
+ * against. Zero would refuse every sign-in of an account whose sessions had
+ * ever been ended; a later read could hold the epoch of a reset made in the
+ * same second as the proof, which would pass and sign in the old password's
+ * holder. Neither is safe, so the sign-in is refused, with the log naming
+ * what the lookup must return. The password was checked first, so this says
+ * nothing about the account to whoever typed it.
+ */
+function provenEpoch(user: CredentialUserRow): number {
+  const read: unknown = user.sessionEpoch;
+  if (read === null) return 0;
+  if (typeof read === "number" && Number.isSafeInteger(read) && read >= 0) {
+    return read;
+  }
+  throw NextlyError.internal({
+    logContext: {
+      userId: user.id,
+      reason: "credential-lookup-without-session-epoch",
+      remedy:
+        "findUserByEmail must return the user row's sessionEpoch with its " +
+        "passwordHash",
+    },
+  });
+}
+
+/** What a password sign-in needs from the database, and its limits. */
+export interface CredentialDeps {
+  findUserByEmail: (email: string) => Promise<CredentialUserRow | null>;
+  incrementFailedAttempts: (userId: string) => Promise<void>;
+  lockAccount: (userId: string, lockedUntil: Date) => Promise<void>;
+  resetFailedAttempts: (userId: string) => Promise<void>;
+  maxLoginAttempts: number;
+  lockoutDurationSeconds: number;
+  requireEmailVerification: boolean;
+  /**
+   * The digester the password is checked with. The app's (its
+   * `passwordHasher`, or core's bcrypt) where none is given.
+   */
+  passwordDigester?: PasswordDigester;
+  /**
+   * Store a proven password again with the app's hasher, in place of the
+   * bcrypt value core stored before the hasher was configured. Only where the
+   * stored value is still `from`, so a password set meanwhile stands.
+   */
+  storeRehashedPassword?: (
+    userId: string,
+    from: string,
+    to: string
+  ) => Promise<void>;
+}
+
+/**
+ * Count a wrong password against the account, and lock it once the threshold
+ * trips. Independent of the public response: locking still happens though the
+ * wire shape is identical to a wrong-password reply.
+ */
+async function recordFailedAttempt(
+  user: CredentialUserRow,
+  deps: CredentialDeps
+): Promise<void> {
+  const newAttempts = user.failedLoginAttempts + 1;
+  if (newAttempts >= deps.maxLoginAttempts) {
+    const lockedUntil = new Date(
+      Date.now() + deps.lockoutDurationSeconds * 1000
+    );
+    await deps.lockAccount(user.id, lockedUntil);
+  } else {
+    await deps.incrementFailedAttempts(user.id);
+  }
+}
+
+/**
+ * Store a proven password again with the app's hasher, in place of the bcrypt
+ * value core stored before the app configured it. Not a new password: the
+ * sessions it signed and when it was set stay as they are.
+ */
+async function storeAgainWithAppHasher(
+  userId: string,
+  stored: string,
+  password: string,
+  context: { digester: PasswordDigester; deps: CredentialDeps }
+): Promise<void> {
+  if (!context.deps.storeRehashedPassword) return;
+  await context.deps.storeRehashedPassword(
+    userId,
+    stored,
+    await context.digester.hash(password)
+  );
+}
+
+/**
+ * Verify email + password credentials.
+ *
+ * Behaviour (per spec §13.1):
+ *   - Always runs exactly one comparison of the app's scheme, even when the
+ *     user is missing, so the response time does not depend on whether the
+ *     email is registered.
+ *   - Throws `NextlyError.invalidCredentials()` for every failure leg
+ *     (missing user, wrong password, locked, unverified, inactive). The
+ *     wire response is identical; logContext records the real cause.
+ *   - Returns `VerifiedUser` on success.
+ *
+ * Failed-attempt tracking and account locking happen as side-effects
+ * inside the wrong-password leg, surfaced as a generic invalid-credentials
+ * response.
+ */
+export async function verifyCredentials(
+  input: CredentialVerifyInput,
+  deps: CredentialDeps
+): Promise<VerifiedUser> {
+  const user = await deps.findUserByEmail(input.email);
+
+  // Timing equalisation: always run exactly one comparison of the app's
+  // scheme. Without it the miss path returns immediately and an attacker can
+  // enumerate registered emails via timing.
+  //
+  // The decoy stands in for an account that HAS no password as well as for
+  // one that does not exist. An externally-authenticated account, created
+  // with a null hash, would otherwise answer a password attempt faster than
+  // an unknown address did. That is the enumeration oracle again, and a
+  // sharper one: it does not merely say an address is registered, it says the
+  // address signs in through the identity provider, which is the account whose
+  // password can never be the thing that stops an attacker.
+  //
+  // A stored value that is not a password hash of the app's scheme takes the
+  // decoy's place too (`verify` compares the decoy for it): it can only be a
+  // password stored as given, which must never be a working credential.
+  const digester = deps.passwordDigester ?? appPasswordDigester();
+  const storedHash = user?.passwordHash;
+  let verdict: PasswordVerdict = { ok: false };
+  if (user) verdict = await digester.verify(input.password, storedHash);
+  else await digester.decoy(input.password);
+  const passwordOk = verdict.ok;
+
+  if (!user || !passwordOk) {
+    if (user) await recordFailedAttempt(user, deps);
+    throw NextlyError.invalidCredentials({
+      logContext: {
+        email: input.email,
+        reason: auditReason(!user ? "user-not-found" : "password-mismatch"),
+      },
+    });
+  }
+
+  // Account-state checks happen AFTER the password check so they cannot be
+  // used as an enumeration side-channel either. They throw the same public
+  // error, except an unverified address, which is named now that the password
+  // is proven so the login page can offer to resend the link.
+  //
+  // The decision itself lives in the shared gate, which every session-issuing
+  // path calls, so the password path cannot drift from the rest.
+  assertAccountUsable(
+    {
+      userId: user.id,
+      isActive: user.isActive,
+      lockedUntil: user.lockedUntil,
+      emailVerified: user.emailVerified,
+      deactivatedAt: user.deactivatedAt,
+      passwordUpdatedAt: user.passwordUpdatedAt,
+    },
+    {
+      requireEmailVerification: deps.requireEmailVerification,
+      // This IS the password strategy, so the attempt lockout applies.
+      enforcePasswordLockout: true,
+      passwordProven: true,
+    }
+  );
+
+  if (user.failedLoginAttempts > 0) {
+    await deps.resetFailedAttempts(user.id);
+  }
+
+  if (verdict.ok && verdict.rehash && storedHash) {
+    await storeAgainWithAppHasher(user.id, storedHash, input.password, {
+      digester,
+      deps,
+    });
+  }
+
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    image: user.image,
+    emailVerified: user.emailVerified,
+    isActive: user.isActive,
+    mustChangePassword: user.mustChangePassword ?? false,
+    passwordUpdatedAt: user.passwordUpdatedAt,
+    sessionEpoch: provenEpoch(user),
+  };
+}

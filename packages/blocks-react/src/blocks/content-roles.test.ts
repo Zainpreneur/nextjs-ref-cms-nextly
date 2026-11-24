@@ -1,0 +1,73 @@
+/**
+ * Which props of the core blocks are content.
+ *
+ * Inside a slot locked `contentOnly`, only the props a block declares with
+ * `role: "content"` can change. A core block that declared none would be
+ * frozen whole there, its text and links included, which makes the lock
+ * useless with the library it ships beside. Content is what a block SAYS:
+ * text, media, links, and the accessible text that goes with them. What it
+ * looks like or how it is configured is not.
+ */
+import { describe, expect, it } from "vitest";
+
+import { coreBlocks } from "./index";
+
+/** The content props of each core block that has any. */
+const CONTENT: Record<string, readonly string[]> = {
+  "core/heading": ["text", "href", "entryCollection", "entryId"],
+  // A whole-block link is content: where the block leads is what an editor
+  // changes, as on Heading and Button.
+  "core/box": ["link", "entryCollection", "entryId"],
+  "core/card": ["link", "entryCollection", "entryId"],
+  "core/text": ["text"],
+  "core/rich-text": ["content"],
+  "core/table-of-contents": ["title"],
+  "core/image": [
+    "mediaId",
+    "src",
+    "alt",
+    "caption",
+    "href",
+    "entryCollection",
+    "entryId",
+    // Whether a click follows the link: chosen where the link is.
+    "whenClicked",
+  ],
+  "core/button": ["label", "href", "entryCollection", "entryId", "ariaLabel"],
+  "core/icon": ["icon", "label", "href", "entryCollection", "entryId"],
+  "core/quote": [
+    "text",
+    "attribution",
+    "source",
+    "href",
+    "entryCollection",
+    "entryId",
+  ],
+  "core/list": ["items"],
+  "core/embed": ["poster", "src", "title"],
+  "core/accordion-item": ["title"],
+  "core/form": ["entryCollection", "entryId", "href", "message", "submitText"],
+};
+
+function contentPropsOf(block: (typeof coreBlocks)[number]): string[] {
+  const props = (block as { props?: Record<string, { role?: unknown }> }).props;
+  return Object.entries(props ?? {})
+    .filter(([, schema]) => schema?.role === "content")
+    .map(([name]) => name)
+    .sort();
+}
+
+describe("the core blocks' content", () => {
+  it.each(Object.entries(CONTENT))("%s declares its content", (name, props) => {
+    const block = coreBlocks.find(entry => entry.name === name);
+    expect(block, name).toBeDefined();
+    expect(contentPropsOf(block!)).toEqual([...props].sort());
+  });
+
+  it("declares no content on a block that only arranges or configures", () => {
+    for (const block of coreBlocks) {
+      if (block.name in CONTENT) continue;
+      expect(contentPropsOf(block), block.name).toEqual([]);
+    }
+  });
+});

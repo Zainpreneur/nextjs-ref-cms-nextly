@@ -1,0 +1,199 @@
+---
+title: Visual Schema Builder
+description: Design Collections, Singles, and Field Groups visually with drag-and-drop instead of writing code.
+---
+
+The **Visual Schema Builder** is Nextly's drag-and-drop schema designer. It produces the same registered Collections, Singles, and Field Groups that the code-first approach produces. It writes no TypeScript: `nextly generate:types` reads your config only, so entities made here get no generated types. Every entity it saves is also written into the UI-schema manifest (`db.uiSchemaFile`, default `./ui-schema.json`), which you commit — that is what `nextly migrate:create` reads. Every save, of any of the three kinds, also writes its change as a migration in `db.migrationsDir` (see [What a Builder save writes](#what-a-builder-save-writes)). See [Persistence](#persistence) and [Builder entities and production](/docs/guides/production-migrations#builder-entities-and-production). You can switch between the Visual Schema Builder and code-first definitions at any time — they are interchangeable per entity.
+
+The Schema Builder has three variants that share the same canvas, palette, and field editor:
+
+| Variant              | Route                         | Output                                                                                                                                                                                                                                                                                                       |
+| -------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Collections Builder  | `/admin/builder/collections`  | Persists the schema row, writes the entity into the UI-schema manifest (`db.uiSchemaFile`), and writes a Drizzle migration under `db.migrationsDir` (default `./src/db/migrations/`). No TypeScript schema file is written: the runtime builds its Drizzle table from the `dynamic_collections` row instead. |
+| Singles Builder      | `/admin/builder/singles`      | Persists the schema in the `dynamic_singles` database table, writes the entity into the UI-schema manifest (`db.uiSchemaFile`), and writes a migration under `db.migrationsDir`.                                                                                                                             |
+| Field Groups Builder | `/admin/builder/field-groups` | Persists the field group definition in the database, writes the entity into the UI-schema manifest (`db.uiSchemaFile`), and writes a migration under `db.migrationsDir`.                                                                                                                                     |
+
+Create a new entity from any of the three list pages above. Edit an existing entity by appending its slug, e.g. `/admin/builder/collections/posts`.
+
+## Layout
+
+Each Schema Builder uses a two-column layout:
+
+- **Canvas** (main area) — a sortable list of the fields in your schema. Each row shows an icon, the field name, the type badge, and a "Required" indicator. Drag the grip handle to reorder. Click a row to edit it. Container types (Repeater, Group) display their child fields inline with indentation and dedicated drop zones.
+- **Right panel.** The field palette and the field editor. Use the toolbar at the top of the canvas to open the Settings dialog (entity-level config like description, sidebar icon, admin group) or to preview/save changes.
+
+### Field palette
+
+The field palette groups field types into five categories, in this order:
+
+| Category   | Field types in the picker                                          |
+| ---------- | ------------------------------------------------------------------ |
+| Basic      | Text, Long text, Editor (rich text), Email, Password, Number, Icon |
+| Advanced   | Code, Date, Select, Radio, Checkbox, Toggle, JSON, Tags (chips)    |
+| Media      | Media (upload)                                                     |
+| Relational | Relationship                                                       |
+| Structured | Repeater, Group, Component                                         |
+
+This is the picker grouping inside the admin UI. The reference docs in [Fields](/docs/configuration/fields) group fields slightly differently (Basic / Selection / Media / Relationship / Layout / Component / Advanced) so the prose can talk about families that don't all map to a single picker tab.
+
+### Field editor
+
+Click a field on the canvas to slide the field editor over the palette. The editor has four tabs:
+
+| Tab            | What you configure                                                                                                                                                                                                                      |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **General**    | Name (auto-derived slug), label, description, default value, and the field's type-specific options (e.g. Select options, Relationship target, Upload MIME pattern).                                                                     |
+| **Validation** | `required`, plus type-specific rules: `minLength` / `maxLength`, `min` / `max`, `minRows` / `maxRows`, `minChips` / `maxChips`, regex `pattern`, custom `message`.                                                                      |
+| **Display**    | Layout `width` (25% / 33% / 50% / 66% / 75% / 100%), `position` (Main content or Sidebar), `readOnly`, `hidden`, conditional visibility (a per-field condition keyed off another field's value), description, placeholder.              |
+| **Advanced**   | `unique` constraint, database `index`, and the `localized` flag, which keeps a value per language on a localized collection, Single or field group (see [Choose what gets translated](/docs/localization#choose-what-gets-translated)). |
+
+Conditional visibility supports type-aware operators (`equals`, `notEquals`, `contains`, `startsWith`, `endsWith`, `isEmpty`, `isNotEmpty`, numeric comparisons, `between`, date `before` / `after`, and boolean `isTrue` / `isNotTrue`).
+
+### Settings dialog
+
+The toolbar's Settings button opens a Basics / Advanced modal that edits entity-level metadata: name, slug, description, sidebar icon, admin group (Collections) or category (Components), sort order, and an `i18n` flag. Hooks written as functions belong to collections defined in code, in the `hooks` object on `defineCollection()`, with an array of functions per phase, such as `hooks: { beforeChange: [...] }`: a function cannot be stored with a collection made here. A collection made here can carry Nextly's pre-built hooks (auto-slug, audit fields and unique validation) as stored settings, and they run on every write, but the Visual Schema Builder has no editor for them today.
+
+## Field types
+
+The palette ships every field type Nextly supports through code-first definitions. The label in the picker can differ from the canonical type name (the picker shows "Long text" for `textarea`, "Editor" for `richText`, "Media" for `upload`, "Tags" for `chips`).
+
+For the full per-type option reference, see [Fields](/docs/configuration/fields).
+
+### Relationships and foreign keys
+
+A one-to-one or many-to-one Relationship field stores the target's id in a
+column of its own, and that column carries a foreign key to the target
+collection, with the field's on-delete and on-update actions. The key is
+created with the collection, or by the save that adds the field to an
+existing one, on PostgreSQL, MySQL and SQLite alike. A one-to-one field
+created with its collection also makes its column unique, so two entries
+cannot point at the same target, and the column stays unique through every
+later save; one added to an existing collection is not made unique yet.
+
+On SQLite, where a key can only be created by rebuilding the table, a save
+that adds a relationship or changes a field's type rebuilds the table with
+every key it holds, and the rows of other collections that point at it are
+kept: no delete action runs during the rebuild.
+
+A rebuild cannot keep a trigger your app or a plugin migration put on the
+table, so on SQLite a save that would rebuild a table with triggers on it is
+refused, naming the table. Make that change with a migration that recreates
+the table with its triggers (`nextly migrate:create --blank`).
+
+A relationship field added to an existing collection before Nextly created
+keys this way has none, and a later save does not add one, so a database that
+already holds rows pointing at missing entries is never asked to accept a key
+those rows would break.
+
+The key points at the table the target collection is stored in, and a
+relationship to Users points at the users table. A relationship to a Single, or
+to several collections at once, gets no key, and neither does one that holds
+several entries: there is no single row for a key to check.
+
+What the key does when an entry it points at is deleted:
+
+- **A required relationship refuses the delete.** The entry stays, and the
+  message says what still points at it, for example: _This entry is still used
+  by 12 Posts in "Author". Change or delete those first._ A bulk delete deletes
+  the other entries and reports each one it could not delete.
+- **An optional relationship is emptied** in the database, and the delete goes
+  through. The referring entries' hooks, versions and webhooks do not run for
+  that change.
+
+Deleting a user works the same way. A required relationship to Users refuses
+the deletion before anything of the account is removed (its roles, its media
+ownership, its email records), with a message such as _This user is still used
+by 12 Posts in "Author". Change or delete those first._ An optional one is
+emptied, and the account is deleted.
+
+Pointing a relationship whose column holds a key at another collection moves
+the key there, once every value it holds is checked against the new collection.
+If some entries hold a value the new collection doesn't have, the save is
+refused before anything changes, naming the field and how many entries are in
+the way, and the old key stays: change or clear those entries first. A target
+with no table to check against (a Single, for example) is refused the same way.
+The new key is added before the old one is dropped, so the field is never left
+unchecked, even on MySQL. Switching the relationship to hold several entries
+works as for any relationship: each value becomes a one-item list, and the key
+goes with the conversion.
+
+### Container fields and nesting
+
+Repeater, Group, and Component fields can themselves contain fields, to any depth. Each level renders with a progressively darker background to make the hierarchy visible. A field group cannot be placed inside itself, directly or through other field groups: a save that would do so is refused, naming the field groups in the cycle (see [Field group nesting](/docs/configuration/field-groups#field-group-nesting)).
+
+A Component field embeds a reusable field group definition (created via the Field Groups Builder or `defineFieldGroup()`). It can target a single field group or a list of allowed field groups, and can be marked repeatable to act as an inline content zone.
+
+## Walkthrough: create a Blog Posts collection
+
+1. Open `/admin/builder/collections` and click **New Collection**.
+2. Fill in the singular and plural names (e.g. "Post" and "Posts"). The slug is generated from the singular name (`post`); you can override it.
+3. Pick a sidebar icon (Lucide icon name) and an optional admin group, then click **Continue** to enter the canvas.
+4. Drag a **Long text** (`textarea`) field from the palette and rename it `excerpt` in the editor.
+5. Drag an **Editor** (`richText`) field and name it `content`.
+6. Drag a **Media** (`upload`) field and name it `featuredImage`. On the General tab, restrict the MIME pattern to `image/*`.
+7. Open the **Advanced** tab and toggle **Status (Draft / Published)** on. This wires Nextly's built-in lifecycle — the runtime injects a `status` system column and the entry editor surfaces Save Draft / Publish buttons. Don't drag a `Select` field for this: declaring a user-defined `status` field would conflict with the system column. (See [Draft / Published status guide](/docs/guides/draft-published-status).)
+8. Drag a **Relationship** field and name it `author`. Set the target collection to `users`.
+9. Reorder the fields by dragging the grip handles.
+10. Click **Save**. For Collections, the toolbar previews the schema diff before applying it; for Singles and Components the change applies immediately.
+
+After save, the new collection appears in the admin sidebar under Collections. The Drizzle migration is written to your `db.migrationsDir`.
+
+Commit the migrations with the snapshots the Builder writes beside them (`meta/<name>.snapshot.json`), as `nextly migrate:create` does.
+
+## Persistence
+
+| Entity     | Where it is stored                                                                               | What gets generated                                                                                                                                                                          |
+| ---------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Collection | `dynamic_collections` table + a migration file on disk                                           | A Drizzle migration in `db.migrationsDir`. No TypeScript schema file: the runtime builds the Drizzle table from the `dynamic_collections` row, so a generated file would only drift from it. |
+| Single     | `dynamic_singles` table + the UI-schema manifest (`db.uiSchemaFile`, default `./ui-schema.json`) | A migration in `db.migrationsDir`. The schema is regenerated from the database row on each request; the manifest entry is what `migrate:create` reads.                                       |
+| Component  | Database row + the UI-schema manifest (`db.uiSchemaFile`, default `./ui-schema.json`)            | A migration in `db.migrationsDir`. Stored alongside dynamic singles; the manifest entry is what `migrate:create` reads.                                                                      |
+
+When you edit and re-save a collection in a way that changes its **data table**, Nextly emits an additive migration (or, when destructive, prompts for confirmation in the toolbar).
+
+**Status and Internationalization are schema changes, not settings.** Turning Status on or off adds or drops the lifecycle's system columns, and turning Internationalization on or off moves translatable columns between the table and its `_locales` companion. Both produce a migration; treat them like any other column change.
+
+An edit that changes only **registry metadata** — a description, or a switch such as Versions — changes no column, and the save writes a settings-only migration for it, which carries the entity's registry row to every database that applies it. A cleared description travels the same way. See [What a Builder save writes](#what-a-builder-save-writes) and [Builder entities and production](/docs/guides/production-migrations#builder-entities-and-production).
+
+### What a Builder save writes
+
+Every save of a Collection, a Single or a Field Group writes its change as migration files in `db.migrationsDir`. In development the save applies them and records them as applied. Each save's main file carries the entity's registry row, so `nextly migrate` gives another database the same table and the same row.
+
+| Save                                                         | Files written                                                                                                                                                                                                                                                                             |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Create                                                       | `<timestamp>_<slug>_create.sql`, and for a translated entity `<timestamp>_create_localization_<slug>.sql` beside it                                                                                                                                                                       |
+| A field change (add, remove, rename, type, required, unique) | `<timestamp>_<slug>_update.sql`, and where the change reaches the translations table, a file for it beside it (`enable_localization_<slug>`, `joins_localization_<slug>` or `adds_localization_<slug>`)                                                                                   |
+| Settings only (a description, or a switch such as Versions)  | One `<timestamp>_<slug>_update.sql` that changes no table: its header names the setting (`-- Settings: posts: description`), and it writes the registry row                                                                                                                               |
+| Delete                                                       | `<timestamp>_<slug>_delete.sql`, which drops its tables; the run that applies it then removes its registry row and the rows other tables hold for it (see [Deleting a collection, Single or field group](/docs/guides/production-migrations#deleting-a-collection-single-or-field-group)) |
+
+Applied migrations are not re-run: `nextly migrate` records a `file_apply` event for every file it applies in the `nextly_schema_events` ledger and skips what is already recorded there. That ledger belongs to the migration runner, not to the Builder's file writer.
+
+## Permissions and visibility
+
+The Visual Schema Builder is reached through the Builders top-level icon.
+
+- In development and test it is on, unless `admin.branding.showBuilder` is `false` in `nextly.config.ts`.
+- In production it is off, whatever `showBuilder` says. Its pages, and every schema save, preview, repair and delete, are refused with `BUILDER_DISABLED`. Make the change in development and deploy it as a migration (see [Production migrations](/docs/guides/production-migrations)). Entry editing is unaffected.
+
+See [Branding > Schema Builder visibility](/docs/admin/branding#schema-builder-visibility) for the full reference.
+
+## Builder vs code-first
+
+Both approaches produce the same registered entities. Pick by workflow:
+
+| Aspect             | Visual Schema Builder                                       | Code-first                               |
+| ------------------ | ----------------------------------------------------------- | ---------------------------------------- |
+| Speed to prototype | Drag-and-drop                                               | Write config, run `nextly db:sync`       |
+| Source of truth    | The registry row, and the migrations each save writes       | Hand-written TypeScript file             |
+| Lifecycle hooks    | Pre-built hooks only, stored with the collection; no editor | Any hook function, in the `hooks` object |
+| Team workflow      | Editors and non-developers can iterate                      | Developers own the schema                |
+
+You can mix both — define core collections in code and let editors prototype new ones in the Schema Builder, or vice versa.
+
+## Next steps
+
+- [Admin Panel Overview](/docs/admin) — full navigation guide
+- [Branding](/docs/admin/branding) — turn the Builder off outside production with `showBuilder`
+- [Collections](/docs/configuration/collections) — code-first collection definitions
+- [Singles](/docs/configuration/singles) — code-first Single definitions
+- [Field Groups](/docs/configuration/field-groups) — reusable field groups
+- [Fields](/docs/configuration/fields) — per-type option reference and validation

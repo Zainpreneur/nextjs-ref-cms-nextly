@@ -1,0 +1,83 @@
+import type { FieldConfig } from "nextly/config";
+import type React from "react";
+
+// fallow-ignore-next-line circular-dependency
+import { FieldRenderer } from "@admin/components/features/entries/fields/FieldRenderer";
+import {
+  fieldWeight,
+  computeGridColumns,
+} from "@admin/lib/forms/pack-fields-into-rows";
+
+export { fieldWeight };
+
+export interface FieldRowProps {
+  /** Fields packed onto this row by `packFieldsIntoRows()`. */
+  fields: FieldConfig[];
+  /** Whether all fields should be disabled */
+  disabled?: boolean;
+  /** Whether all fields should be read-only */
+  readOnly?: boolean;
+  /** Base path for nested fields (e.g. from group parent) */
+  basePath?: string;
+  /** Form mode; write-only fields (password) adjust their affordances */
+  mode?: "create" | "edit";
+}
+
+/**
+ * Renders one row of width-packed fields. Uses CSS grid with proportional
+ * tracks (e.g. two 50% fields → `grid-template-columns: 50fr 50fr`, three
+ * 33% fields → `33fr 33fr 33fr`, mixed 50%+30% → `50fr 30fr`). Gap-aware
+ * via `gap-6`; tracks shrink to accommodate the gap, so widths and gap
+ * compose without overflow.
+ *
+ * The descendant selector `[&>*]:!w-full` forces each grid item's child
+ * (FieldWrapper) to span its track. FieldWrapper's `w-1/2` etc. classes
+ * are correct for the legacy single-column path but would otherwise
+ * shrink the field to half its track inside this grid.
+ *
+ * The sibling `[&>*]:min-w-0` zeroes each item's automatic minimum: a bare
+ * `Nfr` track is `minmax(auto, Nfr)`, and that `auto` honors an item's
+ * min-content — which a Code field can make as wide as its longest
+ * unwrapped line (CodeMirror draws its document with `white-space: pre`),
+ * growing the track past the form panel and painting the code outside the
+ * field's border. With the minimum zeroed, the track keeps its proportional
+ * width and the long line scrolls inside CodeMirror's own scroller.
+ *
+ * A row whose fields all draw nothing, hidden (`admin.hidden`) or with a
+ * condition that does not hold, is left empty, and `empty:hidden` takes it
+ * out of the layout: the form's `space-y-6` would otherwise give it a gap of
+ * its own, so a run of such rows at the top of a form opened a blank band
+ * above its first field.
+ */
+export function FieldRow({
+  fields,
+  disabled,
+  readOnly,
+  basePath,
+  mode,
+}: FieldRowProps): React.ReactElement {
+  const cols = computeGridColumns(fields.map(fieldWeight));
+
+  return (
+    <div
+      className="grid gap-6 items-start [&>*]:!w-full [&>*]:min-w-0 empty:hidden"
+      style={{ gridTemplateColumns: cols }}
+    >
+      {fields.map((field, i) => (
+        <FieldRenderer
+          key={getFieldKey(field, i)}
+          field={field}
+          basePath={basePath}
+          disabled={disabled}
+          readOnly={readOnly}
+          mode={mode}
+        />
+      ))}
+    </div>
+  );
+}
+
+function getFieldKey(field: FieldConfig, index: number): string {
+  if ("name" in field && field.name) return field.name;
+  return `${field.type}-${index}`;
+}

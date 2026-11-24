@@ -1,0 +1,496 @@
+/**
+ * Erasing a plugin-defined person from the audit trail when their plugin
+ * reports them deleted, while keeping the rows.
+ *
+ * The model is a staff user's deletion (`erase-actor-personal-data`): the
+ * address and the client on every row the person acted on, and the plugin
+ * metadata on every plugin row naming them as actor or subject, are cleared,
+ * and the row stays as the record of what happened. Two things differ. A
+ * plugin's id for a person may itself be an address, so the id on those rows
+ * is replaced by the keyed digest of kind and id; and the person is recorded
+ * as deleted, by that digest, so every audit row written for them afterwards
+ * is written already erased (see `principal-digest`).
+ *
+ * All of it happens in one transaction: the plugin's own when it passes one,
+ * so the deletion and the erasure commit together, and otherwise one of its
+ * own. Never as lone statements: on SQLite a lone statement made while another
+ * request's transaction is open runs inside it, and that request's rollback
+ * would undo the erasure. A report made inside an open transaction without
+ * passing it is refused rather than left to join it or to race it.
+ *
+ * @module domains/audit/erase-principal
+ */
+import type {
+  SupportedDialect,
+  TransactionContext,
+} from "@nextlyhq/adapter-drizzle/types";
+import {
+  and,
+  eq,
+  isNotNull,
+  isNull,
+  or,
+  type Column,
+  type Table,
+} from "drizzle-orm";
+
+import { getDialectTables } from "../../database/index";
+import { NextlyError } from "../../errors/nextly-error";
+import { getNextlyLogger } from "../../observability/logger";
+import { linkedTransaction } from "../../plugins/database/plugin-transaction-link";
+import { staffPerson } from "../../plugins/principals/ref";
+import {
+  CONTENT_EVENTS_TABLE,
+  contentEventsTables,
+} from "../../schemas/content-events";
+import {
+  assertNoOpenTransaction,
+  type OpenTransactionProbe,
+} from "../../shared/lib/open-transaction";
+import type { RowLockServer } from "../../shared/lib/row-lock";
+import { runAdapterTransaction } from "../../shared/lib/run-adapter-transaction";
+import { deliveriesTableFor } from "../email/deliveries-table";
+import {
+  erasePrincipalDeliveries,
+  type PersonDeliveriesTable,
+} from "../email/erase-recipient";
+
+import { adapterDialect, rowLockServer } from "./audit-log-writer";
+import { pluginAuditKinds } from "./core-dotted-kinds";
+import {
+  markHoldsDeletionLock,
+  PRINCIPAL_DIGEST_KEY_META_KEY,
+  principalDigestKeyIsCurrent,
+  readPrincipalDigests,
+  resealPrincipalDigestKey,
+  type DigestSubject,
+  type PrincipalDigestDb,
+  type PrincipalDigests,
+  type PrincipalDigestTables,
+} from "./principal-digest";
+
+/** What a refusal or a log names the report as. */
+const OPERATION = "ctx.principals.reportDeleted";
+
+/** The audit-log columns a person's erasure reads and writes. */
+export interface PrincipalAuditLog extends Table {
+  kind: Column;
+  metadata: Column;
+  ipAddress: Column;
+  userAgent: Column;
+  identityErasedAt: Column;
+  actorPrincipalKind: Column;
+  actorPrincipalId: Column;
+  targetPrincipalKind: Column;
+  targetPrincipalId: Column;
+}
+
+/** The Drizzle surface the report needs: the digest's reads and the updates. */
+export interface PrincipalErasureDb extends PrincipalDigestDb {
+  update(table: unknown): {
+    set(data: unknown): { where(condition: unknown): Promise<unknown> };
+  };
+  /** For the digests of a queued email's recipients (`queued-erasure`). */
+  delete(table: unknown): { where(condition: unknown): Promise<unknown> };
+}
+
+/** The adapter surface a report runs through. */
+export interface PrincipalErasureAdapter extends OpenTransactionProbe {
+  transaction<T>(work: (tx: TransactionContext) => Promise<T>): Promise<T>;
+  /** Whether a table exists, for one a database may not have yet. */
+  tableExists?(table: string): Promise<boolean>;
+  /**
+   * The same lookup on a transaction's own connection, for a report made in
+   * one: asked through the pool instead, it waits, on a pool of one, for the
+   * connection that transaction holds.
+   */
+  tableExistsThrough?(tx: TransactionContext, table: string): Promise<boolean>;
+}
+
+/**
+ * Report a person deleted: record their digest and erase them from the audit
+ * trail, in `tx` when one is passed and in a transaction of the report's own
+ * otherwise.
+ *
+ * @param subject - The person, by full kind and id; checked by the caller.
+ * @param options.tx - The handle a plugin's `ctx.db.transaction` callback
+ *   received, to commit the report with the plugin's own work.
+ * @param options.adapter - The database adapter.
+ * @param options.secrets - The install's secrets, current first.
+ * @throws {NextlyError} `VALIDATION_ERROR` for a `tx` that is not such a
+ *   handle; `INTERNAL_ERROR` for a report made inside an open transaction
+ *   without passing it, or when the digest key cannot be read.
+ */
+export async function reportPrincipalDeleted(
+  subject: DigestSubject,
+  options: {
+    tx?: unknown;
+    adapter: PrincipalErasureAdapter;
+    secrets: readonly string[];
+  }
+): Promise<void> {
+  const { adapter, secrets } = options;
+  const dialect = adapterDialect(adapter);
+  if (!dialect) {
+    throw new NextlyError({
+      code: "INTERNAL_ERROR",
+      publicMessage: "An unexpected error occurred.",
+      logMessage: `${OPERATION} could not tell which database the adapter talks to.`,
+      logContext: { operation: OPERATION },
+    });
+  }
+  const server = rowLockServer(adapter, dialect);
+  // The record of content events is erased only where it exists: a database
+  // that has not run `nextly migrate` since it arrived lacks it, and an update
+  // against a missing table would fail the whole report.
+  const tablesBy = async (exists?: (table: string) => Promise<boolean>) =>
+    principalErasureTables(
+      dialect,
+      exists === undefined ? true : await exists(CONTENT_EVENTS_TABLE)
+    );
+  const eraseIn = (tx: TransactionContext, tables: ErasureTables) =>
+    erasePrincipal(
+      tx.getDrizzle<PrincipalErasureDb>(),
+      server,
+      tables,
+      subject,
+      secrets
+    );
+
+  if (options.tx !== undefined) {
+    // Refused before anything is marked: a handle that is not a plugin
+    // transaction's names no transaction to hold the lock.
+    const link = linkedTransaction(options.tx, OPERATION);
+    // Marked, and the report's work started on the transaction, before this
+    // awaits anything, the table probe included. A delivery record the plugin
+    // started alongside the report then finds the lock held and waits for the
+    // report's statements (`runContained`). Marked any later, a record arriving
+    // meanwhile wrote beside the report on the same connection, and its failed
+    // insert aborted the transaction under the report's next statement.
+    markHoldsDeletionLock(options.tx as object);
+    await link.run(async tx => {
+      // Asked on the transaction's connection, which it holds by now.
+      const through = adapter.tableExistsThrough?.bind(adapter);
+      const exists = through
+        ? (table: string) => through(tx, table)
+        : adapter.tableExists?.bind(adapter);
+      return eraseIn(tx, await tablesBy(exists));
+    });
+    return;
+  }
+  // A precondition: refused before the report's own transaction is opened.
+  assertNoOpenTransaction(adapter, OPERATION);
+  // Probed before the transaction opens, so the probe never waits for a
+  // connection the transaction holds.
+  const tables = await tablesBy(adapter.tableExists?.bind(adapter));
+  await runAdapterTransaction(adapter.transaction.bind(adapter), tx =>
+    eraseIn(tx, tables)
+  );
+}
+
+/** A staff user's deletion, once it holds the deleted-people lock. */
+export interface StaffUserDeletion {
+  /**
+   * Put the user on the deleted-people list and erase every delivery record
+   * that names them, whatever address it went to. `userId` is the id as
+   * stored, so the digest is the one every record of theirs is checked
+   * against.
+   */
+  complete(userId: string): Promise<void>;
+}
+
+/**
+ * Inside a staff user's deletion transaction, take the deleted-people lock
+ * exclusively, as a plugin-defined person's deletion report takes it, and hand
+ * back the step that records the user and erases their delivery records.
+ *
+ * Taken first, before the deletion locks the user's row or writes to the
+ * delivery log. A write naming a person holds this lock shared and may then
+ * need the user's row (an audit row naming them as its actor) or a gap in the
+ * delivery log's index (MySQL's insert), so taking it after either would
+ * deadlock against such a write. Holding it, the deletion orders every such
+ * write: one already holding it finishes first and is erased by the step, and
+ * one arriving later waits for the commit and is written erased.
+ *
+ * The list keeps only the keyed digest of kind and id and when, with no
+ * expiry, under the key that survives a rotation of the install's secret.
+ * Audit rows are not touched: a staff user's deletion erases those through the
+ * audit trail's own staff erasure.
+ */
+export async function beginStaffUserDeletion(
+  db: PrincipalErasureDb,
+  adapter: unknown,
+  secrets: readonly string[]
+): Promise<StaffUserDeletion> {
+  const dialect = adapterDialect(adapter);
+  if (!dialect) {
+    throw new NextlyError({
+      code: "INTERNAL_ERROR",
+      publicMessage: "An unexpected error occurred.",
+      logMessage:
+        "A staff user's deletion could not tell which database the adapter talks to.",
+      logContext: { operation: "deleteUser" },
+    });
+  }
+  const tables = principalErasureTables(dialect, false);
+  const digests = await readPrincipalDigests(
+    db,
+    rowLockServer(adapter, dialect),
+    tables,
+    "exclusive",
+    secrets
+  );
+  return {
+    complete: async userId => {
+      await recordDeletedPerson(
+        db,
+        tables,
+        digests,
+        staffPerson(userId),
+        new Date()
+      );
+    },
+  };
+}
+
+/**
+ * At boot, seal the stored digest key again under the current secret when it
+ * is sealed under a retired one (see `resealPrincipalDigestKey`), in a
+ * transaction of its own.
+ *
+ * A key no configured secret opens is logged, never thrown: the app starts,
+ * and only audit writes naming a person and deletion reports fail, each one
+ * logged, until the secret it was sealed under is configured again.
+ */
+export async function resealPrincipalDigestKeyAtBoot(
+  adapter: PrincipalErasureAdapter,
+  secrets: readonly string[],
+  /**
+   * The stored key as the start's one read of the meta rows found it, keyed by meta key. Given,
+   * a key that is absent or already sealed under the current secret is judged from it, and the
+   * locked transaction below runs only for one that needs resealing.
+   */
+  storedValues?: () => Promise<Record<string, unknown>>
+): Promise<void> {
+  const dialect = adapterDialect(adapter);
+  if (!dialect) return;
+  const server = rowLockServer(adapter, dialect);
+  const { meta } = principalErasureTables(dialect, false);
+  try {
+    if (
+      storedValues &&
+      principalDigestKeyIsCurrent(
+        (await storedValues())[PRINCIPAL_DIGEST_KEY_META_KEY],
+        secrets
+      )
+    ) {
+      return;
+    }
+    await runAdapterTransaction(adapter.transaction.bind(adapter), tx =>
+      resealPrincipalDigestKey(
+        tx.getDrizzle<PrincipalErasureDb>(),
+        server,
+        meta,
+        secrets
+      )
+    );
+  } catch (error) {
+    // The reason only: nothing about the key or its envelope is logged.
+    getNextlyLogger().error({
+      kind: "principal-digest-key-unreadable",
+      message:
+        "The key that names deleted plugin-defined people cannot be read with the configured secrets. Configure the secret it was last sealed under in NEXTLY_SECRET_PREVIOUS.",
+      reason: NextlyError.is(error)
+        ? (error.logContext?.reason ?? error.code)
+        : "unexpected",
+    });
+  }
+}
+
+/** The tables a person's erasure touches, on this dialect. */
+function principalErasureTables(
+  dialect: SupportedDialect,
+  contentEventsExist: boolean
+): ErasureTables {
+  const schema = getDialectTables(dialect) as unknown as {
+    auditLog: PrincipalAuditLog;
+    nextlyMeta: PrincipalDigestTables["meta"];
+    nextlyDeletedPrincipals: PrincipalDigestTables["deleted"];
+  };
+  return {
+    auditLog: schema.auditLog,
+    deliveries: deliveriesTableFor(dialect),
+    meta: schema.nextlyMeta,
+    deleted: schema.nextlyDeletedPrincipals,
+    ...(contentEventsExist
+      ? { contentEvents: contentEventsTables(dialect).nextlyContentEvents }
+      : {}),
+  };
+}
+
+/** Every table a person's deletion report reads or erases. */
+type ErasureTables = PrincipalDigestTables & {
+  auditLog: PrincipalAuditLog;
+  deliveries: PersonDeliveriesTable;
+  contentEvents?: PrincipalContentEvents;
+};
+
+/** The content-event columns a person's erasure reads and writes. */
+interface PrincipalContentEvents extends Table {
+  actorKind: Column;
+  actorPrincipalKind: Column;
+  actorId: Column;
+  actorName: Column;
+}
+
+/**
+ * Inside the report's transaction: take the deleted-people lock, record the
+ * person, then erase their rows. Recorded before the scan, and under the lock
+ * every audit writer naming a person shares, so a writer is either finished
+ * before the scan starts and its row is erased by it, or waits for this
+ * commit and writes its row already erased.
+ */
+async function erasePrincipal(
+  db: PrincipalErasureDb,
+  server: RowLockServer,
+  tables: ErasureTables,
+  subject: DigestSubject,
+  secrets: readonly string[]
+): Promise<void> {
+  const digests = await readPrincipalDigests(
+    db,
+    server,
+    tables,
+    "exclusive",
+    secrets
+  );
+  const erasedAt = new Date();
+  // The same transaction erases the email they were sent, so the report
+  // leaves no record naming them either way or neither.
+  const digest = await recordDeletedPerson(
+    db,
+    tables,
+    digests,
+    subject,
+    erasedAt
+  );
+  await erasePrincipalAuditRows(db, tables.auditLog, subject, digest, erasedAt);
+  if (tables.contentEvents) {
+    await erasePrincipalContentEvents(
+      db,
+      tables.contentEvents,
+      subject,
+      digest
+    );
+  }
+}
+
+/**
+ * What every deletion of a person does under the deleted-people lock: record
+ * their digest on the list, unless an earlier deletion already did, and erase
+ * the delivery records that name them. Returns the digest. A plugin-defined
+ * person's report and a staff user's deletion both come through here, so the
+ * two cannot come to disagree about what deleting someone does to the list or
+ * to their email.
+ */
+async function recordDeletedPerson(
+  db: PrincipalErasureDb,
+  tables: PrincipalDigestTables & { deliveries: PersonDeliveriesTable },
+  digests: PrincipalDigests,
+  subject: DigestSubject,
+  deletedAt: Date
+): Promise<string> {
+  const digest = digests.digest(subject);
+  // A second deletion of the same person finds the record and leaves it,
+  // with the time it was first recorded.
+  if (!(await digests.isDeleted(subject))) {
+    await db.insert(tables.deleted).values({ digest, deletedAt });
+  }
+  await erasePrincipalDeliveries(db, tables.deliveries, subject, digest);
+  return digest;
+}
+
+/**
+ * Erase a person's identifiers from the audit trail and name them by
+ * `digest` on every row that named them.
+ *
+ * Keyed on the person's own columns, never on the staff user columns: a staff
+ * user whose id equals the person's keeps every row of theirs. The address and
+ * the client are erased on the rows the person ACTED on only; on a row about
+ * them, those belong to whoever acted, as a staff user's deletion leaves them.
+ */
+export async function erasePrincipalAuditRows(
+  db: PrincipalErasureDb,
+  auditLog: PrincipalAuditLog,
+  subject: DigestSubject,
+  digest: string,
+  erasedAt: Date
+): Promise<void> {
+  const asActor = and(
+    eq(auditLog.actorPrincipalKind, subject.kind),
+    eq(auditLog.actorPrincipalId, subject.id)
+  );
+  const asTarget = and(
+    eq(auditLog.targetPrincipalKind, subject.kind),
+    eq(auditLog.targetPrincipalId, subject.id)
+  );
+
+  await db
+    .update(auditLog)
+    .set({ ipAddress: null, userAgent: null, identityErasedAt: erasedAt })
+    .where(
+      and(
+        asActor,
+        // Rows already erased keep the stamp of the erasure that reached them.
+        or(
+          isNotNull(auditLog.ipAddress),
+          isNotNull(auditLog.userAgent),
+          isNull(auditLog.identityErasedAt)
+        )
+      )
+    );
+
+  // A plugin's metadata may name either party; core's own rows carry core's
+  // fixed projection, which names nobody. A plugin's kind always carries its
+  // `<slug>.` prefix, and the few core kinds with a dot are listed, so
+  // `pluginAuditKinds` tells the two apart as the writer does.
+  await db
+    .update(auditLog)
+    .set({ metadata: null })
+    .where(
+      and(
+        pluginAuditKinds(auditLog.kind),
+        or(asActor, asTarget),
+        isNotNull(auditLog.metadata)
+      )
+    );
+
+  // Last, as the two above find the rows by the id these replace.
+  await db.update(auditLog).set({ actorPrincipalId: digest }).where(asActor);
+  await db.update(auditLog).set({ targetPrincipalId: digest }).where(asTarget);
+}
+
+/**
+ * Erase a person from the record of content events: the name they had on
+ * each event they performed goes, and their id is replaced by the keyed
+ * digest the audit trail names them by, so the events still tell one actor
+ * from another and name nobody. A plugin's id for a person may itself be an
+ * address, which is why the id goes too.
+ */
+async function erasePrincipalContentEvents(
+  db: PrincipalErasureDb,
+  contentEvents: PrincipalContentEvents,
+  subject: DigestSubject,
+  digest: string
+): Promise<void> {
+  await db
+    .update(contentEvents)
+    .set({ actorName: null, actorId: digest })
+    .where(
+      and(
+        eq(contentEvents.actorKind, "principal"),
+        eq(contentEvents.actorPrincipalKind, subject.kind),
+        eq(contentEvents.actorId, subject.id)
+      )
+    );
+}

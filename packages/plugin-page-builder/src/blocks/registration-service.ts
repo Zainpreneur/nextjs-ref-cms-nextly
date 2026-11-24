@@ -1,0 +1,446 @@
+/**
+ * The seam another plugin contributes blocks through.
+ *
+ * Core deliberately knows nothing about blocks — it carries no `contributes.blocks`
+ * key and does not depend on the engine — so a plugin adding blocks is adding
+ * them to the page builder, not to Nextly. That makes the page builder's own
+ * service the contribution channel, reached through the cross-plugin namespace
+ * every plugin already has.
+ *
+ * Registering through here is what puts the blocks in this site's registry,
+ * the one the page builder holds and hands to its routes: the engine's own
+ * `registerBlocks` fills only the calling bundle's registry, which no server
+ * route reads. It is also what makes the timing safe. The site's registry is
+ * cleared and rebuilt on every boot, so a write outside this service could
+ * land before the rebuild and lose the blocks with no error. Resolving this service cannot: services are recorded in boot
+ * pass 1 and `init` runs in pass 2, so a contributor calling from `init` is
+ * guaranteed to reach a live registry whatever order the plugins load in.
+ *
+ * **Declared blocks reach the editor; blocks registered here do not.** A
+ * registered block is known to this site on the server: validation stops
+ * calling its type unknown, and the site's routes, which read the same
+ * registry, draw it on the published site. The editor runs in the admin's browser bundle, whose
+ * registry is a separate copy, and it receives only blocks a plugin DECLARED
+ * (`contributes.declarations`) with an `editorEntry` the app's generated
+ * component map imports. A block registered through this service from `init`
+ * has no module anything could name before the plugin runs, so it stays
+ * server-only, and in development the first registration of each such block
+ * says so.
+ *
+ * @module blocks/registration-service
+ */
+
+import type {
+  AnyBlockDefinition,
+  BlockRegistry,
+  BlockRegistryReader,
+  SupportDefinition,
+} from "@nextlyhq/blocks-engine";
+import { offeredSiteBlocks } from "@nextlyhq/blocks-react";
+import { coreBlocks } from "@nextlyhq/blocks-react/blocks";
+import type { PluginContext } from "@nextlyhq/plugin-sdk";
+import { collectDeclarations } from "nextly";
+import { requireNextly } from "nextly/runtime";
+
+import { blocksIn, editorEntryIn, supportsIn } from "./declared-blocks";
+
+/** The page builder's own name, as the cross-plugin namespace keys it. */
+export const PAGE_BUILDER_PLUGIN = "@nextlyhq/plugin-page-builder";
+
+/** The service name this is registered under. */
+export const BLOCK_SERVICE = "blocks";
+
+/**
+ * What a contributing plugin may do with the page builder's block registry.
+ *
+ * Deliberately narrow: contributing is additive. Reading the registry back, or
+ * removing another plugin's blocks, are not offered — a plugin that could
+ * unregister a sibling's block would make a page's contents depend on plugin
+ * order, which is the property the registry exists to prevent.
+ */
+export interface BlockRegistrationService {
+  /**
+   * Add block definitions to the page builder.
+   *
+   * The contributing plugin is recorded against each block, so a name collision
+   * between two plugins names both culprits instead of failing anonymously. It
+   * is taken from the caller's own identity rather than passed in: a plugin that
+   * renamed itself, or copied a neighbour's call, would otherwise file its
+   * blocks under a plugin that did not register them and send whoever hits the
+   * collision to the wrong package.
+   */
+  register(definitions: AnyBlockDefinition | AnyBlockDefinition[]): void;
+
+  /**
+   * Add a custom support — a capability key blocks may declare.
+   *
+   * Offered here rather than left to the engine's own `registerSupport` because
+   * supports share the block registry's per-boot lifecycle. Registered outside
+   * this service they either survive a reset that should have cleared them, and
+   * collide when the next boot re-registers, or are wiped by a reset that runs
+   * between the support and the blocks declaring it.
+   */
+  registerSupport(support: SupportDefinition): void;
+}
+
+/**
+ * The single service instance the page builder contributes, shared by every
+ * contributor.
+ *
+ * It takes the contributing plugin's name explicitly because one instance
+ * serves them all; `blockRegistry` below is what binds each caller's own
+ * identity, so the name can never be supplied by hand at a call site.
+ */
+interface BlockRegistrationBackend {
+  register(
+    definitions: AnyBlockDefinition | AnyBlockDefinition[],
+    source: string
+  ): void;
+  registerSupport(support: SupportDefinition): void;
+}
+
+/**
+ * Build the service the page builder contributes.
+ *
+ * The registry is emptied here, at the moment the first contribution of a boot
+ * is about to be made, rather than earlier. That placement is load-bearing in
+ * both directions:
+ *
+ * - Not directly in the page builder's `init`, because init order is not fixed:
+ *   a contributor whose init ran first would have its blocks wiped by a later
+ *   clear. The page builder does resolve this service from `init`, but that
+ *   only triggers the reset on a boot where nothing else has already, since
+ *   resolution is memoized.
+ * - Not in `setup`, which is the one hook a config reload DOES re-run. A reload
+ *   never goes back through `registerServices`, so no `init` runs afterwards to
+ *   repopulate — clearing there empties the registry for the rest of the
+ *   process, and contributed blocks disappear on the first unrelated save.
+ *
+ * This factory is memoized per boot, so the reset happens exactly once, in the
+ * same lifecycle as every registration that follows it.
+ *
+ * Blocks AND supports are reset together, because both are per-boot: a support
+ * kept across boots collides when the next boot registers it again, and a
+ * support cleared independently of the blocks declaring it leaves those blocks
+ * refused as using an unknown one. Both are contributed through this service,
+ * so both are registered after the reset and neither can be caught by it.
+ *
+ * A boot on which no plugin contributes still resets, because the page builder
+ * resolves this service from its own `init`. Left to contributors alone, a boot
+ * whose last contributing plugin had been removed would resolve nothing, and
+ * that plugin's blocks would stay registered for the life of the process.
+ *
+ * The case that remains is a config reload, which re-runs neither
+ * `registerServices` nor any `init`: contributions are not re-registered there
+ * either, so the registry keeps exactly the blocks the running process
+ * registered, and a plugin removed by that reload is visible until a restart.
+ * Closing it needs core to re-run `init` on reload, and clearing without that
+ * would empty the registry with nothing left to repopulate it.
+ */
+export function createBlockRegistrationService(
+  registry: BlockRegistry
+): BlockRegistrationBackend {
+  registry.clear();
+  editorVisible.set(registry, new Set<string>());
+  lastStarted = registry;
+  return {
+    registerSupport: support => registry.registerSupport(support),
+    register(definitions, source) {
+      const list = Array.isArray(definitions) ? definitions : [definitions];
+      // Nothing to do rather than an error: a plugin whose block list is
+      // configuration-dependent may legitimately contribute none.
+      if (list.length === 0) return;
+      registry.register(list, { source });
+    },
+  };
+}
+
+/**
+ * A site's registry as its readers take it: lookups only, never a write. What
+ * the page builder offers its routes, so nothing reached through it can add
+ * or drop another site's blocks.
+ */
+export function registryReader(
+  registry: BlockRegistryReader
+): BlockRegistryReader {
+  return {
+    get: name => registry.get(name),
+    has: name => registry.has(name),
+    all: () => registry.all(),
+    sourceOf: name => registry.sourceOf(name),
+    support: key => registry.support(key),
+    supports: () => registry.supports(),
+    lookup: () => registry.lookup(),
+    nestingSource: () => registry.nestingSource(),
+    blockSource: () => registry.blockSource(),
+    migrationSource: () => registry.migrationSource(),
+  };
+}
+
+/**
+ * Typed handle to the page builder's block registry, bound to the calling
+ * plugin.
+ *
+ * The cross-plugin namespace is typed `Record<string, Record<string, unknown>>`,
+ * so reaching it directly costs a cast at every call site and gives block
+ * authors no argument checking. This resolves it once and states what came back.
+ *
+ * Resolving is also what triggers the per-boot reset, so the page builder calls
+ * this on itself during `init` to guarantee the reset happens on every boot
+ * rather than only on boots where something contributes.
+ */
+export function blockRegistry(ctx: PluginContext): BlockRegistrationService {
+  const service = ctx.services.plugins[PAGE_BUILDER_PLUGIN]?.[BLOCK_SERVICE];
+  if (!isBlockRegistrationBackend(service)) {
+    // Named rather than a generic missing-service message: the overwhelmingly
+    // likely cause is that the page builder is not installed, and a plugin
+    // author reading this should not have to infer that.
+    throw new Error(
+      `Cannot contribute blocks: "${PAGE_BUILDER_PLUGIN}" is not installed, or ` +
+        `is registered without its "${BLOCK_SERVICE}" service. Add it to ` +
+        `defineConfig({ plugins: [...] }) before any plugin that contributes blocks.`
+    );
+  }
+  // Provenance comes from the plugin's own resolved identity, so it names the
+  // plugin that actually registered rather than whatever string reached the
+  // call site.
+  const source = ctx.self.name;
+  return {
+    register: definitions => {
+      service.register(definitions, source);
+      warnServerOnly(definitions, source, ctx.logger);
+    },
+    registerSupport: support => service.registerSupport(support),
+  };
+}
+
+/** Blocks already warned about, so a reboot in the same process says it once. */
+const warnedServerOnly = new Set<string>();
+
+/**
+ * In development, say once per block that one registered in code reaches only
+ * the server.
+ *
+ * Every block arriving through `blockRegistry(ctx).register` is one: a block
+ * the same plugin also declared would have collided above, since the page
+ * builder registers declared blocks itself. So the warning needs no second
+ * reading of the declarations. Development only, because the remedy is a
+ * change to the plugin's source, and a production log saying so on every boot
+ * helps nobody who can act on it.
+ */
+function warnServerOnly(
+  definitions: AnyBlockDefinition | AnyBlockDefinition[],
+  source: string,
+  logger: PluginContext["logger"]
+): void {
+  if (process.env.NODE_ENV !== "development") return;
+  for (const definition of Array.isArray(definitions)
+    ? definitions
+    : [definitions]) {
+    if (warnedServerOnly.has(definition.name)) continue;
+    warnedServerOnly.add(definition.name);
+    logger.warn(
+      `[page-builder] Block "${definition.name}" was registered in code by ` +
+        `"${source}" and not declared, so it reaches the server only and the ` +
+        `editor will not offer it. Declare it under contributes.declarations` +
+        `["${PAGE_BUILDER_PLUGIN}"].blocks with an editorEntry instead.`
+    );
+  }
+}
+
+/** Whether a resolved service is the block registry rather than something else. */
+function isBlockRegistrationBackend(
+  value: unknown
+): value is BlockRegistrationBackend {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { register?: unknown }).register === "function"
+  );
+}
+
+/**
+ * Register every block plugins declared for the page builder.
+ *
+ * Called from the page builder's own `init`, which is also what guarantees the
+ * per-boot reset runs: resolving the service is what empties the registry, and
+ * that has to happen before anything is registered into it.
+ *
+ * Each block is attributed to the plugin that DECLARED it, not to the page
+ * builder that registered it on its behalf, so a name collision still names the
+ * package a reader has to go and fix.
+ *
+ * A declaration whose `blocks` is not an array throws rather than being skipped.
+ * It was addressed to this reader by name, so the author meant it to take
+ * effect; silently ignoring it would leave a plugin looking installed while
+ * contributing nothing.
+ */
+/**
+ * Register the core primitive library.
+ *
+ * Called before {@link registerDeclaredBlocks}, and the order is load-bearing
+ * twice over. It resolves the registration service first, which is what
+ * performs the boot's one-time clear, so the core blocks are added to an empty
+ * registry rather than wiped by a later resolution. And registering core first
+ * means a contributed block colliding with a `core/` name is the one reported
+ * as the duplicate, which is the right way round: the core namespace is this
+ * package's.
+ *
+ * Attributed to the page builder itself, because that is the package a reader
+ * would have to go and change.
+ */
+export function registerCoreBlocks(
+  ctx: PluginContext,
+  registry: BlockRegistryReader
+): void {
+  const service = ctx.services.plugins[PAGE_BUILDER_PLUGIN]?.[BLOCK_SERVICE];
+  if (!isBlockRegistrationBackend(service)) return;
+  service.register(coreBlocks, PAGE_BUILDER_PLUGIN);
+  drawnByEditor(registry, coreBlocks);
+}
+
+export function registerDeclaredBlocks(
+  ctx: PluginContext,
+  registry: BlockRegistryReader
+): void {
+  const service = ctx.services.plugins[PAGE_BUILDER_PLUGIN]?.[BLOCK_SERVICE];
+  if (!isBlockRegistrationBackend(service)) return;
+  const declarations = collectDeclarations(
+    ctx.config.plugins ?? [],
+    PAGE_BUILDER_PLUGIN
+  );
+  // Supports first, across every declaration, before any block is registered.
+  // Registration refuses a block naming a support nothing knows yet, and a
+  // block declared by one plugin may use a support declared by another, so
+  // interleaving the two would make the outcome depend on plugin order.
+  for (const declaration of declarations) {
+    const { supports, error } = supportsIn(declaration);
+    if (error) throw new Error(error);
+    for (const support of supports) service.registerSupport(support);
+  }
+  for (const declaration of declarations) {
+    registerDeclaration(service, registry, declaration);
+  }
+}
+
+/** One plugin's declared blocks, registered, and noted when the editor draws them. */
+function registerDeclaration(
+  service: BlockRegistrationBackend,
+  registry: BlockRegistryReader,
+  declaration: Parameters<typeof blocksIn>[0]
+): void {
+  const { blocks, error } = blocksIn(declaration);
+  if (error) throw new Error(error);
+  // Judged here, at boot, though only the generated component map reads it:
+  // a malformed entry would otherwise surface as blocks silently missing
+  // from the editor.
+  const entry = editorEntryIn(declaration);
+  if (entry.error) throw new Error(entry.error);
+  if (blocks.length > 0) service.register(blocks, declaration.source);
+  // Drawn by the editor only when the declaration names the module that
+  // exports them to it; without one the blocks reach the server alone.
+  if (entry.editorEntry !== undefined) drawnByEditor(registry, blocks);
+}
+
+/**
+ * The names of the blocks the editor can draw, per site registry: the core
+ * set, and those a plugin declares with an `editorEntry`. A block registered
+ * in code, or declared without an entry, reaches the server only. Started
+ * afresh with the registry at boot.
+ */
+const editorVisible = new WeakMap<BlockRegistryReader, Set<string>>();
+
+/**
+ * Whether `registry` was started by a boot in this module copy: its
+ * registration service has run here. A production build bundles the plugin
+ * into each route, and a route's copy of a page builder never starts; what it
+ * holds is then read through the instance instead.
+ */
+export function hasStarted(registry: BlockRegistryReader): boolean {
+  return editorVisible.has(registry);
+}
+
+/**
+ * The registry the last boot in this module copy started. What a page
+ * builder that never started here reads instead of its own empty one: a dev
+ * server's config reload evaluates the config again, making new page builder
+ * definitions, but runs no `init`, so their registries stay empty while the
+ * started one holds the site's blocks.
+ */
+let lastStarted: BlockRegistry | undefined;
+
+/**
+ * `own` where it started in this module copy, else the registry the last
+ * boot here started, else `undefined` (none started here).
+ */
+export function runningRegistry(
+  own: BlockRegistryReader
+): BlockRegistryReader | undefined {
+  return hasStarted(own) ? own : lastStarted;
+}
+
+/**
+ * The started site's blocks as the running Nextly instance offers them, for
+ * a copy of the page builder that neither started nor saw a boot: a dev
+ * server compiles a route's modules again, and core may judge a save with a
+ * field type from that copy. Nothing when no instance is running yet.
+ */
+function instanceSiteBlocks(): BlockRegistryReader | undefined {
+  try {
+    return offeredSiteBlocks(requireNextly().plugins);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A reader of {@link runningRegistry} for `own`, chosen on each lookup.
+ * Refused, never answered empty, while nothing has started here: an empty
+ * registry silently refuses nothing.
+ */
+export function runningBlocks(own: BlockRegistryReader): BlockRegistryReader {
+  const current = (): BlockRegistryReader => {
+    const running = runningRegistry(own) ?? instanceSiteBlocks();
+    if (running !== undefined) return running;
+    throw new Error(
+      "[page-builder] this page builder's site has not started, so it has no blocks to read yet."
+    );
+  };
+  return {
+    get: name => current().get(name),
+    has: name => current().has(name),
+    all: () => current().all(),
+    sourceOf: name => current().sourceOf(name),
+    support: key => current().support(key),
+    supports: () => current().supports(),
+    lookup: () => current().lookup(),
+    nestingSource: () => current().nestingSource(),
+    blockSource: () => current().blockSource(),
+    migrationSource: () => current().migrationSource(),
+  };
+}
+
+/**
+ * Note blocks the editor draws, for {@link editorVisibleBlocks}. Kept to the
+ * page builder's own registration, not offered on the service other plugins
+ * reach: only a declaration with an `editorEntry` makes a block drawable.
+ */
+function drawnByEditor(
+  registry: BlockRegistryReader,
+  blocks: readonly AnyBlockDefinition[]
+): void {
+  const drawn = editorVisible.get(registry);
+  for (const block of blocks) drawn?.add(block.name);
+}
+
+/**
+ * The site's registered blocks the editor can draw, for anything the server
+ * derives from what an author can reach there (the relation targets a search
+ * may read, for one), rather than from the whole server registry.
+ */
+export function editorVisibleBlocks(
+  registry: BlockRegistryReader
+): AnyBlockDefinition[] {
+  const drawn = editorVisible.get(registry);
+  return registry.all().filter(block => drawn?.has(block.name) === true);
+}

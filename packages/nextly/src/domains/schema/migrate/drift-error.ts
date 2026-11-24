@@ -1,0 +1,375 @@
+/**
+ * `NEXTLY_MIGRATION_DRIFT` error formatting (spec §4.7.1).
+ *
+ * Built when Phase 2 finds the live DB matches neither the migration's
+ * pre-baseline nor its target — i.e. out-of-band schema changes.
+ *
+ * @module domains/schema/migrate/drift-error
+ * @since v0.0.3-alpha (Plan C2)
+ */
+import { posix, sep, win32 } from "node:path";
+
+import { NextlyError } from "../../../errors";
+
+/** One drift line: `+` present-in-DB, `-` expected-but-absent, `?` unknown. */
+export interface DriftItem {
+  kind: "+" | "-" | "?";
+  detail: string;
+}
+
+export interface MigrationDriftArgs {
+  /** Migration name (filename without extension). */
+  migration: string;
+  /** Set for a plugin's module; its recovery is not the app's. */
+  pluginName?: string;
+  /** Repo-relative path to the .sql file. */
+  file: string;
+  driftItems: DriftItem[];
+  /**
+   * Whether this is a database that has never been adopted into the migration
+   * history — every difference is a table already standing, and the migration
+   * expected to start from nothing.
+   *
+   * It gets its own guidance because the three generic recoveries all fail in
+   * that state: `db:sync` reports no changes, `migrate:resolve --applied`
+   * refuses because live does not equal the target, and `migrate:create`
+   * detects no changes and writes nothing. Offering them is worse than
+   * offering nothing, because each one costs a try before it fails.
+   */
+  unadoptedDatabase?: boolean;
+  /**
+   * Set when the drift is a translations table's, found before its companion file applies.
+   *
+   * It gets its own cause and recoveries because the generic ones do not fit a companion file:
+   * it has no snapshot, so there is no baseline or target it was compared with and nothing a
+   * `capture_drift` migration would capture, and marking it applied would skip the values it
+   * moves between the main table and the translations table.
+   */
+  translationsTable?: string;
+  /**
+   * Set for a Schema Builder save's refusal. The save withdraws the files it
+   * wrote when it is refused, so `migrate:resolve --applied` would name a
+   * file that is gone, and `migrate:create` compares the definitions with the
+   * history, never with the table, so it captures nothing. The way on that
+   * works is the one named instead: put the table back as the history records
+   * it, by hand, then save again.
+   */
+  builderSave?: boolean;
+}
+
+/**
+ * The path functions that split and join `file` in the separator it is
+ * written with.
+ *
+ * `migrate` resolves the migration to an absolute path, which on Windows is
+ * separated by backslashes, so there the platform's own functions split it:
+ * splitting on the forward slash alone would find no directory and name a
+ * `meta/` beside the working directory instead of beside the migration,
+ * leaving the real snapshot in place and `migrate:baseline` still refusing
+ * the project. A path written with forward slashes, which Windows reads too,
+ * keeps them: joined by the platform's functions, its `mv` line would keep
+ * `/` while the `rm` line beside it turned every separator into `\`.
+ */
+function pathsFor(file: string): typeof posix {
+  return sep === "\\" && file.includes("\\") ? win32 : posix;
+}
+
+/**
+ * Where the snapshot paired with a migration lives.
+ *
+ * Derived from the `.sql` path rather than passed in, so the two can never
+ * name different migrations. `snapshot-io` writes them as
+ * `<dir>/<name>.sql` and `<dir>/meta/<name>.snapshot.json`.
+ */
+function snapshotPathFor(file: string, migration: string): string {
+  return pathsFor(file).join(
+    directoryOf(file),
+    "meta",
+    `${migration}.snapshot.json`
+  );
+}
+
+/** The folder a migration is in, in the separator its path is written with. */
+function directoryOf(file: string): string {
+  return pathsFor(file).dirname(file);
+}
+
+/**
+ * Every `.sql` belonging to one migration, as a shell glob.
+ *
+ * A migration can be written once per dialect (`<name>.mysql.sql` beside
+ * `<name>.sql`), and discovery selects one of them. Naming only the selected
+ * file leaves its siblings behind, and `migrate:baseline` then refuses the
+ * project because the history is not empty — which is the same dead end the
+ * ordering here exists to avoid.
+ */
+function variantGlobFor(file: string, migration: string): string {
+  // The literal part is quoted and the `*` left outside it, so a path with
+  // spaces stays one argument AND the glob still expands. Quoting the whole
+  // thing would pass `*.sql` to `rm` verbatim.
+  return `${shellQuote(pathsFor(file).join(directoryOf(file), migration))}*.sql`;
+}
+
+/**
+ * A path as a single shell argument.
+ *
+ * These commands are printed for an operator to paste. An absolute migrations
+ * directory with a space in it — which is ordinary on macOS and Windows —
+ * otherwise splits into two arguments and the cleanup fails before the
+ * recovery can start. Single quotes suppress every expansion, so only the
+ * closing quote itself needs handling.
+ */
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * A migration's name with its generated timestamp removed.
+ *
+ * `formatTimestamp` writes `YYYYMMDD_HHMMSS_mmm_`, three underscore-separated
+ * groups. Stripping only the first leaves `120000_123_add_subtitle`, which
+ * still works as a name but bakes a fragment of the old timestamp into the new
+ * file. The older single-group form is accepted too, so a file generated
+ * before that format still reads back as its own name.
+ */
+function migrationNameWithoutTimestamp(migration: string): string {
+  return migration.replace(/^\d{8}_\d{6}_\d{3}_/, "").replace(/^\d+_/, "");
+}
+
+/**
+ * The recovery for a plugin module's drift.
+ *
+ * A plugin's history ships inside the plugin, so none of the app's recoveries
+ * apply: there is no migrations directory to move, and a migration created or
+ * resolved here would be the app's, not the plugin's. What works is bringing
+ * the plugin's tables to a point its history knows — its current definition,
+ * which `migrate` then records the modules up to — or re-creating them.
+ */
+function pluginRecovery(pluginName: string): string[] {
+  return [
+    `  Recovery — the tables of plugin "${pluginName}" match no point in its`,
+    "  migration history. Pick one:",
+    "    [A] Bring them to the plugin's current definition, then re-run",
+    "        migrate; it records the modules that definition covers as applied:",
+    "          pnpm nextly db:sync && pnpm nextly migrate",
+    "    [B] If they hold nothing you need, drop them and re-run migrate, which",
+    "        creates them from the plugin's modules:",
+    "          pnpm nextly migrate",
+  ];
+}
+
+export function migrationDriftError(args: MigrationDriftArgs): NextlyError {
+  const lines = args.driftItems
+    .map(d => `    ${d.kind} ${d.detail}`)
+    .join("\n");
+
+  if (args.builderSave === true) return builderSaveDriftError(args, lines);
+
+  const { cause, recovery, suggestedActions } = driftVariant(args);
+
+  const publicMessage = [
+    "Migration cannot be applied: schema drift detected",
+    "",
+    `  Migration:  ${args.migration}`,
+    `  File:       ${args.file}`,
+    "",
+    ...cause,
+    "",
+    `  Drift summary (${args.driftItems.length} differences):`,
+    lines,
+    "",
+    ...recovery,
+    "",
+    "  Details: https://docs.nextlyhq.com/guides/migration-drift",
+  ].join("\n");
+
+  return new NextlyError({
+    code: "NEXTLY_MIGRATION_DRIFT",
+    statusCode: 409,
+    publicMessage,
+    logContext: {
+      migration: args.migration,
+      driftItems: args.driftItems,
+      suggestedActions,
+      unadoptedDatabase: args.unadoptedDatabase === true,
+    },
+  });
+}
+
+/** What a drift refusal says of its cause, what it offers to do, and the actions it logs. */
+interface DriftVariant {
+  cause: string[];
+  recovery: string[];
+  suggestedActions: string[];
+}
+
+/**
+ * The variant of the refusal `args` calls for, chosen once so that its cause, its recovery and
+ * its logged actions always describe the same case: a plugin's module, a translations table, a
+ * database never adopted into the history, or any other migration.
+ */
+function driftVariant(args: MigrationDriftArgs): DriftVariant {
+  if (args.pluginName) {
+    return {
+      cause: [
+        "  The database differs from the state this plugin module starts from,",
+        "  from the state it produces, and from every later module's result.",
+      ],
+      recovery: pluginRecovery(args.pluginName),
+      suggestedActions: ["plugin-sync", "plugin-recreate"],
+    };
+  }
+  if (args.translationsTable !== undefined) {
+    return translationsTableVariant(args.translationsTable);
+  }
+  if (args.unadoptedDatabase) return unadoptedVariant(args);
+  return {
+    cause: [
+      "  Your database differs from BOTH the pre-migration baseline and the",
+      "  expected post-migration state. This usually means schema changes were",
+      "  made outside Nextly's tracked paths (manual SQL, a failed prior run,",
+      "  divergent teammate state).",
+    ],
+    recovery: [
+      ...builderRecovery(args.driftItems),
+      "  Recovery (pick one):",
+      "    [A] Sync the DB to your config, then re-run migrate:",
+      "          pnpm nextly db:sync && pnpm nextly migrate",
+      "    [B] Mark it applied without executing (if you applied it manually):",
+      `          pnpm nextly migrate:resolve --applied ${args.migration}`,
+      "    [C] Capture the drift in a new migration:",
+      "          pnpm nextly migrate:create --name capture_drift && pnpm nextly migrate",
+    ],
+    suggestedActions: ["A", "B", "C"],
+  };
+}
+
+/** A translations table's drift, found before its companion file applies (`translationsTable`). */
+function translationsTableVariant(table: string): DriftVariant {
+  return {
+    cause: [
+      `  The translations table ${table} differs from what the applied`,
+      "  migration files left. It was changed outside a migration (manual SQL, a",
+      "  failed earlier run, another build's files). None of the files in your",
+      "  migrations folder has been applied by this run.",
+    ],
+    recovery: [
+      "  Recovery (pick one):",
+      "    [A] Put back what the lines above say is missing (a whole table: from a",
+      "        backup, since its rows are your translations), then re-run migrate.",
+      "    [B] If a missing column was removed on purpose, remove its field from",
+      "        your config and write a migration for it, then re-run migrate:",
+      "          pnpm nextly migrate:create --name <name> && pnpm nextly migrate",
+      "        This works only when no migration file not yet applied uses that column;",
+      "        one that does runs first and needs the column, so put it back as in [A].",
+    ],
+    suggestedActions: ["restore-table", "migrate-the-change"],
+  };
+}
+
+/**
+ * A database never adopted into the history (`unadoptedDatabase`). One recovery, not a menu: all
+ * three generic ones fail on such a database, so listing them would cost three attempts before
+ * the real answer.
+ *
+ * The order matters and is the opposite of the obvious one. This migration was written with a
+ * snapshot beside it, and `migrate:baseline` refuses a project that already has one, so
+ * baselining first reports "already baselined" and nothing happens. Both files have to go first,
+ * and deleting only the `.sql` leaves the snapshot behind to do the same thing.
+ */
+function unadoptedVariant(args: MigrationDriftArgs): DriftVariant {
+  return {
+    cause: [
+      "  This database already has tables, and this migration expects to start",
+      "  from an empty one. That is what a project managed by `db:sync` looks",
+      "  like the first time it creates a migration: the schema is real, but",
+      "  nothing has recorded where the history begins.",
+    ],
+    recovery: [
+      "  Recovery — nothing in this history can be applied, so all of it has",
+      "  to go first. `migrate:baseline` refuses a project that has ANY",
+      "  migration or snapshot, and every file here was generated against a",
+      "  schema that already exists. Move the directory aside:",
+      `          mv ${shellQuote(directoryOf(args.file))} ${shellQuote(`${directoryOf(args.file)}.pre-baseline`)}`,
+      "",
+      "  Or, if this is the only migration, remove just it and its snapshot",
+      "  (the glob covers per-dialect variants, which are one migration):",
+      `          rm ${variantGlobFor(args.file, args.migration)} ${shellQuote(snapshotPathFor(args.file, args.migration))}`,
+      "",
+      "  Record what the database already has, once:",
+      "          pnpm nextly migrate:baseline",
+      "",
+      "  Then re-create the migration; it will contain only what changed:",
+      `          pnpm nextly migrate:create --name ${migrationNameWithoutTimestamp(args.migration)}`,
+    ],
+    suggestedActions: ["baseline"],
+  };
+}
+
+/**
+ * A Schema Builder save's drift refusal (`builderSave`): the differences, and the one way on that
+ * works for a save, which has changed nothing and kept none of its files. Neither the save's
+ * withdrawn file nor a command is named.
+ */
+function builderSaveDriftError(
+  args: MigrationDriftArgs,
+  lines: string
+): NextlyError {
+  const publicMessage = [
+    "The save was refused: schema drift detected",
+    "",
+    "  The table is not what the migration history records. It was changed",
+    "  outside the Schema Builder's saves: by hand, or by an earlier change",
+    "  that stopped part way. This save changed nothing.",
+    "",
+    `  Drift summary (${args.driftItems.length} differences):`,
+    lines,
+    "",
+    "  Way on: put the table back as the history records it, by hand: drop",
+    "  what is present (+), add back what is absent (-) and change back what",
+    "  differs (?), renaming a column back rather than dropping it where it",
+    "  holds values you keep. Then save again.",
+    "",
+    "  Details: https://docs.nextlyhq.com/guides/migration-drift",
+  ].join("\n");
+  return new NextlyError({
+    code: "NEXTLY_MIGRATION_DRIFT",
+    publicMessage,
+    logContext: {
+      migration: args.migration,
+      driftItems: args.driftItems,
+      suggestedActions: ["restore-by-hand"],
+      unadoptedDatabase: false,
+    },
+  });
+}
+
+/** A drift item naming a field group's or a Single's table no snapshot records. */
+const UNRECORDED_BUILDER_TABLE =
+  /^table '((?:comp|single)_[^']+)' present in DB$/;
+
+/**
+ * The one step that records a field group's or a Single's table made by the
+ * Schema Builder before its saves wrote migrations: saving it once, which
+ * writes a migration describing the table as it stands. Named first, since
+ * the generic recoveries would hide the table rather than record it. Nothing
+ * when no such table is among the differences.
+ */
+function builderRecovery(items: readonly DriftItem[]): string[] {
+  const tables = items.flatMap(item => {
+    const match = UNRECORDED_BUILDER_TABLE.exec(item.detail);
+    return match?.[1] === undefined ? [] : [match[1]];
+  });
+  if (tables.length === 0) return [];
+  return [
+    `  No migration records ${tables.map(t => `'${t}'`).join(", ")}. If it is a field group or`,
+    "  a Single made in the Schema Builder before its saves wrote migrations,",
+    "  open it there and save it once: the save writes the migration that",
+    "  records its table. Then run migrate again.",
+    "  If it is translated, its values also stand in a second table that one",
+    "  save cannot record. Record both first: run `nextly migrate:create`, then",
+    "  `nextly migrate:resolve --applied <file>` for each file it writes, and",
+    "  save it again in the Builder.",
+    "",
+  ];
+}

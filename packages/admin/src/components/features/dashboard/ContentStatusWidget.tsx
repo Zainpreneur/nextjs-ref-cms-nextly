@@ -1,0 +1,173 @@
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  Skeleton,
+} from "@nextlyhq/ui";
+import { AlertCircle, FileText, ChevronRight } from "lucide-react";
+import type React from "react";
+
+import { RingChart } from "@admin/components/shared/charts/RingChart";
+import { Link } from "@admin/components/ui/link";
+import { ROUTES } from "@admin/constants/routes";
+import { useDashboardStats } from "@admin/hooks/queries/useDashboardStats";
+
+function StatusItem({
+  label,
+  count,
+  percentage,
+  color,
+}: {
+  label: string;
+  count: number;
+  percentage: number;
+  color: string;
+}) {
+  return (
+    <div className="flex items-center justify-between p-3 rounded-md hover:bg-primary/[0.03] transition-all duration-500 group/item  border border-border border-transparent hover:border-border">
+      <div className="flex items-center gap-3.5">
+        <div
+          className="h-2 w-2 rounded-full transition-transform duration-500 group-hover/item:scale-125"
+          style={{ backgroundColor: color }}
+        />
+        <span className="text-xs font-bold text-muted-foreground group-hover/item:text-foreground transition-colors tracking-tight">
+          {label}
+        </span>
+      </div>
+      <div className="flex items-center gap-3">
+        <span className="text-sm font-black tabular-nums text-foreground/80">
+          {count}
+        </span>
+        <span className="text-xs font-black text-muted-foreground bg-primary/5 px-2 py-0.5 rounded-sm  border border-border min-w-[36px] text-center">
+          {percentage}%
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function LoadingSkeleton() {
+  return (
+    <div className="flex flex-col items-center gap-8 py-6" aria-busy="true">
+      <Skeleton className="h-[160px] w-[160px] rounded-lg ring-8 ring-muted/5" />
+      <div className="w-full space-y-3 px-2">
+        <Skeleton className="h-12 w-full rounded-md" />
+        <Skeleton className="h-12 w-full rounded-md" />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The colours of the Published and Draft marks, one value for the ring's
+ * segment and the legend's dot alike: each status's own colour, as every
+ * status on the dashboard is drawn. Published is the success status's solid,
+ * held to 3:1 on the page in each mode; a draft marks nothing to act on, so it
+ * is drawn in the muted ink.
+ */
+const PUBLISHED_MARK = "var(--nx-success-solid)";
+const DRAFT_MARK = "var(--nx-muted-foreground)";
+
+export const ContentStatusWidget: React.FC = () => {
+  const { data, isLoading, error } = useDashboardStats();
+
+  const published = data?.status.published ?? 0;
+  const draft = data?.status.draft ?? 0;
+  const total = published + draft;
+
+  const publishedPct = total > 0 ? Math.round((published / total) * 100) : 0;
+  const draftPct = total > 0 ? Math.round((draft / total) * 100) : 0;
+
+  const segments = [
+    { label: "Published", value: published, color: PUBLISHED_MARK },
+    { label: "Draft", value: draft, color: DRAFT_MARK },
+  ];
+
+  return (
+    <Card className="border-border bg-card/60 backdrop-blur-md rounded-lg overflow-hidden transition-all duration-500 hover:border-border">
+      <CardHeader
+        noBorder
+        className="flex flex-row items-center justify-between space-y-0 px-8 pt-8 pb-4"
+      >
+        <div className="space-y-1">
+          <CardTitle className="text-xs font-black uppercase tracking-[0.25em] text-muted-foreground">
+            Lifecycle Overview
+          </CardTitle>
+          <div className="h-1 w-6 bg-primary/30 rounded-sm" />
+        </div>
+      </CardHeader>
+      <CardContent className="px-6 pb-8">
+        {isLoading ? (
+          <LoadingSkeleton />
+        ) : error ? (
+          <div className="flex items-center justify-center gap-3 rounded-md border border-danger-border bg-danger-surface py-10 text-xs font-bold uppercase tracking-widest text-foreground">
+            <AlertCircle
+              aria-hidden="true"
+              className="h-4 w-4 text-danger-text"
+            />
+            <span>Health synchronization failed</span>
+          </div>
+        ) : total === 0 ? (
+          <div className="flex flex-col items-center gap-4 py-20 text-center">
+            <div className="p-6 rounded-lg bg-primary/5  border border-border">
+              <FileText className="h-10 w-10 text-muted-foreground" />
+            </div>
+            <div className="space-y-2">
+              <p className="text-sm font-bold text-foreground">
+                No active content detected
+              </p>
+              {/* In the text colour: the primary token is a fill a brand may
+                  set to any colour, and small text drawn in it can fall
+                  under AA. Underlined at rest, so it reads as a link. */}
+              <Link
+                href={ROUTES.BUILDER_COLLECTIONS}
+                className="text-xs font-black uppercase tracking-[0.2em] text-foreground underline underline-offset-2 group flex items-center justify-center gap-2"
+              >
+                Launch Initial Entry{" "}
+                <ChevronRight className="h-3 w-3 group-hover:translate-x-1 transition-transform" />
+              </Link>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center gap-8">
+            <div className="relative group/chart transition-transform duration-700 hover:scale-105">
+              <RingChart
+                total={total}
+                segments={segments}
+                size={180}
+                strokeWidth={16}
+              />
+              <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+                <span className="text-3xl font-black text-foreground tracking-tighter tabular-nums leading-none">
+                  {total}
+                </span>
+                <span className="text-xs font-black uppercase tracking-widest text-muted-foreground mt-1">
+                  Total
+                </span>
+              </div>
+            </div>
+
+            <div className="w-full space-y-1.5 bg-primary/5 p-2 rounded-md  border border-border">
+              <StatusItem
+                label="Published"
+                count={published}
+                percentage={publishedPct}
+                color={PUBLISHED_MARK}
+              />
+              <StatusItem
+                label="Draft"
+                count={draft}
+                percentage={draftPct}
+                color={DRAFT_MARK}
+              />
+            </div>
+            <p className="text-xs text-center text-muted-foreground font-black uppercase tracking-[0.2em] opacity-80 px-4">
+              Consolidated health status across production clusters
+            </p>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+};

@@ -1,0 +1,468 @@
+/**
+ * The Single editor's document panel, as the entry editor's: its sections
+ * beside the fields, the preview pane folding it and showing it closing the
+ * pane, and its frame at each width. The bar and the pane are recorders, so
+ * what is asserted is what the editor hands them and the panel it draws.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import userEvent from "@testing-library/user-event";
+
+import { act, render, screen, within } from "@admin/__tests__/utils";
+import {
+  clearRegistry,
+  registerComponent,
+} from "@admin/lib/plugins/component-registry";
+
+const { barProps, paneProps, released, siteLocales, details, readHistory } =
+  vi.hoisted(() => ({
+    barProps: vi.fn(),
+    paneProps: vi.fn(),
+    released: vi.fn(),
+    // The site's languages; none unless a case configures them.
+    siteLocales: { list: [] as { code: string; label: string }[] },
+    // What the Single's `?details=1` read answers, and what it was asked.
+    details: {
+      asked: vi.fn(),
+      answer: undefined as Record<string, unknown> | undefined,
+    },
+    // Whether the person may read the Single's history.
+    readHistory: { allowed: true },
+  }));
+
+vi.mock("@admin/components/features/entries/EntryForm/DocumentBar", () => ({
+  DocumentBar: (props: Record<string, unknown>) => {
+    barProps(props);
+    return null;
+  },
+}));
+vi.mock("@admin/components/features/entries/PreviewMode/PreviewPanes", () => ({
+  PreviewPanes: ({
+    children,
+    ...rest
+  }: { children: React.ReactNode } & Record<string, unknown>) => {
+    paneProps(rest);
+    return <div data-testid="pane">{children}</div>;
+  },
+}));
+vi.mock("@admin/hooks/useLocalization", () => ({
+  useLocalization: () => ({
+    enabled: true,
+    locales: siteLocales.list,
+    defaultLocale: "en",
+    fallback: true,
+    getLocale: (code: string) =>
+      siteLocales.list.find(locale => locale.code === code),
+  }),
+}));
+vi.mock("@admin/hooks/queries/useReleases", async importOriginal => ({
+  ...(await importOriginal<
+    typeof import("@admin/hooks/queries/useReleases")
+  >()),
+  useReleasesContaining: (document: unknown) => {
+    released(document);
+    return { data: { items: [] }, isError: false, isPending: false };
+  },
+}));
+// The Publishing section asks through the hook's own module.
+vi.mock("@admin/hooks/queries/useReleasesContaining", () => ({
+  useReleasesContaining: (document: unknown) => {
+    released(document);
+    return { data: { items: [] }, isError: false, isPending: false };
+  },
+}));
+vi.mock("@admin/hooks/useCan", () => ({ useCan: () => true }));
+vi.mock("@admin/hooks/useCanRequest", async importOriginal => ({
+  ...(await importOriginal<typeof import("@admin/hooks/useCanRequest")>()),
+  useCanRequest: (_slug: string, request: string) =>
+    request === "readHistory" ? readHistory.allowed : true,
+}));
+vi.mock(
+  "@admin/components/features/entries/EntryForm/entry-details-read",
+  async importOriginal => ({
+    ...(await importOriginal<
+      typeof import("@admin/components/features/entries/EntryForm/entry-details-read")
+    >()),
+    useEntryDetails: (input: unknown) => {
+      details.asked(input);
+      return details.answer;
+    },
+  })
+);
+
+import { SingleForm } from "../SingleForm";
+
+// A Single with a publish lifecycle on a localized site: a preview is offered.
+const schema = {
+  slug: "landing-page",
+  label: "Landing Page",
+  localized: true,
+  status: true,
+  fields: [{ name: "title", type: "text", label: "Title" }],
+} as never;
+
+const document = { id: "s1", title: "Hello", status: "draft" } as never;
+
+function editorWidth(width: number): void {
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+    function (this: HTMLElement) {
+      return {
+        width: this.hasAttribute("data-document-editor-frame") ? width : 0,
+      } as DOMRect;
+    }
+  );
+}
+
+const renderEditor = () =>
+  render(<SingleForm schema={schema} document={document} onSubmit={vi.fn()} />);
+
+const lastBar = () => barProps.mock.calls.at(-1)![0] as Record<string, unknown>;
+const lastPane = () =>
+  paneProps.mock.calls.at(-1)![0] as Record<string, unknown>;
+const run = (prop: string) =>
+  act(() => {
+    (lastBar()[prop] as () => void)();
+  });
+const dockedPanel = () =>
+  screen.queryByRole("complementary", { name: "Document panel" });
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  window.localStorage.clear();
+  window.history.replaceState(null, "", "/");
+  siteLocales.list = [];
+  details.answer = undefined;
+  readHistory.allowed = true;
+});
+afterEach(() => vi.restoreAllMocks());
+
+describe("the Single editor's document panel", () => {
+  // The docked rail carries the language panel whenever the panel is docked,
+  // so the Single's pending shared change is said there too, not only in the
+  // inline panel the docked layout hides.
+  it("says in the docked panel while the Single's shared fields hold unpublished changes", () => {
+    siteLocales.list = [
+      { code: "en", label: "English" },
+      { code: "de", label: "German" },
+    ];
+    const withShared = (pending: boolean) =>
+      ({
+        id: "s1",
+        title: "Hello",
+        status: "published",
+        _sharedChangesPending: pending,
+        _translations: {
+          en: { translated: true, status: "published" },
+          de: { translated: true, status: "published" },
+        },
+      }) as never;
+    const { unmount } = render(
+      <SingleForm
+        schema={schema}
+        document={withShared(true)}
+        locale="de"
+        onSubmit={vi.fn()}
+      />
+    );
+    expect(
+      within(dockedPanel()!).getByRole("status", {
+        name: "Shared changes pending",
+      })
+    ).toBeInTheDocument();
+    // And the inline panel, kept in the page while the docked layout hides
+    // it, says it too: both read the one answer.
+    expect(
+      screen.getAllByRole("status", {
+        name: "Shared changes pending",
+        hidden: true,
+      })
+    ).toHaveLength(2);
+    unmount();
+
+    // The control: the same docked panel without a pending shared change.
+    render(
+      <SingleForm
+        schema={schema}
+        document={withShared(false)}
+        locale="de"
+        onSubmit={vi.fn()}
+      />
+    );
+    expect(dockedPanel()).toBeInTheDocument();
+    expect(
+      within(dockedPanel()!).queryByRole("status", {
+        name: "Shared changes pending",
+      })
+    ).toBeNull();
+    expect(
+      screen.queryAllByRole("status", {
+        name: "Shared changes pending",
+        hidden: true,
+      })
+    ).toHaveLength(0);
+  });
+
+  it("reads what it is, Status, Publishing, Last changed and For developers beside the fields, addressing the Single's releases by its slug", () => {
+    renderEditor();
+    const sections = within(dockedPanel()!)
+      .getAllByRole("region")
+      .map(section => section.getAttribute("data-panel-section"));
+    expect(sections).toEqual([
+      "What this is",
+      "Status",
+      "Publishing",
+      "Last changed",
+      "For developers",
+    ]);
+    expect(screen.getByRole("region", { name: "Status" })).toHaveTextContent(
+      "is a draft, not published yet."
+    );
+    // The address the page's scheduled-release banner asks with, so the two
+    // read one answer.
+    expect(released).toHaveBeenCalledWith({
+      scopeKind: "single",
+      scopeSlug: "landing-page",
+      entryId: "s1",
+    });
+  });
+
+  // The entry's status is the language being edited's own, not the main
+  // row's. The plausible broken implementation reads the main row, so a
+  // German nobody has published reads "published" because English is.
+  it("shows the status of the language being edited, not the default's", () => {
+    siteLocales.list = [
+      { code: "en", label: "English" },
+      { code: "de", label: "German" },
+    ];
+    const published = {
+      id: "s1",
+      title: "Hello",
+      status: "published",
+      _translations: {
+        en: { translated: true, status: "published" },
+        de: { translated: false },
+      },
+    } as never;
+    render(
+      <SingleForm
+        schema={schema}
+        document={published}
+        locale="de"
+        onSubmit={vi.fn()}
+      />
+    );
+
+    expect(lastBar().documentStatus).toMatchObject({ status: "draft" });
+    // German has no content of its own: it is not a draft yet, as the
+    // Languages panel's "not translated" says of it.
+    expect(screen.getByRole("region", { name: "Status" })).toHaveTextContent(
+      "The German version isn't translated or published yet."
+    );
+  });
+
+  it("calls a language with its own unpublished content a draft", () => {
+    siteLocales.list = [
+      { code: "en", label: "English" },
+      { code: "de", label: "German" },
+    ];
+    const drafted = {
+      id: "s1",
+      title: "Hello",
+      status: "published",
+      _translations: {
+        en: { translated: true, status: "published" },
+        de: { translated: true, status: "draft" },
+      },
+    } as never;
+    render(
+      <SingleForm
+        schema={schema}
+        document={drafted}
+        locale="de"
+        onSubmit={vi.fn()}
+      />
+    );
+
+    expect(screen.getByRole("region", { name: "Status" })).toHaveTextContent(
+      "The German version is a draft, not published yet."
+    );
+  });
+
+  it("folds while the preview is open, and closes the preview when it is shown again", () => {
+    renderEditor();
+    run("onTogglePreviewPane");
+    expect(lastPane().open).toBe(true);
+    expect(dockedPanel()).not.toBeInTheDocument();
+    run("onToggleRail");
+    expect(lastPane().open).toBe(false);
+    expect(dockedPanel()).toBeInTheDocument();
+  });
+
+  it("floats under 1000px and is a sheet under 600px, closed until asked for", () => {
+    editorWidth(860);
+    const { unmount } = renderEditor();
+    expect(lastBar().panelMode).toBe("floating");
+    expect(dockedPanel()).not.toBeInTheDocument();
+    run("onToggleRail");
+    expect(dockedPanel()).toHaveAttribute("data-document-panel", "floating");
+    unmount();
+
+    vi.restoreAllMocks();
+    editorWidth(390);
+    renderEditor();
+    expect(lastBar().panelMode).toBe("sheet");
+    run("onToggleRail");
+    expect(screen.getByRole("dialog", { name: "Document" })).toBeVisible();
+  });
+});
+
+describe("what the Single's panel says about the Single", () => {
+  const docked = () => within(dockedPanel()!);
+  const versioned = {
+    ...(schema as object),
+    versions: { enabled: true },
+  } as never;
+
+  it("says there's only ever one of it, where its code gives no description", () => {
+    renderEditor();
+    expect(
+      docked().getByRole("region", { name: "What this is" })
+    ).toHaveTextContent(
+      "One entry the site uses in one place. There's only ever one Landing Page."
+    );
+  });
+
+  it("says its own description where its code gives one", () => {
+    render(
+      <SingleForm
+        schema={
+          {
+            ...(schema as object),
+            admin: { description: "The first page visitors see." },
+          } as never
+        }
+        document={document}
+        onSubmit={vi.fn()}
+      />
+    );
+    expect(
+      docked().getByRole("region", { name: "What this is" })
+    ).toHaveTextContent("The first page visitors see.");
+  });
+
+  it("prefers the Single's own description to the one under admin", () => {
+    render(
+      <SingleForm
+        schema={
+          {
+            ...(schema as object),
+            description: "Where visitors reach the team.",
+            admin: { description: "The first page visitors see." },
+          } as never
+        }
+        document={document}
+        onSubmit={vi.fn()}
+      />
+    );
+    const about = docked().getByRole("region", { name: "What this is" });
+    expect(about).toHaveTextContent("Where visitors reach the team.");
+    expect(about).not.toHaveTextContent("The first page visitors see.");
+  });
+
+  it("reads who changed it from the Single's own details, in the language being edited", () => {
+    details.answer = {
+      createdBy: null,
+      updatedBy: { kind: "person", name: "Ana Lopez" },
+      updatedAt: new Date(Date.now() - 2 * 3_600_000).toISOString(),
+      address: null,
+    };
+    siteLocales.list = [
+      { code: "en", label: "English" },
+      { code: "de", label: "German" },
+    ];
+    render(
+      <SingleForm
+        schema={schema}
+        document={document}
+        locale="de"
+        onSubmit={vi.fn()}
+      />
+    );
+    expect(details.asked).toHaveBeenCalledWith({
+      scope: "single",
+      collectionSlug: "landing-page",
+      entryId: "s1",
+      locale: "de",
+    });
+    expect(
+      docked().getByRole("region", { name: "Last changed" })
+    ).toHaveTextContent("2 hours ago by Ana Lopez");
+  });
+
+  it("reads no details while a document view covers the Single, since nothing draws them", () => {
+    const VIEW = "@acme/pb/admin#Builder";
+    registerComponent(VIEW, () => <div data-testid="builder-view" />);
+    try {
+      render(
+        <SingleForm
+          schema={schema}
+          document={document}
+          onSubmit={vi.fn()}
+          documentView={{ component: VIEW, onExit: vi.fn() }}
+        />
+      );
+      expect(screen.getByTestId("builder-view")).toBeInTheDocument();
+      // Asked for nothing: a read with no document named sends no request.
+      expect(
+        details.asked.mock.calls.filter(([target]) => target !== undefined)
+      ).toEqual([]);
+    } finally {
+      clearRegistry();
+    }
+  });
+
+  it("gives the API address View API response reads, under For developers", () => {
+    renderEditor();
+    expect(
+      docked().getByRole("region", { name: "For developers" })
+    ).toHaveTextContent("/admin/api/singles/landing-page");
+  });
+
+  it("opens the Single's history from History", async () => {
+    render(
+      <SingleForm schema={versioned} document={document} onSubmit={vi.fn()} />
+    );
+    const lastChanged = docked().getByRole("region", { name: "Last changed" });
+    await userEvent.click(
+      within(lastChanged).getByRole("button", { name: "History" })
+    );
+    expect(new URLSearchParams(window.location.search).get("history")).toBe(
+      "1"
+    );
+  });
+
+  it("leaves History out where the Single keeps no history", () => {
+    render(
+      <SingleForm
+        schema={{ ...(schema as object), versions: null } as never}
+        document={document}
+        onSubmit={vi.fn()}
+      />
+    );
+    const lastChanged = docked().getByRole("region", { name: "Last changed" });
+    expect(
+      within(lastChanged).queryByRole("button", { name: "History" })
+    ).toBeNull();
+  });
+
+  it("leaves History out for a person who may not read the Single's history", () => {
+    readHistory.allowed = false;
+    render(
+      <SingleForm schema={versioned} document={document} onSubmit={vi.fn()} />
+    );
+    const lastChanged = docked().getByRole("region", { name: "Last changed" });
+    expect(
+      within(lastChanged).queryByRole("button", { name: "History" })
+    ).toBeNull();
+  });
+});

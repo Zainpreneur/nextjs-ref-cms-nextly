@@ -1,0 +1,578 @@
+/**
+ * The one write that puts a pattern in the library.
+ *
+ * Without it `planSaveAsPattern` has no caller, so the library the insert panel
+ * reads is a screen nobody can put anything into: an author can browse patterns
+ * and never make one.
+ *
+ * ## Why the server plans the save
+ *
+ * The request carries the DOCUMENT and the SELECTION, not a finished pattern.
+ * What a saved pattern is — which nodes travel, what is re-identified, which
+ * selections are refused — is the planner's question, and the planner answers it
+ * against the block registry. That registry is not the same at both ends: the
+ * browser holds the core blocks, while the server also holds every block another
+ * plugin declared. A browser planning the save answers nesting questions about
+ * blocks it has never heard of.
+ *
+ * It is also what makes the guarantee a rule rather than a convention. The
+ * insert panel offers a tile only for a pattern the planner would place; a
+ * pattern posted ready-made would be whatever its sender decided to send, and
+ * that guarantee would hold only for senders who chose to honour it.
+ *
+ * ## Published, deliberately, and that is a WRITE decision
+ *
+ * The row is created `published`. The status column defaults to `draft`, and a
+ * draft pattern is deliberately kept out of the insert panel — so a save that
+ * left the default would answer the author with a pattern their own library
+ * does not show, which is indistinguishable from a save that failed.
+ *
+ * Saving as a pattern is not a half-finished act: the author selected a run,
+ * named it, and asked for it back. The draft state belongs to the OTHER path,
+ * where a stored pattern is opened in the admin and revised.
+ *
+ * Stating the state NAME here is not the mistake the library READ avoids. That
+ * read must not name a state, because it is asking which patterns are public
+ * and the workflow owns that answer. This is stating an intent, which is what
+ * every publish does — the admin's own entry form posts `status: "published"`
+ * for exactly the same reason.
+ *
+ * It grants nothing, either: the write runs AS THE USER, so an author without
+ * permission to publish a pattern is refused by core rather than by this route
+ * having been careful.
+ *
+ * ## The declared permission is COMPUTED, for the reason the read's is
+ *
+ * A permission slug has to spell the collection slug, and a host may rename the
+ * collection — the grant is then seeded under the new name and demanded under
+ * the old one, which is a route nobody can call. That is why this route carried
+ * no declared permission at all, and it left a write reachable by any
+ * authenticated caller.
+ *
+ * `requiredPermission` now takes a function of the plugin's OWN resolved names,
+ * so the demanded grant follows the rename. The write still runs as the user
+ * and core still enforces what the resolved collection seeded; this is the door
+ * in front of it, which is what stops an unauthorized request reaching the
+ * planner at all.
+ *
+ * ## No request size cap of its own
+ *
+ * The document posted here is the same document the page save posts through the
+ * collection API. A cap invented here would be a second, different answer to a
+ * question the platform answers once, and it would refuse a page the platform
+ * itself accepts. What the STORED pattern may weigh is already bounded, by the
+ * planner, against the host's own limits.
+ *
+ * @module save-pattern-route
+ */
+import {
+  documentRefusal,
+  planSaveAsPattern,
+  type BlockDocument,
+  type BlockRegistryReader,
+  type PlanRefusal,
+} from "@nextlyhq/blocks-engine";
+import type {
+  PluginCollectionTransaction,
+  PluginRouteContext,
+  PluginRoutePermissionScope,
+} from "@nextlyhq/plugin-sdk";
+import { respondMutation, slugify } from "nextly";
+import { NextlyError } from "nextly/errors";
+
+import { PATTERNS_SLUG, patternsCollection } from "./collections/patterns";
+import { JUDGEMENT_CONTEXT, judgeInTransaction } from "./judged-writes";
+import {
+  SAVE_PATTERN_ROUTE_PATH,
+  type CopySourceAddress,
+  type SavePatternFields,
+  type SavePatternDryRun,
+  type SavePatternRequest,
+  type SavePatternResponse,
+} from "./library-contract";
+
+/**
+ * The lifecycle state a saved pattern is created in.
+ *
+ * See the module docblock: the default is `draft`, and a draft pattern is not
+ * offered, so leaving it would save a pattern the author cannot find.
+ */
+/**
+ * The status a saved pattern is created with.
+ *
+ * EXPORTED so `capability-route` can derive which permissions this write needs
+ * from the write itself. The status decides that — core requires the publish
+ * grant on top of create when the persisted status is `published` — so a
+ * capability answer that named `create` alone would say yes to an author the
+ * save then refuses, which is the defect it exists to prevent.
+ */
+export const SAVED_PATTERN_STATUS = "published";
+
+/**
+ * The field the collection stores the tree under.
+ *
+ * Named once, here, because this is the write half of the same translation
+ * `library-route.ts` makes on the read half: the collection calls it `content`
+ * and every other surface calls it the document. Getting it wrong stores a
+ * pattern with no tree, which reads back as a row the panel silently drops.
+ */
+const PATTERN_DOCUMENT_FIELD = "content";
+
+/**
+ * The metadata keys a caller may set, taken FROM the collection.
+ *
+ * Derived rather than listed, and that is the point. A listed allowlist is a
+ * second statement of what a pattern carries: a field added to the collection
+ * would be unsettable here with nothing failing, and — the direction that
+ * matters — a key the collection never declared could otherwise be forwarded to
+ * the write. `id`, `status` and the timestamps are columns rather than declared
+ * fields, so they are not in this set and a caller cannot reach them by naming
+ * them.
+ *
+ * The document field is excluded because the PLANNER owns it. A caller
+ * supplying `content` beside a selection would be saying two different things
+ * about what to store, and the one the panel's guarantee rests on is the
+ * planner's.
+ *
+ * A field may legitimately have no name — a presentational group is one — and
+ * those are dropped rather than carried as a hole in the set: an unnamed field
+ * is not a key a caller could send in the first place.
+ *
+ * Computed once: the collection is declared in code and cannot change between
+ * requests, and building it per save would parse the whole collection on every
+ * write.
+ */
+const SETTABLE_FIELDS: ReadonlySet<string> = new Set(
+  patternsCollection()
+    .fields.map(field => field.name)
+    .filter(
+      (name): name is string =>
+        name !== undefined && name !== PATTERN_DOCUMENT_FIELD
+    )
+);
+
+/** The capabilities this route uses, named rather than imported whole. */
+export interface SavePatternRouteContext {
+  self: { collections: Record<string, string | undefined> };
+  user: PluginRouteContext["user"];
+  services: {
+    collections: {
+      createEntry(
+        collection: string,
+        data: Record<string, unknown>,
+        context: unknown
+      ): Promise<{
+        item: unknown;
+        warnings?: SavePatternResponse["warnings"];
+      }>;
+      /**
+       * The save of a document that is a stored entry: the entry is read as
+       * the caller first, and CSS it already holds counts as no change.
+       */
+      createEntryFromSource: PluginRouteContext["services"]["collections"]["createEntryFromSource"];
+      /** For a dry run: the save is made in a transaction and rolled back. */
+      withTransaction: PluginRouteContext["services"]["collections"]["withTransaction"];
+      createEntryInTransaction: PluginRouteContext["services"]["collections"]["createEntryInTransaction"];
+      /** A dry run of a save of a stored entry's document, on the transaction. */
+      createEntryFromSourceInTransaction: PluginRouteContext["services"]["collections"]["createEntryFromSourceInTransaction"];
+      /** Before a dry run's transaction, so a translated read can resolve. */
+      warmLocalizedReadiness: PluginRouteContext["services"]["collections"]["warmLocalizedReadiness"];
+    };
+  };
+}
+
+/**
+ * Store a selection as a pattern, as the user asking for it.
+ *
+ * Separate from the route declaration so it can be tested against a stub
+ * without a server, exactly as the library read is: what this decides — what is
+ * planned, what is written, and what a refusal answers with — is the part worth
+ * holding still.
+ */
+export async function savePattern(
+  req: Request,
+  ctx: SavePatternRouteContext,
+  /** The site's block registry, whose nesting rules the plan follows. */
+  blocks: BlockRegistryReader
+): Promise<Response> {
+  const request = await readRequest(req);
+  const slug = ctx.self.collections[PATTERNS_SLUG] ?? PATTERNS_SLUG;
+
+  const plan = planSaveAsPattern(
+    request.document,
+    request.selectedIds,
+    { collection: slug, fields: request.fields },
+    // The site's registry on the SERVER, which is the one that knows every
+    // block: the declared blocks another plugin contributed are registered
+    // here and not in the browser.
+    blocks.nestingSource()
+  );
+  if (plan.problem !== undefined) throw refusal(plan);
+
+  const data = {
+    ...plan.create.fields,
+    slug: plan.create.fields.slug ?? derivedSlug(plan.create.fields.title),
+    [PATTERN_DOCUMENT_FIELD]: plan.create.document,
+    status: SAVED_PATTERN_STATUS,
+  };
+  // AS THE USER. A write with the instance's own identity would let any
+  // authenticated caller create a pattern whatever the collection's
+  // permissions say — and would record the wrong author on the version.
+  const asUser = { as: "user" as const, user: ctx.user ?? undefined };
+  // A dry run answers the pattern it would store and stores nothing. The save
+  // is made as the caller and rolled back, so the row's own rules (a unique
+  // slug, the caller's right to create and publish a pattern) answer it. A
+  // save of a stored entry's document is made through the same copy as the
+  // real save, on the transaction: the source read as the caller, and only
+  // what it holds vouching for the CSS, so the dry run answers as the save.
+  if (request.dryRun === true) {
+    const collections = ctx.services.collections;
+    const source = request.source;
+    const judging = { ...asUser, context: { [JUDGEMENT_CONTEXT]: true } };
+    // Before the transaction, as core asks: a translated read inside it can
+    // only be read, never resolved.
+    if (source !== undefined) {
+      await collections.warmLocalizedReadiness(source.collection);
+    }
+    const judged = await judgeInTransaction(
+      run => collections.withTransaction(run),
+      (tx: PluginCollectionTransaction) =>
+        source === undefined
+          ? collections.createEntryInTransaction(
+              tx,
+              plan.create.collection,
+              data,
+              judging
+            )
+          : collections.createEntryFromSourceInTransaction(
+              tx,
+              plan.create.collection,
+              data,
+              source,
+              judging
+            )
+    );
+    const result: SavePatternDryRun = {
+      dryRun: true,
+      pattern: judged.refusal === null ? asStored(data, judged.written) : data,
+      refusals: judged.refusal?.messages ?? [],
+    };
+    return respondMutation(
+      judged.refusal === null
+        ? "Nothing was written: this is the saved section it would save."
+        : "Nothing was written: the site would refuse this saved section.",
+      result
+    );
+  }
+
+  // Where the document is a stored entry, saved THROUGH core's copy: core
+  // reads the entry as the caller (refusing one they can't read) before it
+  // creates anything, and only text that read's entry holds vouches for the
+  // section's CSS. The blocks themselves still come from the editor.
+  const collections = ctx.services.collections;
+  const written =
+    request.source === undefined
+      ? await collections.createEntry(plan.create.collection, data, asUser)
+      : await collections.createEntryFromSource(
+          plan.create.collection,
+          data,
+          request.source,
+          asUser
+        );
+
+  // The canonical envelope, BUILT rather than assembled. `respondMutation`
+  // reads the request's own side-effect warning scope — the same scope the
+  // plugin collection facade writes post-commit failures into, because a
+  // failure is recorded against every collector that is open — so forwarding
+  // the facade's own `warnings` beside it would report each of them twice.
+  return respondMutation("Saved to Saved sections.", writtenRow(written.item), {
+    status: 201,
+  });
+}
+
+/**
+ * The pattern a dry run would store: each value it would write, as the save
+ * stored it after its hooks where the save's answer shows it. Only the fields
+ * written are taken, so the row's own id and timestamps, which belong to a
+ * row that was rolled back, are not offered as the pattern's.
+ */
+function asStored(
+  data: Record<string, unknown>,
+  written: unknown
+): Record<string, unknown> {
+  if (typeof written !== "object" || written === null) return data;
+  const row = written as Record<string, unknown>;
+  return Object.fromEntries(
+    Object.entries(data).map(([key, value]) => [
+      key,
+      key in row ? row[key] : value,
+    ])
+  );
+}
+
+/**
+ * The identifier a pattern is keyed by when its author gave none.
+ *
+ * Derived from the title through the framework's own `slugify`, so a pattern's
+ * slug is made the way every other slug in the product is made rather than by a
+ * fourth rule that agrees with the others only until one of them moves.
+ *
+ * **A derivation can legitimately produce nothing, and that is not an edge
+ * case.** `slugify` keeps `[a-z0-9]` and replaces everything else, so a title
+ * written in a script it cannot transliterate comes back empty — measured,
+ * `"見出しセクション"`, `"Заголовок"` and `"Πρότυπο"` all yield `""`. On a
+ * Japanese or Russian site that is EVERY pattern, and an empty slug is refused
+ * by a required field, so the feature would simply not work there.
+ *
+ * An empty derivation therefore falls back to a generated identifier. The slug
+ * is an identity rather than an address — nothing resolves a pattern by it — so
+ * a pattern keyed `pattern-3f2a1b2c` is as usable as one keyed `hero-banner`,
+ * and the author is shown neither. The consequence worth knowing: two patterns
+ * whose titles both derive to nothing never collide, where two titled "Hero" do.
+ */
+function derivedSlug(title: unknown): string {
+  const derived = typeof title === "string" ? slugify(title) : "";
+  return derived === ""
+    ? `pattern-${crypto.randomUUID().slice(0, 8)}`
+    : derived;
+}
+
+/**
+ * The row that was just created, once it is one a caller can address.
+ *
+ * Read defensively for the reason the library read reads its rows defensively:
+ * what comes back has been through the collection's `afterChange` hooks, and a
+ * hook may return anything. A row with no usable id is a save the caller cannot
+ * address afterwards, and putting it in the envelope would report that as a
+ * success — so it is reported as the failure it is, AFTER the row has committed,
+ * which is what the message says.
+ */
+function writtenRow(item: unknown): { id: string } & Record<string, unknown> {
+  const row = (item ?? {}) as Record<string, unknown>;
+  if (typeof row.id === "string" && row.id !== "") {
+    return row as { id: string } & Record<string, unknown>;
+  }
+  throw new NextlyError({
+    code: "INTERNAL_ERROR",
+    publicMessage: "The saved section was saved but could not be identified.",
+    logMessage: "createEntry returned no usable id for a saved pattern",
+    logContext: { reason: "save-pattern-no-id" },
+  });
+}
+
+/**
+ * The error a planner refusal answers with.
+ *
+ * 422 rather than 400: the request was understood and well formed, and it was
+ * refused on a rule the caller can act on — which is what that status is for
+ * here, and what `BUSINESS_RULE_VIOLATION` already carries.
+ *
+ * ONE message for every refusal, with the planner's own cause as the machine
+ * code beside it. Phrasing a sentence per cause would put a second vocabulary of
+ * refusals here, and the surface that has to phrase them for an author already
+ * holds the first: it asks `saveAsPatternRefusal` before it offers the button,
+ * and that answer carries what this one cannot — which parents a refused block
+ * requires, which nominated property was invalid. A caller reaching this has
+ * either skipped that question or disagreed with the server about the
+ * registry, and neither is a case for inventing prose here.
+ *
+ * The cause travels VERBATIM. It is a `PlanProblem`, which is what the caller
+ * compares against, and re-spelling it — screaming it, prefixing it — would make
+ * the two ends agree only for as long as someone maintained the translation.
+ */
+function refusal(refused: PlanRefusal): NextlyError {
+  return new NextlyError({
+    code: "BUSINESS_RULE_VIOLATION",
+    publicMessage: "The selection cannot be saved as a section.",
+    publicData: {
+      errors: [
+        {
+          path: "selectedIds",
+          code: refused.problem,
+          message: "The selection cannot be saved as a section.",
+        },
+      ],
+    },
+    logMessage: "Refused a save-as-pattern request",
+    logContext: { reason: "save-pattern-refused", problem: refused.problem },
+  });
+}
+
+/**
+ * The request, or the refusal that it is not one.
+ *
+ * Only what THIS route needs to do its own job is checked here: the planner
+ * takes a document and a list of ids, and handing it something else is a
+ * `TypeError` reported as a server fault rather than as the bad request it is.
+ *
+ * The metadata are deliberately NOT validated. Which of them are required, how
+ * long they may be, and whether a slug is already taken are the collection's
+ * rules, and it enforces them on every other path into the same table. A second
+ * copy here would be a copy that drifts — and it would drift SILENTLY, since
+ * both copies passing is indistinguishable from one of them being right.
+ */
+async function readRequest(req: Request): Promise<SavePatternRequest> {
+  const body = objectAt(await readJson(req), "body");
+  if (body.dryRun !== undefined && typeof body.dryRun !== "boolean") {
+    throw malformed("dryRun");
+  }
+  const source = sourceAt(body.source);
+  return {
+    document: documentAt(body.document),
+    selectedIds: selectionAt(body.selectedIds),
+    fields: settableFields(objectAt(body.fields, "fields")),
+    ...(body.dryRun === true ? { dryRun: true } : {}),
+    ...(source === undefined ? {} : { source }),
+  };
+}
+
+/**
+ * The stored entry the document is, where the request names one, or the
+ * refusal that it is not an address. Only its collection, id and field are
+ * kept: nothing else the caller sent travels with it.
+ */
+function sourceAt(value: unknown): CopySourceAddress | undefined {
+  if (value === undefined) return undefined;
+  const source = objectAt(value, "source");
+  const named = (key: string): string | undefined => {
+    const part = source[key];
+    return typeof part === "string" && part !== "" ? part : undefined;
+  };
+  const collection = named("collection");
+  const id = named("id");
+  const field = named("field");
+  if (collection === undefined || id === undefined) throw malformed("source");
+  if (source.field !== undefined && field === undefined) {
+    throw malformed("source");
+  }
+  return { collection, id, ...(field === undefined ? {} : { field }) };
+}
+
+/**
+ * The document the selection was made in, or the refusal that it is not one.
+ *
+ * Asked HERE as well as inside the planner, and the two are different questions.
+ * The planner asks whether a document can be edited at all, and refuses one that
+ * cannot as a rule the caller broke; this asks whether the REQUEST carried a
+ * document, which is a question about the request and answers 400. Without it a
+ * body of `{"document":{}}` reaches the planner as a well-formed request whose
+ * refusal reads as the author's fault.
+ *
+ * The same published question either way, never a second predicate for it:
+ * `documentRefusal` is the op layer's own rule about what it will edit.
+ */
+function documentAt(value: unknown): BlockDocument {
+  if (documentRefusal(value) !== undefined) throw malformed("document");
+  return value as BlockDocument;
+}
+
+/**
+ * One part of the request that has to be an object, or the refusal that it is
+ * not.
+ *
+ * Three parts ask the same question, and asking it in one place is what keeps
+ * them answering it identically: written out three times, the check that `null`
+ * is an object too is three chances to forget it, and forgetting it hands the
+ * planner a `null` document that fails as a server fault rather than as the bad
+ * request it is.
+ */
+function objectAt(value: unknown, path: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null) throw malformed(path);
+  return value as Record<string, unknown>;
+}
+
+/**
+ * The selected ids, or the refusal that they are not a selection.
+ *
+ * An empty list is refused HERE rather than left to the planner. The planner
+ * would call it `empty` and this would answer 422 — a rule the caller broke
+ * rather than a request that could not be read — and a caller who selected
+ * nothing has not broken a rule about patterns. Which side answers decides
+ * which status the caller gets, and only one of them is true.
+ */
+function selectionAt(value: unknown): readonly string[] {
+  const ids = Array.isArray(value) ? (value as unknown[]) : undefined;
+  if (ids === undefined || ids.length === 0) throw malformed("selectedIds");
+  if (!ids.every(id => typeof id === "string" && id !== "")) {
+    throw malformed("selectedIds");
+  }
+  return ids as string[];
+}
+
+/**
+ * The metadata this write will carry, and nothing else the caller sent.
+ *
+ * Unknown keys are DROPPED rather than refused. A refusal would make an older
+ * editor unable to save against a newer server the moment the dialog learns a
+ * field, for a key that would have been ignored anyway; dropping keeps the two
+ * versions working together, which is what a route serving a browser it does not
+ * ship with has to do.
+ */
+function settableFields(fields: Record<string, unknown>): SavePatternFields {
+  const kept: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(fields)) {
+    if (SETTABLE_FIELDS.has(name)) kept[name] = value;
+  }
+  return kept as unknown as SavePatternFields;
+}
+
+/** The body as JSON, or the refusal that it was not JSON at all. */
+async function readJson(req: Request): Promise<unknown> {
+  try {
+    return (await req.json()) as unknown;
+  } catch {
+    throw malformed("body");
+  }
+}
+
+/**
+ * What a request this route cannot read answers with.
+ *
+ * The PATH is named and the value is not. Which part of the request was wrong is
+ * what a caller needs to fix it; echoing what they sent would put arbitrary
+ * caller content into an error body, which the public-message rubric refuses for
+ * every other error in the codebase.
+ */
+function malformed(path: string): NextlyError {
+  return NextlyError.validation({
+    errors: [
+      {
+        path,
+        code: "INVALID_TYPE",
+        message: "The request is not a save-as-section request.",
+      },
+    ],
+  });
+}
+
+/**
+ * The route declaration, thin on purpose.
+ *
+ * Everything it decides lives in {@link savePattern}, which answers with a
+ * finished `Response` rather than a body to be wrapped: the status a create
+ * carries and the envelope it carries it in are two halves of one answer, and
+ * splitting them puts the status here and the shape there.
+ *
+ * What is left is the shape of the CONTRIBUTION — the method, the path, and the
+ * fact that it declares no permission — which is the part a reader of
+ * `contributes.routes` needs to see without following a call.
+ */
+export function savePatternRoute(
+  /** The site's block registry, whose nesting rules the plan follows. */
+  blocks: BlockRegistryReader
+): {
+  method: "POST";
+  path: string;
+  requiredPermission: (scope: PluginRoutePermissionScope) => string;
+  handler: (req: Request, ctx: SavePatternRouteContext) => Promise<Response>;
+} {
+  return {
+    method: "POST",
+    path: SAVE_PATTERN_ROUTE_PATH,
+    // No `public: true`, which is what makes this authenticated, and a COMPUTED
+    // `requiredPermission`, which is what keeps it callable on a site that
+    // renamed the collection. See the module docblock.
+    requiredPermission: ({ collection }) => collection(PATTERNS_SLUG, "create"),
+    handler: (req, ctx) => savePattern(req, ctx, blocks),
+  };
+}

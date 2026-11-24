@@ -1,0 +1,564 @@
+/**
+ * The scheduled drain sweeps plugins' one-purpose secrets.
+ *
+ * An install that only mints secrets may make no write that offers the sweep,
+ * and one that goes quiet after minting makes none at all; expired rows keep a
+ * subject and data in clear. The drain is the trigger that keeps running, so
+ * it sweeps them on a marker of its own, within its wall-clock promise.
+ */
+
+import { describe, expect, it, vi } from "vitest";
+
+import { resolveAuditRetentionConfig } from "../../audit/retention-config";
+import { resolveEmailRetentionConfig } from "../../email/retention-config";
+import {
+  buildRetentionPasses,
+  type retentionPoliciesFrom,
+} from "../../retention/passes";
+import {
+  AUDIT_RETENTION_DRAIN_GATE_KEY,
+  CACHE_TAG_EXPIRIES_RETENTION_DRAIN_GATE_KEY,
+  EMAIL_RETENTION_DRAIN_GATE_KEY,
+  ONE_TIME_SECRETS_RETENTION_DRAIN_GATE_KEY,
+  ONE_TIME_SECRETS_RETENTION_GATE_KEY,
+  PLUGIN_EVENTS_RETENTION_DRAIN_GATE_KEY,
+  PREVIEW_LINKS_RETENTION_DRAIN_GATE_KEY,
+  RECEIVED_WEBHOOKS_RETENTION_DRAIN_GATE_KEY,
+  type RetentionGateStore,
+  WEBHOOK_RETENTION_GATE_KEY,
+} from "../../retention/gate";
+import { resolveWebhookRetentionConfig } from "../retention-config";
+import { runDrain } from "../run-drain";
+
+type DrainRetention = NonNullable<Parameters<typeof runDrain>[0]["retention"]>;
+type PolicyName = keyof ReturnType<typeof retentionPoliciesFrom>;
+
+/**
+ * For every policy the shared list names: the drain input that carries it
+ * alone, and the gate the drain claims when it handles it. Keyed by the list's
+ * own type, so a domain added there does not compile until it is entered here,
+ * and the test below then runs it.
+ */
+const DRAIN_PASS: Record<
+  PolicyName,
+  { input: Partial<DrainRetention>; claims: string }
+> = {
+  webhookPolicy: {
+    input: { policy: resolveWebhookRetentionConfig(undefined) ?? undefined },
+    claims: WEBHOOK_RETENTION_GATE_KEY,
+  },
+  auditPolicy: {
+    input: { auditPolicy: resolveAuditRetentionConfig() },
+    claims: AUDIT_RETENTION_DRAIN_GATE_KEY,
+  },
+  emailPolicy: {
+    input: { emailPolicy: resolveEmailRetentionConfig({ maxAgeMs: 1000 }) },
+    claims: EMAIL_RETENTION_DRAIN_GATE_KEY,
+  },
+  oneTimeSecrets: {
+    input: { oneTimeSecrets: true },
+    claims: ONE_TIME_SECRETS_RETENTION_DRAIN_GATE_KEY,
+  },
+  receivedWebhooks: {
+    input: { receivedWebhooks: true },
+    claims: RECEIVED_WEBHOOKS_RETENTION_DRAIN_GATE_KEY,
+  },
+  pluginEvents: {
+    input: { pluginEvents: true },
+    claims: PLUGIN_EVENTS_RETENTION_DRAIN_GATE_KEY,
+  },
+  previewLinks: {
+    input: { previewLinks: true },
+    claims: PREVIEW_LINKS_RETENTION_DRAIN_GATE_KEY,
+  },
+  cacheTagExpiries: {
+    input: { cacheTagExpiries: true },
+    claims: CACHE_TAG_EXPIRIES_RETENTION_DRAIN_GATE_KEY,
+  },
+};
+
+/** A database with no events and no deliveries due, so only retention runs. */
+function idleDb(): never {
+  return {
+    select: async () => [],
+    update: async () => [],
+    insert: async () => [],
+    delete: async () => 0,
+    transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(undefined),
+  } as never;
+}
+
+/**
+ * An adapter holding one expired secret, which the sweep removes. The secret is
+ * a link, with no place in a code's issue order, so it takes no older codes with
+ * it. The sweep reads the batch again inside its transaction, so the
+ * transaction offers `select` as a real adapter's does.
+ */
+function oneExpiredSecret() {
+  const tables: string[] = [];
+  let left = 1;
+  const remove = vi.fn(async () => {
+    const removed = left;
+    left = 0;
+    return removed;
+  });
+  const select = async (table: string) => {
+    tables.push(table);
+    return left > 0 ? [{ id: "expired", kind: "link", issueSeq: null }] : [];
+  };
+  return {
+    tables,
+    remove,
+    adapter: {
+      select,
+      delete: remove,
+      transaction: async (
+        fn: (tx: {
+          delete: typeof remove;
+          select: typeof select;
+        }) => Promise<unknown>
+      ) => fn({ delete: remove, select }),
+    },
+  };
+}
+
+function drain(
+  retention: Parameters<typeof runDrain>[0]["retention"],
+  clock: () => Date = () => new Date(0),
+  maxDurationMs?: number
+): ReturnType<typeof runDrain> {
+  return runDrain({
+    fanOut: { db: idleDb(), loadEndpoints: async () => [] } as never,
+    deliver: { db: idleDb(), now: clock } as never,
+    maxDurationMs,
+    retention,
+  });
+}
+
+/**
+ * An adapter whose cache tag expiry ledger holds two batches of rows past its
+ * age, as the ledger's prune finds and deletes them.
+ */
+function ledgerWithRowsToPrune() {
+  let batches = 2;
+  const deleted: number[] = [];
+  const db = {
+    select: () => ({
+      from: () => ({
+        where: () => ({
+          orderBy: () => ({
+            limit: async () => {
+              if (batches === 0) return [];
+              batches -= 1;
+              return Array.from({ length: 1000 }, (_, i) => ({
+                id: `${batches}-${i}`,
+              }));
+            },
+          }),
+        }),
+      }),
+    }),
+    delete: () => ({
+      where: async () => {
+        deleted.push(1000);
+        return { changes: 1000 };
+      },
+    }),
+  };
+  return {
+    deleted,
+    adapter: {
+      select: async () => [],
+      delete: async () => 0,
+      getCapabilities: () => ({ dialect: "sqlite" as const }),
+      tableExists: async () => true,
+      getDrizzle: () => db,
+    },
+  };
+}
+
+describe("the scheduled drain and the cache tag expiry ledger", () => {
+  const claimAll = {
+    claim: async () => true,
+    release: async () => undefined,
+  };
+
+  it("prunes the ledger's rows on its turn, and reports how many", async () => {
+    const ledger = ledgerWithRowsToPrune();
+    const result = await drain({
+      cacheTagExpiries: true,
+      prune: { adapter: ledger.adapter } as never,
+      gate: claimAll,
+    });
+
+    expect(ledger.deleted).toHaveLength(2);
+    expect(result.pruned.cacheTagExpiries).toBe(2000);
+  });
+
+  it("stops pruning at the drain's budget", async () => {
+    const ledger = ledgerWithRowsToPrune();
+    // A clock already past the drain's budget once the turn has been claimed.
+    let calls = 0;
+    const result = await drain(
+      {
+        cacheTagExpiries: true,
+        prune: { adapter: ledger.adapter } as never,
+        gate: claimAll,
+      },
+      () => new Date(calls++ < 4 ? 0 : 60_000),
+      1000
+    );
+
+    expect(ledger.deleted.length).toBeLessThan(2);
+    expect(result.pruned.cacheTagExpiries).toBeLessThan(2000);
+  });
+
+  it("is left its share behind secrets and preview-link backlogs that never end", async () => {
+    // Every sweep batch takes time and there is always another, so a sweep
+    // handed the whole remainder would spend it all and the ledger's turn,
+    // last, would never run.
+    let clock = 0;
+    const remove = async () => {
+      clock += 50;
+      return 500;
+    };
+    const ledger = ledgerWithRowsToPrune();
+    // Links, outside any code's issue order, read again inside each batch's
+    // transaction: every batch removes a full one, so the backlog never ends.
+    const select = async () =>
+      Array.from({ length: 500 }, (_, i) => ({
+        id: `row-${i}`,
+        kind: "link",
+        issueSeq: null,
+      }));
+    const adapter = {
+      ...ledger.adapter,
+      select,
+      delete: remove,
+      transaction: async (
+        fn: (tx: {
+          delete: typeof remove;
+          select: typeof select;
+        }) => Promise<unknown>
+      ) => fn({ delete: remove, select }),
+    };
+
+    const result = await drain(
+      {
+        oneTimeSecrets: true,
+        previewLinks: true,
+        cacheTagExpiries: true,
+        prune: { adapter } as never,
+        gate: claimAll,
+      },
+      () => new Date(clock),
+      1_000
+    );
+
+    // The secrets backlog was swept, not skipped by a failing sweep.
+    expect(result.pruned.oneTimeSecrets).toBeGreaterThan(0);
+    expect(ledger.deleted.length).toBeGreaterThan(0);
+    expect(result.pruned.cacheTagExpiries).toBeGreaterThan(0);
+  });
+});
+
+describe("the scheduled drain and plugins' one-purpose secrets", () => {
+  it("sweeps them with no other retention configured", async () => {
+    const claimed: string[] = [];
+    const store = oneExpiredSecret();
+
+    const result = await drain({
+      oneTimeSecrets: true,
+      prune: { adapter: store.adapter } as never,
+      gate: {
+        claim: async (key: string) => {
+          claimed.push(key);
+          return true;
+        },
+        release: async () => undefined,
+      },
+    });
+
+    expect(claimed).toContain(ONE_TIME_SECRETS_RETENTION_DRAIN_GATE_KEY);
+    expect(store.tables).toContain("nextly_one_time_secrets");
+    expect(result.pruned.oneTimeSecrets).toBe(1);
+  });
+
+  it.each(Object.entries(DRAIN_PASS))(
+    "runs a pass for %s on its own",
+    async (_, { input, claims }) => {
+      const claimed: string[] = [];
+      await drain({
+        ...input,
+        prune: {
+          adapter: { select: async () => [], delete: async () => 0 },
+        } as never,
+        gate: {
+          claim: async (key: string) => {
+            claimed.push(key);
+            return true;
+          },
+          release: async () => undefined,
+        },
+      });
+      expect(claimed).toContain(claims);
+    }
+  );
+
+  it("does not reject when the sweep fails and the logger throws too", async () => {
+    // Retention is housekeeping after delivery: a failing sweep reported
+    // through a logger that itself throws must not reject the drain.
+    const result = await drain({
+      oneTimeSecrets: true,
+      prune: {
+        adapter: {
+          select: async () => {
+            throw new Error("database gone");
+          },
+          delete: async () => 0,
+        },
+        logger: {
+          warn: () => {
+            throw new Error("logger gone");
+          },
+        },
+      } as never,
+      gate: { claim: async () => true, release: async () => undefined },
+    });
+    expect(result.pruned.oneTimeSecrets).toBe(0);
+  });
+
+  it("claims a marker the capped write path cannot take from it", () => {
+    expect(ONE_TIME_SECRETS_RETENTION_DRAIN_GATE_KEY).not.toBe(
+      ONE_TIME_SECRETS_RETENTION_GATE_KEY
+    );
+  });
+
+  it("hands the turn back when the deadline passes after the claim", async () => {
+    // Claiming is two statements and can spend what remained. A turn kept
+    // without a sweep would hold the next attempt off for a whole interval.
+    let clock = 0;
+    const released: string[] = [];
+    const store = oneExpiredSecret();
+    const gate: RetentionGateStore = {
+      claim: async (key: string) => {
+        if (key === ONE_TIME_SECRETS_RETENTION_DRAIN_GATE_KEY) clock = 10_000;
+        return true;
+      },
+      release: async (key: string) => {
+        released.push(key);
+      },
+    };
+
+    const result = await drain(
+      {
+        oneTimeSecrets: true,
+        prune: { adapter: store.adapter } as never,
+        gate,
+      },
+      () => new Date(clock),
+      1_000
+    );
+
+    expect(store.tables).not.toContain("nextly_one_time_secrets");
+    expect(result.pruned.oneTimeSecrets).toBe(0);
+    expect(released).toContain(ONE_TIME_SECRETS_RETENTION_DRAIN_GATE_KEY);
+  });
+});
+
+describe("the scheduled drain and plugins' durable events", () => {
+  it("sweeps finished events with their deliveries, with no other retention configured", async () => {
+    let left = 1;
+    const removed: string[] = [];
+    const select = async (table: string) =>
+      table === "nextly_plugin_events" && left > 0 ? [{ id: "finished" }] : [];
+    const remove = vi.fn(async (table: string) => {
+      removed.push(table);
+      if (table !== "nextly_plugin_events") return 1;
+      left = 0;
+      return 1;
+    });
+    const result = await drain({
+      pluginEvents: true,
+      prune: {
+        adapter: {
+          select,
+          delete: remove,
+          transaction: async (
+            fn: (tx: {
+              delete: typeof remove;
+              select: typeof select;
+            }) => Promise<unknown>
+          ) => fn({ delete: remove, select }),
+        },
+      } as never,
+      gate: { claim: async () => true, release: async () => undefined },
+    });
+
+    // The deliveries first, then their event, in one transaction.
+    expect(removed).toEqual([
+      "nextly_plugin_event_deliveries",
+      "nextly_plugin_events",
+    ]);
+    expect(result.pruned.pluginEvents).toBe(1);
+  });
+});
+
+describe("the scheduled drain and plugins' received-webhook claims", () => {
+  const claimAll = {
+    claim: async () => true,
+    release: async () => undefined,
+  };
+
+  it("sweeps them with no other retention configured", async () => {
+    const tables: string[] = [];
+    let left = 1;
+    const remove = vi.fn(async (table: string) => {
+      const removed = table === "nextly_received_webhooks" ? left : 0;
+      left = 0;
+      return removed;
+    });
+    const result = await drain({
+      receivedWebhooks: true,
+      prune: {
+        adapter: {
+          select: async (table: string) => {
+            tables.push(table);
+            return left > 0 ? [{ deliveryKey: "old" }] : [];
+          },
+          delete: remove,
+          transaction: async (
+            fn: (tx: { delete: typeof remove }) => Promise<unknown>
+          ) => fn({ delete: remove }),
+        },
+      } as never,
+      gate: claimAll,
+    });
+
+    expect(tables).toContain("nextly_received_webhooks");
+    expect(remove).toHaveBeenCalledWith(
+      "nextly_received_webhooks",
+      expect.anything()
+    );
+    expect(result.pruned.receivedWebhooks).toBe(1);
+  });
+
+  it("is left its share behind earlier passes whose backlogs never end", async () => {
+    // Every table has another batch, and every batch takes time: a pass
+    // before this one that counted it out of the shares would take the whole
+    // remainder, and the claims would never be swept.
+    let clock = 0;
+    const tables: string[] = [];
+    const remove = async () => {
+      clock += 50;
+      return 500;
+    };
+    const select = async (table: string) => {
+      tables.push(table);
+      return Array.from({ length: 500 }, (_, i) => ({
+        id: `row-${i}`,
+        deliveryKey: `key-${i}`,
+      }));
+    };
+    const result = await drain(
+      {
+        auditPolicy: resolveAuditRetentionConfig({ activityMaxAgeMs: 1000 }),
+        receivedWebhooks: true,
+        prune: {
+          adapter: {
+            select,
+            delete: remove,
+            transaction: async (
+              fn: (tx: {
+                delete: typeof remove;
+                select: typeof select;
+              }) => Promise<unknown>
+            ) => fn({ delete: remove, select }),
+          },
+        } as never,
+        gate: claimAll,
+      },
+      () => new Date(clock),
+      1_000
+    );
+
+    expect(tables).toContain("nextly_received_webhooks");
+    expect(result.pruned.receivedWebhooks).toBeGreaterThan(0);
+  });
+});
+
+describe("the scheduled drain and recorded preview links", () => {
+  it("leaves them their share behind a secrets backlog that never ends", async () => {
+    // Every secrets batch takes time and there is always another, so a sweep
+    // given the whole remainder would spend it all and the preview-links
+    // sweep after it would never start.
+    let clock = 0;
+    const tables: string[] = [];
+    const remove = async () => {
+      clock += 50;
+      return 500;
+    };
+    // Links, outside any code's issue order, read again inside each batch's
+    // transaction: every batch removes a full one, so the backlog never ends.
+    const select = async (table: string) => {
+      tables.push(table);
+      return Array.from({ length: 500 }, (_, i) => ({
+        id: `row-${i}`,
+        kind: "link",
+        issueSeq: null,
+      }));
+    };
+    const adapter = {
+      select,
+      delete: remove,
+      transaction: async (
+        fn: (tx: {
+          delete: typeof remove;
+          select: typeof select;
+        }) => Promise<unknown>
+      ) => fn({ delete: remove, select }),
+    };
+
+    const result = await drain(
+      {
+        oneTimeSecrets: true,
+        previewLinks: true,
+        prune: { adapter } as never,
+        gate: { claim: async () => true, release: async () => undefined },
+      },
+      () => new Date(clock),
+      1_000
+    );
+
+    // The secrets backlog was swept, not skipped by a failing sweep.
+    expect(result.pruned.oneTimeSecrets).toBeGreaterThan(0);
+    expect(tables).toContain("nextly_one_time_secrets");
+    expect(tables).toContain("nextly_preview_links");
+  });
+});
+
+describe("the write paths' one-purpose secrets pass", () => {
+  it("does not reach the write when the sweep fails and the logger throws too", async () => {
+    // Every write offers this pass; a sweep failure reported through a
+    // throwing logger must stay inside it rather than fail the write.
+    const passes = buildRetentionPasses({
+      oneTimeSecrets: true,
+      adapter: {
+        select: async () => {
+          throw new Error("database gone");
+        },
+        delete: async () => 0,
+      } as never,
+      gate: { claim: async () => true, release: async () => undefined },
+      logger: {
+        warn: () => {
+          throw new Error("logger gone");
+        },
+      } as never,
+    });
+    const pass = passes.find(
+      candidate => candidate.key === ONE_TIME_SECRETS_RETENTION_GATE_KEY
+    );
+    await expect(pass?.run(2)).resolves.toBeUndefined();
+  });
+});

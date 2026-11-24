@@ -1,0 +1,287 @@
+/**
+ * A widget query is CALLER INPUT, so it must earn exactly what any other read
+ * earns and nothing more.
+ *
+ * `execute.test.ts` mocks `getNextly`, so it can only assert the arguments the
+ * executor builds -- it can never observe what the read path does with them.
+ * The claim this branch rests on ("we delegate enforcement to the ordinary read
+ * path") is therefore invisible to it: an argument that DISABLES a guard looks
+ * exactly like one that does not at a mock boundary. This boots a real Nextly
+ * on in-memory SQLite and runs the executor against it, so the enforcement is
+ * observed rather than restated.
+ *
+ * Two properties, both about the same thing:
+ *   - a caller the collection's read rule denies gets nothing;
+ *   - a `where` (or `sort`) naming a field with a read rule is REFUSED, the
+ *     same named refusal `GET /api/collections/:slug` gives, rather than
+ *     answered. Answering it is a field-value oracle: `count` with
+ *     `{ id: eq X, salary: { greater_than: N } }` replies 1 or 0, and ~20 of
+ *     those bisect a figure the caller may never read.
+ */
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import { userWhoMay } from "../../../__tests__/fixtures/permission-holders";
+import { defineCollection, text } from "../../../config";
+import {
+  createTestNextly,
+  type TestNextly,
+} from "../../../plugins/test-nextly";
+import type { ReadCaller } from "../../../services/dashboard/readable-resources";
+import { refreshCollectionSources } from "../collection-sources";
+import { executeWidgetQuery } from "../execute";
+import { validateWidgetQuery } from "../query";
+
+let current: TestNextly | undefined;
+
+afterEach(async () => {
+  await current?.destroy();
+  current = undefined;
+});
+
+const EMPLOYEES = "employees";
+
+/** The caller under test: a real editor, never an admin, never trusted. */
+const editor: ReadCaller = {
+  user: { id: "editor-1", roles: ["editor"] },
+};
+
+type WriteHandler = {
+  createEntry: (
+    p: Record<string, unknown>,
+    data: Record<string, unknown>
+  ) => Promise<{ success: boolean; data: Record<string, unknown> | null }>;
+};
+
+/**
+ * A collection whose ROWS are readable by anyone but whose `salary` field
+ * carries a read rule -- the shape a field rule exists for, and the shape the
+ * oracle lives in. `readableRows` flips the collection-level rule so the same
+ * fixture serves the permission test too.
+ */
+async function boot(readableRows: boolean): Promise<TestNextly> {
+  const t = await createTestNextly({
+    collections: [
+      defineCollection({
+        slug: EMPLOYEES,
+        access: {
+          read: () => readableRows,
+          create: () => true,
+          update: () => true,
+        },
+        fields: [
+          // Labelled, so the grouped answer below can show the label reaching it from a real
+          // registry: a field the answer describes carries the label a reader sees.
+          text({ name: "title", label: "Job title" }),
+          text({ name: "salary", access: { read: () => false } }),
+        ],
+      }),
+    ],
+  });
+
+  const handler = t.getService("collectionsHandler") as unknown as WriteHandler;
+  await handler.createEntry(
+    { collectionName: EMPLOYEES, overrideAccess: true },
+    { title: "alice", salary: "120000" }
+  );
+  await handler.createEntry(
+    { collectionName: EMPLOYEES, overrideAccess: true },
+    { title: "bob", salary: "60000" }
+  );
+  // A code rule only narrows the permission, so the editor holds read on
+  // employees and the collection's read rule decides.
+  await userWhoMay(t, editor.user.id, "read", [EMPLOYEES]);
+
+  // What `POST /api/dashboard/query` does before resolving any query: publish
+  // the collection sources from the LIVE collection registry. Boot does not do
+  // it -- the registry is not up that early and it keeps changing afterwards --
+  // so a test that drives the domain directly has to make the same call the
+  // endpoint makes. Against a real instance this also proves the derivation
+  // reaches a genuinely booted `dynamic_collections`, which the unit test's
+  // faked container cannot.
+  await refreshCollectionSources();
+  return t;
+}
+
+describe("executeWidgetQuery against a real instance", () => {
+  it("returns rows to a caller the collection's read rule admits", async () => {
+    // The positive control. Without it, every assertion below is satisfied by
+    // a widget path that is simply broken for everyone.
+    current = await boot(true);
+
+    const result = await executeWidgetQuery(
+      validateWidgetQuery({ source: `collection:${EMPLOYEES}`, op: "count" }),
+      editor
+    );
+
+    expect(result).toEqual({ op: "count", total: 2 });
+  });
+
+  it("denies a caller the collection's read rule refuses", async () => {
+    current = await boot(false);
+
+    await expect(
+      executeWidgetQuery(
+        validateWidgetQuery({ source: `collection:${EMPLOYEES}`, op: "count" }),
+        editor
+      )
+    ).rejects.toThrow();
+  });
+
+  it("REFUSES a where that names a field carrying a read rule", async () => {
+    current = await boot(true);
+
+    // The oracle, written out. A count answers 1 or 0 for a guessed value and
+    // hands back no row to redact, so redaction never sees the value leave.
+    const probe = validateWidgetQuery({
+      source: `collection:${EMPLOYEES}`,
+      op: "count",
+      where: { salary: { equals: "120000" } },
+    });
+
+    await expect(executeWidgetQuery(probe, editor)).rejects.toThrow(
+      /FIELD_NOT_FILTERABLE|cannot be used to filter|Validation failed/
+    );
+  });
+
+  it("REFUSES a sort that names a field carrying a read rule", async () => {
+    // The ordering variant of the same leak: the rows come back redacted and
+    // their ORDER is a comparison of the hidden column.
+    current = await boot(true);
+
+    const probe = validateWidgetQuery({
+      source: `collection:${EMPLOYEES}`,
+      op: "list",
+      sort: "-salary",
+      select: ["id"],
+    });
+
+    await expect(executeWidgetQuery(probe, editor)).rejects.toThrow(
+      /FIELD_NOT_SORTABLE|cannot be used to sort|Validation failed/
+    );
+  });
+
+  it("still filters on a field the caller may read", async () => {
+    // The negative control. An executor that refused every filter would pass
+    // both refusal tests above and ship a dashboard that renders nothing.
+    current = await boot(true);
+
+    const result = await executeWidgetQuery(
+      validateWidgetQuery({
+        source: `collection:${EMPLOYEES}`,
+        op: "count",
+        where: { title: { equals: "alice" } },
+      }),
+      editor
+    );
+
+    expect(result).toEqual({ op: "count", total: 1 });
+  });
+
+  it("answers a list's total as the read counted it, under the card's own filter", async () => {
+    // A card asking for one row of two learns there are two in all, which is what its
+    // "View all (N)" says; filtered to one, the total is one. Both come from the read that
+    // returned the rows, as this caller, so the number is the one the linked list shows.
+    current = await boot(true);
+
+    const all = await executeWidgetQuery(
+      validateWidgetQuery({
+        source: `collection:${EMPLOYEES}`,
+        op: "list",
+        select: ["title"],
+        limit: 1,
+      }),
+      editor
+    );
+    const filtered = await executeWidgetQuery(
+      validateWidgetQuery({
+        source: `collection:${EMPLOYEES}`,
+        op: "list",
+        select: ["title"],
+        where: { title: { equals: "alice" } },
+        limit: 1,
+      }),
+      editor
+    );
+
+    expect(all).toMatchObject({ op: "list", total: 2 });
+    expect((all as { items: unknown[] }).items).toHaveLength(1);
+    expect(filtered).toMatchObject({ op: "list", total: 1 });
+  });
+});
+
+describe("a grouped widget query against a real instance", () => {
+  it("answers buckets to a caller the collection admits", async () => {
+    // The positive control for the grouped path: without it, the refusals
+    // below are satisfied by a path that is simply broken for everyone.
+    current = await boot(true);
+
+    const result = await executeWidgetQuery(
+      validateWidgetQuery({
+        source: `collection:${EMPLOYEES}`,
+        op: "groupBy",
+        groupBy: "title",
+      }),
+      editor
+    );
+
+    // The answer describes the field it was grouped by, so a card can head and label its
+    // bars, and the description is the source's own: its label and its kind.
+    expect(result).toEqual({
+      op: "groupBy",
+      buckets: [
+        { value: "alice", count: 1 },
+        { value: "bob", count: 1 },
+      ],
+      field: { name: "title", label: "Job title", type: "string" },
+    });
+  });
+
+  it("denies a grouped query from a caller the read rule refuses", async () => {
+    // The buckets would otherwise describe rows this caller cannot list at
+    // all, which is the aggregate version of the same disclosure.
+    current = await boot(false);
+
+    await expect(
+      executeWidgetQuery(
+        validateWidgetQuery({
+          source: `collection:${EMPLOYEES}`,
+          op: "groupBy",
+          groupBy: "title",
+        }),
+        editor
+      )
+    ).rejects.toThrow();
+  });
+
+  it("REFUSES grouping by a field carrying a read rule", async () => {
+    current = await boot(true);
+
+    // Grouping by `salary` would return its distinct values AS the bucket
+    // labels -- the whole set in one request, where a `where` yields one value
+    // per probe, and redaction never sees either because no row carries it.
+    const probe = validateWidgetQuery({
+      source: `collection:${EMPLOYEES}`,
+      op: "groupBy",
+      groupBy: "salary",
+    });
+
+    // Serialized rather than matched on `.message`: a validation refusal
+    // carries a generic public message and keeps the per-field reason in
+    // `errors`, so asserting the message would assert nothing about WHY.
+    const refusal = await executeWidgetQuery(probe, editor).then(
+      () => "the grouped query was answered",
+      (error: unknown) => {
+        const raised = error as { code?: unknown; publicData?: unknown };
+        return JSON.stringify({
+          code: raised.code,
+          publicData: raised.publicData,
+        });
+      }
+    );
+
+    expect(refusal).toContain("FIELD_NOT_GROUPABLE");
+    // The value itself must not travel in the refusal either.
+    expect(refusal).not.toContain("120000");
+  });
+});

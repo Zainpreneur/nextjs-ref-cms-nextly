@@ -1,0 +1,10 @@
+{
+  "title": "Getting Started",
+  "pages": [
+    "quick-start",
+    "index",
+    "installation",
+    "build-a-blog",
+    "project-structure"
+  ]
+}

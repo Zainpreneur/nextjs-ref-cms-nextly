@@ -1,0 +1,195 @@
+/**
+ * Audit tables — PostgreSQL.
+ *
+ * Tables: auditLog, activityLog.
+ * Moved verbatim from packages/nextly/src/database/schema/postgres.ts as part
+ * of Plan A schemas consolidation. No behavior change.
+ *
+ * Drizzle v2 relations for this feature live centrally in
+ * `../_dialect-bundles/postgres.relations.ts` (defineRelations).
+ * cross-feature import. Re-exported at the bottom so namespace consumers
+ * see it.
+ *
+ * @module schemas/audit/postgres
+ * @since v0.0.3-alpha (Plan A — schemas consolidation)
+ */
+
+import { pgTable, text, timestamp, jsonb, varchar } from "drizzle-orm/pg-core";
+import type { PgBuildExtraConfigColumns } from "drizzle-orm/pg-core";
+
+import {
+  ACTIVITY_LOG_INDEXES,
+  AUDIT_LOG_INDEXES,
+  pgIndexes,
+} from "../_internal/core-indexes";
+
+import {
+  AUDIT_ACTOR_KIND_LENGTH,
+  AUDIT_ACTOR_PRINCIPAL_KIND_LENGTH,
+  AUDIT_KIND_LENGTH,
+  AUDIT_TARGET_PRINCIPAL_KIND_LENGTH,
+} from "./widths";
+
+// Append-only by application convention, with two exceptions the application
+// itself performs and an operator hardening this table has to allow for:
+//
+//   REVOKE UPDATE, DELETE ON audit_log FROM app_role;
+//   GRANT UPDATE (ip_address, user_agent, identity_erased_at)
+//     ON audit_log TO app_role;
+//   GRANT DELETE ON audit_log TO app_role;
+//
+// UPDATE, column-scoped: erasing the address and client a deleted account
+// connected from is an UPDATE, and it runs inside the deletion's transaction,
+// so a blanket revoke makes deleting a user fail. Scoping it to those three
+// columns keeps every other one immutable while allowing exactly that erasure.
+//
+// DELETE: retention needs it. `audit.retention.authMaxAgeMs` prunes rows past
+// their window, and a role without DELETE fails every pass silently, since
+// retention must never fail the request that offered it — so the table grows
+// unbounded while the setting reads as enforced. Revoke it only together with
+// `audit: { retention: { authMaxAgeMs: false } }`, so the configuration says
+// what the privileges actually do.
+//
+// The append-only posture and these two duties only look contradictory while
+// the grant is all-or-nothing.
+/** `audit_log` columns, a fresh builder record per call (see `core-table-contributions`). */
+export function auditLogColumns() {
+  return {
+    id: text("id").primaryKey(),
+    kind: varchar("kind", { length: AUDIT_KIND_LENGTH }).notNull(),
+    actorUserId: text("actor_user_id"),
+    targetUserId: text("target_user_id"),
+    ipAddress: varchar("ip_address", { length: 45 }),
+    userAgent: text("user_agent"),
+    metadata: jsonb("metadata"),
+    createdAt: timestamp("created_at", { withTimezone: false })
+      .defaultNow()
+      .notNull(),
+    // When this row's request identifiers were erased, and NULL while they
+    // were not. `ip_address` and `user_agent` are nullable for rows that
+    // never carried them, so a bare NULL cannot say whether a person was
+    // removed or was never recorded — which is the evidence an erasure
+    // request needs.
+    identityErasedAt: timestamp("identity_erased_at", {
+      withTimezone: false,
+    }),
+    // Who acted, by kind: "staff", "apiKey", "core", "anonymous" (nobody
+    // identified, as on a failed sign-in), or a plugin's kind of signed-in
+    // person ("<plugin>:<name>"). NULL on rows written before the column
+    // existed, which read as they always did.
+    actorKind: varchar("actor_kind", { length: AUDIT_ACTOR_KIND_LENGTH }),
+    // A plugin-defined person, named apart from the staff columns above: a
+    // person's id in `actor_user_id` would be read as a staff user's, and
+    // one that is not a staff user's as an erased account. Once the person is
+    // reported deleted, the id is replaced by a keyed digest of kind and id.
+    actorPrincipalKind: varchar("actor_principal_kind", {
+      length: AUDIT_ACTOR_PRINCIPAL_KIND_LENGTH,
+    }),
+    actorPrincipalId: varchar("actor_principal_id", { length: 191 }),
+    targetPrincipalKind: varchar("target_principal_kind", {
+      length: AUDIT_TARGET_PRINCIPAL_KIND_LENGTH,
+    }),
+    targetPrincipalId: varchar("target_principal_id", { length: 191 }),
+  };
+}
+
+/** `audit_log` indexes, from `AUDIT_LOG_INDEXES`. */
+export function auditLogExtraConfig(
+  t: PgBuildExtraConfigColumns<ReturnType<typeof auditLogColumns>>
+) {
+  return pgIndexes(AUDIT_LOG_INDEXES, t);
+}
+
+// The same tables in another dialect's Drizzle builders: each dialect's
+// column functions are distinct, so the declarations cannot be shared.
+// fallow-ignore-next-line code-duplication
+export const auditLog = pgTable(
+  "audit_log",
+  auditLogColumns(),
+  auditLogExtraConfig
+);
+
+/** `activity_log` columns, a fresh builder record per call (see `core-table-contributions`). */
+export function activityLogColumns() {
+  return {
+    id: text("id").primaryKey(),
+    userId: text("user_id").notNull(),
+    /**
+     * What KIND of caller `user_id` refers to.
+     *
+     * `user_id` is already documented as "the actor, as an opaque reference
+     * that outlives their account" — the name is historical, the meaning is the
+     * actor. What it could never say is WHICH KIND, so a write had to be by a
+     * signed-in person to be recordable at all: any other actor was refused and
+     * left no trace. Imports, API-key writes, job writes and bulk edits were
+     * invisible rather than merely unattributed, and nothing about them is
+     * recoverable after the fact.
+     *
+     * With the kind on the row, `user_id` holds a user's id, an API key's own
+     * id, or a system caller's name, and the reader knows which. The accountable
+     * human is derived rather than stored twice: for a key that is the key's
+     * owner, which the keys table holds and outlives this row.
+     *
+     * NULL on rows written before this existed. Those are all user writes, since
+     * no other kind was recordable — a fact about the old gate rather than an
+     * assumption, so a reader may read NULL as `"user"`.
+     */
+    actorType: text("actor_type"),
+    userName: text("user_name"),
+    userEmail: text("user_email"),
+    action: varchar("action", { length: 10 }).notNull(), // 'create' | 'update' | 'delete'
+    collection: varchar("collection", { length: 255 }).notNull(),
+    entryId: text("entry_id"),
+    entryTitle: text("entry_title"),
+    /** The language this mutation was made in; see `documentRefOf`. */
+    locale: text("locale"),
+    /** What the row is ABOUT; see `documentRefOf`. NULL on legacy rows. */
+    subjectKind: text("subject_kind"),
+    metadata: text("metadata"), // JSON string for additional context
+    createdAt: timestamp("created_at", { withTimezone: false })
+      .defaultNow()
+      .notNull(),
+    identityErasedAt: timestamp("identity_erased_at", { withTimezone: false }),
+  };
+}
+
+/** `activity_log` indexes, from `ACTIVITY_LOG_INDEXES`. */
+export function activityLogExtraConfig(
+  t: PgBuildExtraConfigColumns<ReturnType<typeof activityLogColumns>>
+) {
+  return pgIndexes(ACTIVITY_LOG_INDEXES, t);
+}
+
+/**
+ * Activity log table for recording user actions across all collections.
+ *
+ * Used by the dashboard activity feed to show recent create/update/delete
+ * operations. User name and email are denormalized to avoid JOINs on every
+ * dashboard load. Entry title is a snapshot at action time.
+ *
+ * `user_id` carries NO foreign key, deliberately. It is an opaque historical
+ * reference to whoever acted, and it has to outlive them: a cascade would let
+ * the subject of an audit trail erase it by being deleted, and a restricting
+ * constraint would make deleting an account that ever did anything fail
+ * outright. The actor's identity is instead erased in place —
+ * `eraseActorPersonalData` NULLs `user_name` / `user_email` and stamps
+ * `identity_erased_at` — so the audit FACT survives while the personal data
+ * does not.
+ *
+ * `user_name` / `user_email` are therefore nullable: NULL means erased, and
+ * `identity_erased_at` records when, which is the evidence an erasure request
+ * needs and which a bare NULL cannot supply. It times THIS ROW's erasure
+ * rather than the account's deletion: for an entry erased by a deletion the
+ * two coincide, because the erasure runs inside that transaction, and for one
+ * written after the account was already gone nothing retains when that
+ * deletion happened — so naming it for the deletion would put a number in an
+ * audit field that no record supports.
+ *
+ * Retention: pruned on the schedule in `audit.retention.activityMaxAgeMs`,
+ * 90 days by default.
+ */
+export const activityLog = pgTable(
+  "activity_log",
+  activityLogColumns(),
+  activityLogExtraConfig
+);

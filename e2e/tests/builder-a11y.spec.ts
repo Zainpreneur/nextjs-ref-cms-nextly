@@ -1,0 +1,240 @@
+/**
+ * The page builder, measured against WCAG 2.2 AA by axe.
+ *
+ * A scan is the only instrument here that can be a BOUNDARY rather than a
+ * habit. The unit suites can assert that a control has a label and that a
+ * region has a name; they cannot see contrast, because jsdom applies no
+ * stylesheet, and they cannot see the tree an assistive technology actually
+ * walks, because that tree is the browser's.
+ *
+ * ## It scans the whole page, deliberately
+ *
+ * The editor takes the window, so nearly everything visible IS the editor —
+ * and a violation on the admin behind it is one an author reaches the moment
+ * they leave. Rooting the scan at the editor's own container would read as
+ * tighter and would mostly hide the same page from itself.
+ *
+ * No rule is disabled. The admin names the browser tab for every screen it
+ * renders, so `document-title` (WCAG 2.4.2) holds here like any other rule. An
+ * ignore list is how a guard stops meaning anything.
+ *
+ * ## Why the violations are ENUMERATED rather than counted
+ *
+ * `expect(violations).toHaveLength(0)` is the obvious assertion and a bad one:
+ * when it fails it says "expected 3 to be 0", which is a number rather than a
+ * defect. The helper below reports rule ids and the elements carrying them, so
+ * a failure names what to fix.
+ *
+ * @module tests/builder-a11y.spec
+ */
+import AxeBuilder from "@axe-core/playwright";
+import { expect, type Page } from "@playwright/test";
+
+import { test } from "./support/test";
+import { gotoAdmin, type Theme } from "./support/admin";
+import { LOCK } from "./support/locks";
+
+// Shares state with other specs; see support/locks.ts for what each lock guards.
+test.describe.configure({ lock: [LOCK.homepage] });
+
+/**
+ * The tags that define "AA", stated rather than left to axe's defaults.
+ *
+ * `wcag22aa` is the level B-23 names. The earlier levels are included because
+ * 2.2 is additive: a page failing a 2.0 rule fails 2.2 as well, and omitting
+ * them would let a scan pass while breaking something older and more basic.
+ */
+const AA_TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
+
+/**
+ * The readiness anchor — NOT a scan root.
+ *
+ * `scanEditor` deliberately does not `.include()` this: the scan is whole-page,
+ * for the reason the module docblock gives. This constant only answers "has the
+ * editor finished opening", so the scan never runs against a page that has not
+ * arrived.
+ *
+ * Stated because the name invites the opposite reading, and acting on that
+ * reading would be a regression rather than a tightening: the one violation
+ * this suite has caught so far was admin chrome painted with a branded token —
+ * a real defect reachable from the builder, which a scan rooted here would not
+ * have seen.
+ */
+const EDITOR_READY_ANCHOR = '[aria-label="Editor panels"]';
+
+interface Finding {
+  id: string;
+  impact: string;
+  help: string;
+  targets: string[];
+}
+
+/** What axe found, as something a failure message can name. */
+async function scanEditor(page: Page): Promise<Finding[]> {
+  const results = await new AxeBuilder({ page }).withTags(AA_TAGS).analyze();
+
+  /*
+   * The POPULATION, before any verdict. A scan that ran against nothing reports
+   * zero violations exactly as a clean page does — measured here, an early run
+   * of this suite reported zero while a deliberately broken button sat on the
+   * page, because the result was being read from the wrong field. A passing
+   * rule count is what separates "clean" from "did not look".
+   */
+  expect(
+    results.passes.length,
+    "axe reported no passing rules, so it scanned nothing — the zero below would mean nothing"
+  ).toBeGreaterThan(10);
+
+  return results.violations.map(violation => ({
+    id: violation.id,
+    impact: violation.impact ?? "unknown",
+    help: violation.help,
+    targets: violation.nodes.flatMap(node => node.target.map(String)),
+  }));
+}
+
+/*
+ * The control that opens the page builder, in EITHER state.
+ *
+ * The card names itself for the document it is showing — an empty page invites
+ * you to build it, a populated one to open the builder — so a helper naming one
+ * wording breaks whenever the fixture gains or loses blocks, and breaks with a
+ * timeout that names the editor rather than the button. Kept as a literal
+ * because this suite is deliberately black box and imports no product code;
+ * the source of both strings is `PageBuilderCard`.
+ */
+const OPEN_BUILDER_ACTION = /^Open in builder$/;
+/**
+ * The Page Builder card on the form, whose way in is named as the document
+ * bar's is, so a lookup by that name is scoped to the card.
+ */
+const PAGE_BUILDER_CARD = '[data-slot="page-builder-card"]';
+
+const HOMEPAGE = "/admin/api/singles/homepage";
+
+/**
+ * Give the homepage one block before the editor opens.
+ *
+ * An editor that opens on a page with no blocks opens Add by itself, so a
+ * press on Add would close it again. The tests that open Add from the rail
+ * set the page they open, rather than inherit what the last spec holding
+ * the homepage left, so the press is the one that opens the panel.
+ */
+async function homepageWithABlock(page: Page): Promise<void> {
+  const stored = await page.request.patch(HOMEPAGE, {
+    data: {
+      layout: {
+        formatVersion: 1,
+        kind: "page",
+        nodes: [
+          {
+            id: "a11y-heading",
+            type: "core/heading",
+            version: 1,
+            props: { text: "Scanned with Add open", level: "h2" },
+          },
+        ],
+      },
+      _overwrite: true,
+    },
+  });
+  expect(stored.ok(), `seeding the homepage: ${stored.status()}`).toBe(true);
+}
+
+/** Open the Add panel from the rail, as an author does. */
+async function openAddPanel(page: Page): Promise<void> {
+  const add = page
+    .getByRole("navigation", { name: "Editor panels" })
+    .getByRole("button", { name: "Add", exact: true });
+  // Closed until pressed: the page has a block, so nothing opened it.
+  await expect(add).toHaveAttribute("aria-pressed", "false");
+  await add.click();
+  await expect(add).toHaveAttribute("aria-pressed", "true");
+}
+
+/**
+ * Open a document and put its page builder on screen, in `theme`: the admin
+ * is waited for in that theme, so a dark scan reads the dark palette.
+ */
+async function openEditor(page: Page, theme: Theme = "light"): Promise<void> {
+  await gotoAdmin(page, "/singles/homepage", theme);
+  await page
+    .locator(PAGE_BUILDER_CARD)
+    .getByRole("link", { name: OPEN_BUILDER_ACTION })
+    .click();
+  // POPULATION BEFORE VERDICT. "No violations" is satisfied perfectly by an
+  // editor that never opened, so the scan must not run until it has.
+  await expect(page.locator(EDITOR_READY_ANCHOR)).toBeVisible({
+    timeout: 30_000,
+  });
+}
+
+test.describe("the page builder meets WCAG 2.2 AA", () => {
+  test("has no violations when it opens", async ({ page }) => {
+    await openEditor(page);
+
+    const findings = await scanEditor(page);
+
+    expect(
+      findings,
+      `axe reported ${findings.length} violation(s):\n${JSON.stringify(findings, null, 2)}`
+    ).toEqual([]);
+  });
+
+  test("has no violations with a panel open", async ({ page }) => {
+    // The inserter is a different tree from the canvas — a list of options with
+    // its own roles — and a scan of the closed editor never reaches it.
+    await homepageWithABlock(page);
+    await openEditor(page);
+    await openAddPanel(page);
+    await expect(page.getByRole("option").first()).toBeVisible({
+      timeout: 15_000,
+    });
+
+    const findings = await scanEditor(page);
+
+    expect(
+      findings,
+      `axe reported ${findings.length} violation(s) with the inserter open:\n${JSON.stringify(findings, null, 2)}`
+    ).toEqual([]);
+  });
+
+  test("has no violations with the Add panel open in DARK mode", async ({
+    page,
+  }) => {
+    // The panel's greyed tiles, its placement line and the popover each set
+    // a colour of their own, so each theme is scanned with them on screen.
+    await homepageWithABlock(page);
+    await openEditor(page, "dark");
+    await openAddPanel(page);
+    await expect(page.getByRole("option").first()).toBeVisible({
+      timeout: 15_000,
+    });
+    await page.getByRole("option").first().hover();
+    await expect(page.locator(".nx-insert-popover")).toBeVisible();
+
+    const findings = await scanEditor(page);
+
+    expect(
+      findings,
+      `axe reported ${findings.length} violation(s) with the inserter open in dark mode:\n${JSON.stringify(findings, null, 2)}`
+    ).toEqual([]);
+  });
+
+  test("has no violations in DARK mode", async ({ page }) => {
+    /*
+     * Contrast is the rule most likely to differ between the two, and it is the
+     * one no unit test can reach: jsdom applies no stylesheet, so every colour
+     * assertion in the component suites is really an assertion about a class
+     * name. A palette that fails only in dark mode passes every one of them.
+     */
+    await openEditor(page, "dark");
+
+    const findings = await scanEditor(page);
+
+    expect(
+      findings,
+      `axe reported ${findings.length} violation(s) in dark mode:\n${JSON.stringify(findings, null, 2)}`
+    ).toEqual([]);
+  });
+});

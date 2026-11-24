@@ -1,0 +1,1437 @@
+import { describe, expect, it } from "vitest";
+
+import { buildDesiredTableFromComponentFields } from "../../../schema/pipeline/diff/build-from-fields";
+import type { TableSpec } from "../../../schema/pipeline/diff/types";
+import { STORAGE_FORMAT } from "../../../../schemas/storage-format";
+import {
+  planFieldGroupReconcile,
+  type ReconcilableField,
+  type ReconcileTable,
+} from "../reconcile-field-group-plan";
+
+const TABLE = "comp_hero";
+const COMPANION = "comp_hero_locales";
+const DIALECT = "postgresql" as const;
+
+/**
+ * Live-table fixtures are built by the SAME builder the planner derives its system-column set
+ * from, so a system column the generator gains tomorrow is present on both sides of the
+ * comparison automatically — hand-listing columns here would re-introduce the drift the planner
+ * exists to repair.
+ */
+function liveTableFor(
+  fields: ReconcilableField[],
+  options: { localized?: boolean } = {}
+): TableSpec {
+  return buildDesiredTableFromComponentFields(TABLE, fields, DIALECT, {
+    builtBy: "fieldGroup",
+    ...(options.localized !== undefined
+      ? { localized: options.localized }
+      : {}),
+  });
+}
+
+/**
+ * A companion holding the given user columns beside its structural pair.
+ *
+ * The structural pair carries `primaryKey`, because the real companion DDL declares
+ * `PRIMARY KEY (_parent, _locale)` and introspection reports it per column on all three dialects.
+ * A fixture that omitted it would model a table the generator never produces.
+ */
+function companionWith(
+  columns: Array<{ name: string; type?: string }>
+): TableSpec {
+  return {
+    name: COMPANION,
+    columns: [
+      { name: "_parent", type: "text", nullable: false, primaryKey: true },
+      { name: "_locale", type: "varchar", nullable: false, primaryKey: true },
+      ...columns.map(c => ({
+        name: c.name,
+        type: c.type ?? "text",
+        nullable: true,
+      })),
+    ],
+  };
+}
+
+function plan(args: {
+  storedFields: ReconcilableField[];
+  liveMain: TableSpec;
+  liveCompanion?: TableSpec | null;
+  /** Defaults to false — the flag the row of a never-localized group records. */
+  storedLocalized?: boolean;
+  /**
+   * What the table builders would write, asked per (field, table). Absent means the type check has
+   * nothing to compare and must stay silent.
+   */
+  expectedColumnType?: (
+    field: ReconcilableField,
+    table: ReconcileTable
+  ) => string | undefined;
+  /** The earlier creator's spelling, accepted beside `expectedColumnType`. */
+  preBuilderSaveColumnType?: (
+    field: ReconcilableField,
+    table: ReconcileTable
+  ) => string | undefined;
+  /** The DEFAULT the creator writes, accepted beside the built table's. */
+  creatorColumnDefault?: (field: ReconcilableField) => string | undefined;
+}) {
+  return planFieldGroupReconcile({
+    storedFields: args.storedFields,
+    storedLocalized: args.storedLocalized ?? false,
+    dialect: DIALECT,
+    tableName: TABLE,
+    liveMain: args.liveMain,
+    liveCompanion: args.liveCompanion ?? null,
+    ...(args.expectedColumnType
+      ? { expectedColumnType: args.expectedColumnType }
+      : {}),
+    ...(args.preBuilderSaveColumnType
+      ? { preBuilderSaveColumnType: args.preBuilderSaveColumnType }
+      : {}),
+    ...(args.creatorColumnDefault
+      ? { creatorColumnDefault: args.creatorColumnDefault }
+      : {}),
+  });
+}
+
+describe("planFieldGroupReconcile", () => {
+  it("reports an already-honest definition as unchanged and keeps every field identical", () => {
+    const stored: ReconcilableField[] = [
+      { name: "title", type: "text", required: true },
+      { name: "contact", type: "email" },
+    ];
+    const result = plan({
+      storedFields: stored,
+      liveMain: liveTableFor(stored),
+    });
+
+    expect(result.unchanged).toBe(true);
+    expect(result.fields).toEqual(stored);
+    expect(result.removed).toEqual([]);
+    expect(result.repaired).toEqual([]);
+    expect(result.adopted).toEqual([]);
+  });
+
+  it("keeps the declared LOGICAL type when repairing a physical attribute", () => {
+    // `email` and `text` are one physical `text` column, so a rebuild from introspection would
+    // downgrade the type. The repair must touch only the attribute that drifted.
+    const stored: ReconcilableField[] = [
+      { name: "contact", type: "email", required: true },
+    ];
+    // The live column exists but is nullable: the failed edit never applied the NOT NULL.
+    const live = liveTableFor([{ name: "contact", type: "email" }]);
+
+    const result = plan({ storedFields: stored, liveMain: live });
+
+    expect(result.unchanged).toBe(false);
+    expect(result.fields).toEqual([
+      { name: "contact", type: "email", required: false },
+    ]);
+    expect(result.repaired).toEqual([
+      {
+        fieldName: "contact",
+        columnName: "contact",
+        table: "main",
+        attribute: "required",
+        from: true,
+        to: false,
+      },
+    ]);
+  });
+
+  it("removes a field whose column vanished and reports it by identity", () => {
+    const stored: ReconcilableField[] = [
+      { name: "title", type: "text" },
+      { name: "subtitle", type: "text" },
+    ];
+    const live = liveTableFor([{ name: "title", type: "text" }]);
+
+    const result = plan({ storedFields: stored, liveMain: live });
+
+    expect(result.fields.map(f => f.name)).toEqual(["title"]);
+    expect(result.removed).toEqual([
+      { fieldName: "subtitle", columnName: "subtitle" },
+    ]);
+  });
+
+  it("adopts an unknown live column with a guessed type, flagged as a guess", () => {
+    const live = liveTableFor([{ name: "title", type: "text" }]);
+    live.columns.push({ name: "mystery_count", type: "int4", nullable: false });
+
+    const result = plan({
+      storedFields: [{ name: "title", type: "text" }],
+      liveMain: live,
+    });
+
+    expect(result.adopted).toEqual([
+      {
+        fieldName: "mystery_count",
+        columnName: "mystery_count",
+        table: "main",
+        liveType: "int4",
+        guessedType: "number",
+      },
+    ]);
+    const adopted = result.fields.find(f => f.name === "mystery_count");
+    expect(adopted).toMatchObject({
+      type: "number",
+      required: true,
+    });
+  });
+
+  /**
+   * An adopted column's DEFAULT is part of what the column does, and the matched-field check never
+   * sees an adoption. Dropping it writes a definition that understates the column, and the next
+   * apply — diffing that definition against the table — removes the default outright.
+   */
+  describe("adopted column defaults", () => {
+    const stored: ReconcilableField[] = [{ name: "title", type: "text" }];
+
+    it("carries a boolean default onto the adopted field", () => {
+      const live = liveTableFor(stored);
+      live.columns.push({
+        name: "featured",
+        type: "boolean",
+        nullable: true,
+        default: "true",
+      });
+
+      const result = plan({ storedFields: stored, liveMain: live });
+
+      expect(result.blockers).toEqual([]);
+      expect(result.fields.find(f => f.name === "featured")).toMatchObject({
+        type: "checkbox",
+        defaultValue: true,
+      });
+    });
+
+    // A default the field contract cannot record must refuse rather than be dropped: the creator
+    // only ever emits checkbox defaults, so anything else here is not something the pipeline wrote.
+    it("refuses an adoption whose default cannot be represented", () => {
+      const live = liveTableFor(stored);
+      live.columns.push({
+        name: "headline",
+        type: "text",
+        nullable: true,
+        default: "untitled",
+      });
+
+      const result = plan({ storedFields: stored, liveMain: live });
+
+      expect(result.blockers).toEqual([
+        expect.objectContaining({
+          columnName: "headline",
+          kind: "column-default-changed",
+        }),
+      ]);
+    });
+
+    // The negative control: a column with NO default still adopts cleanly, so the check has not
+    // simply turned every adoption into a refusal.
+    it("still adopts a column that carries no default", () => {
+      const live = liveTableFor(stored);
+      live.columns.push({ name: "subtitle", type: "text", nullable: true });
+
+      const result = plan({ storedFields: stored, liveMain: live });
+
+      expect(result.blockers).toEqual([]);
+      expect(result.adopted.map(a => a.fieldName)).toEqual(["subtitle"]);
+    });
+  });
+
+  it("never adopts a system column, including the probed discriminator spelling", () => {
+    const stored: ReconcilableField[] = [{ name: "title", type: "text" }];
+    // A table the storage migration moved carries the new discriminator name; naming it via
+    // `typeColumn` is what keeps it out of the adoption list.
+    const live = buildDesiredTableFromComponentFields(TABLE, stored, DIALECT, {
+      builtBy: "fieldGroup",
+      typeColumn: "_field_group_type",
+    });
+
+    const result = planFieldGroupReconcile({
+      storedFields: stored,
+      storedLocalized: false,
+      dialect: DIALECT,
+      tableName: TABLE,
+      liveMain: live,
+      liveCompanion: null,
+      typeColumn: "_field_group_type",
+    });
+
+    expect(result.adopted).toEqual([]);
+    expect(result.unchanged).toBe(true);
+  });
+
+  it("derives localized from the companion holding a user column, never from a flag", () => {
+    const stored: ReconcilableField[] = [
+      { name: "title", type: "text", localized: true },
+    ];
+    const result = plan({
+      storedFields: stored,
+      liveMain: liveTableFor(stored, { localized: true }),
+      liveCompanion: companionWith([{ name: "title" }]),
+      storedLocalized: true,
+    });
+
+    expect(result.localized).toBe(true);
+    expect(result.unchanged).toBe(true);
+  });
+
+  /**
+   * A localized group whose fields produce no translatable COLUMN has no companion table at all —
+   * `deriveCompanionSpec` returns null in exactly that case, so the absence is healthy rather than
+   * evidence of anything.
+   *
+   * Reading it as "not localized" rewrites a correct row, and the damage surfaces later: the next
+   * default-translatable field added to the group is placed on the main table, which is the
+   * divergence this operation exists to clear rather than to create.
+   */
+  it("keeps a localized group localized when its fields need no companion", () => {
+    const stored: ReconcilableField[] = [
+      { name: "title", type: "text", localized: false },
+    ];
+
+    const result = plan({
+      storedFields: stored,
+      liveMain: liveTableFor(stored),
+      liveCompanion: null,
+      storedLocalized: true,
+    });
+
+    expect(result.localized).toBe(true);
+    expect(result.unchanged).toBe(true);
+  });
+
+  // The negative control: where the fields WOULD have produced a companion column, a missing
+  // companion is still read as not localized, so a genuine disable is still repaired.
+  it("still reads a missing companion as not localized when one was due", () => {
+    const stored: ReconcilableField[] = [
+      { name: "title", type: "text", localized: true },
+    ];
+
+    const result = plan({
+      storedFields: stored,
+      liveMain: liveTableFor(stored),
+      liveCompanion: null,
+      storedLocalized: true,
+    });
+
+    expect(result.localized).toBe(false);
+  });
+
+  it("reads a companion holding only structural columns as not localized", () => {
+    const stored: ReconcilableField[] = [{ name: "title", type: "text" }];
+    const result = plan({
+      storedFields: stored,
+      liveMain: liveTableFor(stored),
+      liveCompanion: companionWith([]),
+    });
+
+    expect(result.localized).toBe(false);
+  });
+
+  it("does not repair required from a companion column's nullability", () => {
+    // Companion columns are created nullable whatever the field declares, so their nullability is
+    // structural rather than evidence — a required localized field must survive untouched.
+    const stored: ReconcilableField[] = [
+      { name: "title", type: "text", localized: true, required: true },
+    ];
+    const result = plan({
+      storedFields: stored,
+      liveMain: liveTableFor(stored, { localized: true }),
+      liveCompanion: companionWith([{ name: "title" }]),
+      storedLocalized: true,
+    });
+
+    expect(result.repaired).toEqual([]);
+    expect(result.fields).toEqual(stored);
+  });
+
+  it("corrects a declared unique the live table no longer backs, when indexes are tracked", () => {
+    const stored: ReconcilableField[] = [
+      { name: "slug_field", type: "text", unique: true },
+    ];
+    const live = liveTableFor([{ name: "slug_field", type: "text" }]);
+    // Tracked-and-empty is a statement about the table; undefined is a statement about the
+    // snapshot, covered by the test below.
+    live.indexes = [];
+
+    const result = plan({ storedFields: stored, liveMain: live });
+
+    expect(result.repaired).toEqual([
+      {
+        fieldName: "slug_field",
+        columnName: "slug_field",
+        table: "main",
+        attribute: "unique",
+        from: true,
+        to: false,
+      },
+    ]);
+    expect(result.fields[0]).toMatchObject({ type: "text", unique: false });
+  });
+
+  it("leaves declared indexes alone when the snapshot tracked no index data", () => {
+    const stored: ReconcilableField[] = [
+      { name: "slug_field", type: "text", unique: true },
+    ];
+    const live = liveTableFor([{ name: "slug_field", type: "text" }]);
+    delete live.indexes;
+
+    const result = plan({ storedFields: stored, liveMain: live });
+
+    expect(result.repaired).toEqual([]);
+    expect(result.fields).toEqual(stored);
+  });
+
+  it("keeps a layout-only field no column can testify about", () => {
+    const stored: ReconcilableField[] = [
+      { name: "title", type: "text" },
+      // `component` fields produce no column on this table: instances live in the child table.
+      { name: "cta", type: "component" },
+    ];
+    const result = plan({
+      storedFields: stored,
+      liveMain: liveTableFor([{ name: "title", type: "text" }]),
+    });
+
+    expect(result.fields.map(f => f.name)).toContain("cta");
+    expect(result.removed).toEqual([]);
+  });
+
+  // The primary divergence this operation repairs: a localization enable whose DDL landed and
+  // whose row write failed differs from a healthy group ONLY in the flag. Field-list comparison
+  // alone reads that as unchanged, and the caller then skips the one write the repair exists for.
+  it("treats flag drift alone as a change", () => {
+    const stored: ReconcilableField[] = [
+      { name: "title", type: "text", localized: true },
+    ];
+    const result = plan({
+      storedFields: stored,
+      liveMain: liveTableFor(stored, { localized: true }),
+      liveCompanion: companionWith([{ name: "title" }]),
+      // The row still says non-localized: the enable transition committed, the write did not.
+      storedLocalized: false,
+    });
+
+    expect(result.localized).toBe(true);
+    expect(result.unchanged).toBe(false);
+    // And nothing else invented: the flag IS the whole repair.
+    expect(result.removed).toEqual([]);
+    expect(result.repaired).toEqual([]);
+    expect(result.adopted).toEqual([]);
+  });
+
+  // A half-applied type change leaves a live column under a columnless field's own name. Keeping
+  // the columnless declaration AND adopting the column would persist two fields with one name and
+  // mark the ambiguity synced; the columnless field gives way, as a reported removal.
+  it("replaces a columnless field whose name a live column now occupies", () => {
+    const stored: ReconcilableField[] = [
+      { name: "title", type: "text" },
+      { name: "cta", type: "component" },
+    ];
+    const live = liveTableFor([{ name: "title", type: "text" }]);
+    live.columns.push({ name: "cta", type: "text", nullable: true });
+
+    const result = plan({ storedFields: stored, liveMain: live });
+
+    expect(result.fields.filter(f => f.name === "cta")).toHaveLength(1);
+    expect(result.fields.find(f => f.name === "cta")).toMatchObject({
+      type: "text",
+    });
+    expect(result.removed).toEqual([{ fieldName: "cta", columnName: "cta" }]);
+    expect(result.adopted).toEqual([
+      expect.objectContaining({ fieldName: "cta", table: "main" }),
+    ]);
+  });
+
+  // In a localized group a text-like field with NO flag defaults to translatable, which would
+  // re-home a column the planner just found on the MAIN table. Silence is not neutral there, so
+  // main-table adoptions carry an explicit false.
+  it("pins a main-table adoption of a localized group to the main table", () => {
+    const stored: ReconcilableField[] = [
+      { name: "title", type: "text", localized: true },
+    ];
+    const live = liveTableFor(stored, { localized: true });
+    live.columns.push({ name: "mystery_note", type: "text", nullable: true });
+
+    const result = plan({
+      storedFields: stored,
+      liveMain: live,
+      liveCompanion: companionWith([{ name: "title" }]),
+      storedLocalized: true,
+    });
+
+    expect(result.fields.find(f => f.name === "mystery_note")).toMatchObject({
+      type: "text",
+      localized: false,
+    });
+  });
+
+  // 🔴 The finding that would have DESTROYED authored meaning. Toggling one field's `localized`
+  // moves its column between tables; searching only the table the stale flag implies reports the
+  // field as removed and re-adopts its column as a minimal guess, discarding the logical type and
+  // every authored option. Located where the column actually is, the field survives intact.
+  it("keeps a field whose column moved between tables, correcting only its placement", () => {
+    const stored: ReconcilableField[] = [
+      { name: "title", type: "text", localized: true },
+      // Declared as living on the MAIN table, but the apply moved it to the companion.
+      { name: "contact", type: "email", localized: false, required: true },
+    ];
+    const result = plan({
+      storedFields: stored,
+      liveMain: liveTableFor(
+        [{ name: "title", type: "text", localized: true }],
+        {
+          localized: true,
+        }
+      ),
+      liveCompanion: companionWith([{ name: "title" }, { name: "contact" }]),
+      storedLocalized: true,
+    });
+
+    const contact = result.fields.find(f => f.name === "contact");
+    // The authored LOGICAL type survives — an adoption would have guessed `text`.
+    expect(contact).toMatchObject({ type: "email", localized: true });
+    expect(result.removed).toEqual([]);
+    expect(result.adopted).toEqual([]);
+    expect(result.repaired).toContainEqual({
+      fieldName: "contact",
+      columnName: "contact",
+      table: "companion",
+      attribute: "localized",
+      from: false,
+      to: true,
+    });
+  });
+
+  it("refuses when one column exists on both tables", () => {
+    const stored: ReconcilableField[] = [
+      { name: "title", type: "text", localized: true },
+    ];
+    // A localization enable that seeded the companion without finishing the main-table drops.
+    const live = liveTableFor([{ name: "title", type: "text" }]);
+    const result = plan({
+      storedFields: stored,
+      liveMain: live,
+      liveCompanion: companionWith([{ name: "title" }]),
+      storedLocalized: true,
+    });
+
+    expect(result.blockers).toEqual([
+      expect.objectContaining({
+        fieldName: "title",
+        kind: "column-on-both-tables",
+      }),
+    ]);
+  });
+
+  it("refuses when a column's physical type no longer matches its declared field", () => {
+    const stored: ReconcilableField[] = [{ name: "weight", type: "number" }];
+    // The apply changed the column to text and then failed its registry write.
+    const live = liveTableFor([{ name: "weight", type: "number" }]);
+    const col = live.columns.find(c => c.name === "weight");
+    if (col) col.type = "text";
+
+    const result = plan({
+      storedFields: stored,
+      liveMain: live,
+      // 🔴 The expectation comes from the table builders, so the test must supply one — without it
+      // the check has nothing to compare against and correctly stays silent. Supplying nothing here
+      // is what made this case inert when the comparison moved off the column descriptor, and the
+      // suite caught it; this is the check's real input rather than scaffolding.
+      expectedColumnType: () => "int4",
+    });
+
+    expect(result.blockers).toEqual([
+      expect.objectContaining({
+        fieldName: "weight",
+        kind: "physical-type-changed",
+      }),
+    ]);
+  });
+
+  /**
+   * Two spellings of one field's column exist in databases: today's, from the column descriptor a
+   * Builder save's migration builds with, and the one the creator before it gave. A column in
+   * either is the field's column; a column in neither is drift, however the widening is read.
+   */
+  describe("a column built before the Builder's save writer", () => {
+    const stored: ReconcilableField[] = [{ name: "contact", type: "email" }];
+    const withLiveType = (type: string): TableSpec => {
+      const live = liveTableFor([{ name: "contact", type: "email" }]);
+      const col = live.columns.find(c => c.name === "contact");
+      if (col) col.type = type;
+      return live;
+    };
+    // PostgreSQL's spellings for an `email`: `text` today, `VARCHAR(255)` from the earlier creator.
+    const spellings = {
+      expectedColumnType: () => "text",
+      preBuilderSaveColumnType: () => "VARCHAR(255)",
+    };
+
+    it("accepts a column in the earlier creator's spelling", () => {
+      const result = plan({
+        storedFields: stored,
+        liveMain: withLiveType("varchar"),
+        ...spellings,
+      });
+
+      expect(result.blockers).toEqual([]);
+    });
+
+    it("accepts a column in today's spelling", () => {
+      const result = plan({
+        storedFields: stored,
+        liveMain: withLiveType("text"),
+        ...spellings,
+      });
+
+      expect(result.blockers).toEqual([]);
+    });
+
+    it("refuses a column in neither spelling, naming today's", () => {
+      const result = plan({
+        storedFields: stored,
+        liveMain: withLiveType("int4"),
+        ...spellings,
+      });
+
+      expect(result.blockers).toEqual([
+        expect.objectContaining({
+          fieldName: "contact",
+          kind: "physical-type-changed",
+          detail: expect.stringContaining("would create as text"),
+        }),
+      ]);
+    });
+  });
+
+  /**
+   * The two tables are built by different code and spell the same field differently, so the type
+   * check must ask about the table the column was FOUND in.
+   *
+   * The case that makes this load-bearing is the one below: the column has moved to the companion
+   * while the stored flag still says the group is not localized. That disagreement is the primary
+   * divergence this operation repairs, so resolving the expectation from the stored flag would
+   * report drift on precisely the input reconcile exists to fix — and would do it while the column
+   * is perfectly healthy.
+   *
+   * Asserted on the ARGUMENTS the check actually passes rather than only on the absence of a
+   * blocker: a planner that stopped consulting the expectation at all would also produce no
+   * blocker, and this must not pass for that reason.
+   */
+  it("asks for the expected type of the table the column was found in", () => {
+    const stored: ReconcilableField[] = [{ name: "contact", type: "email" }];
+    const live = liveTableFor([]);
+    const companion = companionWith([{ name: "contact", type: "text" }]);
+
+    const asked: Array<{ field: string; table: ReconcileTable }> = [];
+    const result = plan({
+      storedFields: stored,
+      liveMain: live,
+      liveCompanion: companion,
+      // The real spellings this pair produces on PostgreSQL: the main table's builder gives an
+      // `email` a length-capped varchar, the companion's builder gives it unbounded text. Asking
+      // about the wrong table therefore compares `varchar` against a live `text` and blocks.
+      storedLocalized: false,
+      expectedColumnType: (field, table) => {
+        asked.push({ field: field.name, table });
+        return table === "companion" ? "TEXT" : "VARCHAR(255)";
+      },
+    });
+
+    expect(asked).toEqual([{ field: "contact", table: "companion" }]);
+    expect(result.blockers).toEqual([]);
+  });
+
+  /**
+   * The DEFAULT is physical, and drifts exactly as the type does.
+   *
+   * Two writers build the main table and they disagree about a checkbox's default: a table built
+   * from the definition (a Builder save) carries none, and the creator writes the declared one.
+   * Either is healthy; anything else is drift, including a default the definition no longer
+   * declares.
+   */
+  describe("column defaults", () => {
+    /** A stored checkbox, which carries the default the planner reads beside its flags. */
+    type CheckboxField = ReconcilableField & { defaultValue?: boolean };
+
+    /** The creator's spelling of a checkbox default, as `FieldGroupSchemaService` writes it. */
+    const creatorDefault = (field: ReconcilableField): string | undefined =>
+      "defaultValue" in field && field.defaultValue !== undefined
+        ? String(field.defaultValue)
+        : undefined;
+
+    function planWithDefault(
+      liveDefault: string | undefined,
+      declared: boolean | undefined
+    ) {
+      const stored: CheckboxField[] = [
+        {
+          name: "featured",
+          type: "checkbox",
+          ...(declared !== undefined ? { defaultValue: declared } : {}),
+        },
+      ];
+      const live = liveTableFor(stored);
+      const col = live.columns.find(c => c.name === "featured");
+      if (col) {
+        col.default = liveDefault;
+        // Stated rather than assumed: the normaliser only collapses 1/0 to a boolean when it is
+        // told the column is one, so a fixture that left the type to chance would be testing the
+        // fallback path while reading as though it tested the boolean one.
+        col.type = "boolean";
+      }
+      return plan({
+        storedFields: stored,
+        liveMain: live,
+        creatorColumnDefault: creatorDefault,
+      });
+    }
+
+    // A Builder save's table: the definition declares a default, the column carries none.
+    it("accepts a declared default the column does not carry, as a Builder save builds it", () => {
+      expect(planWithDefault(undefined, true).blockers).toEqual([]);
+    });
+
+    // The creator's table: the column carries the declared default.
+    it("accepts the declared default on the column, as the creator builds it", () => {
+      expect(planWithDefault("true", true).blockers).toEqual([]);
+    });
+
+    it("refuses when the live default no longer matches the declared one", () => {
+      expect(planWithDefault("false", true).blockers).toEqual([
+        expect.objectContaining({
+          fieldName: "featured",
+          kind: "column-default-changed",
+        }),
+      ]);
+    });
+
+    // The authored default was REMOVED while the column kept its own: neither writer gives a
+    // column a default the definition does not declare.
+    it("refuses when the definition declares no default and the column has one", () => {
+      expect(planWithDefault("true", undefined).blockers).toEqual([
+        expect.objectContaining({ kind: "column-default-changed" }),
+      ]);
+    });
+
+    // The dialects spell one value differently — SQLite stores a boolean default as 1 where
+    // PostgreSQL reports `true` — so a raw string compare would report drift on every healthy
+    // SQLite group. This is the pair that proves the comparison runs through the normaliser.
+    it("accepts a live default that matches after normalisation", () => {
+      expect(planWithDefault("1", true).blockers).toEqual([]);
+    });
+
+    // Without the creator's answer only the built table's is accepted, so a creator that was not
+    // asked never reads as one that writes no default.
+    it("accepts only the built table's default when the creator is not asked", () => {
+      const stored: CheckboxField[] = [
+        { name: "featured", type: "checkbox", defaultValue: true },
+      ];
+      const live = liveTableFor(stored);
+      const col = live.columns.find(c => c.name === "featured");
+      if (col) {
+        col.default = "true";
+        col.type = "boolean";
+      }
+      expect(plan({ storedFields: stored, liveMain: live }).blockers).toEqual([
+        expect.objectContaining({ kind: "column-default-changed" }),
+      ]);
+    });
+
+    // The companion's columns are rendered by the localization path, which models no defaults, so
+    // a companion column is not judged on one.
+    it("does not judge a companion column's default", () => {
+      const stored: ReconcilableField[] = [
+        { name: "title", type: "text", localized: true },
+      ];
+      const companion = companionWith([{ name: "title" }]);
+      const title = companion.columns.find(c => c.name === "title");
+      if (title) title.default = "'x'";
+      const result = plan({
+        storedFields: stored,
+        liveMain: liveTableFor(stored, { localized: true }),
+        liveCompanion: companion,
+        storedLocalized: true,
+        creatorColumnDefault: creatorDefault,
+      });
+      expect(result.blockers).toEqual([]);
+    });
+  });
+
+  /**
+   * Which index a field's column carries is the generator's answer, not the `index` flag's alone:
+   * a single reference is indexed whether or not it asks, so its undeclared index is healthy and a
+   * missing one is drift no flag can describe.
+   */
+  describe("field indexes", () => {
+    const reference: ReconcilableField & { relationTo: string } = {
+      name: "author",
+      type: "relationship",
+      relationTo: "users",
+    };
+
+    it("accepts the index a single reference carries without declaring one", () => {
+      const stored = [reference];
+      const result = plan({
+        storedFields: stored,
+        liveMain: liveTableFor(stored),
+      });
+      expect(result.repaired).toEqual([]);
+      expect(result.blockers).toEqual([]);
+      expect(result.unchanged).toBe(true);
+    });
+
+    it("refuses a single reference whose index is gone", () => {
+      const stored = [reference];
+      const live = liveTableFor(stored);
+      live.indexes = (live.indexes ?? []).filter(
+        index => !(index.columns.length === 1 && index.columns[0] === "author")
+      );
+      const result = plan({ storedFields: stored, liveMain: live });
+      expect(result.repaired).toEqual([]);
+      expect(result.blockers).toEqual([
+        expect.objectContaining({
+          fieldName: "author",
+          kind: "field-index-changed",
+        }),
+      ]);
+    });
+
+    // The control: where the flag decides the index, a live index the flag does not ask for is
+    // still recorded on the flag, and a declared one that is gone is still cleared.
+    it("records an index the flag does not ask for on a plain field", () => {
+      const stored: ReconcilableField[] = [{ name: "rank", type: "number" }];
+      const live = liveTableFor([
+        { name: "rank", type: "number", index: true },
+      ]);
+      const result = plan({ storedFields: stored, liveMain: live });
+      expect(result.repaired).toEqual([
+        {
+          fieldName: "rank",
+          columnName: "rank",
+          table: "main",
+          attribute: "index",
+          from: false,
+          to: true,
+        },
+      ]);
+      expect(result.blockers).toEqual([]);
+    });
+
+    it("clears a declared index the plain field's column no longer carries", () => {
+      const stored: ReconcilableField[] = [
+        { name: "rank", type: "number", index: true },
+      ];
+      const live = liveTableFor([{ name: "rank", type: "number" }]);
+      const result = plan({ storedFields: stored, liveMain: live });
+      expect(result.repaired).toEqual([
+        expect.objectContaining({
+          fieldName: "rank",
+          attribute: "index",
+          from: true,
+          to: false,
+        }),
+      ]);
+      expect(result.blockers).toEqual([]);
+    });
+  });
+
+  /**
+   * Structural integrity: a table missing a system column or its parent index cannot do its job,
+   * and this operation issues no DDL, so the only honest answer is to refuse.
+   *
+   * The positive controls below REMOVE something from a table the generator produced, rather than
+   * hand-building a broken one — so each asserts on the absence of exactly what the real generator
+   * emits, and cannot drift from it.
+   */
+  describe("structural integrity", () => {
+    const stored: ReconcilableField[] = [{ name: "title", type: "text" }];
+
+    it("refuses a main table missing a system column", () => {
+      const live = liveTableFor(stored);
+      live.columns = live.columns.filter(c => c.name !== "_parent_id");
+
+      const result = plan({ storedFields: stored, liveMain: live });
+
+      expect(result.blockers).toEqual([
+        expect.objectContaining({
+          columnName: "_parent_id",
+          kind: "structural-column-missing",
+        }),
+      ]);
+    });
+
+    /**
+     * The key must BE the skeleton's key, not merely contain it.
+     *
+     * A composite `(id, some_column)` leaves `id` marked as part of a key while enforcing
+     * uniqueness over the pair — so the same component id can repeat whenever the other value
+     * differs, which is precisely the guarantee `id` exists to provide.
+     */
+    it("refuses a main table whose primary key carries extra columns", () => {
+      const live = liveTableFor(stored);
+      const extra = live.columns.find(c => c.name === "title");
+      if (extra) extra.primaryKey = true;
+
+      const result = plan({ storedFields: stored, liveMain: live });
+
+      expect(result.blockers).toEqual([
+        expect.objectContaining({ kind: "structural-column-missing" }),
+      ]);
+    });
+
+    // A column can survive while the constraint that made it meaningful is dropped: `id` present
+    // but no longer the key means duplicate component rows, which every name-based check reads as
+    // healthy. Taken from the skeleton's own `primaryKey`, so it covers whatever is marked next.
+    it("refuses a main table whose id is no longer the primary key", () => {
+      const live = liveTableFor(stored);
+      const id = live.columns.find(c => c.name === "id");
+      if (id) delete id.primaryKey;
+
+      const result = plan({ storedFields: stored, liveMain: live });
+
+      expect(result.blockers).toEqual([
+        expect.objectContaining({
+          columnName: "id",
+          kind: "structural-column-missing",
+        }),
+      ]);
+    });
+
+    /**
+     * A system column can survive with its TYPE or NULLABILITY changed, and both break what the
+     * runtime schema is about to be registered on: a nullable `_parent_id` admits rows belonging
+     * to no parent, and a retyped one makes the parent-scoped queries compare values that no
+     * longer correspond.
+     */
+    it("refuses a structural column that is nullable where the table requires a value", () => {
+      const live = liveTableFor(stored);
+      const parent = live.columns.find(c => c.name === "_parent_id");
+      if (parent) parent.nullable = true;
+
+      const result = plan({ storedFields: stored, liveMain: live });
+
+      expect(result.blockers).toEqual([
+        expect.objectContaining({
+          columnName: "_parent_id",
+          kind: "structural-column-missing",
+        }),
+      ]);
+    });
+
+    it("refuses a structural column whose type has drifted", () => {
+      const live = liveTableFor(stored);
+      const parent = live.columns.find(c => c.name === "_parent_id");
+      if (parent) parent.type = "int4";
+
+      const result = plan({ storedFields: stored, liveMain: live });
+
+      expect(result.blockers).toEqual([
+        expect.objectContaining({
+          columnName: "_parent_id",
+          kind: "structural-column-missing",
+        }),
+      ]);
+    });
+
+    /**
+     * The negative control, and it is the one that decides the direction of the nullability check.
+     *
+     * A column the generator leaves NULLABLE that is live NOT NULL rejects nothing this operation
+     * can repair, and refusing it would turn a table an older generation created with a tighter
+     * constraint into an unreconcilable one — a false refusal on the single path out of trouble.
+     */
+    it("accepts a structural column that is stricter than the skeleton requires", () => {
+      const live = liveTableFor(stored);
+      const nullableInSkeleton = live.columns.find(
+        c => c.name === STORAGE_FORMAT.columns.type
+      );
+      if (nullableInSkeleton) nullableInSkeleton.nullable = false;
+
+      const result = plan({ storedFields: stored, liveMain: live });
+
+      expect(result.blockers).toEqual([]);
+    });
+
+    /**
+     * The system columns' DEFAULTS are load-bearing rather than cosmetic: the generated runtime
+     * schema declares them as DATABASE defaults, so Drizzle omits those columns from an INSERT and
+     * the database supplies the value. A dropped default fails a NOT NULL insert outright, or
+     * silently stores NULL where a zero was intended.
+     *
+     * The skeleton records no default for any system column, so the expectation has to come from
+     * the creator — supplied here the way the service supplies it.
+     */
+    it("refuses a system column whose database default was dropped", () => {
+      const live = liveTableFor(stored);
+      const order = live.columns.find(
+        c => c.name === STORAGE_FORMAT.columns.order
+      );
+      if (order) order.default = undefined;
+
+      const result = planFieldGroupReconcile({
+        storedFields: stored,
+        storedLocalized: false,
+        dialect: DIALECT,
+        tableName: TABLE,
+        liveMain: live,
+        liveCompanion: null,
+        structuralColumnDefaults: new Map([
+          [STORAGE_FORMAT.columns.order, "0"],
+        ]),
+      });
+
+      expect(result.blockers).toEqual([
+        expect.objectContaining({
+          columnName: STORAGE_FORMAT.columns.order,
+          kind: "structural-column-missing",
+        }),
+      ]);
+    });
+
+    // The negative control, and the one that matters most here: the dialects spell the same default
+    // differently from the DDL that wrote it, so a raw string compare would refuse every healthy
+    // table. This is the pair that proves the comparison runs through the normaliser.
+    it("accepts a system default that matches after normalisation", () => {
+      const live = liveTableFor(stored);
+      const order = live.columns.find(
+        c => c.name === STORAGE_FORMAT.columns.order
+      );
+      if (order) order.default = "0";
+
+      const result = planFieldGroupReconcile({
+        storedFields: stored,
+        storedLocalized: false,
+        dialect: DIALECT,
+        tableName: TABLE,
+        liveMain: live,
+        liveCompanion: null,
+        structuralColumnDefaults: new Map([
+          [STORAGE_FORMAT.columns.order, "0"],
+        ]),
+      });
+
+      expect(result.blockers).toEqual([]);
+    });
+
+    it("refuses a main table missing its parent index", () => {
+      const live = liveTableFor(stored);
+      live.indexes = (live.indexes ?? []).filter(
+        index => index.columns.length === 1
+      );
+
+      const result = plan({ storedFields: stored, liveMain: live });
+
+      expect(result.blockers).toEqual([
+        expect.objectContaining({ kind: "system-index-missing" }),
+      ]);
+    });
+
+    // An index over the same columns in a different ORDER is a different object: only this order
+    // serves a lookup by parent id. Matched by ordered list rather than by name or by set.
+    it("refuses a parent index whose columns are in the wrong order", () => {
+      const live = liveTableFor(stored);
+      for (const index of live.indexes ?? []) {
+        if (index.columns.length > 1)
+          index.columns = [...index.columns].reverse();
+      }
+
+      const result = plan({ storedFields: stored, liveMain: live });
+
+      expect(result.blockers).toEqual([
+        expect.objectContaining({ kind: "system-index-missing" }),
+      ]);
+    });
+
+    /**
+     * The companion's composite key is load-bearing at runtime rather than merely structural:
+     * localized writes match rows on `(_parent, _locale)`. A companion that kept both columns and
+     * lost the key passes every other check here while failing every localized write on
+     * PostgreSQL and SQLite, and silently accepting duplicate locale rows on MySQL.
+     */
+    it("refuses a companion whose key columns are no longer its primary key", () => {
+      const localizedStored: ReconcilableField[] = [
+        { name: "title", type: "text", localized: true },
+      ];
+      const companion = companionWith([{ name: "title" }]);
+      for (const column of companion.columns) delete column.primaryKey;
+
+      const result = plan({
+        storedFields: localizedStored,
+        storedLocalized: true,
+        liveMain: liveTableFor(localizedStored, { localized: true }),
+        liveCompanion: companion,
+      });
+
+      expect(result.blockers).toEqual([
+        expect.objectContaining({ kind: "structural-column-missing" }),
+      ]);
+    });
+
+    /**
+     * Membership of the key is not the property; being the WHOLE key is.
+     *
+     * A key of `(_parent, _locale, title)` contains both required columns and enforces uniqueness
+     * over three values, so PostgreSQL and SQLite have no constraint matching the runtime's
+     * `(_parent, _locale)` conflict target and MySQL admits several rows per parent and locale.
+     */
+    it("refuses a companion whose primary key carries extra columns", () => {
+      const localizedStored: ReconcilableField[] = [
+        { name: "title", type: "text", localized: true },
+      ];
+      const companion = companionWith([{ name: "title" }]);
+      const extra = companion.columns.find(c => c.name === "title");
+      if (extra) extra.primaryKey = true;
+
+      const result = plan({
+        storedFields: localizedStored,
+        storedLocalized: true,
+        liveMain: liveTableFor(localizedStored, { localized: true }),
+        liveCompanion: companion,
+      });
+
+      expect(result.blockers).toEqual([
+        expect.objectContaining({ kind: "structural-column-missing" }),
+      ]);
+    });
+
+    // The negative control that keeps the companion check honest: a field group is never
+    // Draft/Published, so its companion has no `_status` and requiring one would refuse every
+    // localized group.
+    it("does not require a status column on a field group's companion", () => {
+      const localizedStored: ReconcilableField[] = [
+        { name: "title", type: "text", localized: true },
+      ];
+      const result = plan({
+        storedFields: localizedStored,
+        storedLocalized: true,
+        liveMain: liveTableFor(localizedStored, { localized: true }),
+        liveCompanion: companionWith([{ name: "title" }]),
+      });
+
+      expect(result.blockers).toEqual([]);
+    });
+  });
+
+  /**
+   * A vanished field standing beside an unclaimed column is equally a rename and a drop-plus-add,
+   * and resolving it silently discards authored configuration that nothing in the database retains.
+   */
+  it("refuses when a removal and an adoption could be one rename", () => {
+    const stored: ReconcilableField[] = [{ name: "headline", type: "text" }];
+    // The table the rename produced: the old column is gone, the new one is described by no field.
+    const live = liveTableFor([{ name: "title", type: "text" }]);
+
+    const result = plan({ storedFields: stored, liveMain: live });
+
+    expect(result.blockers).toEqual([
+      expect.objectContaining({ kind: "ambiguous-rename" }),
+    ]);
+  });
+
+  // The negative control: a removal with NO unclaimed column beside it is an unambiguous drop and
+  // must still be repaired, or the commonest divergence stops being fixable.
+  it("still removes a vanished field when nothing appeared to pair it with", () => {
+    const stored: ReconcilableField[] = [
+      { name: "title", type: "text" },
+      { name: "subtitle", type: "text" },
+    ];
+    const live = liveTableFor([{ name: "title", type: "text" }]);
+
+    const result = plan({ storedFields: stored, liveMain: live });
+
+    expect(result.blockers).toEqual([]);
+    expect(result.removed.map(r => r.fieldName)).toEqual(["subtitle"]);
+  });
+
+  /**
+   * A width change is a physical change, and the canonical form deliberately discards it.
+   *
+   * That strip is right for PostgreSQL, whose introspection reads `udt_name` and never reports a
+   * length — but MySQL reports `COLUMN_TYPE`, which does. So a `maxLength` edit that resized the
+   * column and then failed its registry write leaves the two comparing equal under the canonical
+   * form alone, and the definition keeps a width the column no longer has.
+   */
+  describe("type width", () => {
+    const stored: ReconcilableField[] = [{ name: "title", type: "text" }];
+
+    function planWithWidths(
+      liveType: string,
+      expected: string,
+      liveModifier?: string
+    ) {
+      const live = liveTableFor(stored);
+      const col = live.columns.find(c => c.name === "title");
+      if (col) {
+        col.type = liveType;
+        // The modifier is carried in its OWN field, because the live type string cannot always hold
+        // it: PostgreSQL introspection reports `udt_name`, which never does. A fixture that only
+        // set the type would be modelling a snapshot no PostgreSQL database produces.
+        if (liveModifier !== undefined) col.typeModifier = liveModifier;
+      }
+      return plan({
+        storedFields: stored,
+        liveMain: live,
+        expectedColumnType: () => expected,
+      });
+    }
+
+    it("refuses when both sides report a width and they differ", () => {
+      const result = planWithWidths("varchar", "VARCHAR(255)", "32");
+      expect(result.blockers).toEqual([
+        expect.objectContaining({
+          fieldName: "title",
+          kind: "physical-type-changed",
+        }),
+      ]);
+    });
+
+    it("accepts equal widths", () => {
+      expect(planWithWidths("varchar", "VARCHAR(255)", "255").blockers).toEqual(
+        []
+      );
+    });
+
+    // The negative control, and the reason the check is gated on BOTH sides carrying a modifier:
+    // PostgreSQL's introspected type has none, so demanding one would refuse every healthy
+    // PostgreSQL column whose declaration happens to specify a length.
+    it("stays silent when the live side reports no width", () => {
+      expect(planWithWidths("varchar", "VARCHAR(255)").blockers).toEqual([]);
+    });
+  });
+
+  // The control that keeps the check from firing on a column it has no expectation for. Absence
+  // must SKIP rather than block — treating "I could not derive an expectation" as drift is what
+  // made reconcile refuse healthy groups containing dates and relations.
+  it("stays silent when no expected type is known for the column", () => {
+    const stored: ReconcilableField[] = [{ name: "weight", type: "number" }];
+    const live = liveTableFor([{ name: "weight", type: "number" }]);
+    const col = live.columns.find(c => c.name === "weight");
+    if (col) col.type = "text";
+
+    const result = plan({ storedFields: stored, liveMain: live });
+
+    expect(result.blockers).toEqual([]);
+  });
+
+  it("refuses a live column whose identifier no field name can represent", () => {
+    const live = liveTableFor([{ name: "title", type: "text" }]);
+    live.columns.push({ name: "Legacy-Title", type: "text", nullable: true });
+
+    const result = plan({
+      storedFields: [{ name: "title", type: "text" }],
+      liveMain: live,
+    });
+
+    expect(result.blockers).toEqual([
+      expect.objectContaining({ kind: "unrepresentable-column-name" }),
+    ]);
+    // And it is NOT adopted: persisting it would violate the field contract.
+    expect(result.fields.find(f => f.name === "Legacy-Title")).toBeUndefined();
+  });
+
+  // 🔴 A localized group whose last translatable field was removed leaves a companion holding only
+  // structural columns — physically identical to a never-localized group. Reading that as "not
+  // localized" would make the documented idempotent repair the thing that breaks the group, by
+  // routing the next default-translatable field to the wrong table.
+  it("keeps localization when the companion is structurally empty but the row says localized", () => {
+    const stored: ReconcilableField[] = [{ name: "weight", type: "number" }];
+    const result = plan({
+      storedFields: stored,
+      liveMain: liveTableFor(stored, { localized: true }),
+      liveCompanion: companionWith([]),
+      storedLocalized: true,
+    });
+
+    expect(result.localized).toBe(true);
+    expect(result.unchanged).toBe(true);
+  });
+
+  it("adopts a companion-resident unknown column as a localized field", () => {
+    const stored: ReconcilableField[] = [
+      { name: "title", type: "text", localized: true },
+    ];
+    const result = plan({
+      storedFields: stored,
+      liveMain: liveTableFor(stored, { localized: true }),
+      liveCompanion: companionWith([{ name: "title" }, { name: "tagline" }]),
+      storedLocalized: true,
+    });
+
+    expect(result.adopted).toEqual([
+      {
+        fieldName: "tagline",
+        columnName: "tagline",
+        table: "companion",
+        liveType: "text",
+        guessedType: "text",
+      },
+    ]);
+    expect(result.fields.find(f => f.name === "tagline")).toMatchObject({
+      type: "text",
+      localized: true,
+      required: false,
+    });
+  });
+});
+
+/**
+ * A group with no name only lays fields out, and the fields inside it are stored on the field
+ * group's row. The planner matches each with its column there, keeps the definition in its own
+ * shape, and names the column a table made before such fields were stored is still to receive.
+ */
+describe("planFieldGroupReconcile — fields inside a group with no name", () => {
+  /** A group with no name holding `fields`. */
+  const laidOut = (fields: unknown[]): ReconcilableField =>
+    ({
+      type: "group",
+      label: "Layout",
+      fields,
+    }) as unknown as ReconcilableField;
+
+  /** The stored definition: a field beside the group, and two levels of groups with no name. */
+  const stored = (): ReconcilableField[] => [
+    { name: "title", type: "text" },
+    laidOut([
+      { name: "note", type: "text" },
+      laidOut([{ name: "count", type: "number", required: true }]),
+    ]),
+  ];
+
+  it("matches each field inside the group with its column and keeps the definition's shape", () => {
+    const fields = stored();
+    const result = plan({
+      storedFields: fields,
+      liveMain: liveTableFor(fields),
+    });
+
+    expect(result.unchanged).toBe(true);
+    expect(result.removed).toEqual([]);
+    expect(result.adopted).toEqual([]);
+    expect(result.awaitingColumns).toEqual([]);
+    expect(result.fields).toEqual(fields);
+  });
+
+  it("names a column the table does not hold yet, keeping its field, and the rest unchanged", () => {
+    const fields = stored();
+    // The table as an earlier version made it: a column for the field beside the group alone.
+    const result = plan({
+      storedFields: fields,
+      liveMain: liveTableFor([{ name: "title", type: "text" }]),
+    });
+
+    expect(result.awaitingColumns).toEqual([
+      { fieldName: "note", columnName: "note" },
+      { fieldName: "count", columnName: "count" },
+    ]);
+    expect(result.removed).toEqual([]);
+    expect(result.adopted).toEqual([]);
+    expect(result.blockers).toEqual([]);
+    expect(result.unchanged).toBe(true);
+    expect(result.fields).toEqual(fields);
+  });
+
+  it("refuses a column awaited inside the group beside one no field describes", () => {
+    // `note` may have been renamed to `memo`, or never made: the schema cannot say which, so the
+    // repair refuses rather than adopt `memo` under a guessed type beside a field left waiting.
+    const fields = stored();
+    const result = plan({
+      storedFields: fields,
+      liveMain: liveTableFor([
+        { name: "title", type: "text" },
+        { name: "memo", type: "text" },
+        { name: "count", type: "number", required: true },
+      ]),
+    });
+
+    expect(result.blockers).toEqual([
+      expect.objectContaining({
+        kind: "ambiguous-rename",
+        fieldName: "note",
+        columnName: "memo",
+      }),
+    ]);
+  });
+
+  it("repairs a field inside the group in its place", () => {
+    const fields = stored();
+    // The live `count` column takes nulls, so the field it stores is no longer required.
+    const live = liveTableFor(fields);
+    const count = live.columns.find(column => column.name === "count")!;
+    count.nullable = true;
+
+    const result = plan({ storedFields: fields, liveMain: live });
+
+    expect(result.repaired).toEqual([
+      expect.objectContaining({ fieldName: "count", attribute: "required" }),
+    ]);
+    const inner = (result.fields[1] as unknown as { fields: unknown[] })
+      .fields[1] as { fields: ReconcilableField[] };
+    expect(inner.fields[0]).toMatchObject({ name: "count", required: false });
+    // The stored definition itself is left as it was.
+    expect(
+      (
+        (fields[1] as unknown as { fields: unknown[] }).fields[1] as {
+          fields: ReconcilableField[];
+        }
+      ).fields[0]
+    ).toMatchObject({ required: true });
+  });
+
+  it("adopts an unknown live column beside the group, not inside it", () => {
+    const fields = stored();
+    const live = liveTableFor([...fields, { name: "extra", type: "text" }]);
+
+    const result = plan({ storedFields: fields, liveMain: live });
+
+    expect(result.adopted.map(entry => entry.columnName)).toEqual(["extra"]);
+    expect(result.fields.slice(0, 2)).toEqual(fields);
+    expect(result.fields[2]).toMatchObject({ name: "extra" });
+  });
+
+  it("keeps a many-to-many relationship, whose values a field group keeps on its row", () => {
+    // A collection keeps such links in a junction table; a field group has none, and keeps the
+    // list in a column of its own row, inside a group with no name as beside it.
+    const tags = {
+      name: "tags",
+      type: "relationship",
+      options: { target: "tags", relationType: "manyToMany" },
+    } as unknown as ReconcilableField;
+    const besideTags = {
+      ...tags,
+      name: "labels",
+    } as unknown as ReconcilableField;
+    const fields = [besideTags, laidOut([tags])];
+    const result = plan({
+      storedFields: fields,
+      liveMain: liveTableFor(fields),
+    });
+
+    expect(result.removed).toEqual([]);
+    expect(result.adopted).toEqual([]);
+    expect(result.awaitingColumns).toEqual([]);
+    expect(result.unchanged).toBe(true);
+    expect(result.fields).toEqual(fields);
+  });
+
+  it("expects a text inside the group on the main table of a translated field group", () => {
+    // Which fields are translated is read from the declared list, so the text inside the group
+    // stays on the row however the field group is translated, and its place needs no repair.
+    const fields = stored();
+    const result = plan({
+      storedFields: fields,
+      liveMain: liveTableFor(fields, { localized: true }),
+      liveCompanion: companionWith([{ name: "title" }]),
+      storedLocalized: true,
+    });
+
+    expect(result.repaired).toEqual([]);
+    expect(result.blockers).toEqual([]);
+    expect(result.unchanged).toBe(true);
+  });
+});

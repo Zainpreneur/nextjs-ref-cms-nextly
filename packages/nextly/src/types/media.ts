@@ -1,0 +1,246 @@
+/**
+ * Media Types and Schemas
+ *
+ * Type-safe definitions for media management with Zod validation
+ */
+
+import { z } from "zod";
+
+import { mediaCategoryOf } from "../domains/media/media-categories";
+import type { ServiceErrorCode } from "../errors/error-codes";
+
+// ========================================
+// MEDIA TYPE ENUM
+// ========================================
+
+export const MediaTypeSchema = z.enum([
+  "image",
+  "video",
+  "audio",
+  "document",
+  "other",
+]);
+
+export type MediaType = z.infer<typeof MediaTypeSchema>;
+
+// ========================================
+// MEDIA RECORD SCHEMA
+// ========================================
+
+export const MediaSchema = z.object({
+  id: z.string().uuid(),
+  filename: z.string(),
+  originalFilename: z.string(),
+  mimeType: z.string(),
+  size: z.number().int().positive(),
+  width: z.number().int().positive().nullable(),
+  height: z.number().int().positive().nullable(),
+  duration: z.number().int().positive().nullable(),
+  url: z.string().url(),
+  thumbnailUrl: z.string().url().nullable(),
+  focalX: z.number().int().min(0).max(100).nullable().optional(),
+  focalY: z.number().int().min(0).max(100).nullable().optional(),
+  altText: z.string().nullable(),
+  caption: z.string().nullable(),
+  tags: z.array(z.string()).nullable(),
+  folderId: z.string().nullable().optional(),
+  uploadedBy: z.string().nullable(),
+  uploadedAt: z.date(),
+  updatedAt: z.date(),
+});
+
+export type Media = z.infer<typeof MediaSchema>;
+
+// ========================================
+// INPUT SCHEMAS (VALIDATION)
+// ========================================
+
+export const UploadMediaInputSchema = z.object({
+  file: z.instanceof(Buffer),
+  filename: z.string().min(1, "Filename is required"),
+  mimeType: z.string().min(1, "MIME type is required"),
+  /*
+   * Shape only — a positive whole number of bytes. The LIMIT is
+   * `security.limits.fileSize`, which a static schema cannot know: a constant
+   * here overrode the configured policy, so an install documented as accepting
+   * 20mb refused anything past 10. `UploadValidator` enforces the configured
+   * cap on the bytes themselves, which is also the number a client cannot lie
+   * about, and every upload path runs it.
+   */
+  size: z.number().int().positive(),
+  // Nullable: CLI seeds, data imports, and other system-context uploads
+  // may not have a user to attribute the upload to.
+  uploadedBy: z.string().uuid("Invalid user ID").nullable(),
+  folderId: z.string().uuid("Invalid folder ID").optional(),
+  // The alt text the caller gave, stored on the new row. Without it here the
+  // insert had nothing to write and every upload's alt text was dropped.
+  altText: z.string().optional(),
+  // Optional Content-Disposition to set on the stored object. Forwarded
+  // by `LegacyMediaService.uploadMedia` to the storage adapter's
+  // `UploadOptions.contentDisposition`. The unified MediaService sets
+  // this to `"attachment"` for sanitized SVGs when `svgCsp` is on, so
+  // direct URL navigation downloads instead of rendering. Adapters
+  // without per-object disposition support silently ignore.
+  contentDisposition: z.enum(["inline", "attachment"]).optional(),
+});
+
+export type UploadMediaInput = z.infer<typeof UploadMediaInputSchema>;
+
+export const UpdateMediaInputSchema = z.object({
+  altText: z.string().optional(),
+  caption: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  focalX: z.number().int().min(0).max(100).optional(),
+  focalY: z.number().int().min(0).max(100).optional(),
+  // A move is a folder_id change: routing it through the update path records a
+  // media.updated event (bare folder writes did not). `null` moves to root.
+  folderId: z.string().nullable().optional(),
+});
+
+export type UpdateMediaInput = z.infer<typeof UpdateMediaInputSchema>;
+
+// ========================================
+// QUERY PARAMETERS SCHEMA
+// ========================================
+
+export const MediaParamsSchema = z.object({
+  page: z.number().int().positive().default(1),
+  limit: z.number().int().positive().max(100).default(24),
+  search: z.string().optional(),
+  type: MediaTypeSchema.optional(),
+  folderId: z.string().optional(), // Filter by folder (null = root, string = folder ID)
+  sortBy: z.enum(["filename", "uploadedAt", "size"]).default("uploadedAt"),
+  sortOrder: z.enum(["asc", "desc"]).default("desc"),
+});
+
+export type MediaParams = z.infer<typeof MediaParamsSchema>;
+
+/**
+ * The views beside the folders. `missing-alt` is the images with no alt text;
+ * `unused` is the items the usage record finds no document using and no
+ * avatar or logo keeps.
+ */
+const MEDIA_VIEWS = ["missing-alt", "unused"] as const;
+export type MediaView = (typeof MEDIA_VIEWS)[number];
+
+/** The views a request may name, parsed at the boundary. */
+export const mediaViewSchema = z.enum(MEDIA_VIEWS);
+
+/**
+ * A page of a folder's items as a request asks for it, parsed at the
+ * boundary. Bounds as the list's own: at most 100 items a page.
+ */
+export const mediaPageQuerySchema = z.object({
+  page: z.coerce.number().int().positive().default(1),
+  limit: z.coerce.number().int().positive().max(100).default(24),
+  search: z.string().trim().min(1).optional(),
+  type: MediaTypeSchema.optional(),
+  sortBy: z.enum(["uploadedAt", "filename", "size"]).default("uploadedAt"),
+  sortOrder: z.enum(["asc", "desc"]).default("desc"),
+});
+export type MediaPageQuery = z.infer<typeof mediaPageQuerySchema>;
+
+// ========================================
+// SERVICE RESPONSE TYPES
+// ========================================
+
+export interface MediaListResponse {
+  code?: ServiceErrorCode;
+  success: boolean;
+  statusCode: number;
+  message: string;
+  data: Media[] | null;
+  meta?: {
+    total: number;
+    page: number;
+    limit: number;
+    totalPages: number;
+    /**
+     * Unused's list alone: whether the usage record it was read from was
+     * complete, one build standing throughout the read. Absent from every
+     * other list.
+     */
+    usageRecorded?: boolean;
+  };
+}
+
+export interface MediaResponse {
+  code?: ServiceErrorCode;
+  success: boolean;
+  statusCode: number;
+  message: string;
+  data: Media | null;
+}
+
+/** What a read of several media files by id answers. */
+export interface MediaManyResponse {
+  code?: ServiceErrorCode;
+  success: boolean;
+  statusCode: number;
+  message: string;
+  /** The files found, each once; an id with no file has none. */
+  data: Media[] | null;
+}
+
+export interface DeleteMediaResponse {
+  code?: ServiceErrorCode;
+  success: boolean;
+  statusCode: number;
+  message: string;
+}
+
+// ========================================
+// HELPER FUNCTIONS
+// ========================================
+
+/**
+ * Get media type from MIME type: the kind the media library shows the file
+ * as, and narrows to (`mediaCategoryOf`).
+ */
+export function getMediaTypeFromMime(mimeType: string): MediaType {
+  return mediaCategoryOf(mimeType);
+}
+
+/**
+ * Check if MIME type is an image
+ */
+export function isImageMimeType(mimeType: string): boolean {
+  return mimeType.startsWith("image/");
+}
+
+/**
+ * Check if MIME type is a video
+ */
+export function isVideoMimeType(mimeType: string): boolean {
+  return mimeType.startsWith("video/");
+}
+
+/**
+ * Validate file size (in bytes)
+ */
+export function validateFileSize(
+  size: number,
+  maxSize: number = 10 * 1024 * 1024
+): { valid: boolean; error?: string } {
+  if (size <= 0) {
+    return { valid: false, error: "File size must be greater than 0" };
+  }
+  if (size > maxSize) {
+    const maxMB = Math.round(maxSize / (1024 * 1024));
+    return { valid: false, error: `File too large (max ${maxMB}MB)` };
+  }
+  return { valid: true };
+}
+
+/**
+ * Format file size for display (e.g., "1.5 MB")
+ */
+export function formatFileSize(bytes: number): string {
+  if (bytes === 0) return "0 B";
+
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+
+  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+}

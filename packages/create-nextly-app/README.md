@@ -1,0 +1,158 @@
+# create-nextly-app
+
+The official CLI for scaffolding a new Nextly CMS project.
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/create-nextly-app"><img alt="npm" src="https://img.shields.io/npm/v/create-nextly-app?style=flat-square&label=npm&color=cb3837" /></a>
+  <a href="https://github.com/nextlyhq/nextly/blob/main/LICENSE.md"><img alt="License" src="https://img.shields.io/github/license/nextlyhq/nextly?style=flat-square&color=blue" /></a>
+  <a href="https://nextlyhq.com/docs"><img alt="Status" src="https://img.shields.io/badge/status-alpha-orange?style=flat-square" /></a>
+</p>
+
+> [!IMPORTANT]
+> Nextly is in alpha. APIs may change before 1.0. Pin exact versions in production.
+
+## Quickstart
+
+```bash
+# pnpm
+pnpm create nextly-app@alpha my-app
+
+# npm
+npx create-nextly-app@alpha my-app
+
+# yarn
+yarn create nextly-app@alpha my-app
+
+# bun
+bun create nextly-app@alpha my-app
+```
+
+The CLI walks you through:
+
+1. Project name (or `.` to install in the current directory)
+2. Template (`blank`, `blog` or `plugin`)
+3. Schema approach (`code-first` or `visual`), only for templates that support both
+4. Database (`sqlite`, `postgresql`, or `mysql`)
+5. Database connection string (skipped for SQLite)
+
+### Which release a project gets
+
+A project gets the release of Nextly its CLI belongs to: `create-nextly-app@<version>` declares `nextly` and every `@nextlyhq/*` package at exactly `<version>`, so the templates, the agent guide and the skills it writes match what is installed. To start on another release, run that release's CLI; to upgrade later, move every Nextly package to the new version together.
+
+Adding Nextly to an app that already has a Nextly package at another version, or declared as a range, stops before changing anything and says what to set. With `--branch` or `--local-template`, the packages come from the `alpha` tag, the active release line, and `--use-yalc` links local builds.
+
+After scaffolding, `pnpm dev` runs the project. Visit [http://localhost:3000/admin/setup](http://localhost:3000/admin/setup) to create the first admin user.
+
+## Templates
+
+| Template   | Description                                                                         |
+| ---------- | ----------------------------------------------------------------------------------- |
+| **blank**  | Empty config. Define your own collections from scratch.                             |
+| **blog**   | Posts, categories, tags, frontend pages, RSS, sitemap, and admin-editable homepage. |
+| **plugin** | A publishable Nextly plugin package, with a playground app to try it in.            |
+
+More templates (portfolio, e-commerce, SaaS admin) are planned.
+
+### Plugin template
+
+`--template plugin` creates a library to publish on npm rather than an app, so
+it skips the schema-approach and database questions. Run from inside a
+Next.js app, it still creates the plugin in its own directory.
+
+- `src/` holds the plugin. Only the built `dist/` is published.
+- `dev/` is a small Nextly app on SQLite that registers the plugin. `pnpm dev`
+  runs it, and `/admin` opens signed in as `dev@nextly.local`, a user created
+  on first start under `next dev` only.
+- `pnpm test` boots the plugin in an in-memory Nextly; `pnpm build` builds it.
+
+By default the plugin is copied from the template bundled in the CLI, and its
+Nextly packages are pinned to that CLI's release, so its files and its
+packages come from the same release. Any `--branch`, `main` included,
+`--local-template` or `--use-yalc` uses the live template instead.
+
+## Schema approaches
+
+| Approach       | Description                                                                                               |
+| -------------- | --------------------------------------------------------------------------------------------------------- |
+| **code-first** | Schemas live in `nextly.config.ts` plus files under `src/collections/`. Type-safe and version-controlled. |
+| **visual**     | Schemas are defined in the Admin UI's Schema Builder. Stored in the database.                             |
+
+The two approaches are not mutually exclusive: a code-first project can add UI-defined collections later, and vice versa.
+
+## Non-interactive usage
+
+```bash
+# Blog with code-first approach
+pnpm create nextly-app@alpha my-blog --template blog --approach code-first
+
+# Blank project with PostgreSQL
+pnpm create nextly-app@alpha my-app --template blank --database postgresql
+
+# A plugin package with its playground app
+pnpm create nextly-app@alpha my-plugin --template plugin
+
+# Skip prompts entirely (defaults: blank, SQLite, local storage)
+pnpm create nextly-app@alpha my-app -y
+```
+
+## CLI flags
+
+| Flag                | Short | Description                                                  | Default            |
+| ------------------- | ----- | ------------------------------------------------------------ | ------------------ |
+| `--yes`             | `-y`  | Skip prompts and use defaults (blank, SQLite, local storage) | `false`            |
+| `--template <name>` | `-t`  | Project template: `blank`, `blog`, `plugin`                  | Interactive prompt |
+| `--approach <type>` | `-a`  | Schema approach: `code-first`, `visual`                      | Interactive prompt |
+| `--database <db>`   | `-d`  | Database: `sqlite`, `postgresql`, `mysql`                    | Interactive prompt |
+| `--branch <branch>` | `-b`  | Git branch to take the template from                         | This release       |
+| `--version`         | `-V`  | Print the CLI version                                        |                    |
+| `--help`            | `-h`  | Show help text                                               |                    |
+
+Run `pnpm create nextly-app@alpha --help` for the inline reference.
+
+<details>
+<summary><strong>Contributor flags</strong> (development only)</summary>
+
+These flags exist for Nextly maintainers and contributors working on the framework locally. They are not intended for end-user projects and are not covered by the alpha-stability promise.
+
+| Flag                      | Description                                                                                                                                         |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--local-template <path>` | Read templates from a local filesystem path instead of downloading them from GitHub.                                                                |
+| `--skip-install`          | Skip the dependency-installation step. Useful when testing the scaffolder against unpublished package versions.                                     |
+| `--use-yalc`              | Install Nextly packages from a local [yalc](https://github.com/wclr/yalc) store instead of npm. Used for end-to-end testing of unpublished changes. |
+
+See [CONTRIBUTING.md](https://github.com/nextlyhq/nextly/blob/main/CONTRIBUTING.md) for the local development workflow.
+
+</details>
+
+## Documentation
+
+- [**Quick start**](https://nextlyhq.com/docs/getting-started/quick-start)
+- [**Installation**](https://nextlyhq.com/docs/getting-started/installation)
+- [**Project structure**](https://nextlyhq.com/docs/getting-started/project-structure)
+- [**Templates**](https://nextlyhq.com/docs/templates)
+
+## See also
+
+- [`nextly`](https://github.com/nextlyhq/nextly/tree/main/packages/nextly): the core framework this CLI scaffolds.
+- The [Nextly monorepo](https://github.com/nextlyhq/nextly) for the full ecosystem of packages.
+
+## Community
+
+- [**GitHub Discussions**](https://github.com/nextlyhq/nextly/discussions) for questions, ideas, and show-and-tell
+- [**Issues**](https://github.com/nextlyhq/nextly/issues) for bug reports and feature requests
+- [**Discord**](https://discord.gg/hJUg9AZMn) for real-time chat with the team and other users
+- [**Contributing guide**](https://github.com/nextlyhq/nextly/blob/main/CONTRIBUTING.md) for local setup, the dev workflow, and PR conventions
+
+## Contributing
+
+Contributions of every size are welcome. Start with the [Contributing guide](https://github.com/nextlyhq/nextly/blob/main/CONTRIBUTING.md) for local setup and PR conventions.
+
+## Telemetry
+
+The Nextly CLI (`create-nextly-app` and `nextly`) collects usage data under a random ID, to help us improve the tool: never your name, project contents, file paths or secrets. It is off in CI, Docker, production and non-interactive shells, and `nextly telemetry disable` turns it off.
+
+See [nextlyhq.com/docs/telemetry](https://nextlyhq.com/docs/telemetry) for the full list of what is and is not collected, and for the environment variable that also turns it off (`NEXTLY_TELEMETRY_DISABLED=1`).
+
+## License
+
+[MIT](https://github.com/nextlyhq/nextly/blob/main/LICENSE.md). Free to use, modify, and distribute.

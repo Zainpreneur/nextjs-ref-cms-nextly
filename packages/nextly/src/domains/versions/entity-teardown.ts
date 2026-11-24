@@ -1,0 +1,210 @@
+/**
+ * What goes with a collection or Single when it is deleted, from the versions
+ * domain: its autosaves (recovery points nothing else collects once the
+ * entity is gone) and the pins features hold on its versions (which nothing
+ * could release once the entity is gone, and which a later entity under the
+ * same slug must not inherit).
+ *
+ * Durable history and working drafts are deliberately NOT touched. What a
+ * deletion owes a document's recorded past is a wider question, and answering
+ * it as a side effect here would decide it by accident.
+ *
+ * One function for every path that deletes an entity's registry row (both
+ * registries, a sync's orphan removal, the dev build's), so they cannot come
+ * to sweep different things, or to sweep in a different order.
+ *
+ * @module domains/versions/entity-teardown
+ */
+
+import type { TransactionContext } from "@nextlyhq/adapter-drizzle/types";
+
+import type { RevalidationIntent } from "../../revalidation/types";
+import type { VersionScopeKind } from "../../schemas/versions/types";
+import type { SupportedDialect } from "../../types/database";
+import {
+  dashboardPinsPresent,
+  deletePinsOfTarget,
+} from "../dashboard/dashboard-pins";
+import {
+  type DashboardLogger,
+  type TableProbe,
+  transactionTableProbe,
+} from "../dashboard/table-presence";
+import { clearRegistryRowCache } from "../dynamic-collections/services/collection-row-cache";
+import { deletedEntityIntent } from "../flush-content-change";
+import { countRegistryWriteOn } from "../schema/schema-version";
+
+import type { VersionsDbApi } from "./db-api";
+import { REGISTRY_TABLES } from "./history-locks";
+import { deletePinsForDocument, deletePinsForEntity } from "./version-pins";
+import { deleteViewsForDocument, deleteViewsForEntity } from "./version-views";
+import { VersionsRepository, type VersionRef } from "./versions-repository";
+
+/**
+ * Which of the dashboard's and the media library's tables a sweep may write,
+ * asked by the caller BEFORE its transaction opens (`dashboardPinsPresent`,
+ * `mediaUsagePresent`): a table that does not exist yet (a site that has not
+ * run `nextly migrate`) is skipped, since a statement against it would abort
+ * the whole transaction on PostgreSQL. Required, so no delete path can leave
+ * a deleted entity's pins, or the record of the media it used, behind by
+ * forgetting to ask.
+ */
+export interface DashboardTables {
+  dashboardPinsPresent: boolean;
+  mediaUsagePresent: boolean;
+}
+
+/**
+ * Whether the media usage table is there, for {@link DashboardTables} and for
+ * a write about to record what it uses: the record's code is loaded when a
+ * write or a delete asks, not with the services that make them. Asked `via`
+ * the connection of a transaction the caller holds, when given.
+ */
+export async function mediaUsageTablePresent(
+  db: TableProbe,
+  logger?: DashboardLogger,
+  via?: TableProbe
+): Promise<boolean> {
+  const { mediaUsagePresent } = await import(
+    "../media/usage/media-usage-store"
+  );
+  return mediaUsagePresent(db, logger, via);
+}
+
+/**
+ * The tables a registry row's removal inside `tx` reaches ({@link DashboardTables}), asked on
+ * `tx`'s own connection: a statement against a missing one would abort the transaction on
+ * PostgreSQL, and the pool may have no second connection. For a delete that removes an entity's
+ * row inside its own transaction (`deleteEntityRegistryRow` on that `tx`).
+ */
+export async function entityTablesOn(
+  adapter: TableProbe & Parameters<typeof transactionTableProbe>[0],
+  logger: DashboardLogger | undefined,
+  tx: TransactionContext
+): Promise<DashboardTables> {
+  const probe = transactionTableProbe(adapter, tx);
+  return {
+    dashboardPinsPresent: await dashboardPinsPresent(adapter, logger, probe),
+    mediaUsagePresent: await mediaUsageTablePresent(adapter, logger, probe),
+  };
+}
+
+/**
+ * Delete an entity's registry row, then its autosaves, version pins and
+ * readers' dashboard pins, on the caller's transaction, and count the
+ * registry write (`countRegistryWriteOn`) where a row went, so the stored
+ * schema version moves with the delete. Every path that deletes a registry
+ * row runs here, a CLI command's included, so none can leave the version
+ * where it was: another process (a running dev server) follows the registry
+ * by it, and would otherwise go on serving the deleted entity from its cache.
+ * Inside an open registry write (`writeRegistryRows`) the delete counts
+ * towards that write's version instead. Returns how many registry rows were deleted,
+ * and the intent that expires the entity's cached reads: read from the row's own `revalidate`
+ * setting on this transaction, so it is the current one and not a cached copy, and `undefined` when
+ * nothing was deleted or the entity opts out. The caller flushes it once the transaction commits.
+ *
+ * The row goes FIRST. A pin locks this row before it writes, so deleting it
+ * first takes the same lock in the same order: a pin under way finishes, and
+ * the sweep after it removes what it wrote; a pin that comes later finds the
+ * entity gone. Sweeping first would take no lock a pin waits on, so a pin
+ * holding the row could write after the sweep and outlive the entity, and a
+ * pin moving a slot the sweep had locked would deadlock with it.
+ */
+export async function deleteEntityRegistryRow(
+  tx: VersionsDbApi & Pick<TransactionContext, "getDrizzle">,
+  scopeKind: VersionScopeKind,
+  scopeSlug: string,
+  tables: DashboardTables,
+  dialect: SupportedDialect
+): Promise<DeletedEntity> {
+  const registry = REGISTRY_TABLES[scopeKind];
+  if (registry === undefined) return { deleted: 0, expire: undefined };
+  // Read before the delete, on the same transaction and locking the row, so
+  // the setting is the latest committed one and nothing changes it before
+  // the delete (a plain read on MySQL would see the transaction's snapshot).
+  const [row] = await tx.select<{ revalidate: unknown }>(registry, {
+    columns: ["revalidate"],
+    where: { and: [{ column: "slug", op: "=" as const, value: scopeSlug }] },
+    forUpdate: true,
+  });
+  const deleted = await tx.delete(registry, {
+    and: [{ column: "slug", op: "=" as const, value: scopeSlug }],
+  });
+  if (deleted > 0) await countRegistryWriteOn(tx, dialect);
+  // Cleared as the row goes, so a read later in the transaction does not
+  // answer with the row it read before the delete.
+  clearRegistryRowCache();
+  await new VersionsRepository(tx).deleteAutosavesForEntity(
+    scopeKind,
+    scopeSlug
+  );
+  await deletePinsForEntity(tx, scopeKind, scopeSlug);
+  await deleteViewsForEntity(tx, scopeKind, scopeSlug);
+  // Every reader's dashboard pins of it: each entry of a collection, or the
+  // Single itself. A page is not something a reader pins.
+  if (scopeKind !== "page") {
+    await deletePinsOfTarget(tx, tables.dashboardPinsPresent, {
+      targetType: scopeKind,
+      targetSlug: scopeSlug,
+    });
+  }
+  // The record of the media its documents used: every entry of a collection,
+  // or the Single itself. A page's media is recorded as its collection's.
+  if (scopeKind !== "page" && tables.mediaUsagePresent) {
+    const { removeEntityUsage } = await import(
+      "../media/usage/media-usage-store"
+    );
+    await removeEntityUsage(tx, { kind: scopeKind, slug: scopeSlug });
+  }
+  const expire =
+    deleted > 0 && row !== undefined && isCached(scopeKind)
+      ? deletedEntityIntent(scopeKind, scopeSlug, row.revalidate)
+      : undefined;
+  return { deleted, expire };
+}
+
+/** What deleting an entity's registry row did. */
+export interface DeletedEntity {
+  deleted: number;
+  expire: RevalidationIntent | undefined;
+}
+
+/** Whether nextly tags cached reads of this kind of entity. */
+function isCached(kind: VersionScopeKind): kind is "collection" | "single" {
+  return kind === "collection" || kind === "single";
+}
+
+/**
+ * Remove what the versions domain holds on one deleted document, on the
+ * delete's own transaction: the pins features hold on its versions, and each
+ * person's "last looked at" marker on it. Nothing could release or read
+ * either once the document is gone.
+ */
+export async function sweepDeletedDocument(
+  tx: VersionsDbApi,
+  ref: VersionRef,
+  tables: DashboardTables
+): Promise<void> {
+  await deletePinsForDocument(tx, ref);
+  await deleteViewsForDocument(tx, ref);
+  // Every reader's dashboard pin of the document. A Single's is the Single's
+  // own, which has no entry id; a page is not something a reader pins.
+  if (ref.scopeKind !== "page") {
+    await deletePinsOfTarget(tx, tables.dashboardPinsPresent, {
+      targetType: ref.scopeKind,
+      targetSlug: ref.scopeSlug,
+      entryId: ref.scopeKind === "collection" ? ref.entryId : "",
+    });
+  }
+  // The record of the media the document used: it uses nothing now.
+  if (ref.scopeKind !== "page" && tables.mediaUsagePresent) {
+    const { removeDocumentUsage } = await import(
+      "../media/usage/media-usage-store"
+    );
+    await removeDocumentUsage(tx, {
+      kind: ref.scopeKind,
+      slug: ref.scopeSlug,
+      documentId: ref.scopeKind === "collection" ? ref.entryId : "",
+    });
+  }
+}

@@ -1,0 +1,105 @@
+{
+  "name": "@nextlyhq/blocks-react",
+  "version": "0.0.2-alpha.80",
+  "description": "The React Server Component renderer for Nextly block documents, usable with or without the CMS.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nextlyhq/nextly.git",
+    "directory": "packages/blocks-react"
+  },
+  "homepage": "https://nextlyhq.com/docs",
+  "bugs": {
+    "url": "https://github.com/nextlyhq/nextly/issues"
+  },
+  "type": "module",
+  "main": "dist/index.mjs",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "default": "./dist/index.mjs"
+    },
+    "./next": {
+      "types": "./dist/next.d.ts",
+      "import": "./dist/next.mjs",
+      "default": "./dist/next.mjs"
+    },
+    "./blocks": {
+      "types": "./dist/blocks/index.d.ts",
+      "import": "./dist/blocks/index.mjs",
+      "default": "./dist/blocks/index.mjs"
+    },
+    "./environment": {
+      "types": "./dist/environment.d.ts",
+      "import": "./dist/environment.mjs",
+      "default": "./dist/environment.mjs"
+    },
+    "./icons/lucide": {
+      "types": "./dist/icons/lucide.d.ts",
+      "import": "./dist/icons/lucide.mjs",
+      "default": "./dist/icons/lucide.mjs"
+    }
+  },
+  "files": [
+    "dist",
+    "third-party"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "check-types": "node ../../scripts/tsc.mjs --noEmit && node ../../scripts/tsc.mjs --noEmit -p tsconfig.tests.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rimraf dist",
+    "icons:update-lucide": "node scripts/update-lucide.mjs"
+  },
+  "engines": {
+    "node": "^22.12.0 || >=24.0.0"
+  },
+  "dependencies": {
+    "@nextlyhq/blocks-engine": "workspace:*"
+  },
+  "peerDependencies": {
+    "next": "^16.4.1",
+    "nextly": "workspace:*",
+    "react": "^19.3.0"
+  },
+  "peerDependenciesMeta": {
+    "next": {
+      "optional": true
+    },
+    "nextly": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@nextlyhq/module-specifiers": "workspace:*",
+    "@nextlyhq/tsconfig": "workspace:*",
+    "@testing-library/react": "^16.3.0",
+    "@types/node": "^22.20.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "nextly": "workspace:*",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "rimraf": "^6.1.3",
+    "tsdown": "^0.23.1",
+    "typescript": "7.0.2",
+    "vitest": "^5.0.5"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "provenance": true
+  },
+  "keywords": [
+    "nextly",
+    "blocks",
+    "page-builder",
+    "react-server-components",
+    "renderer"
+  ]
+}
