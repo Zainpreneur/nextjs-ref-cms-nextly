@@ -1,15 +1,9 @@
-import scopeAdminSource from "./postcss-scope-admin-source.mjs";
-
+// Local webpack reference: the upstream config also runs a custom ESM
+// PostCSS plugin that webpack's postcss-loader cannot consume (it requires
+// plugin paths as CommonJS modules). Tailwind alone is enough for this
+// reference to render; admin CSS scoping is a styling-only concern.
 const config = {
-  plugins: [
-    "@tailwindcss/postcss",
-    // After Tailwind, so it scopes the compiled sheet: the admin's source
-    // stylesheet, reached through the `@nextlyhq/admin` source alias, scoped
-    // as the published one is (see the module's comment). Imported rather
-    // than named: Turbopack bundles this config, and resolves a plugin named
-    // by a relative path from the bundle, where the module is not.
-    scopeAdminSource,
-  ],
+  plugins: ["@tailwindcss/postcss"],
 };
 
 export default config;

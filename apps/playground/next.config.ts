@@ -88,6 +88,16 @@ const nextConfig: NextConfig = {
       "postgres",
       "mysql2/promise",
       "mysql2",
+      // Node-only build/runtime helpers bundled from nextly source in dev.
+      // They must stay as Node requires: esbuild's require.context in
+      // particular pulls its .d.ts files into webpack otherwise.
+      "esbuild",
+      "bundle-require",
+      "nodemailer",
+      "bcryptjs",
+      "sharp",
+      "better-sqlite3",
+      "pg",
     ]);
     const existing = config.externals;
     config.externals = [
@@ -180,10 +190,9 @@ const nextConfig: NextConfig = {
   transpilePackages: [
     "@nextlyhq/admin",
     "@nextlyhq/ui",
-    // Only in dev: HMR-eligible workspace packages bundled by Next.js
-    // → HMR fires on source edits. In prod they move to
-    // serverExternalPackages for a smaller bundle.
-    ...(isDev ? NEXTLY_HMR_PACKAGES : []),
+    // Local reference runs under webpack, where Turbopack's source aliases do
+    // not apply. Load the built nextly dist instead of transpiling its large
+    // source graph — much faster to compile and functionally identical here.
   ],
   // Native + third-party Node-only deps stay external always. Workspace
   // packages are external ONLY in prod (Payload pattern). In dev they're
@@ -207,9 +216,9 @@ const nextConfig: NextConfig = {
     // runtime, so they MUST be external in both dev and prod (see the
     // comment on NEXTLY_DYNAMIC_PACKAGES above).
     ...NEXTLY_DYNAMIC_PACKAGES,
-    // HMR-eligible workspace packages flip: external in prod (smaller
-    // bundle), bundled in dev (HMR).
-    ...(isDev ? [] : NEXTLY_HMR_PACKAGES),
+    // Built nextly dist is always external: no dev source-bundling under
+    // webpack (see transpilePackages note above).
+    ...NEXTLY_HMR_PACKAGES,
   ],
   experimental: {
     // Page data is collected by a pool of one worker per CPU unless this is
